@@ -812,6 +812,14 @@ void main() {
 
         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
 
+        // Psh is not written again until the next KV block, so the P fragments are the same
+        // for every hsv_tile. Load them once instead of re-reading LDS per tile.  Row tile 0
+        // only: the row_tiles > 1 fragments stay loaded in place (VGPR pressure at hd256).
+        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> PMat[Bc / MatBc];
+        [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
+            coopMatLoad(PMat[bc_chunk], Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
+        }
+
         // Each subgroup handles HSV/4 columns
         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
             const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * 16;
@@ -856,8 +864,7 @@ void main() {
                                 const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
                                 coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
                             }
-                            coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
-                            PVMat0 = coopMatMulAdd(KMat, QMat, PVMat0);
+                            PVMat0 = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat0);
                         }
                     }
                 } else if (hsv_offset < HSV_pad) {
@@ -866,8 +873,7 @@ void main() {
 
                         // One V operand, one accumulator per row tile: each row tile sums the
                         // same bc_chunk order into its own PVMat.
-                        coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
-                        PVMat0 = coopMatMulAdd(KMat, QMat, PVMat0);
+                        PVMat0 = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat0);
 
                         if (row_tiles > 1) {
                             coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride + MatBr / 4, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
@@ -887,8 +893,7 @@ void main() {
                 if (hsv_offset < HSV_pad) {
                     [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
                         FA_LOAD_V_TILE(stage_v0)
-                        coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
-                        PVMat0 = coopMatMulAdd(KMat, QMat, PVMat0);
+                        PVMat0 = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat0);
                     }
                 }
                 barrier();
