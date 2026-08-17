@@ -9041,6 +9041,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
                       "Vulkan buffer type)\n", device->name.c_str(), ggml_vk_buffer_align(device), ggml_vk_buffer_align_knob(),
                       (size_t) device->properties.limits.minStorageBufferOffsetAlignment);
 
+        // [TAG_VK_UMA_BULK_READ] the proof line: ggml_vk_buffer_read_2d reads a host-visible UMA buffer directly only from a
+        //   HOST_CACHED mapping or for <= 64 KiB; bulk reads of write-combined memory take the device copy path (no knob)
+        GGML_LOG_WARN("ggml_vulkan: %s uma_bulk_read: %s\n", device->name.c_str(), device->uma ?
+                      "copy path (direct CPU read only from HOST_CACHED mappings or for <= 64 KiB; no knob)" : "n/a (not a UMA device)");
+
         // [TAG_QSA_SCORE_KREUSE] the proof line
         if (device->coopmat_support && !device->coopmat2) {
 #ifdef GGML_VULKAN_QSA_KREUSE_NEGCTL
@@ -10821,7 +10826,12 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
     // through PCIe is sufficient fast reading back data from PCIe is slower than going through
     // the HW device to host copy path.
-    if(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible && src->device->uma) {
+    // On UMA, direct CPU reads are only fast from host-cached mappings. Write-combined/uncached
+    // mappings (e.g. GTT without HOST_CACHED) read at uncached speed (~200 MB/s), so bulk reads
+    // must go through the device copy path. Small reads stay direct to avoid the fence round-trip.
+    const bool host_cached = bool(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
+    if((src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) && src->device->uma &&
+       (host_cached || width * height <= 64 * 1024)) {
         GGML_ASSERT(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
