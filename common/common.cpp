@@ -2269,6 +2269,9 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+
+    flags_tgt = 0;
+    flags_dft = 0;
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2280,6 +2283,34 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
+// Save one checkpoint buffer with the given flags. Returns false (leaving `data`/`data_flags`
+// untouched) when the state cannot be serialized this way — e.g. the ON_DEVICE fast path hits a
+// fragmented (multi-range) recurrent state, where get_size_ext returns 0. The caller then retries
+// without ON_DEVICE. Builds into a temporary so a failure never leaves a half-written buffer.
+static bool common_prompt_checkpoint_update_data(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        std::vector<uint8_t> & data,
+        llama_state_seq_flags & data_flags) {
+    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    if (ckpt_size == 0) {
+        return false;
+    }
+
+    std::vector<uint8_t> data_new(ckpt_size);
+
+    const size_t n = llama_state_seq_get_data_ext(ctx, data_new.data(), ckpt_size, seq_id, flags);
+    if (n != ckpt_size) {
+        return false;
+    }
+
+    data       = std::move(data_new);
+    data_flags = flags;
+
+    return true;
+}
+
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
@@ -2288,14 +2319,20 @@ void common_prompt_checkpoint::update_tgt(
         return;
     }
 
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
-
-    data_tgt.resize(ckpt_size);
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
-    if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    if (common_prompt_checkpoint_update_data(ctx, seq_id, flags, data_tgt, flags_tgt)) {
+        return;
     }
+
+    // ON_DEVICE could not apply (fragmented recurrent state) — fall back to host serialization,
+    // recording the host flags so load_tgt restores from the host buffer, not stale device memory.
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) &&
+        common_prompt_checkpoint_update_data(ctx, seq_id, flags & ~LLAMA_STATE_SEQ_FLAGS_ON_DEVICE, data_tgt, flags_tgt)) {
+        return;
+    }
+
+    // no checkpoint could be created — mark it absent
+    data_tgt.clear();
+    flags_tgt = 0;
 }
 
 void common_prompt_checkpoint::update_dft(
@@ -2306,14 +2343,17 @@ void common_prompt_checkpoint::update_dft(
         return;
     }
 
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
-
-    data_dft.resize(ckpt_size);
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
-    if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    if (common_prompt_checkpoint_update_data(ctx, seq_id, flags, data_dft, flags_dft)) {
+        return;
     }
+
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) &&
+        common_prompt_checkpoint_update_data(ctx, seq_id, flags & ~LLAMA_STATE_SEQ_FLAGS_ON_DEVICE, data_dft, flags_dft)) {
+        return;
+    }
+
+    data_dft.clear();
+    flags_dft = 0;
 }
 
 void common_prompt_checkpoint::load_tgt(
@@ -2328,7 +2368,10 @@ void common_prompt_checkpoint::load_tgt(
         return;
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
+    // restore with the flags actually used to save (see flags_tgt): a host-saved checkpoint must be
+    // read back host-side even if the caller now passes ON_DEVICE, or it would read stale device memory.
+    GGML_UNUSED(flags);
+    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags_tgt);
     if (n != data_tgt.size()) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
     }
@@ -2346,7 +2389,8 @@ void common_prompt_checkpoint::load_dft(
         return;
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
+    GGML_UNUSED(flags);
+    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags_dft);
     if (n != data_dft.size()) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
     }
@@ -2354,9 +2398,11 @@ void common_prompt_checkpoint::load_dft(
 
 void common_prompt_checkpoint::clear_tgt() {
     data_tgt.clear();
+    flags_tgt = 0;
 }
 
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
+    flags_dft = 0;
 }

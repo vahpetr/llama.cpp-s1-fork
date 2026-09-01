@@ -1173,6 +1173,13 @@ struct common_prompt_checkpoint {
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
+    // the state_seq flags actually used to SAVE data_tgt/data_dft (may differ from the caller's
+    // request when the ON_DEVICE fast path could not apply and we fell back to host serialization).
+    // load_tgt/load_dft MUST restore with these, not the caller's current flags, or a host-saved
+    // checkpoint would be read back as on-device and silently corrupt the recurrent state.
+    llama_state_seq_flags flags_tgt = 0;
+    llama_state_seq_flags flags_dft = 0;
+
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
