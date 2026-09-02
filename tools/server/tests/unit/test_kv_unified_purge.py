@@ -120,6 +120,7 @@ def test_purge_saves_to_prompt_cache():
     global server
     server.cache_ram = 64
     server.no_cache_idle_slots = True
+    server.slot_save_path = "/tmp"   # enables the /slots/:id?action=... endpoints (erase is used below)
     server.start()
 
     small, big = words(20, 7), words(60, 8)
@@ -131,7 +132,13 @@ def test_purge_saves_to_prompt_cache():
     assert n_big + n_third + 8 <= 1024
     assert slot_tokens()[0] == 0
 
-    # ... coming back with the same prefix restores it from the cache instead of re-processing it
+    # the third client is done and releases its slot (a restore needs room in the pool) ...
+    res = server.make_request("POST", "/slots/2?action=erase")
+    assert res.status_code == 200
+    assert slot_tokens()[2] == 0
+
+    # ... and the purged client coming back with the same prefix restores it from the cache instead of
+    # re-processing it
     res = server.make_request("POST", "/completion", data={
         "prompt": small + " " + words(4, 10),
         "cache_prompt": True,

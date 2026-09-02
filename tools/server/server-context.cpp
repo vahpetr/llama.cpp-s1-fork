@@ -1680,6 +1680,13 @@ private:
             SRV_WRN("purging slot %d with %zu tokens\n", victim->id, victim->prompt.tokens.size());
             SRV_DBG("__TEST_TAG_PURGE_SLOT_%d__\n", victim->id);
 
+            // keep a host copy when a prompt cache exists, so the purged context can be restored instead of
+            // re-processed if the client comes back (see get_available_slot)
+            if (prompt_cache && victim->prompt_save(*prompt_cache)) {
+                SRV_DBG("__TEST_TAG_PURGE_SAVED_%d__\n", victim->id);
+                prompt_cache->update();
+            }
+
             victim->prompt_clear();
 
             res = true;
