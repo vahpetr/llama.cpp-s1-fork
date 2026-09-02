@@ -1664,14 +1664,23 @@ private:
         // and purges again if this did not free enough room.
         server_slot * victim = nullptr;
 
+        // TEST-ONLY knob for the A/B table (not for upstream): first | lru | longest | smallest (default)
+        static const std::string policy = getenv("LLAMA_SERVER_PURGE_POLICY") ? getenv("LLAMA_SERVER_PURGE_POLICY") : "smallest";
+
         for (auto & slot : slots) {
             if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
                 continue;
             }
 
-            if (victim == nullptr ||
-                slot.prompt.n_tokens() <  victim->prompt.n_tokens() ||
-               (slot.prompt.n_tokens() == victim->prompt.n_tokens() && slot.t_last_used < victim->t_last_used)) {
+            bool better = victim == nullptr;
+            if (!better) {
+                if      (policy == "first")   better = false;
+                else if (policy == "lru")     better = slot.t_last_used < victim->t_last_used;
+                else if (policy == "longest") better = slot.prompt.n_tokens() > victim->prompt.n_tokens();
+                else                          better = slot.prompt.n_tokens() <  victim->prompt.n_tokens() ||
+                                                      (slot.prompt.n_tokens() == victim->prompt.n_tokens() && slot.t_last_used < victim->t_last_used);
+            }
+            if (better) {
                 victim = &slot;
             }
         }
