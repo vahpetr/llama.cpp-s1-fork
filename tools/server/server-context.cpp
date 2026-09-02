@@ -1650,7 +1650,6 @@ private:
 
     // return true if at least one slot has been cleared
     // TODO: improve logic
-    //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
     bool try_clear_idle_slots() {
@@ -1660,21 +1659,30 @@ private:
             return res;
         }
 
+        // purge the idle slot that is the cheapest to rebuild: the one with the fewest tokens (its prompt
+        // has to be re-processed if the client comes back). LRU breaks ties. The caller retries the decode
+        // and purges again if this did not free enough room.
+        server_slot * victim = nullptr;
+
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
                 continue;
             }
 
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (victim == nullptr ||
+                slot.prompt.n_tokens() <  victim->prompt.n_tokens() ||
+               (slot.prompt.n_tokens() == victim->prompt.n_tokens() && slot.t_last_used < victim->t_last_used)) {
+                victim = &slot;
             }
+        }
+
+        if (victim != nullptr) {
+            SRV_WRN("purging slot %d with %zu tokens\n", victim->id, victim->prompt.tokens.size());
+            SRV_DBG("__TEST_TAG_PURGE_SLOT_%d__\n", victim->id);
+
+            victim->prompt_clear();
+
+            res = true;
         }
 
         return res;
