@@ -54,6 +54,43 @@ static common_speculative_output_limits server_output_limits(const common_params
 
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
 // on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
+// Replay after a checkpoint restore (partial draft acceptance on a context that cannot seq_rm partially): the
+// tokens in `draft` were ALREADY accepted by the target and are committed in the slot's context. Re-sampling
+// them and comparing with themselves is pointless and unsafe: the replay batch has a different size than the
+// verification batch, so the recomputed logits are not bit-identical and a near-tie can flip the argmax (or a
+// temperature > 0 sample can differ) -> the token is "rejected" -> restore -> replay -> rejected again, forever.
+// Accept the committed tokens unconditionally (advancing the sampler like a normal accept) and only sample the
+// new token at the final position. The synth path (server_sample_and_accept_synth) already did this.
+static std::vector<llama_token> server_sample_and_accept_replay(
+        common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        int & n_mismatch) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    n_mismatch = 0;
+
+    for (size_t i = 0; i < draft.size(); i++) {
+        const llama_token id = common_sampler_sample(smpl, ctx, idxs[i]);
+        if (id != draft[i]) {
+            n_mismatch++;
+        }
+
+        common_sampler_accept(smpl, draft[i], true);
+        result.push_back(draft[i]);
+    }
+
+    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
+    common_sampler_accept(smpl, id, true);
+    result.push_back(id);
+
+    return result;
+}
+
 static std::vector<llama_token> server_sample_and_accept_synth(
         common_sampler * smpl,
         llama_context * ctx,
@@ -662,6 +699,9 @@ struct server_slot {
         if (n_draft_total > 0) {
             const float  draft_ratio  = (float) n_draft_accepted / n_draft_total;
             const double mean_acc_len = n_draft_verif_steps > 0 ? 1.0 + (double) n_draft_accepted / (double) n_draft_verif_steps : 1.0;
+            if (stats.n_replay_mismatch > 0) {
+                SLT_INF(*this, "replay mismatches = %" PRIu64 " (committed tokens kept; would have livelocked before)\n", stats.n_replay_mismatch);
+            }
 
             std::string acceptance_rates_per_pos;
             if (n_draft_verif_steps > 0) {
@@ -3900,11 +3940,23 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+                std::vector<llama_token> accepted;
+                if (!synth_probs.empty()) {
+                    accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                } else if (slot.spec_is_replay) {
+                    int n_mismatch = 0;
+                    accepted = server_sample_and_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, n_mismatch);
+                    if (n_mismatch > 0) {
+                        // would have been rejected again by the old code -> checkpoint restore -> replay -> ... (livelock)
+                        SLT_WRN(slot, "replay: %d of %zu committed tokens re-sampled differently (batch-size dependent rounding or an inexact restore); kept the committed tokens\n",
+                                n_mismatch, slot.spec_draft.size());
+                        slot.stats.n_replay_mismatch += n_mismatch;
+                    }
+                } else {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
