@@ -6,6 +6,25 @@
 #include <algorithm>
 #include <cinttypes>
 
+// vocabulary-pruned LM head (d2t): scatter the n_draft_vocab logits of `logits_k` into a full-vocabulary tensor
+// filled with -INF, so every consumer keeps seeing n_vocab logits (same mechanism as eagle3 / dflash). A head that
+// is not the pruned output.weight (e.g. a dedicated nextn shared head) is returned untouched.
+static ggml_tensor * qwen4exp_scatter_pruned_logits(ggml_context * ctx0, const llama_model & model, const ggml_tensor * head_w, ggml_tensor * logits_k) {
+    if (!model.d2t || head_w != model.output) {
+        return logits_k;
+    }
+    const int64_t n_draft_vocab = logits_k->ne[0];
+    const int64_t n_outputs_cur = logits_k->ne[1];
+    const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
+    GGML_ASSERT(model.d2t->type == GGML_TYPE_I64 && model.d2t->ne[0] == n_draft_vocab);
+    ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs_cur), -INFINITY);
+    ggml_tensor * cur  = ggml_set_rows(ctx0, full,
+            ggml_reshape_3d(ctx0, logits_k,  1,             n_draft_vocab, n_outputs_cur),
+            ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
+    return ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs_cur);
+}
+
+
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -182,6 +201,16 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         LLAMA_LOG_INFO("%s: QWEN4EXP head vocab pruned via d2t: %lld of %lld rows\n", __func__, (long long) n_draft_vocab, (long long) n_vocab);
     }
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_draft_vocab }, TENSOR_NOT_REQUIRED);
+    if (d2t) {
+        // the pruned head must be a real output.weight with exactly n_draft_vocab rows: a tied (token_embd) head or a
+        // dedicated nextn shared head would be full-vocabulary and the scatter would assert
+        if (!output || output->ne[1] != n_draft_vocab) {
+            throw std::runtime_error("QWEN4EXP: d2t requires an output.weight with d2t->ne[0] rows (tied or missing head is not supported)");
+        }
+        if (ml.get_tensor_meta(("blk." + std::to_string(n_layer) + ".nextn.shared_head_head.weight").c_str())) {
+            throw std::runtime_error("QWEN4EXP: d2t with a dedicated nextn.shared_head_head is not supported (prune output.weight instead)");
+        }
+    }
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
@@ -511,19 +540,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     res->t_embd = cur;
 
     cur = build_lora_mm(model.output, cur, model.output_s);
-
-    if (model.d2t) {
-        // vocabulary-pruned head: scatter the n_draft_vocab logits into a full-vocab -INF tensor (see eagle3/dflash)
-        const int64_t n_draft_vocab = cur->ne[0];
-        const int64_t n_outputs_cur = cur->ne[1];
-        const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
-        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64 && model.d2t->ne[0] == n_draft_vocab);
-        ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs_cur), -INFINITY);
-        cur = ggml_set_rows(ctx0, full,
-                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs_cur),
-                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
-        cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs_cur);
-    }
+    cur = qwen4exp_scatter_pruned_logits(ctx0, model, model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -716,19 +733,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
 
     cur = build_lora_mm(head_w, cur, head_s);
-
-    if (model.d2t) {
-        // vocabulary-pruned head: scatter the n_draft_vocab logits into a full-vocab -INF tensor (see eagle3/dflash)
-        const int64_t n_draft_vocab = cur->ne[0];
-        const int64_t n_outputs_cur = cur->ne[1];
-        const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
-        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64 && model.d2t->ne[0] == n_draft_vocab);
-        ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs_cur), -INFINITY);
-        cur = ggml_set_rows(ctx0, full,
-                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs_cur),
-                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
-        cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs_cur);
-    }
+    cur = qwen4exp_scatter_pruned_logits(ctx0, model, head_w, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
