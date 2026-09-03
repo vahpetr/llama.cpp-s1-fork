@@ -1020,7 +1020,8 @@ private:
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
     // fold the next draft into the replay batch after a partial acceptance on a checkpointed target - see the
-    // accept phase. spec_fold_drafter is fixed at init; spec_fold_enabled is a runtime switch (always true here).
+    // accept phase. spec_fold_drafter is fixed at init; spec_fold_enabled is a runtime switch (always true here -
+    // the test-only LLAMA_SPEC_FOLD=0 kill switch, if present, overrides it separately).
     spec_fold_drafter_type spec_fold_drafter = FOLD_UNSUPPORTED;
     bool                   spec_fold_enabled = true;
 
@@ -1452,6 +1453,15 @@ private:
 
             if (trace) {
                 SRV_WRN("LLAMA_TRACE = %d\n", trace);
+            }
+        }
+
+        {
+            // test-only kill switch for Task 5B's replay fold (not exported upstream)
+            const char * LLAMA_SPEC_FOLD = getenv("LLAMA_SPEC_FOLD");
+            if (LLAMA_SPEC_FOLD) {
+                spec_fold_enabled = atoi(LLAMA_SPEC_FOLD) != 0;
+                SRV_WRN("LLAMA_SPEC_FOLD = %d\n", (int) spec_fold_enabled);
             }
         }
 
