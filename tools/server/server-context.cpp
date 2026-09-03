@@ -293,6 +293,7 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    size_t spec_n_committed = 0; // number of committed (already-accepted) tokens at the front of spec_draft this round
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -407,6 +408,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_n_committed = 0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -543,6 +545,8 @@ struct server_slot {
         bool add_ok = true;
         if (spec_draft.empty()) {
             // no speculative decoding
+            stats.n_spec_plain_rounds += 1;
+
             i_batch = batch.size();
 
             if (!inp_embd.empty()) {
@@ -554,6 +558,14 @@ struct server_slot {
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                     sampled, n_ctx, prompt.n_tokens(), truncated);
         } else {
+            if (spec_n_committed == 0) {
+                stats.n_spec_verify_rounds += 1;
+            } else if (spec_n_committed == spec_draft.size()) {
+                stats.n_spec_replay_rounds += 1;
+            } else {
+                stats.n_spec_fold_rounds += 1;
+            }
+
             SLT_DBG(*this, "generate_draft: id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
 
@@ -716,6 +728,11 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
+
+            SLT_INF(*this, "rounds: verify %" PRIu64 ", replay %" PRIu64 ", fold %" PRIu64 ", plain %" PRIu64 " (empty drafts %" PRIu64 ", fold rejected %" PRIu64 ")\n",
+                    stats.n_spec_verify_rounds, stats.n_spec_replay_rounds, stats.n_spec_fold_rounds, stats.n_spec_plain_rounds,
+                    stats.n_spec_empty_drafts, stats.n_spec_fold_rejected);
+
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
@@ -3082,6 +3099,10 @@ private:
 
             slot.stats.n_draft_tokens += draft.size();
 
+            if (draft.empty()) {
+                slot.stats.n_spec_empty_drafts += 1;
+            }
+
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
@@ -3976,6 +3997,7 @@ private:
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
+                        slot.spec_n_committed = accepted.size();
                         slot.spec_draft = std::move(accepted);
 
                         const auto & ckpt = slot.spec_ckpt;
@@ -4013,6 +4035,7 @@ private:
                 n_accepted--;
             }
             slot.spec_is_replay = false;
+            slot.spec_n_committed = 0;
 
             slot.stats.update_gen_last();
 
@@ -4177,6 +4200,13 @@ private:
         metrics.n_draft_tokens      += slot.stats.n_draft_tokens;
         metrics.n_draft_accepted    += slot.stats.n_draft_accepted;
         metrics.n_draft_verif_steps += slot.stats.n_draft_verif_steps;
+
+        metrics.n_spec_verify_rounds += slot.stats.n_spec_verify_rounds;
+        metrics.n_spec_replay_rounds += slot.stats.n_spec_replay_rounds;
+        metrics.n_spec_fold_rounds   += slot.stats.n_spec_fold_rounds;
+        metrics.n_spec_plain_rounds  += slot.stats.n_spec_plain_rounds;
+        metrics.n_spec_empty_drafts  += slot.stats.n_spec_empty_drafts;
+        metrics.n_spec_fold_rejected += slot.stats.n_spec_fold_rejected;
 
         auto & dst = metrics.n_accepted_per_pos;
         const auto & src = slot.n_accepted_per_pos;

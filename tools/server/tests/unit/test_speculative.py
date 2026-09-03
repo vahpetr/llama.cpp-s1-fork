@@ -203,3 +203,23 @@ def test_multi_requests_parallel(n_slots: int, n_requests: int):
     for res in results:
         assert res.status_code == 200
         assert match_regex("(wise|kind|owl|answer)+", res.body["content"])
+
+
+def _metric(server, name):
+    body = server.make_request("GET", "/metrics").body
+    line = [l for l in body.splitlines() if l.startswith("llamacpp:" + name + " ")][0]
+    return int(float(line.split(" ")[1]))
+
+def test_metrics_round_counters_kv_target():
+    global server
+    create_server()
+    server.server_metrics = True
+    server.spec_synth_rates = [0.5] * server.spec_draft_n_max   # forces rejections; a KV target never replays
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is", "temperature": 0.0, "n_predict": 64, "cache_prompt": False})
+    assert res.status_code == 200
+    v, r, f, p = (_metric(server, "spec_decode_num_" + k + "_rounds_total") for k in ("verify", "replay", "fold", "plain"))
+    assert r == 0 and f == 0
+    assert _metric(server, "n_decode_total") - 1 == v + r + f + p
+    assert _metric(server, "spec_decode_num_empty_draft_rounds_total") <= p

@@ -1562,6 +1562,30 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        }, {
+            "spec_decode_num_verify_rounds_total",
+            "Speculative: target decodes that verified a fresh draft",
+            (double) metrics.n_spec_verify_rounds
+        }, {
+            "spec_decode_num_replay_rounds_total",
+            "Speculative: target decodes that replayed committed tokens after a partial acceptance on a checkpointed context",
+            (double) metrics.n_spec_replay_rounds
+        }, {
+            "spec_decode_num_fold_rounds_total",
+            "Speculative: target decodes that replayed committed tokens and verified a fresh draft in one batch",
+            (double) metrics.n_spec_fold_rounds
+        }, {
+            "spec_decode_num_plain_rounds_total",
+            "Speculative: target decodes with no draft tokens",
+            (double) metrics.n_spec_plain_rounds
+        }, {
+            "spec_decode_num_empty_draft_rounds_total",
+            "Speculative: drafter asked and returned nothing",
+            (double) metrics.n_spec_empty_drafts
+        }, {
+            "spec_decode_num_fold_rejected_total",
+            "Speculative: replays following a rejection inside a folded round",
+            (double) metrics.n_spec_fold_rejected
         },
     };
 

@@ -361,6 +361,14 @@ struct server_slot_stats {
     uint64_t n_draft_verif_steps = 0;
     uint64_t n_replay_mismatch  = 0; // committed tokens the replay after a checkpoint restore re-sampled differently (kept anyway)
 
+    // speculative round kinds: every generation decode of a slot is exactly one of these (counted where the batch is built)
+    uint64_t n_spec_verify_rounds = 0; // a fresh draft is verified in this batch
+    uint64_t n_spec_replay_rounds = 0; // only committed tokens in the batch (restore + replay after a partial acceptance)
+    uint64_t n_spec_fold_rounds   = 0; // committed tokens + a fresh draft (replay folded with the next verification)
+    uint64_t n_spec_plain_rounds  = 0; // no draft tokens in the batch (empty draft, or no draft attempted)
+    uint64_t n_spec_empty_drafts  = 0; // drafter was asked and returned nothing (subset of plain)
+    uint64_t n_spec_fold_rejected = 0; // replays that follow a rejection inside a folded round
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;
@@ -479,6 +487,14 @@ struct server_metrics {
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
+
+    // speculative round kinds (see server_slot_stats for the disjointness invariant)
+    uint64_t n_spec_verify_rounds = 0;
+    uint64_t n_spec_replay_rounds = 0;
+    uint64_t n_spec_fold_rounds   = 0;
+    uint64_t n_spec_plain_rounds  = 0;
+    uint64_t n_spec_empty_drafts  = 0;
+    uint64_t n_spec_fold_rejected = 0;
 
     void init() {
         t_start = ggml_time_us();
