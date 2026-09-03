@@ -38,6 +38,16 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// Which per-drafter recipe (if any) can fold the next draft into a replay batch after a partial acceptance on a
+// checkpointed (recurrent) target - see the fold logic around handle_last_sampled_token() / the accept phase.
+// Computed once at server init from the active speculative implementation, not per-round.
+enum spec_fold_drafter_type {
+    FOLD_NONE_NEEDED, // no draft context at all (synthetic acceptance / ngram drafters) - nothing to continue
+    FOLD_MTP,         // draft-mtp with an attention-layer (KV) draft memory: keep the committed prefix in the draft KV
+    FOLD_SIMPLE,      // draft-simple: catch up the draft state with a decode of the committed prefix
+    FOLD_UNSUPPORTED, // eagle3 / dflash / dspark, or an RS-limited draft memory: not folded (plain replay only)
+};
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -325,6 +335,9 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     size_t spec_n_committed = 0; // number of committed (already-accepted) tokens at the front of spec_draft this round
+    size_t spec_n_target_committed = 0; // target-generated tokens inside that prefix (1 after a plain restore, 2 after a fold-tail rejection)
+    bool   spec_folded = false;         // a fold was attempted on the current checkpoint (at most once per checkpoint)
+    llama_tokens spec_fold_draft;       // drafter output for a folded round; merged into spec_draft once drafting completes
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -440,6 +453,9 @@ struct server_slot {
 
         spec_is_replay = false;
         spec_n_committed = 0;
+        spec_n_target_committed = 0;
+        spec_folded = false;
+        spec_fold_draft.clear();
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -596,6 +612,11 @@ struct server_slot {
             } else {
                 stats.n_spec_fold_rounds += 1;
             }
+
+            // output-capacity invariant: this batch adds 1 (sampled) + spec_draft.size() rows for this slot;
+            // a folded round must stay within the same 1 + n_max budget as a fresh verify round (see the
+            // "Batch budget" note by the fold logic in the accept phase / drafting phase below).
+            GGML_ASSERT((int) spec_draft.size() + 1 <= 1 + common_speculative_n_max(spec));
 
             SLT_DBG(*this, "generate_draft: id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
@@ -998,6 +1019,11 @@ private:
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
+    // fold the next draft into the replay batch after a partial acceptance on a checkpointed target - see the
+    // accept phase. spec_fold_drafter is fixed at init; spec_fold_enabled is a runtime switch (always true here).
+    spec_fold_drafter_type spec_fold_drafter = FOLD_UNSUPPORTED;
+    bool                   spec_fold_enabled = true;
+
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
@@ -1357,6 +1383,25 @@ private:
 
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+        }
+
+        // decide once which fold recipe (if any) this server's drafter supports - see spec_fold_drafter_type.
+        // note: assumes a single active drafter type (true for draft-mtp in production and draft-simple in the
+        // recurrent test suite); a chained multi-drafter config would need this decided per round instead.
+        if (ctx_dft == nullptr) {
+            spec_fold_drafter = FOLD_NONE_NEEDED;
+        } else {
+            const auto & spec_types = params_base.speculative.types;
+            const bool is_mtp    = std::find(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP)    != spec_types.end();
+            const bool is_simple = std::find(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) != spec_types.end();
+
+            if (is_mtp && ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                spec_fold_drafter = FOLD_MTP;
+            } else if (is_simple) {
+                spec_fold_drafter = FOLD_SIMPLE;
+            } else {
+                spec_fold_drafter = FOLD_UNSUPPORTED;
+            }
         }
 
         if (spec) {
@@ -3082,7 +3127,35 @@ private:
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
 
-                    if (!slot.spec_draft.empty()) {
+                    if (slot.spec_folded && slot.spec_draft.size() == slot.spec_n_committed) {
+                        // a fold was decided on the checkpoint restore above (spec_draft is still exactly the
+                        // committed prefix [d1..dk, t_new(, d'1..d'j, t2)]): draft the fold's own tail from
+                        // there, using the drafter's post-restore continuation state (see the accept phase /
+                        // common_speculative_continue_from). Collected into spec_fold_draft, not spec_draft
+                        // directly, so stats below can count only the newly drafted tokens.
+                        GGML_ASSERT(slot.spec_i_batch.empty());
+
+                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        slot.spec_prompt.push_back(slot.sampled);
+                        slot.spec_prompt.insert(slot.spec_prompt.end(), slot.spec_draft.begin(), slot.spec_draft.end() - 1);
+                        slot.spec_fold_draft.clear();
+
+                        // room for the fold's own tail within the 1 + n_max output-row budget already spent on
+                        // the committed prefix (n_draft_max here is freshly recomputed post-restore, so it is
+                        // never smaller than the accept phase's conservative pre-restore estimate).
+                        const int n_fold_max = std::max(0, std::min(n_draft_max, common_speculative_n_max(spec.get())) - (int) slot.spec_n_committed);
+
+                        common_speculative_get_draft_params(spec.get(), slot.id) = {
+                            /* .drafting = */ true,
+                            /* .n_max    = */ n_fold_max,
+                            /* .n_past   = */ slot.prompt.n_tokens() + (int) slot.spec_n_committed,
+                            /* .id_last  = */ slot.spec_draft.back(),          // t_new (or t2 after a fold-tail rejection)
+                            /* .prompt   = */ &slot.spec_prompt,
+                            /* .result   = */ &slot.spec_fold_draft,
+                        };
+
+                        drafting.push_back(&slot);
+                    } else if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
@@ -3127,6 +3200,40 @@ private:
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
+
+            if (slot.spec_folded) {
+                // a folded round: the target is already at the checkpoint (restored in the accept phase, not
+                // refreshed here - the folded batch will re-ingest the committed prefix itself) - just fold the
+                // freshly drafted tail into spec_draft and reset the draft context for the upcoming re-ingest.
+                auto & fold = slot.spec_fold_draft;
+
+                if (ctx_dft) {
+                    if (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                        ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                    }
+
+                    // drop the committed prefix + whatever the fold drafter left behind: process() on the
+                    // folded target batch (handle_last_sampled_token / verification) rebuilds it from scratch,
+                    // exactly once, with no duplicate positions.
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                        GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                    }
+                }
+
+                if (fold.empty()) {
+                    // asked for a fold draft, got nothing - the round is a plain replay after all, and the
+                    // batch-build site (handle_last_sampled_token) will count it as such (spec_draft.size() ==
+                    // spec_n_committed again).
+                    slot.stats.n_spec_empty_drafts += 1;
+                    slot.spec_folded = false;
+                } else {
+                    slot.stats.n_draft_tokens += fold.size();
+                    slot.spec_draft.insert(slot.spec_draft.end(), fold.begin(), fold.end());
+                }
+                fold.clear();
+
+                return;
+            }
 
             slot.stats.n_draft_tokens += draft.size();
 
@@ -4019,37 +4126,101 @@ private:
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
 
                 // check for partial draft acceptance
-                if (n_rollback > 0) {
-                    if (use_ckpt_tgt) {
-                        if (trace > 0) {
-                            SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
+                if (n_rollback > 0 && use_ckpt_tgt) {
+                    const auto & ckpt = slot.spec_ckpt;
+
+                    const size_t n_committed = accepted.size(); // committed prefix: k accepted draft tokens + the target's token(s)
+
+                    // room for the fold's own tail within the 1 + n_max output-row budget already spent on the
+                    // committed prefix. slot.get_n_draft_max() here still sees the PRE-restore prompt (the
+                    // truncation below hasn't run yet), so this is a conservative (never too large) estimate -
+                    // the drafting phase recomputes the authoritative n_max after the restore.
+                    const int n_fold_room = std::max(0, std::min(slot.get_n_draft_max(), common_speculative_n_max(spec.get())) - (int) n_committed);
+                    const bool can_fold   = spec_fold_enabled && !slot.spec_folded &&
+                                             spec_fold_drafter != FOLD_UNSUPPORTED && n_fold_room > 0;
+                    const bool after_fold = slot.spec_folded; // this rejection happened inside a folded tail
+
+                    if (trace > 0) {
+                        SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint%s)\n",
+                                accepted.size() - 1, slot.spec_draft.size(), can_fold ? ", fold" : "");
+                    }
+
+                    SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+
+                    ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+
+                    if (slot.ctx_dft) {
+                        ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                    }
+
+                    if (can_fold) {
+                        const llama_pos pos0 = ckpt.pos_max + 1; // position of `sampled`
+
+                        // the target is restored to the checkpoint only (no committed prefix kept) - the
+                        // folded batch re-ingests [sampled, d1..dk, t_new, d'1..] from scratch, exactly once
+                        if (!llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, pos0, -1)) {
+                            GGML_ABORT("failed to remove sequence %d\n", slot.id);
                         }
 
-                        // partial acceptance is not supported by the context -> truncate the draft and restore the state
-                        slot.spec_is_replay = true;
-                        slot.spec_n_committed = accepted.size();
-                        slot.spec_draft = std::move(accepted);
+                        switch (spec_fold_drafter) {
+                            case FOLD_MTP:
+                                // keep [sampled, d1..dk] in the draft KV (already ingested by process() during
+                                // verification, with the target's causal hidden rows) - drop only the rejected tail
+                                if (!llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, pos0 + (llama_pos) n_committed, -1)) {
+                                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                                }
+                                // pending_h = h(d_k), no statistics recorded, no other implementation touched
+                                common_speculative_continue_from(spec.get(), slot.id, (uint16_t) (n_committed - 1));
+                                break;
+                            case FOLD_SIMPLE: {
+                                // draft state is at the checkpoint already (recurrent: load_dft above did the
+                                // full restore; KV: trim it here) - decode the committed prefix to catch up
+                                if (ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                                    !llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, pos0, -1)) {
+                                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                                }
 
-                        const auto & ckpt = slot.spec_ckpt;
-
-                        SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
-
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-
-                        if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                llama_batch catch_up = llama_batch_init((int32_t) n_committed, 0, 1);
+                                common_batch_add(catch_up, slot.sampled, pos0, { slot.id }, false);
+                                for (size_t i = 0; i + 1 < n_committed; ++i) {
+                                    common_batch_add(catch_up, accepted[i], pos0 + 1 + (llama_pos) i, { slot.id }, false);
+                                }
+                                const bool ok = common_speculative_process(spec.get(), catch_up);
+                                llama_batch_free(catch_up);
+                                if (!ok) {
+                                    GGML_ABORT("draft catch-up failed for slot %d\n", slot.id);
+                                }
+                                break;
+                            }
+                            default:
+                                break; // FOLD_NONE_NEEDED: no draft context, nothing to continue
                         }
 
+                        slot.spec_folded             = true;
+                        slot.spec_n_target_committed = 1; // t_new
+                    } else {
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
-                        slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        slot.spec_folded             = false;              // a plain replay re-anchors the checkpoint
+                        slot.spec_n_target_committed = after_fold ? 2 : 1; // t_new (+ t2 if the fold's tail was rejected)
 
-                        // the sampler is deliberately NOT rolled back: the tokens accepted just above are the
-                        // ones the replay round will emit, so the live (post-verification) sampler already has
-                        // the state that belongs after them - see server_sample_and_accept_replay()
-
-                        return;
+                        if (after_fold) {
+                            slot.stats.n_spec_fold_rejected += 1;
+                        }
                     }
+
+                    // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                    slot.spec_is_replay   = true;
+                    slot.spec_n_committed = n_committed;
+                    slot.spec_draft       = std::move(accepted); // [d1..dk, t_new(, d'1..d'j, t2)]; a fold appends d''
+
+                    slot.prompt.tokens.keep_first(ckpt.n_tokens);
+
+                    // the sampler is deliberately NOT rolled back: the tokens accepted just above are the
+                    // ones the replay round will emit, so the live (post-verification) sampler already has
+                    // the state that belongs after them - see server_sample_and_accept_replay()
+
+                    return;
                 }
 
                 if (trace > 0) {
@@ -4063,12 +4234,13 @@ private:
 
             const auto ids = std::move(slot.spec_draft);
 
-            size_t n_accepted = ids.size() - 1;
-            if (slot.spec_is_replay && n_accepted > 0) {
-                n_accepted--;
-            }
-            slot.spec_is_replay = false;
-            slot.spec_n_committed = 0;
+            size_t n_accepted = ids.size() - 1;                                    // everything but the freshly sampled token...
+            n_accepted -= std::min(n_accepted, slot.spec_n_target_committed);       // ...minus the committed target token(s)
+            slot.spec_is_replay          = false;
+            slot.spec_n_committed        = 0;
+            slot.spec_n_target_committed = 0;
+            slot.spec_folded             = false;
+            slot.spec_fold_draft.clear();
 
             slot.stats.update_gen_last();
 

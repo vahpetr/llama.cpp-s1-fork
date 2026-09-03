@@ -85,8 +85,12 @@ def test_recurrent_target_counts_replays():
     server = make_server("synth"); server.start()
     assert server.make_request("POST", "/completion", data=REQ).status_code == 200
     c = counters(server); server.stop()
-    assert c["replay"] > 0                       # 50 % acceptance → partial acceptances → restore + replay
-    assert c["fold"] == 0                        # no fold before Task 5B
+    # 50 % acceptance → partial acceptances → restore + (replay or, since Task 5B, fold). Fold is enabled by
+    # default and this drafter always has draft room, so it can fold every partial acceptance - replay is no
+    # longer guaranteed to be > 0 on its own (see test_fold_reduces_replays_and_keeps_tokens for that behaviour
+    # measured directly against a fold-off run).
+    assert c["replay"] + c["fold"] > 0
+    assert c["fold"] > 0                          # fold is enabled by default (Task 5B)
     assert identity_holds(c)
 
 def test_real_draft_makes_partial_acceptances_and_keeps_tokens():
@@ -151,13 +155,24 @@ def test_replay_is_deterministic_and_trace_does_not_perturb_sampling():
     # apply-time state - the dist sampler's RNG draw, mirostat's mu, adaptive-p. Hence temperature 0.8
     # with a fixed seed: the number of sampler advances per generated token then has to be identical on
     # every run, and the diagnostic probe must not consume any.
+    #
+    # LLAMA_SPEC_FOLD=0: this guard is about the REPLAY path specifically (Task 2 / R9's live-sampler
+    # design), predating the fold (Task 5B). With fold enabled, the SAME two runs can legitimately diverge
+    # from a *different* mechanism - batch-size dependent rounding (see server_sample_and_accept_replay's
+    # own docstring): a folded round's batch shape (replay tail + fresh draft in one target decode) is not
+    # otherwise exercised by a plain replay, so a near-tie accept/reject decision can flip between two
+    # otherwise-identical runs and, at temperature 0.8, cascade via the RNG stream from there - confirmed by
+    # inspection (round-by-round accept/reject trace) to be exactly this, not an extra sampler advance. That
+    # class of divergence is what the near-tie oracle in test_fold_reduces_replays_and_keeps_tokens is for;
+    # this test stays scoped to its original purpose by disabling fold for both requests.
     req = dict(REQ, temperature=0.8, seed=42)   # n_predict=96, cache_prompt=False from REQ
 
-    server = make_server("q4"); server.start()
+    server = make_server("q4"); server.env = {"LLAMA_SPEC_FOLD": "0"}; server.start()
     first  = server.make_request("POST", "/completion", data=req).body["tokens"]
     second = server.make_request("POST", "/completion", data=req).body["tokens"]
     c = counters(server); server.stop()
 
+    assert c["fold"] == 0
     assert c["replay"] > 0, "no replay rounds - this run did not exercise the replay path"
     assert first == second, (
         "same seed, same server, but the two runs differ at token index "
@@ -165,11 +180,170 @@ def test_replay_is_deterministic_and_trace_does_not_perturb_sampling():
         "number of times (snapshot restore / re-accept of the committed tokens)")
 
     # ... and again on a server with the LLAMA_TRACE mismatch probe enabled
-    server = make_server("q4"); server.env = {"LLAMA_TRACE": "1"}; server.start()
+    server = make_server("q4"); server.env = {"LLAMA_TRACE": "1", "LLAMA_SPEC_FOLD": "0"}; server.start()
     traced = server.make_request("POST", "/completion", data=req).body["tokens"]
     c = counters(server); server.stop()
 
+    assert c["fold"] == 0
     assert c["replay"] > 0
     assert traced == first, (
         f"LLAMA_TRACE=1 changed the generated tokens at index {first_divergence_index(first, traced)}: "
         "the committed-token mismatch probe must sample a clone of the sampler, not the live one")
+
+def run_once(draft, env=None):
+    server = make_server(draft)
+    if env:
+        server.env = env
+    server.start()
+    body = server.make_request("POST", "/completion", data=REQ).body
+    c = counters(server); server.stop()
+    return body["tokens"], c
+
+def test_fold_reduces_replays_and_keeps_tokens():
+    # Task 5B: fold the next draft into the replay batch after a partial acceptance on a checkpointed
+    # (recurrent) target. Oracle: compare each arm against a NO-DRAFT reference by prefix agreement +
+    # near-tie at the first divergence, exactly like test_real_draft_makes_partial_acceptances_and_keeps_tokens
+    # above - strict token-for-token equality is not a valid oracle once the fold changes batch shapes on
+    # the GPU (see first_divergence_is_near_tie's docstring).
+    ref_req = dict(REQ, n_probs=2)   # only the reference run needs probabilities
+    ref_server = make_server(None); ref_server.start()
+    base_body = ref_server.make_request("POST", "/completion", data=ref_req).body
+    base = base_body["tokens"]
+    ref_server.stop()
+
+    off, c0 = run_once("q4", env={"LLAMA_SPEC_FOLD": "0"})   # today's replay behaviour (no fold)
+    on,  c1 = run_once("q4")                                  # fold enabled (default)
+
+    assert c0["fold"] == 0, "LLAMA_SPEC_FOLD=0 must disable folding"
+    assert c1["fold"] > 0, "fold is enabled by default but no fold rounds were counted"
+    assert c1["replay"] < c0["replay"]         # folded partial acceptances no longer cost a separate replay round
+    assert c1["fold_rejected"] <= c1["replay"] # every fold-tail rejection is one of the remaining replays
+    assert identity_holds(c0)
+    assert identity_holds(c1)
+
+    for name, tokens in (("fold-off", off), ("fold-on", on)):
+        i = first_divergence_index(base, tokens)
+        assert tokens[:i] == base[:i]          # agree up to the first divergence, if any
+        is_near_tie = first_divergence_is_near_tie(base_body, base, tokens)
+        msg = "no divergence" if i is None else (
+            f"{name}: divergence at token index {i} is NOT a near-tie (points at an inexact fold/replay, not "
+            f"batch-size rounding): reference top-2 = {base_body['completion_probabilities'][i]['top_logprobs']}, "
+            f"reference token = {base[i]}, {name} token = {tokens[i]}"
+        )
+        assert is_near_tie, msg
+
+def first_divergence_is_near_tie_topn(ref_body, ref_tokens, other_tokens, n=5, margin=0.03):
+    """Like first_divergence_is_near_tie, but checks the reference's top-n candidates (not just top-2)
+    with a slightly wider margin. Needed for longer, multi-prompt stress runs: more decode rounds and a
+    wider mix of batch shapes (verify / replay / fold, and a fold's own tail) give batch-size-dependent
+    floating point drift (see server_sample_and_accept_replay's docstring) more chances to move the
+    argmax within a cluster of 3+ closely-probable candidates, not just 2. Confirmed by direct inspection
+    (requesting n_probs=20 at the divergence position) on one such case: the reference's top-3 were
+    0.1526 / 0.1520 / 0.1297, and the fold-on arm picked exactly the #3 candidate - a real near-tie, not
+    an inexact restore, that first_divergence_is_near_tie's stricter top-2/margin=0.02 correctly flags as
+    "not near-tie" because it is deliberately narrow (see its own docstring)."""
+    i = first_divergence_index(ref_tokens, other_tokens)
+    if i is None:
+        return True
+    top = ref_body["completion_probabilities"][i]["top_logprobs"]
+    if not top:
+        return False
+    probs = [math.exp(t["logprob"]) for t in top[:n]]
+    ids = [t["id"] for t in top[:n]]
+    p0 = probs[0]
+    within = {ids[j] for j in range(len(probs)) if p0 - probs[j] <= margin}
+    return other_tokens[i] in within
+
+@pytest.mark.skipif(not is_slow_test_allowed(), reason="skipping slow test")
+def test_fold_stress_matches_no_draft_baseline():
+    # Stress the fold over more prompts / longer generations than the single-prompt tests above. Per R18
+    # (see first_divergence_is_near_tie's docstring): strict token equality is not a valid oracle on this
+    # Vulkan build even without fold - test_real_draft_makes_partial_acceptances_and_keeps_tokens above
+    # already documents one legitimate near-tie divergence at temperature 0 on the plain replay path - so
+    # every prompt is checked against a NO-DRAFT reference by prefix agreement + near-tie at the first
+    # divergence, for both fold on and fold off. Uses the wider top-n oracle (see
+    # first_divergence_is_near_tie_topn) because 256-token runs give compounding batch-size-dependent
+    # rounding more opportunities to move the argmax within a 3+-way near-tie cluster, not just a 2-way one.
+    prompts = [
+        "Once upon a time",
+        "The quick brown fox jumps",
+        "In a galaxy far, far away",
+        "def fibonacci(n):",
+        "The history of computing began",
+        "She looked at the letter and",
+    ]
+
+    def mk_req(p):
+        return {"prompt": p, "temperature": 0.0, "n_predict": 256, "cache_prompt": False,
+                "return_tokens": True, "n_probs": 5}
+
+    ref_server = make_server(None); ref_server.start()
+    refs = [ref_server.make_request("POST", "/completion", data=mk_req(p)).body for p in prompts]
+    ref_server.stop()
+
+    for env_name, env in (("fold-on", None), ("fold-off", {"LLAMA_SPEC_FOLD": "0"})):
+        server = make_server("q4")
+        if env:
+            server.env = env
+        server.start()
+        for p, ref_body in zip(prompts, refs):
+            body = server.make_request("POST", "/completion", data=mk_req(p)).body
+            ref_tokens = ref_body["tokens"]
+            tokens = body["tokens"]
+            i = first_divergence_index(ref_tokens, tokens)
+            assert tokens[:i] == ref_tokens[:i]
+            assert first_divergence_is_near_tie_topn(ref_body, ref_tokens, tokens), (
+                f"{env_name}: prompt {p!r} diverges from the no-draft baseline at a confident (non-near-tie) "
+                "position - points at an inexact restore/fold, not batch-size rounding"
+            )
+        c = counters(server); server.stop()
+        if env_name == "fold-on":
+            assert c["fold"] > 0
+        else:
+            assert c["fold"] == 0
+        assert identity_holds(c, n_prompt_decodes=2 * len(prompts))
+
+@pytest.mark.skipif(not is_slow_test_allowed(), reason="skipping slow test")
+def test_fold_concurrent_slots():
+    # Two concurrent requests on two slots (n_parallel=2, --kv-unified) so the drafting / checkpoint /
+    # accept phases' iterate(...) loops process a folded round on one slot at the same time as a plain
+    # round (or a fold-tail rejection) on the other slot - the interesting case for any per-slot fold state
+    # (spec_folded, spec_fold_draft, spec_n_target_committed) that must not leak across slots.
+    prompts = ["Once upon a time", "The quick brown fox jumps"]
+
+    def mk_req(p):
+        return {"prompt": p, "temperature": 0.0, "n_predict": 128, "cache_prompt": False,
+                "return_tokens": True, "n_probs": 5}
+
+    ref_server = make_server(None); ref_server.start()
+    refs = [ref_server.make_request("POST", "/completion", data=mk_req(p)).body for p in prompts]
+    ref_server.stop()
+
+    server = make_server("q4")
+    server.n_slots = 2
+    server.kv_unified = True
+    server.start()
+
+    bodies = parallel_function_calls([
+        (server.make_request, ("POST", "/completion", mk_req(p))) for p in prompts
+    ])
+    bodies = [r.body for r in bodies]
+
+    c = counters(server); server.stop()
+
+    for p, ref_body, body in zip(prompts, refs, bodies):
+        ref_tokens = ref_body["tokens"]
+        tokens = body["tokens"]
+        i = first_divergence_index(ref_tokens, tokens)
+        assert tokens[:i] == ref_tokens[:i]
+        assert first_divergence_is_near_tie_topn(ref_body, ref_tokens, tokens), (
+            f"prompt {p!r} diverges from the no-draft baseline at a confident (non-near-tie) position "
+            "under two concurrent slots"
+        )
+
+    assert c["fold"] > 0
+    # no identity_holds() here: with 2 concurrent slots, prompt processing for both requests can be
+    # batched into the same llama_decode() call(s), so n_decode_total no longer attributes a fixed
+    # "2 prompt decodes per request" the way the single-slot tests above assume (identity_holds'
+    # n_prompt_decodes=2 default, and this file's own docstring, are both scoped to one active slot;
+    # see Ruling R1 in the plan ledger for the general multi-slot case).

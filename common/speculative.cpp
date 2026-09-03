@@ -171,6 +171,12 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // position the drafter's per-seq carryover state to right after the first n_accepted draft tokens of the
+    // last verified batch, WITHOUT recording statistics or notifying other implementations (used by the server
+    // to fold a replay round with the next draft on a checkpoint restore, common_speculative_continue_from()).
+    // default: no persistent per-seq draft state to carry over.
+    virtual void continue_from(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) {}
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -1715,7 +1721,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                // dp.n_max overrides (tightens) params.n_max for a folded round, where the caller must keep the
+                // folded batch within the 1 + n_max output-row budget already spent on the committed prefix -
+                // see the "Batch budget" note by the fold logic in tools/server/server-context.cpp.
+                const int32_t n_max_eff = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
+                if (n_max_eff <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1781,6 +1791,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    void continue_from(llama_seq_id seq_id, uint16_t n_accepted) override {
+        // identical to accept(): position pending_h at h(d_{n_accepted}) so the next draft() call continues
+        // from there, but without going through common_speculative_accept (no stats, no is_other calls) -
+        // used to fold a replay round with the next draft after a checkpoint restore.
+        accept(seq_id, n_accepted, false);
     }
 };
 
@@ -2930,6 +2947,16 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
+}
+
+void common_speculative_continue_from(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    common_speculative_impl * impl = spec->impl_last[seq_id];
+
+    if (impl == nullptr) {
+        return;
+    }
+
+    impl->continue_from(seq_id, n_accepted);
 }
 
 // TODO: support the case of more than one speculative implementations having a state
