@@ -66,27 +66,33 @@ static std::vector<llama_token> server_sample_and_accept_replay(
         llama_context * ctx,
         const std::vector<int> & idxs,
         const llama_tokens & draft,
+        size_t n_committed,       // leading tokens already committed in the context: accept unconditionally
+        bool probe_mismatch,      // LLAMA_TRACE only: re-sample the committed tokens to count rounding flips
         int & n_mismatch) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(n_committed <= draft.size());
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
-
     n_mismatch = 0;
 
-    for (size_t i = 0; i < draft.size(); i++) {
-        const llama_token id = common_sampler_sample(smpl, ctx, idxs[i]);
-        if (id != draft[i]) {
+    for (size_t i = 0; i < n_committed; i++) {
+        if (probe_mismatch && common_sampler_sample(smpl, ctx, idxs[i]) != draft[i]) {
             n_mismatch++;
         }
-
         common_sampler_accept(smpl, draft[i], true);
         result.push_back(draft[i]);
     }
 
-    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
-    common_sampler_accept(smpl, id, true);
-    result.push_back(id);
+    // verify the (optional) uncommitted tail exactly like common_sampler_sample_and_accept_n
+    for (size_t i = n_committed; i < idxs.size(); i++) {
+        const llama_token id = common_sampler_sample(smpl, ctx, idxs[i]);
+        common_sampler_accept(smpl, id, true);
+        result.push_back(id);
+        if (i < draft.size() && id != draft[i]) {
+            break;
+        }
+    }
 
     return result;
 }
@@ -3957,7 +3963,8 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                const bool may_rollback = slot.spec_n_committed < slot.spec_draft.size();   // an unverified tail exists
+                common_sampler_ptr smpl_save(may_rollback ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
@@ -3968,7 +3975,8 @@ private:
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 } else if (slot.spec_is_replay) {
                     int n_mismatch = 0;
-                    accepted = server_sample_and_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, n_mismatch);
+                    accepted = server_sample_and_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            slot.spec_n_committed, trace > 0, n_mismatch);
                     if (n_mismatch > 0) {
                         // would have been rejected again by the old code -> checkpoint restore -> replay -> ... (livelock)
                         SLT_WRN(slot, "replay: %d of %zu committed tokens re-sampled differently (batch-size dependent rounding or an inexact restore); kept the committed tokens\n",
@@ -4013,6 +4021,7 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        GGML_ASSERT(smpl_save && "a round with an unverified tail always has a sampler snapshot");
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
                         return;
