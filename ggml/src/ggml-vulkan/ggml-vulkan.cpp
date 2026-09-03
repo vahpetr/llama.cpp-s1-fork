@@ -10919,7 +10919,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    static const bool fa_no_gqa = getenv("GGML_VK_FA_NO_GQA") != nullptr;
+    if (!fa_no_gqa && N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
@@ -11024,11 +11025,23 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         }
     }
 
+    static const bool fa_no_split_k = getenv("GGML_VK_FA_NO_SPLIT_K") != nullptr;
+    if (fa_no_split_k) {
+        split_k = 1;
+    }
+
     if (split_k > 1) {
         // Try to evenly split KV into split_k chunks, but it needs to be a multiple
         // of "align", so recompute split_k based on that.
         split_kv = ROUNDUP_POW2(std::max(1u, KV / split_k), alignment);
         split_k = CEIL_DIV(KV, split_kv);
+    }
+
+    static const bool fa_split_k_log = getenv("GGML_VK_FA_SPLIT_K_LOG") != nullptr;
+    if (fa_split_k_log) {
+        fprintf(stderr, "FA: neq1=%u N=%u gqa=%u KV=%u Br=%u Bc=%u align=%u wg=(%u,%u,%u) split_k=%u split_kv=%u\n",
+                (uint32_t) neq1, N, gqa_ratio, KV, Br, Bc, alignment,
+                workgroups_x, workgroups_y, workgroups_z, split_k, split_kv);
     }
 
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
