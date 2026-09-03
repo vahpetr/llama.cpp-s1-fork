@@ -1,4 +1,4 @@
-import os, pytest
+import math, os, pytest
 from utils import *
 
 LFM2_Q8 = "/models/_test/LFM2-350M-Q8_0.gguf"
@@ -44,6 +44,43 @@ def identity_holds(c, n_prompt_decodes=2):
     # KV-cache target (see test_speculative.py::test_metrics_round_counters_kv_target).
     return c["decode"] - n_prompt_decodes == c["verify"] + c["replay"] + c["fold"] + c["plain"]
 
+def first_divergence_index(a, b):
+    """Index of the first position where token sequences a and b differ, or None if one is a
+    prefix of the other (including the two being equal)."""
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return i
+    return None
+
+def first_divergence_is_near_tie(ref_body, ref_tokens, other_tokens, margin=0.02):
+    """Correctness oracle for comparing a drafted run's tokens against an undrafted reference run
+    on a checkpointed (recurrent) target. The two runs feed the same generated position through
+    differently-shaped batches (the reference always decodes 1 token at a time; a drafted run
+    verifies up to n_draft_max+1 at once), so their raw softmax results for that position are not
+    guaranteed bit-identical even at temperature 0 — this is the "batch-size dependent rounding"
+    case server-context.cpp's n_replay_mismatch warning (~3973-3974) already names, distinct from
+    "an inexact restore" (a real correctness bug in the checkpoint-restore mechanism this ladder is
+    built to optimize). The two causes look identical from reproducibility/inspection alone; this
+    function tells them apart by measurement.
+
+    ref_body must be the reference (undrafted) run's response requested with n_probs>=2, so
+    ref_body["completion_probabilities"][i]["top_logprobs"] holds the raw (pre-sampling-chain,
+    i.e. before temperature/greedy collapse) top-2 probabilities at each generated position.
+
+    Finds the first index where ref_tokens and other_tokens differ; returns True if there is none.
+    Otherwise returns True only if the reference run's top-2 probabilities at that position differ
+    by at most `margin` AND other_tokens' token at that position is one of those top-2 (a
+    legitimate near-tie flip). Returns False for a confident-position divergence — that would
+    indicate an inexact restore, not rounding."""
+    i = first_divergence_index(ref_tokens, other_tokens)
+    if i is None:
+        return True
+    top = ref_body["completion_probabilities"][i]["top_logprobs"]
+    if len(top) < 2:
+        return False
+    p0, p1 = math.exp(top[0]["logprob"]), math.exp(top[1]["logprob"])
+    return abs(p0 - p1) <= margin and other_tokens[i] in (top[0]["id"], top[1]["id"])
+
 def test_recurrent_target_counts_replays():
     server = make_server("synth"); server.start()
     assert server.make_request("POST", "/completion", data=REQ).status_code == 200
@@ -53,25 +90,42 @@ def test_recurrent_target_counts_replays():
     assert identity_holds(c)
 
 def test_real_draft_makes_partial_acceptances_and_keeps_tokens():
-    # n_predict=16 here (not the shared REQ's 96): on this Vulkan build, the Q4_0-drafted run and the
-    # undrafted run deterministically diverge starting at token index 20 (verified reproducible, same
-    # token pair every run) — a batch-size-dependent floating-point rounding difference between the
-    # 1-token decode the undrafted run does and the up-to-5-token verify batch the drafted run does for
-    # the same position (matches the "batch-size dependent rounding" case server-context.cpp's
-    # n_replay_mismatch warning already documents; server-context.cpp diff for Task 1 touches no
-    # sampling/accept/restore code, only adds counters, so this is pre-existing, not a regression).
-    # n_predict=16 mirrors test_speculative.py::test_with_and_without_draft's own equality check and
-    # stays well clear of the divergence point while still exercising replay (replay=2 at this length).
-    req = dict(REQ, n_predict=16)
+    # On this Vulkan build, the Q4_0-drafted run and the undrafted reference run deterministically
+    # diverge starting at one token index (verified reproducible: same token pair every run). Per
+    # server-context.cpp's own n_replay_mismatch warning (~3973-3974), a divergence like this has
+    # two possible causes — "batch-size dependent rounding OR an inexact restore" — and only the
+    # second would be a real correctness bug in the checkpoint-restore mechanism this whole ladder
+    # optimizes. first_divergence_is_near_tie() tells them apart by measurement rather than by
+    # inspection: it uses the reference run's top-2 raw probabilities (n_probs=2) at the first
+    # divergence to check whether the reference was itself nearly undecided there (rounding) or
+    # confident (restore bug). Measured on this build: divergence at token index 20, reference
+    # top-2 probabilities 0.44999 vs 0.44951 (margin ~0.00048, i.e. a near-tie), and the drafted
+    # run's token is exactly the reference's runner-up — a legitimate near-tie flip.
+    ref_req = dict(REQ, n_probs=2)   # only the reference run needs probabilities
     server = make_server(None); server.start()
-    base = server.make_request("POST", "/completion", data=req).body["tokens"]; server.stop()
+    base_body = server.make_request("POST", "/completion", data=ref_req).body
+    base = base_body["tokens"]
+    server.stop()
+
     server = make_server("q4"); server.start()
-    res = server.make_request("POST", "/completion", data=req).body
+    res = server.make_request("POST", "/completion", data=REQ).body
     c = counters(server); server.stop()
+    on = res["tokens"]
+
     assert res["timings"]["draft_n"] > 0
     assert c["replay"] > 0                       # the Q4_0 draft disagrees sometimes
     assert identity_holds(c)
-    assert res["tokens"] == base                 # …and the output is still the target's greedy output
+
+    i = first_divergence_index(base, on)
+    assert on[:i] == base[:i]                    # agree up to the first divergence, if any
+    is_near_tie = first_divergence_is_near_tie(base_body, base, on)
+    msg = "no divergence" if i is None else (
+        f"divergence at token index {i} is NOT a near-tie (points at an inexact checkpoint "
+        f"restore, not batch-size rounding): reference top-2 = "
+        f"{base_body['completion_probabilities'][i]['top_logprobs']}, "
+        f"reference token = {base[i]}, drafted token = {on[i]}"
+    )
+    assert is_near_tie, msg
 
 def test_forced_empty_drafts_are_plain_rounds():
     server = make_server("q4"); server.spec_draft_p_min = 1.0   # draft-simple returns nothing (speculative.cpp:336)
