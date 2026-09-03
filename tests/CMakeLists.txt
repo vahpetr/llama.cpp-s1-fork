@@ -290,6 +290,10 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+# GPU-only reproducibility probe for the flash-attention partial query-tile path;
+# built but not registered as a ctest because it needs a non-CPU backend.
+llama_build(test-vk-fa-partial-tile.cpp)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
