@@ -136,3 +136,40 @@ def test_forced_empty_drafts_are_plain_rounds():
     # exactly 1.0 could let draft-simple emit a token even with spec_draft_p_min = 1.0.
     assert c["empty_draft"] > 0 and c["empty_draft"] <= c["plain"]
     assert identity_holds(c)
+
+def test_replay_is_deterministic_and_trace_does_not_perturb_sampling():
+    # Regression guard for how the replay path handles the SAMPLER (not the context).
+    #
+    # A partial draft acceptance on this recurrent target restores a context checkpoint and replays the
+    # committed tokens. Verification (common_sampler_sample_and_accept_n) sampled and accepted exactly
+    # the tokens it returned, so the sampler that already holds the correct state is the LIVE one: the
+    # server must not restore a pre-verification snapshot over it, the replay must not re-accept the
+    # committed tokens, and the LLAMA_TRACE mismatch probe must sample a CLONE.
+    #
+    # Every one of those three mistakes is invisible at temperature 0 (a greedy chain has no state that
+    # an extra sample/accept can perturb) but changes the output as soon as the sampling chain carries
+    # apply-time state - the dist sampler's RNG draw, mirostat's mu, adaptive-p. Hence temperature 0.8
+    # with a fixed seed: the number of sampler advances per generated token then has to be identical on
+    # every run, and the diagnostic probe must not consume any.
+    req = dict(REQ, temperature=0.8, seed=42)   # n_predict=96, cache_prompt=False from REQ
+
+    server = make_server("q4"); server.start()
+    first  = server.make_request("POST", "/completion", data=req).body["tokens"]
+    second = server.make_request("POST", "/completion", data=req).body["tokens"]
+    c = counters(server); server.stop()
+
+    assert c["replay"] > 0, "no replay rounds - this run did not exercise the replay path"
+    assert first == second, (
+        "same seed, same server, but the two runs differ at token index "
+        f"{first_divergence_index(first, second)}: a replay advanced the live sampler a different "
+        "number of times (snapshot restore / re-accept of the committed tokens)")
+
+    # ... and again on a server with the LLAMA_TRACE mismatch probe enabled
+    server = make_server("q4"); server.env = {"LLAMA_TRACE": "1"}; server.start()
+    traced = server.make_request("POST", "/completion", data=req).body["tokens"]
+    c = counters(server); server.stop()
+
+    assert c["replay"] > 0
+    assert traced == first, (
+        f"LLAMA_TRACE=1 changed the generated tokens at index {first_divergence_index(first, traced)}: "
+        "the committed-token mismatch probe must sample a clone of the sampler, not the live one")

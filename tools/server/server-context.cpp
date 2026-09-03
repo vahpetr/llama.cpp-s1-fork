@@ -52,22 +52,35 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
-// synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
-// on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
-// Replay after a checkpoint restore (partial draft acceptance on a context that cannot seq_rm partially): the
-// tokens in `draft` were ALREADY accepted by the target and are committed in the slot's context. Re-sampling
-// them and comparing with themselves is pointless and unsafe: the replay batch has a different size than the
-// verification batch, so the recomputed logits are not bit-identical and a near-tie can flip the argmax (or a
-// temperature > 0 sample can differ) -> the token is "rejected" -> restore -> replay -> rejected again, forever.
-// Accept the committed tokens unconditionally (advancing the sampler like a normal accept) and only sample the
-// new token at the final position. The synth path (server_sample_and_accept_synth) already did this.
+// Replay after a checkpoint restore (partial draft acceptance on a context that cannot seq_rm partially).
+//
+// The leading `n_committed` tokens of `draft` were already sampled AND accepted on this very sampler during the
+// verification round - common_sampler_sample_and_accept_n() returns exactly the tokens it accepted, and that is
+// what the caller stored in spec_draft/spec_n_committed. The verification round then returned early, before
+// emitting them, so the replay round is what emits them. The live sampler therefore already holds the correct
+// post-verification state and the caller must NOT restore a pre-verification snapshot over it.
+//
+// So the committed tokens are neither re-sampled nor re-accepted here:
+//   - re-sampling is unsafe: the replay batch has a different size than the verification batch, so the
+//     recomputed logits are not bit-identical and a near-tie can flip the argmax (or a temperature > 0 sample
+//     can differ) -> the token is "rejected" -> restore -> replay -> rejected again, forever;
+//   - re-accepting would advance the grammar, the reasoning budget and the sampling chain (mirostat mu, the
+//     dist sampler's RNG, ...) a second time for a token that was already accepted.
+//
+// Invariant: every emitted token is accepted on the live sampler exactly once - the committed ones during
+// verification, the final one here.
+//
+// `probe_mismatch` (LLAMA_TRACE only) counts how many committed tokens the target would pick differently now.
+// It samples a CLONE of the sampler, never the live one, so turning the trace on cannot change the generated
+// output. The clone starts from the post-verification state, so for history-dependent samplers (penalties,
+// grammar) the probe is only an approximation - it is a diagnostic counter, not a correctness check.
 static std::vector<llama_token> server_sample_and_accept_replay(
         common_sampler * smpl,
         llama_context * ctx,
         const std::vector<int> & idxs,
         const llama_tokens & draft,
-        size_t n_committed,       // leading tokens already committed in the context: accept unconditionally
-        bool probe_mismatch,      // LLAMA_TRACE only: re-sample the committed tokens to count rounding flips
+        size_t n_committed,       // leading tokens already sampled and accepted during verification: just re-emit
+        bool probe_mismatch,      // LLAMA_TRACE only: re-sample the committed tokens on a clone to count rounding flips
         int & n_mismatch) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(n_committed <= draft.size());
@@ -76,11 +89,16 @@ static std::vector<llama_token> server_sample_and_accept_replay(
     result.reserve(idxs.size());
     n_mismatch = 0;
 
+    // diagnostics only - the live sampler is never sampled at a committed position
+    common_sampler_ptr smpl_probe(probe_mismatch && n_committed > 0 ? common_sampler_clone(smpl) : nullptr);
+
     for (size_t i = 0; i < n_committed; i++) {
-        if (probe_mismatch && common_sampler_sample(smpl, ctx, idxs[i]) != draft[i]) {
-            n_mismatch++;
+        if (smpl_probe) {
+            if (common_sampler_sample(smpl_probe.get(), ctx, idxs[i]) != draft[i]) {
+                n_mismatch++;
+            }
+            common_sampler_accept(smpl_probe.get(), draft[i], true);
         }
-        common_sampler_accept(smpl, draft[i], true);
         result.push_back(draft[i]);
     }
 
@@ -97,6 +115,11 @@ static std::vector<llama_token> server_sample_and_accept_replay(
     return result;
 }
 
+// synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
+// the leading `n_committed` tokens are a replay after a checkpoint restore: they were already sampled and accepted
+// during verification (see server_sample_and_accept_replay), so they are only re-emitted here, never re-sampled and
+// never re-accepted. In particular the last committed token no longer needs a special "accept with is_generated =
+// true" case to advance the grammar / reasoning state - verification already accepted it exactly that way.
 static std::vector<llama_token> server_sample_and_accept_synth(
         common_sampler * smpl,
         llama_context * ctx,
@@ -104,25 +127,27 @@ static std::vector<llama_token> server_sample_and_accept_synth(
         const llama_tokens & draft,
         const std::vector<double> & synth_probs,
         std::mt19937 & rng,
-        bool is_replay) {
+        size_t n_committed) {
     GGML_ASSERT(idxs.size() == draft.size() + 1);
     GGML_ASSERT(synth_probs.size() >= draft.size());
+    GGML_ASSERT(n_committed <= draft.size());
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    for (size_t i = 0; i < n_committed; ++i) {
+        result.push_back(draft[i]);
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
     std::uniform_real_distribution<double> dist(0.0, 1.0);
-    for (size_t i = 0; i < draft.size(); ++i) {
+    for (size_t i = n_committed; i < draft.size(); ++i) {
         const llama_token id = common_sampler_sample(smpl, ctx, idxs[i]);
-        const bool accept = is_replay || dist(rng) < synth_probs[i];
+        const bool accept = dist(rng) < synth_probs[i];
         // do not accept a drafted EOG token - it would end the generation early
-        // on replay the last token is from the target and can be EOG, so skip this check
-        if (accept && (is_replay || !llama_vocab_is_eog(vocab, draft[i]))) {
+        if (accept && !llama_vocab_is_eog(vocab, draft[i])) {
             // synthetic draft tokens do not advance grammar or reasoning state
-            // the last replay token is from the target and must advance both
-            const bool is_replay_target = is_replay && i + 1 == draft.size();
-            common_sampler_accept(smpl, draft[i], is_replay_target);
+            common_sampler_accept(smpl, draft[i], false);
             result.push_back(draft[i]);
             continue;
         }
@@ -3963,16 +3988,13 @@ private:
 
             // verify and try to accept the draft
             {
-                const bool may_rollback = slot.spec_n_committed < slot.spec_draft.size();   // an unverified tail exists
-                common_sampler_ptr smpl_save(may_rollback ? common_sampler_clone(slot.smpl.get()) : nullptr);
-
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                 std::vector<llama_token> accepted;
                 if (!synth_probs.empty()) {
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                            synth_probs, slot.spec_synth_rng, slot.spec_n_committed);
                 } else if (slot.spec_is_replay) {
                     int n_mismatch = 0;
                     accepted = server_sample_and_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
@@ -4021,8 +4043,10 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        GGML_ASSERT(smpl_save && "a round with an unverified tail always has a sampler snapshot");
-                        common_sampler_copy(smpl_save.get(), slot.smpl.get());
+
+                        // the sampler is deliberately NOT rolled back: the tokens accepted just above are the
+                        // ones the replay round will emit, so the live (post-verification) sampler already has
+                        // the state that belongs after them - see server_sample_and_accept_replay()
 
                         return;
                     }
