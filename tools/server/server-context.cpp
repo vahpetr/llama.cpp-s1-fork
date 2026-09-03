@@ -615,8 +615,12 @@ struct server_slot {
 
             // output-capacity invariant: this batch adds 1 (sampled) + spec_draft.size() rows for this slot;
             // a folded round must stay within the same 1 + n_max budget as a fresh verify round (see the
-            // "Batch budget" note by the fold logic in the accept phase / drafting phase below).
-            GGML_ASSERT((int) spec_draft.size() + 1 <= 1 + common_speculative_n_max(spec));
+            // "Batch budget" note by the fold logic in the accept phase / drafting phase below). max(1, n_max):
+            // a per-impl draft loop (e.g. draft-mtp's) decodes and pushes one token before it can check n_max,
+            // so even an n_max=0 config (the no-draft reference arm) can hand back a genuine 1-token verify
+            // draft - pre-existing, harmless (the round is still verified normally), and orthogonal to fold
+            // (n_fold_room is 0 whenever common_speculative_n_max(spec) is 0, so fold never engages there).
+            GGML_ASSERT((int) spec_draft.size() + 1 <= 1 + std::max(1, common_speculative_n_max(spec)));
 
             SLT_DBG(*this, "generate_draft: id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
