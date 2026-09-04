@@ -17,6 +17,7 @@
 #extension GL_KHR_cooperative_matrix : enable
 
 #include "types.glsl"
+#define FA_PV_ACC_TYPE 1
 #include "flash_attn_base.glsl"
 #if !defined(BFLOAT16)
 #include "flash_attn_dequant.glsl"
@@ -614,7 +615,7 @@ void main() {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             Of[r][d_local] *= O_TYPE(Lfrcp[r]);
 #if defined(FLOAT_TYPE_MAX)
-            Of[r][d_local] = clamp(Of[r][d_local], -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
+            Of[r][d_local] = clamp(Of[r][d_local], O_TYPEV4(-FLOAT_TYPE_MAX), O_TYPEV4(FLOAT_TYPE_MAX));
 #endif
         }
     }

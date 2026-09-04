@@ -249,6 +249,19 @@ static void fa_fill_q(fa_ctx & c) {
     ggml_backend_tensor_set(c.qpol, p.data(), 0, p.size());
 }
 
+// Diagnostic: multiply the K/V values written at physical positions >= g_gain_from
+// by g_gain.  Used to measure the weight with which a mask-suppressed KV cell
+// leaks into a live query row (the leak, if any, is linear in the cell value).
+static float   g_gain      = 1.0f;
+static int64_t g_gain_from = -1;
+static bool    g_tailval_set = false;
+static float   g_tailval   = 0.0f;
+// --extra <pos>: both runs write exactly the same KV cells [0,L); the SECOND run
+// additionally overwrites V at physical position <pos> with g_tailval.  Isolates
+// which mask-suppressed KV position leaks into the compared live row.
+static int64_t g_extra_pos = -1;
+static bool    g_extra_on  = false;
+
 // K / V.  Physical KV positions [0, n_written) hold data, the rest hold either
 // zeroes (as a freshly cleared KV cache does) or, when tail_id != 0, distinct
 // finite values so that a non-inert masked tail shows up.
@@ -265,6 +278,7 @@ static void fa_fill_kv(fa_ctx & c, int64_t nk_written, int64_t nv_written, int t
                 const uint64_t seed = live_k ? 0x51ull : (0x51ull ^ ((uint64_t) tail_id << 56));
                 for (int64_t d = 0; d < HSK; ++d) {
                     f[d] = hashf(seed ^ ((uint64_t) hh << 44) ^ ((uint64_t) p << 24) ^ (uint64_t) d);
+                    if (g_gain_from >= 0 && p >= g_gain_from) f[d] = g_tailval_set ? g_tailval : f[d] * g_gain;
                 }
                 ggml_fp32_to_fp16_row(f.data(), h16.data(), HSK);
                 for (int64_t d = 0; d < HSK; ++d) {
@@ -275,11 +289,20 @@ static void fa_fill_kv(fa_ctx & c, int64_t nk_written, int64_t nv_written, int t
                 const uint64_t seedv = live_v ? 0xA7ull : (0xA7ull ^ ((uint64_t) tail_id << 56));
                 for (int64_t d = 0; d < HSV; ++d) {
                     f[d] = hashf(seedv ^ ((uint64_t) hh << 44) ^ ((uint64_t) p << 24) ^ (uint64_t) d);
+                    if (g_gain_from >= 0 && p >= g_gain_from) f[d] = g_tailval_set ? g_tailval : f[d] * g_gain;
                 }
                 ggml_fp32_to_fp16_row(f.data(), h16.data(), HSV);
                 for (int64_t d = 0; d < HSV; ++d) {
                     memcpy(vs.data() + elem_off(c.v, c.vsrc, d, p, hh, 0), &h16[d], sizeof(ggml_fp16_t));
                 }
+            }
+        }
+    }
+    if (g_extra_on && g_extra_pos >= 0) {
+        ggml_fp16_t hv = ggml_fp32_to_fp16(g_tailval);
+        for (int64_t hh = 0; hh < NH_KV; ++hh) {
+            for (int64_t d = 0; d < HSV; ++d) {
+                memcpy(vs.data() + elem_off(c.v, c.vsrc, d, g_extra_pos, hh, 0), &hv, sizeof(ggml_fp16_t));
             }
         }
     }
@@ -332,9 +355,14 @@ static void fa_run(fa_ctx & c, int j, std::vector<float> & row) {
 
 // One reference/rollback pair: the short (N=5) dispatch then the long (N=6) one,
 // with the KV cache in the state each of them would see in production.
+static int g_jlo = 0;   // graph used for the "short" side of the pair
+static int g_jhi = 1;   // graph used for the "long"  side of the pair
+
 static void fa_run_pair(fa_ctx & c, int L, kvtail_t kvtail, int tailsel, bool pollute,
                         std::vector<float> & r_lo, std::vector<float> & r_hi) {
     const int tail_id = kvtail == KVTAIL_POISON ? 1 : 0;
+    g_gain_from = L;
+    g_extra_on  = false;
 
     if (kvtail == KVTAIL_SHARED) {
         fa_fill_kv(c, KVLEN, KVLEN, 0);
@@ -342,20 +370,40 @@ static void fa_run_pair(fa_ctx & c, int L, kvtail_t kvtail, int tailsel, bool po
         fa_fill_kv(c, L, L, tail_id);
     }
     if (pollute) fa_dispatch(c, 2);
-    fa_run(c, 0, r_lo);
+    fa_run(c, g_jlo, r_lo);
 
+    g_extra_on = true;
     if (kvtail != KVTAIL_SHARED) {
-        fa_fill_kv(c, (tailsel & 1) ? L + 1 : L, (tailsel & 2) ? L + 1 : L,
-                   tail_id == 0 ? 0 : 2);
+        if (g_extra_pos >= 0) {
+            fa_fill_kv(c, L, L, tail_id);   // identical KV, plus the single extra V cell
+        } else {
+            fa_fill_kv(c, (tailsel & 1) ? L + 1 : L, (tailsel & 2) ? L + 1 : L,
+                       tail_id == 0 ? 0 : 2);
+        }
     }
     if (pollute) fa_dispatch(c, 2);
-    fa_run(c, 1, r_hi);
+    fa_run(c, g_jhi, r_hi);
 }
 
 struct cmp_res {
     size_t ndiff = 0;
     double maxabs = 0.0;
 };
+
+static bool g_dump = false;
+
+// print the first few differing elements as (head, hsv) with raw bits
+static void dump_diff(const std::vector<float> & a, const std::vector<float> & b, int L) {
+    int shown = 0;
+    for (size_t i = 0; i < a.size() && shown < 10; ++i) {
+        if (memcmp(&a[i], &b[i], sizeof(float)) == 0) continue;
+        uint32_t ua, ub;
+        memcpy(&ua, &a[i], 4); memcpy(&ub, &b[i], 4);
+        printf("    L=%d diff #%d: head=%d d=%d  a=%.9g (0x%08x)  b=%.9g (0x%08x)  d=%.3g\n",
+               L, shown, (int)(i / HSV), (int)(i % HSV), a[i], ua, b[i], ub, (double) b[i] - (double) a[i]);
+        shown++;
+    }
+}
 
 static cmp_res compare(const std::vector<float> & a, const std::vector<float> & b) {
     cmp_res r;
@@ -409,13 +457,27 @@ int main(int argc, char ** argv) {
             kvtail = t == "prod" ? KVTAIL_PROD : (t == "poison" ? KVTAIL_POISON : KVTAIL_SHARED);
         } else if (a == "--tailsel" && i + 1 < argc) {
             const std::string t = argv[++i];
-            tailsel = t == "k" ? 1 : (t == "v" ? 2 : 3);
+            tailsel = t == "k" ? 1 : (t == "v" ? 2 : (t == "none" ? 0 : 3));
+        } else if (a == "--tailval" && i + 1 < argc) {
+            g_tailval_set = true;
+            g_tailval = (float) atof(argv[++i]);
+        } else if (a == "--gain" && i + 1 < argc) {
+            g_gain = (float) atof(argv[++i]);
+        } else if (a == "--pair" && i + 1 < argc) {
+            const std::string t = argv[++i];
+            g_jlo = t == "hihi" ? 1 : 0;
+            g_jhi = t == "lolo" ? 0 : 1;
+        } else if (a == "--extra" && i + 1 < argc) {
+            g_extra_pos = atoi(argv[++i]);
+        } else if (a == "--dump") {
+            g_dump = true;
         } else if (a == "--pollute") {
             pollute = true;
         } else {
             fprintf(stderr,
                     "usage: %s [-b <backend-name-prefix>] [--lmin L] [--lmax L] [--reps N] "
-                    "[--layout view|cache|both] [--kvtail shared|prod|poison] [--tailsel k|v|kv] [--pollute]\n", argv[0]);
+                    "[--layout view|cache|both] [--kvtail shared|prod|poison] [--tailsel k|v|kv] [--pollute] "
+                    "[--gain F] [--pair lohi|lolo|hihi]\n", argv[0]);
             return 2;
         }
     }
@@ -439,8 +501,9 @@ int main(int argc, char ** argv) {
     printf("geom   : hsk=hsv=%d nh_kv=%d nh_q=%d gqa=%d kv=%d N=%d vs %d target row=%d\n",
            (int) HSK, (int) NH_KV, (int) NH_Q, (int) GQA, (int) KVLEN,
            (int) NB_LO, (int) NB_HI, (int) TROW);
-    printf("opts   : kvtail=%s tailsel=%s pollute=%s reps=%d\n", kvtail_name(kvtail),
-           tailsel == 1 ? "k" : (tailsel == 2 ? "v" : "kv"), pollute ? "yes" : "no", reps);
+    printf("opts   : kvtail=%s tailsel=%s pollute=%s reps=%d gain=%g pair=%d/%d\n", kvtail_name(kvtail),
+           tailsel == 1 ? "k" : (tailsel == 2 ? "v" : (tailsel == 0 ? "none" : "kv")), pollute ? "yes" : "no", reps, g_gain, g_jlo, g_jhi);
+    if (g_tailval_set) printf("         tailval=%g (constant written into the extra KV cell)\n", g_tailval);
 
     int n_cases = 0;
     int n_fail  = 0;
@@ -487,6 +550,7 @@ int main(int argc, char ** argv) {
                 const cmp_res s6 = compare(g6, g6b);
 
                 if (r.ndiff)  identical = false;
+                if (r.ndiff && g_dump && rep == 0) dump_diff(g5, g6, L);
                 if (s5.ndiff || s6.ndiff) stable = false;
                 if (r.ndiff > worst.ndiff)   worst.ndiff  = r.ndiff;
                 if (r.maxabs > worst.maxabs) worst.maxabs = r.maxabs;
