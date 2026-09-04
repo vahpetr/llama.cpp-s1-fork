@@ -3930,10 +3930,20 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
+    // Replace V by +0 in KV columns that a Br tile's mask suppresses for every one of its
+    // rows.  Mathematically a no-op (those columns are multiplied by P == 0), but it is what
+    // makes a coopmat1 flash-attention result independent of the V bytes it has masked away:
+    // coopMatMulAdd is not invariant to the sign of a zero product on RDNA3.  Costs a
+    // shared-memory staging pass for V, and only on the tiles that actually have such
+    // columns (i.e. the causal boundary tile), so fully-live tiles are unaffected.
+    static const bool fa_no_zero_dead_v = getenv("GGML_VK_FA_NO_ZERO_DEAD_V") != nullptr;
+    const bool zero_dead_v = !fa_no_zero_dead_v && use_mask && params.path == FA_COOPMAT1;
+
     uint32_t flags = (use_mask_opt      ? 1 : 0) |
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
-                     (old_amd_windows   ? 8 : 0);
+                     (old_amd_windows   ? 8 : 0) |
+                     (zero_dead_v       ? 16 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -10832,7 +10842,10 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 
     const uint32_t slope = Br * acctype;
 
-    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope;
+    // p_dead[Bc] + any_dead (the ZERO_DEAD_V mask-suppressed-column flags)
+    const uint32_t dead = (Bc + 1) * (uint32_t) sizeof(uint32_t);
+
+    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + dead;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
     VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", total_size=" << total_size << ", supported=" << supported);
