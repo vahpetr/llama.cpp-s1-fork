@@ -93,6 +93,23 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #if defined(BFLOAT16)
 #define O_TYPE float
 #define O_TYPEV4 vec4
+#elif defined(FA_PV_ACC_TYPE)
+// The P*V cooperative matmul accumulates in ACC_TYPE, i.e. f32 whenever the op
+// asks for GGML_PREC_F32, instead of always in FLOAT_TYPE (f16 for f16 K/V).
+//
+// Mask-suppressed KV columns have P == +0 exactly, so they are mathematically
+// inert - but they are still fed to coopMatMulAdd, where 0*V evaluates to -0
+// for V < 0.  RDNA3's cooperative matmul is not invariant to the sign of a zero
+// product: a -0 term perturbs the result by one ULP of the accumulator whenever
+// its f16 k-pair partner is a live column.  A live query row's output therefore
+// depends on the V bytes of KV cells it has masked away, which breaks
+// reproducibility across batch shapes (the same row computed against a KV cache
+// with one more written cell).  Accumulating in f32 does not remove the
+// dependency, but it shrinks it by 2^13 - from ~2e-4 (one f16 ULP, ~0.15 on the
+// logits after 32 layers) to ~3e-8 - which is below the noise of the rest of
+// the graph.
+#define O_TYPE ACC_TYPE
+#define O_TYPEV4 ACC_TYPEV4
 #else
 #define O_TYPE FLOAT_TYPE
 #define O_TYPEV4 FLOAT_TYPEV4
