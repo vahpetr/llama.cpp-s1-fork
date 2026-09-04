@@ -11053,9 +11053,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     static const bool fa_split_k_log = getenv("GGML_VK_FA_SPLIT_K_LOG") != nullptr;
     if (fa_split_k_log) {
-        fprintf(stderr, "FA: neq1=%u N=%u gqa=%u KV=%u Br=%u Bc=%u align=%u wg=(%u,%u,%u) split_k=%u split_kv=%u\n",
+        fprintf(stderr, "FA: neq1=%u N=%u gqa=%u KV=%u Br=%u Bc=%u align=%u wg=(%u,%u,%u) split_k=%u split_kv=%u flags=%u f32acc=%d\n",
                 (uint32_t) neq1, N, gqa_ratio, KV, Br, Bc, alignment,
-                workgroups_x, workgroups_y, workgroups_z, split_k, split_kv);
+                workgroups_x, workgroups_y, workgroups_z, split_k, split_kv,
+                fa_pipeline_state.flags, (int) f32acc);
     }
 
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)

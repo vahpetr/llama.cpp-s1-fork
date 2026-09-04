@@ -68,9 +68,9 @@ static const int64_t NH_KV = 4;                 // KV heads
 static const int64_t GQA   = 4;                 // Q heads per KV head
 static const int64_t NH_Q  = NH_KV * GQA;       // 16 Q heads
 static const int64_t KVLEN = 256;               // physical KV length
-static const int64_t NB_HI = 6;                 // long dispatch
-static const int64_t NB_LO = 5;                 // short dispatch
-static const int64_t TROW  = 4;                 // compared query row (last row of the short dispatch)
+static int64_t NB_HI = 6;                 // long dispatch
+static int64_t NB_LO = 5;                 // short dispatch
+static int64_t TROW  = 4;                 // compared query row (last row of the short dispatch)
 
 static const size_t ROW_ELEMS = (size_t) HSV * NH_Q;
 
@@ -437,6 +437,7 @@ int main(int argc, char ** argv) {
     kvtail_t kvtail = KVTAIL_SHARED;
     int  tailsel    = 3;   // bit0 = K differs, bit1 = V differs
     bool pollute    = false;
+    bool trow_set   = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -469,6 +470,13 @@ int main(int argc, char ** argv) {
             g_jhi = t == "lolo" ? 0 : 1;
         } else if (a == "--extra" && i + 1 < argc) {
             g_extra_pos = atoi(argv[++i]);
+        } else if (a == "--nlo" && i + 1 < argc) {
+            NB_LO = atoi(argv[++i]);
+        } else if (a == "--nhi" && i + 1 < argc) {
+            NB_HI = atoi(argv[++i]);
+        } else if (a == "--trow" && i + 1 < argc) {
+            TROW = atoi(argv[++i]);
+            trow_set = true;
         } else if (a == "--dump") {
             g_dump = true;
         } else if (a == "--pollute") {
@@ -477,9 +485,18 @@ int main(int argc, char ** argv) {
             fprintf(stderr,
                     "usage: %s [-b <backend-name-prefix>] [--lmin L] [--lmax L] [--reps N] "
                     "[--layout view|cache|both] [--kvtail shared|prod|poison] [--tailsel k|v|kv] [--pollute] "
-                    "[--gain F] [--pair lohi|lolo|hihi]\n", argv[0]);
+                    "[--gain F] [--pair lohi|lolo|hihi] [--nlo N] [--nhi N] [--trow R]\n", argv[0]);
             return 2;
         }
+    }
+
+    if (!trow_set) {
+        TROW = NB_LO - 1;   // last row of the short dispatch
+    }
+    if (NB_LO < 1 || NB_HI < NB_LO || TROW < 0 || TROW >= NB_LO || NB_HI > NB_POL) {
+        fprintf(stderr, "bad --nlo/--nhi/--trow (%d/%d/%d): need 1 <= nlo <= nhi <= %d and 0 <= trow < nlo\n",
+                (int) NB_LO, (int) NB_HI, (int) TROW, (int) NB_POL);
+        return 2;
     }
 
     ggml_backend_dev_t dev_gpu = find_dev(dev_prefix);
@@ -523,7 +540,7 @@ int main(int argc, char ** argv) {
                gpu.q[1]->nb[1]/sizeof(float), gpu.q[1]->nb[2],
                gpu.k->nb[1]/sizeof(ggml_fp16_t), gpu.k->nb[2]);
         printf("  %-4s %-10s %8s %12s %10s %12s %12s\n",
-               "L", "N5==N6", "ndiff", "max|d|", "stable", "max|d| cpu5", "max|d| cpu6");
+               "L", "Nlo==Nhi", "ndiff", "max|d|", "stable", "max|d| cpulo", "max|d| cpuhi");
 
         std::vector<float> g5, g6, g5b, g6b, c5, c6;
 
@@ -576,8 +593,8 @@ int main(int argc, char ** argv) {
         fa_free(cpu);
     }
 
-    printf("\nsummary: %d/%d cases differ between N=5 and N=6 (row %d); %d cases were unstable across repeats\n",
-           n_fail, n_cases, (int) TROW, n_race);
+    printf("\nsummary: %d/%d cases differ between N=%d and N=%d (row %d); %d cases were unstable across repeats\n",
+           n_fail, n_cases, (int) NB_LO, (int) NB_HI, (int) TROW, n_race);
 
     ggml_backend_free(backend_gpu);
     ggml_backend_free(backend_cpu);
