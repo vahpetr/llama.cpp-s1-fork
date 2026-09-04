@@ -17431,6 +17431,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    // piagent 2026-09-04 (A/B of the command-buffer count per graph): GGML_VK_FLOPS_PER_SUBMIT=<GFLOP> overrides the
+    // FLOP-based submit rule, 0 disables it (submits then happen only per max_nodes_per_submit / almost_ready / last node).
+    {
+        static const long long env_flops = [] { const char * e = getenv("GGML_VK_FLOPS_PER_SUBMIT"); return e ? atoll(e) : -1LL; }();
+        if (env_flops == 0) { flops_per_submit = 0; } else if (env_flops > 0) { flops_per_submit = (uint64_t) env_flops * 1'000'000'000ULL; }
+    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -17759,6 +17765,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // Get the results and pass them to the logger
         std::vector<uint64_t> timestamps(cgraph->n_nodes + 1);
         VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->query_pool, 0, ctx->query_idx, (cgraph->n_nodes + 1)*sizeof(uint64_t), timestamps.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "get timestamp results", ctx->device);
+        if (getenv("GGML_VK_PERF_TSRAW")) {
+            // piagent 2026-09-04: raw first/last GPU timestamps of this graph (ticks) for clock alignment with kernel traces
+            fprintf(stderr, "TSRAW nodes=%d queries=%d first=%llu last=%llu\n", cgraph->n_nodes, (int) ctx->query_idx,
+                    (unsigned long long) timestamps[0], (unsigned long long) timestamps[ctx->query_idx - 1]);
+        }
         if (!vk_perf_logger_concurrent) {
             // Log each op separately
             for (int i = 1; i < ctx->query_idx; i++) {
