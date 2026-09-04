@@ -10817,8 +10817,9 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t vsh_stride = MatBc / 4 * row_split;
     const uint32_t ksh = ((kvshstride >= vsh_stride) ? (Bc * kvshstride) : (Bc * vsh_stride)) * f16vec4;
 
-    // BF16 PVMat accumulator is f32 (no bf16 accumulator support), so pvsh is vec4 (16 bytes)
-    const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16) ? 16u : f16vec4;
+    // The PVMat accumulator is ACC_TYPE (f32 for f32acc), and always f32 for BF16
+    // (no bf16 accumulator support), so pvsh is vec4 (16 bytes) in those cases.
+    const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16 || f32acc) ? 16u : f16vec4;
     const uint32_t osh_stride = params.row_split * MatBr / 4;
     const uint32_t pvsh = MatBc * osh_stride * pvsh_elem_size;
 
