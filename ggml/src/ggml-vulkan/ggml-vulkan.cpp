@@ -546,6 +546,13 @@ vk_conv_block_size vk_conv_block_sizes[CONV_SHAPE_COUNT] = {
 enum dmmv_wg_sizes {
     DMMV_WG_SIZE_SUBGROUP,
     DMMV_WG_SIZE_LARGE,
+    // Same (subgroup-sized) workgroup as DMMV_WG_SIZE_SUBGROUP, but each workgroup computes
+    // dmmv_manyrows_mul times as many output rows.  For thin/low-k mat-vecs a workgroup that
+    // owns only 1-2 rows re-reads the whole num_cols-wide activation slice (and, for MMVQ, its
+    // q8_1 scales) for very little weight traffic, and a single k iteration leaves the 64-wide
+    // subgroup reduction nothing to amortize against.  The per-row reduction order is unchanged,
+    // so the results are bit-identical to DMMV_WG_SIZE_SUBGROUP.
+    DMMV_WG_SIZE_MANYROWS,
     DMMV_WG_SIZE_COUNT,
 };
 
@@ -843,6 +850,11 @@ struct vk_device_struct {
     bool integer_dot_product;
     // 0: default, 1: force mmvq, -1: disable mmvq
     int32_t mmvq_mode;
+
+    // DMMV_WG_SIZE_MANYROWS: rows-per-workgroup multiplier (<= 1 disables the variant) and the
+    // minimum number of workgroups the widened dispatch must still have.
+    uint32_t dmmv_manyrows_mul;
+    uint32_t dmmv_manyrows_min_wg;
 
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
@@ -5247,22 +5259,22 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // mul mat vec
 
     // the number of rows computed per shader depends on GPU model and quant
-    uint32_t rm_stdq = 1;
-    uint32_t rm_kq = 2;
-    uint32_t rm_stdq_int = 1;
-    uint32_t rm_kq_int = 1;
-    auto const &rm_iq_int = [](uint32_t i) { return i == 0 ? 8u : 4u; };
+    uint32_t rm_stdq_base = 1;
+    uint32_t rm_kq_base = 2;
+    uint32_t rm_stdq_int_base = 1;
+    uint32_t rm_kq_int_base = 1;
+    auto const &rm_iq_int_base = [](uint32_t i) { return i == 0 ? 8u : 4u; };
     if (device->vendor_id == VK_VENDOR_ID_AMD) {
         if (device->architecture == AMD_GCN) {
-            rm_stdq = 2;
-            rm_kq = 4;
-            rm_stdq_int = 4;
+            rm_stdq_base = 2;
+            rm_kq_base = 4;
+            rm_stdq_int_base = 4;
         }
     } else if (device->vendor_id == VK_VENDOR_ID_INTEL) {
-        rm_stdq = 2;
-        rm_stdq_int = 2;
+        rm_stdq_base = 2;
+        rm_stdq_int_base = 2;
     }
-    uint32_t rm_iq = 2 * rm_kq;
+    uint32_t rm_iq_base = 2 * rm_kq_base;
 
     const bool use_subgroups = device->subgroup_arithmetic;
     // Ensure a subgroup size >= 16 is available
@@ -5285,16 +5297,30 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif
 
     for (uint32_t w = 0; w < DMMV_WG_SIZE_COUNT; ++w) {
-        const uint32_t wg_size_subgroup   = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size : (subgroup_size * 4);
-        const uint32_t wg_size_subgroup16 = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size16 : (subgroup_size16 * 4);
+        // DMMV_WG_SIZE_MANYROWS reuses the subgroup-sized workgroup and only widens the number of
+        // rows each workgroup computes; everything else (shader variant, block size, reduction) is
+        // identical to DMMV_WG_SIZE_SUBGROUP.
+        const uint32_t rows_mul = (w == DMMV_WG_SIZE_MANYROWS) ? std::max(1u, device->dmmv_manyrows_mul) : 1;
 
-        const shader_reduction_mode reduc = (use_subgroups && w == DMMV_WG_SIZE_SUBGROUP) ? SHADER_REDUCTION_MODE_SUBGROUP :
-                                            (use_subgroups && w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
-                                            SHADER_REDUCTION_MODE_SHMEM;
+        // The IQ row counts are already 4-8, which is what the widening aims for, so leave them
+        // alone: scaling them too would push NUM_ROWS*NUM_COLS past the register budget.
+        const uint32_t rm_stdq     = rm_stdq_base * rows_mul;
+        const uint32_t rm_kq       = rm_kq_base * rows_mul;
+        const uint32_t rm_iq       = rm_iq_base;
+        const uint32_t rm_stdq_int = rm_stdq_int_base * rows_mul;
+        const uint32_t rm_kq_int   = rm_kq_int_base * rows_mul;
+        auto const &rm_iq_int = rm_iq_int_base;
 
-        const shader_reduction_mode reduc16 = (use_subgroups16 && w == DMMV_WG_SIZE_SUBGROUP) ? SHADER_REDUCTION_MODE_SUBGROUP :
-                                              (use_subgroups16 && w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
-                                              SHADER_REDUCTION_MODE_SHMEM;
+        const uint32_t wg_size_subgroup   = (w == DMMV_WG_SIZE_LARGE) ? (subgroup_size * 4) : subgroup_size;
+        const uint32_t wg_size_subgroup16 = (w == DMMV_WG_SIZE_LARGE) ? (subgroup_size16 * 4) : subgroup_size16;
+
+        const shader_reduction_mode reduc = !use_subgroups ? SHADER_REDUCTION_MODE_SHMEM :
+                                            (w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
+                                            SHADER_REDUCTION_MODE_SUBGROUP;
+
+        const shader_reduction_mode reduc16 = !use_subgroups16 ? SHADER_REDUCTION_MODE_SHMEM :
+                                              (w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
+                                              SHADER_REDUCTION_MODE_SUBGROUP;
 
         for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
@@ -5356,7 +5382,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
             if (device->integer_dot_product) {
                 const uint32_t subgroup_size_int = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
-                const uint32_t wg_size_subgroup_int = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_int : (subgroup_size_int * 4);
+                const uint32_t wg_size_subgroup_int = (w == DMMV_WG_SIZE_LARGE) ? (subgroup_size_int * 4) : subgroup_size_int;
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_q8_1_f32", arr_dmmv_q2_0_q8_1_f32_len[reduc], arr_dmmv_q2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32", arr_dmmv_q4_0_q8_1_f32_len[reduc], arr_dmmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
@@ -5438,9 +5464,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef OCP_DMMV_LEN
 
 #if !defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-    GGML_UNUSED(rm_stdq_int);
-    GGML_UNUSED(rm_kq_int);
-    GGML_UNUSED(rm_iq_int);
+    GGML_UNUSED(rm_stdq_int_base);
+    GGML_UNUSED(rm_kq_int_base);
+    GGML_UNUSED(rm_iq_int_base);
 #endif
 
     // dequant shaders
@@ -7114,6 +7140,15 @@ static vk_device ggml_vk_get_device(size_t idx) {
         descriptor_set_layout_create_info.setPNext(&dslbfci);
         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
 
+        // Rows-per-workgroup widening for thin mat-vec shapes (DMMV_WG_SIZE_MANYROWS).  On AMD
+        // RDNA the subgroup-sized dequant-mul-mat-vec pipelines compute 1 row (MMVQ / q8_1) or
+        // 2 rows (f16/f32 activations) per workgroup, so a shape like q5_0 m=10240 k=320 runs
+        // 10240 workgroups that each move ~220 bytes of weights while re-reading the whole
+        // activation slice.  AMD GCN already uses 2-4 rows, and NVIDIA/Intel have their own
+        // DMMV_WG_SIZE_LARGE heuristic, so only widen on AMD RDNA by default.
+        device->dmmv_manyrows_mul    = (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN) ? 4 : 1;
+        device->dmmv_manyrows_min_wg = 512;
+
         ggml_vk_load_shaders(device);
 
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
@@ -7895,6 +7930,14 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
             return nullptr;
     }
 
+    auto const &dmmv_pipeline = [&](uint32_t w) -> vk_pipeline & {
+        if (b_type == GGML_TYPE_Q8_1) {
+            return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][a_type][num_cols-1];
+        }
+        return b_type == GGML_TYPE_F32 ? ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[w][a_type][num_cols-1]
+                                       : ctx->device->pipeline_dequant_mul_mat_vec_f16_f32[w][a_type][num_cols-1];
+    };
+
     // heuristic to choose workgroup size
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
     if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
@@ -7912,14 +7955,24 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         }
     }
 
-    if (b_type == GGML_TYPE_Q8_1) {
-        if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
-            dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
-        }
-        return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
+    if (b_type == GGML_TYPE_Q8_1 && ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+        dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
     }
 
-    return b_type == GGML_TYPE_F32 ? ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[dmmv_wg][a_type][num_cols-1] : ctx->device->pipeline_dequant_mul_mat_vec_f16_f32[dmmv_wg][a_type][num_cols-1];
+    // Opposite case: when the workgroup owns only one or two of very many rows, the per-workgroup
+    // activation loads and the final subgroup reduction cost more than the weight traffic.  Widen
+    // the rows per workgroup as long as the dispatch keeps enough workgroups to fill the device.
+    // The base pipeline is initialized (wg_denoms set) by the first ggml_vk_load_shaders pass even
+    // though its shader is only compiled on demand.
+    if (dmmv_wg == DMMV_WG_SIZE_SUBGROUP && ctx->device->dmmv_manyrows_mul > 1) {
+        const vk_pipeline & base = dmmv_pipeline(DMMV_WG_SIZE_SUBGROUP);
+        const uint32_t base_rows = (base && base->initialized) ? base->wg_denoms[0] : 0;
+        if (base_rows > 0 && m >= base_rows * ctx->device->dmmv_manyrows_mul * ctx->device->dmmv_manyrows_min_wg) {
+            dmmv_wg = DMMV_WG_SIZE_MANYROWS;
+        }
+    }
+
+    return dmmv_pipeline(dmmv_wg);
 }
 
 static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
