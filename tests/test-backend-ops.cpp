@@ -9373,6 +9373,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
+    // Fine-grained MoE routing (Qwen3-Next style): 512 experts, top-10, prefill
+    // ubatch 512 and 1024. Backends that pick the matmul tile from the routed
+    // rows per expert see ~10 and ~20 rows here, not n_tokens. k is the real
+    // n_embd; m is scaled down from the production expert size to keep the
+    // test's memory footprint reasonable.
+    for (int n_tokens : {512, 1024}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 256, n_tokens, 2560));
+    }
+    // Cheap coverage of the three tile sizes as a function of the routed rows
+    // per expert: ~10 (small), ~64 (medium), ~256 (large).
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 64, 512, 256));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 512, 10, false, 64, 512, 256));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32,  64,  8, false, 64, 512, 256));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32,   8,  4, false, 64, 512, 256));
+
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
