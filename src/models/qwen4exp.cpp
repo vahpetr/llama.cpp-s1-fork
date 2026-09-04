@@ -1523,7 +1523,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     const auto   mem_size = mctx_cur->get_size();
 
     if (cparams.n_rs_seq == 0) {
-        // no rollback: a single slot-0 write, unchanged from before [TAG_RECURRENT_ROLLBACK_SPLITS]
+        // no rollback capacity: a single slot-0 write, unchanged from before [TAG_RECURRENT_ROLLBACK_SPLITS]
         ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
                 state_cols, channels, n_seqs,
                 conv_input->nb[1], conv_input->nb[2],
@@ -1538,27 +1538,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     } else {
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
         // slot 0 is the final state, slot s the state s tokens back, as llm_build_delta_net_base::build_conv_state
-        // writes them; the rollback reads slot d after set_rs_idx(d).
-        // This assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside the same ubatch,
-        //   which `split_equal()` guarantees via its n_keep_tail argument.
+        //   writes them; the rollback reads slot d after set_rs_idx(d). Only the K_write planes written here are
+        //   valid, which is what the memory records as this sequence's rollback depth after the ubatch.
         // The strided view is copied straight into the destination plane (as build_conv_state does): a
         //   ggml_cont() per plane would materialise K extra state_cols*channels*n_seqs temporaries in every
         //   recurrent layer of every graph, which is pure per-decode overhead.
-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        const int64_t K_write = std::min<int64_t>(ubatch.n_seq_tokens, (int64_t) ubatch.rs_rollback_depth + 1);
 
-        for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - state_cols - K + t);
-            const int64_t s_slot = K - t;
-
+        for (int64_t slot = 0; slot < K_write; ++slot) {
             ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
                     state_cols, channels, n_seqs,
                     conv_input->nb[1], conv_input->nb[2],
-                    ggml_row_size(conv_input->type, s_idx));
+                    ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols - slot));
 
             ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
                     state_cols * channels, n_seqs,
                     conv_states_all->nb[1],
-                    ((size_t) s_slot * mem_size + kv_head) * row_size);
+                    ((size_t) slot * mem_size + kv_head) * row_size);
 
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
         }

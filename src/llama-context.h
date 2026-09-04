@@ -118,6 +118,7 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+    void set_rs_rollback_depth(uint32_t depth);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -280,6 +281,8 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    uint32_t rs_rollback_depth = 0;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

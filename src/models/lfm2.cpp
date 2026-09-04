@@ -205,7 +205,7 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
         GGML_ASSERT(bx->ne[0] > conv->ne[0]);
 
         // write conv states: slot 0 = the final state, slot s = the state s tokens back (partial rollback)
-        const int64_t K         = hparams.causal_attn && cparams.n_rs_seq > 0 ? (int64_t) cparams.n_rs_seq + 1 : 1;
+        const int64_t K         = hparams.causal_attn ? (int64_t) ubatch.rs_rollback_depth + 1 : 1;
         const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
         const auto    mem_size  = mctx_cur->get_size();
         const size_t  row_size  = ggml_row_size(conv_state->type, (int64_t) d_conv * n_embd);

@@ -17,11 +17,12 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
     return llama_init_from_model(model, cparams);
 }
 
-static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
+static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count, uint32_t rs_rollback_depth = 0) {
     llama_batch batch = llama_batch_init(count, 0, 1);
     for (uint32_t pos = 0; pos < count; ++pos) {
         common_batch_add(batch, tokens[pos], pos, { 0 }, pos + 1 == count);
     }
+    llama_set_rs_rollback_depth(ctx, rs_rollback_depth);
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
     return ok;
@@ -47,6 +48,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     constexpr uint32_t  n_rollback = 3;
     constexpr uint32_t  n_replay   = 40; // > n_ubatch so each seq spans multiple ubatches
     constexpr llama_pos p0         = n_prompt - n_rollback;
+    constexpr llama_pos p_mandatory = p0 - 1;
 
     const auto make_ctx_multi = [&]() {
         auto cparams = common_context_params_to_llama(params);
@@ -83,20 +85,24 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
 
     bool ok = true;
 
-    // both contexts decode the identical [0, p0) prefill; only ctx_roll decodes
-    // the tail, which is then rolled back so its restore is pending at replay
+    // Both contexts decode the identical prefix. The reference then decodes the mandatory token, while the rollback context decodes it with the speculative tail.
     for (uint32_t s = 0; s < n_seqs && ok; ++s) {
         llama_batch batch = llama_batch_init(n_prompt, 0, 1);
-        for (llama_pos pos = 0; pos < (llama_pos) p0; ++pos) {
+        for (llama_pos pos = 0; pos < p_mandatory; ++pos) {
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
         ok = ok && llama_decode(ctx_roll, batch) == 0;
         ok = ok && llama_decode(ctx_ref,  batch) == 0;
 
         common_batch_clear(batch);
-        for (llama_pos pos = p0; pos < (llama_pos) n_prompt; ++pos) {
+        common_batch_add(batch, tok(s, p_mandatory), p_mandatory, { (llama_seq_id) s }, false);
+        ok = ok && llama_decode(ctx_ref, batch) == 0;
+
+        common_batch_clear(batch);
+        for (llama_pos pos = p_mandatory; pos < (llama_pos) n_prompt; ++pos) {
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
+        llama_set_rs_rollback_depth(ctx_roll, n_rollback);
         ok = ok && llama_decode(ctx_roll, batch) == 0;
         llama_batch_free(batch);
 
@@ -277,7 +283,7 @@ int main(int argc, char ** argv) {
     // Decode the full prompt on the source, then roll back three positions.
     // Replaying them crosses DSV4's ratio-4 compressor boundary.
     // Rollback leaves the recurrent memory in a snapshot state (rs_idx != 0).
-    if (!decode_tokens(ctx_src, tokens, n_tokens)) {
+    if (!decode_tokens(ctx_src, tokens, n_tokens, n_rollback)) {
         fprintf(stderr, "%s : failed to decode prompt\n", __func__);
         return 1;
     }
@@ -290,6 +296,10 @@ int main(int argc, char ** argv) {
     common_prompt_checkpoint ckpt;
     ckpt.update_tgt(ctx_src, 0, 0);
     ckpt.load_tgt(ctx_dst, 0, 0);
+
+    constexpr llama_state_seq_flags partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    common_prompt_checkpoint ckpt_partial;
+    ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
 
     constexpr float eps = 1e-5f;
     std::vector<std::vector<float>> logits_src_replay(n_rollback);
@@ -324,15 +334,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
-        !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
-        fprintf(stderr, "%s : partial rollback failed\n", __func__);
+    if (llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
+        llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
+        fprintf(stderr, "%s : rollback with stale snapshot planes was not refused\n", __func__);
         return 1;
     }
 
-    constexpr llama_state_seq_flags partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-    common_prompt_checkpoint ckpt_partial;
-    ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
+    ckpt_partial.load_tgt(ctx_src, 0, partial_flags);
     ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
 
     if (!replay_and_compare("partial")) {
@@ -355,7 +363,7 @@ int main(int argc, char ** argv) {
             t = 0;
         }
     }
-    if (!decode_tokens(ctx_dirty, noise, n_tokens)) {
+    if (!decode_tokens(ctx_dirty, noise, n_tokens, n_rollback)) {
         fprintf(stderr, "%s : dirty prompt decode failed\n", __func__);
         return 1;
     }

@@ -3521,7 +3521,20 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    // [TAG_RECURRENT_ROLLBACK_SPLITS]
+                    // a bounded (recurrent) context only keeps the snapshot planes that the last ubatch of this
+                    //   sequence wrote, so a deeper trim is refused - the only safe fallback is to drop the
+                    //   sequence and reprocess the whole prompt
+                    if (!slot.mem.seq_rm_try(slot.id, p0, -1)) {
+                        SLT_WRN(slot, "partial memory removal refused at pos %d - reprocessing the whole prompt\n", p0);
+
+                        slot.mem.seq_rm(slot.id, -1, -1);
+
+                        slot.prompt.tokens.keep_first(0);
+                        slot.prompt.checkpoints.clear();
+
+                        slot.stats.n_prompt_cached = 0;
+                    }
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -3751,14 +3764,31 @@ private:
         }
 
         bool has_output = false;
+
+        // [TAG_RECURRENT_ROLLBACK_SPLITS]
+        // active recurrent-state rollback depth of this decode: a verification round can reject at most
+        //   spec_draft.size() - spec_n_committed of its tokens, prompt and plain rounds never roll back and
+        //   have an empty spec_draft -> depth 0. One decode can carry several slots, so the depth passed to
+        //   llama_decode() is the maximum over the slots in this view; the memory still records the number of
+        //   planes each sequence actually got, so a seq_rm deeper than that is refused per sequence.
+        uint32_t rs_depth = 0;
+
+        const uint32_t rs_depth_max = llama_n_rs_seq(ctx_tgt);
+
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
+
+            const auto & slot = slots[batch.tokens[i].id_slot];
+            GGML_ASSERT(slot.spec_n_committed <= slot.spec_draft.size());
+
+            rs_depth = std::max(rs_depth, (uint32_t) std::min<size_t>(slot.spec_draft.size() - slot.spec_n_committed, rs_depth_max));
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            llama_set_rs_rollback_depth(ctx_tgt, rs_depth);
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);

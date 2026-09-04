@@ -216,6 +216,7 @@ bool llama_batch_allocr::init(
             /*.n_seqs       =*/ (uint32_t) batch.n_tokens,
             /*.n_seqs_unq   =*/ (uint32_t) this->seq_id_unq.size(),
             /*.n_pos        =*/ n_pos_per_embd,
+            /*.rs_rollback_depth =*/ rs_rollback_depth,
             /*.token        =*/ batch.token,
             /*.embd         =*/ batch.embd,
             /*.pos          =*/ batch.pos,
@@ -421,6 +422,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.n_seqs       =*/ n_seqs,
         /*.n_seqs_unq   =*/ n_seqs,
         /*.n_pos        =*/ n_pos_per_embd,
+        /*.rs_rollback_depth =*/ rs_rollback_depth,
 
         /*.token        =*/ udata->token.data(),
         /*.embd         =*/ nullptr,
@@ -450,6 +452,14 @@ uint32_t llama_batch_allocr::get_n_outputs() const {
 
 uint32_t llama_batch_allocr::get_n_used() const {
     return n_used;
+}
+
+void llama_batch_allocr::set_rs_rollback_depth(uint32_t depth) {
+    rs_rollback_depth = depth;
+}
+
+uint32_t llama_batch_allocr::get_rs_rollback_depth() const {
+    return rs_rollback_depth;
 }
 
 std::vector<int32_t> & llama_batch_allocr::get_out_ids() {
@@ -822,6 +832,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_seqs       =*/ n_seqs,
         /*.n_seqs_unq   =*/ (uint32_t) udata->seq_id_unq.size(),
         /*.n_pos        =*/ n_pos_per_embd,
+        /*.rs_rollback_depth =*/ rs_rollback_depth,
 
         /*.token        =*/ batch.token ? udata->token.data() : nullptr,
         /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
@@ -850,6 +861,7 @@ void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
         LLAMA_LOG_DEBUG("%s:   n_seq_tokens = %d\n", __func__, ubatch.n_seq_tokens);
         LLAMA_LOG_DEBUG("%s:   n_seqs       = %d\n", __func__, ubatch.n_seqs);
         LLAMA_LOG_DEBUG("%s:   n_seqs_unq   = %d\n", __func__, ubatch.n_seqs_unq);
+        LLAMA_LOG_DEBUG("%s:   rs_depth     = %d\n", __func__, ubatch.rs_rollback_depth);
 
         std::stringstream ss_seq_id_unq;
         std::stringstream ss_seq_idx;

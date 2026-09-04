@@ -991,6 +991,10 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // Set the recurrent-state rollback depth for the next llama_decode() call. The value is consumed by that call and clamped to llama_n_rs_seq().
+    // Use 0 when rollback is not needed. For a batch with multiple sequences, pass the maximum depth required by any sequence.
+    LLAMA_API void llama_set_rs_rollback_depth(struct llama_context * ctx, uint32_t depth);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

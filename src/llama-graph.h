@@ -819,6 +819,8 @@ struct llm_graph_params {
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
+            // rollback depth changes the number of snapshot nodes and tensor dimensions
+            ubatch.rs_rollback_depth == other.ubatch.rs_rollback_depth &&
             (
                 (!ubatch.token && !other.ubatch.token) ||
                 (!ubatch.embd  && !other.ubatch.embd)  ||

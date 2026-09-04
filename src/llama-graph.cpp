@@ -1491,6 +1491,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
+        GGML_ASSERT(ubatch.rs_rollback_depth <= cparams.n_rs_seq);
         res->set_params(params);
     }
 

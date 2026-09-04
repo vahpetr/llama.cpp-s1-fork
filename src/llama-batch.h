@@ -36,6 +36,7 @@ struct llama_ubatch {
     uint32_t n_seqs;       // sequence sets in the ubatch
     uint32_t n_seqs_unq;   // unique sequence ids in the ubatch
     uint32_t n_pos;        // number of position inputs for each token/embedding
+    uint32_t rs_rollback_depth; // active recurrent-state rollback depth
 
     // seq_id_unq: unique sequence ids in the ubatch
     // seq_idx:    indices of the unique sequence ids in the ubatch in [0, n_seqs_unq)
@@ -89,6 +90,9 @@ public:
     uint32_t get_n_outputs() const;
     uint32_t get_n_used()    const;
 
+    void set_rs_rollback_depth(uint32_t depth);
+    uint32_t get_rs_rollback_depth() const;
+
     // the array of output indices in the order they were encountered during the ubatch splitting
     std::vector<int32_t> & get_out_ids();
 
@@ -136,6 +140,7 @@ private:
     uint32_t n_embd;
     uint32_t n_seq_max;
     uint32_t n_outputs;
+    uint32_t rs_rollback_depth = 0;
 
     std::array<llama_seq_id, 1> seq_id_0 = {{ 0 }}; // default sequence id
 

@@ -82,11 +82,10 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 const bool unified = (mem_attn->get_n_stream() == 1);
 
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
-                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
-                //   so that the rollback snapshots remain valid
-                const uint32_t n_rs_seq = mem_recr->n_rs_seq;
-
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // the trailing (1 + rs_rollback_depth) tokens of each seq must stay in the same ubatch,
+                //   so that every rollback plane the graph writes for it stays valid
+                const uint32_t rs_depth = balloc.get_rs_rollback_depth();
+                ubatch = balloc.split_equal(n_ubatch, !unified, rs_depth > 0 ? rs_depth + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {

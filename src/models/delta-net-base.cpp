@@ -458,7 +458,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     const auto kv_head  = mctx_cur->get_head();
     const auto mem_size = mctx_cur->get_size();
 
-    const int64_t n_seqs = ubatch.n_seqs;
+    const int64_t n_seqs       = ubatch.n_seqs;
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
@@ -476,9 +477,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (cparams.n_rs_seq == 0) {
-        const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
-        const int64_t s_slot = 0;
+    // [TAG_RECURRENT_ROLLBACK_SPLITS]
+    // plane 0 is the final state, plane s the state s tokens back; only the planes this ubatch writes are valid,
+    //   which is why the memory records K_write - 1 as the sequence's valid rollback depth after the ubatch
+    const int64_t K_write = std::min<int64_t>(n_seq_tokens, (int64_t) ubatch.rs_rollback_depth + 1);
+
+    for (int64_t slot = 0; slot < K_write; ++slot) {
+        const int64_t s_idx = conv_input->ne[0] - conv_states->ne[0] - slot;
 
         ggml_tensor * conv_state_last =
             ggml_view_3d(ctx0, conv_input,
@@ -488,37 +493,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         cb(conv_state_last, "conv_state_last", il);
 
         ggml_tensor * conv_state_update =
-            ggml_view_2d(ctx0, conv_states_all,
-                    row_count, n_seqs, conv_states_all->nb[1],
-                    (s_slot * mem_size + kv_head) * row_size);
+            ggml_view_2d(ctx0,
+                    conv_states_all, row_count, n_seqs,
+                    conv_states_all->nb[1],
+                    ((size_t) slot * mem_size + kv_head) * row_size);
         cb(conv_state_update, "conv_state_update", il);
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
-    } else {
-        // [TAG_RECURRENT_ROLLBACK_SPLITS]
-        // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
-        //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
-
-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
-
-        for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
-            const int64_t s_slot = K - t;
-
-            ggml_tensor * conv_state_last =
-                ggml_view_3d(ctx0, conv_input,
-                        conv_kernel_size - 1, conv_channels, n_seqs,
-                        conv_input->nb[1], conv_input->nb[2],
-                        ggml_row_size(conv_input->type, s_idx));
-
-            ggml_tensor * conv_state_update =
-                ggml_view_2d(ctx0,
-                        conv_states_all, row_count, n_seqs,
-                        conv_states_all->nb[1],
-                        (s_slot * mem_size + kv_head) * row_size);
-
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
-        }
     }
 
     return conv_input;
@@ -543,6 +524,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
+    // [TAG_RECURRENT_ROLLBACK_SPLITS]
+    // the snapshot path is selected by the context (n_rs_seq > 0), never by the active depth: a context must use
+    //   the same GDN implementation for every decode - only the number of planes it writes varies with the depth
     const bool keep = cparams.n_rs_seq > 0;
 
     if (!keep) {
@@ -561,7 +545,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
-    const int64_t K = cparams.n_rs_seq + 1;
+
+    // active plane count: plane 0 is the final state, plane d the state d tokens back (rollback depth d)
+    const int64_t K = (int64_t) ubatch.rs_rollback_depth + 1;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
@@ -584,7 +570,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
-    // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
+    // K_write = min(n_seq_tokens, K): the op writes that many snapshots, the trailing slots are left unwritten.
+    //   Plane 0 (the final state) is always written; the memory records K_write - 1 as the sequence's valid
+    //   rollback depth, so a deeper seq_rm is refused instead of reading a plane from an older ubatch.
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
 
     // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)

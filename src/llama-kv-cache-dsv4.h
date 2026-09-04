@@ -151,6 +151,7 @@ public:
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
+    void set_rs_valid_depth(const llama_ubatch & ubatch);
 
 private:
     llama_hparams hparams_raw;
@@ -162,6 +163,7 @@ private:
     const uint32_t n_rs_seq;
 
     std::vector<uint32_t> rs_idx;
+    std::vector<uint32_t> rs_valid_depth;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
@@ -373,6 +375,7 @@ public:
 
 private:
     size_t i_next = 0;
+    llama_kv_cache_dsv4 * kv = nullptr;
 
     std::vector<llama_ubatch> ubatches;
 

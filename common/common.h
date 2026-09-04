@@ -1003,6 +1003,10 @@ struct common_memory {
 
     // aborts execution on failure
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+
+    // like seq_rm(), but returns false instead of aborting when a context refuses the removal - e.g. a recurrent
+    //   context asked to roll back deeper than the snapshot planes its last ubatch wrote for this sequence
+    bool seq_rm_try(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
 };

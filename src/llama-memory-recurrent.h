@@ -75,8 +75,11 @@ public:
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
+    // valid rollback planes written by the last ubatch for each seq
+    std::vector<uint32_t> rs_valid_depth;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+    void set_rs_valid_depth(llama_seq_id seq_id, uint32_t depth);
 
     // computed before each graph build
     uint32_t n = 0;

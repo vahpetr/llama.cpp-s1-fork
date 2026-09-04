@@ -34,6 +34,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rs_valid_depth.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -156,6 +157,7 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -177,6 +179,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
         set_rs_idx(seq_id, 0);
+        set_rs_valid_depth(seq_id, 0);
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -195,7 +198,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                // planes deeper than rs_valid_depth were not written by the last ubatch of this seq (they still
+                //   hold snapshots of an older one), so refuse instead of restoring a stale state - the caller
+                //   then falls back to its checkpoint/replay path
+                if (!pending && rollback >= 1 && rollback <= (llama_pos) rs_valid_depth[seq_id]) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -205,6 +211,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
                 tail_id = -1;
+                set_rs_idx(seq_id, 0);
+                set_rs_valid_depth(seq_id, 0);
             }
         }
     } else {
@@ -260,6 +268,9 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
     }
 
     if ((uint32_t) seq_id_dst < size && (uint32_t) seq_id_src < size) {
+        set_rs_idx(seq_id_dst, 0);
+        set_rs_valid_depth(seq_id_dst, 0);
+
         auto & tail_src = cells[seq_id_src];
         auto & tail_dst = cells[seq_id_dst];
         if (tail_dst.tail >= 0) {
@@ -289,6 +300,8 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     for (uint32_t i = 0; i < size; ++i) {
         if ((llama_seq_id) i != seq_id) {
             cells[i].tail = -1;
+            set_rs_idx(i, 0);
+            set_rs_valid_depth(i, 0);
         }
 
         if (!cells[i].has_seq_id(seq_id)) {
@@ -417,6 +430,20 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     rs_idx[seq_id] = idx;
 }
 
+void llama_memory_recurrent::set_rs_valid_depth(llama_seq_id seq_id, uint32_t depth) {
+    if (seq_id < 0) {
+        std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
+        return;
+    }
+
+    assert(n_seq_max == rs_valid_depth.size());
+
+    GGML_ASSERT((uint32_t) seq_id < n_seq_max);
+    GGML_ASSERT(depth <= n_rs_seq);
+
+    rs_valid_depth[seq_id] = depth;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {
@@ -440,9 +467,10 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // TODO: non-sequential equal split can be done if using unified KV cache
                 //       for simplicity, we always use sequential equal split for now
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
-                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
-                //   so that the rollback snapshots remain valid
-                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // the trailing (1 + rs_rollback_depth) tokens of each seq must stay in the same ubatch,
+                //   so that every rollback plane the graph writes for it stays valid
+                const uint32_t rs_depth = balloc.get_rs_rollback_depth();
+                ubatch = balloc.split_equal(n_ubatch, true, rs_depth > 0 ? rs_depth + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -873,6 +901,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     if (n_rs_seq != 0) {
         set_rs_idx(seq_id, 0);
+        set_rs_valid_depth(seq_id, 0);
     }
 }
 
@@ -1261,7 +1290,17 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    const auto & ubatch = ubatches[i_next];
+
+    mem->find_slot(ubatch);
+
+    // [TAG_RECURRENT_ROLLBACK_SPLITS]
+    // this ubatch writes K_write = min(n_seq_tokens, rs_rollback_depth + 1) planes for each of its sequences
+    //   (plane 0 = the final state), so K_write - 1 is the deepest rollback a later seq_rm may accept
+    const uint32_t valid_depth = std::min(ubatch.rs_rollback_depth, ubatch.n_seq_tokens - 1);
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        mem->set_rs_valid_depth(ubatch.seq_id_unq[s], valid_depth);
+    }
 
     return true;
 }

@@ -183,7 +183,7 @@ static ggml_tensor * bailingmoe3_causal_conv1d(
         int64_t n_tokens,
         int64_t cache_head,
         uint32_t mem_size,
-        uint32_t n_rs_seq) {
+        uint32_t rs_rollback_depth) {
     const int64_t d_inner = head_dim * n_head;
     const int64_t conv_state_size = (d_conv - 1) * d_inner;
     const int64_t total_state_size = 3 * conv_state_size;
@@ -197,7 +197,7 @@ static ggml_tensor * bailingmoe3_causal_conv1d(
     x_proj = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
     ggml_tensor * conv_x = ggml_concat(ctx0, conv_state, ggml_transpose(ctx0, x_proj), 0);
 
-    const int64_t K = (int64_t) n_rs_seq + 1;
+    const int64_t K = (int64_t) rs_rollback_depth + 1;
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
 
     for (int64_t slot = 0; slot < n_written; ++slot) {
@@ -262,13 +262,13 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
 
             ggml_tensor * q = bailingmoe3_causal_conv1d(
                     gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv,
-                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, cparams.n_rs_seq);
+                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, ubatch.rs_rollback_depth);
             ggml_tensor * k = bailingmoe3_causal_conv1d(
                     gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv,
-                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, cparams.n_rs_seq);
+                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, ubatch.rs_rollback_depth);
             ggml_tensor * v = bailingmoe3_causal_conv1d(
                     gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv,
-                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, cparams.n_rs_seq);
+                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, cache_head, mem_size, ubatch.rs_rollback_depth);
 
             ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
             gate = ggml_add(ctx0, gate, layer.ssm_dt_b);
