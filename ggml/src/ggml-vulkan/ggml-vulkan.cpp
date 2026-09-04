@@ -178,6 +178,16 @@ static constexpr vk::DeviceQueueCreateFlagBits eInternallySynchronizedKHR = vk::
 #define CEIL_DIV(M, N) (((M) / (N)) + (((M) % (N)) != 0))
 static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 
+// Read a boolean tuning knob from the environment. Unset keeps the default,
+// "0"/"false" disables, anything else enables. Used for A/B-able heuristics.
+static bool ggml_vk_env_flag(const char * name, bool default_value) {
+    const char * val = getenv(name);
+    if (val == nullptr || val[0] == '\0') {
+        return default_value;
+    }
+    return !(strcmp(val, "0") == 0 || strcmp(val, "false") == 0 || strcmp(val, "FALSE") == 0);
+}
+
 #define VK_VENDOR_ID_AMD 0x1002
 #define VK_VENDOR_ID_APPLE 0x106b
 #define VK_VENDOR_ID_INTEL 0x8086
@@ -10259,10 +10269,32 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, nei1, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
+    // Tile selection hint for the N (routed-row) dimension.
+    //
+    // mul_mm.comp with MUL_MAT_ID handles one expert per workgroup in Z and one
+    // BN-sized tile of *that expert's* routed rows per workgroup in Y. The rows
+    // an expert actually receives are nei0*nei1 assignments spread over n_as
+    // experts, not nei1. Feeding the full nei1 to the pipeline selector picks
+    // the BN=128 tile even when an expert averages ~10 routed rows (512-expert
+    // top-10 MoE at ubatch 512), so the cooperative-matrix tile spends most of
+    // its work on empty columns. Select the tile from the estimated rows per
+    // expert instead; the dispatch still uses the real nei1, and experts that
+    // receive more than BN rows simply get more Y workgroups (the shader
+    // already loops row_ids per tile and early-outs on empty tiles).
+    // GGML_VK_MMID_EST=0 restores the old nei1-based selection for A/B tests.
+    static const bool mmid_tile_est = ggml_vk_env_flag("GGML_VK_MMID_EST", true);
+    uint64_t n_tile = nei1;
+    if (mmid_tile_est && n_as > 1) {
+        // never larger than the old hint, and at least one row
+        n_tile = std::min<uint64_t>(nei1, std::max<uint64_t>(1, CEIL_DIV(nei0 * nei1, n_as)));
+    }
+
+    // aligned/kpad keep using the same hint as the pipeline selection so that
+    // the alignment we pad K to belongs to the pipeline we actually dispatch.
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, n_tile, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, n_tile, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
