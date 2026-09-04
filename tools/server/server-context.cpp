@@ -428,6 +428,68 @@ struct server_slot {
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
+    // --- adaptive draft length (--spec-draft-n-max-adaptive) ------------------------------------
+    //
+    // Cost model, measured on this target (docs/verification/2026-09-03-spec-replay-census.md §11):
+    // a verification decode of D+1 tokens costs t_dec + D*t_tok (31.5 ms + ~6 ms/token on the prod
+    // GGUF), while every accepted draft token saves a whole plain decode (t_dec).
+    // Drafting position d (1-based) costs t_tok unconditionally, but it only pays off when the whole
+    // prefix 1..d is accepted, i.e. with probability P_d = prod_{i<=d} p_i, where
+    // p_i = P(pos i accepted | 1..i-1 accepted). So we draft the longest prefix whose marginal value
+    // is positive: P_d * t_dec > t_tok  (with the default costs: P_d > 0.16).
+    // p_i is estimated per slot as an EMA over this slot's verification rounds (window ~32,
+    // alpha = 1/32), initialized optimistically at 1.0, so a slot drafts the configured n-max until
+    // its own acceptance says otherwise, and re-adapts within ~32 rounds when the text changes kind.
+    // The result is clamped to [1, configured n-max].
+    //
+    // Quality: this only changes HOW MANY tokens are drafted. Verification and acceptance are
+    // untouched (greedy accept-if-equal at temp 0, unchanged rejection sampling above it), so the
+    // emitted distribution is unchanged; only the round structure differs.
+    std::vector<float> spec_acc_ema;    // p_i per draft position, EMA
+    int                spec_n_max_last = 0; // last adaptive draft length (trace only)
+
+    static constexpr float SPEC_ACC_EMA_ALPHA = 1.0f/32.0f;
+
+    // update the per-position conditional acceptance from one verification round
+    void spec_acc_update(size_t n_draft, size_t n_accepted, int n_max_cfg) {
+        if (n_draft == 0 || n_max_cfg <= 0) {
+            return;
+        }
+
+        if (spec_acc_ema.empty()) {
+            spec_acc_ema.assign(n_max_cfg, 1.0f);
+        }
+
+        // positions 0..n_accepted-1 were accepted; position n_accepted (if it was drafted) was
+        // rejected. positions after a rejection are not observed - they follow a broken prefix.
+        for (size_t i = 0; i < n_draft && i <= n_accepted && i < spec_acc_ema.size(); ++i) {
+            const float obs = (i < n_accepted) ? 1.0f : 0.0f;
+            spec_acc_ema[i] += SPEC_ACC_EMA_ALPHA * (obs - spec_acc_ema[i]);
+        }
+    }
+
+    // the draft length to use for the next round, in [1, n_max_cfg]
+    int spec_n_max_adaptive(int n_max_cfg, float t_tok, float t_dec, float * p_cum_out = nullptr) const {
+        float p_cum = 1.0f;
+        int   d     = 0;
+
+        for (int i = 0; i < n_max_cfg; ++i) {
+            p_cum *= (i < (int) spec_acc_ema.size()) ? spec_acc_ema[i] : 1.0f;
+
+            if (p_cum * t_dec <= t_tok) {
+                break; // the marginal value of drafting this position is negative
+            }
+
+            d = i + 1;
+        }
+
+        if (p_cum_out) {
+            *p_cum_out = p_cum;
+        }
+
+        return std::max(1, d);
+    }
+
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
@@ -464,6 +526,8 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        spec_acc_ema.clear();
+        spec_n_max_last = 0;
 
         n_predict_max = -1;
 
@@ -3101,9 +3165,33 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        int n_draft_req = n_draft_max;
+
+                        if (params_base.speculative.draft.n_max_adaptive) {
+                            const auto & dparams = params_base.speculative.draft;
+
+                            float p_cum = 1.0f;
+                            const int n_adapt = slot.spec_n_max_adaptive(
+                                    common_speculative_n_max(spec.get()),
+                                    dparams.n_max_adaptive_t_tok, dparams.n_max_adaptive_t_dec, &p_cum);
+
+                            n_draft_req = std::min(n_draft_req, n_adapt);
+
+                            if (trace > 0 && n_adapt != slot.spec_n_max_last) {
+                                std::string ema;
+                                for (size_t i = 0; i < slot.spec_acc_ema.size(); ++i) {
+                                    ema += string_format(i ? " %.3f" : "%.3f", slot.spec_acc_ema[i]);
+                                }
+                                SLT_INF(slot, "adaptive draft len: %d -> %d (p_cum %.3f, ema [%s])\n",
+                                        slot.spec_n_max_last, n_adapt, p_cum, ema.c_str());
+                            }
+
+                            slot.spec_n_max_last = n_adapt;
+                        }
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
+                            /* .n_max    = */ n_draft_req,
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
@@ -4094,6 +4182,7 @@ private:
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
+            const bool was_replay = slot.spec_is_replay;
             if (slot.spec_is_replay && n_accepted > 0) {
                 n_accepted--;
             }
@@ -4112,6 +4201,12 @@ private:
             }
             for (size_t i = 0; i < n_accepted && i < n_accepted_per_pos.size(); ++i) {
                 n_accepted_per_pos[i]++;
+            }
+
+            // adaptive draft length: only fresh drafts carry information about the draft model's
+            // acceptance - a replay round re-decodes tokens that were already accepted
+            if (params_base.speculative.draft.n_max_adaptive && !was_replay) {
+                slot.spec_acc_update(n_draft, n_accepted, common_speculative_n_max(spec.get()));
             }
 
             // add accepted tokens to the prompt
