@@ -587,7 +587,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     //   state in build_rs) is ordered before it, and backends treat that source as written.
     ggml_tensor * gdn_out = ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, dst);
 
-    const bool direct = cache_device_supports(ssm_states_all, gdn_out);
+    // test-only knob: LLAMA_GDN_NO_DIRECT=1 forces the two-step path on a backend that supports the direct
+    //   store, so both paths can be compared with one binary
+    static const bool no_direct = getenv("LLAMA_GDN_NO_DIRECT") != nullptr;
+
+    const bool direct = !no_direct && cache_device_supports(ssm_states_all, gdn_out);
 
     if (!direct) {
         // fallback: K snapshot slots packed into the op output, then one strided copy into the cache
