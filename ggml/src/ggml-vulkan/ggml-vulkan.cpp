@@ -7148,6 +7148,15 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // DMMV_WG_SIZE_LARGE heuristic, so only widen on AMD RDNA by default.
         device->dmmv_manyrows_mul    = (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN) ? 4 : 1;
         device->dmmv_manyrows_min_wg = 512;
+        // A/B knobs: GGML_VK_DMMV_MANYROWS=0|1 disables the variant, >1 overrides the row
+        // multiplier; GGML_VK_DMMV_MANYROWS_MIN_WG overrides how many workgroups the widened
+        // dispatch must keep.  Both are read before the pipelines are initialized.
+        if (const char * s = getenv("GGML_VK_DMMV_MANYROWS")) {
+            device->dmmv_manyrows_mul = std::max(1, atoi(s));
+        }
+        if (const char * s = getenv("GGML_VK_DMMV_MANYROWS_MIN_WG")) {
+            device->dmmv_manyrows_min_wg = std::max(1, atoi(s));
+        }
 
         ggml_vk_load_shaders(device);
 
