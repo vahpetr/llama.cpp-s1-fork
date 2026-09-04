@@ -326,6 +326,12 @@ struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
+    // pick the draft length per slot from the running acceptance instead of always drafting n_max
+    // (server only; see the design note at server_slot::spec_n_max_adaptive())
+    bool  n_max_adaptive       = false;
+    float n_max_adaptive_t_tok = 5.0f;   // ms: cost of ONE extra drafted token in a verification decode
+    float n_max_adaptive_t_dec = 31.0f;  // ms: cost of a plain 1-token decode (what an accepted token saves)
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 

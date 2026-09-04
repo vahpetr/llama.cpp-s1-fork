@@ -4162,6 +4162,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
+        {"--spec-draft-n-max-adaptive"},
+        {"--no-spec-draft-n-max-adaptive"},
+        string_format("adapt the draft length per slot to the running acceptance, capped by --spec-draft-n-max (default: %s)",
+                      params.speculative.draft.n_max_adaptive ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.n_max_adaptive = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_ADAPTIVE"));
+    add_opt(common_arg(
+        {"--spec-draft-n-max-adaptive-cost"}, "T_TOK,T_DEC",
+        string_format("cost model for --spec-draft-n-max-adaptive, in ms: one extra drafted token, one plain decode (default: %.1f,%.1f)",
+                      (double) params.speculative.draft.n_max_adaptive_t_tok, (double) params.speculative.draft.n_max_adaptive_t_dec),
+        [](common_params & params, const std::string & value) {
+            const size_t pos = value.find(',');
+            if (pos == std::string::npos) {
+                throw std::invalid_argument("expected T_TOK,T_DEC");
+            }
+            params.speculative.draft.n_max_adaptive_t_tok = std::stof(value.substr(0, pos));
+            params.speculative.draft.n_max_adaptive_t_dec = std::stof(value.substr(pos + 1));
+            if (params.speculative.draft.n_max_adaptive_t_tok <= 0.0f || params.speculative.draft.n_max_adaptive_t_dec <= 0.0f) {
+                throw std::invalid_argument("costs must be positive");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_ADAPTIVE_COST"));
+    add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {
