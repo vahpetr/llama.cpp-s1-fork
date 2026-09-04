@@ -8818,8 +8818,20 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
         return 1;
     }
 
+    // Split-K normally requires at least a full M tile. Shapes with very few
+    // output rows (q4_K m=4, n=512, k=10240 in the Qwen3-Next prefill graph)
+    // then run as one M tile x n/BN N tiles of very long workgroups, with no
+    // other source of parallelism, so K is the only dimension left to split.
+    // A partial M tile is safe here: mul_mm.comp / mul_mm_cm2.comp / mul_mmq.comp
+    // all clip their stores to p.M, the per-split output region is the dense
+    // [batch][N][M] block that ggml_vk_matmul asserts (batch_stride_d == m*n),
+    // and mul_mat_split_k_reduce.comp only sums m*n*batch elements per split.
+    // GGML_VK_SPLITK_SKINNY=0 restores the full-M-tile requirement.
+    static const bool splitk_skinny = ggml_vk_env_flag("GGML_VK_SPLITK_SKINNY", true);
+    const bool m_ok = m >= pipeline->wg_denoms[0] || (splitk_skinny && k >= 2048);
+
     uint32_t split_k = 1;
-    if (ctx->device->shader_core_count != 0 && m >= pipeline->wg_denoms[0] && n >= pipeline->wg_denoms[1]) {
+    if (ctx->device->shader_core_count != 0 && m_ok && n >= pipeline->wg_denoms[1]) {
         // If k is 'large' and the SMs will fill less than halfway, use split_k.
         uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
         uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
@@ -9349,7 +9361,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
 
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
+    // The split-K partials are written as a dense [split_k][batch][N][M] buffer,
+    // which ggml_vk_matmul asserts as batch_stride_d == m*n. Fall back to a
+    // single K group instead of tripping that assert for a strided dst.
+    const bool dst_rows_dense = (uint64_t)stride_batch_d == ne01 * ne11;
+    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || !dst_rows_dense, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
