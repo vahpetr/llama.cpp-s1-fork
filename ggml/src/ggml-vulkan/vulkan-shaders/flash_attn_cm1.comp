@@ -63,6 +63,11 @@ shared O_TYPEV4 pvsh[MatBc * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
+// ZERO_DEAD_V: per-Bc-column flag "this KV column is mask-suppressed for every row of
+// the Br tile", plus a workgroup-uniform "any such column in this tile".
+shared uint32_t p_dead[Bc];
+shared uint32_t any_dead;
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
@@ -422,6 +427,35 @@ void main() {
         }
         barrier();
 
+        // A KV column whose P entries are all zero contributes nothing to any row of this
+        // tile, so its V values may be replaced by +0 without changing the result.  Doing so
+        // is what makes the result independent of them: coopMatMulAdd on RDNA3 is not
+        // invariant to the sign of a zero product (+0 * V == -0 for V < 0), so a suppressed
+        // column with non-zero V perturbs the accumulator by one ULP.  See ZERO_DEAD_V.
+        if (ZERO_DEAD_V && MASK_ENABLE) {
+            if (tid == 0) {
+                any_dead = 0;
+            }
+            barrier();
+            // Only the first n_valid rows of the tile carry a real query; the padded rows
+            // keep whatever Qf held, so their P is not necessarily zero.
+            const uint32_t n_valid = min(Br, N - i * Br);
+            [[unroll]] for (uint32_t idx = 0; idx < Bc; idx += gl_WorkGroupSize.x) {
+                const uint32_t c = idx + tid;
+                if (c < Bc) {
+                    bool dead = true;
+                    for (uint32_t r = 0; r < n_valid; ++r) {
+                        dead = dead && float(Psh[c * psh_stride + r / 4][r % 4]) == 0.0f;
+                    }
+                    p_dead[c] = dead ? 1 : 0;
+                    if (dead) {
+                        atomicOr(any_dead, 1u);
+                    }
+                }
+            }
+            barrier();
+        }
+
         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
 
         // Each subgroup handles HSV/4 columns
@@ -439,10 +473,12 @@ void main() {
             // If not, V is loaded directly from global memory if aligned, otherwise
             // staged through a Bc * MatBr size staging buffer.
             // If V is a quant type, then it is always staged for dequantization.
-            if (SHMEM_STAGING == 0) {
             // For quants we always preload via kvsh. For f16/bf16 we only preload when
-            // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
-            const bool stage_v = USE_DECODE_V || KV_bounds_check;
+            // alignment / bounds force it, or when this Bc tile has mask-suppressed columns
+            // whose V has to be replaced by +0 (ZERO_DEAD_V).
+            const bool stage_v = USE_DECODE_V || KV_bounds_check ||
+                                 (ZERO_DEAD_V && MASK_ENABLE && any_dead != 0);
+            if (SHMEM_STAGING == 0) {
             if (stage_v) {
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                     const uint idx = i * gl_WorkGroupSize.x + tid;
@@ -456,7 +492,9 @@ void main() {
                     const uint ib = coord / BLOCK_SIZE_V;
                     const uint iqs = coord % BLOCK_SIZE_V;
 
-                    if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
+                    if (ZERO_DEAD_V && MASK_ENABLE && p_dead[row] != 0) {
+                        kvsh[row * vsh_stride + col] = FLOAT_TYPEV4(0.0f);
+                    } else if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
@@ -480,7 +518,7 @@ void main() {
                     coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
 
                     if (SHMEM_STAGING == 0) {
-                    if (!USE_DECODE_V && !KV_bounds_check) {
+                    if (!stage_v) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
