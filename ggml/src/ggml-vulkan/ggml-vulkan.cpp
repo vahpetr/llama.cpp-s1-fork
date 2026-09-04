@@ -1888,13 +1888,13 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t H;
     uint32_t n_tokens;
     uint32_t n_seqs;
-    uint32_t s_off;
     uint32_t sq1, sq2, sq3;
     uint32_t sv1, sv2, sv3;
     uint32_t sb1, sb2, sb3;
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t so_off, so1, so2; // state snapshot destination (binding 7), see gated_delta_net.comp
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -5959,7 +5959,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
@@ -8166,6 +8166,13 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
     size += misalign_bytes;
 
     return vk_subbuffer{buffer, offset, size};
+}
+
+// Storage that a node writes through one of its *sources* instead of through its own tensor. Currently only
+// ggml_gated_delta_net_ext (src[6] is the destination of the state snapshots, see ggml.h). Both the graph
+// reordering and the memory-hazard tracking below have to treat it as a write, not as a read.
+static const ggml_tensor * ggml_vk_mutated_src(const ggml_tensor * node) {
+    return node->op == GGML_OP_GATED_DELTA_NET ? node->src[6] : nullptr;
 }
 
 // Get a command buffer from pool. Create a new one if no reusable buffer is available
@@ -12894,7 +12901,10 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const uint32_t K = (uint32_t)ggml_get_op_params_i32(dst, 0);
 
-    const uint32_t s_off = S_v * H * n_tokens * n_seqs;
+    // src[6] (optional) is the direct-store destination for the K state snapshots: the op writes through it
+    //   (see ggml_gated_delta_net_ext). Without it the snapshots are packed into dst after the attention
+    //   scores, which the shader reaches through the same binding with the packed strides.
+    const ggml_tensor * dst_state = dst->src[6];
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
@@ -12906,6 +12916,19 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     for (int i = 0; i < 6; i++) {
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
     }
+
+    // the state destination is misalign-tolerant: the shader indexes it in floats from so_off
+    vk_subbuffer dst_state_buf = dst_state ? ggml_vk_tensor_subbuffer(ctx, dst_state, true) : dst_buf;
+
+    const uint32_t so_off = dst_state
+        ? (uint32_t)(get_misalign_bytes(ctx, dst_state) / sizeof(float))
+        : S_v * H * n_tokens * n_seqs;
+    const uint32_t so1 = dst_state
+        ? (uint32_t)(dst_state->nb[1] / sizeof(float))
+        : S_v * S_v * H;
+    const uint32_t so2 = dst_state
+        ? (uint32_t)(dst_state->nb[2] / sizeof(float))
+        : S_v * S_v * H * n_seqs;
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
     const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
@@ -12922,17 +12945,18 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
 
     const float scale = 1.0f / sqrtf((float)S_v);
     const vk_op_gated_delta_net_push_constants pc = {
-        H, n_tokens, n_seqs, s_off,
+        H, n_tokens, n_seqs,
         sq1, sq2, sq3,
         sv1, sv2, sv3,
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        so_off, so1, so2
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, dst_state_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -15609,6 +15633,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                     break;
                 }
             }
+            // A source the node writes through (ggml_gated_delta_net_ext) also conflicts with earlier reads.
+            const ggml_tensor * mut = ggml_vk_mutated_src(cur_node);
+            if (mut && overlaps_unsynced(mut, ctx->unsynced_nodes_read)) {
+                need_sync = true;
+                break;
+            }
         }
 
         if (need_sync) {
@@ -15637,6 +15667,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                     continue;
                 }
                 ctx->unsynced_nodes_read.push_back(cur_node->src[j]);
+            }
+            if (const ggml_tensor * mut = ggml_vk_mutated_src(cur_node)) {
+                ctx->unsynced_nodes_written.push_back(mut);
             }
         }
     }
@@ -17788,6 +17821,8 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         auto const &base = [](const ggml_tensor * tensor) {
             return tensor->view_src ? tensor->view_src : tensor;
         };
+        const ggml_tensor * dst_mut = ggml_vk_mutated_src(dst);
+        const ggml_tensor * src_mut = ggml_vk_mutated_src(src);
         for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
             if (dst->src[s] == src) {
                 return true;
@@ -17796,16 +17831,24 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 continue;
             }
             // A source view of dst may read storage written through a different view by src.
-            if (dst->src[s] && base(dst->src[s]) == base(src)) {
+            if (dst->src[s] && (base(dst->src[s]) == base(src) ||
+                                (src_mut && base(dst->src[s]) == base(src_mut)))) {
                 return true;
             }
             // Moving dst forward may overwrite storage still read through a view by src.
-            if (src->src[s] && base(dst) == base(src->src[s])) {
+            if (src->src[s] && (base(dst) == base(src->src[s]) ||
+                                (dst_mut && base(dst_mut) == base(src->src[s])))) {
                 return true;
             }
         }
         // implicit dependency if they view the same tensor
         if (base(dst) == base(src)) {
+            return true;
+        }
+        if (src_mut && base(dst) == base(src_mut)) {
+            return true;
+        }
+        if (dst_mut && (base(dst_mut) == base(src) || (src_mut && base(dst_mut) == base(src_mut)))) {
             return true;
         }
         return false;
@@ -18851,6 +18894,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
                 }
+                // optional direct-store destination, see ggml_gated_delta_net_ext
+                if (op->src[6] && (op->src[6]->type != GGML_TYPE_F32 ||
+                                   op->src[6]->nb[0] != sizeof(float) ||
+                                   op->src[6]->nb[1] % sizeof(float) != 0 ||
+                                   op->src[6]->nb[2] % sizeof(float) != 0)) {
+                    return false;
+                }
                 return op->type == GGML_TYPE_F32;
             }
         case GGML_OP_SSM_SCAN:
@@ -19852,9 +19902,14 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
         } else if (tensor->op == GGML_OP_LIGHTNING_INDEXER) {
             tensor_clone = ggml_lightning_indexer(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
         } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
-            tensor_clone = ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
-            src_clone[2], src_clone[3], src_clone[4], src_clone[5],
-            ggml_get_op_params_i32(tensor, 0));
+            // note: with a direct-store destination only the attention scores are in the result; the
+            //   snapshots land in the cloned src[6] and are not compared here
+            tensor_clone = src_clone[6]
+                ? ggml_gated_delta_net_ext(ggml_ctx, src_clone[0], src_clone[1],
+                    src_clone[2], src_clone[3], src_clone[4], src_clone[5], src_clone[6])
+                : ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
+                    src_clone[2], src_clone[3], src_clone[4], src_clone[5],
+                    ggml_get_op_params_i32(tensor, 0));
         } else if (tensor->op == GGML_OP_OPT_STEP_ADAMW) {
             src_clone[0]->flags = tensor->src[0]->flags;
             tensor_clone = ggml_opt_step_adamw(ggml_ctx, src_clone[0], src_clone[1],

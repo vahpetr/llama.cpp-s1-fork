@@ -10761,6 +10761,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     ggml_tensor * src_g     = dst->src[3];
     ggml_tensor * src_beta  = dst->src[4];
     ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * dst_state = dst->src[6]; // optional direct-store destination (written, not read)
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
@@ -10792,8 +10793,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int64_t K = ggml_get_op_params_i32(dst, 0);
     GGML_ASSERT(K >= 1);
-    // per-seq stride in floats (seq s starts at state + s * seq_stride)
-    const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
+    // per-seq stride in floats (seq s starts at state + s * seq_in_stride)
+    const int64_t state_in_seq_stride = src_state->nb[3] / sizeof(float);
 
     const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
     const int ith = params->ith;
@@ -10804,10 +10805,14 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // output layout: [attn_scores | new_states]
     // attn_scores: S_v * H * n_tokens * n_seqs    floats
     // new_states:  S_v * S_v * H * n_seqs * K     floats  (K snapshot slots; last min(n_tokens, K))
+    // with a direct-store destination (src[6]) the state region is absent from dst and the snapshots go to
+    //   dst_state instead: slot k of sequence s at dst_state->data + k*nb[2] + s*nb[1] (+ head*S_v*S_v)
     const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
-    const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float * attn_out_base  = (float *)dst->data;
-    float * state_out_base = (float *)dst->data + attn_score_elems;
+    float * state_out_base = dst_state ? (float *)dst_state->data : (float *)dst->data + attn_score_elems;
+
+    const int64_t state_slot_stride = dst_state ? (int64_t)(dst_state->nb[2]/sizeof(float)) : S_v * S_v * H * n_seqs;
+    const int64_t state_seq_stride  = dst_state ? (int64_t)(dst_state->nb[1]/sizeof(float)) : S_v * S_v * H;
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
@@ -10835,11 +10840,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // For K>1, work in scratch and copy out per-token when the slot is in range.
         float * s_out = (K > 1)
             ? state_work
-            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+            : state_out_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
 
         // copy input state into the working buffer and operate in-place
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        const float * s_in = state_in_base + iv3 * state_in_seq_stride + iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)
@@ -10893,8 +10898,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             if (K > 1) {
                 const int64_t target_slot = n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
-                    float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
-                                     (iv3 * H + iv1) * S_v * S_v;
+                    float * curr_state_o = state_out_base + target_slot * state_slot_stride +
+                                     iv3 * state_seq_stride + iv1 * S_v * S_v;
                     memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
                 }
             }

@@ -6291,7 +6291,7 @@ struct ggml_tensor * ggml_solve_tri(
 
 // ggml_gated_delta_net
 
-struct ggml_tensor * ggml_gated_delta_net(
+static struct ggml_tensor * ggml_gated_delta_net_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
@@ -6299,7 +6299,8 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state,
-        int64_t               K) {
+        int64_t               K,
+        struct ggml_tensor  * dst_state) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6329,7 +6330,23 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(state->ne[2] == H);
     GGML_ASSERT(state->ne[3] == n_seqs);
     GGML_ASSERT(K >= 1);
-    const int64_t state_rows = K * S_v * n_seqs;
+
+    // without dst_state the K snapshots are appended to the result, with it they are written through it
+    //   (see the ggml_gated_delta_net_ext contract) and the result holds the attention scores only
+    int64_t state_rows = K * S_v * n_seqs;
+
+    if (dst_state) {
+        GGML_ASSERT(dst_state->type == GGML_TYPE_F32);
+        GGML_ASSERT(dst_state->ne[0] == S_v * S_v * H);
+        GGML_ASSERT(dst_state->ne[1] == n_seqs);
+        GGML_ASSERT(dst_state->ne[2] == K);
+        GGML_ASSERT(dst_state->ne[3] == 1);
+        GGML_ASSERT(dst_state->nb[0] == ggml_type_size(GGML_TYPE_F32)); // rows must be contiguous
+        GGML_ASSERT(K <= n_tokens); // slot s is the state s tokens back, so it must exist in this batch
+
+        state_rows = 0;
+    }
+
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
@@ -6342,8 +6359,34 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+    result->src[6] = dst_state; // written by the op, not read
 
     return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        int64_t               K) {
+    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, K, NULL);
+}
+
+struct ggml_tensor * ggml_gated_delta_net_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * dst_state) {
+    GGML_ASSERT(dst_state != NULL);
+    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, dst_state->ne[2], dst_state);
 }
 
 // ggml_lightning_indexer

@@ -1278,6 +1278,10 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         break;
     }
     case GGML_OP_GATED_DELTA_NET: {
+        // direct state stores (ggml_gated_delta_net_ext, src[6]) are not implemented here
+        if (op->src[6]) {
+            return false;
+        }
         // enable after https://github.com/openvinotoolkit/openvino/pull/35917 is included in OV release
         // return true;
         // if (ggml_openvino_get_device_name() == "GPU" && op->src[0]->ne[2] > 1) {

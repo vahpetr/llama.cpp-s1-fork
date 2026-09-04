@@ -2597,6 +2597,31 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // variant of ggml_gated_delta_net that stores the state snapshots directly into `dst_state` instead of
+    // appending them to the result. Intended for recurrent-state caches, where the snapshot planes are not
+    // contiguous and the intermediate copy would double the state traffic.
+    //
+    //   dst_state : [S_v*S_v*H_v, n_seqs, K] view of the destination storage, rows contiguous;
+    //               nb[1] = per-sequence stride, nb[2] = per-snapshot-slot stride (both arbitrary)
+    //   result    : [S_v*H_v, n_tokens*n_seqs] -- the attention scores only, no state region
+    //
+    // K == dst_state->ne[2] <= n_tokens; slot 0 is the final state, slot s the state s tokens back.
+    //
+    // NOTE: the op WRITES through `dst_state`, which is a *source* of the node (the same idiom as the
+    //       destination of ggml_set_rows / ggml_cpy). The source edge is what tells the scheduler that
+    //       everything producing that storage has to run first; a graph must not read the same storage
+    //       after this node, and backends must treat src[6] as written when computing memory hazards.
+    //       Backends that do not implement the direct store must reject ops with src[6] != NULL.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * dst_state);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]

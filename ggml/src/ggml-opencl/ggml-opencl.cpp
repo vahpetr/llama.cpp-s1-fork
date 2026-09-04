@@ -7752,6 +7752,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         }
         case GGML_OP_GATED_DELTA_NET:
             {
+                // direct state stores (ggml_gated_delta_net_ext, src[6]) are not implemented here
+                if (op->src[6]) {
+                    return false;
+                }
                 // Match the Vulkan backend: only F32 -> F32, S_v in {16, 32, 64, 128}.
                 if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
                     return false;

@@ -3,6 +3,22 @@
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
+#include "ggml-backend.h"
+
+// [TAG_RECURRENT_ROLLBACK_SPLITS]
+// True when the device that owns `cache` can run `op` itself. Used to pick the direct GDN->cache store: the
+//   op writes through a source (the cache view), which only works if it runs on the device holding the cache -
+//   a scheduler fallback to another backend would write the snapshots into a staging copy that is never
+//   copied back. Backends without the direct store reject src[6] and keep the two-step (op -> cpy) path.
+static bool cache_device_supports(const ggml_tensor * cache, const ggml_tensor * op) {
+    if (!cache->buffer) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cache->buffer));
+
+    return dev && ggml_backend_dev_supports_op(dev, op);
+}
+
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
 // output dim: [x, y, 1, b]
@@ -549,16 +565,40 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     // active plane count: plane 0 is the final state, plane d the state d tokens back (rollback depth d)
     const int64_t K = (int64_t) ubatch.rs_rollback_depth + 1;
 
-    // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+
+    // K_write = min(n_seq_tokens, K): the op writes that many snapshots, the trailing slots are left unwritten.
+    //   Plane 0 (the final state) is always written; the memory records K_write - 1 as the sequence's valid
+    //   rollback depth, so a deeper seq_rm is refused instead of reading a plane from an older ubatch.
+    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+
+    // destination of the snapshots in the recurrent cache (snapshot slot i -> rollback group i):
+    //   [D, n_seqs, n_written], row (plane, cell) = plane*mem_size + cell, cell = kv_head + seq
+    ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
+        D, n_seqs, n_written,
+        ssm_states_all->nb[1],
+        (size_t) mem_size * row_size,
+        (size_t) kv_head * row_size);
+
+    // Preferred path: the op stores the snapshots straight into the cache planes. Saves writing them to the
+    //   op's own output and reading them back (2 x n_written x D x n_seqs floats per layer). The write
+    //   dependency is carried by `dst` being a source of the node: everything that produces the cache
+    //   contents earlier in the graph (the ggml_scale_inplace zeroing and the ggml_get_rows of the initial
+    //   state in build_rs) is ordered before it, and backends treat that source as written.
+    ggml_tensor * gdn_out = ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, dst);
+
+    const bool direct = cache_device_supports(ssm_states_all, gdn_out);
+
+    if (!direct) {
+        // fallback: K snapshot slots packed into the op output, then one strided copy into the cache
+        gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    }
+
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
     }
-
-    const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;
-    const int64_t state_size_per_snap = S_v * S_v * H_v * n_seqs;
 
     ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
         S_v, H_v, n_seq_tokens, n_seqs,
@@ -568,27 +608,20 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         0);
     cb(output, "attn_output", il);
 
-    const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+    if (direct) {
+        ggml_build_forward_expand(gf, gdn_out);
+    } else {
+        const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;
+        const int64_t state_size_per_snap = S_v * S_v * H_v * n_seqs;
 
-    // K_write = min(n_seq_tokens, K): the op writes that many snapshots, the trailing slots are left unwritten.
-    //   Plane 0 (the final state) is always written; the memory records K_write - 1 as the sequence's valid
-    //   rollback depth, so a deeper seq_rm is refused instead of reading a plane from an older ubatch.
-    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+        ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
+            D, n_seqs, n_written,
+            ggml_row_size(gdn_out->type, D),
+            ggml_row_size(gdn_out->type, state_size_per_snap),
+            ggml_row_size(gdn_out->type, attn_score_elems));
 
-    // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
-    ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
-        D, n_seqs, n_written,
-        ggml_row_size(gdn_out->type, D),
-        ggml_row_size(gdn_out->type, state_size_per_snap),
-        ggml_row_size(gdn_out->type, attn_score_elems));
-
-    ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
-        D, n_seqs, n_written,
-        ssm_states_all->nb[1],
-        (size_t) mem_size * row_size,
-        (size_t) kv_head * row_size);
-
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+    }
 
     return output;
 }

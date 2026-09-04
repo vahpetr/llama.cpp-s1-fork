@@ -1708,7 +1708,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+            // direct state stores (ggml_gated_delta_net_ext, src[6]) are not implemented here
+            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0 && op->src[6] == NULL;
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
