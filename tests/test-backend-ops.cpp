@@ -10350,6 +10350,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Thin decode mat-vecs of Qwen3.8-Flash-Next (qwen4exp).  Same shapes as the eval cases added
+    // next to the 2880-wide gpt-oss ones: the batch sizes are the speculative-decode ones (1 token
+    // for the plain round, 5 for the verification graph), and the m/k pairs are the ones whose
+    // rows-per-workgroup and MMVQ variant selection differs from the generic 4096 x bs x 14336
+    // sweep above.  Note that the perf harness replays one shape thousands of times, so the weight
+    // matrix stays resident in the last-level cache: the us/run here isolate the dispatch and
+    // activation-reload cost, they are NOT the cold-DRAM cost the same op has inside a real graph.
+    for (int64_t n : {1, 5, 8}) {
+        // hyper-connection projections: k below one workgroup's worth of reduction work
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, GGML_TYPE_F32, 10240, n,   320, {1, 1}, {1, 1}));
+    }
+    for (int64_t n : {1, 5}) {
+        // MoE expert-sized dense shapes (k = 640 is not a multiple of 256, so no K-quants here)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, GGML_TYPE_F32,  2560, n,   640, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  2560, n,   640, {1, 1}, {1, 1}));
+        // small m: fewer workgroups than the device has compute units
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,    48, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,     4, n, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1}));
+        // tall shapes that already run at the memory roofline
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 10240, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, n,  2560, {1, 1}, {1, 1}));
+        // f32 router weights
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,   512, n,  2560, {1, 1}, {1, 1}));
+    }
+
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
