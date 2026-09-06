@@ -3892,6 +3892,51 @@ struct test_snake_fuse : public test_case {
 };
 
 
+// qwen4exp grouped RMSNorm (build_hc_mix): normalise each of the hc streams of an
+// [n_embd, hc, T] tensor, then scale with a per-(stream, channel) gamma held as
+// [n_embd, hc, 1] and broadcast over T. This is the node shape that lets the backend
+// fuse RMS_NORM+MUL (LLAMA_QWEN4EXP_HC_NORM_FUSE=0 restores the unfusable one).
+struct test_hc_norm_fuse : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_NORM_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, hc, n_tokens, eps);
+    }
+
+    test_hc_norm_fuse(int64_t n_embd = 2560, int64_t hc = 4, int64_t n_tokens = 5, float eps = 1e-6f)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * gamma = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, 1);
+        ggml_set_name(gamma, "gamma");
+
+        // touch gamma first, exactly as the graph builder pre-expands the view, so no
+        // OP_NONE / view node lands between the norm and the multiply
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), gamma);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.0f, 10.0f);
+        }
+    }
+};
+
 // qwen4exp hyper-connection combine (build_hc_combine):
 //   out[i, c, t] = residual[i, c, t] + block[i, t] * (2 * sigmoid(inject[c, t] / hc))
 // emitted as SCALE -> SIGMOID -> SCALE -> REPEAT -> MUL -> ADD. The Vulkan backend matches
@@ -8425,6 +8470,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
 
+    // qwen4exp grouped RMSNorm + gamma fusion at the production geometry (n_embd 2560, hc 4)
+    for (int64_t nt : { 1, 2, 3, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_hc_norm_fuse(2560, 4, nt));
+    }
+    test_cases.emplace_back(new test_hc_norm_fuse(31, 4, 17));    // non-power-of-two row
+    test_cases.emplace_back(new test_hc_norm_fuse(2560, 1, 5));   // hc == 1
+    test_cases.emplace_back(new test_hc_norm_fuse(1025, 3, 7));   // > 1 block per row, primes
+
     // qwen4exp hyper-connection combine fusion, at the production geometry (n_embd 2560, hc 4)
     // over the draft-length range plus the n_outputs=1 tail, and off-geometry shapes
     for (int64_t nt : { 1, 2, 3, 4, 5, 8 }) {
@@ -10148,6 +10201,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
                 }
             }
+        }
+    }
+
+    // qwen4exp routing geometry (512 experts, 10 used) across the draft-length range: the
+    // fused topk_moe path is taken for n_tokens >= 2 as well (GGML_VK_TOPK_MOE_MULTIROW=0
+    // restores the single-row-only rule)
+    for (bool with_norm : {false, true}) {
+        for (int64_t n : { 1, 2, 3, 4, 5, 8, 22 }) {
+            test_cases.emplace_back(new test_topk_moe({512, n, 1, 1}, 10, with_norm, false, GATING_FUNC_SOFTMAX, 0.0f));
         }
     }
 

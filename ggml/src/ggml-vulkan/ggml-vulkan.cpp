@@ -1146,6 +1146,7 @@ struct vk_device_struct {
     // per-fusion kill switches (all default on, GGML_VK_FUSE_<NAME>=0 turns one off)
     bool fuse_hc_combine;
     bool fuse_sigmoid_mul;
+    bool fuse_topk_moe_multirow;
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
@@ -7195,6 +7196,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         };
         device->fuse_hc_combine  = fuse_enabled("GGML_VK_FUSE_HC_COMBINE");
         device->fuse_sigmoid_mul = fuse_enabled("GGML_VK_FUSE_SIGMOID_MUL");
+        device->fuse_topk_moe_multirow = fuse_enabled("GGML_VK_TOPK_MOE_MULTIROW");
 
         device->add_rms_fusion = !device->disable_fusion &&
                                  device->subgroup_arithmetic &&
@@ -17837,7 +17839,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask |= 1 << 3;
                 ctx->fused_topk_moe_mode = TOPK_MOE_EARLY_SOFTMAX_NORM;
                 fusion_string = "TOPK_MOE_EARLY_SOFTMAX_NORM";
-                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                // topk_moe.comp is row-parallel and load-before-store: a subgroup owns one row
+                // and loads all n_expert logits of it into registers before its first store, and
+                // both the logits and the fused ids output are addressed at n_experts*row. So an
+                // *exact* alias between a src and a fused output is safe at any row count, which
+                // is what ggml_vk_tensors_overlap(..., elementwise=true) tests (a partial overlap
+                // still vetoes the fusion). GGML_VK_TOPK_MOE_MULTIROW=0 restores the old
+                // single-row-only behaviour.
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, ctx->device->fuse_topk_moe_multirow);
             } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_sigmoid_norm_bias, { i + 4, i + 10 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_sigmoid_norm_bias_edges) &&
                        ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_SIGMOID_NORM_BIAS)) {
@@ -17846,7 +17855,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask |= 1 << 4;
                 ctx->fused_topk_moe_mode = TOPK_MOE_SIGMOID_NORM_BIAS;
                 fusion_string = "TOPK_MOE_SIGMOID_NORM_BIAS";
-                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                // exact src/dst aliases are safe here, see TOPK_MOE_EARLY_SOFTMAX_NORM above
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, ctx->device->fuse_topk_moe_multirow);
             } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_sqrt_softplus_norm_bias, { i + 5, i + 11 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_sqrt_softplus_norm_bias_edges) &&
                        ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS)) {
@@ -17855,7 +17865,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask |= 1 << 5;
                 ctx->fused_topk_moe_mode = TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS;
                 fusion_string = "TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS";
-                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                // exact src/dst aliases are safe here, see TOPK_MOE_EARLY_SOFTMAX_NORM above
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, ctx->device->fuse_topk_moe_multirow);
             } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_early_softmax, { i + 3, i + 4 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_early_softmax_edges) &&
                        ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_EARLY_SOFTMAX)) {
@@ -17864,7 +17875,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask |= 1 << 3;
                 ctx->fused_topk_moe_mode = TOPK_MOE_EARLY_SOFTMAX;
                 fusion_string = "TOPK_MOE_EARLY_SOFTMAX";
-                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                // exact src/dst aliases are safe here, see TOPK_MOE_EARLY_SOFTMAX_NORM above
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, ctx->device->fuse_topk_moe_multirow);
             } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_late_softmax, { i + 1, i + 5 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_late_softmax_edges) &&
                        ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_LATE_SOFTMAX)) {
@@ -17873,7 +17885,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask |= 1 << 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_LATE_SOFTMAX;
                 fusion_string = "TOPK_MOE_LATE_SOFTMAX";
-                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                // exact src/dst aliases are safe here, see TOPK_MOE_EARLY_SOFTMAX_NORM above
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, ctx->device->fuse_topk_moe_multirow);
             } else if (ggml_vk_can_fuse_sigmoid_mul(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 1;
                 ctx->fused_mul_sigmoid = true;
@@ -18220,6 +18233,14 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
             }
             bool ok = true;
             for (int c = first_unused; c < j; ++c) {
+                // A view node that is already part of current_set is emitted before j either way,
+                // so it cannot be a hazard for j and must not veto pulling j in. Without this, a
+                // view emitted directly ahead of a fusion pair (the grouped-RMSNorm gamma of
+                // qwen4exp build_hc_mix) splits the pair across two sets.
+                if (is_empty(graph->nodes[c]) &&
+                    std::find(current_set.begin(), current_set.end(), c) != current_set.end()) {
+                    continue;
+                }
                 if (!used[c] &&
                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL) &&

@@ -354,6 +354,16 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
     return std::make_unique<graph>(*this, params);
 }
 
+// LLAMA_QWEN4EXP_HC_NORM_FUSE=0 restores the pre-fusion node shape of the grouped RMSNorm
+// (rms_norm -> reshape -> mul), so one binary can A/B the graph-builder side of the fusion.
+static bool hc_norm_fuse() {
+    static const bool enabled = [] {
+        const char * v = getenv("LLAMA_QWEN4EXP_HC_NORM_FUSE");
+        return v == nullptr || atoi(v) != 0;
+    }();
+    return enabled;
+}
+
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
@@ -370,9 +380,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
-    ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
-    xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
+    ggml_tensor * xn = nullptr;
+    if (hc_norm_fuse()) {
+        // Keep the norm and the gamma multiply on the same [n_embd, hc, T] shape. ggml_can_fuse
+        // needs two consecutive nodes of equal shape, so the [hc_dim, T] reshape that used to sit
+        // between them defeated the backends' RMS_NORM+MUL fusion. The gamma view is expanded
+        // first so that it does not land between the norm and the multiply either.
+        // Bit-identical to the unfused form: the fused shader evaluates scale*a*b left to right,
+        // exactly the order of the separate (scale*a) store followed by the *b multiply, and
+        // ggml_mul broadcasts gamma over T the same way the [hc_dim] gamma broadcast over rows.
+        ggml_tensor * w3 = ggml_reshape_3d(ctx0, w_norm, n_embd, hc, 1);
+        ggml_build_forward_expand(gf, w3);
+
+        xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+        xn = ggml_mul(ctx0, xn, w3);
+        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+    } else {
+        xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+        xn = ggml_mul(ctx0, xn, w_norm);
+    }
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
