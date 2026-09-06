@@ -3892,6 +3892,60 @@ struct test_snake_fuse : public test_case {
 };
 
 
+// qwen4exp hyper-connection combine (build_hc_combine):
+//   out[i, c, t] = residual[i, c, t] + block[i, t] * (2 * sigmoid(inject[c, t] / hc))
+// emitted as SCALE -> SIGMOID -> SCALE -> REPEAT -> MUL -> ADD. The Vulkan backend matches
+// the chain and dispatches one fused kernel (GGML_VK_FUSE_HC_COMBINE=0 turns it off).
+struct test_hc_combine_fuse : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_COMBINE_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, n_tokens);
+    }
+
+    test_hc_combine_fuse(int64_t n_embd = 2560, int64_t hc = 4, int64_t n_tokens = 5)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * block = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(block, "block");
+
+        ggml_tensor * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(inject, "inject");
+
+        ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx, w, 2.0f);
+        w = ggml_reshape_3d(ctx, w, 1, hc, n_tokens);
+
+        ggml_tensor * b = ggml_reshape_3d(ctx, block, n_embd, 1, n_tokens);
+        b = ggml_repeat_4d(ctx, b, n_embd, hc, n_tokens, 1);
+
+        ggml_tensor * out = ggml_add(ctx, residual, ggml_mul(ctx, b, w));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            // the injection feeds a sigmoid: keep it wide enough to cover both tails
+            init_tensor_uniform(t, std::string(ggml_get_name(t)) == "inject" ? -8.0f : -1.0f,
+                                   std::string(ggml_get_name(t)) == "inject" ?  8.0f :  1.0f);
+        }
+    }
+};
+
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -8370,6 +8424,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 1, 2}));   // ne[3] > 1
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
+
+    // qwen4exp hyper-connection combine fusion, at the production geometry (n_embd 2560, hc 4)
+    // over the draft-length range plus the n_outputs=1 tail, and off-geometry shapes
+    for (int64_t nt : { 1, 2, 3, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_hc_combine_fuse(2560, 4, nt));
+    }
+    test_cases.emplace_back(new test_hc_combine_fuse(31, 4, 17));     // non-power-of-two row
+    test_cases.emplace_back(new test_hc_combine_fuse(2560, 4, 1));    // n_outputs == 1
+    test_cases.emplace_back(new test_hc_combine_fuse(1, 4, 5));       // degenerate row
+    test_cases.emplace_back(new test_hc_combine_fuse(2560, 1, 5));    // hc == 1
+    test_cases.emplace_back(new test_hc_combine_fuse(257, 3, 7));     // all primes
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));

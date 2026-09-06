@@ -657,6 +657,24 @@ static constexpr std::initializer_list<ggml_op> snake_pattern              { GGM
                                                                              GGML_OP_SQR,      GGML_OP_MUL,
                                                                              GGML_OP_ADD };
 
+// qwen4exp hyper-connection combine: out = residual + repeat(block) * (s2 * sigmoid(s1 * inject)).
+// Emitted by build_hc_combine as
+//   REPEAT(reshape(block)) SCALE(inject,1/hc) UNARY(SIGMOID) SCALE(.,2) RESHAPE MUL ADD
+// (the graph builder pre-expands the inject projection so the seven nodes stay consecutive).
+static constexpr std::initializer_list<ggml_op> hc_combine_pattern         { GGML_OP_REPEAT,  GGML_OP_SCALE,
+                                                                             GGML_OP_UNARY,   GGML_OP_SCALE,
+                                                                             GGML_OP_RESHAPE, GGML_OP_MUL,
+                                                                             GGML_OP_ADD };
+
+static constexpr std::initializer_list<std::array<int, 3>> hc_combine_edges {
+    { 2, 0, 1 }, // sigmoid->src[0] == scale(inject)
+    { 3, 0, 2 }, // scale2->src[0]  == sigmoid
+    { 4, 0, 3 }, // reshape->src[0] == scale2
+    { 5, 0, 0 }, // mul->src[0]     == repeat
+    { 5, 1, 4 }, // mul->src[1]     == reshape
+    { 6, 1, 5 }, // add->src[1]     == mul
+};
+
 //node #978 (  SOFT_MAX):     ffn_moe_probs-15 (   0K) [Vulka         ] use=2:    ffn_moe_logits-15 (   0K) [Vulka         ]
 //node #979 (   RESHAPE): ffn_moe_probs-15 (re (   0K) [Vulka         ] use=1:     ffn_moe_probs-15 (   0K) [Vulka         ]
 //node #980 (   ARGSORT):   ffn_moe_argsort-15 (   0K) [Vulka         ] use=1:     ffn_moe_probs-15 (   0K) [Vulka         ]
@@ -1077,6 +1095,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_col2im_1d_f16;
     vk_pipeline pipeline_col2im_1d_bf16;
     vk_pipeline pipeline_out_prod_f32;
+    vk_pipeline pipeline_hc_combine_f32;
     vk_pipeline pipeline_snake_f32;
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;
@@ -1125,6 +1144,7 @@ struct vk_device_struct {
 
     bool disable_fusion;
     // per-fusion kill switches (all default on, GGML_VK_FUSE_<NAME>=0 turns one off)
+    bool fuse_hc_combine;
     bool fuse_sigmoid_mul;
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
@@ -1824,6 +1844,14 @@ struct vk_op_conv_transpose_1d_push_constants {
 struct vk_op_snake_push_constants {
     uint32_t ne0;
     uint32_t ne1;
+};
+
+struct vk_op_hc_combine_push_constants {
+    uint32_t ne0;
+    uint32_t ne1;
+    uint32_t ne2;
+    float    s1;
+    float    s2;
 };
 
 struct vk_op_pool1d_push_constants {
@@ -5894,6 +5922,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1);
 
+    ggml_vk_create_pipeline(device, device->pipeline_hc_combine_f32, "hc_combine_f32", hc_combine_f32_len, hc_combine_f32_data, "main", 4, sizeof(vk_op_hc_combine_push_constants), {256, 1, 1}, {}, 1);
+
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32,  "snake_f32",  snake_f32_len,  snake_f32_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f16,  "snake_f16",  snake_f16_len,  snake_f16_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_bf16, "snake_bf16", snake_bf16_len, snake_bf16_data, "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
@@ -7163,6 +7193,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
             const char * v = getenv(name);
             return v == nullptr || atoi(v) != 0;
         };
+        device->fuse_hc_combine  = fuse_enabled("GGML_VK_FUSE_HC_COMBINE");
         device->fuse_sigmoid_mul = fuse_enabled("GGML_VK_FUSE_SIGMOID_MUL");
 
         device->add_rms_fusion = !device->disable_fusion &&
@@ -14432,6 +14463,38 @@ static void ggml_vk_sigmoid_mul_dispatch_fused(ggml_backend_vk_context * ctx, vk
     ggml_vk_mul(ctx, subctx, mul->src[0], unary->src[0], mul);
 }
 
+// Dispatch the fused qwen4exp hyper-connection combine:
+//   out[i, c, t] = residual[i, c, t] + block[i, t] * (s2 * sigmoid(s1 * inject[c, t]))
+// The pattern is validated by ggml_vk_can_fuse_hc_combine before this call.
+static void ggml_vk_hc_combine_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * repeat = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * scale1 = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * scale2 = cgraph->nodes[node_idx + 3];
+    ggml_tensor *       add    = cgraph->nodes[node_idx + 6];
+
+    const ggml_tensor * block    = repeat->src[0];
+    const ggml_tensor * inject   = scale1->src[0];
+    const ggml_tensor * residual = add->src[0];
+
+    vk_pipeline pipeline = ctx->device->pipeline_hc_combine_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_op_hc_combine_push_constants pc{};
+    pc.ne0 = static_cast<uint32_t>(add->ne[0]);
+    pc.ne1 = static_cast<uint32_t>(add->ne[1]);
+    pc.ne2 = static_cast<uint32_t>(add->ne[2]);
+    pc.s1  = ((const float *)scale1->op_params)[0];
+    pc.s2  = ((const float *)scale2->op_params)[0];
+
+    vk_subbuffer res_buf = ggml_vk_tensor_subbuffer(ctx, residual);
+    vk_subbuffer blk_buf = ggml_vk_tensor_subbuffer(ctx, block);
+    vk_subbuffer inj_buf = ggml_vk_tensor_subbuffer(ctx, inject);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, add);
+
+    std::array<uint32_t, 3> elements = { pc.ne0, pc.ne1 * pc.ne2, 1 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { res_buf, blk_buf, inj_buf, dst_buf }, pc, elements);
+}
+
 // Dispatch the fused snake activation: y = x + sin^2(a * x) * inv_b.
 // Match the naive mul -> sin -> sqr -> mul -> add chain and run the
 // dedicated kernel directly. The pattern is validated by
@@ -15733,7 +15796,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     switch (node->op) {
     case GGML_OP_REPEAT:
-        ggml_vk_repeat(ctx, compute_ctx, src0, node);
+        if (ctx->num_additional_fused_ops) {
+            ggml_vk_hc_combine_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_repeat(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_REPEAT_BACK:
@@ -17237,6 +17304,85 @@ static bool ggml_vk_can_fuse_sigmoid_mul(ggml_backend_vk_context * ctx, const st
     return true;
 }
 
+// Pattern check for the 7-op qwen4exp hyper-connection combine:
+//   repeat(reshape(block)) , scale(inject) -> sigmoid -> scale -> reshape , mul, add.
+// Verifies the chain edges, the f32-only types, the [ne0, hc, T] / [ne0, 1, T] / [hc, T]
+// shapes and that every operand the shader indexes linearly is contiguous.
+static bool ggml_vk_can_fuse_hc_combine(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ctx->device->fuse_hc_combine) {
+        return false;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, hc_combine_pattern, { node_idx + 6 })) {
+        return false;
+    }
+    if (!ggml_check_edges(cgraph, node_idx, hc_combine_edges)) {
+        return false;
+    }
+
+    const ggml_tensor * repeat  = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * scale1  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * sigmoid = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * scale2  = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * reshape = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * mul     = cgraph->nodes[node_idx + 5];
+    const ggml_tensor * add     = cgraph->nodes[node_idx + 6];
+
+    if (ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+
+    const ggml_tensor * block    = repeat->src[0];
+    const ggml_tensor * inject   = scale1->src[0];
+    const ggml_tensor * residual = add->src[0];
+
+    // the shader is f32 only
+    for (const ggml_tensor * t : { repeat, scale1, sigmoid, scale2, mul, add, block, inject, residual }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+
+    // ggml_scale with a non-zero bias is not what build_hc_combine emits
+    if (((const float *)scale1->op_params)[1] != 0.0f ||
+        ((const float *)scale2->op_params)[1] != 0.0f) {
+        return false;
+    }
+
+    // out / residual / repeat / mul are [ne0, hc, T, 1]
+    if (add->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_are_same_shape(add, residual) ||
+        !ggml_are_same_shape(add, mul) ||
+        !ggml_are_same_shape(add, repeat)) {
+        return false;
+    }
+    // the residual must be the other add operand, not the mul itself
+    if (residual == mul) {
+        return false;
+    }
+    // block is [ne0, 1, T, 1], broadcast over the hc dimension by the repeat
+    if (block->ne[0] != add->ne[0] || block->ne[1] != 1 ||
+        block->ne[2] != add->ne[2] || block->ne[3] != 1) {
+        return false;
+    }
+    // inject is [hc, T, 1, 1] and the reshape presents it as [1, hc, T, 1]
+    if (inject->ne[0] != add->ne[1] || inject->ne[1] != add->ne[2] ||
+        inject->ne[2] != 1 || inject->ne[3] != 1) {
+        return false;
+    }
+    if (reshape->ne[0] != 1 || reshape->ne[1] != add->ne[1] ||
+        reshape->ne[2] != add->ne[2] || reshape->ne[3] != 1) {
+        return false;
+    }
+    // the shader indexes every buffer linearly
+    if (!ggml_is_contiguous(add) || !ggml_is_contiguous(residual) ||
+        !ggml_is_contiguous(block) || !ggml_is_contiguous(inject)) {
+        return false;
+    }
+    return true;
+}
+
 // Pattern check for the 5-op Snake fusion: mul -> sin -> sqr -> mul -> add.
 // Verifies the chain shape, the closure x_in_add == x_in_mul0, and that
 // the broadcast operands a and inv_b share a [1, C] layout.
@@ -17666,6 +17812,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
                 op_srcs_fused_elementwise[2] = false;
+            } else if (ggml_vk_can_fuse_hc_combine(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 6;
+                fusion_string = "HC_COMBINE";
+                // elementwise=true: every thread reads residual[idx] into a register before
+                // writing out[idx] with a data dependency on it, so an exact residual/out
+                // alias is safe. The block and inject srcs have a different byte size than
+                // the destination, so ggml_vk_tensors_overlap still rejects any overlap of
+                // theirs (they are read with a broadcast, not elementwise).
+                std::fill_n(op_srcs_fused_elementwise, 7, true);
             } else if (ggml_vk_can_fuse_snake(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 4;
                 fusion_string = "SNAKE";
@@ -17986,6 +18141,19 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
             return false;
         };
 
+        // True if node `j` is part of an occurrence of `pattern` that starts at or before j.
+        // match_pattern alone only protects a pattern's first node: a node in the middle of a
+        // pattern that does not depend on the pattern's first node (hc_combine's SCALE branch)
+        // would otherwise be hoisted out of the chain by the lookahead below.
+        auto const &inside_pattern = [&](const std::initializer_list<ggml_op> &pattern, int j) -> bool {
+            for (int k = 0; k < (int)pattern.size(); ++k) {
+                if (j - k >= 0 && match_pattern(pattern, j - k)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (match_pattern(pattern, first_unused)) {
                 for (size_t j = 0; j < pattern.size(); ++j) {
@@ -18016,6 +18184,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (keep_pattern(topk_moe_late_softmax)) {
             continue;
         }
+        if (keep_pattern(hc_combine_pattern)) {
+            continue;
+        }
         if (keep_pattern(snake_pattern)) {
             continue;
         }
@@ -18043,7 +18214,8 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
                 match_pattern(topk_moe_early_softmax, j) ||
                 match_pattern(topk_moe_late_softmax, j) ||
-                match_pattern(snake_pattern, j)) {
+                match_pattern(snake_pattern, j) ||
+                inside_pattern(hc_combine_pattern, j)) {
                 continue;
             }
             bool ok = true;

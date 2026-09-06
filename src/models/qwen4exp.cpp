@@ -412,6 +412,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
 
+    // Emit the injection projection before the chain below. Without this the depth-first
+    // expansion of the add walks into it from the scale and drops its nodes in the middle of
+    // the REPEAT/SCALE/SIGMOID/SCALE/MUL/ADD sequence, which stops the backend from matching
+    // the chain as one fused op. Pure reordering: no node and no value changes.
+    ggml_build_forward_expand(gf, inject);
+
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
     w = ggml_scale(ctx0, w, 2.0f);

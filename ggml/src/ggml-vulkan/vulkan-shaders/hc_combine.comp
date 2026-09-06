@@ -1,0 +1,64 @@
+#version 450
+
+#include "types.glsl"
+
+// Fused hyper-connection combine (qwen4exp build_hc_combine):
+//
+//   out[i, c, t] = residual[i, c, t] + block[i, t] * (s2 * sigmoid(s1 * inject[c, t]))
+//
+// replacing the six-dispatch chain SCALE -> SIGMOID -> SCALE -> REPEAT -> MUL -> ADD.
+//
+// Exactness. Every intermediate is rounded to f32 in the order the unfused chain rounds it
+// (scale.comp: a*param1, unary.comp op_sigmoid: 1/(1+exp(-x)), mul.comp: a*b, add.comp: a+b),
+// and the closing multiply/add pair is `precise` so the compiler may not contract it into an
+// FMA -- the six-dispatch chain cannot contract across dispatch boundaries either.
+// The weight is computed in hc_weight() on purpose: glslang propagates the `precise` qualifier
+// backwards through the whole expression tree, and a NoContraction-decorated OpFDiv is not
+// necessarily lowered like the plain one in unary.comp. A function boundary stops the
+// propagation, so the sigmoid is compiled exactly as unary.comp compiles it.
+//
+//   data_a residual [ne0, ne1, ne2]  contiguous f32
+//   data_b block    [ne0, ne2]       contiguous f32, broadcast over ne1
+//   data_c inject   [ne1, ne2]       contiguous f32, broadcast over ne0
+//   data_d out      [ne0, ne1, ne2]  contiguous f32
+layout (binding = 0) readonly  buffer A {float data_a[];};
+layout (binding = 1) readonly  buffer B {float data_b[];};
+layout (binding = 2) readonly  buffer C {float data_c[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint32_t ne0;
+    uint32_t ne1;
+    uint32_t ne2;
+    float    s1;
+    float    s2;
+} p;
+
+// SCALE(inject, s1) -> UNARY(SIGMOID) -> SCALE(., s2), one f32 rounding per step
+float hc_weight(uint32_t i12) {
+    const float x   = data_c[i12] * p.s1;
+    const float sig = 1.0f / (1.0f + exp(-x));
+    return sig * p.s2;
+}
+
+void main() {
+    const uint32_t i0  = gl_GlobalInvocationID.x;
+    const uint32_t i12 = gl_GlobalInvocationID.y;   // c + t*ne1, the row index of an [ne0, ne1, ne2] tensor
+
+    if (i0 >= p.ne0 || i12 >= p.ne1 * p.ne2) {
+        return;
+    }
+
+    const uint32_t t   = i12 / p.ne1;
+    const uint32_t idx = i12 * p.ne0 + i0;
+
+    const float w = hc_weight(i12);
+
+    // MUL(repeat(block), w) and ADD(residual, .) as two separately rounded steps
+    precise float bw  = data_b[t * p.ne0 + i0] * w;
+    precise float acc = data_a[idx] + bw;
+
+    data_d[idx] = acc;
+}
