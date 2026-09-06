@@ -7145,8 +7145,20 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // 2 rows (f16/f32 activations) per workgroup, so a shape like q5_0 m=10240 k=320 runs
         // 10240 workgroups that each move ~220 bytes of weights while re-reading the whole
         // activation slice.  AMD GCN already uses 2-4 rows, and NVIDIA/Intel have their own
-        // DMMV_WG_SIZE_LARGE heuristic, so only widen on AMD RDNA by default.
-        device->dmmv_manyrows_mul    = (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN) ? 4 : 1;
+        // DMMV_WG_SIZE_LARGE heuristic, so only AMD RDNA was ever a candidate.
+        //
+        // OFF by default: the widening wins only when the weights are already in the last-level
+        // cache, which is exactly what test-backend-ops perf measures (it replays one shape
+        // thousands of times from the same tensor): 1.9x at q5_0 m=10240 n=1 k=320, 1.3-1.5x at
+        // n=5, 1.3x at q4_K m=10240 n=5 k=2560.  Inside a real decode graph the weights come from
+        // DRAM and these kernels are bandwidth-bound, so the extra per-lane accumulators cut
+        // occupancy and with it the number of memory requests in flight.  Measured on the
+        // Qwen3.8-Flash-Next prod GGUF (Radeon 8060S, RADV STRIX_HALO): q5_0 m=10240 n=5 k=320
+        // went 23.9 -> 26.5 us/call (103 -> 93 GB/s) and q6_K m=10240 n=5 k=2560 114 -> 137 us
+        // (190 -> 159 GB/s), i.e. +1.4 ms on the 57.2 ms five-token verification graph (+2.5 %)
+        // and +1.1 ms on the 31.8 ms one-token graph (+3.6 %).  Set GGML_VK_DMMV_MANYROWS=4 to
+        // re-enable it for another device or another A/B.
+        device->dmmv_manyrows_mul    = 1;
         device->dmmv_manyrows_min_wg = 512;
         // A/B knobs: GGML_VK_DMMV_MANYROWS=0|1 disables the variant, >1 overrides the row
         // multiplier; GGML_VK_DMMV_MANYROWS_MIN_WG overrides how many workgroups the widened
