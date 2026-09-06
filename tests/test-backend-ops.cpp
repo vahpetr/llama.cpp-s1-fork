@@ -3789,6 +3789,11 @@ struct test_unary_mul : public test_case {
         } else if (layout == "bcast") {
             a = ggml_new_tensor(ctx, type, 4, ne.data());
             b = ggml_new_tensor_4d(ctx, type, ne[0], 1, 1, 1);
+        } else if (layout == "bcast_unary") {
+            // the shared-expert gate: a [1, T] unary broadcast over an [n_embd, T] activation
+            // (use with swap = true, so the unary is the second MUL operand)
+            a = ggml_new_tensor_4d(ctx, type, 1, ne[1], ne[2], ne[3]);
+            b = ggml_new_tensor(ctx, type, 4, ne.data());
         } else {
             GGML_ABORT("unknown layout %s", layout.c_str());
         }
@@ -8342,6 +8347,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "bcast"));
             test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "packed", "reuse"));
         }
+    }
+
+    // qwen4exp gated activations at the production geometry over the draft-length range
+    // (GGML_VK_FUSE_SIGMOID_MUL=0 turns the Vulkan fusion off)
+    for (int64_t n : { 1, 2, 3, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_unary_mul(GGML_UNARY_OP_SIGMOID, GGML_TYPE_F32, { 10240, n, 1, 1 }, true));  // build_hc_mix gate
+        test_cases.emplace_back(new test_unary_mul(GGML_UNARY_OP_SIGMOID, GGML_TYPE_F32, {  6144, n, 1, 1 }, true));  // attention output gate
+        test_cases.emplace_back(new test_unary_mul(GGML_UNARY_OP_SIGMOID, GGML_TYPE_F32, {   128, 48, n, 1 }, true)); // build_norm_gated
+        test_cases.emplace_back(new test_unary_mul(GGML_UNARY_OP_SIGMOID, GGML_TYPE_F32, {  2560, n, 1, 1 }, true, "bcast_unary")); // shared-expert gate
     }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b

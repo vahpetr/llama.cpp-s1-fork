@@ -951,6 +951,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_sub_norepeat[2][2][2];
     vk_pipeline pipeline_mul[2][2][2];
     vk_pipeline pipeline_mul_norepeat[2][2][2];
+    // fused UNARY(SIGMOID) + MUL, f32 only; index is norepeat
+    vk_pipeline pipeline_mul_sigmoid_f32[2];
     vk_pipeline pipeline_div[2][2][2];
     vk_pipeline pipeline_div_norepeat[2][2][2];
     vk_pipeline pipeline_add_rms[2][2][2];
@@ -1122,6 +1124,8 @@ struct vk_device_struct {
     ggml_backend_buffer_type buffer_type;
 
     bool disable_fusion;
+    // per-fusion kill switches (all default on, GGML_VK_FUSE_<NAME>=0 turns one off)
+    bool fuse_sigmoid_mul;
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
@@ -2430,6 +2434,8 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+    // UNARY(SIGMOID) + MUL: the mul reads the sigmoid's source and applies the sigmoid itself
+    bool fused_mul_sigmoid {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -5656,6 +5662,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_BINARY(add_rms, _norepeat, {1}, 4)
 #undef CREATE_BINARY
 
+    ggml_vk_create_pipeline2(device, device->pipeline_mul_sigmoid_f32[0], "mul_sigmoid_f32",          mul_sigmoid_f32_len, mul_sigmoid_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0}, 1);
+    ggml_vk_create_pipeline2(device, device->pipeline_mul_sigmoid_f32[1], "mul_sigmoid_f32_norepeat", mul_sigmoid_f32_len, mul_sigmoid_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {1}, 1);
+
     if (device->multi_add) {
         for (uint32_t i = 0; i < MAX_FUSED_ADDS; ++i) {
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add[i],     "multi_add_f32_"     + std::to_string(i+1), multi_add_f32_len,     multi_add_f32_data,     "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
@@ -7147,6 +7156,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->serialize_submissions = getenv("GGML_VK_SERIALIZE_SUBMISSIONS") != nullptr;
 
         device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
+
+        // Per-fusion kill switches. Default on; GGML_VK_FUSE_<NAME>=0 disables exactly one
+        // fusion so a single binary can A/B it (the fused and unfused paths are bit-identical).
+        auto const &fuse_enabled = [](const char * name) -> bool {
+            const char * v = getenv(name);
+            return v == nullptr || atoi(v) != 0;
+        };
+        device->fuse_sigmoid_mul = fuse_enabled("GGML_VK_FUSE_SIGMOID_MUL");
 
         device->add_rms_fusion = !device->disable_fusion &&
                                  device->subgroup_arithmetic &&
@@ -11309,6 +11326,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         case GGML_OP_MUL:
         {
+            if (ctx->fused_mul_sigmoid) {
+                return ctx->device->pipeline_mul_sigmoid_f32[ggml_are_same_shape(src0, src1)];
+            }
             auto pipelines = ggml_are_same_shape(src0, src1) ? ctx->device->pipeline_mul_norepeat : ctx->device->pipeline_mul;
             return pipelines[src0->type == GGML_TYPE_F16][src1->type == GGML_TYPE_F16][dst->type == GGML_TYPE_F16];
         }
@@ -14403,6 +14423,15 @@ static void ggml_vk_col2im_1d(ggml_backend_vk_context * ctx, vk_context& subctx,
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_COL2IM_1D, std::move(p));
 }
 
+// Dispatch a fused UNARY(SIGMOID) + MUL: run the mul over the sigmoid's own source and let
+// the shader apply the sigmoid. Validated by ggml_vk_can_fuse_sigmoid_mul.
+static void ggml_vk_sigmoid_mul_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * unary = cgraph->nodes[node_idx + 0];
+    ggml_tensor *       mul   = cgraph->nodes[node_idx + 1];
+
+    ggml_vk_mul(ctx, subctx, mul->src[0], unary->src[0], mul);
+}
+
 // Dispatch the fused snake activation: y = x + sin^2(a * x) * inv_b.
 // Match the naive mul -> sin -> sqr -> mul -> add chain and run the
 // dedicated kernel directly. The pattern is validated by
@@ -15860,6 +15889,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
             break;
         }
+        if (ctx->fused_mul_sigmoid) {
+            ggml_vk_sigmoid_mul_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
 
         switch (ggml_get_unary_op(node)) {
         case GGML_UNARY_OP_ELU:
@@ -17163,6 +17196,47 @@ static bool ggml_vk_can_fuse_rope_set_rows(ggml_backend_vk_context * ctx, const 
     return true;
 }
 
+// UNARY(SIGMOID) + MUL where the sigmoid result is the second MUL operand -- the gated
+// activations qwen4exp emits (build_hc_mix gate, build_norm_gated, the shared-expert gate,
+// the attention output gate). Bit-exact for f32: the fused shader evaluates op_sigmoid
+// exactly as unary.comp does and the elided store rounded to f32 too.
+static bool ggml_vk_can_fuse_sigmoid_mul(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ctx->device->fuse_sigmoid_mul) {
+        return false;
+    }
+    // ggml_can_fuse would additionally require the two nodes to have the same shape, which
+    // rejects the broadcast gates (a [1, T] sigmoid over a [n_embd, T] activation). The fused
+    // shader goes through src1_idx() like the unfused mul, so broadcasting is fine here.
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_UNARY, GGML_OP_MUL }, { node_idx + 1 })) {
+        return false;
+    }
+
+    const ggml_tensor * unary = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
+
+    if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    // only the "sigmoid is src1" orientation has a shader, and src0 must be a real tensor:
+    // the fused dispatch reads the sigmoid's source in place of the (never computed) unary
+    if (mul->src[1] != unary || mul->src[0] == unary) {
+        return false;
+    }
+
+    const ggml_tensor * b = unary->src[0];
+
+    // f32 only: with an f16 unary the elided store would drop a rounding step
+    if (unary->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+        mul->src[0]->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // the fused mul indexes b in place of the unary result, so the two must agree in shape
+    if (!ggml_are_same_shape(b, unary)) {
+        return false;
+    }
+    return true;
+}
+
 // Pattern check for the 5-op Snake fusion: mul -> sin -> sqr -> mul -> add.
 // Verifies the chain shape, the closure x_in_add == x_in_mul0, and that
 // the broadcast operands a and inv_b share a [1, C] layout.
@@ -17510,6 +17584,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
+        ctx->fused_mul_sigmoid = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -17644,6 +17719,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_LATE_SOFTMAX;
                 fusion_string = "TOPK_MOE_LATE_SOFTMAX";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_sigmoid_mul(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_mul_sigmoid = true;
+                fusion_string = "SIGMOID_MUL";
+                // each thread reads its own elements of both srcs before writing its own
+                // element of the destination, so an exact alias is safe
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
             }
             if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
                 // Look for an additional scale op to fuse - occurs in deepseek2 and nemotron3 nano.
@@ -17724,6 +17807,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
+                ctx->fused_mul_sigmoid = false;
             }
         }
 
@@ -17972,7 +18056,14 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
-                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY)) {
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL) &&
+                    // The MUL of a UNARY+MUL pair usually also consumes an earlier node of the
+                    // same set (the RMS_NORM+MUL or the reshape that produced its other operand).
+                    // That node is emitted before j either way, so it must not veto the pair.
+                    !(j > 0 && graph->nodes[j]->op == GGML_OP_MUL &&
+                      graph->nodes[j-1]->op == GGML_OP_UNARY && current_set.back() == j-1 &&
+                      std::find(current_set.begin(), current_set.end(), c) != current_set.end())) {
                     ok = false;
                     break;
                 }

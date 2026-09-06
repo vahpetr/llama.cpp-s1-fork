@@ -7,6 +7,22 @@ const uint num_threads = 256;
 
 layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
 
+#if MUL_SIGMOID_B
+// Fused UNARY(SIGMOID) + MUL: data_b holds the sigmoid's *input*, not its result.
+// The expression is character-for-character op_sigmoid from unary.comp and the separate
+// UNARY dispatch stored its result as an f32 without further rounding, so for f32 operands
+// the fused product is bit-identical to the two-dispatch chain. There is no add in this
+// shader, so nothing can be contracted into an FMA either.
+FLOAT_TYPE load_b(uint idx) {
+    const float x = float(data_b[idx]);
+    return FLOAT_TYPE(1.0f / (1.0f + exp(-x)));
+}
+#else
+FLOAT_TYPE load_b(uint idx) {
+    return FLOAT_TYPE(data_b[idx]);
+}
+#endif
+
 void main() {
     uint idx = get_idx();
 
@@ -20,7 +36,7 @@ void main() {
         uint i00, i01, i02, i03;
         get_indices(idx, i00, i01, i02, i03);
 
-        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]) * FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]));
+        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]) * load_b(get_boffset() + src1_idx(i00, i01, i02, i03)));
 
         idx += num_threads;
     }

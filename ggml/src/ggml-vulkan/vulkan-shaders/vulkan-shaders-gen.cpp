@@ -868,6 +868,9 @@ void process_shaders() {
     }
     }
 
+    // fused UNARY(SIGMOID) + MUL, f32 only (see ggml_vk_can_fuse_sigmoid_mul)
+    string_to_spv("mul_sigmoid_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"MUL_SIGMOID_B", "1"}});
+
     string_to_spv("sub_f32", "sub.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
     string_to_spv("acc_f32", "acc.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
