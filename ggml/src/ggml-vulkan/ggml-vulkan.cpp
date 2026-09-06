@@ -17347,6 +17347,9 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+// GGML_VK_FUSION_DIAG=1: log every fusion that the src/dst overlap veto disables.
+static const bool vk_fusion_diag = getenv("GGML_VK_FUSION_DIAG") != nullptr;
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -17700,6 +17703,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                                     }
                                 }
                                 if (!found) {
+                                    // GGML_VK_FUSION_DIAG=1 names the (src, dst) pair that vetoes a
+                                    // fusion; without it a fusion that silently stops firing (topk_moe
+                                    // at n_tokens >= 2) is invisible in the perf log, which keeps
+                                    // printing the fusion name for the first node anyway.
+                                    if (vk_fusion_diag) {
+                                        GGML_LOG_INFO("ggml_vulkan: fusion %s disabled at node %d: src %s (%s) overlaps dst %s (%s), elementwise=%d\n",
+                                                      fusion_string ? fusion_string : "?", i, src->name, ggml_op_name(src->op),
+                                                      dst->name, ggml_op_name(dst->op), (int) op_srcs_fused_elementwise[k]);
+                                    }
                                     need_disable = true;
                                 }
                             }
