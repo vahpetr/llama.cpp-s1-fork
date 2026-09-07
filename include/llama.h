@@ -42,11 +42,17 @@
 #define LLAMA_FILE_MAGIC_GGSN 0x6767736eu // 'ggsn'
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
+// bumped in this fork: the K-only indexer cache (qwen4exp QSA) changed the byte layout of the
+// memory state that both blobs embed - llama_context::state_write_data -> memory->state_write.
+// Without a bump an old file is mis-parsed instead of rejected; the checks are in
+// llama_context::state_load_file (LLAMA_SESSION_*) and state_seq_load_file (LLAMA_STATE_SEQ_*).
+// NOTE: the in-memory llama_state_seq_get_data/set_data pair carries no header, so a blob handed
+//       between two differently-built processes (e.g. a server prompt cache) is still unchecked.
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 10
+#define LLAMA_SESSION_VERSION 11
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 3
+#define LLAMA_STATE_SEQ_VERSION 4
 
 #ifdef __cplusplus
 extern "C" {
