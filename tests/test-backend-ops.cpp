@@ -6053,7 +6053,7 @@ struct test_concat : public test_case {
     const std::array<int64_t, 4> ne_a;
     const int64_t ne_b_d;
     const int dim;
-    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim))
+    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim), 1 << 4: transposed b (dim 1 innermost))
 
     std::string vars() override {
         return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
@@ -6102,6 +6102,17 @@ struct test_concat : public test_case {
 
             b = ggml_view_4d(ctx, b, ne_b[0], ne_b[1], ne_b[2], ne_b[3], b->nb[1], b->nb[2], b->nb[3], 0);
             ggml_set_name(b, "view_of_b");
+        } else if (v & 16) {
+            // Transposed b: nb[0] is strided and nb[1] == type_size. This is the
+            // concat(state, ggml_transpose(x), 0) shape class that every GDN / Mamba-style
+            // conv-state build produces, and the one the Vulkan backend splits into a generic
+            // copy of a plus a tiled 32x32 transpose-copy of b.
+            auto ne = ne_b; std::swap(ne[0], ne[1]);
+            b = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_name(b, "b");
+
+            b = ggml_transpose(ctx, b);
+            ggml_set_name(b, "transpose_of_b");
         } else {
             b = ggml_new_tensor(ctx, type, 4, ne_b.data());
             ggml_set_name(b, "b");
@@ -9754,6 +9765,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_I64, {11, 12, 13, 14}, 7, dim, v));
         }
+    }
+
+    // Transposed src1 (v = 16). concat(state, ggml_transpose(x), 0) is the conv-state build of
+    // qwen4exp/mamba/delta-net/arwkv7; on Vulkan it is split into a copy of src0 plus a tiled
+    // 32x32 transpose-copy of src1, which must be byte-exact with the single-dispatch path.
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32,  {3, 10240, 1, 1}, 2048, 0, 16)); // production shape
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32,  {5,  1027, 1, 1},   67, 0, 16)); // odd sizes, partial tiles
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F16,  {3,  1027, 1, 1},   67, 0, 16)); // 2-byte tiled transpose
+    test_cases.emplace_back(new test_concat(GGML_TYPE_BF16, {3,  1027, 1, 1},   67, 0, 16));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32,  {3,    64, 3, 2},   67, 0, 16)); // dims 2/3 as batch
+    // Same transposed layout but below the tile threshold / on another axis: these must stay on the
+    // generic single-dispatch path, so they guard the gating conditions rather than the fast path.
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32,  {3,  1027, 1, 1},    7, 0, 16));
+    for (int dim : { 1, 2, 3 }) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {67, 129, 1, 1}, 7, dim, 16));
     }
 
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
