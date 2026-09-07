@@ -494,8 +494,20 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // [TAG_PLE_HOIST] before anything else touches gf: the CPU-resident PLE gather has to be the
     // graph's first node for the scheduler to put its split first. One gather per PLE layer, in
     // layer order, so the node set and the tensor names are exactly what the in-loop build produced.
+    //
+    // SINGLE PLE LAYER ASSUMED. The loader rejects anything else: qwen4exp.ple.layers must name
+    // exactly one layer or model loading throws ("only one PLE layer is supported", the n_ple != 1
+    // check at the top of this file, ~line 111), because hparams carries one set of PLE hash
+    // constants and cannot represent two modules. That is what bounds the cost of hoisting: each
+    // hoisted gather stays live from the head of the graph to its consuming layer instead of being
+    // built and consumed inside the layer loop, which for the deployed model is one extra live
+    // [n_embd, ple_n_heads*n_tokens] tensor (~21 MiB at -ub 2048). With k PLE layers it would be
+    // k of them, i.e. ~21 MiB *per* extra layer, not a fixed +21 MiB - so the assertion below is
+    // not just a tidy-up: a future multi-PLE model must revisit this trade before it hoists.
     if (qwen4exp_ple_hoist_enabled()) {
         const auto * mctx_ple = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
+
+        int n_ple_hoisted = 0;
 
         for (int il = 0; il < (int) n_layer; ++il) {
             if (!hparams.is_ple(il)) {
@@ -505,7 +517,13 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             ggml_tensor * emb = build_ple_gather(mctx_ple, il);
             ggml_build_forward_expand(gf, emb);
             ple_gathered[il] = emb;
+
+            ++n_ple_hoisted;
         }
+
+        GGML_ASSERT(n_ple_hoisted <= 1 &&
+                "PLE hoisting assumes a single PLE layer (enforced by the loader's n_ple != 1 check); "
+                "peak liveness grows per hoisted gather, re-measure before allowing more");
     }
 
     const int64_t hc = hparams.dsv4_hc_mult;
