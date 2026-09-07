@@ -1628,6 +1628,10 @@ static void qwen4exp_ple_prefetch(const ggml_tensor * t, const std::vector<int32
 // ubatch. No allocation, no formatting, no syscall, no lock. The function reads only the id vector
 // that has already been computed and writes only to its own file; it feeds nothing back into the
 // graph, so a dumping run and a non-dumping run compute identical values.
+//
+// The FILE * is deliberately never fclose()d: it is a function-local static opened once and written
+// until the process exits, which is the whole intended lifetime of a census run. Every line is
+// fflush()ed, so a killed server still leaves a complete file. (review 0023 - noted, not changed.)
 static void qwen4exp_ple_rowid_dump(const std::vector<int32_t> & idx, int64_t n_tokens) {
     static FILE * const out = [] () -> FILE * {
         const char * path = getenv("LLAMA_PLE_DUMP");
@@ -1657,10 +1661,21 @@ static void qwen4exp_ple_rowid_dump(const std::vector<int32_t> & idx, int64_t n_
     line.reserve(12*(idx.size() + 1));
 
     char buf[24];
-    line.append(buf, (size_t) snprintf(buf, sizeof(buf), "%" PRId64, n_tokens));
+
+    // snprintf returns int: negative on an encoding error and >= sizeof(buf) on truncation, either
+    // of which becomes a huge size_t if cast blind. Both formats fit buf comfortably, so this only
+    // has to be safe, not clever: clamp to [0, sizeof(buf)-1]. (review 0023 nit)
+    auto appended = [&](int n) -> size_t {
+        if (n < 0) {
+            return 0;
+        }
+        return std::min((size_t) n, sizeof(buf) - 1);
+    };
+
+    line.append(buf, appended(snprintf(buf, sizeof(buf), "%" PRId64, n_tokens)));
 
     for (const int32_t row : idx) {
-        line.append(buf, (size_t) snprintf(buf, sizeof(buf), " %d", row));
+        line.append(buf, appended(snprintf(buf, sizeof(buf), " %d", row)));
     }
 
     line += '\n';
