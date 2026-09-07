@@ -2204,6 +2204,16 @@ std::mutex vk_memory_logger::log_mutex;
 static bool vk_perf_logger_enabled = false;
 static bool vk_perf_logger_concurrent = false;
 static bool vk_enable_sync_logger = false;
+// GGML_VK_FLOPS_SEED_LEGACY=1 restores the pre-fix behaviour of seeding the per-submit flop
+// threshold from the *previous* graph_compute call (i.e. the previous scheduler split).
+static bool vk_flops_seed_legacy = false;
+// GGML_VK_SUBMIT_LOG=1 prints one line per graph_compute with the submit count and the seed.
+static bool vk_submit_log_enabled = false;
+// GGML_VK_OPT_WINDOW=<n> sets ggml_vk_graph_optimize's independence lookahead (default 20).
+static int vk_graph_opt_window = 20;
+// GGML_VK_ASYNC_READ_COPYBUF=1 keeps the async readback on the vkCmdCopyBuffer path even when the
+// source buffer is host-visible UMA memory that the host could read directly.
+static bool vk_async_read_copybuf = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
@@ -7578,6 +7588,13 @@ static void ggml_vk_instance_init() {
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
+    vk_flops_seed_legacy = getenv("GGML_VK_FLOPS_SEED_LEGACY") != nullptr;
+    vk_submit_log_enabled = getenv("GGML_VK_SUBMIT_LOG") != nullptr;
+    const char* GGML_VK_OPT_WINDOW = getenv("GGML_VK_OPT_WINDOW");
+    if (GGML_VK_OPT_WINDOW != nullptr) {
+        vk_graph_opt_window = std::max(1, std::stoi(GGML_VK_OPT_WINDOW));
+    }
+    vk_async_read_copybuf = getenv("GGML_VK_ASYNC_READ_COPYBUF") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
     if (GGML_VK_PIPELINE_STATS != nullptr) {
@@ -8680,6 +8697,49 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
     GGML_ASSERT(width > 0);
     GGML_ASSERT(height > 0);
     GGML_ASSERT(src != nullptr);
+
+    // UMA shortcut, same test the synchronous ggml_vk_buffer_read_2d makes: if the source buffer's
+    // memory is host-visible and coherent on a UMA device, the host can read the very bytes the
+    // shader wrote and no vkCmdCopyBuffer (nor a staging buffer) is needed. The synchronous path
+    // memcpys immediately because it waits on a fence itself; here we have to keep the *async*
+    // contract, so instead of copying now we
+    //   (a) record a device->host memory dependency into this command buffer, and
+    //   (b) push the memcpy onto subctx->out_memcpys.
+    // Ordering: the barrier's first synchronization scope is everything earlier in submission
+    // order on this queue - i.e. the compute that produced the tensor, which was recorded into
+    // this same command buffer (or into an earlier batch on the same queue) before the readback -
+    // and its first access scope covers those shader/transfer writes, which it makes available and
+    // visible to the host domain. out_memcpys is then drained by ggml_vk_synchronize only after
+    // ggml_vk_wait_for_fence returns for the batch carrying this command buffer, so the memcpy
+    // cannot run before the GPU is done. Callers already have to synchronize before touching the
+    // destination (ggml_backend_tensor_get_async), and the pinned-destination branch below has
+    // always returned true without an internal synchronize, so no caller contract changes.
+    if (!vk_async_read_copybuf &&
+        src->device->uma &&
+        (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+        (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent) &&
+        src->ptr != nullptr) {
+        const bool transfer_queue = subctx->p->q->transfer_only;
+        const vk::AccessFlags src_access = transfer_queue
+            ? vk::AccessFlags(vk::AccessFlagBits::eTransferWrite)
+            : (vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite);
+
+        subctx->s->buffer->buf.pipelineBarrier(
+            subctx->p->q->stage_flags,
+            vk::PipelineStageFlagBits::eHost,
+            {},
+            { { src_access, vk::AccessFlagBits::eHostRead } },
+            {}, {});
+
+        if (width == spitch && width == dpitch) {
+            deferred_memcpy(dst, (const uint8_t *) src->ptr + offset, width * height, &subctx->out_memcpys);
+        } else {
+            for (size_t i = 0; i < height; i++) {
+                deferred_memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) src->ptr + offset + i * spitch, width, &subctx->out_memcpys);
+            }
+        }
+        return true;
+    }
 
     // TODO: staging_offset is not used
 
@@ -17719,7 +17779,31 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
         }
     }
-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    // The submit threshold has to be sized from the work that is about to be recorded, not from
+    // whatever ran last. ggml_backend_sched calls graph_compute once per *split*, so seeding it
+    // from ctx->last_total_flops makes a big split inherit the flops of the split before it. In
+    // qwen4exp the one-node CPU split (the PLE get_rows) sits between blk.0 and blk.1, so the
+    // 47-layer Vulkan split is seeded from a ~1.25 GFLOP split: ~31 MFLOP, which even after the
+    // three submit_after doublings stays far below a single MoE gate_up, and the flop rule - not
+    // the max_nodes_per_submit rule - ends up firing every few nodes.
+    //
+    // Sum this graph's own flops up front instead. ggml_vk_get_node_flops is a couple of branches
+    // and multiplies per node, so an extra pass over the node array is noise next to the command
+    // recording it precedes, and the seed then never depends on a previous call. A split with no
+    // flop-bearing ops seeds 0, which disables the flop rule for that split and leaves
+    // max_nodes_per_submit as the only bound - the correct behaviour for a split that has no
+    // matmuls to pace.
+    //
+    // This changes *when* command buffers are submitted, nothing about what they contain: the
+    // node order, the recorded commands and every operand are identical, so results are bit-exact.
+    uint64_t graph_total_flops = 0;
+    if (!vk_flops_seed_legacy) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            graph_total_flops += ggml_vk_get_node_flops(cgraph->nodes[i]);
+        }
+    }
+    uint64_t flops_per_submit = std::min(flops_cap, (vk_flops_seed_legacy ? ctx->last_total_flops : graph_total_flops) / 40u);
+    const uint64_t flops_per_submit_seed = flops_per_submit;
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -18062,6 +18146,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ctx->last_total_flops = total_flops;
 
+    if (vk_submit_log_enabled || vk_perf_logger_enabled) {
+        GGML_LOG_INFO("ggml_vulkan: graph_compute: %d nodes, %.3f GFLOP, %u submits, threshold seed %.3f GFLOP (%s)\n",
+                      cgraph->n_nodes, (double) total_flops / 1e9, submit_count,
+                      (double) flops_per_submit_seed / 1e9,
+                      vk_flops_seed_legacy ? "legacy: previous split" : "this graph");
+    }
+
     if (vk_perf_logger_enabled) {
         // End the command buffer and submit/wait
         GGML_ASSERT(!ctx->compute_ctx.expired());
@@ -18252,7 +18343,27 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         // that we support (e.g. RMS_NORM + MUL).
         // This first pass only grabs "real" (non-view nodes). Second pass grabs view nodes.
         // The goal is to not interleave real and view nodes in a way that breaks fusion.
-        const int NUM_TO_CHECK = 20;
+        //
+        // GGML_VK_OPT_WINDOW sets how far ahead we look. Widening it cannot make the reordering
+        // less safe, because the window only bounds which candidate `j` is *considered*: every
+        // candidate still has to clear the same two gates, and both scale with the window rather
+        // than with the constant.
+        //   1. Hazards. For a candidate j the loop below tests is_src_of(nodes[j], nodes[c]) for
+        //      *every* not-yet-emitted c in [first_unused, j), so the number of hazard tests grows
+        //      with the distance, never leaving a gap. Nodes below first_unused are all emitted
+        //      (the while loop at the bottom only advances over used[] entries), and the graph is
+        //      topologically ordered, so every unemitted predecessor of j - and, via is_src_of's
+        //      base()/ggml_vk_mutated_src() checks, every writer or reader that aliases the same
+        //      storage through a view (patch 0012's hazard) - is inside that scanned interval.
+        //      A wider window therefore adds candidates, not unchecked ones.
+        //   2. Fusion patterns. keep_pattern() runs at first_unused only and is untouched. The
+        //      per-candidate match_pattern()/inside_pattern(hc_combine_pattern, j) guards below are
+        //      evaluated for each j in the window, so a node that a wider window newly reaches is
+        //      still refused if it starts or sits inside a protected pattern. The RMS_NORM+MUL,
+        //      MUL_MAT+ADD, ... carve-outs are all conditioned on j == c+1, which no window size
+        //      changes.
+        // Reordering independent nodes changes no operand of any op, so results stay bit-exact.
+        const int NUM_TO_CHECK = vk_graph_opt_window;
         for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
             if (used[j]) {
                 continue;
