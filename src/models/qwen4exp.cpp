@@ -479,11 +479,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
 // unaffected too: llm_graph_input_ple::set_input() reads only the ubatch and the KV cells (which
 // apply_ubatch() filled before any set_input runs) and writes only its own tensor, so it is
 // independent of where in the input list it sits and of when the node that consumes it is built.
-// LLAMA_PLE_HOIST=0 restores the in-loop placement for an A/B.
+// LLAMA_PLE_HOIST=1 enables the hoist (default off, see below); unset/0 = the in-loop placement.
 static bool qwen4exp_ple_hoist_enabled() {
     static const bool enabled = [] {
+        // default OFF since 2026-09-08: the v20 A/B measured the hoist at -3.5 % prefill (483.5 -> 466.5 t/s at 8k,
+        // 404 -> 393 at 32k) and decode unchanged. With the gather in the middle of the graph the scheduler overlaps the
+        // CPU get_rows with blk.0's GPU work; hoisted to the first node it runs while the GPU is idle, and that costs more
+        // than the mid-graph drain it removes. LLAMA_PLE_HOIST=1 re-enables it for an A/B; the right design is the gather
+        // as a graph input computed ahead of the previous ubatch (G25).
         const char * s = getenv("LLAMA_PLE_HOIST");
-        return s == nullptr || atoi(s) != 0;
+        return s != nullptr && atoi(s) != 0;
     }();
 
     return enabled;
