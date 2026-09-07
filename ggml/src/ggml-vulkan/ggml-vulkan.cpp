@@ -2204,6 +2204,11 @@ std::mutex vk_memory_logger::log_mutex;
 static bool vk_perf_logger_enabled = false;
 static bool vk_perf_logger_concurrent = false;
 static bool vk_enable_sync_logger = false;
+// GGML_VK_FLOPS_SEED_LEGACY=1 restores the pre-fix behaviour of seeding the per-submit flop
+// threshold from the *previous* graph_compute call (i.e. the previous scheduler split).
+static bool vk_flops_seed_legacy = false;
+// GGML_VK_SUBMIT_LOG=1 prints one line per graph_compute with the submit count and the seed.
+static bool vk_submit_log_enabled = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
@@ -7578,6 +7583,8 @@ static void ggml_vk_instance_init() {
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
+    vk_flops_seed_legacy = getenv("GGML_VK_FLOPS_SEED_LEGACY") != nullptr;
+    vk_submit_log_enabled = getenv("GGML_VK_SUBMIT_LOG") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
     if (GGML_VK_PIPELINE_STATS != nullptr) {
@@ -17719,7 +17726,31 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
         }
     }
-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    // The submit threshold has to be sized from the work that is about to be recorded, not from
+    // whatever ran last. ggml_backend_sched calls graph_compute once per *split*, so seeding it
+    // from ctx->last_total_flops makes a big split inherit the flops of the split before it. In
+    // qwen4exp the one-node CPU split (the PLE get_rows) sits between blk.0 and blk.1, so the
+    // 47-layer Vulkan split is seeded from a ~1.25 GFLOP split: ~31 MFLOP, which even after the
+    // three submit_after doublings stays far below a single MoE gate_up, and the flop rule - not
+    // the max_nodes_per_submit rule - ends up firing every few nodes.
+    //
+    // Sum this graph's own flops up front instead. ggml_vk_get_node_flops is a couple of branches
+    // and multiplies per node, so an extra pass over the node array is noise next to the command
+    // recording it precedes, and the seed then never depends on a previous call. A split with no
+    // flop-bearing ops seeds 0, which disables the flop rule for that split and leaves
+    // max_nodes_per_submit as the only bound - the correct behaviour for a split that has no
+    // matmuls to pace.
+    //
+    // This changes *when* command buffers are submitted, nothing about what they contain: the
+    // node order, the recorded commands and every operand are identical, so results are bit-exact.
+    uint64_t graph_total_flops = 0;
+    if (!vk_flops_seed_legacy) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            graph_total_flops += ggml_vk_get_node_flops(cgraph->nodes[i]);
+        }
+    }
+    uint64_t flops_per_submit = std::min(flops_cap, (vk_flops_seed_legacy ? ctx->last_total_flops : graph_total_flops) / 40u);
+    const uint64_t flops_per_submit_seed = flops_per_submit;
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -18061,6 +18092,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     ctx->last_total_flops = total_flops;
+
+    if (vk_submit_log_enabled || vk_perf_logger_enabled) {
+        GGML_LOG_INFO("ggml_vulkan: graph_compute: %d nodes, %.3f GFLOP, %u submits, threshold seed %.3f GFLOP (%s)\n",
+                      cgraph->n_nodes, (double) total_flops / 1e9, submit_count,
+                      (double) flops_per_submit_seed / 1e9,
+                      vk_flops_seed_legacy ? "legacy: previous split" : "this graph");
+    }
 
     if (vk_perf_logger_enabled) {
         // End the command buffer and submit/wait
