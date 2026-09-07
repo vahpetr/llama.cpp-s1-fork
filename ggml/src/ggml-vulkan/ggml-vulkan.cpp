@@ -49,7 +49,10 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <tuple>
@@ -7596,7 +7599,18 @@ static void ggml_vk_instance_init() {
     vk_submit_log_enabled = getenv("GGML_VK_SUBMIT_LOG") != nullptr;
     const char* GGML_VK_OPT_WINDOW = getenv("GGML_VK_OPT_WINDOW");
     if (GGML_VK_OPT_WINDOW != nullptr) {
-        vk_graph_opt_window = std::max(1, std::stoi(GGML_VK_OPT_WINDOW));
+        // strtol, not std::stoi: this runs inside ggml_vk_instance_init and a throw from a
+        // malformed value ("", "abc", a huge number) escapes to std::terminate. Anything that is
+        // not a complete, in-range integer leaves the default in place.
+        errno = 0;
+        char * end = nullptr;
+        const long v = strtol(GGML_VK_OPT_WINDOW, &end, 10);
+        if (end != GGML_VK_OPT_WINDOW && *end == '\0' && errno == 0 && v >= 1 && v <= INT_MAX) {
+            vk_graph_opt_window = (int) v;
+        } else {
+            GGML_LOG_WARN("ggml_vulkan: ignoring malformed GGML_VK_OPT_WINDOW=\"%s\", using %d\n",
+                    GGML_VK_OPT_WINDOW, vk_graph_opt_window);
+        }
     }
     vk_async_read_copybuf   = getenv("GGML_VK_ASYNC_READ_COPYBUF") != nullptr;
     vk_async_read_uma_force = getenv("GGML_VK_ASYNC_READ_UMA") != nullptr;
