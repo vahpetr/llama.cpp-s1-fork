@@ -3973,11 +3973,20 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
     static const bool fa_no_zero_dead_v = getenv("GGML_VK_FA_NO_ZERO_DEAD_V") != nullptr;
     const bool zero_dead_v = !fa_no_zero_dead_v && use_mask && params.path == FA_COOPMAT1;
 
+    // ZERO_DEAD_V derives its dead-column predicate from the P values the threads still
+    // hold in registers, reduced with subgroupAnd across the row_split row groups.
+    // GGML_VK_FA_DEADV_LDS=1 selects the original implementation, which rebuilds the same
+    // flags by re-reading Psh from shared memory behind two extra barriers, so one build
+    // can A/B the two.  Both compute the identical predicate.
+    static const bool fa_deadv_lds = getenv("GGML_VK_FA_DEADV_LDS") != nullptr;
+    const bool deadv_lds = zero_dead_v && fa_deadv_lds;
+
     uint32_t flags = (use_mask_opt      ? 1 : 0) |
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
-                     (zero_dead_v       ? 16 : 0);
+                     (zero_dead_v       ? 16 : 0) |
+                     (deadv_lds         ? 32 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -10890,8 +10899,11 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 
     const uint32_t slope = Br * acctype;
 
-    // p_dead[Bc] + any_dead (the ZERO_DEAD_V mask-suppressed-column flags)
-    const uint32_t dead = (Bc + 1) * (uint32_t) sizeof(uint32_t);
+    // p_dead[Bc] + any_dead (the ZERO_DEAD_V mask-suppressed-column flags, DEADV_LDS path)
+    // plus p_dead_sg[row_split * dead_words] (the per-subgroup column masks of the default,
+    // register-reduced path)
+    const uint32_t dead_words = (Bc + 31) / 32;
+    const uint32_t dead = (Bc + 1 + row_split * dead_words) * (uint32_t) sizeof(uint32_t);
 
     const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + dead;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
