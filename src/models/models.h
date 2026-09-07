@@ -2393,6 +2393,17 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * hidden,
                             int   il);
 
+        // [TAG_PLE_HOIST] the gather half of build_ple: the PLE row input plus the single
+        // ggml_get_rows over the CPU-resident table. Split out so it can be built and expanded
+        // ahead of the trunk, which is a pure node reordering -- see build_ple_gather().
+        ggml_tensor * build_ple_gather(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                            int   il);
+
+        // [TAG_PLE_HOIST] il -> the hoisted gather result, picked up by build_ple in the layer
+        // loop. Empty when LLAMA_PLE_HOIST=0, in which case build_ple gathers in place as before.
+        std::map<int, ggml_tensor *> ple_gathered;
+
         // returns pair of qkv, z
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
                     ggml_tensor * input,

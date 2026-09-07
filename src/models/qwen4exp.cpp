@@ -445,8 +445,62 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     return cur;
 }
 
+// [TAG_PLE_HOIST]
+// The PLE gather (ggml_get_rows over per_layer_token_embd) is the only node of the graph that the
+// backend scheduler assigns to the CPU: the table is a CPU-resident weight (-ot
+// per_layer_token_embd=CPU, buffer usage WEIGHTS -> cause "1.wgt0"), and ggml_vk_get_op_batch_size()
+// returns 0 for GGML_OP_GET_ROWS, so ggml_backend_vk_device_offload_op() can never claim it. Built
+// inside the layer loop it lands *between* two Vulkan runs, and the scheduler emits three splits:
+//   Vulkan[inp_embd + blk.0] / CPU[ple gather] / Vulkan[blk.1 .. blk.47]
+// The middle split has n_inputs == 0 (both srcs are already CPU-side), which trips the un-guarded
+// drain at the top of ggml_backend_sched_compute_splits() (ggml/src/ggml-backend.cpp):
+//   if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id)
+//       ggml_backend_synchronize(sched->backends[prev_backend_id]);
+// i.e. a full mid-graph GPU drain -- plus the ggml_vk_graph_cleanup() that
+// ggml_backend_vk_synchronize() runs -- once per ubatch.
+//
+// Emitting the gather as the FIRST node of the graph makes it split 0, where prev_backend_id is
+// still -1, so the drain cannot fire; the split list becomes CPU[ple gather] / Vulkan[everything],
+// and the single remaining Vulkan split sees the whole graph's flops when it sizes its submit
+// batches (ggml_backend_vk_graph_compute's flops_per_submit).
+//
+// Why the values cannot move: this changes the *order in which nodes are appended to the graph*,
+// nothing else. Same ggml_get_rows, same table tensor, same index tensor, same reshape, same
+// consumers (build_lora_mm(ple_key/ple_value, emb)); no operand, no operand order, no dtype, no
+// epsilon and no accumulation order anywhere in the DAG is touched. ggml executes a DAG, so a
+// topological reordering that keeps every edge is value-identical by construction. The row ids are
+// unaffected too: llm_graph_input_ple::set_input() reads only the ubatch and the KV cells (which
+// apply_ubatch() filled before any set_input runs) and writes only its own tensor, so it is
+// independent of where in the input list it sits and of when the node that consumes it is built.
+// LLAMA_PLE_HOIST=0 restores the in-loop placement for an A/B.
+static bool qwen4exp_ple_hoist_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_PLE_HOIST");
+        return s == nullptr || atoi(s) != 0;
+    }();
+
+    return enabled;
+}
+
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
+    // [TAG_PLE_HOIST] before anything else touches gf: the CPU-resident PLE gather has to be the
+    // graph's first node for the scheduler to put its split first. One gather per PLE layer, in
+    // layer order, so the node set and the tensor names are exactly what the in-loop build produced.
+    if (qwen4exp_ple_hoist_enabled()) {
+        const auto * mctx_ple = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
+
+        for (int il = 0; il < (int) n_layer; ++il) {
+            if (!hparams.is_ple(il)) {
+                continue;
+            }
+
+            ggml_tensor * emb = build_ple_gather(mctx_ple, il);
+            ggml_build_forward_expand(gf, emb);
+            ple_gathered[il] = emb;
+        }
+    }
+
     const int64_t hc = hparams.dsv4_hc_mult;
 
     GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
@@ -1671,13 +1725,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     return conv_input;
 }
 
-ggml_tensor * llama_model_qwen4exp::graph::build_ple(
-        llm_graph_input_rs * inp,
+// [TAG_PLE_HOIST] the gather, verbatim from build_ple. Called either from the graph ctor (hoisted,
+// the default) or from build_ple itself (LLAMA_PLE_HOIST=0). Identical either way -- the only
+// difference is the position of these two nodes in gf.
+ggml_tensor * llama_model_qwen4exp::graph::build_ple_gather(
         const llama_memory_hybrid_idx_context * mctx_hyb,
-        ggml_tensor *        hidden,
         int                  il) {
-    const int64_t hc      = hparams.dsv4_hc_mult;
-    const int64_t hc_dim  = hc * n_embd;
     const int64_t n_heads = hparams.ple_n_heads;
 
     // the attention cells see every ubatch regardless of the layer types
@@ -1693,6 +1746,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", il);
+
+    return emb;
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_ple(
+        llm_graph_input_rs * inp,
+        const llama_memory_hybrid_idx_context * mctx_hyb,
+        ggml_tensor *        hidden,
+        int                  il) {
+    const int64_t hc      = hparams.dsv4_hc_mult;
+    const int64_t hc_dim  = hc * n_embd;
+
+    // [TAG_PLE_HOIST] normally the gather is already built and expanded at the head of the graph;
+    // with LLAMA_PLE_HOIST=0 the map is empty and it is built right here, as it was before.
+    const auto it = ple_gathered.find(il);
+    ggml_tensor * emb = it != ple_gathered.end() ? it->second : build_ple_gather(mctx_hyb, il);
 
     ggml_tensor * key   = build_lora_mm(model.layers[il].ple_key,   emb);
     ggml_tensor * value = build_lora_mm(model.layers[il].ple_value, emb);
