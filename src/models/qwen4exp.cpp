@@ -624,6 +624,65 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_build_forward_expand(gf, cur);
 }
 
+// [TAG_MTP_EHPROJ_FLAT]
+// The MTP draft head applies nextn.eh_proj (q4_K, 5120 x 2560) to the [5120, hc, n_tokens] concat
+// of the broadcast token embedding and the wide hidden stream. ggml_mul_mat treats dims 2/3 as a
+// batch, so the Vulkan backend sees dst->ne[1] == hc == 4 with src1->ne[2] == n_tokens, and the
+// mat-vec gate (ggml-vulkan.cpp ggml_vk_mul_mat:
+//     dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2]*src1->ne[3] == 1)
+// with mul_mat_vec_max_cols == 8) fails as soon as n_tokens > 1. So it runs the general GEMM with
+// a degenerate N of 4 over n_tokens batch groups, and every batch group re-reads and
+// re-dequantises the whole 7.03 MiB weight: at n_tokens = 2048 that is 14.1 GiB of nominal A
+// traffic for 215 GFLOP of useful work. Measured 145.2 ms per ubatch at 1479 GFLOPS/s against
+// 16772 GFLOPS/s for the neighbouring dense MUL_MAT of the same dtype -- 514.6 ms of the 19.3 s
+// pp8k prefill (2.7 %), ~11x below the dense-GEMM rate.
+// See docs/research/2026-09-07-m3-followups.md section 2 for the full derivation.
+//
+// The concat is contiguous -- both sources are (e_norm is a ggml_repeat_4d result, h_norm a
+// reshape of a ggml_mul) and ggml_concat allocates a fresh contiguous dst -- so the hc axis and
+// the token axis can be merged into a single N by a pure view:
+//     [5120, hc, n_tokens] -> [5120, hc*n_tokens]
+// The element order is unchanged. ggml is row-major over (ne0, ne1, ne2) for a contiguous tensor,
+// so element (i0, c, t) sits at i0 + 5120*(c + hc*t) in both forms; the GEMM's column j = c + hc*t
+// is exactly the (c, t) column of the 3D form, and reshaping the [2560, hc*n_tokens] result back
+// to [2560, hc, n_tokens] restores bit-for-bit the layout every consumer already expects
+// (build_hc_mix's rms_norm + reshape_2d, the inp_out_ids get_rows below, the t_h_nextn export).
+// Same weight, same k = 5120 reduction, same operand order, same per-tensor scale broadcast --
+// the weight is simply read once instead of n_tokens times.
+//
+// NOT BIT-EXACT BY CONSTRUCTION. ggml_vk_mul_mat_q_f16 selects among the _s/_m/_l tile variants
+// and the aligned/unaligned pipelines by shape, so the merged N can land on a different BK and
+// reassociate the k-loop. Same kernel family, same dtypes, same operands -- but the summation
+// order is not guaranteed, so this has to clear the census oracle
+// (suite.py run --tracks speed,exact) before it ships, per the standing speed/quality ruling.
+//
+// Decode is deliberately left alone. The draft head runs with n_tokens of a handful there; today
+// that is a GEMM with N = 4 over n_tokens batch groups, and the flat form would be either a
+// mat-vec with hc*n_tokens <= 8 columns (n_tokens <= 2) or a GEMM with N = hc*n_tokens
+// (n_tokens >= 3). Analytically the flat form is not worse -- it still reads the 7 MiB weight once
+// instead of n_tokens times -- but it crosses a kernel-family boundary at n_tokens == 2 and cannot
+// be settled without a GPU run, and decode is the latency-critical path. So the reshape is gated
+// on n_tokens >= LLAMA_MTP_EHPROJ_FLAT_MIN_TOKENS (default 32): every decode/verify ubatch keeps
+// today's graph node-for-node and value-for-value, and every prefill ubatch (n_ubatch is 512..2048
+// in prod) takes the flat path. Set the threshold to 1 to A/B the decode side once the oracle has
+// cleared the prefill side.
+//
+// LLAMA_MTP_EHPROJ_FLAT=0 restores today's graph everywhere.
+static bool qwen4exp_mtp_ehproj_flat_enabled(int64_t n_tokens) {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_MTP_EHPROJ_FLAT");
+        return s == nullptr || atoi(s) != 0;
+    }();
+
+    static const int64_t min_tokens = [] {
+        const char * s = getenv("LLAMA_MTP_EHPROJ_FLAT_MIN_TOKENS");
+        const int v = s == nullptr ? 32 : atoi(s);
+        return (int64_t) (v < 1 ? 1 : v);
+    }();
+
+    return enabled && n_tokens >= min_tokens;
+}
+
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for qwen4exp.
 //
 // The head folds the next token's embedding into the trunk's wide hyper-connection residual,
@@ -705,7 +764,26 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
     cb(concat, "mtp_concat", il);
 
-    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
+    // [TAG_MTP_EHPROJ_FLAT] see the comment above graph_mtp: merging the hc axis into N turns a
+    // GEMM with N = 4 over n_tokens batch groups into one GEMM with N = hc*n_tokens, so the q4_K
+    // weight is read and dequantised once per graph instead of once per token. Prefill only --
+    // NOT bit-exact (tile-variant selection may reassociate), oracle-gated.
+    ggml_tensor * res_hc = nullptr;
+
+    if (qwen4exp_mtp_ehproj_flat_enabled(n_tokens)) {
+        GGML_ASSERT(ggml_is_contiguous(concat) && "MTP eh_proj flat path needs a contiguous concat");
+
+        ggml_tensor * concat_flat = ggml_reshape_2d(ctx0, concat, 2*n_embd, hc*n_tokens);
+        cb(concat_flat, "mtp_concat_flat", il);
+
+        ggml_tensor * res_flat = build_lora_mm(layer.nextn.eh_proj, concat_flat, layer.nextn.eh_proj_s);
+        cb(res_flat, "mtp_eh_proj_flat", il);
+
+        res_hc = ggml_reshape_3d(ctx0, res_flat, n_embd, hc, n_tokens);
+    } else {
+        res_hc = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
+    }
+
     cb(res_hc, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
