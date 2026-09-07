@@ -391,9 +391,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
     // collapse the streams by their mean
+    // [TAG_HC_MIX_NO_CONT]
+    // no ggml_cont on the first stream: ggml_add already allocates a contiguous destination
+    // (ggml_dup_tensor of src0), and every add consumer here takes a strided src0 -- the CPU
+    // kernel only needs nb00 == sizeof(float), the Vulkan add carries nb00..nb03 in its push
+    // constants, and ggml_vk_fuse_multi_add explicitly allows "different strides". The values are
+    // unchanged: a f32->f32 cont is a bit copy, and the sum still runs as (((s0+s1)+s2)+s3) with
+    // the same operands in the same order.
     ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
             ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
     for (int64_t c = 1; c < hc; ++c) {
         ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
                 ggml_row_size(gated->type, n_embd) * hc,
