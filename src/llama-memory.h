@@ -93,6 +93,14 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // [TAG_KV_GRAPH_SPAN]
+    // cap the n_kv that init_full() reports, so the worst-case compute buffers (KQ mask, KV views, ...)
+    // are reserved for a span of at most n_kv_max cells instead of the whole cache.
+    // 0 (the default) keeps the historical behaviour of reserving at the full cache size.
+    // this affects the *reserve* path only - init_batch()/apply() keep deriving n_kv from the real slots,
+    // and ggml-alloc grows the compute buffers on demand if a later graph exceeds the reserved span.
+    virtual void set_n_kv_reserve_max(uint32_t n_kv_max) { (void) n_kv_max; }
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;

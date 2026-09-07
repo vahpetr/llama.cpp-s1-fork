@@ -1726,6 +1726,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
+        {"--kv-graph-span"}, "N",
+        string_format("cap the KV span (in tokens) used to size the worst-case compute buffers reserved at startup "
+            "(default: %d = the full KV cache size). does not change the KV span of real batches: buffers grow on "
+            "demand if a batch exceeds N, at the cost of one synchronize + reallocation. lowering it frees the "
+            "[n_kv, n_ubatch] KQ mask (device and pinned host copy) for the unused span", params.kv_graph_span),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-graph-span must be >= 0");
+            }
+            params.kv_graph_span = value;
+        }
+    ).set_env("LLAMA_ARG_KV_GRAPH_SPAN"));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

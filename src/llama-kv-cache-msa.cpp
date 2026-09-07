@@ -147,6 +147,16 @@ llama_memory_context_ptr llama_kv_cache_msa::init_full() {
     return std::make_unique<llama_kv_cache_msa_context>(this);
 }
 
+// [TAG_KV_GRAPH_SPAN] forward the worst-case-reserve cap to every sub-cache
+void llama_kv_cache_msa::set_n_kv_reserve_max(uint32_t n_kv_max) {
+    if (get_base()) {
+        get_base()->set_n_kv_reserve_max(n_kv_max);
+    }
+    if (get_idx()) {
+        get_idx()->set_n_kv_reserve_max(n_kv_max);
+    }
+}
+
 llama_memory_context_ptr llama_kv_cache_msa::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_kv_cache_msa_context>(this, lctx, optimize);
 }

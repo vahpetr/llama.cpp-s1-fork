@@ -250,6 +250,9 @@ llama_context::llama_context(
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 
+    // [TAG_KV_GRAPH_SPAN] cap for the worst-case graph reserve only - see llama_kv_cache::init_full()
+    cparams.kv_graph_span = params.kv_graph_span;
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -316,6 +319,8 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
+    LLAMA_LOG_INFO("%s: kv_graph_span         = %u%s\n", __func__, cparams.kv_graph_span,
+            cparams.kv_graph_span == 0 ? " (full KV size)" : " (worst-case graph reserve only)");
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
         LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
@@ -393,6 +398,15 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // [TAG_KV_GRAPH_SPAN]
+        // shrink the n_kv that init_full() simulates for the worst-case compute-buffer reserve.
+        // this only changes the size of the buffers that are reserved up front - the n_kv of real
+        // batches still comes from llama_kv_cache::get_n_kv(sinfo). if a later graph genuinely needs
+        // more, ggml-alloc reallocates it on demand (see ggml_backend_sched_alloc_splits).
+        if (memory && cparams.kv_graph_span > 0) {
+            memory->set_n_kv_reserve_max(cparams.kv_graph_span);
+        }
     }
 
     // init backends
@@ -3531,6 +3545,7 @@ llama_context_params llama_context_default_params() {
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
+        /*.kv_graph_span               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,

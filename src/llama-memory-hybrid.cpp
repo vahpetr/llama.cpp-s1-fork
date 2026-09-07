@@ -125,6 +125,13 @@ llama_memory_context_ptr llama_memory_hybrid::init_full() {
     return std::make_unique<llama_memory_hybrid_context>(this);
 }
 
+// [TAG_KV_GRAPH_SPAN] forward the worst-case-reserve cap to every sub-cache
+void llama_memory_hybrid::set_n_kv_reserve_max(uint32_t n_kv_max) {
+    if (get_mem_attn()) {
+        get_mem_attn()->set_n_kv_reserve_max(n_kv_max);
+    }
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_context>(this, lctx, optimize);
 }
