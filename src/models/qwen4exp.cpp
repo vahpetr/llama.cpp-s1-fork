@@ -5,6 +5,13 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
+#include <utility>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 // vocabulary-pruned LM head (d2t): scatter the n_draft_vocab logits of `logits_k` into a full-vocabulary tensor
 // filled with -INF, so every consumer keeps seeing n_vocab logits (same mechanism as eagle3 / dflash). A head that
@@ -1431,6 +1438,91 @@ public:
     std::vector<llama_token> prev;
 };
 
+// [TAG_PLE_PREFETCH]
+// Ask the kernel to start reading the PLE rows this ubatch is about to gather.
+//
+// per_layer_token_embd lives in the mmap'd GGUF and is loaded with TENSOR_READ_LAZY, so
+// llama_mmap marks its byte range POSIX_MADV_RANDOM and leaves it out of MAP_POPULATE
+// (src/llama-model-loader.cpp lazy_tensor_ranges -> src/llama-mmap.cpp). There is therefore no
+// readahead of any kind on this path: the first touch is the CPU ggml_get_rows inside the graph,
+// which faults the rows in one at a time, synchronously, with the GPU idle behind the CPU split.
+// The row indices are already known here, one ubatch ahead of that gather.
+//
+// posix_madvise(POSIX_MADV_WILLNEED) is purely advisory: it starts asynchronous page-ins and
+// changes no byte of the mapping, no protection, and no value any op reads. The gather reads the
+// same file bytes either way, so the graph output is bit-identical with the prefetch on or off.
+// Failures are ignored for the same reason. LLAMA_PLE_PREFETCH=0 turns it off for an A/B.
+static void qwen4exp_ple_prefetch(const ggml_tensor * t, const std::vector<int32_t> & rows) {
+#if defined(__linux__)
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_PLE_PREFETCH");
+        return s == nullptr || atoi(s) != 0;
+    }();
+
+    if (!enabled || rows.empty() || t == nullptr || t->data == nullptr || t->buffer == nullptr) {
+        return;
+    }
+
+    // only a host mapping has a page cache behind it; a device buffer must be left alone
+    if (!ggml_backend_buffer_is_host(t->buffer)) {
+        return;
+    }
+
+    const long ps_signed = sysconf(_SC_PAGESIZE);
+    if (ps_signed <= 0) {
+        return;
+    }
+
+    const size_t ps     = (size_t) ps_signed;
+    const size_t row_sz = t->nb[1];
+    const size_t n_rows = (size_t) t->ne[1];
+    char * const base   = (char *) t->data;
+
+    // page-aligned byte range of every row, sorted, then coalesced where the ranges touch.
+    // rounding out of the tensor stays inside the same mapping (the page holding a valid address
+    // is mapped by definition), so the advice can never name an unmapped page.
+    std::vector<std::pair<size_t, size_t>> r;
+    r.reserve(rows.size());
+
+    for (const int32_t row : rows) {
+        if (row < 0 || (size_t) row >= n_rows) {
+            continue;
+        }
+
+        const size_t beg = ((size_t) row)*row_sz;
+        const size_t end = beg + row_sz;
+
+        r.emplace_back(beg & ~(ps - 1), (end + ps - 1) & ~(ps - 1));
+    }
+
+    if (r.empty()) {
+        return;
+    }
+
+    std::sort(r.begin(), r.end());
+
+    size_t beg = r[0].first;
+    size_t end = r[0].second;
+
+    for (size_t i = 1; i < r.size(); ++i) {
+        if (r[i].first <= end) {
+            end = std::max(end, r[i].second);
+            continue;
+        }
+
+        posix_madvise(base + beg, end - beg, POSIX_MADV_WILLNEED);
+
+        beg = r[i].first;
+        end = r[i].second;
+    }
+
+    posix_madvise(base + beg, end - beg, POSIX_MADV_WILLNEED);
+#else
+    GGML_UNUSED(t);
+    GGML_UNUSED(rows);
+#endif
+}
+
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
@@ -1490,6 +1582,10 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+
+    // start the page-ins before the upload, so they overlap the rest of set_inputs and the
+    // graph nodes that run ahead of blk.1's gather
+    qwen4exp_ple_prefetch(pmodel.per_layer_tok_embd, idx);
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
