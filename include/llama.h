@@ -364,6 +364,11 @@ extern "C" {
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+        uint32_t kv_graph_span;         // cap the KV span (n_kv) simulated for the worst-case graph reserve
+                                        // 0 = use the full KV cache size (default, pre-existing behaviour)
+                                        // does NOT change the n_kv of real batches - only the size of the
+                                        // buffers reserved up front; ggml-alloc grows them on demand later
+                                        // [EXPERIMENTAL]
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 

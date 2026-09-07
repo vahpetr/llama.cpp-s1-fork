@@ -738,7 +738,28 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 }
 
 llama_memory_context_ptr llama_kv_cache::init_full() {
-    return std::make_unique<llama_kv_cache_context>(this);
+    // [TAG_KV_GRAPH_SPAN]
+    // the full-cache context is used only to build the worst-case graph for the compute-buffer reserve
+    // (llama_context::sched_reserve / llama_graph_reserve). capping the span it reports shrinks every
+    // tensor in that graph that is sized by n_kv - most importantly the [n_kv, n_ubatch] KQ mask, which
+    // is a graph input and is therefore paid twice on backends that reject the host buffer type.
+    // the cap is padded exactly like get_n_kv(), so the reserved shape is one that can actually occur.
+    uint32_t n_kv = get_size();
+
+    if (n_kv_reserve_max > 0 && n_kv_reserve_max < n_kv) {
+        const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+        n_kv = std::min(n_kv, std::max(n_pad_cur, GGML_PAD(n_kv_reserve_max, n_pad_cur)));
+
+        LLAMA_LOG_DEBUG("%s: capping the worst-case reserve span: n_kv = %u (cache size = %u)\n",
+                __func__, n_kv, get_size());
+    }
+
+    return std::make_unique<llama_kv_cache_context>(this, n_kv);
+}
+
+void llama_kv_cache::set_n_kv_reserve_max(uint32_t n_kv_max) {
+    n_kv_reserve_max = n_kv_max;
 }
 
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
@@ -2725,8 +2746,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+        llama_kv_cache * kv, uint32_t n_kv_span) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+    // [TAG_KV_GRAPH_SPAN] n_kv_span == 0 means "the whole cache" (the historical behaviour)
+    n_kv = n_kv_span == 0 ? kv->get_size() : std::min(n_kv_span, kv->get_size());
 
     const uint32_t n_stream = kv->get_n_stream();
 

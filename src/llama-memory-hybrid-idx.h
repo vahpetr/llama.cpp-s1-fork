@@ -54,6 +54,8 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
+    void set_n_kv_reserve_max(uint32_t n_kv_max) override; // [TAG_KV_GRAPH_SPAN]
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

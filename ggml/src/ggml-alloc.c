@@ -923,15 +923,16 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
-#ifndef NDEBUG
             {
-                size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+                // [TAG_KV_GRAPH_SPAN] growing an already-allocated compute buffer costs a full backend
+                // synchronize plus a free/alloc of the whole chunk. it is the price of a capped worst-case
+                // reserve (llama.cpp's --kv-graph-span), so it must be visible in a release build too.
+                const size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
                 if (cur_size > 0) {
-                    GGML_LOG_DEBUG("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
+                    GGML_LOG_INFO("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
                         __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
                 }
             }
-#endif
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;

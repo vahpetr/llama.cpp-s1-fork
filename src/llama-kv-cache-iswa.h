@@ -63,6 +63,8 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
+    void set_n_kv_reserve_max(uint32_t n_kv_max) override; // [TAG_KV_GRAPH_SPAN]
+
     bool get_can_shift() const override;
 
     void clear(bool data) override;

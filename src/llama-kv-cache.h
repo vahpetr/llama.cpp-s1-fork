@@ -131,6 +131,8 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
+    void set_n_kv_reserve_max(uint32_t n_kv_max) override;
+
     bool get_can_shift() const override;
 
     void clear(bool data) override;
@@ -267,6 +269,10 @@ private:
     // required padding
     const uint32_t n_pad = 1;
 
+    // [TAG_KV_GRAPH_SPAN]
+    // cap on the n_kv reported by init_full() (the worst-case graph reserve); 0 = no cap
+    uint32_t n_kv_reserve_max = 0;
+
     // SWA
     const uint32_t n_swa = 0;
 
@@ -357,8 +363,10 @@ public:
     llama_kv_cache_context(llama_memory_status status);
 
     // used to create a full-cache context
+    // n_kv_span: the simulated span, in cells. 0 = the whole cache (llama_kv_cache::get_size())
     llama_kv_cache_context(
-            llama_kv_cache * kv);
+            llama_kv_cache * kv,
+            uint32_t n_kv_span = 0);
 
     // used to create an update context
     llama_kv_cache_context(
