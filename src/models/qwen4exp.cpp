@@ -4,9 +4,12 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -1515,7 +1518,15 @@ public:
 // posix_madvise(POSIX_MADV_WILLNEED) is purely advisory: it starts asynchronous page-ins and
 // changes no byte of the mapping, no protection, and no value any op reads. The gather reads the
 // same file bytes either way, so the graph output is bit-identical with the prefetch on or off.
-// Failures are ignored for the same reason. LLAMA_PLE_PREFETCH=0 turns it off for an A/B.
+// A failure is therefore never fatal, but it must not be silent: the first non-zero return is
+// logged once (see below). LLAMA_PLE_PREFETCH=0 turns it off for an A/B.
+//
+// ALIGNMENT (the reason this was a no-op before): madvise(2) rejects a non-page-aligned `start`
+// with EINVAL. The address handed to it is `t->data + row*nb[1]` == mmap_base + tensor_file_offset
+// + row*nb[1]; the mmap base is page-aligned but the GGUF tensor offset is only 32 B aligned
+// (per_layer_token_embd.weight sits at file offset 536633120, 536633120 % 4096 == 3872), so
+// rounding the *tensor-relative* offset left every advised address 3872 B into a page and every
+// call returned EINVAL. The ranges below are therefore rounded as ABSOLUTE addresses.
 static void qwen4exp_ple_prefetch(const ggml_tensor * t, const std::vector<int32_t> & rows) {
 #if defined(__linux__)
     static const bool enabled = [] {
@@ -1537,15 +1548,19 @@ static void qwen4exp_ple_prefetch(const ggml_tensor * t, const std::vector<int32
         return;
     }
 
-    const size_t ps     = (size_t) ps_signed;
-    const size_t row_sz = t->nb[1];
-    const size_t n_rows = (size_t) t->ne[1];
-    char * const base   = (char *) t->data;
+    const size_t    ps     = (size_t) ps_signed;
+    const size_t    row_sz = t->nb[1];
+    const size_t    n_rows = (size_t) t->ne[1];
+    const uintptr_t base   = (uintptr_t) t->data;
+    const uintptr_t mask   = ~(uintptr_t) (ps - 1);
 
-    // page-aligned byte range of every row, sorted, then coalesced where the ranges touch.
-    // rounding out of the tensor stays inside the same mapping (the page holding a valid address
-    // is mapped by definition), so the advice can never name an unmapped page.
-    std::vector<std::pair<size_t, size_t>> r;
+    // page-aligned ABSOLUTE address range of every row, sorted, then coalesced where the ranges
+    // touch. Rounding out of the tensor stays inside the same mapping: the tensor lies strictly
+    // inside the mapped file, and the page that contains a valid mapped address is itself mapped
+    // in full, so rounding a valid address down (or the end address up by < 4 KiB) can only name
+    // pages of the same VMA -- llama_mmap maps the whole file and mmap rounds the length up to a
+    // page, so even the last row's tail page exists. The advice can never name an unmapped page.
+    std::vector<std::pair<uintptr_t, uintptr_t>> r;
     r.reserve(rows.size());
 
     for (const int32_t row : rows) {
@@ -1553,10 +1568,10 @@ static void qwen4exp_ple_prefetch(const ggml_tensor * t, const std::vector<int32
             continue;
         }
 
-        const size_t beg = ((size_t) row)*row_sz;
-        const size_t end = beg + row_sz;
+        const uintptr_t a_beg = base + ((size_t) row)*row_sz;
+        const uintptr_t a_end = a_beg + row_sz;
 
-        r.emplace_back(beg & ~(ps - 1), (end + ps - 1) & ~(ps - 1));
+        r.emplace_back(a_beg & mask, (a_end + ps - 1) & mask);
     }
 
     if (r.empty()) {
@@ -1565,8 +1580,21 @@ static void qwen4exp_ple_prefetch(const ggml_tensor * t, const std::vector<int32
 
     std::sort(r.begin(), r.end());
 
-    size_t beg = r[0].first;
-    size_t end = r[0].second;
+    // a failure means the whole prefetch is dead (as it was while the rounding was relative);
+    // report the first one once so it cannot go unnoticed again, then stay quiet
+    static std::atomic<bool> warned{false};
+
+    auto advise = [&](uintptr_t b, uintptr_t e) {
+        const int rc = posix_madvise((void *) b, (size_t) (e - b), POSIX_MADV_WILLNEED);
+
+        if (rc != 0 && !warned.exchange(true)) {
+            LLAMA_LOG_WARN("%s: posix_madvise(%p, %zu, WILLNEED) failed: %s (%d) -- PLE prefetch inactive\n",
+                    __func__, (void *) b, (size_t) (e - b), strerror(rc), rc);
+        }
+    };
+
+    uintptr_t beg = r[0].first;
+    uintptr_t end = r[0].second;
 
     for (size_t i = 1; i < r.size(); ++i) {
         if (r[i].first <= end) {
@@ -1574,13 +1602,13 @@ static void qwen4exp_ple_prefetch(const ggml_tensor * t, const std::vector<int32
             continue;
         }
 
-        posix_madvise(base + beg, end - beg, POSIX_MADV_WILLNEED);
+        advise(beg, end);
 
         beg = r[i].first;
         end = r[i].second;
     }
 
-    posix_madvise(base + beg, end - beg, POSIX_MADV_WILLNEED);
+    advise(beg, end);
 #else
     GGML_UNUSED(t);
     GGML_UNUSED(rows);
