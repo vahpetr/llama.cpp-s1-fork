@@ -2214,6 +2214,10 @@ static int vk_graph_opt_window = 20;
 // GGML_VK_ASYNC_READ_COPYBUF=1 keeps the async readback on the vkCmdCopyBuffer path even when the
 // source buffer is host-visible UMA memory that the host could read directly.
 static bool vk_async_read_copybuf = false;
+// GGML_VK_ASYNC_READ_UMA=1 takes the direct-host-read shortcut even when the source memory type is
+// not HOST_CACHED (i.e. possibly write-combined). For the A/B only - see the eHostCached note in
+// ggml_vk_buffer_read_2d_async.
+static bool vk_async_read_uma_force = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
@@ -7594,7 +7598,8 @@ static void ggml_vk_instance_init() {
     if (GGML_VK_OPT_WINDOW != nullptr) {
         vk_graph_opt_window = std::max(1, std::stoi(GGML_VK_OPT_WINDOW));
     }
-    vk_async_read_copybuf = getenv("GGML_VK_ASYNC_READ_COPYBUF") != nullptr;
+    vk_async_read_copybuf   = getenv("GGML_VK_ASYNC_READ_COPYBUF") != nullptr;
+    vk_async_read_uma_force = getenv("GGML_VK_ASYNC_READ_UMA") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
     if (GGML_VK_PIPELINE_STATS != nullptr) {
@@ -8698,9 +8703,10 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
     GGML_ASSERT(height > 0);
     GGML_ASSERT(src != nullptr);
 
-    // UMA shortcut, same test the synchronous ggml_vk_buffer_read_2d makes: if the source buffer's
-    // memory is host-visible and coherent on a UMA device, the host can read the very bytes the
-    // shader wrote and no vkCmdCopyBuffer (nor a staging buffer) is needed. The synchronous path
+    // UMA shortcut, the synchronous ggml_vk_buffer_read_2d's test plus a HOST_CACHED requirement:
+    // if the source buffer's memory is host-visible, coherent and cached on a UMA device, the host
+    // can read the very bytes the shader wrote and no vkCmdCopyBuffer (nor a staging buffer) is
+    // needed. The synchronous path
     // memcpys immediately because it waits on a fence itself; here we have to keep the *async*
     // contract, so instead of copying now we
     //   (a) record a device->host memory dependency into this command buffer, and
@@ -8714,10 +8720,24 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
     // cannot run before the GPU is done. Callers already have to synchronize before touching the
     // destination (ggml_backend_tensor_get_async), and the pinned-destination branch below has
     // always returned true without an internal synchronize, so no caller contract changes.
+    //
+    // eHostCached is required, not optional. ggml_vk_create_buffer_device asks for
+    // eDeviceLocal|eHostVisible|eHostCoherent as a *minimum* set and ggml_vk_find_memory_properties
+    // accepts any memory type that is a superset, so the type actually chosen is whatever the driver
+    // enumerates first - it may or may not be HOST_CACHED. A device-local host-visible type that is
+    // not HOST_CACHED is write-combined: host *writes* are fast, host *reads* are uncached and go to
+    // memory a cache line at a time, which for the ~5.96 MB logits readback is far slower than the
+    // DMA copy this shortcut replaces. Since this is now the default path, gate on the cached bit
+    // and let the copy engine do the work otherwise.
+    //
+    // Knobs, both for the A/B: GGML_VK_ASYNC_READ_COPYBUF=1 forces the old vkCmdCopyBuffer path
+    // even on cached UMA memory; GGML_VK_ASYNC_READ_UMA=1 forces this shortcut even when the memory
+    // type is not HOST_CACHED (COPYBUF wins if both are set).
     if (!vk_async_read_copybuf &&
         src->device->uma &&
         (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
         (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent) &&
+        ((src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached) || vk_async_read_uma_force) &&
         src->ptr != nullptr) {
         const bool transfer_queue = subctx->p->q->transfer_only;
         const vk::AccessFlags src_access = transfer_queue
