@@ -65,8 +65,16 @@ shared ACC_TYPE slope[Br];
 
 // ZERO_DEAD_V: per-Bc-column flag "this KV column is mask-suppressed for every row of
 // the Br tile", plus a workgroup-uniform "any such column in this tile".
+// Only the DEADV_LDS path uses these; it derives them by re-reading Psh.
 shared uint32_t p_dead[Bc];
 shared uint32_t any_dead;
+
+// ZERO_DEAD_V default path: the same predicate, packed as a Bc-bit column mask, one word
+// group per subgroup (i.e. per row_split row group).  Each subgroup reduces the P values
+// its threads still hold in registers, so Psh is never re-read and no barrier of its own
+// is needed - the publish rides the barrier that already precedes the P*V matmul.
+const uint32_t dead_words = (Bc + 31) / 32;
+shared uint32_t p_dead_sg[row_split * dead_words];
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
@@ -155,6 +163,11 @@ void main() {
     uint32_t mask_opt_idx = ~0;
     uint32_t mask_opt_bits = 0;
     f16vec4 mask_cache[Bc * Br / 4 / WorkGroupSize];
+
+    // ZERO_DEAD_V: only the first n_valid rows of a Br tile carry a real query; the padded
+    // rows keep whatever Qf held, so their P is not necessarily zero and they are excluded
+    // from the dead-column test.
+    const uint32_t n_valid = min(Br, N - i * Br);
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
@@ -382,6 +395,15 @@ void main() {
             }
         }
 
+        // ZERO_DEAD_V: thread (row_tid, col_tid) writes rows
+        // [row_tid * rows_per_thread, +rows_per_thread) of every column it owns, so it can
+        // fold its own P values into a per-column flag right here.  Rows it does not own
+        // are covered by the other row groups, and their verdicts are ANDed below.
+        bool p_dead_col[cols_per_thread];
+        [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+            p_dead_col[c] = true;
+        }
+
         // Calculate and store Pf in Psh
         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
             const uint col = c * cols_per_iter + col_tid;
@@ -389,6 +411,7 @@ void main() {
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; r += 4) {
                 const uint row = tile_row(r);
                 if (KV_bounds_check && j * Bc + col >= KV) {
+                    // stored as +0 for every row, so the column stays a dead-column candidate
                     Psh[col * psh_stride + row / 4] = FLOAT_TYPEV4(0.0f);
                 } else {
                     const vec4 mfvec = vec4(Mf[r], Mf[r + 1], Mf[r + 2], Mf[r + 3]);
@@ -397,6 +420,40 @@ void main() {
                         Lf[r + vec_idx] += Pf[vec_idx];
                     }
                     Psh[col * psh_stride + row / 4] = Pf;
+                    if (ZERO_DEAD_V && MASK_ENABLE && !DEADV_LDS) {
+                        // Psh receives exactly this FLOAT_TYPEV4, so testing the register is
+                        // the same test the DEADV_LDS scan runs on the stored value.
+                        [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
+                            if (row + vec_idx < n_valid && float(Pf[vec_idx]) != 0.0f) {
+                                p_dead_col[c] = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reduce the per-thread flags to one Bc-bit dead-column mask per subgroup.  Every
+        // column of the tile is owned by exactly one lane of each subgroup
+        // (col = c * cols_per_iter + col_tid, and cols_per_iter is the subgroup size - the
+        // same assumption subgroupMax(rowmaxf) above already makes), so a subgroupAnd over
+        // a mask each lane fills with 1s outside its own columns is that row group's
+        // verdict.  Published before the barrier that already separates the Psh writes
+        // above from the coopMatLoad(Psh) below, so this costs no barrier of its own.
+        if (ZERO_DEAD_V && MASK_ENABLE && !DEADV_LDS) {
+            [[unroll]] for (uint32_t w = 0; w < dead_words; ++w) {
+                // bits of columns that do not exist stay 0, so "mask != 0" means
+                // "some real column of this tile is dead"
+                uint32_t m = 0xFFFFFFFFu >> (32 - min(Bc - 32 * w, 32u));
+                [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                    const uint col = c * cols_per_iter + col_tid;
+                    if (!p_dead_col[c] && col / 32 == w) {
+                        m &= ~(1u << (col % 32));
+                    }
+                }
+                m = subgroupAnd(m);
+                if (gl_SubgroupInvocationID == 0) {
+                    p_dead_sg[gl_SubgroupID * dead_words + w] = m;
                 }
             }
         }
@@ -432,14 +489,29 @@ void main() {
         // is what makes the result independent of them: coopMatMulAdd on RDNA3 is not
         // invariant to the sign of a zero product (+0 * V == -0 for V < 0), so a suppressed
         // column with non-zero V perturbs the accumulator by one ULP.  See ZERO_DEAD_V.
-        if (ZERO_DEAD_V && MASK_ENABLE) {
+        // Default path: AND the row_split row-group verdicts published above.  A column is
+        // dead only if every row group found all of its own rows zero, which is the same
+        // "P == 0 for all n_valid rows" predicate the DEADV_LDS scan computes.  The result
+        // is workgroup-uniform: every thread reads the same row_split * dead_words words.
+        uint32_t dead_cols[dead_words];
+        bool any_dead_reg = false;
+        if (ZERO_DEAD_V && MASK_ENABLE && !DEADV_LDS) {
+            [[unroll]] for (uint32_t w = 0; w < dead_words; ++w) {
+                uint32_t m = p_dead_sg[w];
+                [[unroll]] for (uint32_t rs = 1; rs < row_split; ++rs) {
+                    m &= p_dead_sg[rs * dead_words + w];
+                }
+                dead_cols[w] = m;
+                any_dead_reg = any_dead_reg || (m != 0);
+            }
+        }
+
+        // A/B path: rebuild the same flags by re-reading Psh, behind two extra barriers.
+        if (ZERO_DEAD_V && MASK_ENABLE && DEADV_LDS) {
             if (tid == 0) {
                 any_dead = 0;
             }
             barrier();
-            // Only the first n_valid rows of the tile carry a real query; the padded rows
-            // keep whatever Qf held, so their P is not necessarily zero.
-            const uint32_t n_valid = min(Br, N - i * Br);
             [[unroll]] for (uint32_t idx = 0; idx < Bc; idx += gl_WorkGroupSize.x) {
                 const uint32_t c = idx + tid;
                 if (c < Bc) {
@@ -477,7 +549,8 @@ void main() {
             // alignment / bounds force it, or when this Bc tile has mask-suppressed columns
             // whose V has to be replaced by +0 (ZERO_DEAD_V).
             const bool stage_v = USE_DECODE_V || KV_bounds_check ||
-                                 (ZERO_DEAD_V && MASK_ENABLE && any_dead != 0);
+                                 (ZERO_DEAD_V && MASK_ENABLE &&
+                                  (DEADV_LDS ? (any_dead != 0) : any_dead_reg));
             if (SHMEM_STAGING == 0) {
             if (stage_v) {
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
@@ -492,7 +565,10 @@ void main() {
                     const uint ib = coord / BLOCK_SIZE_V;
                     const uint iqs = coord % BLOCK_SIZE_V;
 
-                    if (ZERO_DEAD_V && MASK_ENABLE && p_dead[row] != 0) {
+                    const bool row_dead = ZERO_DEAD_V && MASK_ENABLE &&
+                                          (DEADV_LDS ? (p_dead[row] != 0)
+                                                     : ((dead_cols[row / 32] & (1u << (row % 32))) != 0));
+                    if (row_dead) {
                         kvsh[row * vsh_stride + col] = FLOAT_TYPEV4(0.0f);
                     } else if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
 #if !defined(BFLOAT16)

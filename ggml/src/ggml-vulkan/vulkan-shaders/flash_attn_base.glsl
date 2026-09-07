@@ -26,6 +26,10 @@ const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 // Replace V by +0 in KV columns that this Br tile's mask suppresses for every row.
 const bool ZERO_DEAD_V     = (Flags & 16) != 0;
+// Derive ZERO_DEAD_V's dead-column predicate by re-reading Psh from shared memory (the
+// original implementation) instead of from the P values that are still in registers.
+// Same predicate either way; this is the A/B knob (GGML_VK_FA_DEADV_LDS).
+const bool DEADV_LDS       = (Flags & 32) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
