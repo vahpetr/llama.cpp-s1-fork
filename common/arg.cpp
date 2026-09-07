@@ -1730,7 +1730,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("cap the KV span (in tokens) used to size the worst-case compute buffers reserved at startup "
             "(default: %d = the full KV cache size). does not change the KV span of real batches: buffers grow on "
             "demand if a batch exceeds N, at the cost of one synchronize + reallocation. lowering it frees the "
-            "[n_kv, n_ubatch] KQ mask (device and pinned host copy) for the unused span", params.kv_graph_span),
+            "[n_kv, n_ubatch] KQ mask (device and pinned host copy) for the unused span. ignored while "
+            "--fit is on (the fitter always sizes against the full span), but still applied to the run",
+            params.kv_graph_span),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("--kv-graph-span must be >= 0");

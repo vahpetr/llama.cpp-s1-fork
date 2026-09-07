@@ -1296,6 +1296,30 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
+        // [TAG_KV_GRAPH_SPAN] the fitter must see the UNCAPPED worst case.
+        //
+        // --fit sizes the context from these same cparams, so a capped kv_graph_span shrinks the
+        // compute-buffer estimate it fits against and it can then choose an n_ctx that the run
+        // cannot honour once ggml-alloc regrows those buffers for a batch beyond the span. That
+        // failure lands mid-serving as a reallocation error, not at startup.
+        //
+        // Fitting with the cap removed is the safe direction: the fitter picks an n_ctx whose
+        // FULL-span buffers fit, and the capped run then reserves strictly less and can only ever
+        // grow back up to a size the fitter has already proved fits. Refusing --fit on together
+        // with a non-zero span was the alternative, but --fit defaults to on, so that would make
+        // --kv-graph-span unusable without also passing -fit off, and it would forbid a combination
+        // that is safe once the fitter ignores the cap. The cap still applies to the real context:
+        // it is restored below, after the fit.
+        const uint32_t kv_graph_span_run = cparams.kv_graph_span;
+
+        if (kv_graph_span_run > 0) {
+            LOG_WRN("%s: --fit is on: sizing the context against the full KV span and ignoring "
+                    "--kv-graph-span %u for the fit; the cap still applies to the run\n",
+                    __func__, kv_graph_span_run);
+
+            cparams.kv_graph_span = 0;
+        }
+
         // the draft context is created from the same base params and follows the main context, fit both together
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
@@ -1309,6 +1333,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         }
         cparams_dft.n_rs_seq = 0;
+        cparams_dft.kv_graph_span = 0; // see above
 
         const common_fit_extra_model extra = {
             /*.path_model   =*/ params_dft.model.path.c_str(),
@@ -1324,6 +1349,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        cparams.kv_graph_span = kv_graph_span_run;
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
