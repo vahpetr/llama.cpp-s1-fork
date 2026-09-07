@@ -2211,6 +2211,9 @@ static bool vk_flops_seed_legacy = false;
 static bool vk_submit_log_enabled = false;
 // GGML_VK_OPT_WINDOW=<n> sets ggml_vk_graph_optimize's independence lookahead (default 20).
 static int vk_graph_opt_window = 20;
+// GGML_VK_ASYNC_READ_COPYBUF=1 keeps the async readback on the vkCmdCopyBuffer path even when the
+// source buffer is host-visible UMA memory that the host could read directly.
+static bool vk_async_read_copybuf = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
@@ -7591,6 +7594,7 @@ static void ggml_vk_instance_init() {
     if (GGML_VK_OPT_WINDOW != nullptr) {
         vk_graph_opt_window = std::max(1, std::stoi(GGML_VK_OPT_WINDOW));
     }
+    vk_async_read_copybuf = getenv("GGML_VK_ASYNC_READ_COPYBUF") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
     if (GGML_VK_PIPELINE_STATS != nullptr) {
@@ -8693,6 +8697,49 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
     GGML_ASSERT(width > 0);
     GGML_ASSERT(height > 0);
     GGML_ASSERT(src != nullptr);
+
+    // UMA shortcut, same test the synchronous ggml_vk_buffer_read_2d makes: if the source buffer's
+    // memory is host-visible and coherent on a UMA device, the host can read the very bytes the
+    // shader wrote and no vkCmdCopyBuffer (nor a staging buffer) is needed. The synchronous path
+    // memcpys immediately because it waits on a fence itself; here we have to keep the *async*
+    // contract, so instead of copying now we
+    //   (a) record a device->host memory dependency into this command buffer, and
+    //   (b) push the memcpy onto subctx->out_memcpys.
+    // Ordering: the barrier's first synchronization scope is everything earlier in submission
+    // order on this queue - i.e. the compute that produced the tensor, which was recorded into
+    // this same command buffer (or into an earlier batch on the same queue) before the readback -
+    // and its first access scope covers those shader/transfer writes, which it makes available and
+    // visible to the host domain. out_memcpys is then drained by ggml_vk_synchronize only after
+    // ggml_vk_wait_for_fence returns for the batch carrying this command buffer, so the memcpy
+    // cannot run before the GPU is done. Callers already have to synchronize before touching the
+    // destination (ggml_backend_tensor_get_async), and the pinned-destination branch below has
+    // always returned true without an internal synchronize, so no caller contract changes.
+    if (!vk_async_read_copybuf &&
+        src->device->uma &&
+        (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+        (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent) &&
+        src->ptr != nullptr) {
+        const bool transfer_queue = subctx->p->q->transfer_only;
+        const vk::AccessFlags src_access = transfer_queue
+            ? vk::AccessFlags(vk::AccessFlagBits::eTransferWrite)
+            : (vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite);
+
+        subctx->s->buffer->buf.pipelineBarrier(
+            subctx->p->q->stage_flags,
+            vk::PipelineStageFlagBits::eHost,
+            {},
+            { { src_access, vk::AccessFlagBits::eHostRead } },
+            {}, {});
+
+        if (width == spitch && width == dpitch) {
+            deferred_memcpy(dst, (const uint8_t *) src->ptr + offset, width * height, &subctx->out_memcpys);
+        } else {
+            for (size_t i = 0; i < height; i++) {
+                deferred_memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) src->ptr + offset + i * spitch, width, &subctx->out_memcpys);
+            }
+        }
+        return true;
+    }
 
     // TODO: staging_offset is not used
 
