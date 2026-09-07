@@ -50,11 +50,22 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
 
+        // [TAG_IDX_CACHE_K_ONLY]
+        // the indexer stores and reads keys only (build_qsa_top_k: cpy_k at the write, get_k at the
+        // mean-pool); nothing on that path ever calls cpy_v or get_v, so a V plane is pure waste --
+        // 2x the K bytes here, because n_embd_head_v is left at the attention value length.
+        // llama_kv_cache picks K-only storage off hparams.is_mla(); set the pair of MLA head sizes
+        // the same way llama_kv_cache_dsv4 does (dsv4_make_k_only, src/llama-kv-cache-dsv4.cpp).
+        // Note: this changes the byte layout of the indexer section of a full (non-PARTIAL_ONLY)
+        // sequence state, so slot-save files written by an older build cannot be restored.
+        hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
+        hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
+
         // the cached indexer keys are raw, rotation happens after pooling at read time, so a
         // K-shift must not rotate them while the stream copies in the same update still apply
         hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
 
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+        LLAMA_LOG_INFO("%s: creating indexer KV cache (K only), size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,

@@ -2472,10 +2472,26 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
 
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
-                            // QSA runs on the dense-attention layers only
-                            filter_idx = [&](uint32_t il) {
-                                return il < hparams.n_layer() && !hparams.is_recr(il);
-                            };
+                            // [TAG_QSA_DEAD_IDX_CACHE]
+                            // the indexer cache is written and read by exactly one place: build_qsa_top_k()
+                            // in src/models/qwen4exp.cpp (cpy_k / get_k), and build_layer_attn() only calls it
+                            // when hparams.dsv4_compress_ratios[il] > 0. A GGUF that carries the indexer
+                            // tensors but leaves the ratio array all-zero (any converter other than
+                            // conversion/qwen4exp.py) therefore never touches the cache -- do not allocate it.
+                            const bool has_qsa = std::any_of(
+                                    hparams.dsv4_compress_ratios.begin(),
+                                    hparams.dsv4_compress_ratios.begin() + hparams.n_layer(),
+                                    [](uint32_t r) { return r > 0; });
+
+                            if (has_qsa) {
+                                // QSA runs on the dense-attention layers only
+                                filter_idx = [&](uint32_t il) {
+                                    return il < hparams.n_layer() && !hparams.is_recr(il);
+                                };
+                            } else {
+                                LLAMA_LOG_INFO("%s: qwen4exp: all compress ratios are zero - sparse attention is off, "
+                                        "skipping the indexer KV cache\n", __func__);
+                            }
                         }
                     }
 
