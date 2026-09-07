@@ -1155,6 +1155,9 @@ struct vk_device_struct {
     // per-fusion kill switches (all default on, GGML_VK_FUSE_<NAME>=0 turns one off)
     bool fuse_hc_combine;
     bool fuse_sigmoid_mul;
+    // split a dim-0 concat with a transposed src1 into copy + tiled transpose-copy
+    // (default on, GGML_VK_CONCAT_TRANSPOSE=0 turns it off)
+    bool concat_transpose;
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
@@ -7238,6 +7241,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->fuse_hc_combine  = fuse_enabled("GGML_VK_FUSE_HC_COMBINE");
         device->fuse_sigmoid_mul = fuse_enabled("GGML_VK_FUSE_SIGMOID_MUL");
 
+        // Same "default on, =0 disables" convention for the concat transpose split. Like the
+        // fusions above, both arms are bit-identical, so this is an A/B knob and not a fallback.
+        device->concat_transpose = fuse_enabled("GGML_VK_CONCAT_TRANSPOSE");
+
         device->add_rms_fusion = !device->disable_fusion &&
                                  device->subgroup_arithmetic &&
                                  device->vendor_id != VK_VENDOR_ID_INTEL;
@@ -13283,8 +13290,115 @@ static void ggml_vk_opt_step_sgd(ggml_backend_vk_context * ctx, vk_context& subc
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_OPT_STEP_SGD, { (uint32_t)n, 0, 0.0f, 0.0f, 0.0f, 0.0f });
 }
 
+// A stack-only shallow view of `dst` covering `ne0` columns of dimension 0 starting at column
+// `col_off`. It keeps dst's own strides, so writing through the view writes into a column slab of
+// dst. Only the fields ggml_vk_op_f32() reads (ne/nb/type/buffer/data/view_src/view_offs) are
+// meaningful; the tensor never leaves this file and is never handed back to ggml.
+static ggml_tensor ggml_vk_dst_col_view(const ggml_tensor * dst, int64_t col_off, int64_t ne0) {
+    ggml_tensor view = *dst;
+
+    view.ne[0] = ne0;
+
+    const size_t off = (size_t)col_off * dst->nb[0];
+
+    // ggml_vk_tensor_subbuffer() resolves the buffer offset as vk_tensor_offset() + view_offs,
+    // and vk_tensor_offset() reads through view_src when there is one. Re-base onto dst itself
+    // when dst is not already a view so the column offset is counted exactly once.
+    if (dst->view_src != nullptr) {
+        view.view_offs = dst->view_offs + off;
+    } else {
+        view.view_src  = const_cast<ggml_tensor *>(dst);
+        view.view_offs = off;
+    }
+    view.data = (char *) dst->data + off;
+
+    return view;
+}
+
+// GGML_OP_CONCAT along dim 0 with a transposed src1 is the `concat(conv_state, ggml_transpose(x), 0)`
+// idiom that every GDN / Mamba-style conv-state build uses (qwen4exp build_conv_state_at, and
+// upstream mamba-base, mamba2, delta-net-base, bailingmoe3, arwkv7).
+//
+// concat.comp is a scalar kernel: one element per invocation, source address i0*nb10 + i1*nb11.
+// With a transposed src1 (nb11 == type_size) consecutive lanes read addresses ne1*type_size apart,
+// so every 4-byte load pulls a fresh cache line. Measured on gfx1151 (dst [2051,10240] f32, 84 MB):
+// 12 460 us = 13.5 GB/s effective, against 222 GB/s for the very same kernel on a contiguous source
+// in the same graph -- a locality collapse, not a bandwidth wall. copy_transpose.comp moves the same
+// bytes through a 32x32 shared-memory tile with both the load and the store coalesced and runs the
+// identical 84 MB at ~140 GB/s in that same log.
+//
+// So when the shape class matches, split the op into (a) a generic copy of src0 into dst's first
+// ne00 columns and (b) a tiled transpose-copy of src1 into dst's remaining columns. Both halves move
+// the same source elements to the same destination positions as concat.comp would, with no
+// arithmetic anywhere, so the result is byte-identical.
+static bool ggml_vk_concat_use_transpose(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int dim) {
+    if (!ctx->device->concat_transpose) {
+        return false;
+    }
+    if (dim != 0) {
+        return false;
+    }
+
+    // ggml_vk_get_cpy_pipeline() only has tiled transposes for 2- and 4-byte scalar types, and the
+    // split writes whole elements, so quantized blocks stay on the generic path.
+    const ggml_type type = dst->type;
+    if (ggml_is_quantized(type) || src0->type != type || src1->type != type) {
+        return false;
+    }
+    const size_t ts = ggml_type_size(type);
+    if (ts != 2 && ts != 4) {
+        return false;
+    }
+
+    // dst must be a plain row-major destination, so that the transposed store is coalesced and the
+    // column slabs are exactly [0, ne00) and [ne00, ne00+ne10) of every row.
+    if (!ggml_is_contiguous(dst) || dst->nb[0] != ts) {
+        return false;
+    }
+
+    // src1 must be exactly the shape class ggml_vk_cpy() routes to pipeline_cpy_transpose_*:
+    // dimension 1 innermost (nb[1] == type_size), dimension 0 strided.
+    if (src1->nb[1] != ts || src1->nb[0] == ts) {
+        return false;
+    }
+
+    // At least one full 32x32 tile in each direction, otherwise most of the tile is masked off and
+    // the extra dispatch is pure overhead. This is also what keeps decode on the single generic
+    // dispatch: there src1 is the transpose of [channels, n_tokens] with n_tokens far below 32.
+    if (src1->ne[0] < 32 || src1->ne[1] < 32) {
+        return false;
+    }
+
+    if (ggml_nelements(src0) == 0 || ggml_nelements(src1) == 0) {
+        return false;
+    }
+
+    return true;
+}
+
 static void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     int * op_params = (int *)dst->op_params;
+
+    if (ggml_vk_concat_use_transpose(ctx, src0, src1, dst, op_params[0])) {
+        // (a) src0 -> dst[0 .. ne00) of every row. Strided destination, so this takes the generic
+        //     (non-contiguous) copy shader. In the GDN case this is the 3-column conv state.
+        ggml_tensor dst0 = ggml_vk_dst_col_view(dst, 0, src0->ne[0]);
+        ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, &dst0, GGML_OP_CPY,
+                       vk_op_unary_push_constants_init(src0, &dst0, ggml_nelements(src0)));
+
+        // (b) src1 -> dst[ne00 .. ne00+ne10) of every row, through the 32x32 tiled transpose.
+        //     dst1 has src1's shape, so ggml_vk_get_cpy_pipeline() picks pipeline_cpy_transpose_*
+        //     on src1->nb[1] == type_size exactly as it does for a plain CONT of a transposed view;
+        //     the shader writes data_d[i0*nb10 + i1*nb11 + ...], so dst's row stride and the column
+        //     offset folded into the descriptor need no shader change.
+        ggml_tensor dst1 = ggml_vk_dst_col_view(dst, src0->ne[0], src1->ne[0]);
+        ggml_vk_op_f32(ctx, subctx, src1, nullptr, nullptr, nullptr, &dst1, GGML_OP_CPY,
+                       vk_op_unary_push_constants_init(src1, &dst1, ggml_nelements(src1)));
+
+        // The two dispatches write disjoint column slabs of dst and read different sources, so they
+        // are free to overlap: no barrier between them.
+        return;
+    }
 
     const uint32_t unit_size = ggml_vk_concat_unit_size(dst->type);
     const uint32_t units_per_block = ggml_type_size(dst->type) / unit_size;
