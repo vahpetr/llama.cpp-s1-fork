@@ -31,6 +31,11 @@ layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 // the 16 KiB every Vulkan implementation must provide).  The host picks the value (see
 // ggml-vulkan.cpp, vk_count_experts_max_experts) and turns hoisting off for larger n_as.
 // Must be >= BLOCK_SIZE: vals[] doubles as the reduction scratch of the non-hoisted path.
+//
+// Two pipelines are built from this module: the plain counting one is specialized to BLOCK_SIZE
+// (3 KiB, the upstream footprint) and never takes the p.hoist_row_ids branch; the hoisting one is
+// specialized to vk_count_experts_max_experts.  So the larger allocation is paid only where it is
+// used, and a dispatch that only counts keeps its old occupancy.
 layout (constant_id = 0) const uint N_EXPERTS_MAX = BLOCK_SIZE;
 
 layout (binding = 0) readonly buffer A {uint data_a[];};
