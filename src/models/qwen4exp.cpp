@@ -5,8 +5,12 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <string>
 #include <utility>
+#include <vector>
 
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -1583,6 +1587,60 @@ static void qwen4exp_ple_prefetch(const ggml_tensor * t, const std::vector<int32
 #endif
 }
 
+// [TAG_PLE_ROWID_DUMP]
+// Observation only, for the off-line row-id skew census (M4). With LLAMA_PLE_DUMP=<path> set,
+// append one line per set_input() call:
+//   "<n_tokens> <id0> <id1> ... <id_{n_heads*n_tokens-1}>"
+// the ids in exactly the layout the graph input holds them, head-minor: idx[i*n_heads + h], so a
+// reader recovers n_heads as (count-1)/n_tokens and the head of an id as (position % n_heads).
+// Consumed by scripts/bench/probe/ple_rowid_skew.py (unique fraction, hot-row and 4 KiB-page
+// coverage) -- no GPU and no server change needed to answer whether a packed hot-row cache pays.
+//
+// Cost when LLAMA_PLE_DUMP is unset: one load of a function-local static and a null test per
+// ubatch. No allocation, no formatting, no syscall, no lock. The function reads only the id vector
+// that has already been computed and writes only to its own file; it feeds nothing back into the
+// graph, so a dumping run and a non-dumping run compute identical values.
+static void qwen4exp_ple_rowid_dump(const std::vector<int32_t> & idx, int64_t n_tokens) {
+    static FILE * const out = [] () -> FILE * {
+        const char * path = getenv("LLAMA_PLE_DUMP");
+
+        if (path == nullptr || path[0] == '\0') {
+            return nullptr;
+        }
+
+        FILE * h = fopen(path, "a");
+        if (h == nullptr) {
+            LLAMA_LOG_WARN("%s: cannot open LLAMA_PLE_DUMP=%s for append, PLE row-id dump disabled\n",
+                    __func__, path);
+        }
+
+        return h;
+    }();
+
+    if (out == nullptr) {
+        return;
+    }
+
+    // one fwrite per ubatch, under a lock: several llama_contexts can share the process
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
+
+    std::string line;
+    line.reserve(12*(idx.size() + 1));
+
+    char buf[24];
+    line.append(buf, (size_t) snprintf(buf, sizeof(buf), "%" PRId64, n_tokens));
+
+    for (const int32_t row : idx) {
+        line.append(buf, (size_t) snprintf(buf, sizeof(buf), " %d", row));
+    }
+
+    line += '\n';
+
+    fwrite(line.data(), 1, line.size(), out);
+    fflush(out);
+}
+
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
@@ -1642,6 +1700,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+
+    // [TAG_PLE_ROWID_DUMP] off by default; a no-op unless LLAMA_PLE_DUMP names a file
+    qwen4exp_ple_rowid_dump(idx, n_tokens);
 
     // start the page-ins before the upload, so they overlap the rest of set_inputs and the
     // graph nodes that run ahead of blk.1's gather
