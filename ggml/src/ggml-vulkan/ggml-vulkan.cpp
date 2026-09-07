@@ -389,6 +389,15 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
+// Largest n_as for which mul_mat_id can hoist the row ids (see #26686 and count_experts.comp).
+// It is the size of the three per-expert scratch arrays that count_experts.comp keeps in
+// shared memory, so the cost is n * 3 * 4 B = 6 KiB at 512 - safely below the 16 KiB of
+// shared memory Vulkan guarantees.  Passed to the shader as specialization constant 0, and
+// must be >= the shader's BLOCK_SIZE (256), which reuses vals[] as its reduction scratch.
+// 512 covers Qwen3.8-Flash-Next (n_as = 512); upstream had this fixed at 256.
+static constexpr uint32_t vk_count_experts_max_experts = 512;
+static_assert(vk_count_experts_max_experts >= 256, "count_experts.comp needs vals[] >= BLOCK_SIZE");
+
 enum vk_device_architecture {
     OTHER,
     AMD_GCN,
@@ -5897,9 +5906,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_count_equal_i32, "count_equal_i32", count_equal_i32_len, count_equal_i32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, { device->subgroup_size }, 1);
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
-        ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_subgroup_len, count_experts_subgroup_data, "main", 2, sizeof(vk_op_count_experts_push_constants), {1, 1, 1}, {}, 1, true, true);
+        ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_subgroup_len, count_experts_subgroup_data, "main", 2, sizeof(vk_op_count_experts_push_constants), {1, 1, 1}, {vk_count_experts_max_experts}, 1, true, true);
     } else {
-        ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_len, count_experts_data, "main", 2, sizeof(vk_op_count_experts_push_constants), {1, 1, 1}, {}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_len, count_experts_data, "main", 2, sizeof(vk_op_count_experts_push_constants), {1, 1, 1}, {vk_count_experts_max_experts}, 1, true);
     }
 
     for (auto &s : device->pipeline_solve_tri_f32) {
@@ -10243,8 +10252,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const uint64_t n_as = ne02;
     // n_as counts, n_as offsets, one total, then one packed row id per (expert, token).
     // Hoisting requires 16-bit indices for the packing and a table that fits one binding.
+    // n_as is bounded by count_experts.comp's per-expert shared scratch, not by the packing:
+    // the (i01 << 16) | i00 row id constrains nei1 / nei0 only.
+    // A/B knob: GGML_VK_DISABLE_HOIST_ROW_IDS falls back to the per-workgroup ids scan.
+    static const bool disable_hoist_row_ids = getenv("GGML_VK_DISABLE_HOIST_ROW_IDS") != nullptr;
     const uint64_t hoisted_row_id_words = 2 * n_as + 1 + nei0 * nei1;
-    const bool hoist_row_ids = n_as <= 256 && nei0 <= 0xffff && nei1 <= 0xffff &&
+    const bool hoist_row_ids = !disable_hoist_row_ids &&
+                                n_as <= vk_count_experts_max_experts && nei0 <= 0xffff && nei1 <= 0xffff &&
                                 hoisted_row_id_words * sizeof(uint32_t) <=
                                     ctx->device->properties.limits.maxStorageBufferRange;
 

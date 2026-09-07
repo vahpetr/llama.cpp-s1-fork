@@ -26,12 +26,19 @@ layout (push_constant) uniform parameter
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
+// Upper bound on p.n_experts for the hoisting path: vals/offsets/cursors are indexed by
+// expert id, so they cost N_EXPERTS_MAX * 3 * 4 B of shared memory (6 KiB at 512, well under
+// the 16 KiB every Vulkan implementation must provide).  The host picks the value (see
+// ggml-vulkan.cpp, vk_count_experts_max_experts) and turns hoisting off for larger n_as.
+// Must be >= BLOCK_SIZE: vals[] doubles as the reduction scratch of the non-hoisted path.
+layout (constant_id = 0) const uint N_EXPERTS_MAX = BLOCK_SIZE;
+
 layout (binding = 0) readonly buffer A {uint data_a[];};
 layout (binding = 1) writeonly buffer D {uint data_d[];};
 
-shared uint vals[BLOCK_SIZE];
-shared uint offsets[BLOCK_SIZE];
-shared uint cursors[BLOCK_SIZE];
+shared uint vals[N_EXPERTS_MAX];
+shared uint offsets[N_EXPERTS_MAX];
+shared uint cursors[N_EXPERTS_MAX];
 
 // see init_fastdiv_values in ggml-vulkan.cpp
 uint fastdiv(uint n, uint mp, uint L) {
@@ -53,8 +60,9 @@ void main() {
     const uint tid = gl_LocalInvocationID.x;
 
     if (p.hoist_row_ids != 0) {
-        if (tid < p.n_experts) {
-            vals[tid] = 0;
+        // n_experts may exceed the workgroup size (e.g. 512 experts, 256 threads), so stride.
+        for (uint expert = tid; expert < p.n_experts; expert += BLOCK_SIZE) {
+            vals[expert] = 0;
         }
         barrier();
 
