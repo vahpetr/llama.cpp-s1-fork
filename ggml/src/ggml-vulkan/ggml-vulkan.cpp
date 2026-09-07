@@ -2209,6 +2209,8 @@ static bool vk_enable_sync_logger = false;
 static bool vk_flops_seed_legacy = false;
 // GGML_VK_SUBMIT_LOG=1 prints one line per graph_compute with the submit count and the seed.
 static bool vk_submit_log_enabled = false;
+// GGML_VK_OPT_WINDOW=<n> sets ggml_vk_graph_optimize's independence lookahead (default 20).
+static int vk_graph_opt_window = 20;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
@@ -7585,6 +7587,10 @@ static void ggml_vk_instance_init() {
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_flops_seed_legacy = getenv("GGML_VK_FLOPS_SEED_LEGACY") != nullptr;
     vk_submit_log_enabled = getenv("GGML_VK_SUBMIT_LOG") != nullptr;
+    const char* GGML_VK_OPT_WINDOW = getenv("GGML_VK_OPT_WINDOW");
+    if (GGML_VK_OPT_WINDOW != nullptr) {
+        vk_graph_opt_window = std::max(1, std::stoi(GGML_VK_OPT_WINDOW));
+    }
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
     if (GGML_VK_PIPELINE_STATS != nullptr) {
@@ -18290,7 +18296,27 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         // that we support (e.g. RMS_NORM + MUL).
         // This first pass only grabs "real" (non-view nodes). Second pass grabs view nodes.
         // The goal is to not interleave real and view nodes in a way that breaks fusion.
-        const int NUM_TO_CHECK = 20;
+        //
+        // GGML_VK_OPT_WINDOW sets how far ahead we look. Widening it cannot make the reordering
+        // less safe, because the window only bounds which candidate `j` is *considered*: every
+        // candidate still has to clear the same two gates, and both scale with the window rather
+        // than with the constant.
+        //   1. Hazards. For a candidate j the loop below tests is_src_of(nodes[j], nodes[c]) for
+        //      *every* not-yet-emitted c in [first_unused, j), so the number of hazard tests grows
+        //      with the distance, never leaving a gap. Nodes below first_unused are all emitted
+        //      (the while loop at the bottom only advances over used[] entries), and the graph is
+        //      topologically ordered, so every unemitted predecessor of j - and, via is_src_of's
+        //      base()/ggml_vk_mutated_src() checks, every writer or reader that aliases the same
+        //      storage through a view (patch 0012's hazard) - is inside that scanned interval.
+        //      A wider window therefore adds candidates, not unchecked ones.
+        //   2. Fusion patterns. keep_pattern() runs at first_unused only and is untouched. The
+        //      per-candidate match_pattern()/inside_pattern(hc_combine_pattern, j) guards below are
+        //      evaluated for each j in the window, so a node that a wider window newly reaches is
+        //      still refused if it starts or sits inside a protected pattern. The RMS_NORM+MUL,
+        //      MUL_MAT+ADD, ... carve-outs are all conditioned on j == c+1, which no window size
+        //      changes.
+        // Reordering independent nodes changes no operand of any op, so results stay bit-exact.
+        const int NUM_TO_CHECK = vk_graph_opt_window;
         for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
             if (used[j]) {
                 continue;
