@@ -1117,6 +1117,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_col2im_1d_bf16;
     vk_pipeline pipeline_out_prod_f32;
     vk_pipeline pipeline_hc_combine_f32;
+    vk_pipeline pipeline_add_softplus_mul_f32;
     vk_pipeline pipeline_snake_f32;
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;
@@ -1168,6 +1169,7 @@ struct vk_device_struct {
     // per-fusion kill switches (all default on, GGML_VK_FUSE_<NAME>=0 turns one off)
     bool fuse_hc_combine;
     bool fuse_sigmoid_mul;
+    bool fuse_gdn_pre;
     // split a dim-0 concat with a transposed src1 into copy + tiled transpose-copy
     // (default on, GGML_VK_CONCAT_TRANSPOSE=0 turns it off)
     bool concat_transpose;
@@ -1889,6 +1891,11 @@ struct vk_op_hc_combine_push_constants {
     float    s2;
 };
 
+struct vk_op_add_softplus_mul_push_constants {
+    uint32_t ne0;
+    uint32_t ne;
+};
+
 struct vk_op_pool1d_push_constants {
     uint32_t IL;
     uint32_t OL;
@@ -2535,6 +2542,8 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // UNARY(SIGMOID) + MUL: the mul reads the sigmoid's source and applies the sigmoid itself
     bool fused_mul_sigmoid {};
+    // ADD + UNARY(SOFTPLUS) + MUL: the GDN decay pre-chain, one dispatch off the ADD node
+    bool fused_gdn_pre {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -6009,6 +6018,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_hc_combine_f32, "hc_combine_f32", hc_combine_f32_len, hc_combine_f32_data, "main", 4, sizeof(vk_op_hc_combine_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_add_softplus_mul_f32, "add_softplus_mul_f32", add_softplus_mul_f32_len, add_softplus_mul_f32_data, "main", 4, sizeof(vk_op_add_softplus_mul_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32,  "snake_f32",  snake_f32_len,  snake_f32_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f16,  "snake_f16",  snake_f16_len,  snake_f16_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
@@ -7281,6 +7291,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         };
         device->fuse_hc_combine  = fuse_enabled("GGML_VK_FUSE_HC_COMBINE");
         device->fuse_sigmoid_mul = fuse_enabled("GGML_VK_FUSE_SIGMOID_MUL");
+        device->fuse_gdn_pre     = fuse_enabled("GGML_VK_FUSE_GDN_PRE");
 
         // Same "default on, =0 disables" convention for the concat transpose split. Like the
         // fusions above, both arms are bit-identical, so this is an A/B knob and not a fallback.
@@ -14767,6 +14778,34 @@ static void ggml_vk_sigmoid_mul_dispatch_fused(ggml_backend_vk_context * ctx, vk
     ggml_vk_mul(ctx, subctx, mul->src[0], unary->src[0], mul);
 }
 
+// Dispatch the fused Gated-DeltaNet decay pre-chain (qwen4exp build_layer_attn_linear):
+//   out[i0, r] = softplus(alpha[i0, r] + dt[i0]) * a[i0]
+// replacing ADD -> UNARY(SOFTPLUS) -> MUL. The pattern is validated by
+// ggml_vk_can_fuse_add_softplus_mul before this call.
+static void ggml_vk_add_softplus_mul_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * add = cgraph->nodes[node_idx + 0];
+    ggml_tensor *       mul = cgraph->nodes[node_idx + 2];
+
+    const ggml_tensor * alpha = add->src[0];
+    const ggml_tensor * bias  = add->src[1];
+    const ggml_tensor * scale = mul->src[1];
+
+    vk_pipeline pipeline = ctx->device->pipeline_add_softplus_mul_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_op_add_softplus_mul_push_constants pc{};
+    pc.ne0 = static_cast<uint32_t>(mul->ne[0]);
+    pc.ne  = static_cast<uint32_t>(ggml_nelements(mul));
+
+    vk_subbuffer a_buf = ggml_vk_tensor_subbuffer(ctx, alpha);
+    vk_subbuffer b_buf = ggml_vk_tensor_subbuffer(ctx, bias);
+    vk_subbuffer c_buf = ggml_vk_tensor_subbuffer(ctx, scale);
+    vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, mul);
+
+    std::array<uint32_t, 3> elements = { pc.ne, 1, 1 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a_buf, b_buf, c_buf, d_buf }, pc, elements);
+}
+
 // Dispatch the fused qwen4exp hyper-connection combine:
 //   out[i, c, t] = residual[i, c, t] + block[i, t] * (s2 * sigmoid(s1 * inject[c, t]))
 // The pattern is validated by ggml_vk_can_fuse_hc_combine before this call.
@@ -16125,7 +16164,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_ADD:
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->fused_gdn_pre) {
+            ggml_vk_add_softplus_mul_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->num_additional_fused_ops) {
             ggml_vk_multi_add(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_add(ctx, compute_ctx, src0, src1, node);
@@ -17648,6 +17689,82 @@ static bool ggml_vk_can_fuse_sigmoid_mul(ggml_backend_vk_context * ctx, const st
     return true;
 }
 
+// ADD(alpha, ssm_dt) -> UNARY(SOFTPLUS) -> MUL(., ssm_a): the Gated-DeltaNet decay
+// pre-chain qwen4exp emits once per GDN layer (build_layer_attn_linear). alpha is
+// [num_v_heads, n_tokens] and both ssm_dt and ssm_a are one f32 per value-head,
+// broadcast over the token axis.
+//
+// Bit-exactness. add_softplus_mul.comp evaluates the three steps in the same order,
+// with the same f32 rounding after each, and with op_softplus copied character for
+// character out of unary.comp. All six operands are f32, so the two stores the fusion
+// elides rounded to f32 anyway and drop nothing. The match below therefore only has to
+// pin the shape and the layout the shader assumes:
+//   * the intermediates have no consumer outside the triple (the `outputs` argument),
+//   * the chain edges are exactly add -> softplus -> mul->src[0],
+//   * every tensor is f32,
+//   * alpha and the destination are contiguous and identically shaped, so one linear
+//     index reaches both,
+//   * ssm_dt / ssm_a are contiguous with exactly ne0 elements, so `idx % ne0` is their
+//     index (this is the qwen4exp shape; anything else is left to the unfused chain),
+//   * no binding is misaligned (the push constants carry no per-tensor offset).
+static bool ggml_vk_can_fuse_add_softplus_mul(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ctx->device->fuse_gdn_pre) {
+        return false;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { node_idx + 2 })) {
+        return false;
+    }
+
+    const ggml_tensor * add   = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * unary = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * mul   = cgraph->nodes[node_idx + 2];
+
+    if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SOFTPLUS) {
+        return false;
+    }
+    // only the "chain is src0" orientation has a shader
+    if (unary->src[0] != add || mul->src[0] != unary || mul->src[1] == unary) {
+        return false;
+    }
+
+    const ggml_tensor * alpha = add->src[0];
+    const ggml_tensor * bias  = add->src[1];
+    const ggml_tensor * scale = mul->src[1];
+
+    // f32 only: with an f16 intermediate the elided stores would drop a rounding step
+    for (const ggml_tensor * t : { add, unary, mul, alpha, bias, scale }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    // the shader walks alpha and the destination with one linear index
+    if (!ggml_are_same_shape(alpha, add) || !ggml_are_same_shape(add, unary) || !ggml_are_same_shape(unary, mul)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(alpha) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+    // ssm_dt / ssm_a: one value per row element, broadcast over every row
+    for (const ggml_tensor * t : { bias, scale }) {
+        if (t->ne[0] != mul->ne[0] || ggml_nelements(t) != mul->ne[0] || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    // the shader applies no per-tensor offset, so reject misaligned bindings
+    for (const ggml_tensor * t : { alpha, bias, scale, mul }) {
+        if (get_misalign_bytes(ctx, t) != 0) {
+            return false;
+        }
+    }
+    // one thread per element, 256 per workgroup
+    const int64_t ne = ggml_nelements(mul);
+    if (ne > (int64_t) UINT32_MAX ||
+        CEIL_DIV((uint32_t) ne, 256u) > ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+        return false;
+    }
+    return true;
+}
+
 // Pattern check for the 7-op qwen4exp hyper-connection combine:
 //   repeat(reshape(block)) , scale(inject) -> sigmoid -> scale -> reshape , mul, add.
 // Verifies the chain edges, the f32-only types, the [ne0, hc, T] / [ne0, 1, T] / [hc, T]
@@ -18103,6 +18220,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_mul_sigmoid = false;
+        ctx->fused_gdn_pre = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -18246,6 +18364,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_LATE_SOFTMAX;
                 fusion_string = "TOPK_MOE_LATE_SOFTMAX";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_add_softplus_mul(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_gdn_pre = true;
+                fusion_string = "ADD_SOFTPLUS_MUL";
+                // elementwise=true: each thread reads alpha[idx] into a register before it
+                // writes out[idx] with a data dependency on it, so an exact alias is safe.
+                // ssm_dt / ssm_a have a different byte size than the destination, so
+                // ggml_vk_tensors_overlap still rejects any overlap of theirs (they are read
+                // with a broadcast, not elementwise).
+                std::fill_n(op_srcs_fused_elementwise, 3, true);
             } else if (ggml_vk_can_fuse_sigmoid_mul(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 1;
                 ctx->fused_mul_sigmoid = true;
@@ -18335,6 +18463,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_mul_sigmoid = false;
+                ctx->fused_gdn_pre = false;
             }
         }
 
@@ -18639,6 +18768,17 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL) &&
+                    // ADD -> UNARY(SOFTPLUS) opens the GDN decay pre-chain (ADD_SOFTPLUS_MUL);
+                    // the UNARY -> MUL carve-out above closes it. Without this the SOFTPLUS is
+                    // pushed to a later set and any independent node pulled in behind the ADD
+                    // lands between them, so the triple is no longer adjacent and the fusion
+                    // never fires. Narrowed to SOFTPLUS on purpose: it is the only unary in the
+                    // decode graph that follows an ADD it consumes, and the topk_moe chain that
+                    // also uses SOFTPLUS is protected by its own keep_pattern above.
+                    !(j == c+1 && c == current_set.back() &&
+                      !ctx->device->disable_fusion && ctx->device->fuse_gdn_pre &&
+                      graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_UNARY &&
+                      ggml_get_unary_op(graph->nodes[j]) == GGML_UNARY_OP_SOFTPLUS) &&
                     // The MUL of a UNARY+MUL pair usually also consumes an earlier node of the
                     // same set (the RMS_NORM+MUL or the reshape that produced its other operand).
                     // That node is emitted before j either way, so it must not veto the pair.

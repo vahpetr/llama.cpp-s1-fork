@@ -1064,6 +1064,8 @@ void process_shaders() {
 
     string_to_spv("hc_combine_f32", "hc_combine.comp", {});
 
+    string_to_spv("add_softplus_mul_f32", "add_softplus_mul.comp", {});
+
     string_to_spv("snake_f32",  "snake.comp", {{"DATA_A_F32", "1"},  {"A_TYPE", "float"},     {"D_TYPE", "float"}});
     string_to_spv("snake_f16",  "snake.comp", {{"DATA_A_F16", "1"},  {"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
     string_to_spv("snake_bf16", "snake.comp", {{"DATA_A_BF16", "1"}, {"DATA_D_BF16", "1"}, {"A_TYPE", "uint16_t"},  {"D_TYPE", "uint16_t"}});
