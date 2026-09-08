@@ -2890,6 +2890,11 @@ struct ggml_cplan ggml_graph_plan(
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
                     } break;
+                case GGML_OP_GET_ROWS:
+                    {
+                        // [TAG_GET_ROWS_SORTED] shared (page key, dst index) array + radix scratch
+                        cur = ggml_get_rows_work_size(node);
+                    } break;
                 case GGML_OP_SOFT_MAX:
                 case GGML_OP_ROPE:
                 case GGML_OP_ROPE_BACK:
