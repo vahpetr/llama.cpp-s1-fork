@@ -410,6 +410,19 @@ static constexpr uint32_t vk_count_experts_max_experts = 512;
 static_assert(vk_count_experts_max_experts >= vk_count_experts_block_size,
         "count_experts.comp needs vals[] >= BLOCK_SIZE");
 
+// [TAG_MMID_ROWS_EST] mul_mat_id tile selection from the expected rows per expert.
+// Smallest nei1 at which the rows-per-expert estimate replaces nei1 in the tile heuristic.  The
+// estimate is an average over n_as experts, so it only says something useful once the batch is
+// large enough for the routing to average out; below this, every shape keeps today's behaviour.
+// (nei1 <= 8 never reaches this path at all - ggml_vk_use_mul_mat_vec_id takes those.)
+static constexpr uint32_t vk_mmid_rows_est_min_nei1 = 64;
+// The estimate may only downgrade the large tile to the medium one, never to the small one: at
+// these row counts the 32x32 tile issues the same padded FLOPs as the 64x64 one (40 rows ->
+// ceil(40/32) = 2 tiles of 32 columns vs 1 tile of 64) while quadrupling the workgroup launches,
+// because the grid is { m, nei1, n_as } and every halving of BM/BN costs 4x the launches.  33 is
+// the smallest value that cannot select `s` through the heuristic's `n <= 32` test.
+static constexpr uint32_t vk_mmid_rows_est_floor = 33;
+
 enum vk_device_architecture {
     OTHER,
     AMD_GCN,
@@ -2495,6 +2508,18 @@ struct ggml_backend_vk_context {
     // If false, then it's contiguous.
     bool prealloc_y_last_decode_vector_staging {};
 
+    // [TAG_MMID_COUNT_CACHE] what the expert-count region of prealloc_split_k currently holds, so
+    // the three mul_mat_id ops of one MoE layer (gate/up/down all take the *same* ids tensor) run
+    // count_experts once instead of three times over byte-identical input.
+    // Key = the ids node plus every push constant that feeds count_experts; the node pointer alone
+    // is not enough because llama.cpp reuses graph nodes across decodes with new contents, which is
+    // why this is cleared at the top of every ggml_backend_vk_graph_compute (and in
+    // ggml_vk_graph_cleanup), exactly like prealloc_y_last_tensor_used above.  It is additionally
+    // cleared whenever prealloc_split_k is reallocated or written by anyone else (split-k matmul,
+    // split-k flash-attn, the two-pass ops) - see ggml_vk_mmid_count_invalidate.
+    const ggml_tensor * mmid_count_ids {};
+    std::array<uint32_t, 6> mmid_count_key {};
+
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
     std::vector<const ggml_tensor *> unsynced_nodes_read;
@@ -3771,6 +3796,12 @@ static void ggml_vk_destroy_buffer(vk_buffer& buf) {
 
 static vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buffer& buf, size_t offset = 0) {
     return { buf, offset, ggml_vk_get_max_buffer_range(ctx, buf, offset) };
+}
+
+// [TAG_MMID_COUNT_CACHE] drop the cached count_experts result: prealloc_split_k no longer holds it.
+static void ggml_vk_mmid_count_invalidate(ggml_backend_vk_context * ctx) {
+    ctx->mmid_count_ids = nullptr;
+    ctx->mmid_count_key = {};
 }
 
 static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
@@ -9163,6 +9194,7 @@ static void ggml_vk_matmul(
     const std::array<uint32_t, 2> pc2 = { (uint32_t)(m * n * batch), split_k };
     ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_matmul_split_k_reduce, { split_k_buffer, d }, pc2, { m * n * batch, 1, 1 });
     ctx->prealloc_split_k_need_sync = true;
+    ggml_vk_mmid_count_invalidate(ctx);  // [TAG_MMID_COUNT_CACHE] this pass overwrote prealloc_split_k
 }
 
 static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
@@ -9216,6 +9248,31 @@ static void ggml_vk_matmul_id(
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
                                               nei0, nei1, nbi1, ne11, padded_n, n_as, uint32_t(hoist_row_ids) };
+    // [TAG_MMID_ROWS_EST] One (M-tile, N-tile) pair per expert.  Only ceil(count_e / BN) of the
+    // ceil(nei1 / BN) N-tiles of expert e have work - 1 of 32 at n_as 512 / nei0 10 / nei1 2048
+    // with BN 64 - so ~97 % of these workgroups exit immediately on mul_mm{,q,_cm2}.comp's
+    // `ic * BN >= data_expert_count[expert_idx]`.  That early-out is one L2-resident load since
+    // #26686, but 47 M launches per pp2048 ubatch is not free, and it is the reason the smaller
+    // tile is a measurement rather than an obvious win.
+    //
+    // The y extent cannot simply be shrunk.  An expert's count is bounded only by nei1 (a token
+    // selects a given expert at most once, so a fully skewed router routes every token to one
+    // expert), and a tile that is never dispatched is a dst row that is never written - an
+    // in-shader early-out cannot recover it.  A `min(nei1, 4 * n_eff)` grid built from the
+    // rows-per-expert *average* would silently drop rows on a skewed batch; it is not a safe bound.
+    //
+    // Two variants that are safe, both follow-ups because both need shader changes:
+    //  1. Flatten (expert, N-tile) into one dimension.  sum_e ceil(count_e / BN) is bounded by
+    //     n_as + nei0 * nei1 / BN, which the *host* can compute: 832 tiles instead of 32 * 512 =
+    //     16 384 at the shape above.  Dispatch that many in y with z = 1 and map gl_WorkGroupID.y
+    //     -> (expert_idx, ic) through a per-expert tile prefix sum that count_experts.comp would
+    //     write alongside the row prefix sum it already computes.  No indirect buffer and no
+    //     barrier changes; costs a search over n_as entries per workgroup in mul_mm.comp,
+    //     mul_mmq.comp and mul_mm_cm2.comp.
+    //  2. Indirect dispatch (MOE-5): count_experts writes a VkDispatchIndirectCommand with
+    //     y = ceil(max_e count_e / BN), which is exact.  Needs eIndirectBuffer usage on
+    //     prealloc_split_k, an eDrawIndirect/eIndirectCommandRead barrier in ggml_vk_sync_buffers,
+    //     and a vkCmdDispatchIndirect path through ggml_vk_dispatch_pipeline.
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
 }
 
@@ -10493,10 +10550,40 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, nei1, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
+    // [TAG_MMID_ROWS_EST] MOE-2 / G7.  ggml_vk_guess_matmul_id_pipeline's `n` means "how many
+    // columns of the N-tile will actually be filled".  For mul_mat_id that is *not* nei1: the
+    // dispatch is one (M-tile, N-tile) grid per expert and each of the n_as experts only receives
+    // the rows routed to it, on average
+    //     n_eff = ceil(nei0 * nei1 / n_as)
+    // = 40 for Qwen3.8-Flash-Next at n_as 512 / top-10 / 2048 tokens, where nei1 = 2048 always
+    // selects the large BM=BN=128 tile.  That tile then computes 128 columns to keep 40, i.e. 3.2x
+    // the useful FLOPs, while the medium 64x64 tile has identical A traffic (a whole expert weight
+    // matrix is streamed once per N-tile either way, and there is still one N-tile per expert) and
+    // roughly 2x fewer tile FLOPs.
+    //
+    // The estimate steers the *tile shape* only; it is not a bound and correctness does not depend
+    // on it.  A skewed router can give one expert up to nei1 rows: the grid still covers
+    // ceil(nei1 / BN) N-tiles per expert and mul_mm{,q,_cm2}.comp still early-outs on
+    // data_expert_count[expert_idx], so a hot expert simply runs more of them.
+    //
+    // Guarded on n_as > 1 (with a single expert nei1 *is* the fill) and on a minimum nei1, and
+    // floored so it can only downgrade l -> m (see vk_mmid_rows_est_floor).  Note the cost side:
+    // the grid is { m, nei1, n_as }, so halving BM and BN launches 4x the workgroups, of which the
+    // extra ones exit immediately on the early-out - which is why this is a measurement, not a
+    // free win, and why it is switchable in one image.
+    // A/B knob: GGML_VK_MMID_ROWS_EST=0 restores the nei1 heuristic.
+    // Value-parsed, not a presence test - see ggml_vk_env_bool [TAG_ENV_BOOL].
+    static const bool mmid_rows_est = ggml_vk_env_bool("GGML_VK_MMID_ROWS_EST", true);
+    uint32_t n_tile_guess = (uint32_t)nei1;
+    if (mmid_rows_est && n_as > 1 && nei1 >= vk_mmid_rows_est_min_nei1) {
+        const uint64_t rows_per_expert = CEIL_DIV(nei0 * nei1, n_as);
+        n_tile_guess = (uint32_t)std::min<uint64_t>(nei1, std::max<uint64_t>(rows_per_expert, vk_mmid_rows_est_floor));
+    }
+
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, n_tile_guess, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, n_tile_guess, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -10558,6 +10645,20 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const size_t expert_data_size = sizeof(uint32_t) *
         (hoist_row_ids ? hoisted_row_id_words : n_as);
 
+    // [TAG_MMID_COUNT_CACHE] G13.  gate, up and down of one MoE layer are three mul_mat_id ops over
+    // the *same* ids tensor, so count_experts runs three times on byte-identical input (and with
+    // hoisting it is a single-workgroup pass with a full barrier on either side).  Everything that
+    // determines its output is in this key; the ids node identity is the rest of it.
+    const std::array<uint32_t, 6> mmid_key = {
+        (uint32_t)nei0, (uint32_t)nei1,
+        (uint32_t)(nbi1 / ggml_type_size(ids->type)),
+        (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
+        (uint32_t)n_as, uint32_t(hoist_row_ids) };
+    // A/B knob: GGML_VK_MMID_COUNT_CACHE=0 dispatches count_experts for every op, as before.
+    // Value-parsed, not a presence test - see ggml_vk_env_bool [TAG_ENV_BOOL].
+    static const bool mmid_count_cache = ggml_vk_env_bool("GGML_VK_MMID_COUNT_CACHE", true);
+    bool reuse_expert_count = false;
+
     {
         if (
                 (qx_needs_dequant && x_sz > ctx->device->properties.limits.maxStorageBufferRange) ||
@@ -10577,6 +10678,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
 
+        // [TAG_MMID_COUNT_CACHE] decided after the preallocation above, which may have replaced
+        // prealloc_split_k (and therefore invalidated the cache).
+        reuse_expert_count = mmid_count_cache &&
+                             ctx->mmid_count_ids == ids && ctx->mmid_count_key == mmid_key;
+
         // Request descriptor sets
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
         if (qx_needs_dequant) {
@@ -10588,7 +10694,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         if (quantize_y) {
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
         }
-        ggml_pipeline_request_descriptor_sets(ctx, count_experts, 1);
+        if (!reuse_expert_count) {
+            ggml_pipeline_request_descriptor_sets(ctx, count_experts, 1);
+        }
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
@@ -10640,10 +10748,14 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
     // Count how many times each expert is used
     vk_subbuffer expert_count_buf = { ctx->prealloc_split_k, 0, expert_data_size };
-    if (ctx->prealloc_split_k_need_sync) {
-        ggml_vk_sync_buffers(ctx, subctx);
-    }
-    {
+    // [TAG_MMID_COUNT_CACHE] on reuse there is nothing to write, so the read-before-write barrier
+    // is not needed either: the cached contents were made visible by the ggml_vk_sync_buffers that
+    // the op which produced them issues before its own matmul, and this op issues one too (below).
+    // Any other writer of prealloc_split_k since then would have cleared the cache.
+    if (!reuse_expert_count) {
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
         vk_op_count_experts_push_constants pc = { (uint32_t)nei0,
                                            (uint32_t)nei1,
                                            (uint32_t)(nbi0 / ggml_type_size(ids->type)),
@@ -10656,6 +10768,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
             { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc,
             { hoist_row_ids ? 1u : (uint32_t)n_as, 1, 1});
+        ctx->mmid_count_ids = ids;
+        ctx->mmid_count_key = mmid_key;
     }
 
     if (x_non_contig) {
@@ -11441,6 +11555,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                     {split_k_buf, sinks_buf, dst_buf},
                                     pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
         ctx->prealloc_split_k_need_sync = true;
+        ggml_vk_mmid_count_invalidate(ctx);  // [TAG_MMID_COUNT_CACHE] this pass overwrote prealloc_split_k
     } else {
         if (gqa_ratio > 1) {
             // When using gqa, we want one actual workgroup per batch, so cancel out wg_denoms
@@ -14463,6 +14578,7 @@ static void ggml_vk_cumsum(ggml_backend_vk_context * ctx, vk_context& subctx, co
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline2, {src_buf, dst_buf, temp_buf}, pc, elements);
 
     ctx->prealloc_split_k_need_sync = true;
+    ggml_vk_mmid_count_invalidate(ctx);  // [TAG_MMID_COUNT_CACHE] this pass overwrote prealloc_split_k
 }
 
 static std::array<uint32_t, 3> ggml_vk_nrows_elements(uint32_t nr) {
@@ -15158,6 +15274,7 @@ static void ggml_vk_test_matmul(ggml_backend_vk_context * ctx, size_t m, size_t 
                 ggml_vk_destroy_buffer(ctx->prealloc_split_k);
             }
             ctx->prealloc_split_k = ggml_vk_create_buffer_check(ctx->device, sizeof(float) * d_ne * split_k, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+            ggml_vk_mmid_count_invalidate(ctx);  // [TAG_MMID_COUNT_CACHE]
         }
     }
 
@@ -15666,6 +15783,7 @@ static void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m,
                 ggml_vk_destroy_buffer(ctx->prealloc_split_k);
             }
             ctx->prealloc_split_k = ggml_vk_create_buffer_check(ctx->device, sizeof(float) * d_ne * split_k, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+            ggml_vk_mmid_count_invalidate(ctx);  // [TAG_MMID_COUNT_CACHE]
         }
     }
     if (mmq) {
@@ -15937,6 +16055,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
             ggml_vk_destroy_buffer(ctx->prealloc_split_k);
         }
         ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k);
+        ggml_vk_mmid_count_invalidate(ctx);  // [TAG_MMID_COUNT_CACHE] new buffer, old contents gone
     }
     if (ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_add_rms_partials << ")");
@@ -16571,6 +16690,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_y_last_pipeline_used = {};
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->prealloc_y_last_decode_vector_staging = false;
+    ggml_vk_mmid_count_invalidate(ctx);
 
     ctx->unsynced_nodes_written.clear();
     ctx->unsynced_nodes_read.clear();
@@ -17988,6 +18108,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->prealloc_y_last_decode_vector_staging = false;
+    // [TAG_MMID_COUNT_CACHE] a reused cgraph hands us the same ids *nodes* with new contents.
+    ggml_vk_mmid_count_invalidate(ctx);
 
     if (ctx->prealloc_size_add_rms_partials) {
         ggml_vk_preallocate_buffers(ctx, nullptr);
