@@ -4902,7 +4902,10 @@ void ggml_compute_forward_cont(
 // GGML_GET_ROWS_SORTED / LLAMA_PLE_GATHER_SORT override: 0 = off everywhere (restores today's
 // order exactly), 1 = on for every get_rows regardless of size (for test-backend-ops).
 // GGML_GET_ROWS_STATS=1 emits one line per gathered op with the page census, and works with the
-// sort both on and off so the two orders can be compared without a profiler.
+// sort both on and off so the two orders can be compared without a profiler (the "without sorting"
+// count is taken from the ids as they arrive, before the sort, so a single run reports both).
+// GGML_GET_ROWS_STATS=2 additionally ignores the size gate, i.e. censuses every get_rows -- for
+// test-backend-ops-scale tensors, where the 1 GiB rule would otherwise suppress the line.
 
 #define GGML_GET_ROWS_PAGE_SHIFT          12            // 4 KiB -- the granularity that costs a fault
 #define GGML_GET_ROWS_SORT_MIN_SRC_BYTES  (1ull << 30)  // 1 GiB, see above
@@ -4925,13 +4928,18 @@ static int ggml_get_rows_sort_env(void) {
     return mode;
 }
 
-static bool ggml_get_rows_stats_env(void) {
-    static const bool on = []() -> bool {
+// 0 = off, 1 = census for the gated (PLE-sized) gathers, >= 2 = census for every get_rows
+static int ggml_get_rows_stats_env(void) {
+    static const int level = []() -> int {
         const char * s = getenv("GGML_GET_ROWS_STATS");
-        return s != nullptr && atoi(s) != 0;
+        if (s == nullptr) {
+            return 0;
+        }
+        const int v = atoi(s);
+        return v > 0 ? v : 0;
     }();
 
-    return on;
+    return level;
 }
 
 struct ggml_get_rows_plan {
@@ -4958,10 +4966,10 @@ static ggml_get_rows_plan ggml_get_rows_plan_of(const ggml_tensor * node) {
         return p;
     }
 
-    const int  mode  = ggml_get_rows_sort_env();
-    const bool stats = ggml_get_rows_stats_env();
+    const int mode  = ggml_get_rows_sort_env();
+    const int stats = ggml_get_rows_stats_env();
 
-    if (mode == 0 && !stats) {
+    if (mode == 0 && stats == 0) {
         return p;  // off and nothing to measure: not a byte of setup
     }
 
@@ -4971,7 +4979,7 @@ static ggml_get_rows_plan ggml_get_rows_plan_of(const ggml_tensor * node) {
         return p;
     }
 
-    if (mode != 1) {  // auto / stats: the PLE-sized gather only
+    if (mode != 1 && stats < 2) {  // auto: the PLE-sized gather only
         if ((uint64_t) ggml_nbytes(src0) < GGML_GET_ROWS_SORT_MIN_SRC_BYTES ||
             nr < GGML_GET_ROWS_SORT_MIN_ROWS) {
             return p;
@@ -4991,7 +4999,7 @@ static ggml_get_rows_plan ggml_get_rows_plan_of(const ggml_tensor * node) {
     }
 
     p.sort   = (mode != 0);
-    p.stats  = stats;
+    p.stats  = (stats > 0);
     p.nr     = nr;
     p.wbytes = 2*(size_t) nr*sizeof(uint64_t);  // keys + radix scratch
 
