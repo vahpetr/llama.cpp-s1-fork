@@ -2340,6 +2340,13 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 // decreases performance with GPU offloading
                 //n_tasks = n_threads;
                 n_tasks = 1;
+
+                // [TAG_GET_ROWS_SORTED] opt-in (GGML_GET_ROWS_THREADS), and only for the nodes the
+                // page-order size gate already selected -- i.e. the PLE gather, never an ordinary
+                // embedding lookup. Off by default, so the FIXME above still holds everywhere else.
+                if (node->op == GGML_OP_GET_ROWS && ggml_get_rows_threads() > 1 && ggml_get_rows_work_size(node) > 0) {
+                    n_tasks = MIN(ggml_get_rows_threads(), n_threads);
+                }
             } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:
@@ -2889,6 +2896,11 @@ struct ggml_cplan ggml_graph_plan(
                         if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
+                    } break;
+                case GGML_OP_GET_ROWS:
+                    {
+                        // [TAG_GET_ROWS_SORTED] shared (page key, dst index) array + radix scratch
+                        cur = ggml_get_rows_work_size(node);
                     } break;
                 case GGML_OP_SOFT_MAX:
                 case GGML_OP_ROPE:

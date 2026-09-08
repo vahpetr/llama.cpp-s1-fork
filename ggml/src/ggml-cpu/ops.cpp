@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 // ggml_compute_forward_dup
 
@@ -4843,6 +4845,425 @@ void ggml_compute_forward_cont(
 
 // ggml_compute_forward_get_rows
 
+// [TAG_GET_ROWS_SORTED]
+// Page-ordered gather -- a permutation of the WORK ORDER of get_rows, nothing else.
+//
+// Why this op: `get_rows` is the only CPU node in the qwen4exp prefill graph. The PLE table
+// (`per_layer_token_embd`, Q5_0, 320 001 536 rows x 110 B = 32.78 GiB, mmap'd and read lazily) is
+// pinned to the CPU and gathered 16 rows per token. The 16 row ids of one token are drawn from 16
+// disjoint ~2 GiB bands with 16 different moduli (src/models/qwen4exp.cpp, llm_graph_input_ple),
+// so a token-major walk over a 2048-token ubatch visits 32 768 rows in 32 768 essentially random
+// places of a 32.78 GiB mapping: 3.4 MiB of useful row bytes spread over up to 128 MiB of 4 KiB
+// pages (37x page amplification), every one of them a page-cache lookup and, cold, a major fault.
+// The *set* of pages is fixed by the ids and cannot be reduced; the *order* is free, and the order
+// decides how many times the walk re-enters a page it has already left, how far apart consecutive
+// faults are, and whether readahead can see a pattern at all.
+//
+// So visit the rows in source-address order and write each one to its original destination.
+//
+// WHY THIS IS BIT-EXACT
+//   * every output row of a get_rows is produced by exactly one call of a pure per-row conversion
+//     (`dequantize_row_q<type>`, `ggml_cpu_fp16_to_fp32`, `ggml_cpu_bf16_to_fp32`,
+//     `ggml_vec_cpy_f32`) reading `src0->data + i01*nb01 + i11*nb02 + i12*nb03` and writing
+//     `dst->data + i10*nb1 + i11*nb2 + i12*nb3`;
+//   * i -> (i10,i11,i12) is a bijection onto the rows of dst, so the destinations are pairwise
+//     disjoint: nothing is accumulated, nothing is read back, no row depends on another;
+//   * this change alters neither the set {i : 0 <= i < nr}, nor the (src,dst) address pair of any
+//     i, nor the function applied to it, nor its length nc -- only the sequence in which the
+//     elements are visited and which thread visits which of them.
+// Every output byte is therefore the same function of the same input bytes as before. This is not
+// "exact up to floating-point reassociation": there is no arithmetic across rows to reassociate.
+// Exactness does not even depend on the sort being *correct* -- ANY permutation of [0, nr) yields
+// the identical output, a wrong one merely gathers slowly. The two properties that do have to hold
+// are (a) the visit order is a permutation of [0, nr) -- the radix sort is a permutation by
+// construction and asserts its prefix sums, and (b) the thread slices tile it exactly once --
+// enforced by the pure, monotone snap() below with snap(0) = 0 and snap(nr) = nr.
+//
+// THREAD PARTITION. Sorting inside each thread's existing token-major range would recover almost
+// nothing: the ranges are token-major, so every thread's range already spans all 16 bands and the
+// full 32.78 GiB span; sorting a random subset of 1/nth of the ids leaves the same number of
+// distinct pages per thread and the same 37x amplification, just locally ordered. The order has to
+// be built over ALL ids and then cut: thread 0 sorts once into the shared work buffer, and each
+// thread takes a contiguous slice of the SORTED order, so each thread owns a contiguous, disjoint
+// block of source pages (slice boundaries are snapped to a page-key change so that no 4 KiB page
+// is faulted by two threads).
+//
+// THRESHOLD (auto mode). On by default only when
+//     ggml_nbytes(src0) >= 1 GiB   and   nelements(src1) >= 1024 ids.
+//   - 1 GiB: below it the source is small enough to be page-cache resident and inside the reach of
+//     the hardware prefetchers and the TLB, so the reorder has nothing to win and the sort is pure
+//     cost. It also keeps every ordinary token-embedding gather on the old path (this model's
+//     token_embd is [2560, 248320] q6_K = 0.5 GiB); the PLE table is 32.78 GiB.
+//   - 1024 ids: the sort is O(nr) plus four 256-entry histograms, so break-even is far below 1024,
+//     but 1024 has a second, more important property here: it keeps the DECODE gather (16 heads x
+//     <= 30 tokens = <= 480 ids, normally 96) bit-for-bit on today's code path. Decode is
+//     latency-critical, its ids are 96 rows that cannot be usefully reordered, and it must not pay
+//     a setup it cannot amortise. Prefill at -ub 2048 is 32 768 ids and is the whole target.
+// GGML_GET_ROWS_SORTED / LLAMA_PLE_GATHER_SORT override: 0 = off everywhere (restores today's
+// order exactly), 1 = on for every get_rows regardless of size (for test-backend-ops).
+// GGML_GET_ROWS_STATS=1 emits one line per gathered op with the page census, and works with the
+// sort both on and off so the two orders can be compared without a profiler (the "without sorting"
+// count is taken from the ids as they arrive, before the sort, so a single run reports both).
+// GGML_GET_ROWS_STATS=2 additionally ignores the size gate, i.e. censuses every get_rows -- for
+// test-backend-ops-scale tensors, where the 1 GiB rule would otherwise suppress the line.
+
+#define GGML_GET_ROWS_PAGE_SHIFT          12            // 4 KiB -- the granularity that costs a fault
+#define GGML_GET_ROWS_SORT_MIN_SRC_BYTES  (1ull << 30)  // 1 GiB, see above
+#define GGML_GET_ROWS_SORT_MIN_ROWS       1024          // ids, see above
+#define GGML_GET_ROWS_SORT_MAX_ROWS       (1ll << 22)   // 4 Mi ids = 64 MiB of work buffer
+
+// -1 = auto (size gate), 0 = off, 1 = forced on
+static int ggml_get_rows_sort_env(void) {
+    static const int mode = []() -> int {
+        const char * s = getenv("GGML_GET_ROWS_SORTED");
+        if (s == nullptr) {
+            s = getenv("LLAMA_PLE_GATHER_SORT");
+        }
+        if (s == nullptr) {
+            return -1;
+        }
+        return atoi(s) != 0 ? 1 : 0;
+    }();
+
+    return mode;
+}
+
+// 0 = off, 1 = census for the gated (PLE-sized) gathers, >= 2 = census for every get_rows
+static int ggml_get_rows_stats_env(void) {
+    static const int level = []() -> int {
+        const char * s = getenv("GGML_GET_ROWS_STATS");
+        if (s == nullptr) {
+            return 0;
+        }
+        const int v = atoi(s);
+        return v > 0 ? v : 0;
+    }();
+
+    return level;
+}
+
+struct ggml_get_rows_plan {
+    bool    sort   = false;  // gather in page order
+    bool    stats  = false;  // emit the per-op census line
+    int64_t nr     = 0;      // number of gathered rows
+    int     shift  = GGML_GET_ROWS_PAGE_SHIFT;
+    size_t  wbytes = 0;      // work-buffer bytes required (0 = neither path is active)
+};
+
+// the single predicate, shared by ggml_graph_plan() (work-buffer sizing) and the op itself, so the
+// two can never disagree about whether the buffer exists
+static ggml_get_rows_plan ggml_get_rows_plan_of(const ggml_tensor * node) {
+    ggml_get_rows_plan p;
+
+    if (node == nullptr || node->op != GGML_OP_GET_ROWS) {
+        return p;
+    }
+
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+
+    if (src0 == nullptr || src1 == nullptr) {
+        return p;
+    }
+
+    const int mode  = ggml_get_rows_sort_env();
+    const int stats = ggml_get_rows_stats_env();
+
+    if (mode == 0 && stats == 0) {
+        return p;  // off and nothing to measure: not a byte of setup
+    }
+
+    const int64_t nr = ggml_nelements(src1);
+
+    if (nr < 2 || nr > GGML_GET_ROWS_SORT_MAX_ROWS || src0->ne[1] < 2) {
+        return p;
+    }
+
+    if (mode != 1 && stats < 2) {  // auto: the PLE-sized gather only
+        if ((uint64_t) ggml_nbytes(src0) < GGML_GET_ROWS_SORT_MIN_SRC_BYTES ||
+            nr < GGML_GET_ROWS_SORT_MIN_ROWS) {
+            return p;
+        }
+    }
+
+    // the sort key is a page index and shares a uint64 with the destination index, so it has to fit
+    // in 32 bits; widen the page for a source that is larger than 4 KiB * 2^32 = 16 TiB
+    const uint64_t span = (uint64_t) (src0->ne[1] - 1)*src0->nb[1]
+                        + (uint64_t) (src0->ne[2] - 1)*src0->nb[2]
+                        + (uint64_t) (src0->ne[3] - 1)*src0->nb[3]
+                        + (uint64_t) src0->nb[1];
+
+    p.shift = GGML_GET_ROWS_PAGE_SHIFT;
+    while ((span >> p.shift) > 0xffffffffull) {
+        p.shift++;
+    }
+
+    p.sort   = (mode != 0);
+    p.stats  = (stats > 0);
+    p.nr     = nr;
+    p.wbytes = 2*(size_t) nr*sizeof(uint64_t);  // keys + radix scratch
+
+    return p;
+}
+
+size_t ggml_get_rows_work_size(const struct ggml_tensor * node) {
+    return ggml_get_rows_plan_of(node).wbytes;
+}
+
+// [TAG_GET_ROWS_SORTED] opt-in, OFF by default (returns 1 = today's single-threaded gather).
+// GET_ROWS has carried n_tasks = 1 since the "cost of launching additional threads decreases
+// performance with GPU offloading" FIXME in ggml_get_n_tasks(), and in this fork's prefill graph
+// the PLE split is that one node, so the 32 768-row / 128 MiB-of-pages gather runs on ONE thread
+// with one outstanding fault at a time. Once the walk is in page order the obvious follow-up is to
+// fan it out -- each thread then owns a contiguous, disjoint block of source pages, so N threads
+// give N independent, locally ordered fault streams instead of N random ones. That is a scheduling
+// change with the same bit-exactness argument as the reordering itself (disjoint destinations, one
+// pure conversion per row), but it is a separate measurement, so it stays behind its own env var
+// and only ever applies to the nodes the size gate already selected.
+int ggml_get_rows_threads(void) {
+    static const int n = []() -> int {
+        const char * s = getenv("GGML_GET_ROWS_THREADS");
+        if (s == nullptr) {
+            return 1;
+        }
+        const int v = atoi(s);
+        return v > 1 ? v : 1;
+    }();
+
+    return n;
+}
+
+// LSD radix sort of the packed (page key, dst index) pairs on the key bits [32, 64). Returns the
+// buffer that holds the sorted array (a or b). A pass whose key byte is constant is the identity
+// permutation and is skipped, which is why the result buffer is not a function of nr alone.
+static uint64_t * ggml_get_rows_sort_pages(uint64_t * a, uint64_t * b, int64_t n) {
+    for (int sh = 32; sh < 64; sh += 8) {
+        size_t cnt[256] = { 0 };
+
+        for (int64_t i = 0; i < n; ++i) {
+            cnt[(a[i] >> sh) & 0xffu]++;
+        }
+
+        bool constant_byte = false;
+        for (int d = 0; d < 256; ++d) {
+            if (cnt[d] == (size_t) n) {
+                constant_byte = true;
+                break;
+            }
+        }
+
+        if (constant_byte) {
+            continue;
+        }
+
+        size_t sum = 0;
+        for (int d = 0; d < 256; ++d) {
+            const size_t c = cnt[d];
+            cnt[d] = sum;
+            sum   += c;
+        }
+
+        // the prefix sums are what make the scatter a permutation of [0, n)
+        GGML_ASSERT(sum == (size_t) n);
+
+        for (int64_t i = 0; i < n; ++i) {
+            b[cnt[(a[i] >> sh) & 0xffu]++] = a[i];
+        }
+
+        std::swap(a, b);
+    }
+
+    return a;
+}
+
+struct ggml_get_rows_order {
+    int64_t          begin = 0;        // [begin, end) into perm, or into [0, nr) when perm == null
+    int64_t          end   = 0;
+    const uint64_t * perm  = nullptr;  // sorted (page key << 32 | dst index); null = today's order
+
+    // census, thread 0 only
+    bool     stats       = false;
+    int      ith         = 0;
+    int      nth         = 1;
+    int      shift       = GGML_GET_ROWS_PAGE_SHIFT;
+    int64_t  nr          = 0;
+    int64_t  n_pages     = 0;  // distinct pages touched (order-independent)
+    int64_t  enter_nat   = 0;  // page entries walking the ids token-major (today)
+    int64_t  enter_sort  = 0;  // page entries walking them in page order (== n_pages)
+    int64_t  t_sort_us   = 0;
+    int64_t  t_beg_us    = 0;
+    const ggml_tensor * dst = nullptr;
+};
+
+static ggml_get_rows_order ggml_get_rows_prepare(const ggml_compute_params * params, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    const int64_t nr  = ggml_nelements(src1);
+    const int     ith = params->ith;
+    const int     nth = params->nth;
+
+    ggml_get_rows_order o;
+
+    o.dst = dst;
+    o.ith = ith;
+    o.nth = nth;
+    o.nr  = nr;
+
+    const ggml_get_rows_plan p = ggml_get_rows_plan_of(dst);
+
+    // every thread evaluates the same predicate on the same tensor and the same params, so the
+    // decision below is identical on all of them -- which is what makes the barrier safe
+    const bool have_work = p.wbytes > 0
+                        && params->wdata != nullptr
+                        && params->wsize >= p.wbytes
+                        && (nth == 1 || params->threadpool != nullptr);
+
+    if (!have_work) {
+        // today's split, expression for expression
+        const int dr = (nr + nth - 1)/nth;
+
+        o.begin = dr*ith;
+        o.end   = MIN(o.begin + dr, nr);
+        o.stats = p.stats;
+        o.shift = p.shift;
+
+        if (o.stats) {
+            o.t_beg_us = ggml_time_us();
+        }
+
+        return o;
+    }
+
+    uint64_t * a = (uint64_t *) params->wdata;
+    uint64_t * b = a + nr;
+
+    o.shift = p.shift;
+    o.stats = p.stats;
+
+    const int64_t t_sort_beg = p.stats ? ggml_time_us() : 0;
+
+    if (ith == 0) {
+        const int64_t ne01 = src0->ne[1];
+
+        const size_t nb01 = src0->nb[1];
+        const size_t nb02 = src0->nb[2];
+        const size_t nb03 = src0->nb[3];
+
+        const int64_t ne10 = src1->ne[0];
+        const int64_t ne11 = src1->ne[1];
+
+        const size_t nb10 = src1->nb[0];
+        const size_t nb11 = src1->nb[1];
+        const size_t nb12 = src1->nb[2];
+
+        const int shift = p.shift;
+
+        for (int64_t i = 0; i < nr; ++i) {
+            const int64_t i12 = i/(ne11*ne10);
+            const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+            const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+            const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+            GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+            const uint64_t off = (uint64_t) i01*nb01 + (uint64_t) i11*nb02 + (uint64_t) i12*nb03;
+            const uint64_t key = off >> shift;
+
+            GGML_ASSERT(key <= 0xffffffffull);
+
+            a[i] = (key << 32) | (uint64_t) (uint32_t) i;
+        }
+
+        // the "without sorting" half of the census: page entries in the order the ids arrive
+        if (p.stats) {
+            int64_t enter = nr > 0 ? 1 : 0;
+            for (int64_t i = 1; i < nr; ++i) {
+                enter += (a[i] >> 32) != (a[i-1] >> 32);
+            }
+            o.enter_nat = enter;
+        }
+
+        uint64_t * s = ggml_get_rows_sort_pages(a, b, nr);
+        if (s != a) {
+            memcpy(a, s, (size_t) nr*sizeof(uint64_t));
+        }
+
+        if (p.stats) {
+            int64_t pages = nr > 0 ? 1 : 0;
+            for (int64_t i = 1; i < nr; ++i) {
+                pages += (a[i] >> 32) != (a[i-1] >> 32);
+            }
+            o.n_pages    = pages;
+            o.enter_sort = pages;  // in page order every page is entered exactly once
+            o.t_sort_us  = ggml_time_us() - t_sort_beg;
+        }
+    }
+
+    if (nth > 1) {
+        ggml_barrier(params->threadpool);
+    }
+
+    if (p.sort) {
+        // contiguous slice of the SORTED order, boundaries snapped forward to the next page so no
+        // 4 KiB page is faulted by two threads. snap is pure and monotone with snap(0) = 0 and
+        // snap(nr) = nr, so the slices tile [0, nr) exactly once whatever the sorted contents are.
+        auto snap = [a, nr](int64_t pos) -> int64_t {
+            if (pos <= 0)  { return 0;  }
+            if (pos >= nr) { return nr; }
+            while (pos < nr && (a[pos] >> 32) == (a[pos - 1] >> 32)) {
+                ++pos;
+            }
+            return pos;
+        };
+
+        o.perm  = a;
+        o.begin = snap((nr*(int64_t) ith)      /nth);
+        o.end   = snap((nr*(int64_t) (ith + 1))/nth);
+    } else {
+        const int dr = (nr + nth - 1)/nth;
+
+        o.begin = dr*ith;
+        o.end   = MIN(o.begin + dr, nr);
+    }
+
+    if (o.stats) {
+        o.t_beg_us = ggml_time_us();
+    }
+
+    return o;
+}
+
+static inline int64_t ggml_get_rows_at(const ggml_get_rows_order & o, int64_t j) {
+    return o.perm ? (int64_t) (uint32_t) o.perm[j] : j;
+}
+
+static void ggml_get_rows_finish(const ggml_get_rows_order & o) {
+    if (!o.stats || o.ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * src0 = o.dst->src[0];
+
+    const int64_t t_gather_us = ggml_time_us() - o.t_beg_us;
+
+    const size_t  page      = (size_t) 1 << o.shift;
+    const size_t  row_bytes = ggml_row_size(src0->type, src0->ne[0]);
+    const double  useful    = (double) o.nr*row_bytes;
+    const double  paged     = (double) o.n_pages*page;
+
+    GGML_LOG_INFO("get_rows[stats]: %s <- %s [%s] rows=%lld row=%zuB nth=%d order=%s | "
+                  "pages=%lld enter_nat=%lld enter_sorted=%lld page_MiB=%.2f useful_MiB=%.3f amp=%.1fx | "
+                  "sort_us=%lld gather_us=%lld\n",
+                  o.dst->name, src0->name, ggml_type_name(src0->type),
+                  (long long) o.nr, row_bytes, o.nth, o.perm ? "page" : "natural",
+                  (long long) o.n_pages, (long long) o.enter_nat, (long long) o.enter_sort,
+                  paged/(1024.0*1024.0), useful/(1024.0*1024.0),
+                  useful > 0.0 ? paged/useful : 0.0,
+                  (long long) o.t_sort_us, (long long) t_gather_us);
+}
+
+
 static void ggml_compute_forward_get_rows_q(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -4863,17 +5284,14 @@ static void ggml_compute_forward_get_rows_q(
     assert(nb00 == ggml_type_size(type));
     assert(ggml_nrows(dst) == nr);
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    GGML_UNUSED(nr);  // only asserted; the visit order owns the row range now
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // [TAG_GET_ROWS_SORTED] page-ordered visit order + thread slice (identical work, permuted)
+    const ggml_get_rows_order order = ggml_get_rows_prepare(params, dst);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    for (int64_t j = order.begin; j < order.end; ++j) {
+        const int64_t i = ggml_get_rows_at(order, j);
 
-    for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
@@ -4885,6 +5303,8 @@ static void ggml_compute_forward_get_rows_q(
                 (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
                      (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
     }
+
+    ggml_get_rows_finish(order);
 }
 
 static void ggml_compute_forward_get_rows_f16(
@@ -4904,17 +5324,14 @@ static void ggml_compute_forward_get_rows_f16(
     assert(nb00 == sizeof(ggml_fp16_t));
     assert(ggml_nrows(dst) == nr);
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    GGML_UNUSED(nr);  // only asserted; the visit order owns the row range now
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // [TAG_GET_ROWS_SORTED] page-ordered visit order + thread slice (identical work, permuted)
+    const ggml_get_rows_order order = ggml_get_rows_prepare(params, dst);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    for (int64_t j = order.begin; j < order.end; ++j) {
+        const int64_t i = ggml_get_rows_at(order, j);
 
-    for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
@@ -4926,6 +5343,8 @@ static void ggml_compute_forward_get_rows_f16(
             (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
                        (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
     }
+
+    ggml_get_rows_finish(order);
 }
 
 static void ggml_compute_forward_get_rows_bf16(
@@ -4945,17 +5364,14 @@ static void ggml_compute_forward_get_rows_bf16(
     assert(nb00 == sizeof(ggml_bf16_t));
     assert(ggml_nrows(dst) == nr);
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    GGML_UNUSED(nr);  // only asserted; the visit order owns the row range now
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // [TAG_GET_ROWS_SORTED] page-ordered visit order + thread slice (identical work, permuted)
+    const ggml_get_rows_order order = ggml_get_rows_prepare(params, dst);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    for (int64_t j = order.begin; j < order.end; ++j) {
+        const int64_t i = ggml_get_rows_at(order, j);
 
-    for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
@@ -4967,6 +5383,8 @@ static void ggml_compute_forward_get_rows_bf16(
             (const ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
                         (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
     }
+
+    ggml_get_rows_finish(order);
 }
 
 static void ggml_compute_forward_get_rows_f32(
@@ -4986,17 +5404,14 @@ static void ggml_compute_forward_get_rows_f32(
     assert(nb00 == sizeof(float));
     assert(ggml_nrows(dst) == nr);
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    GGML_UNUSED(nr);  // only asserted; the visit order owns the row range now
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // [TAG_GET_ROWS_SORTED] page-ordered visit order + thread slice (identical work, permuted)
+    const ggml_get_rows_order order = ggml_get_rows_prepare(params, dst);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    for (int64_t j = order.begin; j < order.end; ++j) {
+        const int64_t i = ggml_get_rows_at(order, j);
 
-    for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
@@ -5008,6 +5423,8 @@ static void ggml_compute_forward_get_rows_f32(
                 (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
                 (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
     }
+
+    ggml_get_rows_finish(order);
 }
 
 void ggml_compute_forward_get_rows(
