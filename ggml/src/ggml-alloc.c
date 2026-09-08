@@ -933,10 +933,24 @@ static bool ggml_gallocr_reserve_n_impl(
                         __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
                 }
             }
-            ggml_vbuffer_free(galloc->buffers[i]);
-            if (no_alloc) {
-                galloc->buffers[i] = NULL;
-            } else {
+            // [TAG_KV_GRAPH_SPAN] entries that share a buffer type share the *same* vbuffer pointer
+            // (the alias loop above copies it), so freeing entry i's buffer dangles every other entry
+            // that still holds that pointer. On the success path the alias loop repairs them when
+            // their own iteration comes around, but only for j > i and only if we get there: an
+            // allocation failure returns immediately, leaving [NULL, freed] behind. ggml_gallocr_free
+            // then deduplicates by pointer equality, sees the NULL and the freed pointer as different
+            // buffers, and frees the dead one a second time. Drop every alias of the buffer we are
+            // about to free before freeing it, so no stale pointer can outlive it on any path.
+            struct vbuffer * old_buffer = galloc->buffers[i];
+            if (old_buffer != NULL) {
+                for (int j = 0; j < galloc->n_buffers; j++) {
+                    if (galloc->buffers[j] == old_buffer) {
+                        galloc->buffers[j] = NULL;
+                    }
+                }
+            }
+            ggml_vbuffer_free(old_buffer);
+            if (!no_alloc) {
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
@@ -945,7 +959,8 @@ static bool ggml_gallocr_reserve_n_impl(
                     // decide that no reallocation is needed and then allocate tensors out of a NULL
                     // vbuffer (ggml_vbuffer_tensor_alloc -> buf->chunks[...]), which segfaults instead of
                     // reporting the OOM. invalidate the plan so the next alloc_graph re-reserves (and
-                    // fails cleanly) rather than trusting it.
+                    // fails cleanly) rather than trusting it. every alias of the freed buffer is NULL by
+                    // now, so the next reserve re-allocates it and ggml_gallocr_free cannot double-free.
                     galloc->n_nodes = 0;
                     galloc->n_leafs = 0;
                     return false;
