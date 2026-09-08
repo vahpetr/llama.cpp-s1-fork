@@ -1599,6 +1599,17 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// env: GGML_SCHED_PROFILE=1 - per-split host timing of ggml_backend_sched_compute_splits, printed to stderr as
+// "[sched-prof]" lines (the same env drives llama-context.cpp and ggml_backend_vk_graph_compute). Read once
+// and cached: with the env off every instrumented site is a single branch on this bool and nothing else.
+static bool ggml_sched_prof_enabled(void) {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_SCHED_PROFILE");
+        return s != NULL && atoi(s) != 0;
+    }();
+    return enabled;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1609,10 +1620,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    const bool prof = ggml_sched_prof_enabled();
+
+    int64_t prof_t_graph_us  = 0; // start of this graph
+    int64_t prof_t_split_us  = 0; // start of the current split (before the previous-split wait + input copies)
+    int64_t prof_copies_us   = 0; // sum over splits: wait for the previous split's backend + input copies
+    int64_t prof_cpu_us      = 0; // sum over splits on synchronous backends (CPU): the actual compute
+    int64_t prof_submit_us   = 0; // sum over splits on asynchronous backends (Vulkan): graph_compute_async, i.e. record + submit
+    if (prof) {
+        prof_t_graph_us = ggml_time_us();
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        if (prof) {
+            prof_t_split_us = ggml_time_us();
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1747,6 +1773,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        int64_t prof_t_compute_us = 0;
+        if (prof) {
+            prof_t_compute_us = ggml_time_us();
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1792,6 +1823,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+
+        if (prof) {
+            const int64_t t_now_us = ggml_time_us();
+            // a backend without a synchronize hook (CPU) computes inline, so its graph_compute_async is the
+            // compute itself; any other backend (Vulkan) only records and submits, the GPU runs on
+            const bool    is_async  = split_backend->iface.synchronize != NULL;
+            const int64_t t_copy    = prof_t_compute_us - prof_t_split_us;
+            const int64_t t_compute = t_now_us - prof_t_compute_us;
+            prof_copies_us += t_copy;
+            if (is_async) {
+                prof_submit_us += t_compute;
+            } else {
+                prof_cpu_us += t_compute;
+            }
+            fprintf(stderr, "[sched-prof]   split %d backend=%s nodes=%d inputs=%d copy=%.3fms compute=%.3fms(%s)\n",
+                    split_id, ggml_backend_name(split_backend), split->graph.n_nodes, split->n_inputs,
+                    t_copy/1000.0, t_compute/1000.0, is_async ? "async" : "sync");
+        }
+    }
+
+    if (prof) {
+        fprintf(stderr, "[sched-prof] graph splits=%d copies=%.3fms cpu_compute=%.3fms submit=%.3fms total=%.3fms\n",
+                sched->n_splits, prof_copies_us/1000.0, prof_cpu_us/1000.0, prof_submit_us/1000.0,
+                (ggml_time_us() - prof_t_graph_us)/1000.0);
     }
 
     return GGML_STATUS_SUCCESS;

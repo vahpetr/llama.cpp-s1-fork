@@ -7,6 +7,10 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -15,6 +19,8 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -23,6 +29,41 @@
 //
 // llama_context
 //
+
+// env: GGML_SCHED_PROFILE=1 - host-side timing of the decode path, printed to stderr as "[sched-prof]" lines
+// (the same env drives ggml_backend_sched_compute_splits and ggml_backend_vk_graph_compute). Read once and
+// cached: with the env off every instrumented site is a single branch on this bool and nothing else.
+static bool sched_prof_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_SCHED_PROFILE");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return enabled;
+}
+
+// n_kv of the attention cache the graph was built against; -1 when there is none (encoder, recurrent-only)
+static int64_t sched_prof_n_kv(const llama_memory_context_i * mctx) {
+    if (mctx == nullptr) {
+        return -1;
+    }
+    if (const auto * c = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+        return c->get_n_kv();
+    }
+    if (const auto * c = dynamic_cast<const llama_kv_cache_iswa_context *>(mctx)) {
+        return c->get_base()->get_n_kv();
+    }
+    if (const auto * c = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+        return c->get_attn()->get_n_kv();
+    }
+    if (const auto * c = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
+        return c->get_attn()->get_base()->get_n_kv();
+    }
+    return -1;
+}
+
+static const char * sched_prof_ctx_name(llama_context_type ctx_type) {
+    return ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main";
+}
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -721,7 +762,22 @@ void llama_context::synchronize() {
         return;
     }
 
+    const bool prof = sched_prof_enabled();
+
+    int64_t t_prof_us = 0;
+    if (prof) {
+        t_prof_us = ggml_time_us();
+    }
+
     ggml_backend_sched_synchronize(sched.get());
+
+    if (prof && n_queued_tokens > 0) {
+        // the GPU wait for everything decode() enqueued since the previous synchronize (the async graph
+        // compute plus the async output reads); printed only when there was queued work, so the many
+        // no-op synchronize() calls from the getters stay silent
+        fprintf(stderr, "[sched-prof] sync ctx=%s n_queued=%" PRId64 " wait=%.3fms\n",
+                sched_prof_ctx_name(cparams.ctx_type), n_queued_tokens, (ggml_time_us() - t_prof_us)/1000.0);
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1341,6 +1397,14 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const bool prof = sched_prof_enabled();
+
+    int64_t t_prof_us = 0;
+    if (prof) {
+        t_prof_us = ggml_time_us();
+        sched_prof.t_start_us = t_prof_us;
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1365,6 +1429,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+
+        if (prof) {
+            // reuse path: build = mctx->apply() + graph_params() + the can_reuse() check (+ the
+            // pipeline-parallel synchronize); no graph is built and nothing is allocated
+            const int64_t t_now_us = ggml_time_us();
+            sched_prof.reused     = true;
+            sched_prof.t_build_us = t_now_us - t_prof_us;
+            sched_prof.t_alloc_us = 0;
+            t_prof_us = t_now_us;
+        }
     } else {
         res->reset();
 
@@ -1383,10 +1457,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (prof) {
+            // build path: build = mctx->apply() + graph_params() + the failed can_reuse() check +
+            // ggml_backend_sched_reset() + model.build_graph()
+            const int64_t t_now_us = ggml_time_us();
+            sched_prof.reused     = false;
+            sched_prof.t_build_us = t_now_us - t_prof_us;
+            t_prof_us = t_now_us;
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        if (prof) {
+            const int64_t t_now_us = ggml_time_us();
+            sched_prof.t_alloc_us = t_now_us - t_prof_us;
+            t_prof_us = t_now_us;
         }
     }
 
@@ -1400,7 +1489,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (prof) {
+        const int64_t t_now_us = ggml_time_us();
+        sched_prof.t_inputs_us = t_now_us - t_prof_us;
+        t_prof_us = t_now_us;
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (prof) {
+        // graph_compute() is ggml_backend_sched_graph_compute_async(): on an asynchronous backend (Vulkan)
+        // this is the host-side split walk + command recording + vkQueueSubmit time only - the GPU wait
+        // lands in synchronize() and is printed there as "[sched-prof] sync ... wait="
+        sched_prof.t_compute_us = ggml_time_us() - t_prof_us;
+        sched_prof.n_kv         = sched_prof_n_kv(mctx);
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1410,6 +1514,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     ret = GGML_STATUS_SUCCESS;
 
     return res;
+}
+
+// one line per ubatch; t_outputs_start_us is the time process_ubatch() returned, so "outputs" brackets the
+// ggml_backend_tensor_get_async() calls for logits / embeddings / h_nextn / backend-sampler rows and "total"
+// runs from the start of process_ubatch() to the end of those queued reads
+void llama_context::sched_prof_print_ubatch(const char * ctx_name, uint32_t n_tokens, int64_t t_outputs_start_us) const {
+    const int64_t t_now_us = ggml_time_us();
+
+    fprintf(stderr, "[sched-prof] ubatch ctx=%s n_tokens=%u n_kv=%" PRId64 " reuse=%d build=%.3fms alloc=%.3fms inputs=%.3fms compute=%.3fms outputs=%.3fms total=%.3fms\n",
+            ctx_name, n_tokens, sched_prof.n_kv, sched_prof.reused ? 1 : 0,
+            sched_prof.t_build_us/1000.0, sched_prof.t_alloc_us/1000.0, sched_prof.t_inputs_us/1000.0, sched_prof.t_compute_us/1000.0,
+            (t_now_us - t_outputs_start_us)/1000.0, (t_now_us - sched_prof.t_start_us)/1000.0);
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
@@ -1480,6 +1596,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     ggml_status status;
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+
+    int64_t t_prof_outputs_us = 0;
+    if (sched_prof_enabled()) {
+        t_prof_outputs_us = ggml_time_us();
+    }
 
     cparams.causal_attn = causal_attn_org;
 
@@ -1570,6 +1691,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
     }
 
+    if (sched_prof_enabled()) {
+        sched_prof_print_ubatch("enc", n_tokens, t_prof_outputs_us);
+    }
+
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
         //cross.t_embd = t_embd;
@@ -1652,6 +1777,17 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    const bool prof = sched_prof_enabled();
+
+    // pre = batch init + memory init_batch (slot search) + output_reserve, ubatches = the ubatch loop,
+    // post = output-id mapping; the per-ubatch lines are printed inside the loop
+    int64_t t_prof_decode_us = 0;
+    int64_t t_prof_loop0_us  = 0;
+    int64_t t_prof_loop1_us  = 0;
+    int32_t n_prof_ubatch    = 0;
+    if (prof) {
+        t_prof_decode_us = ggml_time_us();
+    }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1815,6 +1951,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    if (prof) {
+        t_prof_loop0_us = ggml_time_us();
+    }
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -1837,6 +1977,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        int64_t t_prof_outputs_us = 0;
+        if (prof) {
+            t_prof_outputs_us = ggml_time_us();
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1988,9 +2133,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
         }
 
+        if (prof) {
+            n_prof_ubatch++;
+            sched_prof_print_ubatch(sched_prof_ctx_name(cparams.ctx_type), ubatch.n_tokens, t_prof_outputs_us);
+        }
+
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    if (prof) {
+        t_prof_loop1_us = ggml_time_us();
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2040,6 +2194,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 output_ids[out_ids[i]] = i;
             }
         }
+    }
+
+    if (prof) {
+        const int64_t t_now_us = ggml_time_us();
+        fprintf(stderr, "[sched-prof] decode ctx=%s n_tokens=%u n_ubatch=%d pre=%.3fms ubatches=%.3fms post=%.3fms total=%.3fms\n",
+                sched_prof_ctx_name(cparams.ctx_type), n_tokens_all, n_prof_ubatch,
+                (t_prof_loop0_us - t_prof_decode_us)/1000.0, (t_prof_loop1_us - t_prof_loop0_us)/1000.0,
+                (t_now_us - t_prof_loop1_us)/1000.0, (t_now_us - t_prof_decode_us)/1000.0);
     }
 
     // wait for the computation to finish (automatically done when obtaining the model output)

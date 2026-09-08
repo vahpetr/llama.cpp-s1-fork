@@ -2266,6 +2266,15 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
     return atoi(s) != 0;
 }
 
+// env: GGML_SCHED_PROFILE=1 - host-side timing of ggml_backend_vk_graph_compute, printed to stderr as
+// "[sched-prof]" lines (the same env drives llama-context.cpp and ggml_backend_sched_compute_splits).
+// Read once and cached: with the env off every instrumented site is a single branch on this bool. It does
+// not touch the GGML_VK_PERF_LOGGER timestamp-query path, which perturbs the GPU timeline.
+static bool ggml_vk_sched_prof_enabled() {
+    static const bool enabled = ggml_vk_env_bool("GGML_SCHED_PROFILE", false);
+    return enabled;
+}
+
 // [TAG_DMMV_RM] G50a: rows-per-workgroup knob for the dense mat-vec (dmmv) pipelines.  Same
 // "absent leaves the default, otherwise the value is parsed" convention as [TAG_ENV_BOOL].
 //
@@ -2592,6 +2601,9 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    // for GGML_SCHED_PROFILE: host time spent inside ggml_vk_submit() during the current graph_compute
+    int64_t sched_prof_submit_us {};
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -16807,6 +16819,11 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             memset(mset.dst, mset.val, mset.n);
         }
 
+        int64_t prof_t_submit_us = 0;
+        if (ggml_vk_sched_prof_enabled()) {
+            prof_t_submit_us = ggml_time_us();
+        }
+
         if (ctx->device->serialize_submissions) {
             ggml_vk_submit(subctx, ctx->fence);
         } else if (almost_ready && !ctx->almost_ready_fence_pending) {
@@ -16816,6 +16833,10 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             ggml_vk_submit(subctx, {});
         }
         ctx->submit_pending = true;
+
+        if (ggml_vk_sched_prof_enabled()) {
+            ctx->sched_prof_submit_us += ggml_time_us() - prof_t_submit_us;
+        }
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
         ggml_vk_synchronize(ctx);
@@ -18270,9 +18291,24 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
+    const bool prof = ggml_vk_sched_prof_enabled();
+
+    int64_t prof_t_start_us  = 0; // entry
+    int64_t prof_flush_us    = 0; // ggml_vk_flush_pending_host_reads: a fence wait when a UMA host read is pending
+    int64_t prof_t_record_us = 0; // start of the node loop
+    int64_t prof_wait_us     = 0; // fence waits inside this call (serialize_submissions only)
+    if (prof) {
+        prof_t_start_us = ggml_time_us();
+        ctx->sched_prof_submit_us = 0;
+    }
+
     // [TAG_ASYNC_READ_UMA] a pending direct host read owns ctx->compute_ctx; recording this graph
     // into it would strand or race the queued memcpy.
     ggml_vk_flush_pending_host_reads(ctx);
+
+    if (prof) {
+        prof_flush_us = ggml_time_us() - prof_t_start_us;
+    }
 
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
@@ -18395,6 +18431,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
+            int64_t prof_t_wait_us = 0;
+            if (prof) {
+                prof_t_wait_us = ggml_time_us();
+            }
             try {
                 auto res = ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX);
                 if (res != vk::Result::eSuccess) {
@@ -18413,6 +18453,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ctx->device->diag_cgraph = cgraph;
             ctx->device->diag_prev_start = start;
             ctx->device->diag_prev_end = end;
+            if (prof) {
+                prof_wait_us += ggml_time_us() - prof_t_wait_us;
+            }
         }
         first_node_in_batch = true;
         submitted_nodes = 0;
@@ -18422,6 +18465,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
         submit_count++;
     };
+
+    if (prof) {
+        prof_t_record_us = ggml_time_us();
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
@@ -18745,6 +18792,20 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     ctx->last_total_flops = total_flops;
+
+    if (prof) {
+        const int64_t t_now_us = ggml_time_us();
+        // pre    = everything before the node loop (flush, transfer-ctx submit, prealloc, perf-logger setup); flush is its fence-wait part
+        // record = the node loop: ggml_vk_build_graph command recording, fusion detection and the submits it issues
+        // submit_time = the ggml_vk_submit() (vkQueueSubmit) part of record; submits = how many this graph issued
+        // wait   = fence waits inside this call - only non-zero with serialize_submissions; on the normal path
+        //          graph_compute returns with the GPU still running (async) and the wait happens in
+        //          ggml_backend_vk_synchronize, i.e. under "[sched-prof] sync" / the sched copy of the next CPU split
+        fprintf(stderr, "[sched-prof]   vk graph nodes=%d pre=%.3fms flush=%.3fms record=%.3fms submits=%u submit_time=%.3fms wait=%.3fms total=%.3fms(async)\n",
+                cgraph->n_nodes, (prof_t_record_us - prof_t_start_us)/1000.0, prof_flush_us/1000.0,
+                (t_now_us - prof_t_record_us)/1000.0, submit_count, ctx->sched_prof_submit_us/1000.0,
+                prof_wait_us/1000.0, (t_now_us - prof_t_start_us)/1000.0);
+    }
 
     if (vk_submit_log_enabled || vk_perf_logger_enabled) {
         GGML_LOG_INFO("ggml_vulkan: graph_compute: %d nodes, %.3f GFLOP, %u submits, threshold seed %.3f GFLOP (%s)\n",

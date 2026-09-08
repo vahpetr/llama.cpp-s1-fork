@@ -394,4 +394,18 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // env: GGML_SCHED_PROFILE=1 - host-side timing of the last ubatch. process_ubatch() fills it,
+    // decode()/encode() print it once the output copies are queued. Never touched when the env is off.
+    struct {
+        int64_t t_start_us   = 0;
+        int64_t t_build_us   = 0;
+        int64_t t_alloc_us   = 0;
+        int64_t t_inputs_us  = 0;
+        int64_t t_compute_us = 0;
+        int64_t n_kv         = -1;
+        bool    reused       = false;
+    } sched_prof;
+
+    void sched_prof_print_ubatch(const char * ctx_name, uint32_t n_tokens, int64_t t_outputs_start_us) const;
 };
