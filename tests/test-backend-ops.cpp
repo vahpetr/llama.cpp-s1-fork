@@ -10083,6 +10083,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
+    // Speculative-decode verify rounds at the Flash-Next attention shape (2 KV heads, GQA 12,
+    // HSK = HSV = 256, q8_0 or f16 KV, long KV).  The upstream matrix only ever runs the GQA
+    // decode path at nb == 1, so nothing covered a batch of drafted tokens; the Vulkan coopmat1
+    // backend folds those tokens into the row dimension (one KV pass per round instead of one
+    // per token), which is only exercised at nb > 1.  nb 5 and 6 leave the last row tile
+    // partly empty, nb 2 fills a single tile.
+    for (int64_t nb : { 2, 5, 6 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, nb, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, nb, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    // ... the same fold with a KV that is not a multiple of the KV block (bounds-checked
+    // variant), with ALiBi + sinks + softcap (per-row slope and sink indexing) over a batch
+    // dimension, and at a second head/GQA shape.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16385, 6, true, false, 0,  0,
+                                                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, 16384, 6, true, true,  8, 30,
+                                                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, { 8, 1}, 16384, 4, true, false, 0,  0,
+                                                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
