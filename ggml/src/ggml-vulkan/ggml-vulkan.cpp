@@ -18598,7 +18598,14 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         //      still refused if it starts or sits inside a protected pattern. The RMS_NORM+MUL,
         //      MUL_MAT+ADD, ... carve-outs are all conditioned on j == c+1, which no window size
         //      changes.
-        // Reordering independent nodes changes no operand of any op, so results stay bit-exact.
+        // Reordering independent nodes changes no operand of any op. That is not by itself a proof of
+        // bit identity across window sizes: fusion in this backend is chosen from *adjacency* in the
+        // final order (ggml_can_fuse / ggml_vk_can_fuse) and a fused pair can use a different
+        // reduction than the two ops apart - ADD+RMS_NORM accumulates partial sums of squares in the
+        // ADD, standalone RMS_NORM reduces over the whole row - so a window that newly makes two
+        // nodes adjacent can change the floating-point summation order. The carve-outs below keep an
+        // already-adjacent pattern together; they do not stop a wider window from creating one. Treat
+        // "same results" as an expectation to verify per window value, not as an invariant.
         const int NUM_TO_CHECK = vk_graph_opt_window;
         // first_unused < n_nodes here (the enclosing while), so n_nodes - first_unused >= 1 and this
         // cannot overflow the way first_unused + NUM_TO_CHECK can once the window is settable.
