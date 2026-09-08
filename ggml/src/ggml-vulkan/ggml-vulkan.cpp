@@ -2242,6 +2242,19 @@ static bool vk_async_read_uma_force = false;
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
 
+// [TAG_ENV_BOOL] value-parsed boolean knob: absent (or empty) leaves the default, otherwise the
+// value is parsed, so =0 means off and =1 means on. A presence test would make FOO=0 turn the
+// feature *on*, which is a foot-gun for a benchmark matrix that sets every knob to 0 or 1.
+// Only 0 and 1 are meaningful; any other integer reads as 1 and any non-numeric value as 0.
+// Note that every caller below caches the result, so changing the environment later has no effect.
+static bool ggml_vk_env_bool(const char * name, bool def) {
+    const char * s = getenv(name);
+    if (s == nullptr || *s == '\0') {
+        return def;
+    }
+    return atoi(s) != 0;
+}
+
 static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
         const uint64_t m     = node->ne[0];
@@ -4028,7 +4041,7 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
     // coopMatMulAdd is not invariant to the sign of a zero product on RDNA3.  Costs a
     // shared-memory staging pass for V, and only on the tiles that actually have such
     // columns (i.e. the causal boundary tile), so fully-live tiles are unaffected.
-    static const bool fa_no_zero_dead_v = getenv("GGML_VK_FA_NO_ZERO_DEAD_V") != nullptr;
+    static const bool fa_no_zero_dead_v = ggml_vk_env_bool("GGML_VK_FA_NO_ZERO_DEAD_V", false);
     const bool zero_dead_v = !fa_no_zero_dead_v && use_mask && params.path == FA_COOPMAT1;
 
     // ZERO_DEAD_V derives its dead-column predicate from the P values the threads still
@@ -4036,7 +4049,7 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
     // GGML_VK_FA_DEADV_LDS=1 selects the original implementation, which rebuilds the same
     // flags by re-reading Psh from shared memory behind two extra barriers, so one build
     // can A/B the two.  Both compute the identical predicate.
-    static const bool fa_deadv_lds = getenv("GGML_VK_FA_DEADV_LDS") != nullptr;
+    static const bool fa_deadv_lds = ggml_vk_env_bool("GGML_VK_FA_DEADV_LDS", false);
     const bool deadv_lds = zero_dead_v && fa_deadv_lds;
 
     uint32_t flags = (use_mask_opt      ? 1 : 0) |
@@ -7623,8 +7636,8 @@ static void ggml_vk_instance_init() {
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
-    vk_flops_seed_legacy = getenv("GGML_VK_FLOPS_SEED_LEGACY") != nullptr;
-    vk_submit_log_enabled = getenv("GGML_VK_SUBMIT_LOG") != nullptr;
+    vk_flops_seed_legacy = ggml_vk_env_bool("GGML_VK_FLOPS_SEED_LEGACY", false);
+    vk_submit_log_enabled = ggml_vk_env_bool("GGML_VK_SUBMIT_LOG", false);
     const char* GGML_VK_OPT_WINDOW = getenv("GGML_VK_OPT_WINDOW");
     if (GGML_VK_OPT_WINDOW != nullptr) {
         // strtol, not std::stoi: this runs inside ggml_vk_instance_init and a throw from a
@@ -7640,8 +7653,8 @@ static void ggml_vk_instance_init() {
                     GGML_VK_OPT_WINDOW, vk_graph_opt_window);
         }
     }
-    vk_async_read_copybuf   = getenv("GGML_VK_ASYNC_READ_COPYBUF") != nullptr;
-    vk_async_read_uma_force = getenv("GGML_VK_ASYNC_READ_UMA") != nullptr;
+    vk_async_read_copybuf   = ggml_vk_env_bool("GGML_VK_ASYNC_READ_COPYBUF", false);
+    vk_async_read_uma_force = ggml_vk_env_bool("GGML_VK_ASYNC_READ_UMA", false);
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
     if (GGML_VK_PIPELINE_STATS != nullptr) {
@@ -10393,12 +10406,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // n_as is bounded by count_experts.comp's per-expert shared scratch, not by the packing:
     // the (i01 << 16) | i00 row id constrains nei1 / nei0 only.
     // A/B knob: GGML_VK_DISABLE_HOIST_ROW_IDS=1 falls back to the per-workgroup ids scan.
-    // Value-parsed, not a presence test: =0 must mean "leave hoisting on" (review 0016 nit -- a
-    // presence test is a foot-gun in a bench matrix that sets every knob to 0 or 1).
-    static const bool disable_hoist_row_ids = [] {
-        const char * s = getenv("GGML_VK_DISABLE_HOIST_ROW_IDS");
-        return s != nullptr && atoi(s) != 0;
-    }();
+    // Value-parsed, not a presence test - see ggml_vk_env_bool [TAG_ENV_BOOL].
+    static const bool disable_hoist_row_ids = ggml_vk_env_bool("GGML_VK_DISABLE_HOIST_ROW_IDS", false);
     const uint64_t hoisted_row_id_words = 2 * n_as + 1 + nei0 * nei1;
     const bool hoist_row_ids = !disable_hoist_row_ids &&
                                 n_as <= vk_count_experts_max_experts && nei0 <= 0xffff && nei1 <= 0xffff &&
