@@ -1,0 +1,61 @@
+#version 450
+
+#include "types.glsl"
+#include "utils.glsl"
+
+// Fused Gated-DeltaNet decay pre-chain (qwen4exp build_layer_attn_linear):
+//
+//   out[i0, r] = softplus(alpha[i0, r] + dt[i0]) * a[i0]
+//
+// replacing the three-dispatch chain ADD -> UNARY(SOFTPLUS) -> MUL. dt (ssm_dt, the bias)
+// and a (ssm_a, = -A_log.exp()) are one value per value-head, broadcast over every row of
+// alpha; alpha and out are [ne0, n_tokens] (ne0 = num_v_heads).
+//
+// Exactness. The three steps are evaluated in the order and at the precision the unfused
+// chain evaluates them:
+//   1. add.comp        FLOAT_TYPE(data_a) + FLOAT_TYPE(data_b), stored as f32
+//   2. unary.comp      op_softplus(x) = (x > 20.0f) ? x : log(1.0f + exp(x)), stored as f32
+//   3. mul.comp        a * b, stored as f32
+// Every operand and every intermediate is f32, so the two stores this shader elides round
+// nothing away, and each statement below rounds exactly where the corresponding dispatch
+// rounded. Nothing here can be contracted into an FMA either: a fused multiply-add needs a
+// multiply feeding an add, and the only multiply in the chain is the final one, whose result
+// goes straight to memory.
+//
+// op_softplus is character-for-character the unary.comp function, and it lives in a function
+// of its own for the same reason hc_combine.comp isolates its sigmoid: a `precise`/
+// NoContraction decoration propagated backwards through an expression tree can change how
+// glslang lowers the transcendentals, and a function boundary stops that propagation. There
+// is no `precise` in this shader, but keeping the shape identical to unary.comp keeps the
+// generated code identical too.
+layout (binding = 0) readonly  buffer A {float data_a[];};   // alpha [ne0, nrows] contiguous f32
+layout (binding = 1) readonly  buffer B {float data_b[];};   // dt    [ne0]        contiguous f32
+layout (binding = 2) readonly  buffer C {float data_c[];};   // a     [ne0]        contiguous f32
+layout (binding = 3) writeonly buffer D {float data_d[];};   // out   [ne0, nrows] contiguous f32
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint32_t ne0;   // elements per row (num_v_heads)
+    uint32_t ne;    // total elements = ne0 * nrows
+} p;
+
+// UNARY(SOFTPLUS) exactly as unary.comp defines it
+float op_softplus(float x) {
+    return (x > 20.0f) ? x : log(1.0f + exp(x));
+}
+
+void main() {
+    const uint32_t idx = gl_GlobalInvocationID.x;
+
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const uint32_t i0 = fastmod(idx, p.ne0);
+
+    const float biased = data_a[idx] + data_b[i0];   // ADD
+    const float sp     = op_softplus(biased);        // UNARY(SOFTPLUS)
+
+    data_d[idx] = sp * data_c[i0];                   // MUL
+}

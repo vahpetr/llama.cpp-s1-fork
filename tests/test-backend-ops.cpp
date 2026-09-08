@@ -3946,6 +3946,61 @@ struct test_hc_combine_fuse : public test_case {
     }
 };
 
+// Fused Gated-DeltaNet decay pre-chain (qwen4exp build_layer_attn_linear):
+//   ADD(alpha, ssm_dt) -> UNARY(SOFTPLUS) -> MUL(., ssm_a)
+// Production geometry is nh = num_v_heads = 48 over the draft-length token range.
+// With extra_consumer the softplus feeds a second op, which must veto the fusion and
+// fall back to the three-dispatch chain.
+struct test_add_softplus_mul_fuse : public test_case {
+    const int64_t nh;
+    const int64_t n_tokens;
+    const int64_t n_seqs;
+    const bool    extra_consumer;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_SOFTPLUS_MUL_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(nh, n_tokens, n_seqs, extra_consumer);
+    }
+
+    test_add_softplus_mul_fuse(int64_t nh = 48, int64_t n_tokens = 5, int64_t n_seqs = 1, bool extra_consumer = false)
+        : nh(nh), n_tokens(n_tokens), n_seqs(n_seqs), extra_consumer(extra_consumer) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * alpha = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nh, n_tokens, n_seqs);
+        ggml_set_name(alpha, "alpha");
+
+        ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+        ggml_set_name(dt, "dt");
+
+        ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * softplus = ggml_softplus(ctx, ggml_add(ctx, alpha, dt));
+        ggml_tensor * out      = ggml_mul(ctx, softplus, a);
+
+        if (extra_consumer) {
+            out = ggml_add(ctx, out, softplus);
+        }
+
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            // alpha + dt has to cross the x > 20 branch of op_softplus in both directions
+            const bool wide = std::string(ggml_get_name(t)) == "alpha";
+            init_tensor_uniform(t, wide ? -30.0f : -2.0f, wide ? 30.0f : 2.0f);
+        }
+    }
+};
+
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -8446,6 +8501,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_combine_fuse(1, 4, 5));       // degenerate row
     test_cases.emplace_back(new test_hc_combine_fuse(2560, 1, 5));    // hc == 1
     test_cases.emplace_back(new test_hc_combine_fuse(257, 3, 7));     // all primes
+
+    // qwen4exp Gated-DeltaNet decay pre-chain fusion, at the production geometry
+    // (num_v_heads 48) over the draft-length range, plus off-geometry shapes and the
+    // veto case where the softplus has a second consumer
+    for (int64_t nt : { 1, 2, 3, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_add_softplus_mul_fuse(48, nt, 1));
+    }
+    test_cases.emplace_back(new test_add_softplus_mul_fuse(48, 2048, 1));      // prefill ubatch
+    test_cases.emplace_back(new test_add_softplus_mul_fuse(48, 5, 4));         // n_seqs > 1
+    test_cases.emplace_back(new test_add_softplus_mul_fuse(1, 5, 1));          // degenerate row
+    test_cases.emplace_back(new test_add_softplus_mul_fuse(31, 17, 1));        // non-power-of-two row
+    test_cases.emplace_back(new test_add_softplus_mul_fuse(257, 7, 3));        // all primes
+    test_cases.emplace_back(new test_add_softplus_mul_fuse(48, 5, 1, true));   // extra consumer: no fusion
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
