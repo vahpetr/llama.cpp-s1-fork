@@ -2351,14 +2351,18 @@ struct llama_model_qwen4exp : public llama_model_base {
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 
-        // QSA: token indices this layer's queries may attend to, or nullptr for dense
+        // QSA: token indices this layer's queries may attend to, or nullptr for dense.
+        // cache_only writes this ubatch's indexer keys and returns nullptr: the caller then runs
+        // the dense build_attn() but the indexer K cache stays complete, so the very next ubatch
+        // that is NOT exhaustive can select over a full history [TAG_QSA_BYPASS_EXHAUSTIVE].
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il);
+                            int   il,
+                           bool   cache_only);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

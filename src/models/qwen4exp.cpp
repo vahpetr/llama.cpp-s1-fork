@@ -494,6 +494,32 @@ static bool qwen4exp_ple_hoist_enabled() {
     return enabled;
 }
 
+// [TAG_QSA_BYPASS_EXHAUSTIVE] (M1.1, triage row T12)
+//
+// The indexer budget is width = min(n_kv, indexer_top_k + r - 1). When that clamps to n_kv the
+// selection is provably exhaustive - ggml_top_k(expanded, n_kv) returns every column, so QSA is
+// mathematically the dense attention, computed through ~40 extra nodes per layer, a second KV
+// write, a top-k over the whole window and a rebuilt KQ mask. Below the budget the two arms must
+// therefore be byte-identical, and on the v19-qsa prototype they were not (T1) - while short-context
+// decode also fell 60.4 -> 50.4 t/s for a selection that selects everything.
+//
+// With this on, an exhaustive layer still writes its indexer K cache (so the history stays complete
+// for the first ubatch that IS above budget) but calls the dense build_attn(). That makes the
+// below-budget identity a property of the graph rather than of the arithmetic, and it removes the
+// short-context regression.
+//
+// Default ON. LLAMA_QSA_BYPASS_EXHAUSTIVE=0 keeps the full QSA graph at every depth, which is what
+// the M0/M1 divergence diagnosis has to run with: the bypass may ship, the diagnosis must be proven
+// without it (gate M1).
+static bool qwen4exp_qsa_bypass_exhaustive() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_BYPASS_EXHAUSTIVE");
+        return s == nullptr || atoi(s) != 0;
+    }();
+
+    return enabled;
+}
+
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     // [TAG_PLE_HOIST] before anything else touches gf: the CPU-resident PLE gather has to be the
@@ -953,12 +979,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool cache_only = false) :
+        mctx(mctx), ratio(ratio), blk_bias(blk_bias), cache_only(cache_only) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+
+        // [TAG_QSA_BYPASS_EXHAUSTIVE] cache-only: nothing but the indexer K write is in the graph,
+        // so skip the O(n_kv) host-side block census entirely
+        if (cache_only) {
+            return;
+        }
+
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
     }
 
@@ -979,6 +1012,15 @@ public:
         res &= params.ubatch.n_tokens % n_stream == 0;
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
+
+        if (cache_only) {
+            // the bypass decision itself depends on n_kv, so a graph built for the exhaustive
+            // regime must not be reused once the window has grown past the budget
+            res &= (int64_t) std::min<int64_t>(n_kv, (int64_t) bypass_top_k + (int64_t) ratio - 1) == n_kv;
+
+            return res;
+        }
+
         res &= cell_blk->ne[0]  == n_kv;
         res &= cell_blk->ne[1]  == n_stream;
         res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
@@ -1001,6 +1043,12 @@ public:
 
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
+
+    // [TAG_QSA_BYPASS_EXHAUSTIVE] only k_idxs is live; cell_blk/blk_cells/blk_pos/bias are nullptr
+    const bool cache_only;
+
+    // hparams.indexer_top_k, copied so can_reuse() can re-evaluate the bypass condition
+    uint32_t bypass_top_k = 0;
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -1009,7 +1057,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_tensor *                           inp_pos,
         ggml_tensor *                           kq_mask,
         int *                                   sections,
-        int                                     il) {
+        int                                     il,
+        bool                                    cache_only) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
     const int64_t idx_dim  = hparams.indexer_head_size;
@@ -1041,19 +1090,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     const auto it = qsa_inps.find((uint32_t) r);
     if (it != qsa_inps.end()) {
         inp = it->second;
+
+        // every layer sharing a ratio also shares the exhaustive/not decision (it is a function of
+        // n_kv and r alone), so a cached input set can never be the wrong kind
+        GGML_ASSERT(inp->cache_only == cache_only);
     } else {
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, cache_only);
 
-        qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
-        qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        qsa->k_idxs        = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+        qsa->bypass_top_k  = hparams.indexer_top_k;
 
-        ggml_set_input(qsa->cell_blk);
-        ggml_set_input(qsa->blk_cells);
-        ggml_set_input(qsa->blk_pos);
-        ggml_set_input(qsa->bias);
+        // [TAG_QSA_BYPASS_EXHAUSTIVE] cache-only needs the K write and nothing else: skipping the
+        // four layout inputs also drops their device buffers and their host-side fill
+        if (!cache_only) {
+            qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+            qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+            qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+            qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+
+            ggml_set_input(qsa->cell_blk);
+            ggml_set_input(qsa->blk_cells);
+            ggml_set_input(qsa->blk_pos);
+            ggml_set_input(qsa->bias);
+        }
 
         inp = qsa.get();
         res->add_input(std::move(qsa));
@@ -1066,6 +1125,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     cb(k_raw, "indexer_k_raw", il);
 
     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il));
+
+    // [TAG_QSA_BYPASS_EXHAUSTIVE] the selection would name every cell; the caller runs dense
+    // attention instead, and the indexer cache above stays complete for the batches that follow
+    if (cache_only) {
+        return nullptr;
+    }
 
     // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
@@ -1330,10 +1395,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // [TAG_QSA_RATIO_OVERRIDE] --qsa-ratio 0 forces dense even for a GGUF that carries ratios;
     // --qsa-ratio N > 0 forces sparse wherever the indexer cache exists. get_idx() is itself
     // allocated from the same effective ratios (llama-model.cpp [TAG_QSA_DEAD_IDX_CACHE]).
-    const bool qsa = mctx_hyb->get_idx() != nullptr &&
-                     llama_hparams_qsa_ratio(hparams, cparams.qsa_ratio, (uint32_t) il) > 0;
+    const uint32_t qsa_ratio = llama_hparams_qsa_ratio(hparams, cparams.qsa_ratio, (uint32_t) il);
 
-    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
+    const bool qsa = mctx_hyb->get_idx() != nullptr && qsa_ratio > 0;
+
+    // [TAG_QSA_BYPASS_EXHAUSTIVE] width == n_kv means ggml_top_k() returns every column: the
+    // selection is exhaustive and QSA is the dense attention with ~40 extra nodes per layer.
+    // Keep the indexer K write (cache_only), run the dense build_attn().
+    bool qsa_exhaustive = false;
+
+    if (qsa && qwen4exp_qsa_bypass_exhaustive()) {
+        // same expression as build_qsa_top_k()'s `width`, over the same n_kv
+        const int64_t n_kv_idx = mctx_hyb->get_idx()->get_n_kv();
+        const int64_t width    = std::min<int64_t>(n_kv_idx, (int64_t) hparams.indexer_top_k + (int64_t) qsa_ratio - 1);
+
+        qsa_exhaustive = width == n_kv_idx;
+    }
+
+    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, qsa_exhaustive) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
