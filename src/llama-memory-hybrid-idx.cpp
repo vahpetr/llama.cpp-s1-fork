@@ -310,8 +310,15 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
     // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
     ns_ubatch(mem->get_mem_idx() == nullptr ?
         std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
+    // [TAG_KV_GRAPH_SPAN] init_full(), not the llama_kv_cache_context constructor: the attention side
+    // goes through llama_kv_cache::init_full() (llama_memory_hybrid_context above), which applies the
+    // n_kv_reserve_max cap. Constructing this one directly would default n_kv_span to 0 == "the whole
+    // cache", so with the cap set the indexer would report a wider span than the attention cache and
+    // qwen4exp's "the indexer cache must track the attention cache cell for cell" assertion would abort
+    // graph construction. set_n_kv_reserve_max is forwarded to mem_idx and the padding rule is the same
+    // on both caches, so the two spans stay equal with the cap on and with it off.
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx())) {}
+        mem->get_mem_idx()->init_full()) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
