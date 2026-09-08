@@ -2478,10 +2478,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             // when hparams.dsv4_compress_ratios[il] > 0. A GGUF that carries the indexer
                             // tensors but leaves the ratio array all-zero (any converter other than
                             // conversion/qwen4exp.py) therefore never touches the cache -- do not allocate it.
-                            const bool has_qsa = std::any_of(
-                                    hparams.dsv4_compress_ratios.begin(),
-                                    hparams.dsv4_compress_ratios.begin() + hparams.n_layer(),
-                                    [](uint32_t r) { return r > 0; });
+                            // [TAG_QSA_RATIO_OVERRIDE] the context-level --qsa-ratio override decides
+                            // this the same way build_layer_attn() does, so "all ratios are zero =>
+                            // no indexer cache" stays consistent with "no layer runs QSA": ratio 0
+                            // forces dense and skips the cache, ratio N > 0 allocates it even for a
+                            // GGUF whose ratio array is all-zero.
+                            const bool has_qsa = llama_hparams_qsa_any(hparams, cparams.qsa_ratio);
 
                             if (has_qsa) {
                                 // QSA runs on the dense-attention layers only
@@ -2489,8 +2491,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     return il < hparams.n_layer() && !hparams.is_recr(il);
                                 };
                             } else {
-                                LLAMA_LOG_INFO("%s: qwen4exp: all compress ratios are zero - sparse attention is off, "
-                                        "skipping the indexer KV cache\n", __func__);
+                                LLAMA_LOG_INFO("%s: qwen4exp: all effective compress ratios are zero - sparse attention "
+                                        "is off, skipping the indexer KV cache\n", __func__);
                             }
                         }
                     }

@@ -431,6 +431,18 @@ extern "C" {
         // NOTE: appended at the end of the struct on purpose - inserting a field in the middle
         //       silently shifts every following member for positional initialisers
         uint32_t kv_graph_span;
+
+        // [TAG_QSA_RATIO_OVERRIDE] [EXPERIMENTAL]
+        // context-level override of the per-layer QSA compression ratios read from the GGUF
+        // (qwen4exp.attention.compress_ratios -> hparams.dsv4_compress_ratios):
+        //   < 0 : use the GGUF value (default, pre-existing behaviour)
+        //  == 0 : force dense attention on every full-attention layer, even if the GGUF has ratios
+        //   > 0 : use this ratio on every full-attention layer of a model that carries an indexer
+        // Applied before the memory is created, so the indexer KV cache follows the override and
+        // one GGUF can serve both the dense and the QSA arm - and one process can hold a dense and
+        // a QSA context of the same model at the same time.
+        // NOTE: appended at the end of the struct on purpose - see the note above.
+        int32_t qsa_ratio;
     };
 
     struct llama_model_tensor_override {

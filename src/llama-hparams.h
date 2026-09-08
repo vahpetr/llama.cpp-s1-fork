@@ -479,3 +479,33 @@ struct llama_hparams {
 };
 
 static_assert(std::is_trivially_copyable<llama_hparams>::value, "llama_hparams must be trivially copyable");
+
+// [TAG_QSA_RATIO_OVERRIDE]
+// Effective QSA compression ratio of layer `il` under a context-level override
+// (llama_context_params::qsa_ratio, mirrored into llama_cparams::qsa_ratio):
+//   ratio_override <  0 : the GGUF value (default)
+//   ratio_override == 0 : 0 on every layer - dense attention even when the GGUF carries ratios
+//   ratio_override >  0 : the override on every full-attention layer of a model that has an
+//                         indexer; recurrent layers and models without indexer tensors stay at 0
+// Kept as a free function (not a member) because llama_hparams must stay trivially copyable and
+// the override does not belong to the model - two contexts of the same model may disagree on it.
+static inline uint32_t llama_hparams_qsa_ratio(const llama_hparams & hparams, int32_t ratio_override, uint32_t il) {
+    if (ratio_override < 0) {
+        return hparams.dsv4_compress_ratios[il];
+    }
+    if (ratio_override == 0 || hparams.indexer_head_size == 0 || il >= hparams.n_layer() || hparams.is_recr(il)) {
+        return 0;
+    }
+    return (uint32_t) ratio_override;
+}
+
+// true when at least one layer ends up with a positive effective ratio, i.e. the indexer KV cache
+// is actually needed - see [TAG_QSA_DEAD_IDX_CACHE] in llama-model.cpp
+static inline bool llama_hparams_qsa_any(const llama_hparams & hparams, int32_t ratio_override) {
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (llama_hparams_qsa_ratio(hparams, ratio_override, il) > 0) {
+            return true;
+        }
+    }
+    return false;
+}

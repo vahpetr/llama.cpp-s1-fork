@@ -1761,6 +1761,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.kv_graph_span     = (uint32_t) std::max(params.kv_graph_span, 0);
+    cparams.qsa_ratio         = params.qsa_ratio; // [TAG_QSA_RATIO_OVERRIDE]
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

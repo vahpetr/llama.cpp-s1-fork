@@ -1741,6 +1741,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_GRAPH_SPAN"));
     add_opt(common_arg(
+        {"--qsa-ratio"}, "N",
+        string_format("[TAG_QSA_RATIO_OVERRIDE] override the per-layer Qwen sparse-attention compression ratios read "
+            "from the GGUF (qwen4exp.attention.compress_ratios). -1 = use the GGUF value (default), 0 = force dense "
+            "attention on every full-attention layer even when the GGUF has ratios, N > 0 = force ratio N on every "
+            "full-attention layer of a model that carries indexer tensors. Applied at context creation, before the "
+            "indexer KV cache is sized, so one GGUF serves both the dense and the QSA arm (default: %d)",
+            params.qsa_ratio),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("--qsa-ratio must be >= -1");
+            }
+            params.qsa_ratio = value;
+        }
+    ).set_env("LLAMA_ARG_QSA_RATIO"));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

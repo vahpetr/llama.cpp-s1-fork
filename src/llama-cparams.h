@@ -17,6 +17,7 @@ struct llama_cparams {
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
     uint32_t kv_graph_span;   // cap on the KV span used for the worst-case graph reserve (0 = full KV size)
+    int32_t  qsa_ratio;       // [TAG_QSA_RATIO_OVERRIDE] -1 = use the GGUF ratios, 0 = force dense, N > 0 = force ratio N
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
 

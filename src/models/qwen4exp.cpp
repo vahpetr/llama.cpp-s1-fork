@@ -1014,7 +1014,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     const int64_t idx_dim  = hparams.indexer_head_size;
     const int64_t n_idx_h  = hparams.indexer_n_head;
-    const int64_t r        = hparams.dsv4_compress_ratios[il];
+    // [TAG_QSA_RATIO_OVERRIDE] the context override wins over the GGUF value
+    const int64_t r        = llama_hparams_qsa_ratio(hparams, cparams.qsa_ratio, (uint32_t) il);
     const int64_t n_kv     = mctx_idx->get_n_kv();
 
     GGML_ASSERT(r > 0);
@@ -1326,7 +1327,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
-    const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    // [TAG_QSA_RATIO_OVERRIDE] --qsa-ratio 0 forces dense even for a GGUF that carries ratios;
+    // --qsa-ratio N > 0 forces sparse wherever the indexer cache exists. get_idx() is itself
+    // allocated from the same effective ratios (llama-model.cpp [TAG_QSA_DEAD_IDX_CACHE]).
+    const bool qsa = mctx_hyb->get_idx() != nullptr &&
+                     llama_hparams_qsa_ratio(hparams, cparams.qsa_ratio, (uint32_t) il) > 0;
 
     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
 

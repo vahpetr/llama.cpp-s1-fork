@@ -294,6 +294,11 @@ llama_context::llama_context(
     // [TAG_KV_GRAPH_SPAN] cap for the worst-case graph reserve only - see llama_kv_cache::init_full()
     cparams.kv_graph_span = params.kv_graph_span;
 
+    // [TAG_QSA_RATIO_OVERRIDE] must be set before create_memory() below: the indexer KV cache is
+    // allocated from the *effective* ratios, so a forced-dense context must not allocate it and a
+    // forced-QSA context must
+    cparams.qsa_ratio = params.qsa_ratio;
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -362,6 +367,12 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
     LLAMA_LOG_INFO("%s: kv_graph_span         = %u%s\n", __func__, cparams.kv_graph_span,
             cparams.kv_graph_span == 0 ? " (full KV size)" : " (worst-case graph reserve only)");
+    if (hparams.indexer_head_size > 0) {
+        // [TAG_QSA_RATIO_OVERRIDE]
+        LLAMA_LOG_INFO("%s: qsa_ratio             = %d%s\n", __func__, cparams.qsa_ratio,
+                cparams.qsa_ratio < 0  ? " (from the GGUF)" :
+                cparams.qsa_ratio == 0 ? " (forced dense)"  : " (forced sparse)");
+    }
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
         LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
@@ -3738,6 +3749,7 @@ llama_context_params llama_context_default_params() {
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
         /*.kv_graph_span               =*/ 0,
+        /*.qsa_ratio                   =*/ -1,
     };
 
     return result;
