@@ -410,6 +410,19 @@ static constexpr uint32_t vk_count_experts_max_experts = 512;
 static_assert(vk_count_experts_max_experts >= vk_count_experts_block_size,
         "count_experts.comp needs vals[] >= BLOCK_SIZE");
 
+// [TAG_MMID_ROWS_EST] mul_mat_id tile selection from the expected rows per expert.
+// Smallest nei1 at which the rows-per-expert estimate replaces nei1 in the tile heuristic.  The
+// estimate is an average over n_as experts, so it only says something useful once the batch is
+// large enough for the routing to average out; below this, every shape keeps today's behaviour.
+// (nei1 <= 8 never reaches this path at all - ggml_vk_use_mul_mat_vec_id takes those.)
+static constexpr uint32_t vk_mmid_rows_est_min_nei1 = 64;
+// The estimate may only downgrade the large tile to the medium one, never to the small one: at
+// these row counts the 32x32 tile issues the same padded FLOPs as the 64x64 one (40 rows ->
+// ceil(40/32) = 2 tiles of 32 columns vs 1 tile of 64) while quadrupling the workgroup launches,
+// because the grid is { m, nei1, n_as } and every halving of BM/BN costs 4x the launches.  33 is
+// the smallest value that cannot select `s` through the heuristic's `n <= 32` test.
+static constexpr uint32_t vk_mmid_rows_est_floor = 33;
+
 enum vk_device_architecture {
     OTHER,
     AMD_GCN,
@@ -10493,10 +10506,40 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, nei1, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
+    // [TAG_MMID_ROWS_EST] MOE-2 / G7.  ggml_vk_guess_matmul_id_pipeline's `n` means "how many
+    // columns of the N-tile will actually be filled".  For mul_mat_id that is *not* nei1: the
+    // dispatch is one (M-tile, N-tile) grid per expert and each of the n_as experts only receives
+    // the rows routed to it, on average
+    //     n_eff = ceil(nei0 * nei1 / n_as)
+    // = 40 for Qwen3.8-Flash-Next at n_as 512 / top-10 / 2048 tokens, where nei1 = 2048 always
+    // selects the large BM=BN=128 tile.  That tile then computes 128 columns to keep 40, i.e. 3.2x
+    // the useful FLOPs, while the medium 64x64 tile has identical A traffic (a whole expert weight
+    // matrix is streamed once per N-tile either way, and there is still one N-tile per expert) and
+    // roughly 2x fewer tile FLOPs.
+    //
+    // The estimate steers the *tile shape* only; it is not a bound and correctness does not depend
+    // on it.  A skewed router can give one expert up to nei1 rows: the grid still covers
+    // ceil(nei1 / BN) N-tiles per expert and mul_mm{,q,_cm2}.comp still early-outs on
+    // data_expert_count[expert_idx], so a hot expert simply runs more of them.
+    //
+    // Guarded on n_as > 1 (with a single expert nei1 *is* the fill) and on a minimum nei1, and
+    // floored so it can only downgrade l -> m (see vk_mmid_rows_est_floor).  Note the cost side:
+    // the grid is { m, nei1, n_as }, so halving BM and BN launches 4x the workgroups, of which the
+    // extra ones exit immediately on the early-out - which is why this is a measurement, not a
+    // free win, and why it is switchable in one image.
+    // A/B knob: GGML_VK_MMID_ROWS_EST=0 restores the nei1 heuristic.
+    // Value-parsed, not a presence test - see ggml_vk_env_bool [TAG_ENV_BOOL].
+    static const bool mmid_rows_est = ggml_vk_env_bool("GGML_VK_MMID_ROWS_EST", true);
+    uint32_t n_tile_guess = (uint32_t)nei1;
+    if (mmid_rows_est && n_as > 1 && nei1 >= vk_mmid_rows_est_min_nei1) {
+        const uint64_t rows_per_expert = CEIL_DIV(nei0 * nei1, n_as);
+        n_tile_guess = (uint32_t)std::min<uint64_t>(nei1, std::max<uint64_t>(rows_per_expert, vk_mmid_rows_est_floor));
+    }
+
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, n_tile_guess, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, n_tile_guess, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
