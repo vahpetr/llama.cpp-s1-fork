@@ -3952,6 +3952,29 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 // hsk == hsv == 256 anyway.
 static constexpr uint32_t fa_cm1_block_rows_min = 16;
 static constexpr uint32_t fa_cm1_block_rows_max = 32;
+
+// [TAG_FA_CM1_BC] Bc for the coopmat1 shader.  The shader's structure fixes it: each of the
+// row_split subgroups owns exactly MatBc == 16 KV columns of the tile (the QK^T coopMatStore
+// and the K coopMatLoad are both indexed by gl_SubgroupID * MatBc), so
+//
+//     Bc == 16 * row_split,   and   workgroup_size == row_split * subgroup_size
+//
+// the latter because the softmax closes each row with subgroupMax over the lanes of one row
+// group, which is only a per-row reduction if a row group is exactly a subgroup.  Together
+// those give cols_per_thread == Bc / subgroup_size, so *Bc < subgroup_size does not exist*:
+// at Bc = 32 on a wave64 part every softmax loop would run zero iterations.
+//
+// Hence 64 is the only Bc this shader can take on gfx1151 (RADV, wave64) and 32 is offered
+// only where subgroups are 32 wide.  The narrow variant would not buy occupancy anyway: at
+// HSK = HSV = 256, f32acc, (Br, Bc) = (32, 32) is 29 880 B against (32, 64)'s 46 816 B, but
+// its workgroup is also half the size (2 subgroups), so a 128 KiB WGP holds 4 x 2 waves
+// instead of 2 x 4 - the same 8 waves - while halving Bc doubles the number of KV tiles, and
+// with it the ~13 barriers per tile that the wide tile is already struggling to hide.  What it
+// would buy is 4 independent workgroups to interleave instead of 2.  It also multiplies
+// rows_per_thread by 2 and d_per_thread by 2 (16 x 2 vec4 accumulators against 8 x 1), which
+// on this part is a spill.  Kept selectable, and off by default, on that basis.
+static constexpr uint32_t fa_cm1_block_cols_min = 32;
+static constexpr uint32_t fa_cm1_block_cols_max = 64;
 // [TAG_FA_CM1_BR_GATE] A batch this size or larger is a *real prefill*, and the only shape
 // the wide tile is offered to.
 //
@@ -3985,8 +4008,9 @@ static constexpr uint32_t fa_cm1_block_rows_32_min_n = 512;
 // i.e. every column lands on the same bank and the scan serialises 32 ways per half-wave.
 // One extra vec4 makes the stride 36 words -> 8 banks, a 4x shorter conflict, for Bc * 16 B
 // (1 KiB at Bc = 64) of shared memory - which changes no occupancy bracket either way: at
-// HSK = HSV = 256 the wide tile goes 46 816 -> 47 840 B, and both sit in the same
-// (128 KiB / 3, 128 KiB / 2] band, i.e. 2 workgroups per WGP.
+// HSK = HSV = 256 the wide tile goes 46 816 -> 47 840 B, and both sit in the same band whether
+// the driver allocates from a 128 KiB WGP pool ((128/3, 128/2] KiB: 2 workgroups) or a 64 KiB
+// CU pool ((64/2, 64] KiB: 1 workgroup).
 //
 // Only for Br > 16: at the historical tile the flag is never set, so those pipelines keep the
 // exact shared-memory layout (and SPIR-V) they have always had. Purely an addressing change -
@@ -4007,17 +4031,7 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
 
     const uint32_t coopmat_block_cols = 16;
 
-    const uint32_t num_subgroups = 4;
-
-    result.block_cols = coopmat_block_cols * num_subgroups;
-    result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
-    result.workgroup_size = num_subgroups * result.subgroup_size;
-
-    const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
-    result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
-
-    result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
 
     // A coopmat1 workgroup streams the whole K and V of its KV head once per Br query rows, so
     // at prefill shapes this kernel's arithmetic intensity is proportional to Br and it runs at
@@ -4044,12 +4058,53 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
         block_rows = (fa_cm1_br_env >= fa_cm1_block_rows_max) ? fa_cm1_block_rows_max : fa_cm1_block_rows_min;
     }
 
-    result.block_rows = block_rows;
+    // Bc == 16 * row_split, so this also picks the workgroup width.  Auto is always the wide
+    // Bc: it is the only one this shader can express at subgroup_size 64, and where it can be
+    // expressed the narrow one costs more than it saves ([TAG_FA_CM1_BC]).  The knob is scoped
+    // to the wide *row* tile so that turning it on cannot perturb decode dispatches, which are
+    // pinned to Br = 16 and Bc = 64 whatever this says.  Values other than 32 round down to 32
+    // and anything >= 64 rounds to 64, see [TAG_ENV_UINT].
+    static const uint32_t fa_cm1_bc_env = ggml_vk_env_uint("GGML_VK_FA_CM1_BC", 0, 0, fa_cm1_block_cols_max);
+
+    uint32_t block_cols = fa_cm1_block_cols_max;
+    if (fa_cm1_bc_env != 0 && block_rows > fa_cm1_block_rows_min) {
+        const uint32_t want = (fa_cm1_bc_env >= fa_cm1_block_cols_max) ? fa_cm1_block_cols_max : fa_cm1_block_cols_min;
+        if (want >= result.subgroup_size) {
+            block_cols = want;
+        } else {
+            // cols_per_thread would be 0: every per-row softmax loop in the shader would run
+            // zero iterations and the result would be silently wrong, so refuse rather than
+            // build it.  See [TAG_FA_CM1_BC].
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                GGML_LOG_WARN("ggml_vulkan: ignoring GGML_VK_FA_CM1_BC=%u, the coopmat1 shader needs Bc >= subgroup size (%u)\n",
+                              want, result.subgroup_size);
+            }
+        }
+    }
+
+    const uint32_t num_subgroups = block_cols / coopmat_block_cols;
+
+    result.block_rows    = block_rows;
+    result.block_cols    = block_cols;
+    result.row_split     = num_subgroups;
+    result.workgroup_size = num_subgroups * result.subgroup_size;
+
+    const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
+    result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
+
+    result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
+
     if (block_rows > fa_cm1_block_rows_min &&
         !ggml_vk_flash_attn_coopmat_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
-        // Fall back to the one-tile shape rather than let get_fa_tuning_params drop the whole
-        // op to the scalar path over a tile choice.
-        result.block_rows = fa_cm1_block_rows_min;
+        // Fall back to the historical shape whole rather than let get_fa_tuning_params drop the
+        // op to the scalar path over a tile choice.  Bc goes back with Br: the narrow Bc only
+        // exists as part of the wide-tile variant, and (16, 32) is a shape nothing asks for.
+        result.block_rows     = fa_cm1_block_rows_min;
+        result.block_cols     = fa_cm1_block_cols_max;
+        result.row_split      = fa_cm1_block_cols_max / coopmat_block_cols;
+        result.workgroup_size = result.row_split * result.subgroup_size;
     }
 
     return result;
@@ -11143,15 +11198,32 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
     return supported;
 }
 
+// Byte-for-byte model of flash_attn_cm1.comp's shared declarations.  Needs to be kept up to
+// date on shader changes.  At the production shape (hsk == hsv == 256, f32acc, no staging) the
+// implemented (Br, Bc) variants come out as:
+//
+//     (16, 64)            28 056 B   the historical tile
+//     (32, 64)            46 816 B   the wide tile ([TAG_FA_CM1_BR])
+//     (32, 64) + SF_PAD   47 840 B   the wide tile, bank-padded ([TAG_FA_CM1_SF_PAD])
+//     (32, 32)            29 880 B   narrow-Bc wide tile, subgroup_size <= 32 only
+//     (32, 32) + SF_PAD   30 392 B     ([TAG_FA_CM1_BC] - not expressible on wave64)
+//
+// against a 65 536 B per-workgroup limit.  What actually costs the wide tile its performance is
+// not that limit - every variant is far inside it - but how many workgroups fit in the LDS
+// pool: 4, 2, 2, 4, 4 per 128 KiB WGP, or 2, 1, 1, 2, 2 per 64 KiB CU.  The ratio is the same
+// whichever mode the driver picks, and it is halved by the wide tile and unchanged by the
+// padding.
 static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type) {
     GGML_UNUSED(v_type);
-    // Needs to be kept up to date on shader changes
     const uint32_t Br = params.block_rows;
     const uint32_t Bc = params.block_cols;
 
     const uint32_t MatBr = 16, MatBc = 16;
 
+    // The shader's row_split is the subgroup count and Bc is 16 columns per subgroup, so these
+    // are the same number; see [TAG_FA_CM1_BC].
     const uint32_t row_split = Bc / MatBc;
+    GGML_ASSERT(params.row_split == row_split);
     // Br query rows are covered as row_tiles coopmat tiles of MatBr rows, see
     // [TAG_FA_CM1_ROW_TILES] in flash_attn_cm1.comp.
     const uint32_t row_tiles = Br / MatBr;
