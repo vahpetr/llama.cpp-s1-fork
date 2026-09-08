@@ -11052,6 +11052,9 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t MatBr = 16, MatBc = 16;
 
     const uint32_t row_split = Bc / MatBc;
+    // Br query rows are covered as row_tiles coopmat tiles of MatBr rows, see
+    // [TAG_FA_CM1_ROW_TILES] in flash_attn_cm1.comp.
+    const uint32_t row_tiles = Br / MatBr;
 
     const uint32_t hsk_pad = ROUNDUP_POW2(hsk, 16);
     const uint32_t hsv_pad = ROUNDUP_POW2(hsv, 16);
@@ -11080,15 +11083,16 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     // (no bf16 accumulator support), so pvsh is vec4 (16 bytes) in those cases.
     const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16 || f32acc) ? 16u : f16vec4;
     const uint32_t osh_stride = params.row_split * MatBr / 4;
-    const uint32_t pvsh = MatBc * osh_stride * pvsh_elem_size;
+    // pvsh's first index is a query row of the Br tile, so it holds row_tiles coopmat tiles.
+    const uint32_t pvsh = Br * osh_stride * pvsh_elem_size;
 
     const uint32_t slope = Br * acctype;
 
-    // p_dead[Bc] + any_dead (the ZERO_DEAD_V mask-suppressed-column flags, DEADV_LDS path)
-    // plus p_dead_sg[row_split * dead_words] (the per-subgroup column masks of the default,
-    // register-reduced path)
+    // The ZERO_DEAD_V mask-suppressed-column masks: p_dead_sg[row_split * dead_words] (the
+    // per-row-group masks of the default, register-reduced path) plus
+    // p_dead_lds[row_tiles * dead_words] (the DEADV_LDS A/B path's per-row-tile masks).
     const uint32_t dead_words = (Bc + 31) / 32;
-    const uint32_t dead = (Bc + 1 + row_split * dead_words) * (uint32_t) sizeof(uint32_t);
+    const uint32_t dead = (row_split + row_tiles) * dead_words * (uint32_t) sizeof(uint32_t);
 
     const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + dead;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
