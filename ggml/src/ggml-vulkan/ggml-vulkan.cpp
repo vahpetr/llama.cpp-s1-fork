@@ -9248,6 +9248,31 @@ static void ggml_vk_matmul_id(
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
                                               nei0, nei1, nbi1, ne11, padded_n, n_as, uint32_t(hoist_row_ids) };
+    // [TAG_MMID_ROWS_EST] One (M-tile, N-tile) pair per expert.  Only ceil(count_e / BN) of the
+    // ceil(nei1 / BN) N-tiles of expert e have work - 1 of 32 at n_as 512 / nei0 10 / nei1 2048
+    // with BN 64 - so ~97 % of these workgroups exit immediately on mul_mm{,q,_cm2}.comp's
+    // `ic * BN >= data_expert_count[expert_idx]`.  That early-out is one L2-resident load since
+    // #26686, but 47 M launches per pp2048 ubatch is not free, and it is the reason the smaller
+    // tile is a measurement rather than an obvious win.
+    //
+    // The y extent cannot simply be shrunk.  An expert's count is bounded only by nei1 (a token
+    // selects a given expert at most once, so a fully skewed router routes every token to one
+    // expert), and a tile that is never dispatched is a dst row that is never written - an
+    // in-shader early-out cannot recover it.  A `min(nei1, 4 * n_eff)` grid built from the
+    // rows-per-expert *average* would silently drop rows on a skewed batch; it is not a safe bound.
+    //
+    // Two variants that are safe, both follow-ups because both need shader changes:
+    //  1. Flatten (expert, N-tile) into one dimension.  sum_e ceil(count_e / BN) is bounded by
+    //     n_as + nei0 * nei1 / BN, which the *host* can compute: 832 tiles instead of 32 * 512 =
+    //     16 384 at the shape above.  Dispatch that many in y with z = 1 and map gl_WorkGroupID.y
+    //     -> (expert_idx, ic) through a per-expert tile prefix sum that count_experts.comp would
+    //     write alongside the row prefix sum it already computes.  No indirect buffer and no
+    //     barrier changes; costs a search over n_as entries per workgroup in mul_mm.comp,
+    //     mul_mmq.comp and mul_mm_cm2.comp.
+    //  2. Indirect dispatch (MOE-5): count_experts writes a VkDispatchIndirectCommand with
+    //     y = ceil(max_e count_e / BN), which is exact.  Needs eIndirectBuffer usage on
+    //     prealloc_split_k, an eDrawIndirect/eIndirectCommandRead barrier in ggml_vk_sync_buffers,
+    //     and a vkCmdDispatchIndirect path through ggml_vk_dispatch_pipeline.
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
 }
 
