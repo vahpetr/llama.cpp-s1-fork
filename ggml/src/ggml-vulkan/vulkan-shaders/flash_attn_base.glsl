@@ -30,6 +30,14 @@ const bool ZERO_DEAD_V     = (Flags & 16) != 0;
 // original implementation) instead of from the P values that are still in registers.
 // Same predicate either way; this is the A/B knob (GGML_VK_FA_DEADV_LDS).
 const bool DEADV_LDS       = (Flags & 32) != 0;
+// [TAG_FA_GQA_TOKENS] Fold the query tokens into the row dimension on top of the GQA head
+// fold: a Br tile holds rows of the (token, head) product space, decoded as
+// token = r / gqa_ratio, head = iq2 + r % gqa_ratio, instead of one token's gqa_ratio heads.
+// One workgroup then covers ceil(gqa_ratio * n_tokens / Br) tiles' worth of KV passes instead
+// of one pass per token, which is the point: at decode depth this kernel is bound by how many
+// times it streams its KV head.  Rows still index gl_WorkGroupID.x the way the non-gqa path
+// does (i = row tile), and the mask gets a real per-row stride.
+const bool GQA_TOKENS      = (Flags & 64) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -174,8 +182,13 @@ void init_indices()
     N = p.N;
     KV = p.KV;
 
+    // gl_WorkGroupID.x is a query token when a workgroup covers one token's gqa_ratio heads
+    // (the plain GQA fold), and a Br-row tile of the (token, head) row space under GQA_TOKENS,
+    // which is the same layout the non-gqa path uses.  Written out at each site rather than
+    // hoisted into a local so that, with GQA_TOKENS specialized to false, each test is the
+    // "p.gqa_ratio > 1" the compiler saw before.
     if (p.k_num > 1) {
-        if (p.gqa_ratio > 1) {
+        if (!GQA_TOKENS && p.gqa_ratio > 1) {
             i = 0;
             // batch and split_k share gl_WorkGroupID.x
             gqa_iq1 = gl_WorkGroupID.x / p.k_num;
@@ -185,7 +198,7 @@ void init_indices()
             split_k_index = gl_WorkGroupID.x % p.k_num;
             i = gl_WorkGroupID.x / p.k_num;
         }
-    } else if (p.gqa_ratio > 1) {
+    } else if (!GQA_TOKENS && p.gqa_ratio > 1) {
         i = 0;
         gqa_iq1 = gl_WorkGroupID.x;
         split_k_index = 0;
@@ -226,12 +239,33 @@ void init_indices()
     q_stride = p.gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
     k_stride = p.nb11;
     v_stride = p.nb21;
-    // When using grouped query attention, all rows use the same mask (stride 0).
-    // "p.gqa_ratio >> 16" is just a roundabout way of writing zero
-    // that prevents the compiler from folding the "&" through the select
+    // When one workgroup covers one token's heads, all rows use the same mask (stride 0) and
+    // the token is folded into m_offset instead.  "p.gqa_ratio >> 16" is just a roundabout way
+    // of writing zero that prevents the compiler from folding the "&" through the select
     // and breaking the alignment detection.
-    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+    // With GQA_TOKENS the rows are (token, head) pairs, so the mask gets its real row stride
+    // back and fa_mask_row() below turns a row into its token.
+    m_stride = (!GQA_TOKENS && p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
 }
+
+// The mask row of row r of the N-row query space.  Rows past the end of the batch (the padding
+// of the last Br tile) are clamped so the read stays inside the mask; their result is discarded.
+uint32_t fa_mask_row(const in uint32_t r)
+{
+    return GQA_TOKENS ? min(r / p.gqa_ratio, p.nem1 - 1) : r;
+}
+
+// Q row r as a vec4 offset relative to q_offset / 4.  Without GQA_TOKENS this is exactly the
+// expression the callers used to inline; with it, the row carries its own token and head.
+uint32_t fa_q_row_offset4(const in uint32_t r)
+{
+    return GQA_TOKENS ? ((r / p.gqa_ratio) * p.nb01 + (r % p.gqa_ratio) * q_stride) / 4
+                      : r * q_stride / 4;
+}
+
+// The token and the head-within-group of row r.  Only meaningful when GQA_TOKENS is set.
+#define FA_ROW_TOKEN(r) ((r) / p.gqa_ratio)
+#define FA_ROW_HEAD(r)  ((r) % p.gqa_ratio)
 
 // Bias applied to softmax to stay in fp16 range.
 // Based on ggml-cuda issue https://github.com/ggml-org/llama.cpp/issues/18606
