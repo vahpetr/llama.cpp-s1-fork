@@ -4795,7 +4795,11 @@ struct test_mul_mat_hadamard : public test_mul_mat {
 enum mul_mat_id_router {
     MMID_ROUTER_UNIFORM = 0,  // a shuffled permutation of (i % n_mats) per token: counts ~ equal
     MMID_ROUTER_SKEWED  = 1,  // every token also picks expert 0: one expert holds all nei1 rows
-    MMID_ROUTER_SINGLE  = 2,  // every slot of every token picks expert 0: one expert, nei0*nei1 rows
+    MMID_ROUTER_TAIL    = 2,  // every token picks expert 0 in slot 0 and expert n_mats - j in slot j > 0: expert 0
+                              // and the last n_used - 1 experts hold nei1 rows each, the other n_mats - n_used
+                              // are empty. count_e <= nei1 for every expert, which is the most one expert can
+                              // legally take (the legacy Vulkan grid and CUDA assume it); the former
+                              // MMID_ROUTER_SINGLE (nei0*nei1 rows on expert 0) violated it and was dropped.
 };
 
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, int router = MMID_ROUTER_UNIFORM) {
@@ -4821,8 +4825,13 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, int router =
                         }
                     }
                     data[0] = 0;
-                } else if (router == MMID_ROUTER_SINGLE) {
-                    std::fill(data.begin(), data.end(), 0);
+                } else if (router == MMID_ROUTER_TAIL) {
+                    // slot 0 -> expert 0, slot j -> expert n_mats - j: distinct within the row for every
+                    // j < n_mats, so the used view (the leading n_used slots) is always a legal routing
+                    data[0] = 0;
+                    for (int i = 1; i < t->ne[0]; i++) {
+                        data[i] = n_mats - i;
+                    }
                 }
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }
@@ -9602,10 +9611,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     //   m = 128, n = 16   -> small tile;  m = 128, n = 6 is the production verify-round shape, which
     //                                     Vulkan routes to mul_mat_vec_id (ids->ne[1] <= 8) and which
     //                                     must therefore stay unaffected by the compact grid.
-    // The three routers bracket the host-side bound min(n_as, nei0*nei1) + nei0*nei1/BN: uniform is
-    // ~one tile per expert (512 of 672 at n = 2048, BN 128), skewed gives one expert all nei1 rows,
-    // and single puts every one of the nei0*nei1 rows on expert 0 (160 of 672, 511 empty prefixes).
-    for (int router : {MMID_ROUTER_UNIFORM, MMID_ROUTER_SKEWED, MMID_ROUTER_SINGLE}) {
+    // The three routers bracket the host-side bound min(n_as, nei0*nei1) + nei0*nei1/BN (672 at n = 2048,
+    // n_used 10, BN 128): uniform is ~one tile per expert (512 of 672), skewed gives expert 0 all nei1 rows
+    // (16 tiles) and ~one tile to each of the other 511 (~527 of 672), and tail gives nei1 rows to expert 0
+    // and to each of the last n_used - 1 = 9 experts (10 x 16 = 160 of 672, 502 empty prefixes) - the
+    // heaviest legal load on a single expert (count_e <= nei1). Every shape is a legal routing (distinct
+    // experts per row, no expert above nei1 rows), so the same list runs on the legacy grid
+    // (GGML_VK_MMID_COMPACT=0) and on CUDA.
+    for (int router : {MMID_ROUTER_UNIFORM, MMID_ROUTER_SKEWED, MMID_ROUTER_TAIL}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 10, false, 128, 2048, 256, router));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 10, false,  64, 2048, 256, router));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 10, false, 128,   16, 256, router));
