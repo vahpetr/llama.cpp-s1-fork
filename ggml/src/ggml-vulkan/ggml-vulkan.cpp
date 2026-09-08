@@ -2255,6 +2255,25 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
     return atoi(s) != 0;
 }
 
+// [TAG_ENV_UINT] value-parsed unsigned knob: absent, empty, malformed or out of [lo, hi]
+// leaves the default in place. strtol, not std::stoi, for the same reason as
+// GGML_VK_OPT_WINDOW: a throw out of a device/pipeline setup path is not recoverable.
+// Callers cache the result, so changing the environment later has no effect.
+static uint32_t ggml_vk_env_uint(const char * name, uint32_t def, uint32_t lo, uint32_t hi) {
+    const char * s = getenv(name);
+    if (s == nullptr || *s == '\0') {
+        return def;
+    }
+    errno = 0;
+    char * end = nullptr;
+    const long v = strtol(s, &end, 10);
+    if (end != s && *end == '\0' && errno == 0 && v >= (long) lo && v <= (long) hi) {
+        return (uint32_t) v;
+    }
+    GGML_LOG_WARN("ggml_vulkan: ignoring malformed %s=\"%s\", using %u\n", name, s, def);
+    return def;
+}
+
 static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
         const uint64_t m     = node->ne[0];
@@ -3927,24 +3946,28 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     return result;
 }
 
+// [TAG_FA_CM1_BR] Smallest and largest Br the coopmat1 shader implements. A workgroup covers
+// Br query rows as Br/16 coopmat row tiles; 16 is one tile (the historical shape), 32 is two.
+// Anything above 32 is not implemented, and would not fit 64 KB of shared memory at
+// hsk == hsv == 256 anyway.
+static constexpr uint32_t fa_cm1_block_rows_min = 16;
+static constexpr uint32_t fa_cm1_block_rows_max = 32;
+// A batch this size or larger is a prefill: enough rows to fill both row tiles of every
+// workgroup, and the shape where the extra K/V reuse is worth the shared memory.
+static constexpr uint32_t fa_cm1_block_rows_32_min_n = 64;
+
 static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
-    GGML_UNUSED(n_rows);
     GGML_UNUSED(n_kv);
-    GGML_UNUSED(k_type);
-    GGML_UNUSED(v_type);
-    GGML_UNUSED(f32acc);
 
     vk_fa_tuning_params result{};
     result.path = FA_COOPMAT1;
 
     const uint32_t D = hsk | hsv;
 
-    const uint32_t coopmat_block_rows = 16;
     const uint32_t coopmat_block_cols = 16;
 
     const uint32_t num_subgroups = 4;
 
-    result.block_rows = coopmat_block_rows;
     result.block_cols = coopmat_block_cols * num_subgroups;
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
@@ -3954,6 +3977,30 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
+
+    // A coopmat1 workgroup streams the whole K and V of its KV head once per Br query rows, so
+    // at prefill shapes this kernel's arithmetic intensity is proportional to Br and it runs at
+    // the memory roofline. Two row tiles halve that re-streaming. Decode shapes keep one tile:
+    // they have too few rows to fill two, and the wider tile costs shared memory (and with it
+    // occupancy). The shader computes each row exactly as it does at Br == 16, see
+    // [TAG_FA_CM1_ROW_TILES] in flash_attn_cm1.comp.
+    // GGML_VK_FA_CM1_BR=16|32 forces one or the other, for A/B; 0 (or unset) is auto. Any
+    // other value in range rounds to one of the two implemented tiles rather than being
+    // silently ignored, and anything else is rejected with a warning. See [TAG_ENV_UINT].
+    static const uint32_t fa_cm1_br_env = ggml_vk_env_uint("GGML_VK_FA_CM1_BR", 0, 0, fa_cm1_block_rows_max);
+
+    uint32_t block_rows = (n_rows >= fa_cm1_block_rows_32_min_n) ? fa_cm1_block_rows_max : fa_cm1_block_rows_min;
+    if (fa_cm1_br_env != 0) {
+        block_rows = (fa_cm1_br_env >= fa_cm1_block_rows_max) ? fa_cm1_block_rows_max : fa_cm1_block_rows_min;
+    }
+
+    result.block_rows = block_rows;
+    if (block_rows > fa_cm1_block_rows_min &&
+        !ggml_vk_flash_attn_coopmat_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+        // Fall back to the one-tile shape rather than let get_fa_tuning_params drop the whole
+        // op to the scalar path over a tile choice.
+        result.block_rows = fa_cm1_block_rows_min;
+    }
 
     return result;
 }
@@ -11187,7 +11234,12 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
-    const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
+    // A grouped-query dispatch sets N = gqa_ratio (<= 32) and relies on one workgroup covering
+    // all of it, so max_gqa must not exceed the Br the *small*-N tuning will hand out. The
+    // large probe above still reports the scalar path's biggest tile, but coopmat1's Br now
+    // depends on n_rows ([TAG_FA_CM1_BR]), so clamp with a probe taken in the decode regime.
+    const vk_fa_tuning_params gqa_probe = get_fa_tuning_params(ctx->device, HSK, HSV, 32, KV, k_type_eff, v_type_eff, f32acc);
+    const uint32_t max_gqa = std::min({ tuning_params.block_rows, gqa_probe.block_rows, 32u });
 
     if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
