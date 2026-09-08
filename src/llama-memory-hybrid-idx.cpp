@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>
 #include <stdexcept>
 
@@ -372,6 +373,48 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
     return ns_ubatch[i_cur];
 }
 
+// [TAG_QSA_TAIL_FIX] (M1.5, triage row T3)
+//
+// Only a COMPLETE group of r cells is given a block id (`grp_slots[g] != slots_full -> continue`
+// below), so the up-to-(r-1) newest cells of a stream - the incomplete final block, which at decode
+// contains the query's OWN key - have no block of their own. They are routed to `dead_bid`, and in
+// the live per-block bias path every block index >= n_bid is scored -INFINITY, while the `1e9f`
+// tail boost only ever reaches ALLOCATED complete blocks. Above the budget (width < n_kv) those
+// cells therefore lose the top-k to any finite cell and the query cannot attend to its own key.
+// (Below the budget width == n_kv, top_k returns every column and the bias cannot change the
+// selection - so this fix does not touch the below-budget identity oracle.)
+//
+// The fix routes them to the same spare id but scores it +1e9f, which is what the reference does
+// with the tail: always visible. Two facts make the spare id safe:
+//   * if any cell is unpooled then n_bid < n_blocks, so `dead_bid == n_bid` is a genuinely unused
+//     block id. Proof: n_bid complete groups occupy n_bid*r distinct cells, so
+//     n_bid*r + 1 <= n_kv <= n_blocks*r, hence n_bid < n_blocks. When there is no unpooled cell,
+//     dead_bid is reached by EMPTY cells only and must stay -inf-ish; the guard below keeps it so.
+//   * empty, foreign and future cells also land on dead_bid, and the caller adds the attention
+//     mask afterwards, which is -INFINITY for exactly those. 1e9f + (-inf) = -inf, never a nan.
+//
+// Default ON. LLAMA_QSA_TAIL_FIX=0 restores the -inf tail for an A/B against the pre-fix numbers.
+static bool qsa_tail_fix_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_TAIL_FIX");
+        return s == nullptr || atoi(s) != 0;
+    }();
+
+    return enabled;
+}
+
+// LLAMA_QSA_TAIL_ASSERT=1 turns on an O(n_kv) per-token re-check of the property the fix exists
+// for: every non-empty cell this query can see whose in-block index is at or past the tail start
+// must carry a finite, boosted bias. Off by default - at 213k cells x 2048 tokens it is the graph.
+static bool qsa_tail_assert_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_TAIL_ASSERT");
+        return s != nullptr && atoi(s) != 0;
+    }();
+
+    return enabled;
+}
+
 void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
@@ -393,6 +436,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
+
+    const bool tail_fix    = qsa_tail_fix_enabled();     // [TAG_QSA_TAIL_FIX]
+    const bool tail_assert = qsa_tail_assert_enabled();
 
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
@@ -592,8 +638,15 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             }
         }
 
-        // unpooled cells point at a dead block whose per-block bias is -inf
+        // unpooled cells point at a dead block. [TAG_QSA_TAIL_FIX]: when that id is a spare one
+        // (which is implied by the existence of any unpooled cell, see the proof at the top of the
+        // file) the per-block bias below boosts it instead of killing it, so the incomplete tail -
+        // including the query's own key at decode - stays selectable above the budget.
         const int32_t dead_bid = n_bid < n_blocks ? n_bid : n_blocks - 1;
+
+        // n_bid == n_blocks => no unpooled non-empty cell exists => dead_bid aliases a REAL block
+        // and must keep that block's own bias
+        const bool tail_bid_spare = n_bid < n_blocks;
 
         for (int64_t j = 0; j < n_kv; ++j) {
             const int32_t g = cell_grp[j];
@@ -647,13 +700,39 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 float * cur_blk_bias = dst_bias + i*n_blocks;
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
-                    if (b >= n_bid || !cells.seq_has((uint32_t) bid_cell[b], seq_id)) {
+                    if (b >= n_bid) {
+                        // [TAG_QSA_TAIL_FIX] (T3) the spare id every unpooled cell points at: the
+                        // incomplete tail block. Boost it - the attention mask the caller adds
+                        // still drops the empty / foreign / future cells that share the id.
+                        cur_blk_bias[b] = (tail_fix && tail_bid_spare && b == dead_bid) ? 1e9f : -INFINITY;
+                        continue;
+                    }
+
+                    if (!cells.seq_has((uint32_t) bid_cell[b], seq_id)) {
                         cur_blk_bias[b] = -INFINITY;
                         continue;
                     }
 
                     // finite, so it can never meet a -inf and produce a nan
                     cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+                }
+
+                if (tail_assert) {
+                    // every visible cell at or past the tail start must be boosted
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        if (cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
+                            continue;
+                        }
+
+                        const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+
+                        if (idx < tail_start || idx > q) {
+                            continue;
+                        }
+
+                        GGML_ASSERT(cur_blk_bias[cur_cell_blk[j]] >= 1e9f &&
+                                "qsa: visible tail cell is not selectable [TAG_QSA_TAIL_FIX]");
+                    }
                 }
 
                 continue;
@@ -669,6 +748,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
                     if (idx <= q) {
                         // finite, so it can never meet a -inf and produce a nan
+                        // [TAG_QSA_TAIL_FIX] this per-cell path already boosts the tail whether or
+                        // not the cell has a block, so T3 never applied here - only to the per-block
+                        // path above, which is the live one for a causal, non-alibi run
                         v = idx >= tail_start ? 1e9f : (blk_of[j] < 0 ? -INFINITY : 0.0f);
                     }
                 }
