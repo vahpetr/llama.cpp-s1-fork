@@ -1485,6 +1485,9 @@ struct vk_op_count_experts_push_constants {
     uint32_t hoist_row_ids;
     uint32_t ne00mp;
     uint32_t ne00L;
+    // [TAG_MMID_COMPACT] BN of the mul_mat_id pipeline this count feeds, or 0 to skip the
+    // per-expert tile prefix sum entirely (then the scratch keeps its pre-G51 size and contents).
+    uint32_t tile_bn;
 };
 
 struct vk_op_glu_push_constants {
@@ -10430,6 +10433,15 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                 hoisted_row_id_words * sizeof(uint32_t) <=
                                     ctx->device->properties.limits.maxStorageBufferRange;
 
+    // [TAG_MMID_COMPACT] G51: flatten the (expert, N-tile) grid.  count_experts.comp appends a
+    // per-expert tile prefix sum after the row ids and the matmul_id shaders binary-search it to
+    // turn a flat workgroup id into (expert, ic), so the y*z extent shrinks from
+    // n_as * ceil(nei1 / BN) to a host-computable bound on sum_e ceil(count_e / BN).  It rides on
+    // the hoisted row id table, so it is off whenever hoisting is.
+    // Value-parsed, not a presence test - see ggml_vk_env_bool [TAG_ENV_BOOL].
+    static const bool enable_mmid_compact = ggml_vk_env_bool("GGML_VK_MMID_COMPACT", true);
+    const bool mmid_compact = enable_mmid_compact && hoist_row_ids;
+
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
     ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
@@ -10571,8 +10583,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     vk_pipeline count_experts = hoist_row_ids ? ctx->device->pipeline_count_experts_hoist
                                               : ctx->device->pipeline_count_experts;
 
+    // [TAG_MMID_COMPACT] the tile prefix sum is n_as offsets plus the total, appended after the
+    // (fixed, nei0*nei1 word) row id region so the header and the row ids keep their addresses.
     const size_t expert_data_size = sizeof(uint32_t) *
-        (hoist_row_ids ? hoisted_row_id_words : n_as);
+        (hoist_row_ids ? hoisted_row_id_words + (mmid_compact ? n_as + 1 : 0) : n_as);
 
     {
         if (
@@ -10667,7 +10681,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                            (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
                                            (uint32_t)n_as,
                                            uint32_t(hoist_row_ids),
-                                           0, 0 };
+                                           0, 0,
+                                           mmid_compact ? pipeline->wg_denoms[1] : 0u };
         init_pushconst_fastdiv(pc);
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
             { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc,
