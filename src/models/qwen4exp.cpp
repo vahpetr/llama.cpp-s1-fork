@@ -12,6 +12,8 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -452,6 +454,82 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     return cur;
 }
 
+// [TAG_PLE_INPUT]
+// The PLE gather as a graph *input* instead of a graph *node*.
+//
+// Baseline (LLAMA_PLE_INPUT=0): the graph carries one ggml_get_rows(per_layer_token_embd, rows)
+// whose table operand is a CPU-resident weight, so the scheduler has to give that node to the CPU
+// backend -- see [TAG_PLE_HOIST] below for why no flag can move it. That single node costs three
+// splits, a mid-graph ggml_backend_synchronize(Vulkan) + ggml_vk_graph_cleanup, a second
+// ggml_backend_vk_graph_compute entry whose flops_per_submit is then seeded from one layer's flops,
+// and -- the expensive part -- it does the 16 x n_tokens row reads *inside* the graph, with the GPU
+// idle behind it: ~500-900 ms per 2048-token ubatch, 13-23 % of prefill
+// (docs/research/2026-09-07-m3-followups.md section 3.2 item 2).
+//
+// With LLAMA_PLE_INPUT=1 (default) build_ple_gather emits no node at all. It creates an F32
+// [ple_head_dim*ple_n_heads, n_tokens] tensor, marks it ggml_set_input(), and hands that to the same
+// consumers. llm_graph_input_ple::set_input() then performs the gather on the host, straight into
+// the tensor's (host-visible, pinned) buffer, fanned out over the same thread count the CPU backend
+// would have used. No CPU-assigned node is left in the graph, so at -ngl 999 the split list is one
+// split, there is no mid-graph drain, and the Vulkan submit heuristic sees the whole graph.
+//
+// WHY THE VALUES CANNOT MOVE. The CPU implementation of GGML_OP_GET_ROWS over a quantised source is
+// ggml_compute_forward_get_rows_q() (ggml/src/ggml-cpu/ops.cpp): for every entry i of the index
+// tensor it calls
+//     ggml_get_type_traits(src0->type)->to_float(src0->data + i01*nb01, dst->data + i*nb1, ne00)
+// i.e. dequantize_row_q5_0() for this table, one whole row at a time, into a contiguous F32
+// destination laid out row-major in index order. qwen4exp_ple_gather_host() calls that *same
+// function pointer*, over the *same source bytes* (same mmap, same nb[1] stride, same row ids from
+// the same unchanged hash loop), into the same offsets of a contiguous F32 tensor of the same
+// shape: ggml_get_rows() produced [ne00, n_heads*n_tokens] and build_ple reshaped it to
+// [ne00*n_heads, n_tokens], which is byte-for-byte the layout of the [ne00*n_heads, n_tokens]
+// tensor created here. Rows are independent and each is written exactly once, so the thread
+// partition cannot change a byte either (the baseline is itself multi-threaded over these rows).
+// Every downstream consumer therefore sees identical F32 input, and identical f32 input into an
+// unchanged DAG gives identical output.
+//
+// LLAMA_PLE_INPUT=0 restores the in-graph ggml_get_rows path verbatim, including its
+// [TAG_PLE_PREFETCH] madvise (which is redundant here: the host gather reads the rows itself, on 16
+// threads, so there is nothing left to overlap the advisory page-ins with).
+static bool qwen4exp_ple_input_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_PLE_INPUT");
+        return s == nullptr || atoi(s) != 0;
+    }();
+
+    return enabled;
+}
+
+// [TAG_PLE_INPUT] the host gather reads the table through a plain pointer and reproduces
+// get_rows_q()'s arithmetic exactly; both need the table to look the way get_rows_q assumes.
+// Anything else -- table on a device buffer, a non-quantised type (whose CPU get_rows is a
+// different function: get_rows_f32/f16/bf16, not to_float), a padded first dimension, a 3-D/4-D
+// table -- falls back to the in-graph ggml_get_rows, which handles all of them.
+static bool qwen4exp_ple_host_gatherable(const ggml_tensor * t) {
+    if (t == nullptr || t->buffer == nullptr || t->data == nullptr) {
+        return false;
+    }
+
+    // only a host mapping can be dereferenced here
+    if (!ggml_backend_buffer_is_host(t->buffer)) {
+        return false;
+    }
+
+    // get_rows_q's i11/i12 terms vanish only for a 2-D table
+    if (t->ne[2] != 1 || t->ne[3] != 1) {
+        return false;
+    }
+
+    // exactly get_rows_q's own asserts: a row is a packed run of blocks at i01*nb[1]
+    if (t->nb[0] != ggml_type_size(t->type) || t->ne[0] % ggml_blck_size(t->type) != 0) {
+        return false;
+    }
+
+    // to_float is the get_rows_q path; ggml_is_quantized() is what selects it in
+    // ggml_compute_forward_get_rows()
+    return ggml_is_quantized(t->type) && ggml_get_type_traits(t->type)->to_float != nullptr;
+}
+
 // [TAG_PLE_HOIST]
 // The PLE gather (ggml_get_rows over per_layer_token_embd) is the only node of the graph that the
 // backend scheduler assigns to the CPU: the table is a CPU-resident weight (-ot
@@ -509,7 +587,13 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // [n_embd, ple_n_heads*n_tokens] tensor (~21 MiB at -ub 2048). With k PLE layers it would be
     // k of them, i.e. ~21 MiB *per* extra layer, not a fixed +21 MiB - so the assertion below is
     // not just a tidy-up: a future multi-PLE model must revisit this trade before it hoists.
-    if (qwen4exp_ple_hoist_enabled()) {
+    //
+    // [TAG_PLE_INPUT] with the gather emitted as a graph input there is no CPU node to hoist -- the
+    // whole reason this block exists is gone -- and ggml_build_forward_expand() on a bare input leaf
+    // would only append it to gf->leafs out of order. So the hoist is skipped whenever the input
+    // path is live; LLAMA_PLE_INPUT=0 hands the A/B back.
+    if (qwen4exp_ple_hoist_enabled() &&
+            !(qwen4exp_ple_input_enabled() && qwen4exp_ple_host_gatherable(model.per_layer_tok_embd))) {
         const auto * mctx_ple = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
 
         int n_ple_hoisted = 0;
@@ -1585,22 +1669,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 class llm_graph_input_ple : public llm_graph_input_i {
 public:
     llm_graph_input_ple(const llama_model_qwen4exp & pmodel,
-                        const llama_kv_cache_context * mctx) : pmodel(pmodel), mctx(mctx) {}
+                        const llama_kv_cache_context * mctx,
+                        int n_threads) : pmodel(pmodel), mctx(mctx), n_threads(n_threads) {}
     virtual ~llm_graph_input_ple() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+
+        // [TAG_PLE_INPUT] exactly one of the two is ever allocated; both are sized by n_tokens only
+        if (embd != nullptr) {
+            return embd->ne[1] == (int64_t) params.ubatch.n_tokens;
+        }
+
         return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]                 (in-graph gather)
+    ggml_tensor * embd = nullptr;   // F32 [ple_head_dim*ple_n_heads, n_tokens]     [TAG_PLE_INPUT]
 
     const llama_model_qwen4exp & pmodel;
 
     // the predecessor tokens live in the attention KV cells (ext.tok)
     const llama_kv_cache_context * mctx;
+
+    // [TAG_PLE_INPUT] the fan-out width of the host gather: whatever the CPU backend would have
+    // used for this graph (cparams.n_threads_batch at prefill, cparams.n_threads at decode), so the
+    // replacement runs at the same width as the ggml get_rows it replaces. Declared after mctx so
+    // the member order matches the constructor's initialiser list (-Wreorder).
+    int n_threads = 1;
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
@@ -1785,6 +1883,110 @@ static void qwen4exp_ple_rowid_dump(const std::vector<int32_t> & idx, int64_t n_
     fflush(out);
 }
 
+// [TAG_PLE_INPUT] the gather itself, on the host, straight into the graph input's buffer.
+//
+// This is ggml_compute_forward_get_rows_q()'s inner loop (ggml/src/ggml-cpu/ops.cpp) transcribed:
+// the same to_float function pointer, the same source addresses (base + i01*nb[1]), the same
+// destination offsets (dst + i*ne00), the same per-row length ne00, the same bounds assert. The
+// only thing that differs is which thread runs it -- and rows are independent and each destination
+// row is written exactly once, so no partition of them can change a byte.
+//
+// Threading: plain std::thread per ubatch rather than a persistent pool. The graph input object is
+// rebuilt on most ubatches (graph reuse is rare at prefill), so a pool owned by it would be
+// recreated anyway; a process-wide static pool would add a lifetime and a static-destruction
+// hazard for ~0.4 ms per 4 s prefill ubatch. The ggml threadpool is not reachable from here: it is
+// owned by llama_context and handed to the CPU backend inside graph_compute(), with no accessor on
+// the set_input path -- and it is the pool that would otherwise be about to run the graph.
+//
+// Below QWEN4EXP_PLE_MT_MIN_ROWS the fan-out is skipped: a decode ubatch gathers 16*6 = 96 rows
+// (15 KiB of f32), where spawning threads would cost more than the work, and decode runs hundreds
+// of graphs per request. A 2048-token prefill ubatch gathers 32 768 rows and always fans out.
+static constexpr int64_t QWEN4EXP_PLE_MT_MIN_ROWS = 1024;
+
+static void qwen4exp_ple_gather_host(const ggml_tensor * tbl, const std::vector<int32_t> & idx,
+                                     float * dst, int n_threads) {
+    const int64_t nc    = tbl->ne[0];
+    const int64_t n_row = tbl->ne[1];
+    const size_t  nb1   = tbl->nb[1];
+    const char *  base  = (const char *) tbl->data;
+
+    const ggml_to_float_t to_float = ggml_get_type_traits(tbl->type)->to_float;
+    GGML_ASSERT(to_float != nullptr);
+
+    const int64_t nr = (int64_t) idx.size();
+
+    if (nr == 0) {
+        return;
+    }
+
+    // one contiguous run of rows per thread, as get_rows_q partitions them
+    const auto work = [&](int64_t ir0, int64_t ir1) {
+        for (int64_t i = ir0; i < ir1; ++i) {
+            const int64_t i01 = idx[i];
+
+            GGML_ASSERT(i01 >= 0 && i01 < n_row);
+
+            to_float((const void *) (base + i01*nb1), dst + i*nc, nc);
+        }
+    };
+
+    int nth = n_threads > 1 ? n_threads : 1;
+
+    if (nr < QWEN4EXP_PLE_MT_MIN_ROWS) {
+        nth = 1;
+    }
+
+    if ((int64_t) nth > nr) {
+        nth = (int) nr;
+    }
+
+    if (nth <= 1) {
+        work(0, nr);
+        return;
+    }
+
+    const int64_t dr = (nr + nth - 1)/nth;
+
+    std::vector<std::pair<int64_t, int64_t>> ranges;
+    ranges.reserve((size_t) nth - 1);
+
+    for (int ith = 1; ith < nth; ++ith) {
+        const int64_t ir0 = dr*ith;
+
+        if (ir0 >= nr) {
+            break;
+        }
+
+        ranges.emplace_back(ir0, std::min(ir0 + dr, nr));
+    }
+
+    std::vector<std::thread> workers;
+    workers.reserve(ranges.size());
+
+    size_t spawned = 0;
+
+    try {
+        for (; spawned < ranges.size(); ++spawned) {
+            workers.emplace_back(work, ranges[spawned].first, ranges[spawned].second);
+        }
+    } catch (const std::system_error & e) {
+        // out of threads: the ranges that did not get one are simply run inline below. Same rows,
+        // same function, same destinations -- only slower.
+        LLAMA_LOG_WARN("%s: could not start a PLE gather worker (%s), continuing with %zu\n",
+                __func__, e.what(), spawned + 1);
+    }
+
+    work(0, std::min(dr, nr));
+
+    for (size_t k = spawned; k < ranges.size(); ++k) {
+        work(ranges[k].first, ranges[k].second);
+    }
+
+    for (auto & t : workers) {
+        t.join();
+    }
+}
+
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
@@ -1845,8 +2047,25 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    // [TAG_PLE_ROWID_DUMP] off by default; a no-op unless LLAMA_PLE_DUMP names a file
+    // [TAG_PLE_ROWID_DUMP] off by default; a no-op unless LLAMA_PLE_DUMP names a file. The ids are
+    // the same on both paths below, so a census run is unaffected by LLAMA_PLE_INPUT.
     qwen4exp_ple_rowid_dump(idx, n_tokens);
+
+    // [TAG_PLE_INPUT] the gather is this input, not a graph node: dequantise the rows here, into
+    // the tensor the graph reads. No madvise: these very threads are about to touch the pages, so
+    // there is nothing left for an advisory read-ahead to overlap with (and the ~32 768 single-
+    // threaded posix_madvise() calls it costs are pure latency on this path).
+    if (embd != nullptr) {
+        GGML_ASSERT(rows == nullptr);
+        GGML_ASSERT(embd->buffer != nullptr && ggml_backend_buffer_is_host(embd->buffer));
+        GGML_ASSERT(ggml_is_contiguous(embd));
+        GGML_ASSERT(embd->type == GGML_TYPE_F32);
+        GGML_ASSERT(embd->ne[0] == hp.ple_head_dim*n_heads && embd->ne[1] == n_tokens);
+
+        qwen4exp_ple_gather_host(pmodel.per_layer_tok_embd, idx, (float *) embd->data, n_threads);
+
+        return;
+    }
 
     // start the page-ins before the upload, so they overlap the rest of set_inputs and the
     // graph nodes that run ahead of blk.1's gather
@@ -1938,18 +2157,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple_gather(
         int                  il) {
     const int64_t n_heads = hparams.ple_n_heads;
 
+    // [TAG_PLE_INPUT] the host gather runs at the width the CPU backend would have used for this
+    // graph -- llama_context::graph_compute() picks n_threads_batch exactly when n_tokens > 1.
+    const int n_threads = n_tokens > 1 ? cparams.n_threads_batch : cparams.n_threads;
+
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
-            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
+            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn(), n_threads);
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
+    ggml_tensor * emb = nullptr;
+
+    if (qwen4exp_ple_input_enabled() && qwen4exp_ple_host_gatherable(model.per_layer_tok_embd)) {
+        // [TAG_PLE_INPUT] no node at all: the gathered, already-flattened embeddings ARE the input.
+        // Same shape and same byte layout as the get_rows + reshape_2d pair below produced --
+        // ggml_get_rows() returns [ple_head_dim, n_heads*n_tokens] contiguous, which reshaped is
+        // [ple_head_dim*n_heads, n_tokens]; llm_graph_input_ple::set_input() fills it row by row in
+        // that same index order with the same dequantiser.
+        ple_inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim * n_heads, n_tokens);
+        ggml_set_input(ple_inp->embd);
+
+        emb = ple_inp->embd;
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        ggml_tensor * rows = ple_inp->rows;
+
+        // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+        emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+    }
+
     res->add_input(std::move(ple_inp));
 
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
-    emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", il);
 
     return emb;
