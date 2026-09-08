@@ -4718,6 +4718,23 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// [TAG_DMMV_SHAPES] The Vulkan backend routes a MUL_MAT with ne1 <= 8 and a batch of one to a
+// separate mat-vec kernel family (ggml_vk_mul_mat -> ggml_vk_mul_mat_vec_q_f16), and picks its
+// pipeline - including the rows-per-workgroup the GGML_VK_DMMV_RM_* knobs set - from
+// (type, m, n, k).  Whether it even quantizes B to q8_1 first depends on n and the type
+// (ggml_vk_should_use_mmvq), so the shapes have to be the real ones to exercise the real
+// pipelines.  Give them their own op name so `test-backend-ops -o MUL_MAT_VEC` is exactly that
+// kernel at exactly the production shapes, instead of being buried in the generic MUL_MAT set.
+struct test_mul_mat_vec : public test_mul_mat {
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC";
+    }
+
+    test_mul_mat_vec(ggml_type type_a = GGML_TYPE_F32, int64_t m = 4096, int64_t n = 6, int64_t k = 2560)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -9509,6 +9526,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 128 + m,  1, 1056 + k, {bs,  bs2}, {nr, 1}, {0, 1, 2, 3}, 2*1056 + k));
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // [TAG_DMMV_SHAPES] the dense mat-vec dispatches of a Flash-Next verify graph, at the weight
+    // types and the (m, k) the model actually has: q4_K/q6_K attention and FFN projections,
+    // q5_0 and q8_0 heads, and the f32 weights.  n = 6 is a 5-token draft plus the verified
+    // token (the shapes the M3 capture shows at 53 % of the DRAM roofline); n = 1 is the same
+    // kernel at NUM_COLS = 1, which is a separate pipeline object.  k = 320 is skipped for the
+    // 256-element k-quants, which cannot have it.
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int64_t k : {320, 2560, 10240}) {
+            if (k % ggml_blck_size(type_a) != 0) {
+                continue;
+            }
+            for (int64_t m : {4, 512, 2560, 6144, 10240}) {
+                for (int64_t n : {1, 6}) {
+                    test_cases.emplace_back(new test_mul_mat_vec(type_a, m, n, k));
                 }
             }
         }
