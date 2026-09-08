@@ -1157,7 +1157,14 @@ public:
     }
 
     server_metrics get_metrics() const {
-        return metrics;
+        server_metrics res = metrics;
+
+        // G32: process-wide, not tracked per slot - see the SERVER_TASK_TYPE_METRICS handler
+        res.n_sampling_us    = common_sampler_perf_time_us();
+        res.n_sampling_calls = common_sampler_perf_n_sample();
+        res.n_sampling_fast  = common_sampler_perf_n_fast();
+
+        return res;
     }
 
     void reset_metrics_bucket() {
@@ -2088,6 +2095,17 @@ private:
 
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
+            // G32: build only the candidate window the chain can reach, instead of one llama_token_data per
+            // vocabulary entry (2.98 MB per sample call on qwen4exp, ~5 calls per speculative round). The
+            // selected token and the RNG stream are unchanged, but the candidate array is then a window, so it
+            // has to stay off when the response reports post-sampling probabilities - that is the only place in
+            // the server that reads cur_p back (populate_token_probs). Pre-sampling probabilities (n_probs
+            // without post_sampling_probs, what the census sends) go through get_token_probabilities(), which
+            // reads the raw logits and is unaffected.
+            const bool need_post_sample_probs = task.params.sampling.n_probs > 0 && task.params.post_sampling_probs;
+
+            common_sampler_set_fastpath(slot.smpl.get(), !need_post_sample_probs);
+
             bool use_backend_sampling = task.params.sampling.backend_sampling;
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
@@ -2101,6 +2119,7 @@ private:
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
+            SLT_TRC(slot, "sampler fast path: %s\n", common_sampler_fastpath_str(slot.smpl.get()));
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
 
             if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
@@ -2796,7 +2815,8 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
-                    res->metrics             = metrics;
+                    // get_metrics() fills in the process-wide sampling counters (G32)
+                    res->metrics             = get_metrics();
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
