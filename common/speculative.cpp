@@ -1417,6 +1417,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+            // G54: opt this draft sampler into the G32 candidate window.  The chain reduces to
+            // top_k(10), so common_sampler_fast_mode_of() resolves it to FAST_TOPK: instead of
+            // materialising and partial-sorting all 248 320 candidates, set_logits_fast_top_k()
+            // heap-selects the top 10 by raw logit and refuses (falling back to the full array)
+            // unless the top k+1 are strictly decreasing, which pins the order exactly as
+            // llama_sampler_top_k would have left it.  The chain then runs on those 10 - same
+            // set, same order, same number of RNG draws - and the only reader here,
+            // common_sampler_get_candidates() after the chain, sees the same 10 entries either
+            // way.  In prod this is insurance only: params.backend_sampling defaults to true, so
+            // the draft logits arrive pre-truncated and set_logits_fast declines; it fires just
+            // on the SPC_WRN("backend offload failed") CPU fallback below.
+            common_sampler_set_fastpath(s.get(), true);
         }
 
         // offload draft sampling to the backend
