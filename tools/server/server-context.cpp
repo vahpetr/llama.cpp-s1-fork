@@ -1022,10 +1022,15 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // against the token count recovers exactly the two numbers the adaptive rule needs:
 //     t_tok = b       (one extra drafted token in the verification decode)
 //     t_dec = a + b   (a plain 1-token decode)
-// The window is short enough (~256 rounds) that the fit is local in KV depth: it tracks the depth of
-// the traffic that is actually running instead of extrapolating an affine model from startup. When
-// the fit is not usable - too few samples, or the batch sizes seen were all the same, so the slope is
-// not identified - the caller falls back to the configured affine-in-n_kv model.
+// The fit is taken over a short window (~256 rounds), so it describes the traffic that is actually
+// running. It does NOT replace the affine-in-n_kv model: a fit is a single (t_tok, t_dec) pair at the
+// mean depth of its own samples, so on its own it would say nothing about a slot sitting at a
+// different depth. Instead the fit CALIBRATES the model - it fixes the level at the depth it was
+// measured at, and the model keeps supplying the depth derivative:
+//     t(n_kv) = [ t_measured / model(kv_window) ] * model(n_kv)
+// which is exactly the measurement when the slot is at the window's depth, and the model's own
+// extrapolation away from it. When the fit is not usable - too few samples, or the batch sizes seen
+// were all the same, so the slope is not identified - the configured model is used unscaled.
 //
 // Only decodes that are pure generation (no prompt tokens) and that were synchronized are fed in, so
 // prefill ubatches cannot contaminate the fit.
@@ -1034,10 +1039,12 @@ struct server_spec_cost_fit {
     static constexpr double W_MIN   = 32.0;      // effective samples before the fit is trusted
     static constexpr double VAR_MIN = 0.25;      // spread in n (var, tokens^2) needed to identify the slope
     static constexpr double R_MAX   = 0.98;      // a drafted token cannot cost a whole decode - see solve()
+    static constexpr double F_MIN   = 0.1;       // clamp on the calibration factor: the model and the
+    static constexpr double F_MAX   = 10.0;      // machine may disagree, but not by 10x in both directions
 
-    double w = 0.0, s_n = 0.0, s_t = 0.0, s_nn = 0.0, s_nt = 0.0;
+    double w = 0.0, s_n = 0.0, s_t = 0.0, s_nn = 0.0, s_nt = 0.0, s_kv = 0.0;
 
-    void add(int n_tokens, double t_ms) {
+    void add(int n_tokens, double t_ms, int n_kv) {
         if (n_tokens <= 0 || !(t_ms > 0.0)) {
             return;
         }
@@ -1059,10 +1066,13 @@ struct server_spec_cost_fit {
         s_t  = d*s_t  + t_ms;
         s_nn = d*s_nn + n*n;
         s_nt = d*s_nt + n*t_ms;
+        s_kv = d*s_kv + (double) std::max(n_kv, 0);
     }
 
-    // returns true and fills t_tok/t_dec (ms) when the fit is usable
-    bool solve(float & t_tok, float & t_dec) const {
+    // model(n_kv) = c0 + k*n_kv for each cost. Returns true and fills t_tok/t_dec (ms) with the
+    // measurement-calibrated model at n_kv, or false when the fit is not usable.
+    bool solve(int n_kv, float t_tok0, float k_tok, float t_dec0, float k_dec,
+               float & t_tok, float & t_dec) const {
         if (w < W_MIN) {
             return false;
         }
@@ -1089,8 +1099,20 @@ struct server_spec_cost_fit {
             return false;
         }
 
-        t_tok = (float) slope;
-        t_dec = (float) (icpt + slope);
+        // depth the fit describes, and the model there
+        const double kv_win    = s_kv / w;
+        const double m_tok_win = (double) t_tok0 + (double) k_tok*kv_win;
+        const double m_dec_win = (double) t_dec0 + (double) k_dec*kv_win;
+
+        if (!(m_tok_win > 0.0) || !(m_dec_win > 0.0)) {
+            return false;
+        }
+
+        const double f_tok = std::min(std::max(slope        / m_tok_win, F_MIN), F_MAX);
+        const double f_dec = std::min(std::max((icpt+slope) / m_dec_win, F_MIN), F_MAX);
+
+        t_tok = (float) (f_tok*((double) t_tok0 + (double) k_tok*(double) n_kv));
+        t_dec = (float) (f_dec*((double) t_dec0 + (double) k_dec*(double) n_kv));
 
         return true;
     }
@@ -3299,7 +3321,11 @@ private:
                             float t_tok = dparams.n_max_adaptive_t_tok + dparams.n_max_adaptive_k_tok*(float) n_kv;
                             float t_dec = dparams.n_max_adaptive_t_dec + dparams.n_max_adaptive_k_dec*(float) n_kv;
 
-                            const bool measured = dparams.n_max_adaptive_measure && spec_cost.solve(t_tok, t_dec);
+                            const bool measured = dparams.n_max_adaptive_measure &&
+                                spec_cost.solve(n_kv,
+                                        dparams.n_max_adaptive_t_tok, dparams.n_max_adaptive_k_tok,
+                                        dparams.n_max_adaptive_t_dec, dparams.n_max_adaptive_k_dec,
+                                        t_tok, t_dec);
 
                             const int n_max_cfg = common_speculative_n_max(spec.get());
 
@@ -4414,13 +4440,16 @@ private:
     // span of the cache, so the depth is the max over the slots that are running; without it every
     // sequence has its own cells and only this slot's depth matters.
     int spec_n_kv_depth(const server_slot & slot) const {
-        int n_kv = slot.prompt.n_tokens();
+        return params_base.kv_unified ? std::max((int) slot.prompt.n_tokens(), spec_n_kv_busy()) : slot.prompt.n_tokens();
+    }
 
-        if (params_base.kv_unified) {
-            for (const auto & other : slots) {
-                if (other.is_processing()) {
-                    n_kv = std::max(n_kv, (int) other.prompt.n_tokens());
-                }
+    // deepest sequence currently running - the depth a shared (unified) decode pays for
+    int spec_n_kv_busy() const {
+        int n_kv = 0;
+
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                n_kv = std::max(n_kv, (int) slot.prompt.n_tokens());
             }
         }
 
@@ -4497,7 +4526,7 @@ private:
             if (n_prompt_tokens == 0 &&
                     params_base.speculative.draft.n_max_adaptive &&
                     params_base.speculative.draft.n_max_adaptive_measure) {
-                spec_cost.add(n_tokens, (ggml_time_us() - t_decode_start) / 1000.0);
+                spec_cost.add(n_tokens, (ggml_time_us() - t_decode_start) / 1000.0, spec_n_kv_busy());
             }
         }
 
