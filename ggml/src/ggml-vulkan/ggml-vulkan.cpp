@@ -4040,7 +4040,8 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 }
 
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type,
+                                                  bool gqa_tokens = false) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -4066,7 +4067,9 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
                      (zero_dead_v       ? 16 : 0) |
-                     (deadv_lds         ? 32 : 0);
+                     (deadv_lds         ? 32 : 0) |
+                     // [TAG_FA_GQA_TOKENS] rows are (token, head) pairs, see flash_attn_base.glsl
+                     (gqa_tokens        ? 64 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -11063,6 +11066,9 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t MatBr = 16, MatBc = 16;
 
     const uint32_t row_split = Bc / MatBc;
+    // Br query rows are covered as row_tiles coopmat tiles of MatBr rows, see
+    // [TAG_FA_CM1_ROW_TILES] in flash_attn_cm1.comp.
+    const uint32_t row_tiles = Br / MatBr;
 
     const uint32_t hsk_pad = ROUNDUP_POW2(hsk, 16);
     const uint32_t hsv_pad = ROUNDUP_POW2(hsv, 16);
@@ -11091,15 +11097,16 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     // (no bf16 accumulator support), so pvsh is vec4 (16 bytes) in those cases.
     const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16 || f32acc) ? 16u : f16vec4;
     const uint32_t osh_stride = params.row_split * MatBr / 4;
-    const uint32_t pvsh = MatBc * osh_stride * pvsh_elem_size;
+    // pvsh's first index is a query row of the Br tile, so it holds row_tiles coopmat tiles.
+    const uint32_t pvsh = Br * osh_stride * pvsh_elem_size;
 
     const uint32_t slope = Br * acctype;
 
-    // p_dead[Bc] + any_dead (the ZERO_DEAD_V mask-suppressed-column flags, DEADV_LDS path)
-    // plus p_dead_sg[row_split * dead_words] (the per-subgroup column masks of the default,
-    // register-reduced path)
+    // The ZERO_DEAD_V mask-suppressed-column masks: p_dead_sg[row_split * dead_words] (the
+    // per-row-group masks of the default, register-reduced path) plus
+    // p_dead_lds[row_tiles * dead_words] (the DEADV_LDS A/B path's per-row-tile masks).
     const uint32_t dead_words = (Bc + 31) / 32;
-    const uint32_t dead = (Bc + 1 + row_split * dead_words) * (uint32_t) sizeof(uint32_t);
+    const uint32_t dead = (row_split + row_tiles) * dead_words * (uint32_t) sizeof(uint32_t);
 
     const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + dead;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
@@ -11208,6 +11215,46 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
 
+    // [TAG_FA_GQA_TOKENS] Fold the query tokens into the row dimension on top of the head fold.
+    //
+    // The block above gives every token its own workgroup, and a workgroup streams its KV head
+    // in full, so a speculative verify round of neq1 tokens pays neq1 passes over the KV cache
+    // per KV head (split_k splits each pass, it does not share them).  Widening the tile to
+    // rows of the (token, head) product space instead costs ceil(gqa_ratio * neq1 / Br) passes.
+    // At the production decode shape - gqa_ratio 12, neq1 6, Br 32 - that is 3 passes instead
+    // of 6, i.e. half the KV bytes per round; at neq1 2 it is one pass instead of two.
+    //
+    // Br is widened to two coopmat row tiles (see [TAG_FA_CM1_ROW_TILES]) when, and only when,
+    // that removes a pass - the narrow tile keeps the historic shared-memory footprint and
+    // twice the occupancy.  Br = 64 would fold 6 tokens into 2 passes but needs 84 KiB of
+    // shared memory at HSK = HSV = 256, over the 64 KiB limit; Br = 48 needs 65 576 B, still
+    // 40 B over, and a third row tile the shader does not have.  So 32 is the widest tile that
+    // fits, and at the production shape the fold takes 3 of the 6 passes.
+    //
+    // Conditions, beyond "the plain GQA fold applies":
+    //   * coopmat1: the other two paths have no row-tile machinery.
+    //   * the fold must actually remove passes (tiles < neq1), which excludes gqa_ratio >= Br.
+    //   * neq1 <= Br, which is what lets the shader read mask-opt block row 0 for every tile.
+    //   * the tile must fit in shared memory.
+    // GGML_VK_FA_GQA_TOKENS=0 restores the per-token dispatch.
+    static const bool fa_gqa_tokens = ggml_vk_env_bool("GGML_VK_FA_GQA_TOKENS", true);
+    bool gqa_tokens = false;
+    if (fa_gqa_tokens && gqa_ratio > 1 && neq1 > 1 && tuning_params.path == FA_COOPMAT1) {
+        const uint32_t rows_folded = gqa_ratio * (uint32_t)neq1;
+        vk_fa_tuning_params folded = tuning_params;
+        if (CEIL_DIV(rows_folded, 2 * 16) < CEIL_DIV(rows_folded, folded.block_rows)) {
+            folded.block_rows = 2 * 16; // two MatBr = 16 coopmat row tiles
+        }
+        const uint32_t tiles_folded = CEIL_DIV(rows_folded, folded.block_rows);
+        if (tiles_folded < (uint32_t)neq1 &&
+            (uint32_t)neq1 <= folded.block_rows &&
+            ggml_vk_flash_attn_coopmat_shmem_support(ctx->device, folded, HSK, HSV, f32acc, k_type_eff, v_type_eff)) {
+            gqa_tokens = true;
+            N = rows_folded;
+            tuning_params = folded;
+        }
+    }
+
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
     uint32_t v_stride = (uint32_t)(nbv1 / ggml_type_size(v->type));
@@ -11257,7 +11304,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
+                                                                   gqa_tokens);
 
     vk_pipeline pipeline = nullptr;
 
@@ -11292,7 +11340,13 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t Tr = CEIL_DIV(N, Br);
 
     // Try to use split_k when KV is large enough to be worth the overhead.
-    if (gqa_ratio > 1 && workgroups_x <= Br) {
+    if (gqa_tokens) {
+        // One workgroup per row tile, so the row tiles are the x geometry (as without gqa).
+        const uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
+        if (total_wgs_no_split < shader_core_count * 2) {
+            split_k = shader_core_count * 2 / total_wgs_no_split;
+        }
+    } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
@@ -11433,8 +11487,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
         // We reuse workgroups_x to mean the number of splits, so we need to
         // cancel out the divide by wg_denoms[0].
+        // The token fold puts the row tiles back in x, i.e. the non-gqa geometry.
         uint32_t dispatch_x;
-        if (gqa_ratio > 1) {
+        if (gqa_ratio > 1 && !gqa_tokens) {
             workgroups_x *= pipeline->wg_denoms[0];
             dispatch_x = split_k * workgroups_x;
         } else {
@@ -11453,7 +11508,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                     pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
         ctx->prealloc_split_k_need_sync = true;
     } else {
-        if (gqa_ratio > 1) {
+        if (gqa_tokens) {
+            // One workgroup per Br-row tile of the folded (token, head) row space.
+            workgroups_x = N;
+        } else if (gqa_ratio > 1) {
             // When using gqa, we want one actual workgroup per batch, so cancel out wg_denoms
             workgroups_x *= pipeline->wg_denoms[0];
         }
