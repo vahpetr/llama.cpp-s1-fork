@@ -2488,6 +2488,11 @@ struct ggml_backend_vk_context {
 
     vk_context_ref compute_ctx;
 
+    // [TAG_ASYNC_READ_UMA] true while compute_ctx carries a host memcpy queued by the direct-read
+    // shortcut in ggml_vk_buffer_read_2d_async, i.e. a read that is not yet performed and whose
+    // source is still live device memory. See ggml_vk_flush_pending_host_reads.
+    bool pending_host_read {};
+
     vk_context_ref transfer_ctx;
     vk_semaphore transfer_semaphore;
     uint64_t transfer_semaphore_last_submitted {};
@@ -8753,6 +8758,13 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
     // cannot run before the GPU is done. Callers already have to synchronize before touching the
     // destination (ggml_backend_tensor_get_async), and the pinned-destination branch below has
     // always returned true without an internal synchronize, so no caller contract changes.
+    //
+    // The deferral is only safe while nothing else is recorded into subctx first. A queued
+    // vkCmdCopyBuffer is self-contained - it carries its own source snapshot in submission order -
+    // but a queued host memcpy is not: it is executed by the CPU at drain time, out of the live
+    // source buffer, and it lives in a list that graph compute neither drains nor preserves. The
+    // caller therefore has to fence off the compute context before recording anything else into
+    // it; ggml_vk_flush_pending_host_reads does that, driven by ctx->pending_host_read.
     //
     // eHostCached is required, not optional. ggml_vk_create_buffer_device asks for
     // eDeviceLocal|eHostVisible|eHostCoherent as a *minimum* set and ggml_vk_find_memory_properties
@@ -16928,6 +16940,31 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
     return &ctx->device->buffer_type;
 }
 
+// [TAG_ASYNC_READ_UMA]
+// The UMA direct-read shortcut in ggml_vk_buffer_read_2d_async leaves a host memcpy queued on the
+// compute context (subctx->out_memcpys) instead of recording a vkCmdCopyBuffer. That list is only
+// drained by ggml_vk_synchronize, and only while ctx->compute_ctx still points at the context that
+// holds it. Anything that records further work into the same context breaks both halves of that:
+//
+//   * graph compute reuses ctx->compute_ctx, then ends it, submits it and resets ctx->compute_ctx
+//     at its first submit boundary. ggml_vk_compute_forward only drains out_memcpys when the
+//     submitted batch is the graph's *exit* batch, so on any earlier batch the queued read is
+//     stranded in a context nothing will look at again and the destination is never written; on the
+//     exit batch it is executed immediately after vkQueueSubmit, without waiting for the fence.
+//   * the memcpy reads the live source buffer at drain time, so dispatches recorded after it can
+//     overwrite the bytes before the host copies them.
+//
+// llama.cpp reaches this ordering: llama_context::decode extracts logits / embeddings / the MTP
+// h_nextn rows with ggml_backend_tensor_get_async at the end of each ubatch iteration and only
+// synchronizes after the last one, so a multi-ubatch batch does get_async(A), graph_compute(B).
+// Fence the pending reads off before recording anything else. In the ordinary
+// graph_compute -> get_async... -> synchronize sequence nothing is pending and this is free.
+static void ggml_vk_flush_pending_host_reads(ggml_backend_vk_context * ctx) {
+    if (ctx->pending_host_read) {
+        ggml_vk_synchronize(ctx);
+    }
+}
+
 static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
@@ -16937,6 +16974,8 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
     if (size == 0) {
         return;
     }
+
+    ggml_vk_flush_pending_host_reads(ctx);
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
@@ -17010,6 +17049,12 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
     auto src_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
     bool ret = ggml_vk_buffer_read_2d_async(compute_ctx, buf, src_offset, data, stride_tensor, stride_data, size, n_copies);
 
+    // [TAG_ASYNC_READ_UMA] the direct-read shortcut queued the memcpy instead of recording a copy;
+    // it must be fenced and drained before anything else is recorded into this context.
+    if (!compute_ctx->out_memcpys.empty()) {
+        ctx->pending_host_read = true;
+    }
+
     if (!ret) {
         const size_t staging_size = size * n_copies;
         ggml_vk_ensure_sync_staging_buffer(ctx, staging_size);
@@ -17059,6 +17104,8 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     if (dst->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend_dst)) {
         return false;
     }
+
+    ggml_vk_flush_pending_host_reads(ctx);
 
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
     vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
@@ -17170,8 +17217,13 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         for (auto& cpy : compute_ctx->out_memcpys) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
+        // [TAG_ASYNC_READ_UMA] the context stays alive in ctx->gc until ggml_vk_graph_cleanup; clear
+        // the drained list so it can never be replayed against a buffer that has moved on.
+        compute_ctx->out_memcpys.clear();
         ctx->compute_ctx.reset();
     }
+
+    ctx->pending_host_read = false;
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
@@ -17852,6 +17904,10 @@ static const bool vk_fusion_diag = getenv("GGML_VK_FUSION_DIAG") != nullptr;
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    // [TAG_ASYNC_READ_UMA] a pending direct host read owns ctx->compute_ctx; recording this graph
+    // into it would strand or race the queued memcpy.
+    ggml_vk_flush_pending_host_reads(ctx);
 
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
