@@ -20,6 +20,7 @@ layout (push_constant) uniform parameter
     uint32_t hoist_row_ids;
     uint32_t ne00mp;
     uint32_t ne00L;
+    uint32_t tile_bn;
 } p;
 
 #define BLOCK_SIZE 256
@@ -59,6 +60,19 @@ uint fastdiv(uint n, uint mp, uint L) {
 //   [2*n_experts]                 total row count
 //   [2*n_experts + 1,         )   row ids grouped by expert, packed as (i01 << 16) | (i00 & 0xffff)
 // Otherwise only data_d[expert_id] is written, holding that expert's row count.
+//
+// [TAG_MMID_COMPACT] When p.tile_bn is also non-zero a third region follows the row id region.
+// The row id region is addressed from a fixed base and is at most ne00*ne01 words long (one packed
+// row id per (expert slot, token)), so the third region starts at a host-computable
+//   T = 2*n_experts + 1 + ne00*ne01
+// and holds the per-expert *tile* prefix sum for a tile width of p.tile_bn:
+//   [T + e]             sum over e' < e of ceil(count[e'] / tile_bn)
+//   [T + n_experts]     the total tile count, sum over all e of ceil(count[e] / tile_bn)
+// mul_mm.comp / mul_mmq.comp / mul_mm_cm2.comp binary-search that array to turn a flat workgroup
+// id into an (expert, ic) pair, which lets the host dispatch sum_e ceil(count_e / BN) tiles instead
+// of n_experts * ceil(nei1 / BN).  It is appended *after* the row ids on purpose: the header and
+// the row id region keep byte-identical contents and addressing either way, so turning the compact
+// grid on cannot move a single row id.
 void main() {
     const uint expert_id = gl_WorkGroupID.x;
     const uint num_elements = p.ne00 * p.ne01;
@@ -101,6 +115,25 @@ void main() {
             if (subgroupElect()) {
                 data_d[2 * p.n_experts] = base;
             }
+            // [TAG_MMID_COMPACT] second pass over the same vals[]: the per-expert tile prefix sum.
+            // Same trip count and the same uniform control flow as the loop above; p.tile_bn is a
+            // push constant, so the branch is uniform across the dispatch.
+            if (p.tile_bn != 0) {
+                const uint tile_base = 2 * p.n_experts + 1 + num_elements;
+                uint tiles = 0;
+                for (uint expert = gl_SubgroupInvocationID; expert < n_experts_padded; expert += gl_SubgroupSize) {
+                    const bool in_range = expert < p.n_experts;
+                    const uint expert_tiles = in_range ? (vals[expert] + p.tile_bn - 1) / p.tile_bn : 0;
+                    const uint tile_offset = tiles + subgroupExclusiveAdd(expert_tiles);
+                    if (in_range) {
+                        data_d[tile_base + expert] = tile_offset;
+                    }
+                    tiles += subgroupAdd(expert_tiles);
+                }
+                if (subgroupElect()) {
+                    data_d[tile_base + p.n_experts] = tiles;
+                }
+            }
         }
 #else
         if (tid == 0) {
@@ -114,6 +147,16 @@ void main() {
                 offset += count;
             }
             data_d[2 * p.n_experts] = offset;
+            // [TAG_MMID_COMPACT] see the subgroup branch above.
+            if (p.tile_bn != 0) {
+                const uint tile_base = 2 * p.n_experts + 1 + num_elements;
+                uint tiles = 0;
+                for (uint expert = 0; expert < p.n_experts; ++expert) {
+                    data_d[tile_base + expert] = tiles;
+                    tiles += (vals[expert] + p.tile_bn - 1) / p.tile_bn;
+                }
+                data_d[tile_base + p.n_experts] = tiles;
+            }
         }
 #endif
         barrier();

@@ -4788,7 +4788,17 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
+// [TAG_MMID_COMPACT] Router shapes for the ids tensor.  The flattened (expert, N-tile) MoE grid
+// dispatches a host-computed bound on sum_e ceil(count_e / BN); how close the real tile total gets
+// to that bound depends entirely on how skewed the routing is, so the skewed shapes below are what
+// exercise both ends of it.
+enum mul_mat_id_router {
+    MMID_ROUTER_UNIFORM = 0,  // a shuffled permutation of (i % n_mats) per token: counts ~ equal
+    MMID_ROUTER_SKEWED  = 1,  // every token also picks expert 0: one expert holds all nei1 rows
+    MMID_ROUTER_SINGLE  = 2,  // every slot of every token picks expert 0: one expert, nei0*nei1 rows
+};
+
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, int router = MMID_ROUTER_UNIFORM) {
     std::random_device rd;
     std::default_random_engine rng(rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -4801,6 +4811,19 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
                     data[i] = i % n_mats;
                 }
                 std::shuffle(data.begin(), data.end(), rng);
+                if (router == MMID_ROUTER_SKEWED) {
+                    // move expert 0 into slot 0 (the used view keeps the leading n_used slots),
+                    // swapping so the row still holds distinct experts
+                    for (int i = 1; i < t->ne[0]; i++) {
+                        if (data[i] == 0) {
+                            data[i] = data[0];
+                            break;
+                        }
+                    }
+                    data[0] = 0;
+                } else if (router == MMID_ROUTER_SINGLE) {
+                    std::fill(data.begin(), data.end(), 0);
+                }
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }
         } else {
@@ -4819,9 +4842,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const int router;
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, router);
     }
 
     double max_nmse_err() override {
@@ -4843,9 +4867,10 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32,
+            int router = MMID_ROUTER_UNIFORM)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), router(router) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4871,7 +4896,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mul_mat_id_tensors(ctx, n_mats, router);
     }
 };
 
@@ -9567,6 +9592,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+
+    // [TAG_MMID_COMPACT] Flash-Next MoE routing: 512 experts, 10 used per token.  These are the
+    // shapes the flattened (expert, N-tile) grid is built for - at n = 2048 the 3-D grid launches
+    // 512 x ceil(2048/128) = 8 192 tile-columns of which ~512 hold rows - and they are also what
+    // pins the Vulkan row id hoisting (n_as <= 512).  m and k are kept small: what is under test is
+    // the launch enumeration and the tile prefix sum, not the tile arithmetic.
+    //   m = 128, n = 2048 -> large tile;  m = 64, n = 2048 -> medium tile (the G53 arm);
+    //   m = 128, n = 16   -> small tile;  m = 128, n = 6 is the production verify-round shape, which
+    //                                     Vulkan routes to mul_mat_vec_id (ids->ne[1] <= 8) and which
+    //                                     must therefore stay unaffected by the compact grid.
+    // The three routers bracket the host-side bound min(n_as, nei0*nei1) + nei0*nei1/BN: uniform is
+    // ~one tile per expert (512 of 672 at n = 2048, BN 128), skewed gives one expert all nei1 rows,
+    // and single puts every one of the nei0*nei1 rows on expert 0 (160 of 672, 511 empty prefixes).
+    for (int router : {MMID_ROUTER_UNIFORM, MMID_ROUTER_SKEWED, MMID_ROUTER_SINGLE}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 10, false, 128, 2048, 256, router));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 10, false,  64, 2048, 256, router));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 10, false, 128,   16, 256, router));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 10, false, 128,    6, 256, router));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 128, 2048, 256, router));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 128,   16, 256, router));
+    }
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));

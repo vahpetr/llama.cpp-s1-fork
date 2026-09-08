@@ -2,6 +2,41 @@
 shared u16vec2 row_ids[BN];
 uint _ne1;
 
+// [TAG_MMID_COMPACT] Map a flat workgroup id to the (expert, N-tile) pair it owns.
+//
+// count_experts.comp appends, after the row id region, the per-expert prefix sum of
+// ceil(count_e / BN) plus the total (see its data_d layout comment).  Tile `flat_tile` belongs to
+// the *last* expert whose prefix is <= flat_tile: experts with no tiles repeat their predecessor's
+// prefix, so taking the last one skips them.  The array is non-decreasing, so that is one
+// binary search - ceil(log2(n_as)) = 9 dependent scalar loads at n_as 512 - over values that are
+// L2-resident (every workgroup of the dispatch reads the same words).
+//
+// Returns false for a flat id past the real tile total; the host dispatches a conservative bound,
+// so the residual workgroups land here and exit before touching A, B or the row ids.
+bool mmid_compact_tile(uint flat_tile, out uint expert_idx, out uint ic) {
+    const uint tile_base = 2 * p.n_experts + 1 + p.nei0 * p.nei1;
+
+    if (flat_tile >= uint(data_expert_count[tile_base + p.n_experts])) {
+        return false;
+    }
+
+    // invariant: tile_offsets[lo] <= flat_tile, and tile_offsets[hi] > flat_tile or hi == n_experts
+    uint lo = 0;
+    uint hi = p.n_experts;
+    while (hi - lo > 1) {
+        const uint mid = (lo + hi) >> 1;
+        if (uint(data_expert_count[tile_base + mid]) <= flat_tile) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    expert_idx = lo;
+    ic         = flat_tile - uint(data_expert_count[tile_base + lo]);
+    return true;
+}
+
 #ifdef MUL_MAT_ID_USE_SUBGROUPS
 shared uvec4 ballots_sh[NUM_WARPS];
 

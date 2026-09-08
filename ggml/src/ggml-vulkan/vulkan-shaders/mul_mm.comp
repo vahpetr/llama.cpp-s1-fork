@@ -91,6 +91,7 @@ layout (push_constant) uniform parameter
     uint padded_N;
     uint n_experts;
     uint hoist_row_ids;
+    uint mmid_compact;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -143,13 +144,25 @@ shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #include "mul_mm_funcs.glsl"
 
 void main() {
-    const uint ic = gl_WorkGroupID.y;
-
 #ifdef MUL_MAT_ID
-    const uint expert_idx = gl_WorkGroupID.z;
+    // [TAG_MMID_COMPACT] Either enumeration hands this workgroup one (expert, ic) pair and nothing
+    // downstream can tell them apart: ir/ic/expert_idx are the only launch-derived values, and the
+    // row ids, the K loop and the store are functions of exactly those three.
+    uint ic;
+    uint expert_idx;
+    if (p.mmid_compact != 0) {
+        if (!mmid_compact_tile(gl_WorkGroupID.z, expert_idx, ic)) {
+            return;
+        }
+    } else {
+        ic         = gl_WorkGroupID.y;
+        expert_idx = gl_WorkGroupID.z;
+    }
     if (ic * BN >= data_expert_count[expert_idx]) {
         return;
     }
+#else
+    const uint ic = gl_WorkGroupID.y;
 #endif
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);

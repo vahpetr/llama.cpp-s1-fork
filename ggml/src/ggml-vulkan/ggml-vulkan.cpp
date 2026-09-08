@@ -1401,6 +1401,7 @@ struct vk_mat_mat_id_push_constants {
     uint32_t padded_N;
     uint32_t n_experts;
     uint32_t hoist_row_ids;
+    uint32_t mmid_compact;
 };
 struct vk_mat_vec_id_push_constants {
     uint32_t ncols;
@@ -1485,6 +1486,9 @@ struct vk_op_count_experts_push_constants {
     uint32_t hoist_row_ids;
     uint32_t ne00mp;
     uint32_t ne00L;
+    // [TAG_MMID_COMPACT] BN of the mul_mat_id pipeline this count feeds, or 0 to skip the
+    // per-expert tile prefix sum entirely (then the scratch keeps its pre-G51 size and contents).
+    uint32_t tile_bn;
 };
 
 struct vk_op_glu_push_constants {
@@ -9298,14 +9302,39 @@ static void ggml_vk_matmul_id(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
-        uint32_t padded_n, bool hoist_row_ids) {
+        uint32_t padded_n, bool hoist_row_ids, bool mmid_compact, uint32_t mmid_tile_bound) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-                                              nei0, nei1, nbi1, ne11, padded_n, n_as, uint32_t(hoist_row_ids) };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
+                                              nei0, nei1, nbi1, ne11, padded_n, n_as, uint32_t(hoist_row_ids),
+                                              uint32_t(mmid_compact) };
+
+    // The default grid is one (M-tile, N-tile) pair per expert: { m, nei1, n_as } becomes
+    // { ceil(m/BM), ceil(nei1/BN), n_as } workgroups.  Only ceil(count_e / BN) of an expert's
+    // ceil(nei1 / BN) N-tiles hold rows - 1 of 16 at n_as 512 / nei0 10 / nei1 2048 with BN 128 -
+    // so ~97 % of them exit immediately on `ic * BN >= data_expert_count[expert_idx]`.
+    //
+    // The y extent cannot simply be shrunk in place: an expert's count is bounded only by nei1 (a
+    // fully skewed router puts every token on one expert), and a tile that is never dispatched is a
+    // dst row that is never written, which no in-shader early-out can recover.
+    //
+    // [TAG_MMID_COMPACT] G51 flattens the pair instead.  count_experts.comp writes the per-expert
+    // prefix sum of ceil(count_e / BN), mmid_compact_tile() inverts it, and the caller passes a
+    // conservative host-computed bound on the total (the derivation is at its computation site in
+    // ggml_vk_mul_mat_id_q_f16).  The slack workgroups - 672 minus the real total at the production
+    // shape - return from mmid_compact_tile() before touching A, B, the ids or the row ids.
+    //
+    // No indirect dispatch and no readback: prealloc_split_k is created without eIndirectBuffer
+    // (see the usage flags in ggml_vk_create_buffer) and would additionally need a DRAW_INDIRECT
+    // barrier in ggml_vk_sync_buffers.
+    if (mmid_compact) {
+        // elements[1] = 1 gives CEIL_DIV(1, BN) = 1, so y is flat and z carries the pair index.
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, 1, mmid_tile_bound });
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
+    }
 }
 
 static bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
@@ -10503,6 +10532,15 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                 hoisted_row_id_words * sizeof(uint32_t) <=
                                     ctx->device->properties.limits.maxStorageBufferRange;
 
+    // [TAG_MMID_COMPACT] G51: flatten the (expert, N-tile) grid.  count_experts.comp appends a
+    // per-expert tile prefix sum after the row ids and the matmul_id shaders binary-search it to
+    // turn a flat workgroup id into (expert, ic), so the y*z extent shrinks from
+    // n_as * ceil(nei1 / BN) to a host-computable bound on sum_e ceil(count_e / BN).  It rides on
+    // the hoisted row id table, so it is off whenever hoisting is.
+    // Value-parsed, not a presence test - see ggml_vk_env_bool [TAG_ENV_BOOL].
+    static const bool enable_mmid_compact = ggml_vk_env_bool("GGML_VK_MMID_COMPACT", true);
+    bool mmid_compact = enable_mmid_compact && hoist_row_ids;
+
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
     ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
@@ -10590,6 +10628,35 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
+
+    // [TAG_MMID_COMPACT] The compact grid puts one (expert, N-tile) pair per z workgroup, so its
+    // extent is a bound on sum_e ceil(count_e / BN) rather than n_as.  Derivation:
+    //
+    //   sum_e ceil(c_e / BN) = #{e : c_e > 0} + sum_e floor((c_e - 1) / BN)          (c_e > 0 terms)
+    //                       <= min(n_as, R)   + floor(R / BN),   R = sum_e c_e <= nei0 * nei1
+    //
+    // using sum of floors <= floor of sum.  R is the number of routed rows, which the host bounds by
+    // nei0 * nei1 without reading anything back.  Prefill (n_as 512, nei0 10, nei1 2048, BN 128):
+    // 512 + 160 = 672 against 512 * ceil(2048/128) = 8 192 tile-columns.  A fully skewed router is
+    // the easy case - one expert with R rows is ceil(R / BN) <= 1 + floor(R / BN) tiles - so the
+    // bound holds for every routing, with the whole min(n_as, R) term to spare.
+    //
+    // Unlike the old z extent (n_as, capped at 512 by the hoisting limit) this one grows with
+    // nei0 * nei1 / BN, so a pathological shape can exceed maxComputeWorkGroupCount[2] (65 535 is
+    // the Vulkan minimum).  Fall back to the 3-D grid there rather than tripping the assert in
+    // ggml_vk_dispatch_pipeline.  wg_denoms[1] is the pipeline's BN spec constant - the same value
+    // count_experts.comp is told to build the tile prefix sum with.
+    uint32_t mmid_tile_bound = 0;
+    if (mmid_compact) {
+        const uint64_t n_rows = nei0 * nei1;
+        const uint64_t bound  = std::min<uint64_t>(n_as, n_rows) + n_rows / pipeline->wg_denoms[1];
+        if (bound <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
+            mmid_tile_bound = (uint32_t)bound;
+        } else {
+            mmid_compact = false;
+        }
+    }
+
     // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
     uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) :ne11;
     const uint64_t x_ne = ggml_nelements(src0);
@@ -10644,8 +10711,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     vk_pipeline count_experts = hoist_row_ids ? ctx->device->pipeline_count_experts_hoist
                                               : ctx->device->pipeline_count_experts;
 
+    // [TAG_MMID_COMPACT] the tile prefix sum is n_as offsets plus the total, appended after the
+    // (fixed, nei0*nei1 word) row id region so the header and the row ids keep their addresses.
     const size_t expert_data_size = sizeof(uint32_t) *
-        (hoist_row_ids ? hoisted_row_id_words : n_as);
+        (hoist_row_ids ? hoisted_row_id_words + (mmid_compact ? n_as + 1 : 0) : n_as);
 
     {
         if (
@@ -10740,7 +10809,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                            (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
                                            (uint32_t)n_as,
                                            uint32_t(hoist_row_ids),
-                                           0, 0 };
+                                           0, 0,
+                                           mmid_compact ? pipeline->wg_denoms[1] : 0u };
         init_pushconst_fastdiv(pc);
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
             { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc,
@@ -10813,7 +10883,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         { d_D, d_buf_offset, d_sz }, { d_ids, ids_buf_offset, ids_sz }, expert_count_buf,
         ne01, ne21, ne10, ne10, stride_b_y, ne01,
         stride_batch_x, stride_batch_y, ne20*ne21,
-        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, padded_n, hoist_row_ids
+        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, padded_n, hoist_row_ids, mmid_compact,
+        mmid_tile_bound
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
