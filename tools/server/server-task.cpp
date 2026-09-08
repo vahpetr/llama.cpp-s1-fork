@@ -1563,6 +1563,10 @@ std::string server_task_result_metrics::to_metrics() {
             "Number of sample calls that built only a candidate window instead of the full vocabulary",
             (double) metrics.n_sampling_fast
         }, {
+            "sampling_fastpath_penalties_total",
+            "Subset of sampling_fastpath_total: windows built with the penalty-aware mode (G52, FAST_TOPK_PEN)",
+            (double) metrics.n_sampling_fast_pen
+        }, {
             "spec_decode_num_draft_tokens_total",
             "Speculative: Total draft tokens generated",
             (double) metrics.n_draft_tokens
