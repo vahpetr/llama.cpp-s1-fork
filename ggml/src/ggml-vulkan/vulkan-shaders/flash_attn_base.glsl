@@ -37,6 +37,18 @@ const bool DEADV_LDS       = (Flags & 32) != 0;
 // of one pass per token, which is the point: at decode depth this kernel is bound by how many
 // times it streams its KV head.  Rows still index gl_WorkGroupID.x the way the non-gqa path
 // does (i = row tile), and the mask gets a real per-row stride.
+//
+// The packing is dense: a Br tile is a contiguous slice of the row space and a token's rows
+// may straddle two tiles.  The alternative - round each tile down to a whole number of tokens,
+// floor(Br / gqa_ratio) * gqa_ratio rows - keeps every tile's rows inside one token, but at
+// the shape this exists for (gqa_ratio 12, Br 32) that is 24 rows per tile, so it needs the
+// same ceil(6 / 2) = 3 tiles as dense packing while leaving a quarter of every tile's QK and
+// P*V work on padding rows.  It buys nothing in return: no reduction in this kernel is over
+// rows, so a tile that mixes tokens costs nothing, and the mask is read per row either way
+// (the four rows of one mask f16vec4 already come from four independent scalar loads).  What
+// the alternative WOULD buy is a tile-uniform mask row, i.e. one mask load broadcast to all
+// rows - but at decode the mask block is 64 x Br f16 served out of L1, not a DRAM cost, so it
+// is not worth a quarter of the tile.
 const bool GQA_TOKENS      = (Flags & 64) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
