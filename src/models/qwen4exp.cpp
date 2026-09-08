@@ -491,6 +491,57 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
 // LLAMA_PLE_INPUT=0 restores the in-graph ggml_get_rows path verbatim, including its
 // [TAG_PLE_PREFETCH] madvise (which is redundant here: the host gather reads the rows itself, on 16
 // threads, so there is nothing left to overlap the advisory page-ins with).
+// [TAG_PLE_INPUT_OVERLAP]
+// The cross-ubatch overlap (the r2 study's rank 5 / G27, "gather ubatch i+1's rows during ubatch
+// i's GPU work") comes out of the change above for free, with no prefetch thread and no
+// llama_context change. Traced end to end, because "for free" is a claim that has to be checked:
+//
+//   1. llama_context::decode() loops over the ubatches of one batch and, per ubatch, calls
+//      process_ubatch(): mctx->apply(), build_graph(), ggml_backend_sched_alloc_graph(),
+//      res->set_inputs(&ubatch), graph_compute() (src/llama-context.cpp).
+//   2. graph_compute() calls ggml_backend_sched_graph_compute_ASYNC() and returns its status
+//      without synchronizing (src/llama-context.cpp).
+//   3. ggml_backend_vk_graph_compute() records and submits, then returns *without waiting* when
+//      device->support_async is set -- true for every non-DG1 vendor unless GGML_VK_DISABLE_ASYNC
+//      is exported (ggml-vulkan.cpp: support_async assignment, and the trailing
+//      `if (!ctx->device->support_async) ggml_vk_synchronize(ctx);`).
+//   4. nothing in the rest of the decode loop blocks: logits, embeddings, the MTP h_nextn rows and
+//      the sampler outputs all leave through ggml_backend_tensor_get_async(), and the only
+//      ggml_backend_sched_synchronize() is after the loop.
+//
+// So when set_input() runs for ubatch i+1, ubatch i's graph is still executing on the GPU, and the
+// host gather -- the whole ~500-900 ms of it at -ub 2048 -- runs against that. The CPU blocks on
+// ubatch i only later, inside ubatch i+1's own ggml_backend_sched_compute_splits().
+//
+// WHY IT IS RACE-FREE, i.e. why no second buffer is needed. ggml_backend_sched_compute_splits()
+// treats a GGML_TENSOR_FLAG_INPUT source differently from every other split input
+// (ggml/src/ggml-backend.cpp): "inputs from the user must be copied immediately to prevent the user
+// overwriting the data before the copy is done" -- it does ggml_backend_synchronize(split_backend)
+// and then a SYNCHRONOUS ggml_backend_tensor_copy() into the device-side copy, not the async one.
+// So by the time ubatch i's graph starts executing, its device copy of this tensor already holds
+// the bytes and the host tensor is dead to it. Overwriting the host tensor during ubatch i's
+// execution therefore cannot be observed by ubatch i -- which is the same invariant that lets
+// llama_context refill inp_tokens, inp_pos and the KQ mask in place, and it is why the tensor here
+// is a graph input and not a hand-managed buffer.
+//
+// What removes the overlap, in case a measurement ever shows it gone:
+//   * GGML_VK_PERF_LOGGER=1 -- the perf logger forces a submit + waitForFences per graph, so every
+//     graph_compute becomes synchronous. Do not read a G25 A/B off an instrumented run.
+//   * GGML_VK_DISABLE_ASYNC=1, or an Intel DG1 (support_async false -> graph_compute waits).
+//   * cparams.pipeline_parallel (false on a single device): llama_context then calls
+//     ggml_backend_sched_synchronize() before set_inputs on the graph-reuse path.
+//   * the first ubatch of a batch, which by definition has nothing in flight to hide behind, and
+//     single-ubatch decode graphs, whose gather is 96 rows anyway.
+//
+// A LLAMA_PLE_INPUT_PREFETCH thread was considered and dropped: it could only help the first
+// ubatch of a batch, and it would have to compute ubatch i+1's row ids before mctx->apply() has
+// stored that ubatch in the KV cells -- llama_kv_cache::get_prev_tokens() reads the predecessors
+// out of the cells and explicitly documents that dependency ("apply_ubatch() has already stored
+// the current ubatch"), so every token past the first two would hash against LLAMA_TOKEN_NULL.
+// Getting it right needs a next-ubatch accessor on llama_memory_context_i, a prefetch hook in
+// llama_context::decode(), a join before mctx->apply(), and a shadow reimplementation of
+// apply_ubatch()'s effect on get_prev_tokens() -- four changes to shared code, for a window this
+// change already covers.
 static bool qwen4exp_ple_input_enabled() {
     static const bool enabled = [] {
         const char * s = getenv("LLAMA_PLE_INPUT");
