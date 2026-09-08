@@ -70,6 +70,7 @@ layout (push_constant) uniform parameter
 #ifdef MUL_MAT_ID
     uint n_experts;
     uint hoist_row_ids;
+    uint mmid_compact;
 #endif
 } p;
 
@@ -164,6 +165,31 @@ D_TYPE perElemOpD(const in uint32_t r, const in uint32_t c, const in D_TYPE elem
     return elem;
 }
 
+// [TAG_MMID_COMPACT] cm2 keeps its own copy of the row id helpers; this mirrors
+// mul_mm_id_funcs.glsl's mmid_compact_tile() exactly, see the comment there.
+bool mmid_compact_tile(uint flat_tile, out uint expert_idx, out uint ic) {
+    const uint tile_base = 2 * p.n_experts + 1 + p.nei0 * p.nei1;
+
+    if (flat_tile >= uint(data_expert_count[tile_base + p.n_experts])) {
+        return false;
+    }
+
+    uint lo = 0;
+    uint hi = p.n_experts;
+    while (hi - lo > 1) {
+        const uint mid = (lo + hi) >> 1;
+        if (uint(data_expert_count[tile_base + mid]) <= flat_tile) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    expert_idx = lo;
+    ic         = flat_tile - uint(data_expert_count[tile_base + lo]);
+    return true;
+}
+
 void load_row_ids(uint expert_idx, bool nei0_is_pow2, uint ic) {
     _ne1 = 0;
     uint num_elements = p.nei1 * p.nei0;
@@ -250,10 +276,19 @@ void load_row_ids_hoisted(uint expert_idx, uint ic) {
 
 void main() {
     const uint tid = gl_LocalInvocationIndex;
-    const uint ic = gl_WorkGroupID.y;
 
 #ifdef MUL_MAT_ID
-    const uint expert_idx = gl_WorkGroupID.z;
+    // [TAG_MMID_COMPACT] see mul_mm.comp: only the enumeration of (expert, ic) changes.
+    uint ic;
+    uint expert_idx;
+    if (p.mmid_compact != 0) {
+        if (!mmid_compact_tile(gl_WorkGroupID.z, expert_idx, ic)) {
+            return;
+        }
+    } else {
+        ic         = gl_WorkGroupID.y;
+        expert_idx = gl_WorkGroupID.z;
+    }
     if (ic * BN >= data_expert_count[expert_idx]) {
         return;
     }
@@ -264,6 +299,8 @@ void main() {
 #if !defined(NEEDS_INIT_IQ_SHMEM)
     barrier();
 #endif
+#else
+    const uint ic = gl_WorkGroupID.y;
 #endif
 
 #ifdef NEEDS_INIT_IQ_SHMEM
