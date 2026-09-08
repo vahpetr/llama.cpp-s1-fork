@@ -74,6 +74,7 @@ const char * common_sampler_fastpath_str(const struct common_sampler * gsmpl);
 uint64_t common_sampler_perf_time_us();  // wall time spent inside common_sampler_sample()
 uint64_t common_sampler_perf_n_sample(); // number of calls
 uint64_t common_sampler_perf_n_fast();   // number of calls that built only a candidate window
+uint64_t common_sampler_perf_n_fast_pen(); // subset of those: the penalty-aware window (FAST_TOPK_PEN)
 
 // extended sampling implementation:
 //

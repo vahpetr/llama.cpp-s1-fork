@@ -1167,9 +1167,10 @@ public:
         server_metrics res = metrics;
 
         // G32: process-wide, not tracked per slot - see the SERVER_TASK_TYPE_METRICS handler
-        res.n_sampling_us    = common_sampler_perf_time_us();
-        res.n_sampling_calls = common_sampler_perf_n_sample();
-        res.n_sampling_fast  = common_sampler_perf_n_fast();
+        res.n_sampling_us       = common_sampler_perf_time_us();
+        res.n_sampling_calls    = common_sampler_perf_n_sample();
+        res.n_sampling_fast     = common_sampler_perf_n_fast();
+        res.n_sampling_fast_pen = common_sampler_perf_n_fast_pen();
 
         return res;
     }

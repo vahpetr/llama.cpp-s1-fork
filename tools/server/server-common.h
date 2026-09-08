@@ -484,9 +484,10 @@ struct server_metrics {
     uint64_t n_busy_slots = 0;
 
     // G32: CPU sampling cost, filled from the process-wide counters in common/sampling.cpp when /metrics is served
-    uint64_t n_sampling_us    = 0;
-    uint64_t n_sampling_calls = 0;
-    uint64_t n_sampling_fast  = 0;
+    uint64_t n_sampling_us       = 0;
+    uint64_t n_sampling_calls    = 0;
+    uint64_t n_sampling_fast     = 0;
+    uint64_t n_sampling_fast_pen = 0;
 
     uint64_t n_draft_tokens      = 0; // Total draft tokens generated
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
