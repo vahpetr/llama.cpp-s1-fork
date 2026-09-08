@@ -328,9 +328,21 @@ struct common_params_speculative_draft {
 
     // pick the draft length per slot from the running acceptance instead of always drafting n_max
     // (server only; see the design note at server_slot::spec_n_max_adaptive())
+    //
+    // The cost model is affine in the KV depth, because every drafted token adds one more KV pass to
+    // the verification graph (and to the draft loop), so both costs grow with n_kv:
+    //     t_tok(n_kv) = t_tok0 + k_tok * n_kv    ms, cost of ONE extra drafted token
+    //     t_dec(n_kv) = t_dec0 + k_dec * n_kv    ms, cost of a plain 1-token decode
+    // Defaults are fitted from the s1 (Strix Halo / Qwen3.8-Flash-Next + MTP, n-max 5) measurements,
+    // see the fit in the commit message and at server_slot::spec_n_max_adaptive().
     bool  n_max_adaptive       = false;
-    float n_max_adaptive_t_tok = 5.0f;   // ms: cost of ONE extra drafted token in a verification decode
-    float n_max_adaptive_t_dec = 31.0f;  // ms: cost of a plain 1-token decode (what an accepted token saves)
+    float n_max_adaptive_t_tok = 12.0f;    // ms  @ n_kv = 0
+    float n_max_adaptive_t_dec = 32.0f;    // ms  @ n_kv = 0
+    float n_max_adaptive_k_tok = 9.0e-5f;  // ms per KV cell
+    float n_max_adaptive_k_dec = 9.0e-5f;  // ms per KV cell
+    // prefer the server's own measured round times (an exponentially-weighted least-squares fit of the
+    // decode wall time against the batch token count) over the affine model above, when the fit is usable
+    bool  n_max_adaptive_measure = true;
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)

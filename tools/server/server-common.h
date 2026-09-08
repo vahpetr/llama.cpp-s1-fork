@@ -496,6 +496,13 @@ struct server_metrics {
     uint64_t n_spec_empty_drafts  = 0;
     uint64_t n_spec_fold_rejected = 0;
 
+    // adaptive draft length (--spec-draft-n-max-adaptive) - gauges, last decision taken by any slot
+    uint64_t spec_adaptive_n_max    = 0;  // effective draft length asked of the drafter
+    uint64_t spec_adaptive_n_kv     = 0;  // KV depth the cost model was evaluated at
+    uint64_t spec_adaptive_measured = 0;  // 1 = costs came from the running fit, 0 = the affine model
+    double   spec_adaptive_t_tok_ms = 0.0;
+    double   spec_adaptive_t_dec_ms = 0.0;
+
     void init() {
         t_start = ggml_time_us();
     }

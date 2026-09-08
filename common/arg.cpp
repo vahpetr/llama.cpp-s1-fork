@@ -4171,21 +4171,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_ADAPTIVE"));
     add_opt(common_arg(
-        {"--spec-draft-n-max-adaptive-cost"}, "T_TOK,T_DEC",
-        string_format("cost model for --spec-draft-n-max-adaptive, in ms: one extra drafted token, one plain decode (default: %.1f,%.1f)",
-                      (double) params.speculative.draft.n_max_adaptive_t_tok, (double) params.speculative.draft.n_max_adaptive_t_dec),
+        {"--spec-draft-n-max-adaptive-cost"}, "T_TOK0,T_DEC0[,K_TOK,K_DEC]",
+        string_format("depth-aware cost model for --spec-draft-n-max-adaptive: t_tok(n_kv) = T_TOK0 + K_TOK*n_kv is the "
+                      "cost in ms of one extra drafted token, t_dec(n_kv) = T_DEC0 + K_DEC*n_kv the cost of a plain "
+                      "1-token decode; giving only two values leaves the slopes at their defaults "
+                      "(default: %g,%g,%g,%g)",
+                      (double) params.speculative.draft.n_max_adaptive_t_tok, (double) params.speculative.draft.n_max_adaptive_t_dec,
+                      (double) params.speculative.draft.n_max_adaptive_k_tok, (double) params.speculative.draft.n_max_adaptive_k_dec),
         [](common_params & params, const std::string & value) {
-            const size_t pos = value.find(',');
-            if (pos == std::string::npos) {
-                throw std::invalid_argument("expected T_TOK,T_DEC");
+            std::vector<std::string> parts = string_split<std::string>(value, ',');
+            if (parts.size() != 2 && parts.size() != 4) {
+                throw std::invalid_argument("expected T_TOK0,T_DEC0 or T_TOK0,T_DEC0,K_TOK,K_DEC");
             }
-            params.speculative.draft.n_max_adaptive_t_tok = std::stof(value.substr(0, pos));
-            params.speculative.draft.n_max_adaptive_t_dec = std::stof(value.substr(pos + 1));
-            if (params.speculative.draft.n_max_adaptive_t_tok <= 0.0f || params.speculative.draft.n_max_adaptive_t_dec <= 0.0f) {
+            auto & dp = params.speculative.draft;
+            dp.n_max_adaptive_t_tok = std::stof(parts[0]);
+            dp.n_max_adaptive_t_dec = std::stof(parts[1]);
+            if (parts.size() == 4) {
+                dp.n_max_adaptive_k_tok = std::stof(parts[2]);
+                dp.n_max_adaptive_k_dec = std::stof(parts[3]);
+            }
+            if (dp.n_max_adaptive_t_tok <= 0.0f || dp.n_max_adaptive_t_dec <= 0.0f) {
                 throw std::invalid_argument("costs must be positive");
+            }
+            if (dp.n_max_adaptive_k_tok < 0.0f || dp.n_max_adaptive_k_dec < 0.0f) {
+                throw std::invalid_argument("cost slopes must not be negative");
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_ADAPTIVE_COST"));
+    add_opt(common_arg(
+        {"--spec-draft-n-max-adaptive-measure"},
+        {"--no-spec-draft-n-max-adaptive-measure"},
+        string_format("with --spec-draft-n-max-adaptive, prefer the server's measured decode round times over the "
+                      "--spec-draft-n-max-adaptive-cost model when the running fit is usable (default: %s)",
+                      params.speculative.draft.n_max_adaptive_measure ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.n_max_adaptive_measure = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_ADAPTIVE_MEASURE"));
     add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),

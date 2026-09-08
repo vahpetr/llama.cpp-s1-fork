@@ -430,23 +430,38 @@ struct server_slot {
 
     // --- adaptive draft length (--spec-draft-n-max-adaptive) ------------------------------------
     //
-    // Cost model, measured on this target (docs/verification/2026-09-03-spec-replay-census.md §11):
-    // a verification decode of D+1 tokens costs t_dec + D*t_tok (31.5 ms + ~6 ms/token on the prod
-    // GGUF), while every accepted draft token saves a whole plain decode (t_dec).
+    // A verification decode of D+1 tokens costs t_dec + D*t_tok, while every accepted draft token
+    // saves a whole plain decode (t_dec).
     // Drafting position d (1-based) costs t_tok unconditionally, but it only pays off when the whole
     // prefix 1..d is accepted, i.e. with probability P_d = prod_{i<=d} p_i, where
     // p_i = P(pos i accepted | 1..i-1 accepted). So we draft the longest prefix whose marginal value
-    // is positive: P_d * t_dec > t_tok  (with the default costs: P_d > 0.16).
+    // is positive: P_d * t_dec > t_tok, i.e. P_d > r with r = t_tok/t_dec.
     // p_i is estimated per slot as an EMA over this slot's verification rounds (window ~32,
     // alpha = 1/32), initialized optimistically at 1.0, so a slot drafts the configured n-max until
     // its own acceptance says otherwise, and re-adapts within ~32 rounds when the text changes kind.
-    // The result is clamped to [1, configured n-max].
+    // The result is clamped to [1, configured n-max], so the recurrent-state rollback depth
+    // (n_rs_seq = n-max, allocated at startup) is never exceeded.
+    //
+    // [TAG_SPEC_ADAPTIVE_DEPTH] t_tok and t_dec are NOT constants: each drafted token adds one more
+    // KV pass to the verification graph (and to the draft loop), so both grow with the KV depth.
+    // The server therefore evaluates the affine model
+    //     t_tok(n_kv) = t_tok0 + k_tok * n_kv ,  t_dec(n_kv) = t_dec0 + k_dec * n_kv
+    // at the slot's current depth, and prefers its own measured round times when they are available
+    // (see server_context_impl::spec_cost). Because r(n_kv) rises with n_kv, the chosen draft length
+    // shrinks with depth - which is the point: at 213k a drafted token costs a much larger fraction
+    // of the decode it might save than at 8k.
     //
     // Quality: this only changes HOW MANY tokens are drafted. Verification and acceptance are
     // untouched (greedy accept-if-equal at temp 0, unchanged rejection sampling above it), so the
     // emitted distribution is unchanged; only the round structure differs.
     std::vector<float> spec_acc_ema;    // p_i per draft position, EMA
-    int                spec_n_max_last = 0; // last adaptive draft length (trace only)
+    int                spec_n_max_last = 0; // last adaptive draft length (also reported in /slots)
+
+    // last cost model evaluation, for /slots and /metrics (diagnostics only)
+    float spec_cost_t_tok    = 0.0f;
+    float spec_cost_t_dec    = 0.0f;
+    int   spec_cost_n_kv     = 0;
+    bool  spec_cost_measured = false;
 
     static constexpr float SPEC_ACC_EMA_ALPHA = 1.0f/32.0f;
 
@@ -527,7 +542,11 @@ struct server_slot {
         stats = {};
         n_accepted_per_pos.clear();
         spec_acc_ema.clear();
-        spec_n_max_last = 0;
+        spec_n_max_last    = 0;
+        spec_cost_t_tok    = 0.0f;
+        spec_cost_t_dec    = 0.0f;
+        spec_cost_n_kv     = 0;
+        spec_cost_measured = false;
 
         n_predict_max = -1;
 
@@ -845,6 +864,24 @@ struct server_slot {
             {"is_processing", is_processing()},
         };
 
+        // adaptive draft length (--spec-draft-n-max-adaptive): the effective n-max this slot last
+        // asked the drafter for, and the cost model it came from - so a bench can see the rule work
+        if (spec_n_max_last > 0) {
+            json acc_ema = json::array();
+            for (const float p : spec_acc_ema) {
+                acc_ema.push_back(p);
+            }
+
+            res["spec_draft"] = {
+                {"n_max_eff",    spec_n_max_last},
+                {"acc_ema",      acc_ema},
+                {"cost_t_tok_ms", spec_cost_t_tok},
+                {"cost_t_dec_ms", spec_cost_t_dec},
+                {"cost_n_kv",     spec_cost_n_kv},
+                {"cost_measured", spec_cost_measured},
+            };
+        }
+
         const auto & ptask = task ? task : task_prev;
 
         if (ptask) {
@@ -978,6 +1015,87 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     return try_decode();
 }
 
+// [TAG_SPEC_ADAPTIVE_DEPTH] running cost fit for the adaptive draft length
+//
+// Every target decode gives us one (n_tokens, wall_time) sample. The cost of a decode is affine in
+// the batch size, cost(n) = a + b*n, so an exponentially-weighted least-squares fit of the wall time
+// against the token count recovers exactly the two numbers the adaptive rule needs:
+//     t_tok = b       (one extra drafted token in the verification decode)
+//     t_dec = a + b   (a plain 1-token decode)
+// The window is short enough (~256 rounds) that the fit is local in KV depth: it tracks the depth of
+// the traffic that is actually running instead of extrapolating an affine model from startup. When
+// the fit is not usable - too few samples, or the batch sizes seen were all the same, so the slope is
+// not identified - the caller falls back to the configured affine-in-n_kv model.
+//
+// Only decodes that are pure generation (no prompt tokens) and that were synchronized are fed in, so
+// prefill ubatches cannot contaminate the fit.
+struct server_spec_cost_fit {
+    static constexpr double ALPHA   = 1.0/256.0; // forgetting factor
+    static constexpr double W_MIN   = 32.0;      // effective samples before the fit is trusted
+    static constexpr double VAR_MIN = 0.25;      // spread in n (var, tokens^2) needed to identify the slope
+    static constexpr double R_MAX   = 0.98;      // a drafted token cannot cost a whole decode - see solve()
+
+    double w = 0.0, s_n = 0.0, s_t = 0.0, s_nn = 0.0, s_nt = 0.0;
+
+    void add(int n_tokens, double t_ms) {
+        if (n_tokens <= 0 || !(t_ms > 0.0)) {
+            return;
+        }
+
+        // reject gross outliers (a stall, a page-fault storm, a task processed inside the yield):
+        // they would drag the slope around for a whole window
+        if (w >= W_MIN) {
+            const double mean_t = s_t / w;
+            if (t_ms > 8.0*mean_t) {
+                return;
+            }
+        }
+
+        const double n = (double) n_tokens;
+        const double d = 1.0 - ALPHA;
+
+        w    = d*w    + 1.0;
+        s_n  = d*s_n  + n;
+        s_t  = d*s_t  + t_ms;
+        s_nn = d*s_nn + n*n;
+        s_nt = d*s_nt + n*t_ms;
+    }
+
+    // returns true and fills t_tok/t_dec (ms) when the fit is usable
+    bool solve(float & t_tok, float & t_dec) const {
+        if (w < W_MIN) {
+            return false;
+        }
+
+        const double mean_n = s_n / w;
+        const double mean_t = s_t / w;
+        const double var_n  = s_nn / w - mean_n*mean_n;
+
+        if (var_n < VAR_MIN) {
+            return false; // all batches had the same size - the slope is not identified
+        }
+
+        const double cov   = s_nt / w - mean_n*mean_t;
+        const double slope = cov / var_n;
+        const double icpt  = mean_t - slope*mean_n;
+
+        if (!(slope > 0.0) || !(icpt > 0.0)) {
+            return false; // nonsense fit (noise-dominated); keep the model
+        }
+
+        // a verification decode of d+1 tokens is one graph, so one extra drafted token cannot cost as
+        // much as the whole decode it might save; a fit that says otherwise is noise, not physics
+        if (slope > R_MAX*(icpt + slope)) {
+            return false;
+        }
+
+        t_tok = (float) slope;
+        t_dec = (float) (icpt + slope);
+
+        return true;
+    }
+};
+
 //
 // server_context_impl (private implementation)
 //
@@ -1073,6 +1191,9 @@ private:
     int64_t  t_decode_start  = 0; // start of the last submitted decode
     int64_t  t_prompt_start  = 0; // start of the oldest queued prompt decode
     uint64_t n_prompt_queued = 0;
+
+    // measured cost model for --spec-draft-n-max-adaptive (see server_spec_cost_fit)
+    server_spec_cost_fit spec_cost;
 
     json json_ui_settings = json::object();
 
@@ -3170,11 +3291,28 @@ private:
                         if (params_base.speculative.draft.n_max_adaptive) {
                             const auto & dparams = params_base.speculative.draft;
 
-                            float p_cum = 1.0f;
-                            const int n_adapt = slot.spec_n_max_adaptive(
-                                    common_speculative_n_max(spec.get()),
-                                    dparams.n_max_adaptive_t_tok, dparams.n_max_adaptive_t_dec, &p_cum);
+                            // [TAG_SPEC_ADAPTIVE_DEPTH] the cost of a drafted token and of the decode it
+                            // might save both grow with the KV depth - evaluate them at this slot's depth,
+                            // or take the server's own measured round times when the fit is usable
+                            const int n_kv = spec_n_kv_depth(slot);
 
+                            float t_tok = dparams.n_max_adaptive_t_tok + dparams.n_max_adaptive_k_tok*(float) n_kv;
+                            float t_dec = dparams.n_max_adaptive_t_dec + dparams.n_max_adaptive_k_dec*(float) n_kv;
+
+                            const bool measured = dparams.n_max_adaptive_measure && spec_cost.solve(t_tok, t_dec);
+
+                            const int n_max_cfg = common_speculative_n_max(spec.get());
+
+                            float p_cum = 1.0f;
+                            int n_adapt = slot.spec_n_max_adaptive(n_max_cfg, t_tok, t_dec, &p_cum);
+
+                            // --spec-draft-n-min: the drafter throws away a draft shorter than n_min, so
+                            // shortening below it would silently disable speculation instead of cheapening it
+                            n_adapt = std::max(n_adapt, std::min(dparams.n_min, n_max_cfg));
+
+                            // never above the configured n-max (the recurrent rollback depth n_rs_seq is
+                            // sized from it at startup) and never below 1 - both are enforced above, this
+                            // only adds the remaining context space
                             n_draft_req = std::min(n_draft_req, n_adapt);
 
                             if (trace > 0 && n_adapt != slot.spec_n_max_last) {
@@ -3182,11 +3320,23 @@ private:
                                 for (size_t i = 0; i < slot.spec_acc_ema.size(); ++i) {
                                     ema += string_format(i ? " %.3f" : "%.3f", slot.spec_acc_ema[i]);
                                 }
-                                SLT_INF(slot, "adaptive draft len: %d -> %d (p_cum %.3f, ema [%s])\n",
-                                        slot.spec_n_max_last, n_adapt, p_cum, ema.c_str());
+                                SLT_INF(slot, "adaptive draft len: %d -> %d (p_cum %.3f, ema [%s], n_kv %d, "
+                                        "t_tok %.2f ms, t_dec %.2f ms, %s)\n",
+                                        slot.spec_n_max_last, n_adapt, p_cum, ema.c_str(), n_kv,
+                                        t_tok, t_dec, measured ? "measured" : "model");
                             }
 
-                            slot.spec_n_max_last = n_adapt;
+                            slot.spec_n_max_last    = n_adapt;
+                            slot.spec_cost_t_tok    = t_tok;
+                            slot.spec_cost_t_dec    = t_dec;
+                            slot.spec_cost_n_kv     = n_kv;
+                            slot.spec_cost_measured = measured;
+
+                            metrics.spec_adaptive_n_max    = (uint64_t) n_adapt;
+                            metrics.spec_adaptive_n_kv     = (uint64_t) n_kv;
+                            metrics.spec_adaptive_t_tok_ms = t_tok;
+                            metrics.spec_adaptive_t_dec_ms = t_dec;
+                            metrics.spec_adaptive_measured = measured ? 1 : 0;
                         }
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
@@ -4259,6 +4409,24 @@ private:
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
     }
 
+    // [TAG_SPEC_ADAPTIVE_DEPTH] KV depth the next decode of this slot will attend over - the cost
+    // driver for the adaptive draft length. With a unified KV cache the attention walks the whole used
+    // span of the cache, so the depth is the max over the slots that are running; without it every
+    // sequence has its own cells and only this slot's depth matters.
+    int spec_n_kv_depth(const server_slot & slot) const {
+        int n_kv = slot.prompt.n_tokens();
+
+        if (params_base.kv_unified) {
+            for (const auto & other : slots) {
+                if (other.is_processing()) {
+                    n_kv = std::max(n_kv, (int) other.prompt.n_tokens());
+                }
+            }
+        }
+
+        return n_kv;
+    }
+
     //
     // metrics helpers
     //
@@ -4323,6 +4491,14 @@ private:
         if (has_output) {
             // the context is already synchronized, so the timings are correct
             metrics_flush_prompt();
+
+            // [TAG_SPEC_ADAPTIVE_DEPTH] one (batch size, wall time) sample for the measured cost model.
+            // Pure-generation batches only: a prefill ubatch would swamp the fit.
+            if (n_prompt_tokens == 0 &&
+                    params_base.speculative.draft.n_max_adaptive &&
+                    params_base.speculative.draft.n_max_adaptive_measure) {
+                spec_cost.add(n_tokens, (ggml_time_us() - t_decode_start) / 1000.0);
+            }
         }
 
         // advance the prompt timing of the slots that had tokens in this batch

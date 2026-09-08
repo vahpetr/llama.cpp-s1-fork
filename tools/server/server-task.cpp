@@ -1610,6 +1610,26 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "spec_decode_adaptive_n_max",
+            "Speculative: effective draft length last chosen by --spec-draft-n-max-adaptive (0 = rule not running)",
+            (double) metrics.spec_adaptive_n_max
+        }, {
+            "spec_decode_adaptive_n_kv",
+            "Speculative: KV depth the adaptive draft-length cost model was last evaluated at",
+            (double) metrics.spec_adaptive_n_kv
+        }, {
+            "spec_decode_adaptive_cost_measured",
+            "Speculative: 1 when the adaptive draft-length costs came from the running fit, 0 when from the configured model",
+            (double) metrics.spec_adaptive_measured
+        }, {
+            "spec_decode_adaptive_cost_t_tok_ms",
+            "Speculative: cost in ms of one extra drafted token, as used by the adaptive draft-length rule",
+            metrics.spec_adaptive_t_tok_ms
+        }, {
+            "spec_decode_adaptive_cost_t_dec_ms",
+            "Speculative: cost in ms of a plain 1-token decode, as used by the adaptive draft-length rule",
+            metrics.spec_adaptive_t_dec_ms
         },
     };
 
