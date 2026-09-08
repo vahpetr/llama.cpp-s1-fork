@@ -475,6 +475,7 @@ struct common_params {
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
     int32_t kv_graph_span         =     0; // cap the KV span used for the worst-case graph reserve (0 = full KV size)
+    int32_t qsa_ratio             =    -1; // [TAG_QSA_RATIO_OVERRIDE] QSA compress ratio override (-1 = from the GGUF, 0 = dense)
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
