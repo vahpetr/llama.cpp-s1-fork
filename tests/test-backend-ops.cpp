@@ -433,6 +433,7 @@ static std::string var_to_str(ggml_scale_mode mode) {
 #define VARS_TO_STR14(a, b, c, d, e, f, g, h, i, j, k, l, m, n) VAR_TO_STR(a) + "," + VARS_TO_STR13(b, c, d, e, f, g, h, i, j, k, l, m, n)
 #define VARS_TO_STR15(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) VAR_TO_STR(a) + "," + VARS_TO_STR14(b, c, d, e, f, g, h, i, j, k, l, m, n, o)
 #define VARS_TO_STR16(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) VAR_TO_STR(a) + "," + VARS_TO_STR15(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p)
+#define VARS_TO_STR17(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) VAR_TO_STR(a) + "," + VARS_TO_STR16(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
 
 #ifdef GGML_USE_SYCL
 static bool inline _isinf(float f) {
@@ -7218,9 +7219,13 @@ struct test_flash_attn_ext : public test_case {
     std::array<int32_t, 4> permute;
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
+    // rows of the mask, when it is padded past the batch. llama.cpp always pads the KQ mask to
+    // GGML_KQ_MASK_PAD (64) rows, so at decode/verify batch sizes nem1 is 64 and not nb - which
+    // is what enables the Vulkan mask-opt summary path (nem1 >= 32). 0 means "exactly nb".
+    const int64_t mask_rows;
 
     std::string vars() override {
-        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, mask_rows);
     }
 
     double max_nmse_err() override {
@@ -7237,9 +7242,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t mask_rows = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_rows(mask_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7287,7 +7292,7 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, std::max(nb, mask_rows), 1, nr23[1]);
             ggml_set_name(m, "m");
         }
 
@@ -10172,6 +10177,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                     GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, { 8, 1}, 16384, 4, true, false, 0,  0,
                                                     GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
+    // ... and the same fold as production actually dispatches it.  The cases above build a mask
+    // with exactly nb rows, which is not what llama.cpp does: the KQ mask is padded to
+    // GGML_KQ_MASK_PAD (64) rows, and that is what puts nem1 over the Vulkan backend's
+    // use_mask_opt threshold (nem1 >= 32, nem0*nem1 > 32768).  Without it the mask-opt summary
+    // path - including the folded dispatch's "read block row 0 for every row tile" rule - is
+    // never reached.  The Q/K/V layout is the permuted {0, 2, 1, 3} one a real graph produces.
+    for (int64_t nb : { 2, 5, 6 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, nb, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                                                        {0, 1, 2, 3}, true, false, 64));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, nb, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                                                        {0, 2, 1, 3}, true, false, 64));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, nb, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
+                                                        {0, 2, 1, 3}, true, false, 64));
+    }
+    // padded mask + KV that is not a multiple of the KV block (bounds-checked variant), and
+    // padded mask + ALiBi/sinks/softcap over a batch dimension, both in the permuted layout.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16385, 6, true, false, 0,  0,
+                                                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                                                    {0, 2, 1, 3}, true, false, 64));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, 16384, 6, true, true,  8, 30,
+                                                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                                                    {0, 2, 1, 3}, true, false, 64));
+    // a short KV that leaves the folded dispatch with a single split (no split_k reduce), so the
+    // fold is compared against the per-token dispatch on the non-split store path too.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 512, 6, true, false, 0,  0,
+                                                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                                                    {0, 2, 1, 3}, true, false, 64));
 
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
