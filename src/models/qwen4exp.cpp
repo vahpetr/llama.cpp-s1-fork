@@ -2113,6 +2113,12 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(embd->type == GGML_TYPE_F32);
         GGML_ASSERT(embd->ne[0] == hp.ple_head_dim*n_heads && embd->ne[1] == n_tokens);
 
+        // the gather writes idx.size()*ne[0] floats; ne[0] is the table's row length, which the
+        // loader fixes at ple_head_dim (create_tensor { ple_head_dim, ple_rows }). Assert it rather
+        // than trust it: a mismatch would run off the end of embd, not just compute the wrong thing.
+        GGML_ASSERT(pmodel.per_layer_tok_embd->ne[0] == (int64_t) hp.ple_head_dim);
+        GGML_ASSERT((int64_t) idx.size() == n_heads*n_tokens);
+
         qwen4exp_ple_gather_host(pmodel.per_layer_tok_embd, idx, (float *) embd->data, n_threads);
 
         return;
