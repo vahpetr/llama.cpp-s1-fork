@@ -11241,6 +11241,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // GGML_VK_FA_GQA_TOKENS=0 restores the per-token dispatch.
     static const bool fa_gqa_tokens = ggml_vk_env_bool("GGML_VK_FA_GQA_TOKENS", true);
     bool gqa_tokens = false;
+    const uint32_t unfolded_block_rows = tuning_params.block_rows;
     if (fa_gqa_tokens && gqa_ratio > 1 && neq1 > 1 && tuning_params.path == FA_COOPMAT1) {
         const uint32_t rows_folded = gqa_ratio * (uint32_t)neq1;
         vk_fa_tuning_params folded = tuning_params;
@@ -11343,10 +11344,21 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     // Try to use split_k when KV is large enough to be worth the overhead.
     if (gqa_tokens) {
-        // One workgroup per row tile, so the row tiles are the x geometry (as without gqa).
-        const uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
-        if (total_wgs_no_split < shader_core_count * 2) {
-            split_k = shader_core_count * 2 / total_wgs_no_split;
+        // [TAG_FA_GQA_TOKENS] split_k is deliberately NOT re-derived from the folded geometry.
+        // It partitions the KV range, and each partition produces its own softmax maximum and
+        // sum for the reduce shader to combine, so a different number of partitions gives a
+        // different (equally correct) f32 result for every row.  The fold is only allowed to
+        // change which workgroup and which tile row a query row lands in - not its arithmetic -
+        // so the KV partition is held at exactly the value the per-token dispatch would have
+        // chosen, mirroring the gqa branch below with the unfolded workgroup count and Br.
+        // Deriving it from the folded geometry instead (6 tokens, 2 KV heads, 40 CUs: 80/6 = 13
+        // splits where the per-token dispatch takes 80/12 = 6) is what made G10's bit-exactness
+        // claim false.  The cost is parallelism, not bytes: the fold halves the workgroup count
+        // (3*2*6 = 36 instead of 6*2*6 = 72) while still halving the KV bytes per round.
+        if (workgroups_x <= unfolded_block_rows) {
+            // max(1) only guards the integer division; the per-token branch below can round it
+            // to zero for a wide enough token x KV-head product and has always been able to.
+            split_k = std::max(1u, shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z));
         }
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
