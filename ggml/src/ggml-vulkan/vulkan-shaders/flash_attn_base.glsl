@@ -30,6 +30,10 @@ const bool ZERO_DEAD_V     = (Flags & 16) != 0;
 // original implementation) instead of from the P values that are still in registers.
 // Same predicate either way; this is the A/B knob (GGML_VK_FA_DEADV_LDS).
 const bool DEADV_LDS       = (Flags & 32) != 0;
+// coopmat1 only: pad the QK^T scratch stride by one ACC_TYPEV4 per KV column so the softmax's
+// column-strided scan does not put every column on one LDS bank.  Addressing only, and only
+// ever set for Br > 16.  See [TAG_FA_CM1_SF_PAD] in ggml-vulkan.cpp.
+const bool CM1_SF_PAD      = (Flags & 64) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;

@@ -58,8 +58,15 @@ shared FLOAT_TYPEV4 Qf[Br * qstride];
 const uint psh_stride = Br / 4 + 2;
 shared FLOAT_TYPEV4 Psh[Bc * psh_stride];
 
-// Avoid padding for hsk==256 to make it fit in 48KB shmem.
-const uint32_t sfshstride = (HSK <= 128) ? (Br / 4 + 2) : Br / 4;
+// sfsh is [Bc][Br]: KV column c occupies sfshstride consecutive ACC_TYPEV4, of which the
+// first Br / 4 are the query rows and the rest is padding.  Every access below goes through
+// sfshstride, so the padding is invisible to the arithmetic.
+// Avoid the 2-vec4 padding for hsk==256 to make it fit in 48KB shmem.  CM1_SF_PAD adds one
+// vec4 instead, which is what breaks the LDS bank conflict of the wide tile's rowmax scan
+// (32 words -> 36 words, 1 bank -> 8 banks); it is only ever set for Br > 16, so the
+// historical tile keeps its exact layout.  See [TAG_FA_CM1_SF_PAD] in ggml-vulkan.cpp, and
+// keep ggml_vk_flash_attn_coopmat_shmem_support in step with this expression.
+const uint32_t sfshstride = Br / 4 + (HSK <= 128 ? 2 : 0) + (CM1_SF_PAD ? 1 : 0);
 shared ACC_TYPEV4 sfsh[Bc * sfshstride];
 
 const uint32_t D_pad = HSK_pad > HSV_pad ? HSK_pad : HSV_pad;

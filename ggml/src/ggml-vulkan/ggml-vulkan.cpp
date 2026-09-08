@@ -3975,6 +3975,28 @@ static constexpr uint32_t fa_cm1_block_rows_max = 32;
 // optimum.  GGML_VK_FA_CM1_BR overrides it in either direction.
 static constexpr uint32_t fa_cm1_block_rows_32_min_n = 512;
 
+// [TAG_FA_CM1_SF_PAD] Pad the QK^T scratch by one ACC_TYPEV4 per KV column, for the wide tile
+// only.
+//
+// sfsh is [Bc][Br] of ACC_TYPEV4, so KV column c starts at c * sfshstride * 16 bytes, and the
+// softmax reads it *column*-strided: one query row, all Bc columns, one lane per column. LDS
+// has 32 banks of 4 bytes, so that read touches 32 / gcd(sfshstride * 4, 32) distinct banks.
+// At Br = 16 the stride is 4 vec4 = 16 words -> 2 banks; at Br = 32 it is 8 vec4 = 32 words,
+// i.e. every column lands on the same bank and the scan serialises 32 ways per half-wave.
+// One extra vec4 makes the stride 36 words -> 8 banks, a 4x shorter conflict, for Bc * 16 B
+// (1 KiB at Bc = 64) of shared memory - which changes no occupancy bracket either way: at
+// HSK = HSV = 256 the wide tile goes 46 816 -> 47 840 B, and both sit in the same
+// (128 KiB / 3, 128 KiB / 2] band, i.e. 2 workgroups per WGP.
+//
+// Only for Br > 16: at the historical tile the flag is never set, so those pipelines keep the
+// exact shared-memory layout (and SPIR-V) they have always had. Purely an addressing change -
+// no value, and no order of any reduction, depends on the stride - so it is bit-exact.
+// GGML_VK_FA_CM1_PAD=0 turns it off for the A/B.
+static bool fa_cm1_sf_pad(const vk_fa_tuning_params & params) {
+    static const bool enable = ggml_vk_env_bool("GGML_VK_FA_CM1_PAD", true);
+    return enable && params.path == FA_COOPMAT1 && params.block_rows > fa_cm1_block_rows_min;
+}
+
 static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc, bool gqa_batched) {
     GGML_UNUSED(n_kv);
 
@@ -4129,12 +4151,13 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
     static const bool fa_deadv_lds = ggml_vk_env_bool("GGML_VK_FA_DEADV_LDS", false);
     const bool deadv_lds = zero_dead_v && fa_deadv_lds;
 
-    uint32_t flags = (use_mask_opt      ? 1 : 0) |
-                     (use_mask          ? 2 : 0) |
-                     (use_logit_softcap ? 4 : 0) |
-                     (old_amd_windows   ? 8 : 0) |
-                     (zero_dead_v       ? 16 : 0) |
-                     (deadv_lds         ? 32 : 0);
+    uint32_t flags = (use_mask_opt        ? 1 : 0) |
+                     (use_mask            ? 2 : 0) |
+                     (use_logit_softcap   ? 4 : 0) |
+                     (old_amd_windows     ? 8 : 0) |
+                     (zero_dead_v         ? 16 : 0) |
+                     (deadv_lds           ? 32 : 0) |
+                     (fa_cm1_sf_pad(params) ? 64 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -11149,7 +11172,9 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t psh_stride = Br / 4 + 2;
     const uint32_t Psh = Bc * psh_stride * f16vec4;
 
-    const uint32_t sfshstride = (hsk <= 128) ? (Br + 8) : Br;
+    // In scalars: the shader's sfshstride is in ACC_TYPEV4, so its "+ 2" is + 8 here and the
+    // [TAG_FA_CM1_SF_PAD] "+ 1" is + 4. Keep in step with flash_attn_cm1.comp.
+    const uint32_t sfshstride = ((hsk <= 128) ? (Br + 8) : Br) + (fa_cm1_sf_pad(params) ? 4 : 0);
     const uint32_t sfsh = Bc * sfshstride * acctype;
 
     const uint32_t kvshstride = (params.shmem_staging ? std::max(hsk_pad, hsv_pad) : MatBr) / 4 + 2;
