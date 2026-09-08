@@ -1551,6 +1551,18 @@ std::string server_task_result_metrics::to_metrics() {
             "Largest observed sequence length (prompt + generation)",
             (double) metrics.n_tokens_max
         }, {
+            "sampling_seconds_total",
+            "Total time spent in common_sampler_sample() (CPU sampling, after the context synchronization)",
+            metrics.n_sampling_us / 1.e6
+        }, {
+            "sampling_calls_total",
+            "Number of common_sampler_sample() calls (one per sampled position, incl. speculative verification)",
+            (double) metrics.n_sampling_calls
+        }, {
+            "sampling_fastpath_total",
+            "Number of sample calls that built only a candidate window instead of the full vocabulary",
+            (double) metrics.n_sampling_fast
+        }, {
             "spec_decode_num_draft_tokens_total",
             "Speculative: Total draft tokens generated",
             (double) metrics.n_draft_tokens
