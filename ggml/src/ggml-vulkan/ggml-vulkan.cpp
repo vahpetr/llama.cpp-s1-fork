@@ -2226,6 +2226,10 @@ static bool vk_flops_seed_legacy = false;
 // GGML_VK_SUBMIT_LOG=1 prints one line per graph_compute with the submit count and the seed.
 static bool vk_submit_log_enabled = false;
 // GGML_VK_OPT_WINDOW=<n> sets ggml_vk_graph_optimize's independence lookahead (default 20).
+// Clamped to vk_graph_opt_window_max: the lookahead is only ever used as a bound on a node index,
+// so anything at or above the largest graph is already "the whole graph", and letting it reach
+// INT_MAX makes first_unused + window overflow.
+static constexpr int vk_graph_opt_window_max = 1 << 20;
 static int vk_graph_opt_window = 20;
 // GGML_VK_ASYNC_READ_COPYBUF=1 keeps the async readback on the vkCmdCopyBuffer path even when the
 // source buffer is host-visible UMA memory that the host could read directly.
@@ -7629,7 +7633,7 @@ static void ggml_vk_instance_init() {
         errno = 0;
         char * end = nullptr;
         const long v = strtol(GGML_VK_OPT_WINDOW, &end, 10);
-        if (end != GGML_VK_OPT_WINDOW && *end == '\0' && errno == 0 && v >= 1 && v <= INT_MAX) {
+        if (end != GGML_VK_OPT_WINDOW && *end == '\0' && errno == 0 && v >= 1 && v <= vk_graph_opt_window_max) {
             vk_graph_opt_window = (int) v;
         } else {
             GGML_LOG_WARN("ggml_vulkan: ignoring malformed GGML_VK_OPT_WINDOW=\"%s\", using %d\n",
@@ -18587,7 +18591,10 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         //      changes.
         // Reordering independent nodes changes no operand of any op, so results stay bit-exact.
         const int NUM_TO_CHECK = vk_graph_opt_window;
-        for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
+        // first_unused < n_nodes here (the enclosing while), so n_nodes - first_unused >= 1 and this
+        // cannot overflow the way first_unused + NUM_TO_CHECK can once the window is settable.
+        const int window_end = first_unused + std::min(NUM_TO_CHECK, graph->n_nodes - first_unused);
+        for (int j = first_unused+1; j < window_end; ++j) {
             if (used[j]) {
                 continue;
             }
@@ -18722,7 +18729,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         // Second pass grabs view nodes.
         // Skip this if it would break a fusion optimization (don't split up add->rms_norm or add->add).
         if (graph->nodes[current_set.back()]->op != GGML_OP_ADD) {
-            for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
+            for (int j = first_unused+1; j < window_end; ++j) {
                 if (used[j]) {
                     continue;
                 }
