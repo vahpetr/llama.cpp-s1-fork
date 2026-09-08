@@ -56,6 +56,8 @@ void ggml_compute_forward_cont(const struct ggml_compute_params * params, struct
 // [TAG_GET_ROWS_SORTED] work-buffer bytes the page-ordered gather needs for this node (0 = none).
 // ggml_graph_plan() and the op itself go through this one predicate so they cannot disagree.
 size_t ggml_get_rows_work_size(const struct ggml_tensor * node);
+// [TAG_GET_ROWS_SORTED] GGML_GET_ROWS_THREADS: opt-in fan-out of the page-ordered gather (1 = off)
+int ggml_get_rows_threads(void);
 void ggml_compute_forward_get_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_get_rows_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_set_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);

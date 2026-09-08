@@ -5002,6 +5002,29 @@ size_t ggml_get_rows_work_size(const struct ggml_tensor * node) {
     return ggml_get_rows_plan_of(node).wbytes;
 }
 
+// [TAG_GET_ROWS_SORTED] opt-in, OFF by default (returns 1 = today's single-threaded gather).
+// GET_ROWS has carried n_tasks = 1 since the "cost of launching additional threads decreases
+// performance with GPU offloading" FIXME in ggml_get_n_tasks(), and in this fork's prefill graph
+// the PLE split is that one node, so the 32 768-row / 128 MiB-of-pages gather runs on ONE thread
+// with one outstanding fault at a time. Once the walk is in page order the obvious follow-up is to
+// fan it out -- each thread then owns a contiguous, disjoint block of source pages, so N threads
+// give N independent, locally ordered fault streams instead of N random ones. That is a scheduling
+// change with the same bit-exactness argument as the reordering itself (disjoint destinations, one
+// pure conversion per row), but it is a separate measurement, so it stays behind its own env var
+// and only ever applies to the nodes the size gate already selected.
+int ggml_get_rows_threads(void) {
+    static const int n = []() -> int {
+        const char * s = getenv("GGML_GET_ROWS_THREADS");
+        if (s == nullptr) {
+            return 1;
+        }
+        const int v = atoi(s);
+        return v > 1 ? v : 1;
+    }();
+
+    return n;
+}
+
 // LSD radix sort of the packed (page key, dst index) pairs on the key bits [32, 64). Returns the
 // buffer that holds the sorted array (a or b). A pass whose key byte is constant is the identity
 // permutation and is skipped, which is why the result buffer is not a function of nr alone.
