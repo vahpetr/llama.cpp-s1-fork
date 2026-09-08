@@ -17065,6 +17065,13 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
 //     exit batch it is executed immediately after vkQueueSubmit, without waiting for the fence.
 //   * the memcpy reads the live source buffer at drain time, so dispatches recorded after it can
 //     overwrite the bytes before the host copies them.
+//   * ggml_backend_vk_event_record does the same end/submit/reset to signal an event, with the
+//     same result: the queued read ends up in a context ggml_vk_synchronize no longer looks at.
+//
+// Every entry point that can end or submit ctx->compute_ctx therefore calls
+// ggml_vk_flush_pending_host_reads first: graph compute, set_tensor_2d_async,
+// cpy_tensor_async and event_record.  (ggml_vk_cleanup discards the context outright, but it
+// only runs on backend free, when no destination is still worth writing.)
 //
 // llama.cpp reaches this ordering: llama_context::decode extracts logits / embeddings / the MTP
 // h_nextn rows with ggml_backend_tensor_get_async at the end of each ubatch iteration and only
@@ -18987,6 +18994,17 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
     VK_LOG_DEBUG("ggml_backend_vk_event_record(backend=" << backend << ", event=" << event << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     vk_event *vkev = (vk_event *)event->context;
+
+    // [TAG_ASYNC_READ_UMA] this is the third path that ends, submits and then drops
+    // ctx->compute_ctx (graph compute and the async set/copy entry points are the other two).
+    // A pending direct host read owns that context: the ggml_vk_ctx_end + ggml_vk_submit +
+    // ctx->compute_ctx.reset() below would strand its out_memcpys in a context
+    // ggml_vk_synchronize can no longer reach - do_transfer is false once compute_ctx has
+    // expired - while the synchronize still clears ctx->pending_host_read.  So
+    // get_async(A); event_record(e); event_synchronize(e); backend_synchronize() would return
+    // with A's destination never written.  Fence the reads off first; in the ordinary
+    // graph_compute -> get_async... -> synchronize order nothing is pending and this is free.
+    ggml_vk_flush_pending_host_reads(ctx);
 
     ggml_vk_submit_transfer_ctx(ctx);
 
