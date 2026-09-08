@@ -465,7 +465,14 @@ struct server_slot {
 
     static constexpr float SPEC_ACC_EMA_ALPHA = 1.0f/32.0f;
 
-    // update the per-position conditional acceptance from one verification round
+    // Update the per-position conditional acceptance from one verification round.
+    //
+    // Called once per verified round with that round's FRESH draft tail only: n_draft is the
+    // number of tokens drafted this round (spec_draft minus the leading committed tokens a
+    // replay/fold round re-emits) and n_accepted how many of them matched.  A pure replay round
+    // has no fresh tail, so n_draft == 0 and this returns immediately.  The call site is above
+    // the checkpoint-restore branch so that a round which ends in a restore - i.e. a rejection -
+    // is observed exactly like one that does not.
     void spec_acc_update(size_t n_draft, size_t n_accepted, int n_max_cfg) {
         if (n_draft == 0 || n_max_cfg <= 0) {
             return;
@@ -4326,6 +4333,34 @@ private:
 
                 GGML_ASSERT(accepted.size() >= 1);
 
+                // adaptive draft length: record this round's per-position acceptance here, before
+                // the branch, so it happens exactly once per verified round on every exit.
+                //
+                // Only the tokens that were freshly drafted this round carry information about the
+                // draft model.  slot.spec_n_committed leading tokens of spec_draft (nonzero on a
+                // replay or a fold round, see 0006-0010) were sampled and accepted during an
+                // earlier round and are merely re-emitted here, so they are not observations - and
+                // on a pure replay round there is no fresh tail at all, which makes n_fresh_draft
+                // zero and spec_acc_update a no-op.
+                //
+                // Doing this before the branch is the fix: the checkpoint-restore branch below
+                // returns early, and the round it schedules next is a replay, which used to be
+                // excluded wholesale by "!was_replay".  A FULL-rollback target (or an RS target
+                // whose rollback is deeper than n_rs_seq) therefore fed the estimator every
+                // success and no failure, and the EMA converged to 1.0 - i.e. always draft n-max -
+                // no matter how badly the draft model was doing.  A fold round's fresh tail was
+                // dropped for the same reason.
+                if (params_base.speculative.draft.n_max_adaptive) {
+                    const size_t n_committed_in = std::min(slot.spec_n_committed, n_draft);
+                    const size_t n_fresh_draft  = n_draft - n_committed_in;
+                    const size_t n_matched      = accepted.size() - 1;
+                    const size_t n_fresh_acc    = n_matched > n_committed_in
+                                                ? std::min(n_matched - n_committed_in, n_fresh_draft)
+                                                : 0;
+
+                    slot.spec_acc_update(n_fresh_draft, n_fresh_acc, common_speculative_n_max(spec.get()));
+                }
+
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                 const bool use_ckpt_tgt =
@@ -4378,7 +4413,6 @@ private:
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
-            const bool was_replay = slot.spec_is_replay;
             if (slot.spec_is_replay && n_accepted > 0) {
                 n_accepted--;
             }
@@ -4399,11 +4433,8 @@ private:
                 n_accepted_per_pos[i]++;
             }
 
-            // adaptive draft length: only fresh drafts carry information about the draft model's
-            // acceptance - a replay round re-decodes tokens that were already accepted
-            if (params_base.speculative.draft.n_max_adaptive && !was_replay) {
-                slot.spec_acc_update(n_draft, n_accepted, common_speculative_n_max(spec.get()));
-            }
+            // (the adaptive draft length's acceptance EMA was updated in the verification block
+            // above, before the checkpoint-restore branch, so that a restore round is observed too)
 
             // add accepted tokens to the prompt
             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
