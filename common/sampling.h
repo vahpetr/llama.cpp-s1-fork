@@ -55,6 +55,26 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
+// G32: candidate-window fast path.
+//
+// When the sampling chain provably cannot reach outside a small window of the vocabulary (temp <= 0 with nothing
+// in the chain that can reorder the logits or drop the maximum, or a chain whose first non-no-op sampler is
+// top-k), common_sampler_sample() can build only that window instead of one llama_token_data per vocabulary
+// entry. The selected token, the sampler state and the RNG stream are unchanged - but the candidate array is
+// then a window, so this must stay off for callers that read the full array back out of
+// common_sampler_get_candidates() (post-sampling probabilities; the speculative drafters, which inspect
+// cur_p->data[0].p against p_min). Off by default. LLAMA_SAMPLER_FASTPATH=0 forces it off everywhere;
+// LLAMA_SAMPLER_FASTPATH=2 additionally cross-checks every window against the reference selection.
+void common_sampler_set_fastpath(struct common_sampler * gsmpl, bool enabled);
+
+// "off" / "none" / "greedy" / "top-k" - what the fast path resolved to, for logging
+const char * common_sampler_fastpath_str(const struct common_sampler * gsmpl);
+
+// process-wide sampling counters (all common_sampler_sample() calls since process start)
+uint64_t common_sampler_perf_time_us();  // wall time spent inside common_sampler_sample()
+uint64_t common_sampler_perf_n_sample(); // number of calls
+uint64_t common_sampler_perf_n_fast();   // number of calls that built only a candidate window
+
 // extended sampling implementation:
 //
 // - set logits

@@ -8,12 +8,49 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
+
+//
+// G32: candidate-window fast path + sampling time counters
+//
+// LLAMA_SAMPLER_FASTPATH:
+//   0 / off / false - never take the fast path (exactly today's code)
+//   1 / unset       - take it whenever it is provably identical (default)
+//   2 / verify      - take it, but also build the reference window and log any disagreement
+//
+static int common_sampler_fastpath_env() {
+    static const int val = []() {
+        const char * s = getenv("LLAMA_SAMPLER_FASTPATH");
+        if (s == nullptr || *s == '\0') {
+            return 1;
+        }
+        if (strcmp(s, "0") == 0 || strcmp(s, "off") == 0 || strcmp(s, "false") == 0) {
+            return 0;
+        }
+        if (strcmp(s, "2") == 0 || strcmp(s, "verify") == 0) {
+            return 2;
+        }
+        return 1;
+    }();
+
+    return val;
+}
+
+// process-wide, so that a server can report them without reaching into per-slot samplers
+static std::atomic<uint64_t> g_smpl_t_us  {0};
+static std::atomic<uint64_t> g_smpl_n     {0};
+static std::atomic<uint64_t> g_smpl_n_fast{0};
+
+uint64_t common_sampler_perf_time_us() { return g_smpl_t_us  .load(std::memory_order_relaxed); }
+uint64_t common_sampler_perf_n_sample() { return g_smpl_n     .load(std::memory_order_relaxed); }
+uint64_t common_sampler_perf_n_fast  () { return g_smpl_n_fast.load(std::memory_order_relaxed); }
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
@@ -127,7 +164,8 @@ struct common_sampler {
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
+    // today's path: one llama_token_data per vocabulary entry
+    void set_logits_full(struct llama_context * ctx, int idx) {
         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
@@ -159,6 +197,194 @@ struct common_sampler {
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
+
+        fast_used = false;
+    }
+
+    void set_logits(struct llama_context * ctx, int idx) {
+        if (set_logits_fast(ctx, idx)) {
+            return;
+        }
+
+        set_logits_full(ctx, idx);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // G32: build only the window of the vocabulary that the chain can reach.
+    //
+    // set_logits_full() writes n_vocab * sizeof(llama_token_data) (248 320 * 12 B = 2.98 MB on qwen4exp) on every
+    // sample call, and the chain then walks all of it (temp's -INF sweep, top-k's partial_sort over the full
+    // array, ...). ~5 calls per speculative round. When the chain provably cannot reach outside a small window,
+    // the identical result can be produced from a window built straight from the raw logits.
+    //
+    // Both modes reproduce the *state of cur_p at a point in today's chain*, so everything from that point on is
+    // bit-identical, including the RNG draw of the `dist` sampler:
+    //
+    //   FAST_GREEDY - the chain reduces to "argmax of the raw logits" (temp <= 0, dynatemp off, and nothing in
+    //       the chain that can reorder the logits or drop the maximum: penalties/DRY/XTC/typical/top-n-sigma are
+    //       all statically disabled, and top-k / top-p / min-p can only truncate a descending array, so they
+    //       always keep the maximum). llama_sampler_temp_impl(<=0) then sets every other candidate to -INF and
+    //       `dist` selects the single finite one. The scan below is llama_sampler_temp_impl's own scan (strict
+    //       `>`, so the earliest index wins a tie), and the fast path only fires when the maximum is *unique*,
+    //       so no tie order can be observed. The chain is then applied to the 1-element array: top-k/top-p/min-p
+    //       keep it, temp_impl(<=0) leaves it untouched, and `dist` takes its size == 1 branch, which draws from
+    //       the RNG exactly once - as the full-array branch does.
+    //
+    //   FAST_TOPK - top-k is the first sampler in the chain that is not statically a no-op, so today's chain
+    //       hands everything downstream exactly `top_k` candidates in descending order. The window below is
+    //       built from the raw logits and is accepted only when the top k+1 logits are *strictly* decreasing;
+    //       the descending order of the top k is then unique, so it cannot depend on how std::partial_sort
+    //       happens to order equal logits. cur_p is handed to the chain with .sorted = true and .size = k, which
+    //       is exactly the state llama_sampler_top_k_impl leaves behind (it then re-runs as a no-op:
+    //       k = min(k, size) = size and !sorted is false). Nothing downstream is inspected: it sees the same
+    //       bytes in the same order as today.
+    //
+    // Known, documented differences (neither can be avoided without reproducing libstdc++ internals):
+    //   * FAST_GREEDY and a `dist` draw of exactly 0.0: today's full-array branch selects cur_p->data[0] (the
+    //     accumulator starts at 0.0 and `sum_run >= sum_tgt` is true at i == 0), i.e. token id 0 rather than the
+    //     argmax; the 1-element branch returns the argmax. P(rnd == 0.0) ~ 2^-53 per token.
+    //   * NaN logits: FAST_GREEDY's scan is temp_impl's scan, so it behaves identically; FAST_TOPK bails to the
+    //     slow path (the strict-decrease test fails on any NaN), where std::partial_sort's comparator is not a
+    //     strict weak ordering and the outcome is undefined anyway.
+    // ---------------------------------------------------------------------------------------------------------
+    bool set_logits_fast(struct llama_context * ctx, int idx) {
+        if (fast_mode == FAST_NONE || !fast_enabled) {
+            return false;
+        }
+
+        // a backend sampler is attached -> the candidate window is whatever it returned, not the raw logits
+        if (llama_get_sampled_probs_ith(ctx, idx) || llama_get_sampled_logits_ith(ctx, idx)) {
+            return false;
+        }
+
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+
+        const bool ok = fast_mode == FAST_GREEDY ?
+            set_logits_fast_greedy(logits, n_vocab) :
+            set_logits_fast_top_k (logits, n_vocab);
+
+        if (!ok) {
+            return false;
+        }
+
+        cur_p = { cur.data(), cur.size(), -1, /* .sorted = */ true };
+
+        fast_used = true;
+
+        g_smpl_n_fast.fetch_add(1, std::memory_order_relaxed);
+
+        return true;
+    }
+
+    // argmax of the raw logits, with llama_sampler_temp_impl's tie handling; refuses a non-unique maximum
+    bool set_logits_fast_greedy(const float * logits, int n_vocab) {
+        if (n_vocab <= 0) {
+            return false;
+        }
+
+        int   max_i   = 0;
+        float max_l   = logits[0];
+        bool  max_uni = true;
+
+        for (int i = 1; i < n_vocab; ++i) {
+            const float l = logits[i];
+            if (l > max_l) {
+                max_i   = i;
+                max_l   = l;
+                max_uni = true;
+            } else if (l == max_l) {
+                max_uni = false;
+            }
+        }
+
+        if (!max_uni) {
+            return false;
+        }
+
+        if (fastpath_verify) {
+            const float * ref = std::max_element(logits, logits + n_vocab);
+            if (ref != logits + max_i) {
+                LOG_ERR("%s: fast path (greedy) disagrees with std::max_element: %d vs %d\n",
+                        __func__, max_i, (int) (ref - logits));
+            }
+        }
+
+        cur.resize(1);
+        cur[0] = llama_token_data{ max_i, max_l, 0.0f };
+
+        return true;
+    }
+
+    // the top `fast_k` logits in descending order; refuses anything but a strictly decreasing top k+1
+    bool set_logits_fast_top_k(const float * logits, int n_vocab) {
+        const int m = fast_k + 1; // one witness past the window, to prove the boundary is not a tie
+
+        if (n_vocab < m) {
+            return false;
+        }
+
+        // same comparator as llama_token_data_array_partial_sort(); with it, heap.front() is the *smallest* logit
+        static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
+            return a.logit > b.logit;
+        };
+
+        auto & heap = fast_heap;
+
+        heap.clear();
+        heap.reserve(m);
+
+        for (int i = 0; i < m; ++i) {
+            heap.push_back(llama_token_data{ i, logits[i], 0.0f });
+        }
+
+        std::make_heap(heap.begin(), heap.end(), comp);
+
+        float thresh = heap.front().logit;
+
+        for (int i = m; i < n_vocab; ++i) {
+            const float l = logits[i];
+            if (l > thresh) {
+                std::pop_heap(heap.begin(), heap.end(), comp);
+                heap.back() = llama_token_data{ i, l, 0.0f };
+                std::push_heap(heap.begin(), heap.end(), comp);
+
+                thresh = heap.front().logit;
+            }
+        }
+
+        std::sort(heap.begin(), heap.end(), comp);
+
+        // a tie anywhere in the window - or at its boundary - makes the order ambiguous: hand it to the slow path
+        for (int i = 0; i + 1 < m; ++i) {
+            if (!(heap[i].logit > heap[i + 1].logit)) {
+                return false;
+            }
+        }
+
+        if (fastpath_verify) {
+            std::vector<llama_token_data> ref(n_vocab);
+            for (int i = 0; i < n_vocab; ++i) {
+                ref[i] = llama_token_data{ i, logits[i], 0.0f };
+            }
+            std::partial_sort(ref.begin(), ref.begin() + fast_k, ref.end(), comp);
+            for (int i = 0; i < fast_k; ++i) {
+                if (ref[i].id != heap[i].id || ref[i].logit != heap[i].logit) {
+                    LOG_ERR("%s: fast path (top-k) disagrees with std::partial_sort at %d: "
+                            "(%d, %g) vs (%d, %g)\n",
+                            __func__, i, heap[i].id, (double) heap[i].logit, ref[i].id, (double) ref[i].logit);
+                    break;
+                }
+            }
+        }
+
+        cur.assign(heap.begin(), heap.begin() + fast_k);
+
+        return true;
     }
 
     common_time_meas tm() {
@@ -166,6 +392,21 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
+
+    // G32 fast path state - see set_logits_fast()
+    enum fast_mode_t {
+        FAST_NONE = 0,
+        FAST_GREEDY,
+        FAST_TOPK,
+    };
+
+    fast_mode_t fast_mode       = FAST_NONE;  // what the chain provably reduces to (decided in common_sampler_init)
+    bool        fast_enabled    = false;      // caller opt-in: the candidate array is a window, not the vocabulary
+    bool        fastpath_verify = false;
+    bool        fast_used       = false;      // whether the last set_logits() built a window
+    int         fast_k          = 0;
+
+    std::vector<llama_token_data> fast_heap;
 };
 
 std::string common_params_sampling::print() const {
@@ -182,6 +423,96 @@ std::string common_params_sampling::print() const {
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
     return std::string(result);
+}
+
+// G32: decide once what the chain provably reduces to. See the block comment above set_logits_fast().
+//
+// The "statically a no-op" predicates below mirror the early returns of the corresponding samplers in
+// src/llama-sampler.cpp; keep them in sync (they are named there, next to the code they mirror).
+static common_sampler::fast_mode_t common_sampler_fast_mode_of(
+        const common_params_sampling & params,
+        bool has_grmr,
+        bool has_rbudget,
+        bool has_logit_bias) {
+    // these rewrite or reorder the logits before any window can be taken
+    if (has_grmr || has_rbudget || has_logit_bias || params.backend_sampling) {
+        return common_sampler::FAST_NONE;
+    }
+
+    // mirostat replaces params.samplers with its own two-sampler chain
+    if (params.mirostat != 0) {
+        return common_sampler::FAST_NONE;
+    }
+
+    // llama_sampler_penalties::is_disabled()
+    const bool no_penalties = params.penalty_last_n == 0 ||
+        (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f);
+    // llama_sampler_dry_apply()
+    const bool no_dry       = params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0;
+    // llama_sample_xtc_apply()
+    const bool no_xtc       = params.xtc_probability <= 0.0f || params.xtc_threshold > 0.5f;
+    // llama_sampler_typical_apply(), llama_sampler_top_n_sigma_apply(), llama_sampler_top_p_apply(),
+    // llama_sampler_min_p_apply(), llama_sampler_top_k_impl()
+    const bool no_typical   = params.typ_p       >= 1.0f;
+    const bool no_top_n_sig = params.top_n_sigma <= 0.0f;
+    const bool no_top_p     = params.top_p       >= 1.0f;
+    const bool no_min_p     = params.min_p       <= 0.0f;
+    const bool no_top_k     = params.top_k       <= 0;
+
+    auto is_noop = [&](enum common_sampler_type cnstr) {
+        switch (cnstr) {
+            case COMMON_SAMPLER_TYPE_PENALTIES:  return no_penalties;
+            case COMMON_SAMPLER_TYPE_DRY:        return no_dry;
+            case COMMON_SAMPLER_TYPE_XTC:        return no_xtc;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:  return no_typical;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:return no_top_n_sig;
+            case COMMON_SAMPLER_TYPE_TOP_P:      return no_top_p;
+            case COMMON_SAMPLER_TYPE_MIN_P:      return no_min_p;
+            case COMMON_SAMPLER_TYPE_TOP_K:      return no_top_k;
+            default:                             return false;
+        }
+    };
+
+    bool has_temp = false;
+    for (const auto & cnstr : params.samplers) {
+        has_temp |= cnstr == COMMON_SAMPLER_TYPE_TEMPERATURE;
+    }
+
+    // greedy: temp <= 0 turns the chain into "argmax of the raw logits" as long as nothing in it can reorder the
+    // logits or drop the maximum. What is left after the no-op tests is top-k / top-p / min-p, and all three only
+    // truncate a descending array, so the maximum always survives them - in any order.
+    if (has_temp && params.temp <= 0.0f && params.dynatemp_range <= 0.0f) {
+        bool ok = true;
+        for (const auto & cnstr : params.samplers) {
+            switch (cnstr) {
+                case COMMON_SAMPLER_TYPE_TOP_K:
+                case COMMON_SAMPLER_TYPE_TOP_P:
+                case COMMON_SAMPLER_TYPE_MIN_P:
+                case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                    break;
+                default:
+                    ok &= is_noop(cnstr);
+            }
+        }
+        if (ok) {
+            return common_sampler::FAST_GREEDY;
+        }
+    }
+
+    // top-k: everything before top-k in the chain must be a no-op, and then the window handed downstream is
+    // exactly the top k in descending order - whatever the rest of the chain happens to be.
+    if (params.top_k > 0 && params.top_k <= 1024) {
+        for (const auto & cnstr : params.samplers) {
+            if (cnstr == COMMON_SAMPLER_TYPE_TOP_K) {
+                return common_sampler::FAST_TOPK;
+            }
+            if (!is_noop(cnstr)) {
+                break;
+            }
+        }
+    }
+
+    return common_sampler::FAST_NONE;
 }
 
 struct common_sampler * common_sampler_init(
@@ -323,6 +654,7 @@ struct common_sampler * common_sampler_init(
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
+    bool has_logit_bias = false;
     {
         std::vector<llama_logit_bias> merged = params.logit_bias;
 
@@ -334,6 +666,8 @@ struct common_sampler * common_sampler_init(
 
         if (!merged.empty()) {
             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+
+            has_logit_bias = true;
         }
     }
 
@@ -434,7 +768,34 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
     };
 
+    // G32: what the chain reduces to is fixed by the parameters, so decide it once. Whether the fast path is
+    // actually taken is the caller's call (common_sampler_set_fastpath): it truncates the candidate array, so it
+    // must stay off for callers that read the full array back out of common_sampler_get_candidates().
+    result->fast_mode       = common_sampler_fast_mode_of(params, grmr != nullptr, rbudget != nullptr, has_logit_bias);
+    result->fast_k          = params.top_k;
+    result->fastpath_verify = common_sampler_fastpath_env() == 2;
+
     return result;
+}
+
+void common_sampler_set_fastpath(struct common_sampler * gsmpl, bool enabled) {
+    if (!gsmpl) {
+        return;
+    }
+
+    gsmpl->fast_enabled = enabled && common_sampler_fastpath_env() != 0;
+}
+
+const char * common_sampler_fastpath_str(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->fast_enabled) {
+        return "off";
+    }
+
+    switch (gsmpl->fast_mode) {
+        case common_sampler::FAST_GREEDY: return "greedy";
+        case common_sampler::FAST_TOPK:   return "top-k";
+        default:                          return "none";
+    }
 }
 
 void common_sampler_free(struct common_sampler * gsmpl) {
@@ -507,7 +868,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -516,6 +877,15 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
     };
+
+    // a clone must sample exactly like the original, so it inherits the fast-path decision too
+    result->fast_mode       = gsmpl->fast_mode;
+    result->fast_enabled    = gsmpl->fast_enabled;
+    result->fastpath_verify = gsmpl->fastpath_verify;
+    result->fast_used       = gsmpl->fast_used;
+    result->fast_k          = gsmpl->fast_k;
+
+    return result;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -536,6 +906,12 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->t_total_us = src->t_total_us;
+
+    dst->fast_mode       = src->fast_mode;
+    dst->fast_enabled    = src->fast_enabled;
+    dst->fastpath_verify = src->fastpath_verify;
+    dst->fast_used       = src->fast_used;
+    dst->fast_k          = src->fast_k;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -591,11 +967,26 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// G32: accumulate the wall time spent in common_sampler_sample() process-wide, so that a server can report it
+// without a profiler (llamacpp:sampling_seconds_total). Two clock reads per sample call.
+struct common_sampler_perf_meas {
+    common_sampler_perf_meas() : t_start_us(ggml_time_us()) {}
+
+    ~common_sampler_perf_meas() {
+        g_smpl_t_us.fetch_add((uint64_t) (ggml_time_us() - t_start_us), std::memory_order_relaxed);
+        g_smpl_n   .fetch_add(1,                                        std::memory_order_relaxed);
+    }
+
+    const int64_t t_start_us;
+};
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
+
+    const common_sampler_perf_meas pm;
 
     llama_token id = LLAMA_TOKEN_NULL;
 
@@ -616,6 +1007,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+
+            // a backend sampler that returns only the token (e.g. greedy) leaves the raw-logits branch in place,
+            // so the window may not contain the token it picked - rebuild the full candidate array to find it
+            if (gsmpl->fast_used) {
+                gsmpl->set_logits_full(ctx, idx);
+            }
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {

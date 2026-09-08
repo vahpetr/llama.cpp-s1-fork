@@ -2344,6 +2344,7 @@ static const char * llama_sampler_xtc_name(const struct llama_sampler * /*smpl*/
 static void llama_sample_xtc_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (llama_sampler_xtc *) smpl->ctx;
 
+    // note: mirrored by common_sampler_fast_mode_of() in common/sampling.cpp (G32 candidate-window fast path)
     if (ctx->probability <= 0.0f
         || ctx->threshold > 0.5f
         || cur_p->size < 2) {
@@ -2882,6 +2883,7 @@ struct llama_sampler_penalties : public llama_sampler_backend {
         token_count = src.token_count;
     }
 
+    // note: mirrored by common_sampler_fast_mode_of() in common/sampling.cpp (G32 candidate-window fast path)
     static bool is_disabled(
             int32_t penalty_last_n,
             float   penalty_repeat,
@@ -3386,6 +3388,7 @@ static void llama_sampler_dry_accept(struct llama_sampler * smpl, llama_token to
 static void llama_sampler_dry_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (llama_sampler_dry *) smpl->ctx;
 
+    // note: mirrored by common_sampler_fast_mode_of() in common/sampling.cpp (G32 candidate-window fast path)
     if (ctx->dry_multiplier == 0.0f || ctx->dry_base < 1.0f || ctx->dry_penalty_last_n == 0) {
         return;
     }
