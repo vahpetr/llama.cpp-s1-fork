@@ -10103,6 +10103,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
+    // Qwen3.8-Flash-Next prefill geometry: hsk = hsv = 256, 2 KV heads x GQA 12 = 24 query
+    // heads, q8_0 K/V, a mask and no ALiBi.  nb = 64 is the smallest batch the Vulkan
+    // coopmat1 path treats as a prefill (it is also the threshold for the q8_0 -> f16 KV
+    // scratch); nb = 2048 is the production ubatch.  kv 4096 / 16384 put the mask's
+    // -INF blocks well inside a long KV stream.  Both K/V layouts are covered: the default
+    // one exercises the in-kernel dequant, the {0, 2, 1, 3} permutation is the KV-cache
+    // layout that engages the f16 scratch, which is what production runs.
+    for (int64_t kv : { 4096, 16384 }) {
+        for (int64_t nb : { 64, 2048 }) {
+            // The kv=16384 / nb=2048 case is the only one big enough to matter for the CPU
+            // reference, so run it at 12 query heads (one KV head) and in the cache layout
+            // only, which keeps it in the same cost class as the large cases above.
+            const bool big = (kv == 16384 && nb == 2048);
+            if (!big) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0,
+                                                                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, big ? 1 : 2, {12, 1}, kv, nb, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+        }
+    }
+
     // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
