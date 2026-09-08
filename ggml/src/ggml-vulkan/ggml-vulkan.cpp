@@ -3952,11 +3952,30 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 // hsk == hsv == 256 anyway.
 static constexpr uint32_t fa_cm1_block_rows_min = 16;
 static constexpr uint32_t fa_cm1_block_rows_max = 32;
-// A batch this size or larger is a prefill: enough rows to fill both row tiles of every
-// workgroup, and the shape where the extra K/V reuse is worth the shared memory.
-static constexpr uint32_t fa_cm1_block_rows_32_min_n = 64;
+// [TAG_FA_CM1_BR_GATE] A batch this size or larger is a *real prefill*, and the only shape
+// the wide tile is offered to.
+//
+// The first cut of this gate was n_rows >= 64 - "enough rows to fill both row tiles" - which
+// is necessary but nowhere near sufficient.  Measured on gfx1151 (RADV, wave64, image v23 vs
+// v22, identical apart from the tile): pp8k and pp32k unchanged, but prefill at a 107k KV
+// went 272.6 -> 256.6 t/s (-6 %) and at 213k 166.9 -> 155.3 (-7 %).  The extra K/V re-use is
+// real, and it is still not enough to pay for what the wider tile costs: shared memory goes
+// 28 056 -> 46 816 B, which halves how many workgroups a WGP can hold (128 KiB / 45.7 KiB = 2,
+// against 4 at Br = 16), and with half as many workgroups to interleave, the ~13 barriers a
+// workgroup takes per KV tile stop being hidden.  Rows in flight per WGP are identical either
+// way (2 x 32 == 4 x 16), so the trade is purely "fewer K/V bytes, less latency hiding".
+//
+// So the gate is not "does the wide tile have enough rows to be legal" but "is this batch big
+// enough that the K/V stream, not the barrier latency, is what the kernel is waiting on".
+// 512 rows is a batch that already has 16 wide workgroups per KV head to schedule, i.e. one
+// per WGP on this part, and it keeps every batch that has ever been measured to regress
+// (n_rows <= 32: every decode and every speculative verify) on the historical tile with a
+// wide margin.  It is deliberately conservative: the wide tile has never been measured to win
+// at any shape, so this bound exists to make the A/B cheap, not because 512 is a discovered
+// optimum.  GGML_VK_FA_CM1_BR overrides it in either direction.
+static constexpr uint32_t fa_cm1_block_rows_32_min_n = 512;
 
-static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
+static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc, bool gqa_batched) {
     GGML_UNUSED(n_kv);
 
     vk_fa_tuning_params result{};
@@ -3980,16 +3999,25 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
 
     // A coopmat1 workgroup streams the whole K and V of its KV head once per Br query rows, so
     // at prefill shapes this kernel's arithmetic intensity is proportional to Br and it runs at
-    // the memory roofline. Two row tiles halve that re-streaming. Decode shapes keep one tile:
-    // they have too few rows to fill two, and the wider tile costs shared memory (and with it
-    // occupancy). The shader computes each row exactly as it does at Br == 16, see
-    // [TAG_FA_CM1_ROW_TILES] in flash_attn_cm1.comp.
+    // the memory roofline. Two row tiles halve that re-streaming, and cost shared memory, and
+    // with it the number of workgroups a WGP can interleave across this kernel's barriers.
+    // On gfx1151 that trade has measured negative at every shape tried so far, so the wide
+    // tile is offered only to batches large enough for the K/V stream to dominate - see
+    // [TAG_FA_CM1_BR_GATE] for the numbers and for why the bound is where it is. The shader
+    // computes each row exactly as it does at Br == 16, see [TAG_FA_CM1_ROW_TILES] in
+    // flash_attn_cm1.comp.
     // GGML_VK_FA_CM1_BR=16|32 forces one or the other, for A/B; 0 (or unset) is auto. Any
     // other value in range rounds to one of the two implemented tiles rather than being
     // silently ignored, and anything else is rejected with a warning. See [TAG_ENV_UINT].
     static const uint32_t fa_cm1_br_env = ggml_vk_env_uint("GGML_VK_FA_CM1_BR", 0, 0, fa_cm1_block_rows_max);
 
-    uint32_t block_rows = (n_rows >= fa_cm1_block_rows_32_min_n) ? fa_cm1_block_rows_max : fa_cm1_block_rows_min;
+    // gqa_batched says the caller is building a grouped-query dispatch, where n_rows is not a
+    // batch size at all: ggml_vk_flash_attn replaces N by gqa_ratio and folds the query heads
+    // of one KV head into the row dimension, so a "big" n_rows there would still be a decode.
+    // The n_rows bound already excludes it (gqa_ratio <= 32 by max_gqa), but the flag is what
+    // states the rule, and it keeps the two from drifting apart: the wide tile is for batches
+    // of *tokens*, never for the gqa fold.  See [TAG_FA_CM1_BR_GATE].
+    uint32_t block_rows = (!gqa_batched && n_rows >= fa_cm1_block_rows_32_min_n) ? fa_cm1_block_rows_max : fa_cm1_block_rows_min;
     if (fa_cm1_br_env != 0) {
         block_rows = (fa_cm1_br_env >= fa_cm1_block_rows_max) ? fa_cm1_block_rows_max : fa_cm1_block_rows_min;
     }
@@ -4033,7 +4061,9 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
     return result;
 }
 
-static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
+// gqa_batched: this is (or is probing) a grouped-query dispatch, i.e. n_rows is gqa_ratio and
+// not a token count.  Only the coopmat1 tile selection looks at it.
+static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc, bool gqa_batched) {
     FaCodePath path = device->coopmat2 ? FA_COOPMAT2 :
                       device->coopmat1_fa_support ? FA_COOPMAT1 : FA_SCALAR;
 
@@ -4052,7 +4082,7 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
     if (path == FA_COOPMAT1) {
         bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
                         (!f32acc && device->coopmat_support_16x16x16_f16acc);
-        const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
+        const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc, gqa_batched);
         bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type);
 
         if (!shape_ok || !shmem_ok) {
@@ -4069,7 +4099,7 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
     case FA_SCALAR:
         return get_fa_tuning_params_scalar(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
     case FA_COOPMAT1:
-        return get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
+        return get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc, gqa_batched);
     case FA_COOPMAT2:
         return get_fa_tuning_params_coopmat2(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
     default:
@@ -11233,12 +11263,12 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
-    vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
+    vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc, false);
     // A grouped-query dispatch sets N = gqa_ratio (<= 32) and relies on one workgroup covering
     // all of it, so max_gqa must not exceed the Br the *small*-N tuning will hand out. The
     // large probe above still reports the scalar path's biggest tile, but coopmat1's Br now
     // depends on n_rows ([TAG_FA_CM1_BR]), so clamp with a probe taken in the decode regime.
-    const vk_fa_tuning_params gqa_probe = get_fa_tuning_params(ctx->device, HSK, HSV, 32, KV, k_type_eff, v_type_eff, f32acc);
+    const vk_fa_tuning_params gqa_probe = get_fa_tuning_params(ctx->device, HSK, HSV, 32, KV, k_type_eff, v_type_eff, f32acc, true);
     const uint32_t max_gqa = std::min({ tuning_params.block_rows, gqa_probe.block_rows, 32u });
 
     if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
@@ -11251,7 +11281,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         workgroups_y /= gqa_ratio;
     }
 
-    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, gqa_ratio > 1);
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
