@@ -49,7 +49,12 @@ const bool DEADV_LDS       = (Flags & 32) != 0;
 // the alternative WOULD buy is a tile-uniform mask row, i.e. one mask load broadcast to all
 // rows - but at decode the mask block is 64 x Br f16 served out of L1, not a DRAM cost, so it
 // is not worth a quarter of the tile.
-const bool GQA_TOKENS      = (Flags & 64) != 0;
+// Bit 64 is deliberately skipped: the prod-v7-fa line uses it for CM1_SF_PAD (the coopmat1
+// QK^T scratch stride pad, [TAG_FA_CM1_SF_PAD]).  The two series are independent and either
+// could land first, so they must not alias - a merge that gave one branch's dispatch the
+// other's shader meaning would pad sfshstride under a GQA_TOKENS dispatch (mismatching the
+// host-side shared-memory estimate) and mis-decode the rows.  Keep new FA flags above 64.
+const bool GQA_TOKENS      = (Flags & 128) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;

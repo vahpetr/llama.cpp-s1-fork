@@ -4068,8 +4068,10 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
                      (old_amd_windows   ? 8 : 0) |
                      (zero_dead_v       ? 16 : 0) |
                      (deadv_lds         ? 32 : 0) |
-                     // [TAG_FA_GQA_TOKENS] rows are (token, head) pairs, see flash_attn_base.glsl
-                     (gqa_tokens        ? 64 : 0);
+                     // [TAG_FA_GQA_TOKENS] rows are (token, head) pairs, see flash_attn_base.glsl.
+                     // Bit 64 is reserved for prod-v7-fa's CM1_SF_PAD so the two FA series cannot
+                     // alias if they are ever merged; see flash_attn_base.glsl.
+                     (gqa_tokens        ? 128 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
