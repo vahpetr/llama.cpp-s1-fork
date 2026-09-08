@@ -80,6 +80,12 @@ shared ACC_TYPE slope[Br];
 // and no wider: a column may only be replaced by +0 for a tile in which it is dead for every
 // one of that tile's rows.  At row_tiles == 1 this is exactly the Br-wide predicate that
 // shipped before.
+//
+// This is also why GQA_TOKENS packs its (token, head) rows token-aligned: the predicate is a
+// reduction over the rows of a row tile, so a tile that mixed two tokens would lose exactly
+// the columns that a causal mask suppresses for the earlier token and not the later one -
+// the causal-boundary tile - and reopen the RDNA3 signed-zero hazard for that token.  See
+// [TAG_FA_GQA_TOKENS] in flash_attn_base.glsl.
 const uint32_t dead_words = (Bc + 31) / 32;
 
 // Default path: one mask per row group.  Each subgroup reduces the P values its threads
@@ -247,10 +253,15 @@ void main() {
     uint32_t mask_opt_bits = 0;
     f16vec4 mask_cache[Bc * Br / 4 / WorkGroupSize];
 
-    // ZERO_DEAD_V: only the first n_valid rows of a Br tile carry a real query; the padded
-    // rows keep whatever Qf held, so their P is not necessarily zero and they are excluded
-    // from the dead-column test.
+    // ZERO_DEAD_V / output stores: row "row" of this Br tile carries a real query only if it is
+    // inside the batch and - under GQA_TOKENS - is not one of the rows that pad its token out
+    // to a whole MatBr row tile.  Padding rows load a duplicate of their token's last head
+    // (fa_q_row_offset4), so their P is a real nonzero value and would defeat the dead-column
+    // test; they are excluded here and their outputs are never stored.  Takes the tile-local
+    // row so that, with GQA_TOKENS specialized off, it is literally the "row < n_valid" the
+    // shader used before the fold existed.
     const uint32_t n_valid = min(Br, N - i * Br);
+#define fa_row_live(row) (GQA_TOKENS ? (i * Br + (row) < N && !FA_ROW_PAD(i * Br + (row))) : ((row) < n_valid))
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
@@ -521,7 +532,7 @@ void main() {
                         // Psh receives exactly this FLOAT_TYPEV4, so testing the register is
                         // the same test the DEADV_LDS scan runs on the stored value.
                         [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
-                            if (row + vec_idx < n_valid && float(Pf[vec_idx]) != 0.0f) {
+                            if (fa_row_live(row + vec_idx) && float(Pf[vec_idx]) != 0.0f) {
                                 p_dead_col[c] = false;
                             }
                         }
@@ -592,7 +603,7 @@ void main() {
         // Default path: AND the row-group verdicts published above.  A row tile's rows are
         // covered by MatBr / rows_per_thread consecutive row groups, so a column is dead for
         // that tile iff every one of those groups found all of its own rows zero - the same
-        // "P == 0 for all n_valid rows of the tile" predicate the DEADV_LDS scan computes, and
+        // "P == 0 for every live row of the tile" predicate the DEADV_LDS scan computes, and
         // at row_tiles == 1 the same Br-wide AND as before.  Workgroup-uniform: every thread
         // reads the same shared words.
         if (ZERO_DEAD_V && MASK_ENABLE && !DEADV_LDS) {
@@ -621,10 +632,11 @@ void main() {
                 const uint32_t c = idx + tid;
                 if (c < Bc) {
                     [[unroll]] for (uint32_t t = 0; t < row_tiles; ++t) {
-                        const uint32_t r_end = min(n_valid, (t + 1) * MatBr);
                         bool dead = true;
-                        for (uint32_t r = t * MatBr; r < r_end; ++r) {
-                            dead = dead && float(Psh[c * psh_stride + r / 4][r % 4]) == 0.0f;
+                        for (uint32_t r = t * MatBr; r < (t + 1) * MatBr; ++r) {
+                            if (fa_row_live(r)) {
+                                dead = dead && float(Psh[c * psh_stride + r / 4][r % 4]) == 0.0f;
+                            }
                         }
                         if (dead) {
                             atomicOr(p_dead_lds[t * dead_words + c / 32], 1u << (c % 32));
@@ -646,9 +658,10 @@ void main() {
 
         // A row tile entirely past the end of the batch has no output worth protecting, and
         // marking all of its columns dead would force a V staging pass on every KV tile of
-        // the last query tile.  Unreachable at row_tiles == 1 (n_valid >= 1 always).
+        // the last query tile.  A row tile's rows belong to one token (token-aligned packing),
+        // so its first row is live iff any of them is.  Unreachable at row_tiles == 1.
         [[unroll]] for (uint32_t t = 1; t < row_tiles; ++t) {
-            if (ZERO_DEAD_V && MASK_ENABLE && t * MatBr >= n_valid) {
+            if (ZERO_DEAD_V && MASK_ENABLE && !fa_row_live(t * MatBr)) {
                 [[unroll]] for (uint32_t w = 0; w < dead_words; ++w) {
                     dead_cols[t * dead_words + w] = 0;
                 }
@@ -794,7 +807,7 @@ void main() {
             // ([HSV, ne1, k, ne2, ne3], and [ne1, k, ne2, ne3] for L/M) is per row.
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                 const uint32_t grow = i * Br + tile_row(r);
-                if (grow < N) {
+                if (fa_row_live(tile_row(r))) {
                     const uint32_t tok = FA_ROW_TOKEN(grow);
                     const uint32_t hd  = FA_ROW_HEAD(grow);
 
@@ -901,7 +914,7 @@ void main() {
     if (GQA_TOKENS) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             const uint32_t grow = i * Br + tile_row(r);
-            if (grow < N) {
+            if (fa_row_live(tile_row(r))) {
                 const uint32_t row_o_offset = (FA_ROW_TOKEN(grow)*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 4;
                 const uint32_t hd = FA_ROW_HEAD(grow);
                 [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {

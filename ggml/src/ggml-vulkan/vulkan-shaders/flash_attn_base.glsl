@@ -32,23 +32,33 @@ const bool ZERO_DEAD_V     = (Flags & 16) != 0;
 const bool DEADV_LDS       = (Flags & 32) != 0;
 // [TAG_FA_GQA_TOKENS] Fold the query tokens into the row dimension on top of the GQA head
 // fold: a Br tile holds rows of the (token, head) product space, decoded as
-// token = r / gqa_ratio, head = iq2 + r % gqa_ratio, instead of one token's gqa_ratio heads.
-// One workgroup then covers ceil(gqa_ratio * n_tokens / Br) tiles' worth of KV passes instead
-// of one pass per token, which is the point: at decode depth this kernel is bound by how many
-// times it streams its KV head.  Rows still index gl_WorkGroupID.x the way the non-gqa path
-// does (i = row tile), and the mask gets a real per-row stride.
+// token = r / FA_GQA_ROWS, head = iq2 + r % FA_GQA_ROWS, instead of one token's gqa_ratio
+// heads.  One workgroup then covers ceil(rows / Br) tiles' worth of KV passes instead of one
+// pass per token, which is the point: at decode depth this kernel is bound by how many times
+// it streams its KV head.  Rows still index gl_WorkGroupID.x the way the non-gqa path does
+// (i = row tile), and the mask gets a real per-row stride.
 //
-// The packing is dense: a Br tile is a contiguous slice of the row space and a token's rows
-// may straddle two tiles.  The alternative - round each tile down to a whole number of tokens,
-// floor(Br / gqa_ratio) * gqa_ratio rows - keeps every tile's rows inside one token, but at
-// the shape this exists for (gqa_ratio 12, Br 32) that is 24 rows per tile, so it needs the
-// same ceil(6 / 2) = 3 tiles as dense packing while leaving a quarter of every tile's QK and
-// P*V work on padding rows.  It buys nothing in return: no reduction in this kernel is over
-// rows, so a tile that mixes tokens costs nothing, and the mask is read per row either way
-// (the four rows of one mask f16vec4 already come from four independent scalar loads).  What
-// the alternative WOULD buy is a tile-uniform mask row, i.e. one mask load broadcast to all
-// rows - but at decode the mask block is 64 x Br f16 served out of L1, not a DRAM cost, so it
-// is not worth a quarter of the tile.
+// The packing is TOKEN-ALIGNED, not dense: a token is given FA_GQA_ROWS = gqa_ratio rounded up
+// to a whole number of MatBr = 16 coopmat row tiles, so a row tile never straddles two tokens.
+// That is a correctness requirement, not a preference.  ZERO_DEAD_V's dead-column predicate
+// ("this KV column is mask-suppressed for every row of this coopmat row tile") is a reduction
+// over the rows of a row tile, and V is coopMatMulAdd's shared B operand across those rows, so
+// a column can only be replaced by +0 when it is dead for all of them.  With a causal verify
+// mask, token t sees keys <= pos_t, so at the diagonal tile a column is dead for the earlier
+// token and live for the later one.  Dense packing puts both tokens in one row tile, the
+// predicate goes false, V keeps its original bytes, and the earlier token's masked rows
+// compute P == +0 times a possibly negative V - which is exactly the RDNA3 signed-zero
+// coopMatMulAdd hazard ZERO_DEAD_V exists to contain (docs/contrib/
+// ISSUE-vulkan-fa-coopmat-signed-zero.md).  The result then differs from the per-token
+// dispatch by ULPs on precisely the causal-boundary token, which is the token a speculative
+// verify round is about to accept or reject.
+//
+// The alignment is free at the shape this exists for.  gqa_ratio 12 pads to 16 rows per token,
+// so a Br = 32 tile holds 2 tokens and 6 tokens still take ceil(6/2) = 3 tiles - the same 3
+// passes and the same 96 row slots as dense packing, and the same 96 row slots the per-token
+// Br = 16 dispatch already used for its 12-head tokens.  In general the padding a token wastes
+// here is the padding the unfolded dispatch wasted anyway, because both allot a whole coopmat
+// row tile per token.
 // Bit 64 is deliberately skipped: the prod-v7-fa line uses it for CM1_SF_PAD (the coopmat1
 // QK^T scratch stride pad, [TAG_FA_CM1_SF_PAD]).  The two series are independent and either
 // could land first, so they must not alias - a merge that gave one branch's dispatch the
@@ -159,6 +169,19 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
 
+// [TAG_FA_GQA_TOKENS] The folded row space, as macros so they can be used by the
+// perElemOp* helpers above init_indices().  Only meaningful when GQA_TOKENS is set.
+//
+//   FA_GQA_ROWS  rows allotted to one token: gqa_ratio rounded up to a whole number of
+//                MatBr = 16 coopmat row tiles, so a row tile holds rows of one token only.
+//                A power of two, so the divisions below are shifts.
+//   FA_ROW_PAD   this row pads its token out to that multiple - no query of its own.
+//   FA_ROW_HEAD  head within the group, clamped so a padding row still reads in bounds.
+#define FA_GQA_ROWS     ((p.gqa_ratio + 15u) & ~15u)
+#define FA_ROW_TOKEN(r) ((r) / FA_GQA_ROWS)
+#define FA_ROW_PAD(r)   (((r) % FA_GQA_ROWS) >= p.gqa_ratio)
+#define FA_ROW_HEAD(r)  min((r) % FA_GQA_ROWS, p.gqa_ratio - 1u)
+
 // Store column zero. This is used to save per-row m and L values for split_k.
 ACC_TYPE perElemOpStoreCol0(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
@@ -172,7 +195,7 @@ ACC_TYPE perElemOpStoreCol0(const in uint32_t r, const in uint32_t c, const in A
 // Load the slope matrix, indexed by Q's dimension 2.
 ACC_TYPE perElemOpComputeSlope(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
 {
-    const uint32_t h = iq2 + (r % p.gqa_ratio);
+    const uint32_t h = iq2 + (GQA_TOKENS ? FA_ROW_HEAD(r) : (r % p.gqa_ratio));
 
     uint32_t n_head_log2 = p.mask_n_head_log2 & N_LOG2_MASK;
 
@@ -185,7 +208,7 @@ ACC_TYPE perElemOpComputeSlope(const in uint32_t r, const in uint32_t c, const i
 // Load the sink value, indexed by Q's dimension 2.
 ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
 {
-    const uint32_t h = iq2 + (r % p.gqa_ratio);
+    const uint32_t h = iq2 + (GQA_TOKENS ? FA_ROW_HEAD(r) : (r % p.gqa_ratio));
 
     return ACC_TYPE(data_s[h]);
 }
@@ -269,20 +292,19 @@ void init_indices()
 // of the last Br tile) are clamped so the read stays inside the mask; their result is discarded.
 uint32_t fa_mask_row(const in uint32_t r)
 {
-    return GQA_TOKENS ? min(r / p.gqa_ratio, p.nem1 - 1) : r;
+    return GQA_TOKENS ? min(r / FA_GQA_ROWS, p.nem1 - 1) : r;
 }
 
 // Q row r as a vec4 offset relative to q_offset / 4.  Without GQA_TOKENS this is exactly the
 // expression the callers used to inline; with it, the row carries its own token and head.
+// A row that pads its token out to a whole row tile reads its token's last head instead, so
+// the load stays inside Q; FA_ROW_PAD keeps its result out of every output and out of the
+// ZERO_DEAD_V predicate.
 uint32_t fa_q_row_offset4(const in uint32_t r)
 {
-    return GQA_TOKENS ? ((r / p.gqa_ratio) * p.nb01 + (r % p.gqa_ratio) * q_stride) / 4
+    return GQA_TOKENS ? ((r / FA_GQA_ROWS) * p.nb01 + FA_ROW_HEAD(r) * q_stride) / 4
                       : r * q_stride / 4;
 }
-
-// The token and the head-within-group of row r.  Only meaningful when GQA_TOKENS is set.
-#define FA_ROW_TOKEN(r) ((r) / p.gqa_ratio)
-#define FA_ROW_HEAD(r)  ((r) % p.gqa_ratio)
 
 // Bias applied to softmax to stay in fp16 range.
 // Based on ggml-cuda issue https://github.com/ggml-org/llama.cpp/issues/18606

@@ -11233,9 +11233,19 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // 40 B over, and a third row tile the shader does not have.  So 32 is the widest tile that
     // fits, and at the production shape the fold takes 3 of the 6 passes.
     //
+    // The row space is TOKEN-ALIGNED: a token gets gqa_ratio rounded up to a whole number of
+    // MatBr = 16 coopmat row tiles, so a row tile never holds rows of two tokens.  ZERO_DEAD_V's
+    // dead-column predicate reduces over the rows of a row tile and V is coopMatMulAdd's shared
+    // B operand across them, so a tile that mixed tokens would stop zeroing exactly the columns
+    // a causal mask suppresses for the earlier token and not the later one - the causal-boundary
+    // tile - and reopen the RDNA3 signed-zero hazard on the verify round's boundary token.  See
+    // [TAG_FA_GQA_TOKENS] in flash_attn_base.glsl.  It costs nothing here: gqa_ratio 12 pads to
+    // 16, so 6 tokens still take ceil(6*16/32) = 3 tiles and 96 row slots - the same 3 passes as
+    // dense packing and the same 96 row slots the per-token Br = 16 dispatch already used.
+    //
     // Conditions, beyond "the plain GQA fold applies":
     //   * coopmat1: the other two paths have no row-tile machinery.
-    //   * the fold must actually remove passes (tiles < neq1), which excludes gqa_ratio >= Br.
+    //   * the fold must actually remove passes (tiles < neq1).
     //   * neq1 <= Br, which is what lets the shader read mask-opt block row 0 for every tile.
     //   * the tile must fit in shared memory.
     // GGML_VK_FA_GQA_TOKENS=0 restores the per-token dispatch.
@@ -11243,7 +11253,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     bool gqa_tokens = false;
     const uint32_t unfolded_block_rows = tuning_params.block_rows;
     if (fa_gqa_tokens && gqa_ratio > 1 && neq1 > 1 && tuning_params.path == FA_COOPMAT1) {
-        const uint32_t rows_folded = gqa_ratio * (uint32_t)neq1;
+        // must match FA_GQA_ROWS in flash_attn_base.glsl
+        const uint32_t gqa_rows_padded = ROUNDUP_POW2(gqa_ratio, 16u);
+        const uint32_t rows_folded = gqa_rows_padded * (uint32_t)neq1;
         vk_fa_tuning_params folded = tuning_params;
         if (CEIL_DIV(rows_folded, 2 * 16) < CEIL_DIV(rows_folded, folded.block_rows)) {
             folded.block_rows = 2 * 16; // two MatBr = 16 coopmat row tiles
