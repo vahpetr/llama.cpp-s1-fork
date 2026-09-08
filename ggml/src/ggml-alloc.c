@@ -940,6 +940,14 @@ static bool ggml_gallocr_reserve_n_impl(
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
+                    // the node/leaf assignments installed above already point into this buffer, and the
+                    // old one has been freed. leaving them in place lets a later ggml_gallocr_alloc_graph
+                    // decide that no reallocation is needed and then allocate tensors out of a NULL
+                    // vbuffer (ggml_vbuffer_tensor_alloc -> buf->chunks[...]), which segfaults instead of
+                    // reporting the OOM. invalidate the plan so the next alloc_graph re-reserves (and
+                    // fails cleanly) rather than trusting it.
+                    galloc->n_nodes = 0;
+                    galloc->n_leafs = 0;
                     return false;
                 }
             }
