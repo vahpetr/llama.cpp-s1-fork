@@ -6294,7 +6294,15 @@ struct test_top_k : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     const int k;
-    const bool ties;
+    // 0: distinct values, compare the indices exactly.
+    // 1: random duplicates, compare the selected VALUES as a multiset - any resolution of a
+    //    tie that straddles the k-th value passes.
+    // 2: ties by construction, compare the INDICES exactly. The reference is the top k under
+    //    (value descending, index ascending) - cmp_top_k in ggml-cpu/ops.cpp - so a backend
+    //    passes only if it resolves ties the same way, which is the property that makes a
+    //    selection reproducible run to run. Vulkan's radix-select (k >= 1024) ranks ties by
+    //    index; keep these cases at large k, the bitonic small-k fallback does not.
+    const int ties;
     ggml_tensor * input {};
 
     std::string vars() override {
@@ -6303,7 +6311,7 @@ struct test_top_k : public test_case {
 
     test_top_k(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {16, 10, 10, 10},
-            int k = 4, bool ties = false)
+            int k = 4, int ties = 0)
         : type(type), ne(ne), k(k), ties(ties) {}
 
     double max_err() override {
@@ -6312,7 +6320,7 @@ struct test_top_k : public test_case {
 
     // When there are ties, only validate the final result.
     // The logic in err can't handle the sentinel tensors.
-    bool run_whole_graph() override { return ties; }
+    bool run_whole_graph() override { return ties != 0; }
 
     double err(const float * a, const float * b, size_t n) override {
         // When there are no ties, we expect the exact same set of indices,
@@ -6320,7 +6328,7 @@ struct test_top_k : public test_case {
         // can be different but the input values they correspond to should be
         // the same. The logic for ties could work for non-ties, but only for
         // the output tensor, not for the sentinel tensors.
-        if (ties) {
+        if (ties == 1) {
             std::vector<float> src(ggml_nelements(input));
 
             ggml_backend_tensor_get(input, src.data(), 0, ggml_nelements(input) * ggml_type_size(type));
@@ -6388,6 +6396,57 @@ struct test_top_k : public test_case {
         return out;
     }
 
+    // ties == 2: one structure per row, all of them tie ON the k-th largest value, so the
+    // selection is only reproducible if the backend breaks the tie the way the reference does.
+    // Every value is a small integer, exact in f32.
+    void fill_tie_row(std::vector<float> & data, int64_t n, int64_t row) const {
+        const int64_t rot = 7919*row; // keep the rows from selecting alike
+        switch (row % 4) {
+            case 0: {
+                // block-constant: 4 consecutive cells share a value, the qwen4exp indexer
+                // layout, and k is not a multiple of 4 so it cuts inside a block - the tie
+                // group at the threshold is 4 wide with fewer slots left
+                const int64_t nb = (n + 3)/4;
+                for (int64_t i = 0; i < n; i++) {
+                    data[i] = (float) ((i/4 + rot) % nb);
+                }
+            } break;
+            case 1:
+                // one value: the answer is exactly the k lowest indices
+                for (int64_t i = 0; i < n; i++) {
+                    data[i] = 1.0f;
+                }
+                break;
+            case 2: {
+                // a plateau far wider than the slots the distinct values leave: the k-th
+                // largest has ~n - k/2 ties and only k - k/2 places to put them
+                for (int64_t i = 0; i < n; i++) {
+                    data[i] = 1.0f;
+                }
+                const int64_t nhi    = std::max(1, k/2);
+                const int64_t stride = std::max<int64_t>(1, n/nhi);
+                for (int64_t j = 0; j < nhi && j*stride < n; j++) {
+                    data[(j*stride + rot) % n] = 2.0f + (float) j;
+                }
+            } break;
+            default: {
+                // row % 4 == 3: the same plateau, but at zero and with both signs: IEEE compare - and so
+                // the reference - calls -0.0 and +0.0 equal, while the bit pattern of -0.0
+                // sorts strictly below +0.0. A backend keying on the bits without folding
+                // the two together selects every +0.0 before any -0.0 instead of the lowest
+                // indices of the two combined.
+                for (int64_t i = 0; i < n; i++) {
+                    data[i] = (i % 2) ? -0.0f : 0.0f;
+                }
+                const int64_t nhi    = std::max(1, k/2);
+                const int64_t stride = std::max<int64_t>(1, n/nhi);
+                for (int64_t j = 0; j < nhi && j*stride < n; j++) {
+                    data[(j*stride + rot) % n] = 1.0f + (float) j;
+                }
+            } break;
+        }
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
         std::random_device rd;
         std::default_random_engine rng(rd());
@@ -6395,6 +6454,11 @@ struct test_top_k : public test_case {
             int tie_denom = std::max(1, std::min(10, k / 2));
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
                 std::vector<float> data(t->ne[0]);
+                if (ties == 2) {
+                    fill_tie_row(data, t->ne[0], r);
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+                    continue;
+                }
                 for (int i = 0; i < t->ne[0]; i++) {
                     if (ties) {
                         // integer division to introduce duplicates
@@ -6431,6 +6495,15 @@ struct test_topk_qsa : public test_case {
     // GGML_OP_NONE and it skips those). test-backend-ops allocates linearly and would never produce
     // the alias on its own, so without this no TOPK_QSA case reaches that veto.
     const int     alias;
+    // 0 = the tie-free initialisations below. Otherwise the tie structure the deployed
+    // selection actually runs into, which those deliberately avoid: the mask is all zero, so
+    // every cell of a block carries the identical block score exactly as qwen4exp expands it,
+    // and the width cuts inside a block. 1 = one score per block (tie group = ratio cells),
+    // 2 = every cell of the row equal, 3 = eight blocks share a score, so the threshold's tie
+    // group is 8*ratio cells wide with 3 slots left. Requires blocked. The ids are compared
+    // exactly, which is only meaningful because the CPU reference resolves ties by index
+    // (cmp_top_k) and the Vulkan radix-select does too.
+    const int     ties;
     ggml_tensor * out {};
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6439,12 +6512,15 @@ struct test_topk_qsa : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR7(n_blocks, n_kv, n_tps, n_stream, width, blocked, alias);
+        return VARS_TO_STR8(n_blocks, n_kv, n_tps, n_stream, width, blocked, alias, ties);
     }
 
     test_topk_qsa(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1, int width = 1500,
-                  bool blocked = false, int alias = 0)
-        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), blocked(blocked), alias(alias) {}
+                  bool blocked = false, int alias = 0, int ties = 0)
+        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), blocked(blocked), alias(alias),
+          ties(ties) {
+        GGML_ASSERT(ties == 0 || blocked);
+    }
 
     double max_err() override { return 0.0; }
     bool run_whole_graph() override { return true; }
@@ -6476,8 +6552,9 @@ struct test_topk_qsa : public test_case {
 
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
 
-    // Two tie-free initializations - the comparison is a set of indices, so a tie that
-    // straddles the k-th value would let CPU and backend disagree legitimately.
+    // Two tie-free initializations plus the tie modes above. The comparison is a set of
+    // indices, so before the reference's tie-break existed a tie that straddled the k-th value
+    // would let CPU and backend disagree legitimately; now the ties ARE the interesting case.
     //
     // default: distinct mask ramp + small scores. Only valid while n_kv <= 2048: f16 stops
     //   representing consecutive integers there and saturates to inf past 65504.
@@ -6504,7 +6581,8 @@ struct test_topk_qsa : public test_case {
                 std::vector<ggml_fp16_t> data(ggml_nelements(t));
                 for (int64_t row = 0; row < ggml_nrows(t); row++) {
                     for (int64_t i = 0; i < n_kv; i++) {
-                        const float v = blocked ? 0.25f*(float) (i % r) : (float) i;
+                        // ties: no in-block offset, so a block's cells are indistinguishable
+                        const float v = ties ? 0.0f : blocked ? 0.25f*(float) (i % r) : (float) i;
                         data[row * n_kv + i] = ggml_fp32_to_fp16(v);
                     }
                 }
@@ -6519,7 +6597,8 @@ struct test_topk_qsa : public test_case {
                 std::vector<float> data(ggml_nelements(t));
                 for (int64_t row = 0; row < ggml_nrows(t); row++) {
                     for (int64_t b = 0; b < n_blocks; b++) {
-                        data[row * n_blocks + b] = (float) ((b + 7919*row) % n_blocks);
+                        const int64_t v = (b + 7919*row) % n_blocks;
+                        data[row * n_blocks + b] = ties == 2 ? 0.0f : (float) (ties == 3 ? v/8 : v);
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
@@ -10157,8 +10236,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 2051));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 1, 1, 1 }, 2051));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051));
-    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 2051, true));
-    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051, true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 2051, 1));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051, 1));
+
+    // ... and ties the k-th largest value actually lands on, with the ids compared exactly
+    // (ties == 2, four structures spread over the rows: block-constant, all-equal, plateau,
+    // signed-zero plateau). k >= 1024 on purpose - that is the radix-select path, the one the
+    // QSA selection uses; the small-k pipelines are not required to rank ties by index.
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 2048,  4, 1, 1 }, 1025, 2));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  4, 1, 1 }, 2051, 2));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 16384, 4, 1, 1 }, 2051, 2));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051, 2));
 
     // qwen4exp QSA indexer top-k fusion (get_rows + f16 mask + top_k)
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  1, 1, 1500));
@@ -10179,14 +10267,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // ... and with the ties the selection is built out of (see test_topk_qsa::ties): the mask
+    // is zero, so a block's cells are indistinguishable and width 2051 = 512*4 + 3 cuts inside
+    // one. Production width and ratio 4 at the 4k/16k shapes. The ids are compared with zero
+    // tolerance, so these fail on any backend whose large-k top_k picks a different member of
+    // the tie group than (value descending, index ascending) - which is the point: that choice
+    // is what makes a decode reproducible.
+    test_cases.emplace_back(new test_topk_qsa(1024, 4096,  6, 1, 2051, true, 0, 1));
+    test_cases.emplace_back(new test_topk_qsa(4096, 16384, 1, 1, 2051, true, 0, 1));
+    test_cases.emplace_back(new test_topk_qsa(4096, 16384, 6, 1, 2051, true, 0, 2));
+    test_cases.emplace_back(new test_topk_qsa(4096, 16384, 6, 1, 2051, true, 0, 3));
+
     // Qwen 3.8 Flash Next at the deployed context: n_kv 213000, ratio 4, width 2051, decode
     // and -ub 2048 prefill. Opt-in: the n_tps 2048 pair needs ~10 GB of backend and as much
     // host memory for the reference, and runs for a while.
     if (getenv("GGML_TEST_TOPK_PROD")) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 213000, 6,    1, 1 }, 2051));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 213000, 2048, 1, 1 }, 2051));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 213000, 6,    1, 1 }, 2051, 2));
         test_cases.emplace_back(new test_topk_qsa(53250, 213000, 6,    1, 2051, true));
         test_cases.emplace_back(new test_topk_qsa(53250, 213000, 2048, 1, 2051, true));
+        test_cases.emplace_back(new test_topk_qsa(53250, 213000, 6,    1, 2051, true, 0, 1));
     }
 
     // exhaustive top_k tests
