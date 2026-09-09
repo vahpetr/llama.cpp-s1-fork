@@ -31,7 +31,9 @@ layout (push_constant) uniform parameter {
 shared uint histo[RADIX_SIZE];
 shared uint sh_bucket;
 shared uint sh_above;
-shared uint out_count;
+// per-invocation counts of the two output classes, scanned in place (see topk)
+shared uint sh_gt[BLOCK_SIZE];
+shared uint sh_eq[BLOCK_SIZE];
 
 // order-preserving float -> uint mapping
 uint f2ui(float x) {
@@ -58,8 +60,10 @@ float load(uint row, uint i, bool first) {
     if (QSA == 0) {
         return data_a[row * p.ncols + i];
     }
-    // materialize the scattered gather on the first pass and reuse it after; each
-    // invocation only touches its own scratch entries, so no barrier is needed
+    // materialize the scattered gather on the first pass and reuse it after. The radix
+    // passes keep the same strided element->invocation map as the pass that wrote it, so
+    // they read their own entries; the emit phase below re-partitions the row and must
+    // publish the writes first (memoryBarrierBuffer).
     const uint off = row * p.ncols + i;
     if (first) {
         const float v = gather(row, i);
@@ -69,7 +73,7 @@ float load(uint row, uint i, bool first) {
     return scratch[off];
 }
 
-// one workgroup per row: radix-select the K-th largest, then compact it plus enough ties
+// one workgroup per row: radix-select the K-th largest, then compact it plus the lowest-index ties
 void topk(const uint row) {
     const uint tid = gl_LocalInvocationID.x;
     const uint ncols = p.ncols;
@@ -114,25 +118,76 @@ void topk(const uint row) {
         barrier();
     }
 
-    if (tid == 0) {
-        out_count = 0;
+    // Emit. `threshold` is the key of the k-th largest element and `desired` is how many of
+    // the elements EQUAL to it the row still needs, so `k - desired` elements are strictly
+    // above it and all of them are selected. Which ties fill the rest is a real choice: pick
+    // the lowest indices, which is what the CPU reference selects (it sorts by value
+    // descending, index ascending), so the two agree element for element.
+    //
+    // The rank of an element within its class is computed instead of raced for: the row is
+    // split into BLOCK_SIZE contiguous ranges, one per invocation, and a prefix sum over the
+    // per-range counts turns "how many of my class come before my range" into "where my range
+    // starts". Both classes share the scan's barriers. Nothing here is order-dependent, so
+    // the ids are a pure function of the input - including their order, which the QSA gather
+    // path needs: it sums the attention window in id order.
+    const uint threshold = prefix;
+    const uint n_above   = p.k - desired;
+
+    // contiguous ranges, balanced to +-1 element; tid*quot cannot overflow (it is <= ncols)
+    const uint quot = ncols / uint(BLOCK_SIZE);
+    const uint rem  = ncols % uint(BLOCK_SIZE);
+    const uint lo   = tid*quot + min(tid, rem);
+    const uint hi   = lo + quot + (tid < rem ? 1u : 0u);
+
+    if (QSA != 0) {
+        // the ranges cross the strided map the radix passes used, so this is the first read
+        // of scratch entries another invocation wrote - publish them
+        memoryBarrierBuffer();
     }
     barrier();
 
-    // emit everything above the threshold, then fill the rest from ties
-    const uint threshold = prefix;
-    for (uint i = tid; i < ncols; i += BLOCK_SIZE) {
-        if (f2ui(load(row, i, false)) > threshold) {
-            data_d[row_out + atomicAdd(out_count, 1u)] = int(i);
-        }
+    uint cnt_gt = 0;
+    uint cnt_eq = 0;
+    for (uint i = lo; i < hi; ++i) {
+        const uint key = f2ui(load(row, i, false));
+        cnt_gt += key >  threshold ? 1u : 0u;
+        cnt_eq += key == threshold ? 1u : 0u;
     }
+    sh_gt[tid] = cnt_gt;
+    sh_eq[tid] = cnt_eq;
     barrier();
-    for (uint i = tid; i < ncols; i += BLOCK_SIZE) {
-        if (f2ui(load(row, i, false)) == threshold) {
-            const uint pos = atomicAdd(out_count, 1u);
-            if (pos < p.k) {
-                data_d[row_out + pos] = int(i);
+
+    for (uint d = 1; d < uint(BLOCK_SIZE); d <<= 1) {
+        uint add_gt = 0;
+        uint add_eq = 0;
+        if (tid >= d) {
+            add_gt = sh_gt[tid - d];
+            add_eq = sh_eq[tid - d];
+        }
+        barrier();
+        sh_gt[tid] += add_gt;
+        sh_eq[tid] += add_eq;
+        barrier();
+    }
+
+    // exclusive prefix: where this range's first element of each class lands
+    uint pos_gt = tid == 0 ? 0 : sh_gt[tid - 1];
+    uint pos_eq = tid == 0 ? 0 : sh_eq[tid - 1];
+
+    for (uint i = lo; i < hi; ++i) {
+        const uint key = f2ui(load(row, i, false));
+        if (key > threshold) {
+            // the counts guarantee pos_gt < n_above; the test keeps a hypothetical
+            // miscount inside this row instead of overwriting the next one
+            if (pos_gt < n_above) {
+                data_d[row_out + pos_gt] = int(i);
             }
+            pos_gt++;
+        } else if (key == threshold) {
+            if (pos_eq < desired) {
+                data_d[row_out + n_above + pos_eq] = int(i);
+            }
+            pos_eq++;
         }
     }
 }
