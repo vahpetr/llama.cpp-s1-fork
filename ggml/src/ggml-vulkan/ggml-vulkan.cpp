@@ -6282,7 +6282,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     // large-k fallback: one workgroup per row, radix-select instead of a full sort. The QSA
     // variant (spec constant 1) additionally gathers the qwen4 indexer input on the fly.
-    {
+    // topk_radix_select.comp declares the Vulkan memory model to publish its QSA scratch
+    // ([TAG_QSA_SCRATCH_COHERENT]), exactly like argsort_large.comp, so it needs the feature -
+    // leave both pipelines null without it. supports_op already reads null as "not supported"
+    // (TOP_K falls back to the tournament pipelines or to the CPU, QSA_TOP_K and the topk_qsa
+    // fusion to the CPU and the unfused chain).
+    if (device->vulkan_memory_model) {
         const uint32_t BLOCK_SIZE = 1u << std::min(10u, device->max_workgroup_size_log2);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);

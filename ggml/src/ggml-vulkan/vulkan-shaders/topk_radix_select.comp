@@ -2,6 +2,19 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
+// [TAG_QSA_SCRATCH_COHERENT] The QSA path publishes the gathered row in `scratch` (binding 4) from
+// one invocation and reads it back in others: the radix passes keep the strided element ->
+// invocation map of the pass that wrote it, but the emit phase re-partitions the row into
+// contiguous ranges, so nearly every entry it reads was written by a different invocation. Under
+// the default GLSL memory model `barrier()` orders shared memory and `memoryBarrierBuffer()` is a
+// bare availability/visibility operation whose pairing with the execution barrier is exactly the
+// under-specified corner the Vulkan memory model exists to pin down - "it happens to work on this
+// driver" is not a guarantee, and the failure mode (a stale scratch entry) is a wrong selection,
+// not a crash. Use the house idiom instead - argsort_large.comp publishes its bitonic scratch the
+// same way: the Vulkan memory model, `workgroupcoherent` on the buffer that crosses invocations,
+// and a controlBarrier carrying buffer storage semantics at the publish point.
+#extension GL_KHR_memory_scope_semantics : enable
+#pragma use_vulkan_memory_model
 
 #include "types.glsl"
 
@@ -14,7 +27,9 @@ layout (binding = 0) readonly buffer A  {float     data_a[];};   // input values
 layout (binding = 1) writeonly buffer D {int       data_d[];};   // [k, ...]
 layout (binding = 2) readonly buffer CB {int       cell_blk[];}; // QSA: cell->block map [n_kv, n_stream]
 layout (binding = 3) readonly buffer M  {float16_t mask[];};     // QSA: raw f16 kq_mask [n_kv, n_tps, n_stream]
-layout (binding = 4) buffer S           {float     scratch[];};  // QSA: [nrows, n_kv] gathered inputs
+// workgroupcoherent: written by one invocation, read by others of the same workgroup (see
+// [TAG_QSA_SCRATCH_COHERENT]). Never shared between workgroups - one workgroup owns a row.
+layout (binding = 4) workgroupcoherent buffer S {float scratch[];};  // QSA: [nrows, n_kv] gathered inputs
 
 layout (push_constant) uniform parameter {
     uint ncols;
@@ -76,7 +91,7 @@ float load(uint row, uint i, bool first) {
     // materialize the scattered gather on the first pass and reuse it after. The radix
     // passes keep the same strided element->invocation map as the pass that wrote it, so
     // they read their own entries; the emit phase below re-partitions the row and must
-    // publish the writes first (memoryBarrierBuffer).
+    // publish the writes first (controlBarrier with buffer semantics, [TAG_QSA_SCRATCH_COHERENT]).
     const uint off = row * p.ncols + i;
     if (first) {
         const float v = gather(row, i);
@@ -153,9 +168,11 @@ void topk(const uint row) {
     const uint hi   = lo + quot + (tid < rem ? 1u : 0u);
 
     if (QSA != 0) {
-        // the ranges cross the strided map the radix passes used, so this is the first read
-        // of scratch entries another invocation wrote - publish them
-        memoryBarrierBuffer();
+        // The ranges cross the strided map the radix passes used, so this is the first read of
+        // scratch entries another invocation wrote - publish them. QSA is a specialization
+        // constant, so this branch is uniform over the workgroup and a controlBarrier is legal
+        // here. [TAG_QSA_SCRATCH_COHERENT]
+        controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
     }
     barrier();
 
