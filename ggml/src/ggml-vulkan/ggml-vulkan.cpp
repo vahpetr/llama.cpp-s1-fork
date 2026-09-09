@@ -19243,8 +19243,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                                 continue;
                             }
                             if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
+                                // n <= k, not n < k: a src that IS one of the pattern's own nodes is an
+                                // elided intermediate, and that includes the node being scanned itself.
+                                // ggml_cast sets result->src[1] = result (for consistency with
+                                // ggml_cpy_impl, whose src[1] is the copy's destination), so a pattern
+                                // that elides a cast - topk_qsa's f32 mask cast is the only one in this
+                                // backend - carries a src that points at an elided node the fused
+                                // dispatch never binds. Without this the cast's freed block vetoes the
+                                // whole layer whenever ggml-alloc drops the fused destination into it,
+                                // which at the production shapes it does in every layer of every graph
+                                // (width 2051 vs n_kv 2304 makes it the tightest fit).
                                 bool found = false;
-                                for (int n = 0; n < k; ++n) {
+                                for (int n = 0; n <= k; ++n) {
                                     if (cgraph->nodes[i + n] == src) {
                                         found = true;
                                         break;
