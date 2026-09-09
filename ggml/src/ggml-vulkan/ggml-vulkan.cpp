@@ -49,6 +49,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -2275,6 +2276,28 @@ static bool ggml_vk_sched_prof_enabled() {
     return enabled;
 }
 
+// env: GGML_VK_FUSION_COUNT=1 - one stderr line per graph_compute call,
+//   [vk-fusion-count] graph nodes=N name1=c1 name2=c2 ... vetoed:name=c ...
+// with the number of times each fusion pattern was dispatched in that graph (after the src/dst overlap
+// veto) and, as vetoed:<name>, the number of matches the veto turned back into unfused ops. GGML_VK_FUSION_DIAG
+// only logs the individual vetoes, so it cannot tell "the router fused in 47 layers" from "in 12"; this can,
+// per graph, and two runs (or the two arms of an A/B) can be compared line by line.
+// Read once and cached: when unset the cost is one load per node and an empty std::map per graph.
+static bool ggml_vk_fusion_count_enabled() {
+    static const bool enabled = ggml_vk_env_bool("GGML_VK_FUSION_COUNT", false);
+    return enabled;
+}
+
+// GGML_VK_FUSION_COUNT: the per-graph tally. Keys are the lower-case fusion_string of the match
+// site, optionally prefixed (with "vetoed:" for a match the overlap veto undid).
+static void ggml_vk_fusion_count_add(std::map<std::string, int> & counts, const char * prefix, const char * fusion_string) {
+    std::string key = prefix;
+    for (const char * c = fusion_string; *c; ++c) {
+        key += (char) tolower((unsigned char) *c);
+    }
+    counts[key]++;
+}
+
 // [TAG_DMMV_RM] G50a: rows-per-workgroup knob for the dense mat-vec (dmmv) pipelines.  Same
 // "absent leaves the default, otherwise the value is parsed" convention as [TAG_ENV_BOOL].
 //
@@ -2591,6 +2614,8 @@ struct ggml_backend_vk_context {
     bool fused_mul_sigmoid {};
     // ADD + UNARY(SOFTPLUS) + MUL: the GDN decay pre-chain, one dispatch off the ADD node
     bool fused_gdn_pre {};
+    // GGML_VK_FUSION_COUNT: add_rms fusions of the current graph (decided inside ggml_vk_build_graph)
+    int fusion_count_add_rms {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -16259,6 +16284,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             ctx->do_add_rms_partials_offset_calculation = true;
             if (ctx->prealloc_size_add_rms_partials_offset + size <= ctx->prealloc_size_add_rms_partials) {
                 ctx->do_add_rms_partials = true;
+                if (ggml_vk_fusion_count_enabled()) {
+                    ctx->fusion_count_add_rms++;
+                }
             }
         }
     }
@@ -18429,6 +18457,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     uint64_t flops_per_submit = std::min(flops_cap, (vk_flops_seed_legacy ? ctx->last_total_flops : graph_total_flops) / 40u);
     const uint64_t flops_per_submit_seed = flops_per_submit;
 
+    // GGML_VK_FUSION_COUNT tally for this graph (empty and untouched when the knob is off)
+    const bool fusion_count = ggml_vk_fusion_count_enabled();
+    std::map<std::string, int> fusion_counts;
+    ctx->fusion_count_add_rms = 0;
+
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
             int64_t prof_t_wait_us = 0;
@@ -18749,6 +18782,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
 
+        if (fusion_count && fusion_string) {
+            // a match that the overlap veto undid has num_additional_fused_ops == 0 here
+            ggml_vk_fusion_count_add(fusion_counts, ctx->num_additional_fused_ops > 0 ? "" : "vetoed:", fusion_string);
+            if (ctx->num_additional_fused_ops > 0 && ctx->fused_topk_moe_scale) {
+                ggml_vk_fusion_count_add(fusion_counts, "", "topk_moe_scale");
+            }
+        }
+
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
@@ -18792,6 +18833,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     ctx->last_total_flops = total_flops;
+
+    if (fusion_count) {
+        if (ctx->fusion_count_add_rms) {
+            fusion_counts["add_rms"] = ctx->fusion_count_add_rms;
+        }
+        std::string line = "[vk-fusion-count] graph nodes=" + std::to_string(cgraph->n_nodes);
+        for (const auto & kv : fusion_counts) {
+            line += " " + kv.first + "=" + std::to_string(kv.second);
+        }
+        fprintf(stderr, "%s\n", line.c_str());
+    }
 
     if (prof) {
         const int64_t t_now_us = ggml_time_us();
