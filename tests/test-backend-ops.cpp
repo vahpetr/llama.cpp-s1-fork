@@ -8,6 +8,15 @@
 // and section 3 defines which tests to run.
 // Quick start for adding a new GGML op: Go to section 2 and create a struct that inherits from test_case,
 // then go to section 3 and add an instantiation of your struct.
+//
+// Environment variables:
+//   GGML_TEST_TOPK_PROD=1     also run the selection cases at the deployed Qwen 3.8 Flash Next shapes
+//                             (n_kv 213000, width 2051). Needs ~10 GB of backend and as much host
+//                             memory, and runs for a while.
+//   GGML_TEST_DUMP_IDS=<dir>  write the ids each TOP_K / TOPK_QSA / QSA_TOP_K case produced on the
+//                             BACKEND UNDER TEST to <dir>/<case>.ids, row-major, one row per line,
+//                             so two runs can be diffed byte-for-byte. The directory must exist and
+//                             should be fresh per run. See [TAG_QSA_ID_DUMP].
 
 
 // ##############################
@@ -29,6 +38,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <ctime>
 #include <future>
@@ -310,6 +320,75 @@ static double jdst(const T * a, const T * b, size_t n) {
     }
 
     return (double) diff / (2*n);
+}
+
+// [TAG_QSA_ID_DUMP] GGML_TEST_DUMP_IDS=<dir>
+//
+// Determinism evidence for the selection ops. The ids a TOP_K / TOPK_QSA / QSA_TOP_K case produced
+// ON THE BACKEND UNDER TEST (backend1, not the CPU reference) are written row-major to
+// <dir>/<case>.ids, so two runs of the same binary on the same backend can be diffed
+// byte-for-byte:
+//
+//   GGML_TEST_DUMP_IDS=/tmp/ids.a ./bin/test-backend-ops -b Vulkan0 -o QSA_TOP_K
+//   GGML_TEST_DUMP_IDS=/tmp/ids.b ./bin/test-backend-ops -b Vulkan0 -o QSA_TOP_K
+//   diff -r /tmp/ids.a /tmp/ids.b && echo "selection is reproducible"
+//
+// This is the check "two runs produced the same OK/FAIL lines" does not make: a pass/fail digest is
+// identical whenever both runs are correct, and a tie broken by a race is correct both times. The
+// ORDER within a row is dumped as the backend wrote it - the comparator is order-insensitive on
+// purpose (the CPU reference even swaps its first two ids), but a run-to-run difference in that
+// order still means the kernel raced, so the dump keeps it.
+//
+// The directory must exist; a file that cannot be opened is reported once per case and the run
+// continues. Use a FRESH directory per run: files are truncated, not appended, and a stale file
+// from an earlier filter would diff clean by accident.
+static const char * dump_ids_dir() {
+    static const char * dir = getenv("GGML_TEST_DUMP_IDS");
+    return dir;
+}
+
+// case string -> a file name that survives a shell and a filesystem
+static std::string dump_ids_path(const char * dir, const std::string & case_name) {
+    std::string name;
+    name.reserve(case_name.size() + 8);
+    for (const char c : case_name) {
+        name += (std::isalnum((unsigned char) c) || strchr("._-=,+()[]", c) != nullptr) ? c : '_';
+    }
+    return std::string(dir) + "/" + name + ".ids";
+}
+
+static void dump_ids(const char * dir, const std::string & case_name, const char * backend_name,
+                     const ggml_tensor * t, const std::vector<float> & vals) {
+    const int64_t row_len = t->ne[0];
+    const int64_t nrows   = ggml_nrows(t);
+
+    if (row_len <= 0 || nrows <= 0 || (size_t) (row_len*nrows) != vals.size()) {
+        return;
+    }
+
+    const std::string path = dump_ids_path(dir, case_name);
+
+    std::ofstream f(path, std::ios::out | std::ios::trunc);
+    if (!f) {
+        printf("[GGML_TEST_DUMP_IDS] cannot write %s (does the directory exist?) ", path.c_str());
+        return;
+    }
+
+    f << "# case=" << case_name << "\n";
+    f << "# backend=" << backend_name << " tensor=" << ggml_get_name(t)
+      << " op=" << ggml_op_name(t->op) << " nrows=" << nrows << " row_len=" << row_len << "\n";
+
+    std::string line;
+    for (int64_t r = 0; r < nrows; r++) {
+        line.clear();
+        for (int64_t c = 0; c < row_len; c++) {
+            if (c) {
+                line += ' ';
+            }
+            line += std::to_string((int32_t) vals[r*row_len + c]);
+        }
+        f << line << "\n";
+    }
 }
 
 // Exact-id comparison for the selection ops (TOP_K / TOPK_QSA / QSA_TOP_K), PER ROW.
@@ -1508,6 +1587,15 @@ struct test_case {
 
             std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
+
+            // [TAG_QSA_ID_DUMP] determinism evidence: the ids the backend under test produced,
+            // before any comparison can short-circuit the callback
+            // the case's output node, named "out" by every selection test - one file per case, so a
+            // graph that happens to carry a second TOP_K cannot overwrite it
+            if (dump_ids_dir() && (t1->op == GGML_OP_TOP_K || t1->op == GGML_OP_QSA_TOP_K) &&
+                strcmp(ggml_get_name(t1), "out") == 0) {
+                dump_ids(dump_ids_dir(), ud->tc->current_op_name + "(" + ud->tc->vars() + ")", bn1, t1, f1);
+            }
 
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
@@ -11828,6 +11916,11 @@ static void usage(char ** argv) {
     printf("    --show-coverage shows test coverage\n");
     printf("    --test-file reads test operators from a test file generated by test-export-graph-ops\n");
     printf("    -j <n> runs tests using <n> parallel worker threads (default: 1, test mode only)\n");
+    printf("    environment:\n");
+    printf("      GGML_TEST_TOPK_PROD=1    also run the selection cases at the deployed 213k-context shapes\n");
+    printf("      GGML_TEST_DUMP_IDS=<dir> write each TOP_K/TOPK_QSA/QSA_TOP_K case's output ids (row-major,\n");
+    printf("                               from the backend under test) to <dir>/<case>.ids, so two runs can\n");
+    printf("                               be diffed byte-for-byte. <dir> must exist; use a fresh one per run\n");
 }
 
 int main(int argc, char ** argv) {
