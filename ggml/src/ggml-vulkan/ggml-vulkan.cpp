@@ -53,7 +53,9 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <tuple>
@@ -2298,6 +2300,22 @@ static void ggml_vk_fusion_count_add(std::map<std::string, int> & counts, const 
     counts[key]++;
 }
 
+// GGML_VK_FUSION_COUNT: FNV-1a, the mixer of the per-graph numerics signature (sig=0x...).
+// Only ever fed under ggml_vk_fusion_count_enabled(), so the knob stays free when it is off.
+static const uint64_t vk_fnv1a_seed = 0xcbf29ce484222325ull;
+
+static uint64_t ggml_vk_fnv1a(uint64_t h, const void * data, size_t n) {
+    const uint8_t * p = (const uint8_t *) data;
+    for (size_t i = 0; i < n; ++i) {
+        h = (h ^ p[i]) * 0x100000001b3ull;
+    }
+    return h;
+}
+
+static uint64_t ggml_vk_fnv1a_str(uint64_t h, const char * s) {
+    return ggml_vk_fnv1a(h, s, strlen(s));
+}
+
 // [TAG_DMMV_RM] G50a: rows-per-workgroup knob for the dense mat-vec (dmmv) pipelines.  Same
 // "absent leaves the default, otherwise the value is parsed" convention as [TAG_ENV_BOOL].
 //
@@ -2616,6 +2634,10 @@ struct ggml_backend_vk_context {
     bool fused_gdn_pre {};
     // GGML_VK_FUSION_COUNT: add_rms fusions of the current graph (decided inside ggml_vk_build_graph)
     int fusion_count_add_rms {};
+    // GGML_VK_FUSION_COUNT: running numerics signature of the current graph. Fed once per node
+    // (op, fused pattern, applied misalignment) and once per dispatch (pipeline name + workgroup
+    // counts, which is where the shader and the split_k/rows-per-wg choice show up).
+    uint64_t fusion_sig {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -8531,6 +8553,15 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
         std::cerr << "(" << buffer.buffer << ", " << buffer.offset << ", " << buffer.range << "), ";
     }
     std::cerr << "}, (" << wg0 << "," << wg1 << "," << wg2 << "))");
+    if (ggml_vk_fusion_count_enabled()) {
+        // GGML_VK_FUSION_COUNT numerics signature: which shader ran, and over how many workgroups.
+        // The workgroup counts are where an offset-dependent decision that changes the arithmetic
+        // becomes visible - split_k picks a different wg2, the mat-vec rows-per-workgroup knob a
+        // different wg0 - so two graphs with the same sig ran the same shaders over the same
+        // decomposition, in the same order.
+        const uint32_t wg[3] = { wg0, wg1, wg2 };
+        ctx->fusion_sig = ggml_vk_fnv1a(ggml_vk_fnv1a_str(ctx->fusion_sig, pipeline->name.c_str()), wg, sizeof(wg));
+    }
     GGML_ASSERT(wg0 <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
                 wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                 wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
@@ -17730,6 +17761,82 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
     return true;
 }
 
+// GGML_VK_FUSION_COUNT: name the *first* condition that keeps MUL_MAT_ID + MUL (the MoE
+// expert-weight multiply) unfused at node_idx, or nullptr when nothing does. The tally alone says
+// "47 of 47 fused" or "none fused"; only the reason distinguishes the classes that matter for
+// determinism, because they are not all benign:
+//   - scale_ne*  : a shape gate (scale_ne2 is n_tokens > 1) - a legitimate, shape-determined miss,
+//   - not_adjacent / not_src / n_uses / view / output / no_compute_flag : the graph order that
+//     ggml_vk_graph_optimize produced separated the pair, so the same shape can fuse or not
+//     between two executions,
+//   - misalign : ggml-alloc placed the scale operand at an offset the shader cannot fold in,
+//   - not_matvec / type / scale_noncontig : backend capability gates.
+// Mirrors ggml_can_fuse_ext() then mmid_mul_ok() in evaluation order so the key is the real cause.
+static const char * ggml_vk_mmid_mul_nofuse_reason(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mmid = cgraph->nodes[node_idx];
+    if (mmid->op != GGML_OP_MUL_MAT_ID) {
+        return nullptr;
+    }
+    if (node_idx + 1 >= cgraph->n_nodes) {
+        return "graph_end";
+    }
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    if (mul->op == GGML_OP_ADD_ID) {
+        // the {MUL_MAT_ID, ADD_ID, MUL} variant; it has its own fusion_string and its own key
+        return "add_id";
+    }
+    if (mul->op != GGML_OP_MUL) {
+        return "not_adjacent";
+    }
+    if ((mmid->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (mul->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return "no_compute_flag";
+    }
+    if (ggml_node_get_use_count(cgraph, node_idx) != 1) {
+        return "n_uses";
+    }
+    if (mmid->view_src) {
+        return "view";
+    }
+    if (mmid->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return "output";
+    }
+    if (mul->src[0] != mmid && mul->src[1] != mmid) {
+        return "not_src";
+    }
+    if (!ggml_are_same_shape(mul, mmid)) {
+        return "shape_ne";
+    }
+    if (mul->src[0] != mmid) {
+        return "mmid_is_src1";
+    }
+    if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
+        return "not_matvec";
+    }
+    const ggml_tensor * scale = mul->src[1];
+    if (mmid->type != scale->type) {
+        return "type";
+    }
+    if (!ggml_is_contiguous(scale)) {
+        return "scale_noncontig";
+    }
+    if (get_misalign_bytes(ctx, scale) != 0) {
+        return "misalign";
+    }
+    if (scale->ne[0] != 1) {
+        return "scale_ne0";
+    }
+    if (scale->ne[1] != mul->ne[1]) {
+        return "scale_ne1";
+    }
+    if (scale->ne[2] != 1) {
+        return "scale_ne2";
+    }
+    if (scale->ne[3] != 1) {
+        return "scale_ne3";
+    }
+    return nullptr;
+}
+
 // Match SSM_CONV + UNARY(SILU) or SSM_CONV + ADD + UNARY(SILU). num_extra is 1 or 2.
 static bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, int num_extra) {
@@ -18461,6 +18568,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     const bool fusion_count = ggml_vk_fusion_count_enabled();
     std::map<std::string, int> fusion_counts;
     ctx->fusion_count_add_rms = 0;
+    ctx->fusion_sig = vk_fnv1a_seed;
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -18790,6 +18898,40 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
 
+        if (fusion_count) {
+            // mmid_mul_nofuse:<reason>=count - why the expert-weight multiply stayed unfused at this
+            // MUL_MAT_ID. The tally above cannot say: a pattern that never matched has no
+            // fusion_string, so it is simply absent from the line.
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+                const bool fused_mul = ctx->num_additional_fused_ops > 0 && fusion_string &&
+                                       (strcmp(fusion_string, "MUL_MAT_ID_MUL") == 0 ||
+                                        strcmp(fusion_string, "MUL_MAT_ID_ADD_ID_MUL") == 0);
+                if (!fused_mul) {
+                    const char * why = ggml_vk_mmid_mul_nofuse_reason(ctx, cgraph, i);
+                    // every gate passed and it still did not fuse => the src/dst overlap veto undid it
+                    ggml_vk_fusion_count_add(fusion_counts, "mmid_mul_nofuse:", why ? why : "veto");
+                }
+            }
+
+            // Numerics signature, node half: the op, the fused pattern that will be dispatched for
+            // it, and the misalignment ggml-alloc left on its operands (get_misalign_bytes is what
+            // mmid_mul_ok and mm_add_ok gate on, and what the shaders fold into their offsets).
+            // The dispatch half (pipeline name + workgroup counts) is added in
+            // ggml_vk_dispatch_pipeline, below, from inside ggml_vk_build_graph.
+            const ggml_tensor * node = cgraph->nodes[i];
+            uint64_t h = ggml_vk_fnv1a_str(ctx->fusion_sig, ggml_op_name(node->op));
+            h = ggml_vk_fnv1a_str(h, fusion_string ? fusion_string : "-");
+            const uint32_t nfused = (uint32_t) ctx->num_additional_fused_ops;
+            h = ggml_vk_fnv1a(h, &nfused, sizeof(nfused));
+            for (int s = -1; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * t = s < 0 ? node : node->src[s];
+                const uint32_t misalign = (t && t->buffer && ggml_backend_buffer_is_vk(t->buffer))
+                                              ? get_misalign_bytes(ctx, t) : 0xffffffffu;
+                h = ggml_vk_fnv1a(h, &misalign, sizeof(misalign));
+            }
+            ctx->fusion_sig = h;
+        }
+
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
@@ -18842,6 +18984,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         for (const auto & kv : fusion_counts) {
             line += " " + kv.first + "=" + std::to_string(kv.second);
         }
+        // add_rms is a per-graph running-offset decision, so it belongs in the signature too
+        const uint64_t add_rms = (uint64_t) ctx->fusion_count_add_rms;
+        char sig[32];
+        snprintf(sig, sizeof(sig), " sig=0x%016llx",
+                 (unsigned long long) ggml_vk_fnv1a(ctx->fusion_sig, &add_rms, sizeof(add_rms)));
+        line += sig;
         fprintf(stderr, "%s\n", line.c_str());
     }
 
