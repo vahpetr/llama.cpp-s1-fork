@@ -8,10 +8,19 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    6
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    0
+// [TAG_QSA_FUSED_SELECT] 0 -> 1: this fork inserts GGML_OP_QSA_TOP_K before GGML_OP_UNARY, so every
+// op number from UNARY on is shifted by one relative to stock ggml, and rpc_tensor serialises
+// tensor->op raw. The bump is what the assert below asks for, but be clear about what it does NOT
+// buy: ggml_backend_rpc_buffer_type's handshake only rejects on major mismatch or a server minor
+// ahead of the client (ggml-rpc.cpp:356), so the patch number is reported and logged, never
+// enforced. A fork peer and a stock peer at major 6 / minor 0 still shake hands and would then
+// disagree about every op past UNARY. Nothing here builds with GGML_RPC=ON, so this is a marker for
+// whoever turns it on - if RPC ever ships from this fork the version policy needs a real decision
+// (a major bump), not a patch.
+#define RPC_PROTO_PATCH_VERSION    1
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
