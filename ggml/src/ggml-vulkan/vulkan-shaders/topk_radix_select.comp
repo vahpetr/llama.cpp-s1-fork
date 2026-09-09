@@ -10,7 +10,7 @@ layout(constant_id = 1) const int QSA = 0; // 1: fuse the qwen4 QSA indexer gath
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) readonly buffer A  {float     data_a[];};   // input values, or QSA block scores [n_tps, n_blocks, n_stream]
+layout (binding = 0) readonly buffer A  {float     data_a[];};   // input values, or QSA block scores (strides in sb_blk/sb_tps)
 layout (binding = 1) writeonly buffer D {int       data_d[];};   // [k, ...]
 layout (binding = 2) readonly buffer CB {int       cell_blk[];}; // QSA: cell->block map [n_kv, n_stream]
 layout (binding = 3) readonly buffer M  {float16_t mask[];};     // QSA: raw f16 kq_mask [n_kv, n_tps, n_stream]
@@ -23,6 +23,13 @@ layout (push_constant) uniform parameter {
     uint n_tps;    // QSA only
     uint n_blocks; // QSA only
     uint n_stream; // QSA only
+    // QSA only: the score operand's element strides along the block and the token axis. One shader
+    // serves both callers: the seven-node fusion hands it cont(permute(score)) - [n_tps, n_blocks,
+    // n_stream], so sb_blk = n_tps and sb_tps = 1 - while GGML_OP_QSA_TOP_K hands it the score in
+    // its natural [n_blocks, n_tps, n_stream] layout - sb_blk = 1, sb_tps = n_blocks - and skips
+    // the permute+cont entirely. The stream stride is n_blocks*n_tps either way.
+    uint sb_blk;   // QSA only
+    uint sb_tps;   // QSA only
 } p;
 
 #define RADIX_BITS 8
@@ -57,7 +64,7 @@ float gather(uint row, uint i) {
     const uint t = row % p.n_tps;
     const uint s = row / p.n_tps;
     const uint block = uint(cell_blk[s * p.ncols + i]);
-    const float a = data_a[(s * p.n_blocks + block) * p.n_tps + t];
+    const float a = data_a[s * p.n_blocks * p.n_tps + block * p.sb_blk + t * p.sb_tps];
     const float m = float(mask[(s * p.n_tps + t) * p.ncols + i]);
     return a + m;
 }

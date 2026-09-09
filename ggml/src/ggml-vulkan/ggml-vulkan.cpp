@@ -1831,6 +1831,12 @@ struct vk_op_topk_radix_push_constants {
     uint32_t n_tps;    // QSA only
     uint32_t n_blocks; // QSA only
     uint32_t n_stream; // QSA only
+    // [TAG_QSA_FUSED_SELECT] QSA only: the score operand's element strides along the block and the
+    // token axis, so one shader serves both the seven-node fusion (score permuted:
+    // [n_tps, n_blocks, n_stream] => sb_blk = n_tps, sb_tps = 1) and GGML_OP_QSA_TOP_K (score in
+    // its natural [n_blocks, n_tps, n_stream] layout => sb_blk = 1, sb_tps = n_blocks).
+    uint32_t sb_blk;   // QSA only
+    uint32_t sb_tps;   // QSA only
 };
 
 struct vk_op_im2col_push_constants {
@@ -2446,6 +2452,10 @@ static bool ggml_vk_sched_prof_enabled() {
 // only logs the individual vetoes, so it cannot tell "the router fused in 47 layers" from "in 12"; this can,
 // per graph, and two runs (or the two arms of an A/B) can be compared line by line.
 // Read once and cached: when unset the cost is one load per node and an empty std::map per graph.
+// Two keys on the line are not fusions: add_rms (a per-graph offset decision) and
+// [TAG_QSA_FUSED_SELECT] topk_qsa_op (QSA selections that arrived as one GGML_OP_QSA_TOP_K node
+// instead of as the seven-node topk_qsa pattern, i.e. GGML_VK_QSA_FUSED_SELECT=1). Neither can be
+// vetoed, so neither ever appears with a vetoed:/disabled: prefix.
 static bool ggml_vk_fusion_count_enabled() {
     static const bool enabled = ggml_vk_env_bool("GGML_VK_FUSION_COUNT", false);
     return enabled;
@@ -14817,7 +14827,7 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
             ggml_vk_sync_buffers(ctx, subctx);
         }
 
-        vk_op_topk_radix_push_constants pc { ncols, k, nrows, 0, 0, 0 };
+        vk_op_topk_radix_push_constants pc { ncols, k, nrows, 0, 0, 0, 0, 0 };
         std::array<uint32_t, 3> elements {
             pipeline->wg_denoms[0],
             std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
@@ -14944,42 +14954,53 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 // hint is n_ctx-sized and can exceed what one binding covers, which the range guard below catches.
 static const bool vk_qsa_scratch_presize = ggml_vk_env_bool("GGML_VK_QSA_SCRATCH_PRESIZE", false);
 
-// Bytes the fused select's gather scratch needs for the topk_qsa pattern starting at `node_idx`
-// (the GET_ROWS): n_kv * n_tps * n_stream * 4, i.e. one float per (row, key). One definition, used
-// both by the dispatch below and by the reserve-time hint, so the two cannot drift.
+// Bytes the fused select's gather scratch needs: n_kv * n_tps * n_stream * 4, i.e. one float per
+// (row, key). One definition for all three callers below - the pattern dispatch, the op dispatch
+// and the reserve-time hint - so they cannot drift.
+static size_t ggml_vk_qsa_scratch_bytes(int64_t n_kv, int64_t n_tps, int64_t n_stream) {
+    return (size_t) n_kv * (size_t) n_tps * (size_t) n_stream * sizeof(float);
+}
+
+// ... for the topk_qsa PATTERN starting at `node_idx` (the GET_ROWS), whose score operand arrives
+// permuted, so n_tps is scores->ne[0].
 static size_t ggml_vk_topk_qsa_scratch_size(const ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * get_rows = cgraph->nodes[node_idx];
     const ggml_tensor * scores   = get_rows->src[0]; // [n_tps, n_blocks, n_stream]
     const ggml_tensor * cell_blk = get_rows->src[1]; // [n_kv, n_stream]
-    return (size_t) cell_blk->ne[0] * (size_t) scores->ne[0] * (size_t) scores->ne[2] * sizeof(float);
+    return ggml_vk_qsa_scratch_bytes(cell_blk->ne[0], scores->ne[0], scores->ne[2]);
 }
 
-static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
-    const ggml_tensor * get_rows = cgraph->nodes[node_idx + 0];
-    const ggml_tensor * add      = cgraph->nodes[node_idx + ctx->num_additional_fused_ops - 1];
-    ggml_tensor *       top_k    = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+// ... and for a GGML_OP_QSA_TOP_K node, whose score is the unpermuted [n_blocks, n_tps, n_stream],
+// so the same selection gives the same bytes with n_tps read from ne[1] instead of ne[0].
+static size_t ggml_vk_qsa_top_k_scratch_size(const ggml_tensor * node) {
+    return ggml_vk_qsa_scratch_bytes(node->src[1]->ne[0], node->src[0]->ne[1], node->src[0]->ne[2]);
+}
 
-    const ggml_tensor * scores   = get_rows->src[0]; // [n_tps, n_blocks, n_stream]
-    const ggml_tensor * cell_blk = get_rows->src[1]; // [n_kv, n_stream]
-
-    // raw f16 mask: follow the reshape/cpy chain back to the materialized input
-    const ggml_tensor * mask = add->src[1];
-    while (mask->op == GGML_OP_RESHAPE || mask->op == GGML_OP_CPY) {
-        mask = mask->src[0];
-    }
-
-    const uint32_t n_tps    = scores->ne[0];
-    const uint32_t n_blocks = scores->ne[1];
-    const uint32_t n_stream = scores->ne[2];
-    const uint32_t n_kv     = cell_blk->ne[0];
-    const uint32_t width    = top_k->ne[0];
-    const uint32_t nrows    = n_tps * n_stream;
+// [TAG_QSA_FUSED_SELECT] one dispatch of the QSA indexer selection: gather(score, cell_blk) + mask
+// + top-k, in a single radix-select. Shared by the seven-node fusion (ggml_vk_topk_qsa) and by
+// GGML_OP_QSA_TOP_K (ggml_vk_qsa_top_k); the two differ only in where the score's block and token
+// axes are, which travels in sb_blk/sb_tps, and in how the operands are found.
+//
+// ALIASING. For the fusion this dispatch reads three buffers that ggml-alloc believes are dead
+// several nodes earlier, which is why ggml_vk_can_fuse_topk_qsa has to veto an overlap with the
+// destination by hand. For the op the question cannot arise: score, cell_blk and mask are the
+// node's own srcs, so ggml-alloc will not place the dst over any of them, and the generic
+// unsynced-nodes bookkeeping in ggml_vk_build_graph sees all three as reads of this node. No veto,
+// by construction.
+static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context & subctx,
+                                      const ggml_tensor * scores, const ggml_tensor * cell_blk,
+                                      const ggml_tensor * mask, ggml_tensor * top_k,
+                                      uint32_t n_tps, uint32_t n_blocks, uint32_t n_stream,
+                                      uint32_t sb_blk, uint32_t sb_tps) {
+    const uint32_t n_kv  = cell_blk->ne[0];
+    const uint32_t width = top_k->ne[0];
+    const uint32_t nrows = n_tps * n_stream;
 
     vk_pipeline pipeline = ctx->device->pipeline_topk_radix_qsa;
     GGML_ASSERT(pipeline != nullptr);
 
     // scratch holds the gathered+masked input, materialized once and reused across passes
-    const size_t scratch_size = ggml_vk_topk_qsa_scratch_size(cgraph, node_idx); // n_kv * nrows * 4
+    const size_t scratch_size = ggml_vk_qsa_scratch_bytes(n_kv, n_tps, n_stream);
     if (vk_qsa_scratch_presize) {
         // [TAG_QSA_SCRATCH] Raise the shared prealloc_x to the largest extent any optimized graph
         // asked for, not just to what this dispatch needs. The reserve graphs were optimized before
@@ -15046,7 +15067,7 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    vk_op_topk_radix_push_constants pc { n_kv, width, nrows, n_tps, n_blocks, n_stream };
+    vk_op_topk_radix_push_constants pc { n_kv, width, nrows, n_tps, n_blocks, n_stream, sb_blk, sb_tps };
     std::array<uint32_t, 3> elements {
         pipeline->wg_denoms[0],
         std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
@@ -15059,6 +15080,46 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
           ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
           scratch_buf }, pc, elements);
     ctx->prealloc_x_need_sync = true;
+}
+
+// the seven-node fusion: the operands are read out of the pattern and the elided cast/reshape are
+// followed back to the raw f16 mask
+static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * get_rows = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * add      = cgraph->nodes[node_idx + ctx->num_additional_fused_ops - 1];
+    ggml_tensor *       top_k    = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+
+    const ggml_tensor * scores   = get_rows->src[0]; // [n_tps, n_blocks, n_stream]
+    const ggml_tensor * cell_blk = get_rows->src[1]; // [n_kv, n_stream]
+
+    // raw f16 mask: follow the reshape/cpy chain back to the materialized input
+    const ggml_tensor * mask = add->src[1];
+    while (mask->op == GGML_OP_RESHAPE || mask->op == GGML_OP_CPY) {
+        mask = mask->src[0];
+    }
+
+    const uint32_t n_tps    = scores->ne[0];
+    const uint32_t n_blocks = scores->ne[1];
+    const uint32_t n_stream = scores->ne[2];
+
+    // score is cont(permute(score, 1,0,2,3)): [n_tps, n_blocks, n_stream]
+    ggml_vk_topk_qsa_dispatch(ctx, subctx, scores, cell_blk, mask, top_k,
+                              n_tps, n_blocks, n_stream, /*sb_blk =*/ n_tps, /*sb_tps =*/ 1);
+}
+
+// [TAG_QSA_FUSED_SELECT] GGML_OP_QSA_TOP_K: the same dispatch, with the operands read straight off
+// the node instead of reconstructed from six of them.
+static void ggml_vk_qsa_top_k(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * node) {
+    const ggml_tensor * scores   = node->src[0]; // [n_blocks, n_tps, n_stream]
+    const ggml_tensor * cell_blk = node->src[1]; // [n_kv, n_stream]
+    const ggml_tensor * mask     = node->src[2]; // [n_kv, n_tps, 1, n_stream] f16
+
+    const uint32_t n_blocks = scores->ne[0];
+    const uint32_t n_tps    = scores->ne[1];
+    const uint32_t n_stream = scores->ne[2];
+
+    ggml_vk_topk_qsa_dispatch(ctx, subctx, scores, cell_blk, mask, node,
+                              n_tps, n_blocks, n_stream, /*sb_blk =*/ 1, /*sb_tps =*/ n_blocks);
 }
 
 static void ggml_vk_sum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -17045,6 +17106,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_TOP_K:
         ggml_vk_topk(ctx, compute_ctx, src0, node);
+
+        break;
+    // [TAG_QSA_FUSED_SELECT] one node, three live srcs; no fusion bookkeeping and no alias veto
+    case GGML_OP_QSA_TOP_K:
+        ggml_vk_qsa_top_k(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_SUM:
@@ -19427,6 +19493,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         if (fusion_count) {
+            // [TAG_QSA_FUSED_SELECT] topk_qsa_op=<count>: QSA selections dispatched as the single
+            // GGML_OP_QSA_TOP_K node rather than as the seven-node fusion. Not a fusion - it can
+            // never be vetoed and never appears as vetoed:/disabled: - but the M2 gate counts
+            // "12 selections per graph" out of this line, so with GGML_VK_QSA_FUSED_SELECT=1 the
+            // 12 move from topk_qsa= to topk_qsa_op= and the total is unchanged.
+            if (cgraph->nodes[i]->op == GGML_OP_QSA_TOP_K) {
+                ggml_vk_fusion_count_add(fusion_counts, "", "topk_qsa_op");
+            }
+
             // mmid_mul_nofuse:<reason>=count - why the expert-weight multiply stayed unfused at this
             // MUL_MAT_ID. The tally above cannot say: a pattern that never matched has no
             // fusion_string, so it is simply absent from the line.
@@ -19614,6 +19689,24 @@ static void ggml_vk_qsa_scratch_hint(ggml_backend_vk_context * ctx, const struct
     // allocated - any bigger need is the dispatch's own scratch_size, which it applies itself - so
     // stop paying for it on every graph. The `> 0` keeps the very first (reserve) graph walking.
     if (ctx->prealloc_size_qsa_hint > 0 && ctx->prealloc_size_x >= ctx->prealloc_size_qsa_hint) {
+        return;
+    }
+    // [TAG_QSA_FUSED_SELECT] GGML_VK_QSA_FUSED_SELECT=1 replaces the whole pattern with one
+    // GGML_OP_QSA_TOP_K node, which needs the SAME scratch (ggml_vk_qsa_scratch_bytes is one
+    // definition for both). Walked first and unconditionally: the op is not a fusion, so
+    // GGML_VK_DISABLE_FUSION_PATTERNS must not turn its scratch hint off.
+    bool saw_op = false;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i]->op != GGML_OP_QSA_TOP_K) {
+            continue;
+        }
+        saw_op = true;
+        ctx->prealloc_size_qsa_hint = std::max(ctx->prealloc_size_qsa_hint,
+                                               ggml_vk_qsa_top_k_scratch_size(graph->nodes[i]));
+    }
+    if (saw_op) {
+        // the two forms never coexist in one graph (the knob is read once per graph build), so a
+        // graph carrying the op has no pattern to match and the walk below would only cost time
         return;
     }
     // GGML_VK_DISABLE_FUSION_PATTERNS=topk_qsa must not reserve scratch for a fusion that will not
@@ -20666,6 +20759,41 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return device->pipeline_topk_radix_f32 != nullptr;
             }
+        case GGML_OP_QSA_TOP_K:
+            {
+                // [TAG_QSA_FUSED_SELECT] the same shader the topk_qsa fusion dispatches, so the
+                // same constraints: an f16 mask (binding 3 is float16_t - an f32 mask would need a
+                // second variant, and the graph only emits the op when the mask is f16, exactly as
+                // the pattern only matches through a cast), contiguous operands, and the indexer
+                // layout the gather addressing assumes. Unlike TOP_K there is no tournament
+                // fallback here: one op means one dispatch, and the radix select handles every k.
+                const ggml_tensor * scores   = op->src[0];
+                const ggml_tensor * cell_blk = op->src[1];
+                const ggml_tensor * mask     = op->src[2];
+                if (!scores || !cell_blk || !mask) {
+                    return false;
+                }
+                if (scores->type != GGML_TYPE_F32 || cell_blk->type != GGML_TYPE_I32 ||
+                    mask->type != GGML_TYPE_F16 || op->type != GGML_TYPE_I32) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(scores) || !ggml_is_contiguous(cell_blk) ||
+                    !ggml_is_contiguous(mask) || !ggml_is_contiguous(op)) {
+                    return false;
+                }
+                const int64_t n_blocks = scores->ne[0];
+                const int64_t n_tps    = scores->ne[1];
+                const int64_t n_stream = scores->ne[2];
+                const int64_t n_kv     = cell_blk->ne[0];
+                if (scores->ne[3] != 1 || cell_blk->ne[1] != n_stream ||
+                    ggml_nrows(cell_blk) != n_stream ||
+                    ggml_nelements(mask) != n_kv*n_tps*n_stream ||
+                    op->ne[1] != n_tps || op->ne[2] != 1 || op->ne[3] != n_stream ||
+                    n_blocks <= 0 || n_kv <= 0 || op->ne[0] <= 0 || op->ne[0] > n_kv) {
+                    return false;
+                }
+                return device->pipeline_topk_radix_qsa != nullptr;
+            }
         case GGML_OP_UPSCALE:
             if (op->op_params[0] & GGML_SCALE_FLAG_ANTIALIAS) {
                 if ((op->op_params[0] & 0xFF) != GGML_SCALE_MODE_BILINEAR) {
@@ -21703,6 +21831,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_argsort(ggml_ctx, src_clone[0], (ggml_sort_order) *(int *)tensor->op_params);
         } else if (tensor->op == GGML_OP_TOP_K) {
             tensor_clone = ggml_top_k(ggml_ctx, src_clone[0], tensor->ne[0]);
+        } else if (tensor->op == GGML_OP_QSA_TOP_K) {
+            tensor_clone = ggml_qsa_top_k(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], tensor->ne[0]);
         } else if (tensor->op == GGML_OP_SUM) {
             tensor_clone = ggml_sum(ggml_ctx, src_clone[0]);
         } else if (tensor->op == GGML_OP_SUM_ROWS) {
