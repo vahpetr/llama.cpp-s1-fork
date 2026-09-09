@@ -520,6 +520,37 @@ static bool qwen4exp_qsa_bypass_exhaustive() {
     return enabled;
 }
 
+// [TAG_QSA_FUSED_SELECT] GGML_VK_QSA_FUSED_SELECT=1 emits the indexer selection as ONE node
+// (GGML_OP_QSA_TOP_K) instead of the six that the Vulkan topk_qsa pattern matches and elides.
+//
+// The six exist for the matcher, not for any backend: ggml_vk_topk_qsa already computes
+// gather(score, cell_blk) + mask + top-k in a single shader. What they cost is ggml-alloc, which
+// has to reserve every intermediate whether or not the backend reads it - at the deployed shape
+// (n_kv 196608, n_tps 2050, 12 QSA layers) the permuted score, the gathered [n_tps x n_kv]
+// expansion, its transpose back, the f32 mask cast and the sum are 384 MiB + 4 x 1537 MiB of
+// compute-buffer surface per layer, all of it write-once/read-once. The op materializes the top-k
+// ids and nothing else.
+//
+// It also makes M2.0's hazard impossible rather than vetoed. The fused dispatch reads three
+// buffers at the TOP_K node that ggml-alloc believes died six nodes earlier, so
+// ggml_vk_can_fuse_topk_qsa has to test each of them against the destination and un-fuse the layer
+// when the allocator happened to reuse one. With one node all three are its own srcs: ggml-alloc
+// cannot place a destination over a live source, so there is nothing to veto and nothing to lose
+// the fusion over.
+//
+// The knob is named for the backend behaviour it selects, like the other QSA A/B knobs, even
+// though it is read here on the graph side - the graph is where the node count is decided.
+// Default OFF (QSA plan section 3.3: one A/B knob per change, off until its own gate passes); with it
+// off this builder emits exactly the graph that shipped, node for node.
+static bool qwen4exp_qsa_fused_select() {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_VK_QSA_FUSED_SELECT");
+        return s != nullptr && atoi(s) != 0;
+    }();
+
+    return enabled;
+}
+
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     // [TAG_PLE_HOIST] before anything else touches gf: the CPU-resident PLE gather has to be the
@@ -1195,6 +1226,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         score = ggml_add(ctx0, score, inp->bias);
     }
 
+    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+
+    // [TAG_QSA_FUSED_SELECT] the single-node form. Gated on exactly what the Vulkan topk_qsa
+    // pattern needs (blk_bias, i.e. the per-block bias and a matching mask, and an f16 mask - the
+    // shader's binding 3 is float16_t and the pattern likewise only matches through ggml_cast), so
+    // no configuration that fuses today falls off the fused path, and none that does not gets a
+    // node the backend would have to run somewhere else.
+    if (blk_bias && kq_mask->type == GGML_TYPE_F16 && kq_mask->ne[2] == 1 && qwen4exp_qsa_fused_select()) {
+        // one node, [width, n_tps, 1, n_stream] i32 - already the shape build_attn_qsa wants, so
+        // neither the ggml_cont nor the reshape below is needed either.
+        // Note for the node-diff probes: this arm has no "indexer_score_tokens-<il>" node, because
+        // the surface that name refers to is the one the op exists not to materialize. The
+        // selection itself is still named "indexer_top_k-<il>", so the pairing key that matters
+        // downstream is unchanged.
+        ggml_tensor * top_k = ggml_qsa_top_k(ctx0, score, inp->cell_blk, kq_mask, (int) width);
+        cb(top_k, "indexer_top_k", il);
+
+        return top_k;
+    }
+
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
     ggml_tensor * expanded = ggml_get_rows(ctx0,
             ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
@@ -1208,9 +1260,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         expanded = ggml_add(ctx0, expanded, inp->bias);
     }
     cb(expanded, "indexer_score_tokens", il);
-
-    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
 
