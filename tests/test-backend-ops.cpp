@@ -955,6 +955,9 @@ struct console_printer : public printer {
         } else {
             printf("\033[1;31mFAIL\033[0m\n");
         }
+        // when stdout is a pipe the verdict would otherwise sit in the stdio buffer, and an
+        // abort() in the next case drops it - which misattributes that crash to this case
+        fflush(stdout);
     }
 
     void print_perf_console(const test_result & result) {
@@ -6487,8 +6490,13 @@ struct test_topk_qsa : public test_case {
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
-            } else if (blocked) {
-                // score [n_blocks, n_tps, n_stream]; +7919*row keeps the rows from selecting alike
+            } else if (blocked && strcmp(ggml_get_name(t), "score") == 0) {
+                // score [n_blocks, n_tps, n_stream]; +7919*row keeps the rows from selecting alike.
+                // Only the score gets the block ramp: the harness plants 1024-element F32
+                // sentinels after every input (add_sentinel), and writing n_blocks values into
+                // one of those overflows its buffer as soon as n_blocks > 1024 - the
+                // GGML_TEST_TOPK_PROD shapes. The sentinels keep the uniform init below.
+                GGML_ASSERT(t->ne[0] == n_blocks && ggml_nrows(t) == n_tps*n_stream);
                 std::vector<float> data(ggml_nelements(t));
                 for (int64_t row = 0; row < ggml_nrows(t); row++) {
                     for (int64_t b = 0; b < n_blocks; b++) {
