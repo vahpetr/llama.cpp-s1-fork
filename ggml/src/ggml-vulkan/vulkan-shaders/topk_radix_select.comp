@@ -35,9 +35,15 @@ shared uint sh_above;
 shared uint sh_gt[BLOCK_SIZE];
 shared uint sh_eq[BLOCK_SIZE];
 
-// order-preserving float -> uint mapping
+// order-preserving float -> uint mapping. -0.0 is folded onto +0.0 first: its bit pattern
+// sorts strictly below +0.0, but IEEE compare - and therefore the CPU reference - calls the
+// two equal, and now that ties are resolved by index the difference is observable in the
+// selected SET whenever the threshold value is zero.
 uint f2ui(float x) {
     uint y = floatBitsToUint(x);
+    if (y == 0x80000000u) {
+        y = 0u;
+    }
     if ((y & 0x80000000u) != 0u) {
         y ^= 0xFFFFFFFFu;
     } else {
