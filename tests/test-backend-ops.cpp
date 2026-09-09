@@ -6474,6 +6474,77 @@ struct test_top_k : public test_case {
     }
 };
 
+// Initialization shared by test_topk_qsa (the six-node chain) and test_qsa_top_k (the single
+// GGML_OP_QSA_TOP_K node): the two feed the SAME selection, so the only way to read one against the
+// other is for them to be filled identically. Tensors are keyed by name - "score", "cell_blk",
+// "kq_mask" - and everything else (the harness sentinels) keeps the uniform fill.
+//
+// Two tie-free initializations plus the tie modes. The comparison is a set of indices, so before
+// the reference's tie-break existed a tie that straddled the k-th value would let CPU and backend
+// disagree legitimately; now the ties ARE the interesting case.
+//
+// default: distinct mask ramp + small scores. Only valid while n_kv <= 2048: f16 stops
+//   representing consecutive integers there and saturates to inf past 65504.
+// blocked: the production layout - cell i belongs to block i/r, the mask carries the in-block
+//   offset - so value(i) = ((i/r + 7919*row) % n_blocks) + 0.25*(i%r), unique for every cell of a
+//   row and exact in both f16 and f32 at any n_kv.
+static void qsa_select_init_tensors(ggml_context * ctx, int64_t n_blocks, int64_t n_kv, int64_t n_tps,
+                                    int64_t n_stream, bool blocked, int ties) {
+    GGML_UNUSED(n_stream);
+    const int64_t r = (n_kv + n_blocks - 1)/n_blocks;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->op != GGML_OP_NONE) {
+            continue;
+        }
+        const char * name = ggml_get_name(t);
+        if (strcmp(name, "cell_blk") == 0) {
+            // cell_blk [n_kv, n_stream]
+            GGML_ASSERT(t->type == GGML_TYPE_I32);
+            std::vector<int32_t> data(ggml_nelements(t));
+            for (int64_t row = 0; row < ggml_nrows(t); row++) {
+                for (int64_t i = 0; i < n_kv; i++) {
+                    data[row * n_kv + i] = blocked ? (int32_t) std::min(i/r, n_blocks - 1) : rand() % n_blocks;
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+        } else if (strcmp(name, "kq_mask") == 0) {
+            // kq_mask [n_kv, n_tps, (1,) n_stream], f16 in the flash-attention graph the fusion and
+            // the op are built for, f32 in the one case that covers the reference's other branch
+            GGML_ASSERT(t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_F32);
+            std::vector<char> data(ggml_nbytes(t));
+            for (int64_t row = 0; row < ggml_nrows(t); row++) {
+                for (int64_t i = 0; i < n_kv; i++) {
+                    // ties: no in-block offset, so a block's cells are indistinguishable
+                    const float v = ties ? 0.0f : blocked ? 0.25f*(float) (i % r) : (float) i;
+                    if (t->type == GGML_TYPE_F16) {
+                        ((ggml_fp16_t *) data.data())[row * n_kv + i] = ggml_fp32_to_fp16(v);
+                    } else {
+                        ((float *) data.data())[row * n_kv + i] = v;
+                    }
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size());
+        } else if (blocked && strcmp(name, "score") == 0) {
+            // score [n_blocks, n_tps, n_stream]; +7919*row keeps the rows from selecting alike.
+            // Only the score gets the block ramp: the harness plants 1024-element F32 sentinels
+            // after every input (add_sentinel), and writing n_blocks values into one of those
+            // overflows its buffer as soon as n_blocks > 1024 - the GGML_TEST_TOPK_PROD shapes.
+            // The sentinels keep the uniform init below.
+            GGML_ASSERT(t->ne[0] == n_blocks && ggml_nrows(t) == n_tps*n_stream);
+            std::vector<float> data(ggml_nelements(t));
+            for (int64_t row = 0; row < ggml_nrows(t); row++) {
+                for (int64_t b = 0; b < n_blocks; b++) {
+                    const int64_t v = (b + 7919*row) % n_blocks;
+                    data[row * n_blocks + b] = ties == 2 ? 0.0f : (float) (ties == 3 ? v/8 : v);
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+        } else {
+            init_tensor_uniform(t, 0.0f, 0.5f);
+        }
+    }
+}
+
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
 struct test_topk_qsa : public test_case {
     const int64_t n_blocks;
@@ -6552,60 +6623,88 @@ struct test_topk_qsa : public test_case {
 
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
 
-    // Two tie-free initializations plus the tie modes above. The comparison is a set of
-    // indices, so before the reference's tie-break existed a tie that straddled the k-th value
-    // would let CPU and backend disagree legitimately; now the ties ARE the interesting case.
-    //
-    // default: distinct mask ramp + small scores. Only valid while n_kv <= 2048: f16 stops
-    //   representing consecutive integers there and saturates to inf past 65504.
-    // blocked: the production layout - cell i belongs to block i/r, the mask carries the
-    //   in-block offset - so value(i) = ((i/r + 7919*row) % n_blocks) + 0.25*(i%r), unique
-    //   for every cell of a row and exact in both f16 and f32 at any n_kv.
     void initialize_tensors(ggml_context * ctx) override {
-        const int64_t r = (n_kv + n_blocks - 1)/n_blocks;
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->op != GGML_OP_NONE) {
-                continue;
-            }
-            if (t->type == GGML_TYPE_I32) {
-                // cell_blk [n_kv, n_stream]
-                std::vector<int32_t> data(ggml_nelements(t));
-                for (int64_t row = 0; row < ggml_nrows(t); row++) {
-                    for (int64_t i = 0; i < n_kv; i++) {
-                        data[row * n_kv + i] = blocked ? (int32_t) std::min(i/r, n_blocks - 1) : rand() % n_blocks;
-                    }
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
-            } else if (t->type == GGML_TYPE_F16) {
-                // kq_mask [n_kv, n_tps, n_stream]
-                std::vector<ggml_fp16_t> data(ggml_nelements(t));
-                for (int64_t row = 0; row < ggml_nrows(t); row++) {
-                    for (int64_t i = 0; i < n_kv; i++) {
-                        // ties: no in-block offset, so a block's cells are indistinguishable
-                        const float v = ties ? 0.0f : blocked ? 0.25f*(float) (i % r) : (float) i;
-                        data[row * n_kv + i] = ggml_fp32_to_fp16(v);
-                    }
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
-            } else if (blocked && strcmp(ggml_get_name(t), "score") == 0) {
-                // score [n_blocks, n_tps, n_stream]; +7919*row keeps the rows from selecting alike.
-                // Only the score gets the block ramp: the harness plants 1024-element F32
-                // sentinels after every input (add_sentinel), and writing n_blocks values into
-                // one of those overflows its buffer as soon as n_blocks > 1024 - the
-                // GGML_TEST_TOPK_PROD shapes. The sentinels keep the uniform init below.
-                GGML_ASSERT(t->ne[0] == n_blocks && ggml_nrows(t) == n_tps*n_stream);
-                std::vector<float> data(ggml_nelements(t));
-                for (int64_t row = 0; row < ggml_nrows(t); row++) {
-                    for (int64_t b = 0; b < n_blocks; b++) {
-                        const int64_t v = (b + 7919*row) % n_blocks;
-                        data[row * n_blocks + b] = ties == 2 ? 0.0f : (float) (ties == 3 ? v/8 : v);
-                    }
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
-            } else {
-                init_tensor_uniform(t, 0.0f, 0.5f);
-            }
+        qsa_select_init_tensors(ctx, n_blocks, n_kv, n_tps, n_stream, blocked, ties);
+    }
+
+    // top-k output order is unspecified; compare as a set of indices
+    double err(const float * a, const float * b, size_t n) override {
+        std::vector<int32_t> ia(n), ib(n);
+        double diff = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            ia[i] = (int32_t) a[i];
+            ib[i] = (int32_t) b[i];
+            diff += std::fabs(a[i] - ia[i]) + std::fabs(b[i] - ib[i]);
         }
+        return diff + jdst(ia.data(), ib.data(), n);
+    }
+};
+
+// [TAG_QSA_FUSED_SELECT] the same selection as test_topk_qsa above, emitted as ONE node
+// (GGML_OP_QSA_TOP_K) instead of six. Same inputs, same initialization, same comparison, so the two
+// tests read against each other directly: -o TOPK_QSA is the seven-node pattern the Vulkan backend
+// fuses, -o QSA_TOP_K is the op that replaces it under GGML_VK_QSA_FUSED_SELECT=1.
+//
+// No `alias` mode here, unlike test_topk_qsa, and that absence is the point of the task. The fused
+// pattern reads three buffers at its TOP_K that ggml-alloc believes died six nodes earlier, so it
+// needs a hand-written veto and a test that forces each aliasing placement. The op's three
+// operands are its own srcs: ggml_gallocr allocates a node's destination BEFORE it frees the
+// parents whose use count the node just dropped to zero (ggml-alloc.c, the parent-update loop runs
+// after ggml_gallocr_allocate_node), and QSA_TOP_K is not in ggml_op_can_inplace, so a src's block
+// is not on the free list when the dst is placed and no in-place reuse is offered either. The
+// alias is unreachable, and unlike the fusion there is no unfused fallback that would be correct
+// under it - the shader writes ids while other workgroups are still reading the score - so forcing
+// it would assert a graph the allocator cannot build. The reachability claim is checked where it
+// can be: the M2.1 replay runs the real ggml_gallocr over the production reserve graph and reports
+// dst-over-src overlaps for every QSA_TOP_K node (scripts/bench/probe/qsa_fusion_replay.cpp).
+struct test_qsa_top_k : public test_case {
+    const int64_t   n_blocks;
+    const int64_t   n_kv;
+    const int64_t   n_tps;
+    const int64_t   n_stream;
+    const int       width;
+    // production cell->block layout; the only tie-free choice once n_kv > 2048 (see qsa_select_init_tensors)
+    const bool      blocked;
+    // as test_topk_qsa::ties: 1 = one score per block, 2 = the whole row equal, 3 = eight blocks
+    // share a score. Requires blocked.
+    const int       ties;
+    // the graph builds the op with an f16 mask (flash attention); GGML_TYPE_F32 covers the other
+    // branch of the CPU reference. The Vulkan shader binds a float16_t mask, so an f32 case is
+    // expected to report "not supported" there rather than to run.
+    const ggml_type mask_type;
+
+    std::string vars() override {
+        return VARS_TO_STR8(n_blocks, n_kv, n_tps, n_stream, width, blocked, ties, mask_type);
+    }
+
+    test_qsa_top_k(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1,
+                   int width = 1500, bool blocked = false, int ties = 0, ggml_type mask_type = GGML_TYPE_F16)
+        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), blocked(blocked),
+          ties(ties), mask_type(mask_type) {
+        GGML_ASSERT(ties == 0 || blocked);
+    }
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // the score in its natural per-block layout: no permute, no cont, no expansion
+        ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
+        ggml_set_name(score, "score");
+        ggml_tensor * cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
+        ggml_set_name(cell_blk, "cell_blk");
+        // [n_kv, n_tps, 1, n_stream], exactly as llm_graph_input_attn_kv builds it
+        ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, mask_type, n_kv, n_tps, 1, n_stream);
+        ggml_set_name(kq_mask, "kq_mask");
+
+        ggml_tensor * out = ggml_qsa_top_k(ctx, score, cell_blk, kq_mask, width);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        qsa_select_init_tensors(ctx, n_blocks, n_kv, n_tps, n_stream, blocked, ties);
     }
 
     // top-k output order is unspecified; compare as a set of indices
@@ -10278,6 +10377,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(4096, 16384, 6, 1, 2051, true, 0, 2));
     test_cases.emplace_back(new test_topk_qsa(4096, 16384, 6, 1, 2051, true, 0, 3));
 
+    // [TAG_QSA_FUSED_SELECT] ... and the same selection as ONE node (GGML_OP_QSA_TOP_K, the
+    // GGML_VK_QSA_FUSED_SELECT=1 graph). Deliberately the same shapes as the pattern cases above,
+    // minus the alias modes - see test_qsa_top_k for why the alias is unreachable for a node whose
+    // operands are its own srcs - so -o TOPK_QSA and -o QSA_TOP_K cover the same ground.
+    test_cases.emplace_back(new test_qsa_top_k(512,  2048,  1, 1, 1500));
+    test_cases.emplace_back(new test_qsa_top_k(512,  2048,  2, 1, 1500));
+    test_cases.emplace_back(new test_qsa_top_k(256,  2048,  4, 2, 2000));
+    test_cases.emplace_back(new test_qsa_top_k(64,   256,   2, 1, 200));   // small k: still the radix path
+    test_cases.emplace_back(new test_qsa_top_k(1024, 4096,  6, 1, 2051, true));
+    for (int64_t n_tps : { 1, 6 }) {
+        test_cases.emplace_back(new test_qsa_top_k(4096, 16384, n_tps, 1, 2051, true));
+    }
+    test_cases.emplace_back(new test_qsa_top_k(1024, 4096,  6, 1, 2051, true, 1));
+    test_cases.emplace_back(new test_qsa_top_k(4096, 16384, 1, 1, 2051, true, 1));
+    test_cases.emplace_back(new test_qsa_top_k(4096, 16384, 6, 1, 2051, true, 2));
+    test_cases.emplace_back(new test_qsa_top_k(4096, 16384, 6, 1, 2051, true, 3));
+    // the f32-mask branch of the CPU reference. The graph never builds this (it emits the op only
+    // for the f16 flash-attention mask) and the Vulkan shader binds a float16_t mask, so this case
+    // is expected to report "not supported" there rather than to run.
+    test_cases.emplace_back(new test_qsa_top_k(1024, 4096,  6, 1, 2051, true, 0, GGML_TYPE_F32));
+
     // Qwen 3.8 Flash Next at the deployed context: n_kv 213000, ratio 4, width 2051, decode
     // and -ub 2048 prefill. Opt-in: the n_tps 2048 pair needs ~10 GB of backend and as much
     // host memory for the reference, and runs for a while.
@@ -10288,6 +10408,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_topk_qsa(53250, 213000, 6,    1, 2051, true));
         test_cases.emplace_back(new test_topk_qsa(53250, 213000, 2048, 1, 2051, true));
         test_cases.emplace_back(new test_topk_qsa(53250, 213000, 6,    1, 2051, true, 0, 1));
+        test_cases.emplace_back(new test_qsa_top_k(53250, 213000, 6,    1, 2051, true));
+        test_cases.emplace_back(new test_qsa_top_k(53250, 213000, 2048, 1, 2051, true));
+        test_cases.emplace_back(new test_qsa_top_k(53250, 213000, 6,    1, 2051, true, 1));
     }
 
     // exhaustive top_k tests
