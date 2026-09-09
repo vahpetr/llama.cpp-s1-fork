@@ -312,6 +312,63 @@ static double jdst(const T * a, const T * b, size_t n) {
     return (double) diff / (2*n);
 }
 
+// Exact-id comparison for the selection ops (TOP_K / TOPK_QSA / QSA_TOP_K), PER ROW.
+//
+// A selection's contract is per row: row r of the destination must hold the ids of the top
+// `row_len` values of row r of the source, each id in [0, ncols) and each id at most once. The
+// ORDER inside a row is explicitly not part of it (both CPU references swap dst[0] and dst[1] to
+// say so), so rows are compared as sets.
+//
+// Comparing the whole tensor as one multiset - which is what jdst() over all n elements does -
+// accepts three wrong results: an id that migrated from one row to another, a row that repeats an
+// id while another row drops one, and (since the multiset only ever sees the reference's own
+// values) it never checks the range at all. On a many-row backend dispatch (one workgroup per row,
+// which is exactly how the radix select is dispatched) row-crossing is the failure mode to expect,
+// so the whole-tensor multiset was checking the one property that cannot fail.
+//
+// Returns 0 for a match; every violation adds at least 1, and max_err() for these tests is 0.
+static double cmp_ids_per_row(const float * a, const float * b, size_t n, int64_t row_len, int64_t ncols) {
+    GGML_ASSERT(row_len > 0 && n % (size_t) row_len == 0);
+
+    const size_t nrows = n / (size_t) row_len;
+
+    double diff = 0.0;
+
+    std::vector<int32_t> ia(row_len), ib(row_len);
+    for (size_t r = 0; r < nrows; r++) {
+        const float * ar = a + r*row_len;
+        const float * br = b + r*row_len;
+
+        for (int64_t c = 0; c < row_len; c++) {
+            ia[c] = (int32_t) ar[c];
+            ib[c] = (int32_t) br[c];
+
+            // penalize the result if the data is not integer valued
+            diff += std::fabs(ar[c] - ia[c]);
+            diff += std::fabs(br[c] - ib[c]);
+
+            // ... or if an id does not point into the row it selects from
+            diff += (ia[c] < 0 || ia[c] >= ncols) ? 1.0 : 0.0;
+            diff += (ib[c] < 0 || ib[c] >= ncols) ? 1.0 : 0.0;
+        }
+
+        // the same SET of ids as the reference, order-insensitively
+        diff += jdst(ia.data(), ib.data(), row_len);
+
+        // ... and a selection, i.e. no id twice in a row
+        std::sort(ia.begin(), ia.end());
+        std::sort(ib.begin(), ib.end());
+        if (std::adjacent_find(ia.begin(), ia.end()) != ia.end()) {
+            diff += 1.0;
+        }
+        if (std::adjacent_find(ib.begin(), ib.end()) != ib.end()) {
+            diff += 1.0;
+        }
+    }
+
+    return diff;
+}
+
 // maximum absolute asymmetry between a and b
 // asymmetry: (a - b) / (a + b)
 // This is more stable than relative error if one of the values fluctuates towards zero.
@@ -6365,6 +6422,13 @@ struct test_top_k : public test_case {
             }
             return diff;
         } else {
+            // ties == 0 does not set run_whole_graph(), so err() is also called on the harness
+            // sentinels; only the output tensor has the (nrows x k) id layout, everything else
+            // keeps the flat comparison (a sentinel is memcmp'd for equality before this anyway).
+            if (n == (size_t) (ggml_nrows(input) * k)) {
+                return cmp_ids_per_row(a, b, n, k, input->ne[0]);
+            }
+
             std::vector<int32_t> ia(n);
             std::vector<int32_t> ib(n);
 
@@ -6661,16 +6725,11 @@ struct test_topk_qsa : public test_case {
         qsa_select_init_tensors(ctx, n_blocks, n_kv, n_tps, n_stream, blocked, ties, width);
     }
 
-    // top-k output order is unspecified; compare as a set of indices
+    // top-k output order is unspecified; compare each ROW as a set of indices, and require that
+    // each row is a selection out of its own n_kv cells (see cmp_ids_per_row). Only the `out`
+    // tensor reaches err() here - run_whole_graph() is on and fusion_test_nodes() names it.
     double err(const float * a, const float * b, size_t n) override {
-        std::vector<int32_t> ia(n), ib(n);
-        double diff = 0.0;
-        for (size_t i = 0; i < n; i++) {
-            ia[i] = (int32_t) a[i];
-            ib[i] = (int32_t) b[i];
-            diff += std::fabs(a[i] - ia[i]) + std::fabs(b[i] - ib[i]);
-        }
-        return diff + jdst(ia.data(), ib.data(), n);
+        return cmp_ids_per_row(a, b, n, width, n_kv);
     }
 };
 
@@ -6742,16 +6801,11 @@ struct test_qsa_top_k : public test_case {
         qsa_select_init_tensors(ctx, n_blocks, n_kv, n_tps, n_stream, blocked, ties, width);
     }
 
-    // top-k output order is unspecified; compare as a set of indices
+    // top-k output order is unspecified; compare each ROW as a set of indices, and require that
+    // each row is a selection out of its own n_kv cells (see cmp_ids_per_row). Only the `out`
+    // tensor reaches err() here - run_whole_graph() is on, so only the graph's `out` is compared.
     double err(const float * a, const float * b, size_t n) override {
-        std::vector<int32_t> ia(n), ib(n);
-        double diff = 0.0;
-        for (size_t i = 0; i < n; i++) {
-            ia[i] = (int32_t) a[i];
-            ib[i] = (int32_t) b[i];
-            diff += std::fabs(a[i] - ia[i]) + std::fabs(b[i] - ib[i]);
-        }
-        return diff + jdst(ia.data(), ib.data(), n);
+        return cmp_ids_per_row(a, b, n, width, n_kv);
     }
 };
 
