@@ -2352,6 +2352,14 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // the contiguous f32 copy shader (a compute dispatch, the path every GGML_OP_CPY takes) instead
 // of vkCmdCopyBuffer (a transfer command inside the compute command buffer - CP DMA on RADV for
 // copies under 4 KiB - the one link of the bounce that no other in-graph op exercises).
+// GGML_VK_TOPK_MOE_BOUNCE_BARRIER_AFTER=1 adds a second full barrier *after* the copy. By the
+// hazard tracking that is redundant - the GET_ROWS bounce buffer and the weights destination are
+// both in the fusion's write set, so ggml_vk_build_graph emits a barrier at the first later node
+// whose range meets either of them (verified on the real qwen4exp graph: the block is reused at
+// node +10 by ffn_moe_gate-47, a plain tracked MUL_MAT_ID destination). It exists only to bisect a
+// suspected ordering defect on the GPU without rebuilding: if a census that is wrong with the
+// default becomes clean with this set, the defect is the ordering around the copy; if it does not
+// change, ordering is not the mechanism. Default off, so the recorded stream is unchanged.
 static const char * const vk_fusion_pattern_names[] = {
     "multi_add", "mul_mat_add_add", "mul_mat_add", "mul_mat_id_add_id_mul", "mul_mat_id_add_id",
     "mul_mat_id_mul", "rms_norm_mul_rope_view_set_rows", "rms_norm_mul_rope", "rms_norm_mul",
@@ -2366,6 +2374,7 @@ static bool vk_fusion_list_enabled = false;
 static bool vk_fusion_count_enabled = false;
 static int  vk_topk_moe_bounce_mode = 1;         // 0 = veto, 1 = bounce when weights aliases logits, 2 = always
 static bool vk_topk_moe_bounce_shader_copy = false;
+static bool vk_topk_moe_bounce_barrier_after = false;
 
 static bool ggml_vk_fusion_pattern_matches(const std::string & pat, const char * name) {
     if (!pat.empty() && pat.back() == '*') {
@@ -2397,9 +2406,11 @@ static void ggml_vk_fusion_patterns_init() {
         vk_topk_moe_bounce_mode = (s == nullptr || *s == '\0') ? 1 : std::min(2, std::max(0, atoi(s)));
     }
     vk_topk_moe_bounce_shader_copy = ggml_vk_env_bool("GGML_VK_TOPK_MOE_BOUNCE_SHADER_COPY", false);
-    if (vk_topk_moe_bounce_mode != 1 || vk_topk_moe_bounce_shader_copy) {
-        GGML_LOG_INFO("ggml_vulkan: topk_moe bounce mode %d (%s copy)\n", vk_topk_moe_bounce_mode,
-                      vk_topk_moe_bounce_shader_copy ? "shader" : "transfer");
+    vk_topk_moe_bounce_barrier_after = ggml_vk_env_bool("GGML_VK_TOPK_MOE_BOUNCE_BARRIER_AFTER", false);
+    if (vk_topk_moe_bounce_mode != 1 || vk_topk_moe_bounce_shader_copy || vk_topk_moe_bounce_barrier_after) {
+        GGML_LOG_INFO("ggml_vulkan: topk_moe bounce mode %d (%s copy%s)\n", vk_topk_moe_bounce_mode,
+                      vk_topk_moe_bounce_shader_copy ? "shader" : "transfer",
+                      vk_topk_moe_bounce_barrier_after ? ", barrier after" : "");
     }
     vk_fusion_patterns_disabled.clear();
     vk_fusion_patterns_disabled_any = false;
@@ -14710,6 +14721,10 @@ static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, 
             ggml_vk_cpy(ctx, subctx, bounce, weights);
         } else {
             ggml_vk_buffer_copy_async(subctx, weights_dst.buffer, weights_dst.offset, weights_buf.buffer, weights_buf.offset, ggml_nbytes(weights));
+        }
+        if (vk_topk_moe_bounce_barrier_after) {
+            // GGML_VK_TOPK_MOE_BOUNCE_BARRIER_AFTER=1: redundant by the hazard tracking, a bisect knob
+            ggml_vk_sync_buffers(ctx, subctx);
         }
     }
 }

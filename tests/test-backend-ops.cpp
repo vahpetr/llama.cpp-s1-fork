@@ -6527,8 +6527,21 @@ struct test_topk_moe : public test_case {
     // without this the aliasing that the backends' fused-router overlap handling exists for
     // (the Vulkan src/dst veto and its GET_ROWS bounce) is never exercised here.
     const bool alias_logits;
+    // Place a LATER node's output over the storage of the pattern's GET_ROWS (view_src = the
+    // get_rows node). ggml-alloc does this in every real graph: the get_rows block is freed right
+    // after the DIV and the next best-fit allocation lands in it (Qwen3.8-Flash-Next, 6-token
+    // verify graph: get_rows@86016/240, reused at node +10 by ffn_moe_gate-47). A backend that
+    // routes the fused router's weights *through* that block (the Vulkan bounce: shader writes
+    // get_rows, a copy moves it to the real destination) therefore has to order the reusing kernel
+    // behind the copy's read (WAR) and the weights' consumer behind the copy's write (RAW).
+    // test-backend-ops allocates linearly and never reuses a freed block, so neither ordering is
+    // exercised by the plain cases. The reuse node reads the fused output and writes the bounce
+    // buffer, so it cannot be hoisted above the router by a graph reorder.
+    const bool reuse_bounce;
     ggml_tensor * weights {};
     ggml_tensor * selected_experts {};
+    ggml_tensor * bounce_reuse {};
+    ggml_tensor * reuse_out {};
 
     test_topk_moe(std::array<int64_t, 4> ne              = { 10, 5, 1, 1 },
                   int                    n_expert_used   = 1,
@@ -6536,18 +6549,22 @@ struct test_topk_moe : public test_case {
                   bool                   bias_probs      = false,
                   MoeGatingFunc          gating_func     = GATING_FUNC_SOFTMAX,
                   float                  scale_w         = 0.0f,
-                  bool                   alias_logits    = false) :
+                  bool                   alias_logits    = false,
+                  bool                   reuse_bounce    = false) :
         ne(ne),
         n_expert_used(n_expert_used),
         with_norm(with_norm),
         bias_probs(bias_probs),
         gating_func(gating_func),
         scale_w(scale_w),
-        alias_logits(alias_logits) {
+        alias_logits(alias_logits),
+        reuse_bounce(reuse_bounce) {
         GGML_ASSERT(n_expert_used <= ne[0]);
+        // the reuse target is the GET_ROWS, so it must not be the pattern's output as well
+        GGML_ASSERT(!reuse_bounce || with_norm || gating_func == GATING_FUNC_SOFTMAX_WEIGHT);
     }
 
-    std::string vars() override { return VARS_TO_STR7(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w, alias_logits); }
+    std::string vars() override { return VARS_TO_STR8(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w, alias_logits, reuse_bounce); }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6594,6 +6611,7 @@ struct test_topk_moe : public test_case {
 
         weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens), selected_experts); // [1, n_expert_used, n_tokens]
         ggml_set_name(weights, "weights");
+        ggml_tensor * get_rows_node = weights;
         if (final_is_get_rows) {
             alias(weights);
         }
@@ -6628,10 +6646,32 @@ struct test_topk_moe : public test_case {
         }
 
         ggml_set_name(weights, "weights");
-        return weights;
+        if (!reuse_bounce) {
+            return weights;
+        }
+
+        // A node that consumes the fused output (so graph order keeps it after the router) and
+        // writes the pattern's GET_ROWS storage (so it is the block's next owner, as in a real
+        // graph). Getting either ordering wrong shows up as a corrupt `weights` or `reuse_out`.
+        GGML_ASSERT(get_rows_node != weights);
+        ggml_tensor * w2d = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+        bounce_reuse = ggml_scale(ctx, w2d, 2.0f);
+        GGML_ASSERT(bounce_reuse->view_src == nullptr && ggml_nbytes(bounce_reuse) <= ggml_nbytes(get_rows_node));
+        bounce_reuse->view_src  = get_rows_node;
+        bounce_reuse->view_offs = 0;
+        ggml_set_name(bounce_reuse, "bounce_reuse");
+
+        reuse_out = ggml_add(ctx, w2d, bounce_reuse);
+        ggml_set_name(reuse_out, "reuse_out");
+        return reuse_out;
     }
-    // Verify two outputs
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
+    // Verify two outputs (three when a later node reuses the bounce buffer)
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (reuse_bounce) {
+            return { selected_experts, weights, reuse_out };
+        }
+        return { selected_experts, weights };
+    }
 
     // allow output in arbitrary order
     double err(const float * a, const float * b, size_t n) override {
@@ -10565,6 +10605,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n_tokens : {1, 2, 3, 4, 5, 6, 40, 46}) {
         test_cases.emplace_back(new test_topk_moe({512, n_tokens, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f, true));
     }
+    // ... and with the freed GET_ROWS block reused by a later node, the way ggml-alloc reuses it in
+    // the real graph (see reuse_bounce): this is the only case that exercises the orderings the
+    // Vulkan bounce depends on.
+    for (int n_tokens : {2, 4, 6, 46}) {
+        test_cases.emplace_back(new test_topk_moe({512, n_tokens, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f, true, true));
+    }
+    test_cases.emplace_back(new test_topk_moe({71, 22, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, 0.0f, true, true));
+    test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, true, true, GATING_FUNC_SIGMOID, 0.0f, true, true));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
