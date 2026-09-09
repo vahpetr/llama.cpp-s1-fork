@@ -6419,6 +6419,18 @@ struct test_topk_qsa : public test_case {
     const int     width;
     // production cell->block layout; the only tie-free choice once n_kv > 2048 (see initialize_tensors)
     const bool    blocked;
+    // 0 = off. Otherwise place the TOP_K destination inside the storage of one of the three operands
+    // the FUSED dispatch reads at the TOP_K node - 1 = scores (the cont(permute(score)) the shader
+    // gathers from), 2 = cell_blk, 3 = the raw f16 mask - by pointing out->view_src at it. That is
+    // what ggml-alloc does by accident in the real graph: all three die inside the pattern's window
+    // (scores at the GET_ROWS, cell_blk after the LAST QSA layer's GET_ROWS since one input serves
+    // every layer of the ratio) and the TOP_K is a fresh best-fit allocation that can land in the
+    // freed block. Unfused the graph is still correct - every read precedes the TOP_K in graph order
+    // - so a backend that fuses here MUST veto (ggml_vk_can_fuse_topk_qsa tests exactly these three
+    // against the destination; for cell_blk and the mask the generic src/dst loop cannot, their op is
+    // GGML_OP_NONE and it skips those). test-backend-ops allocates linearly and would never produce
+    // the alias on its own, so without this no TOPK_QSA case reaches that veto.
+    const int     alias;
     ggml_tensor * out {};
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6427,12 +6439,12 @@ struct test_topk_qsa : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR6(n_blocks, n_kv, n_tps, n_stream, width, blocked);
+        return VARS_TO_STR7(n_blocks, n_kv, n_tps, n_stream, width, blocked, alias);
     }
 
     test_topk_qsa(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1, int width = 1500,
-                  bool blocked = false)
-        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), blocked(blocked) {}
+                  bool blocked = false, int alias = 0)
+        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), blocked(blocked), alias(alias) {}
 
     double max_err() override { return 0.0; }
     bool run_whole_graph() override { return true; }
@@ -6452,6 +6464,13 @@ struct test_topk_qsa : public test_case {
         e = ggml_add(ctx, e, ggml_reshape_3d(ctx, m, n_kv, n_tps, n_stream));
         out = ggml_top_k(ctx, e, width);
         ggml_set_name(out, "out");
+
+        if (alias) {
+            ggml_tensor * target = alias == 1 ? a : alias == 2 ? cell_blk : kq_mask;
+            GGML_ASSERT(out->view_src == nullptr && ggml_nbytes(out) <= ggml_nbytes(target));
+            out->view_src  = target;
+            out->view_offs = 0;
+        }
         return out;
     }
 
@@ -10148,6 +10167,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
     // production width (indexer_top_k 2048 + ratio 4 - 1) and decode n_tps (5 draft + 1)
     test_cases.emplace_back(new test_topk_qsa(1024, 4096,  6, 1, 2051, true));
+
+    // ... and with the fused destination forced to alias each operand the dispatch reads at the
+    // TOP_K (1 = scores, 2 = cell_blk, 3 = the raw f16 mask; see test_topk_qsa::alias). Production
+    // width and ratio 4, at decode (n_tps 1) and verify (n_tps 6) shapes; n_kv/n_blocks are sized so
+    // the destination fits inside each target. A backend that fuses one of these instead of vetoing
+    // reads a buffer it is writing, and the result stops matching the CPU reference.
+    for (int64_t n_tps : { 1, 6 }) {
+        for (int alias = 1; alias <= 3; ++alias) {
+            test_cases.emplace_back(new test_topk_qsa(4096, 16384, n_tps, 1, 2051, true, alias));
+        }
+    }
 
     // Qwen 3.8 Flash Next at the deployed context: n_kv 213000, ratio 4, width 2051, decode
     // and -ub 2048 prefill. Opt-in: the n_tps 2048 pair needs ~10 GB of backend and as much

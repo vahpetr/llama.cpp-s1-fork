@@ -18293,6 +18293,13 @@ static bool ggml_vk_match_ops(const struct ggml_cgraph * cgraph, int node_idx,
     return true;
 }
 
+// defined with the dispatcher's veto loop below; used here for the operands that loop cannot see
+static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise);
+
+// GGML_VK_FUSION_DIAG=1: log every fusion that the src/dst overlap veto disables (declared here so
+// ggml_vk_can_fuse_topk_qsa, which runs its own operand-vs-destination test, can log the same way).
+static const bool vk_fusion_diag = getenv("GGML_VK_FUSION_DIAG") != nullptr;
+
 // True if the qwen4 QSA indexer top-k can be fused at node_idx (the get_rows).
 static bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (ctx->device->disable_fusion || !ctx->device->pipeline_topk_radix_qsa) {
@@ -18357,6 +18364,31 @@ static bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struc
     // only worth it in the radix regime; small k uses the faster tournament unfused
     const uint32_t k_min_pipeline = std::max((uint32_t) log2f(float(width)) + 1, ctx->device->subgroup_size_log2);
     if (k_min_pipeline < num_topk_pipelines && ctx->device->pipeline_topk_f32[k_min_pipeline]) {
+        return false;
+    }
+
+    // The fused dispatch reads `scores`, `cell_blk` and the RAW f16 mask at the TOP_K node - several
+    // nodes after ggml-alloc believes their last consumer ran - and writes the TOP_K there, so none
+    // of the three may share bytes with it. The dispatcher's generic veto loop cannot decide this:
+    // cell_blk and the mask are graph inputs, and it skips every src whose op is GGML_OP_NONE, so an
+    // overlap on those would be a silently wrong selection instead of a veto. ggml-alloc really can
+    // produce it - one cell_blk input serves every layer of the ratio, so its block is freed after
+    // the LAST QSA layer's GET_ROWS, i.e. inside that layer's own pattern window, six nodes before
+    // its TOP_K is allocated, and a CPU replay of the reserve caught exactly that placement. Unfused
+    // the same graph is correct (every read precedes the TOP_K in graph order), so refuse the fusion
+    // rather than read a buffer this dispatch is writing. `scores` is included for completeness: the
+    // generic loop already tests it, but this keeps the shader's whole read set in one place.
+    // test-backend-ops TOPK_QSA's alias=1|2|3 cases force each of the three aliases.
+    auto overlaps_top_k = [&](const ggml_tensor * t) {
+        return t && t->buffer && top_k->buffer &&
+               ggml_backend_buffer_is_vk(t->buffer) && ggml_backend_buffer_is_vk(top_k->buffer) &&
+               ggml_vk_tensors_overlap(t, top_k, false);
+    };
+    if (overlaps_top_k(scores) || overlaps_top_k(cell_blk) || overlaps_top_k(mask)) {
+        if (vk_fusion_diag) {
+            GGML_LOG_INFO("ggml_vulkan: fusion TOPK_QSA disabled at node %d: an operand (scores/cell_blk/mask) overlaps the top_k dst %s\n",
+                          node_idx, top_k->name);
+        }
         return false;
     }
     return true;
@@ -18776,9 +18808,6 @@ static int32_t find_first_set(uint32_t x) {
     }
     return ret;
 }
-
-// GGML_VK_FUSION_DIAG=1: log every fusion that the src/dst overlap veto disables.
-static const bool vk_fusion_diag = getenv("GGML_VK_FUSION_DIAG") != nullptr;
 
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
