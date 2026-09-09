@@ -6492,6 +6492,11 @@ static void qsa_select_init_tensors(ggml_context * ctx, int64_t n_blocks, int64_
                                     int64_t n_stream, bool blocked, int ties) {
     GGML_UNUSED(n_stream);
     const int64_t r = (n_kv + n_blocks - 1)/n_blocks;
+    // The three inputs are found BY NAME, so a rename in either build_graph would silently fall
+    // through to the uniform fill: the cell->block map would become random floats reinterpreted as
+    // indices and the tie constructions would stop constructing ties, i.e. the tests would still
+    // pass and cover nothing. Count them and require all three.
+    int seen_score = 0, seen_cell = 0, seen_mask = 0;
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->op != GGML_OP_NONE) {
             continue;
@@ -6499,6 +6504,7 @@ static void qsa_select_init_tensors(ggml_context * ctx, int64_t n_blocks, int64_
         const char * name = ggml_get_name(t);
         if (strcmp(name, "cell_blk") == 0) {
             // cell_blk [n_kv, n_stream]
+            seen_cell++;
             GGML_ASSERT(t->type == GGML_TYPE_I32);
             std::vector<int32_t> data(ggml_nelements(t));
             for (int64_t row = 0; row < ggml_nrows(t); row++) {
@@ -6510,6 +6516,7 @@ static void qsa_select_init_tensors(ggml_context * ctx, int64_t n_blocks, int64_
         } else if (strcmp(name, "kq_mask") == 0) {
             // kq_mask [n_kv, n_tps, (1,) n_stream], f16 in the flash-attention graph the fusion and
             // the op are built for, f32 in the one case that covers the reference's other branch
+            seen_mask++;
             GGML_ASSERT(t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_F32);
             std::vector<char> data(ggml_nbytes(t));
             for (int64_t row = 0; row < ggml_nrows(t); row++) {
@@ -6524,7 +6531,13 @@ static void qsa_select_init_tensors(ggml_context * ctx, int64_t n_blocks, int64_
                 }
             }
             ggml_backend_tensor_set(t, data.data(), 0, data.size());
-        } else if (blocked && strcmp(name, "score") == 0) {
+        } else if (strcmp(name, "score") == 0) {
+            seen_score++;
+            if (!blocked) {
+                // the default initialization gets its distinct values from the mask ramp instead
+                init_tensor_uniform(t, 0.0f, 0.5f);
+                continue;
+            }
             // score [n_blocks, n_tps, n_stream]; +7919*row keeps the rows from selecting alike.
             // Only the score gets the block ramp: the harness plants 1024-element F32 sentinels
             // after every input (add_sentinel), and writing n_blocks values into one of those
@@ -6543,6 +6556,8 @@ static void qsa_select_init_tensors(ggml_context * ctx, int64_t n_blocks, int64_
             init_tensor_uniform(t, 0.0f, 0.5f);
         }
     }
+    // exactly one of each, or a rename has made this initializer vacuous
+    GGML_ASSERT(seen_score == 1 && seen_cell == 1 && seen_mask == 1);
 }
 
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
