@@ -2742,6 +2742,7 @@ struct ggml_backend_vk_context {
     // labels the log line (first raise vs. a later growth). Both stay 0/false while the knob is off.
     size_t prealloc_size_qsa_hint {};
     bool prealloc_x_qsa_presized {};
+    bool prealloc_x_qsa_range_warned {};
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -8194,8 +8195,9 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
-    ctx->prealloc_size_qsa_hint  = 0;     // [TAG_QSA_SCRATCH]
-    ctx->prealloc_x_qsa_presized = false; // [TAG_QSA_SCRATCH]
+    ctx->prealloc_size_qsa_hint      = 0;     // [TAG_QSA_SCRATCH]
+    ctx->prealloc_x_qsa_presized     = false; // [TAG_QSA_SCRATCH]
+    ctx->prealloc_x_qsa_range_warned = false; // [TAG_QSA_SCRATCH]
     // Fixed size of 1KB, for deterministic behavior
     ctx->prealloc_size_add_rms_partials = 1024;
 
@@ -14938,6 +14940,8 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 // of the graph being recorded (see the field comments). [TAG_ENV_BOOL] value-parsed and cached;
 // default off, per the QSA plan's "one A/B knob per change, off until its own gate passes". With it
 // off the fused select is byte-for-byte the code that shipped.
+// Presumes a --kv-graph-span well under maxStorageBufferRange: with the span at its default 0 the
+// hint is n_ctx-sized and can exceed what one binding covers, which the range guard below catches.
 static const bool vk_qsa_scratch_presize = ggml_vk_env_bool("GGML_VK_QSA_SCRATCH_PRESIZE", false);
 
 // Bytes the fused select's gather scratch needs for the topk_qsa pattern starting at `node_idx`
@@ -14988,18 +14992,42 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
         // QSA is by far the largest of them, so presizing costs only the geometric headroom, where
         // moving the scratch into a buffer of its own would have cost the whole non-QSA maximum
         // (~416 MiB here, the flash-attention q8_0->f16 K/V staging) on top of it.
+        // Nothing anticipated here may exceed what a single storage-buffer binding covers:
+        // scratch_buf below binds the whole buffer, so an over-large presize would turn a dispatch
+        // that works today into a validation error. Reachable without a --kv-graph-span, which is
+        // the default (src/llama-cparams.h, llama-context.cpp:454-461): the hint is then the pool's
+        // own extent, e.g. 524288 * 2050 * 4 = 4 299 161 600 B against a 4 GiB-1 cap. The four
+        // mul_mat sites GGML_ABORT in this situation; the presize instead falls back to the cap,
+        // because its extra size is an optimization while the dispatch's own need is not - if even
+        // scratch_size is over the limit we still request it, exactly as the unpresized code does,
+        // and the warning says so.
+        const size_t range_cap = (size_t) ctx->device->properties.limits.maxStorageBufferRange;
         size_t want = std::max(scratch_size, ctx->prealloc_size_qsa_hint);
+        if (want > range_cap) {
+            const size_t clamped = scratch_size > range_cap ? scratch_size : range_cap;
+            if (!ctx->prealloc_x_qsa_range_warned) {
+                ctx->prealloc_x_qsa_range_warned = true;
+                GGML_LOG_WARN("ggml_vulkan: QSA scratch hint %s exceeds maxStorageBufferRange %s; "
+                              "presizing to %s instead (%s)\n",
+                              format_size(ctx->prealloc_size_qsa_hint).c_str(),
+                              format_size(range_cap).c_str(),
+                              format_size(clamped).c_str(),
+                              scratch_size > range_cap
+                                  ? "this dispatch alone is already over the limit - set --kv-graph-span"
+                                  : "set --kv-graph-span to keep the reserve inside the limit");
+            }
+            want = clamped;
+        }
         if (ctx->prealloc_size_x < want) {
             const size_t geometric = ctx->prealloc_size_x + ctx->prealloc_size_x / 4;
-            // ...but never past what a single storage-buffer binding can cover: scratch_buf below
-            // binds the whole buffer, so headroom we could not bind would be a validation error.
-            const size_t range_cap = (size_t) ctx->device->properties.limits.maxStorageBufferRange;
             if (geometric > want && geometric <= range_cap) {
                 want = geometric;
             }
             // One line per QSA-driven (re)allocation, with the shape that triggered it, so the M2
-            // gate can count growths out of the server log without the memory logger.
-            GGML_LOG_INFO("ggml_vulkan: QSA scratch %s prealloc_x: %s -> %s (reserve hint %s; "
+            // gate can count growths out of the server log without the memory logger. The hint is
+            // "max seen", not "reserve": it is the running maximum over every graph optimized so
+            // far, and the walk that maintains it stops once prealloc_x already covers it.
+            GGML_LOG_INFO("ggml_vulkan: QSA scratch %s prealloc_x: %s -> %s (hint (max seen) %s; "
                           "trigger n_kv=%u n_tps=%u n_stream=%u = %s)\n",
                           ctx->prealloc_x_qsa_presized ? "GREW" : "presized",
                           format_size(ctx->prealloc_size_x).c_str(),
@@ -17309,8 +17337,9 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
-    ctx->prealloc_size_qsa_hint  = 0;     // [TAG_QSA_SCRATCH]
-    ctx->prealloc_x_qsa_presized = false; // [TAG_QSA_SCRATCH]
+    ctx->prealloc_size_qsa_hint      = 0;     // [TAG_QSA_SCRATCH]
+    ctx->prealloc_x_qsa_presized     = false; // [TAG_QSA_SCRATCH]
+    ctx->prealloc_x_qsa_range_warned = false; // [TAG_QSA_SCRATCH]
 
     for (auto& event : ctx->gc.events) {
         ctx->device->device.destroyEvent(event);
@@ -19581,6 +19610,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 // therefore cannot decide during a reserve) can only make this an over-estimate of one graph, never
 // an allocation on its own: nothing is allocated until a dispatch actually happens.
 static void ggml_vk_qsa_scratch_hint(ggml_backend_vk_context * ctx, const struct ggml_cgraph * graph) {
+    // Once prealloc_x already covers the largest extent seen, a further walk cannot change what gets
+    // allocated - any bigger need is the dispatch's own scratch_size, which it applies itself - so
+    // stop paying for it on every graph. The `> 0` keeps the very first (reserve) graph walking.
+    if (ctx->prealloc_size_qsa_hint > 0 && ctx->prealloc_size_x >= ctx->prealloc_size_qsa_hint) {
+        return;
+    }
     // GGML_VK_DISABLE_FUSION_PATTERNS=topk_qsa must not reserve scratch for a fusion that will not
     // run. Tested directly rather than through vk_fusion_veto(), which would also add this graph to
     // the GGML_VK_FUSION_COUNT tally the dispatcher owns.
