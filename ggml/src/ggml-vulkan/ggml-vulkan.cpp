@@ -2269,6 +2269,141 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
     return atoi(s) != 0;
 }
 
+// GGML_VK_DISABLE_FUSION_PATTERNS=name1,name2,... disables individual graph-fusion patterns by
+// name, so a fusion-caused divergence can be bisected pattern by pattern (GGML_VK_DISABLE_FUSION
+// still turns every fusion off at once). Comma-separated, case-insensitive; a trailing '*' matches
+// a prefix (topk_moe* = every topk_moe_* mode). Read once in ggml_vk_instance_init and cached:
+// when the variable is unset every match site costs exactly one load of the cached bool
+// vk_fusion_patterns_disabled_any and nothing else changes. Unknown names are warned about at
+// startup. The names are the lower-case fusion_string of the match site in
+// ggml_backend_vk_graph_compute; the sites are tried in this order, so disabling a longer pattern
+// lets its shorter prefix match instead (no mul_mat_add_add -> mul_mat_add fires):
+//   multi_add                        ADD+ADD(+ADD...)                     ggml_vk_fuse_multi_add
+//   mul_mat_add_add                  MUL_MAT+ADD+ADD                      (mat-vec bias adds)
+//   mul_mat_add                      MUL_MAT+ADD
+//   mul_mat_id_add_id_mul            MUL_MAT_ID+ADD_ID+MUL
+//   mul_mat_id_add_id                MUL_MAT_ID+ADD_ID
+//   mul_mat_id_mul                   MUL_MAT_ID+MUL                       (MoE expert-weight multiply)
+//   rms_norm_mul_rope_view_set_rows  RMS_NORM+MUL+ROPE+VIEW+SET_ROWS
+//   rms_norm_mul_rope                RMS_NORM+MUL+ROPE
+//   rms_norm_mul                     RMS_NORM+MUL
+//   ssm_conv_bias_silu               SSM_CONV+ADD+SILU
+//   ssm_conv_silu                    SSM_CONV+SILU
+//   rope_view_set_rows               ROPE+VIEW+SET_ROWS
+//   hc_combine                       REPEAT+SCALE+SIGMOID+SCALE+RESHAPE+MUL+ADD   (qwen4exp hyper-connection combine)
+//   snake                            MUL+SIN+SQR+MUL+ADD
+//   topk_moe_early_softmax_norm      SOFT_MAX+RESHAPE+ARGSORT+VIEW+GET_ROWS+RESHAPE+SUM_ROWS+CLAMP+DIV+RESHAPE
+//   topk_moe_sigmoid_norm_bias       SIGMOID+RESHAPE+ADD+ARGSORT+VIEW+GET_ROWS+RESHAPE+SUM_ROWS+CLAMP+DIV+RESHAPE
+//   topk_moe_sqrt_softplus_norm_bias SOFTPLUS+SQRT+RESHAPE+ADD+ARGSORT+VIEW+GET_ROWS+RESHAPE+SUM_ROWS+CLAMP+DIV+RESHAPE
+//   topk_moe_early_softmax           SOFT_MAX+RESHAPE+ARGSORT+VIEW+GET_ROWS
+//   topk_moe_late_softmax            ARGSORT+VIEW+GET_ROWS+RESHAPE+SOFT_MAX+RESHAPE
+//   topk_moe_scale                   the optional trailing DIV+RESHAPE+SCALE / GET_ROWS+SCALE appended to any topk_moe_*
+//   add_softplus_mul                 ADD+SOFTPLUS+MUL                     (qwen4exp GDN decay pre-chain)
+//   sigmoid_mul                      SIGMOID+MUL
+//   add_rms                          ADD that also writes the sum-of-squares partials consumed by the RMS_NORM
+//                                    right after it (ggml_vk_build_graph; decode only, rows == 1)
+// (topk_qsa of the source commit has no match site on this branch and is not listed.)
+// ggml_vk_graph_optimize's keep_pattern list is deliberately not gated: it only keeps a pattern's
+// nodes adjacent (GGML_VK_DISABLE_FUSION does not gate it either), so the node order of a run with
+// a pattern disabled is the same as with the pattern enabled.
+//
+// Port note vs the source commit: the gate is the *last* term of each match condition instead of
+// the first, so a veto is only recorded for a pattern that really matched at this node and
+// GGML_VK_FUSION_COUNT can report it as disabled:<name>=<count>. Every ggml_vk_can_fuse*/
+// ggml_vk_fuse_multi_add predicate is side-effect free (none of them writes ctx->), so evaluating
+// the predicate before the gate changes nothing but the cost of a run that sets the knob.
+//
+// GGML_VK_FUSION_LIST=1 prints one stderr line "[vk-fusion] name: OP1+OP2+..." the first time
+// each distinct (pattern name, fused op names) tuple fires - after the src/dst overlap veto, so
+// only fusions that were really dispatched - so the fusion sets of two runs can be diffed.
+static const char * const vk_fusion_pattern_names[] = {
+    "multi_add", "mul_mat_add_add", "mul_mat_add", "mul_mat_id_add_id_mul", "mul_mat_id_add_id",
+    "mul_mat_id_mul", "rms_norm_mul_rope_view_set_rows", "rms_norm_mul_rope", "rms_norm_mul",
+    "ssm_conv_bias_silu", "ssm_conv_silu", "rope_view_set_rows", "hc_combine", "snake",
+    "topk_moe_early_softmax_norm", "topk_moe_sigmoid_norm_bias", "topk_moe_sqrt_softplus_norm_bias",
+    "topk_moe_early_softmax", "topk_moe_late_softmax", "topk_moe_scale", "add_softplus_mul",
+    "sigmoid_mul", "add_rms",
+};
+static bool vk_fusion_patterns_disabled_any = false;
+static std::vector<std::string> vk_fusion_patterns_disabled; // lower-case; trailing '*' = prefix match
+static bool vk_fusion_list_enabled = false;
+
+static bool ggml_vk_fusion_pattern_matches(const std::string & pat, const char * name) {
+    if (!pat.empty() && pat.back() == '*') {
+        return strncmp(name, pat.c_str(), pat.size() - 1) == 0;
+    }
+    return pat == name;
+}
+
+static bool ggml_vk_fusion_disabled_slow(const char * name) {
+    for (const std::string & pat : vk_fusion_patterns_disabled) {
+        if (ggml_vk_fusion_pattern_matches(pat, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ggml_vk_fusion_patterns_init() {
+    vk_fusion_list_enabled = ggml_vk_env_bool("GGML_VK_FUSION_LIST", false);
+    vk_fusion_patterns_disabled.clear();
+    vk_fusion_patterns_disabled_any = false;
+    const char * s = getenv("GGML_VK_DISABLE_FUSION_PATTERNS");
+    if (s == nullptr) {
+        return;
+    }
+    std::string tok;
+    for (const char * p = s; ; ++p) {
+        if (*p == ',' || *p == ';' || *p == ' ' || *p == '\0') {
+            if (!tok.empty()) {
+                vk_fusion_patterns_disabled.push_back(tok);
+                tok.clear();
+            }
+            if (*p == '\0') {
+                break;
+            }
+        } else {
+            tok += (char) tolower((unsigned char) *p);
+        }
+    }
+    vk_fusion_patterns_disabled_any = !vk_fusion_patterns_disabled.empty();
+    for (const std::string & pat : vk_fusion_patterns_disabled) {
+        bool known = false;
+        for (const char * n : vk_fusion_pattern_names) {
+            known = known || ggml_vk_fusion_pattern_matches(pat, n);
+        }
+        if (!known) {
+            GGML_LOG_WARN("ggml_vulkan: GGML_VK_DISABLE_FUSION_PATTERNS: \"%s\" matches no fusion pattern\n", pat.c_str());
+        }
+    }
+    if (vk_fusion_patterns_disabled_any) {
+        GGML_LOG_INFO("ggml_vulkan: fusion patterns disabled: %s\n", s);
+    }
+}
+
+// GGML_VK_FUSION_LIST: report a fusion the first time its (name, fused op names) tuple fires.
+// n_fused nodes starting at node_idx are listed with ggml_op_desc (SILU, not UNARY).
+static void ggml_vk_fusion_list_report(const char * name, const struct ggml_cgraph * cgraph, int node_idx, int n_fused,
+                                       const char * suffix = nullptr) {
+    std::string key = name;
+    if (suffix) {
+        key += suffix;
+    }
+    key += ": ";
+    for (int k = 0; k < n_fused; ++k) {
+        if (k) {
+            key += '+';
+        }
+        key += ggml_op_desc(cgraph->nodes[node_idx + k]);
+    }
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    std::lock_guard<std::mutex> guard(mutex);
+    if (seen.insert(key).second) {
+        fprintf(stderr, "[vk-fusion] %s\n", key.c_str());
+    }
+}
+
 // env: GGML_SCHED_PROFILE=1 - host-side timing of ggml_backend_vk_graph_compute, printed to stderr as
 // "[sched-prof]" lines (the same env drives llama-context.cpp and ggml_backend_sched_compute_splits).
 // Read once and cached: with the env off every instrumented site is a single branch on this bool. It does
@@ -2638,6 +2773,9 @@ struct ggml_backend_vk_context {
     // (op, fused pattern, applied misalignment) and once per dispatch (pipeline name + workgroup
     // counts, which is where the shader and the split_k/rows-per-wg choice show up).
     uint64_t fusion_sig {};
+    // GGML_VK_FUSION_COUNT: matches GGML_VK_DISABLE_FUSION_PATTERNS vetoed in the current graph,
+    // reported as disabled:<name>=<count> so a bisect arm can be proven to have acted
+    std::map<std::string, int> fusion_count_disabled;
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -2652,6 +2790,20 @@ struct ggml_backend_vk_context {
     // for GGML_SCHED_PROFILE: host time spent inside ggml_vk_submit() during the current graph_compute
     int64_t sched_prof_submit_us {};
 };
+
+// The gate at every fusion match site, evaluated *after* the pattern's own match test so that a
+// veto belongs to a pattern that really matched at this node: returns true when
+// GGML_VK_DISABLE_FUSION_PATTERNS names this pattern, and then records it for the
+// GGML_VK_FUSION_COUNT tally. One load of a cached bool when the knob is unset.
+static inline bool vk_fusion_veto(ggml_backend_vk_context * ctx, const char * name) {
+    if (!vk_fusion_patterns_disabled_any || !ggml_vk_fusion_disabled_slow(name)) {
+        return false;
+    }
+    if (ggml_vk_fusion_count_enabled()) {
+        ctx->fusion_count_disabled[name]++;
+    }
+    return true;
+}
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
 
@@ -7790,6 +7942,7 @@ static void ggml_vk_instance_init() {
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_flops_seed_legacy = ggml_vk_env_bool("GGML_VK_FLOPS_SEED_LEGACY", false);
     vk_submit_log_enabled = ggml_vk_env_bool("GGML_VK_SUBMIT_LOG", false);
+    ggml_vk_fusion_patterns_init();
     const char* GGML_VK_OPT_WINDOW = getenv("GGML_VK_OPT_WINDOW");
     if (GGML_VK_OPT_WINDOW != nullptr) {
         // strtol, not std::stoi: this runs inside ggml_vk_instance_init and a throw from a
@@ -16310,13 +16463,18 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             cgraph->nodes[next_node_idx]->op == GGML_OP_RMS_NORM &&
             cgraph->nodes[next_node_idx]->src[0] == cgraph->nodes[next_node_idx - 1] &&
             ggml_nrows(cgraph->nodes[next_node_idx]) == 1 &&
-            ctx->device->add_rms_fusion) {
+            ctx->device->add_rms_fusion &&
+            !vk_fusion_veto(ctx, "add_rms")) {
             uint32_t size = ggml_vk_rms_partials_size(ctx, cgraph->nodes[node_idx]);
             ctx->do_add_rms_partials_offset_calculation = true;
             if (ctx->prealloc_size_add_rms_partials_offset + size <= ctx->prealloc_size_add_rms_partials) {
                 ctx->do_add_rms_partials = true;
                 if (ggml_vk_fusion_count_enabled()) {
                     ctx->fusion_count_add_rms++;
+                }
+                if (vk_fusion_list_enabled) {
+                    // the ADD (or the whole multi_add chain) plus the RMS_NORM that consumes the partials
+                    ggml_vk_fusion_list_report("add_rms", cgraph, node_idx, ctx->num_additional_fused_ops + 2);
                 }
             }
         }
@@ -18569,6 +18727,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     std::map<std::string, int> fusion_counts;
     ctx->fusion_count_add_rms = 0;
     ctx->fusion_sig = vk_fnv1a_seed;
+    ctx->fusion_count_disabled.clear();
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -18647,33 +18806,38 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-            if (num_adds) {
+            if (num_adds && !vk_fusion_veto(ctx, "multi_add")) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD }) &&
+                       !vk_fusion_veto(ctx, "mul_mat_add_add")) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD }) &&
+                       !vk_fusion_veto(ctx, "mul_mat_add")) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL }) &&
+                       !vk_fusion_veto(ctx, "mul_mat_id_add_id_mul")) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ID_ADD_ID_MUL";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID })) {
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID }) &&
+                       !vk_fusion_veto(ctx, "mul_mat_id_add_id")) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ID_ADD_ID";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL })) {
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL }) &&
+                       !vk_fusion_veto(ctx, "mul_mat_id_mul")) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ID_MUL";
                 op_srcs_fused_elementwise[0] = false;
@@ -18681,7 +18845,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 4 }) &&
                        ggml_check_edges(cgraph, i, rms_norm_mul_rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i) &&
-                       ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i + 2)) {
+                       ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i + 2) &&
+                       !vk_fusion_veto(ctx, "rms_norm_mul_rope_view_set_rows")) {
                 ctx->num_additional_fused_ops = 4;
                 fusion_string = "RMS_NORM_MUL_ROPE_VIEW_SET_ROWS";
                 op_srcs_fused_elementwise[0] = false;
@@ -18690,21 +18855,24 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[3] = false;
                 op_srcs_fused_elementwise[4] = false;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE })&&
-                       ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i)) {
+                       ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i) &&
+                       !vk_fusion_veto(ctx, "rms_norm_mul_rope")) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "RMS_NORM_MUL_ROPE";
                 // rope is approximately elementwise - whole rows are done by a single workgroup and it's row-wise
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }) &&
+                       !vk_fusion_veto(ctx, "rms_norm_mul")) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "RMS_NORM_MUL";
                 // rms_norm is not elementwise, but whole rows must be consumed and the scale factor computed before
                 // they are overwritten, and one workgroup per row. So close enough.
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
+            } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2) &&
+                       !vk_fusion_veto(ctx, "ssm_conv_bias_silu")) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "SSM_CONV_BIAS_SILU";
                 // ssm_conv reads multiple input tokens per output, so it's not elementwise w.r.t. its srcs.
@@ -18712,20 +18880,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
-            } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 1)) {
+            } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 1) &&
+                       !vk_fusion_veto(ctx, "ssm_conv_silu")) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "SSM_CONV_SILU";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
             } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 2 }) &&
                        ggml_check_edges(cgraph, i, rope_view_set_rows_edges) &&
-                       ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i)) {
+                       ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i) &&
+                       !vk_fusion_veto(ctx, "rope_view_set_rows")) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "ROPE_VIEW_SET_ROWS";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
                 op_srcs_fused_elementwise[2] = false;
-            } else if (ggml_vk_can_fuse_hc_combine(ctx, cgraph, i)) {
+            } else if (ggml_vk_can_fuse_hc_combine(ctx, cgraph, i) &&
+                       !vk_fusion_veto(ctx, "hc_combine")) {
                 ctx->num_additional_fused_ops = 6;
                 fusion_string = "HC_COMBINE";
                 // elementwise=true: every thread reads residual[idx] into a register before
@@ -18734,7 +18905,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // the destination, so ggml_vk_tensors_overlap still rejects any overlap of
                 // theirs (they are read with a broadcast, not elementwise).
                 std::fill_n(op_srcs_fused_elementwise, 7, true);
-            } else if (ggml_vk_can_fuse_snake(ctx, cgraph, i)) {
+            } else if (ggml_vk_can_fuse_snake(ctx, cgraph, i) &&
+                       !vk_fusion_veto(ctx, "snake")) {
                 ctx->num_additional_fused_ops = 4;
                 fusion_string = "SNAKE";
                 // elementwise=true: snake.comp is safe under exact aliasing because each
@@ -18744,7 +18916,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 std::fill_n(op_srcs_fused_elementwise, 5, true);
             } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_early_softmax_norm, { i + 3, i + 9 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_early_softmax_norm_edges) &&
-                       ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_EARLY_SOFTMAX_NORM)) {
+                       ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_EARLY_SOFTMAX_NORM) &&
+                       !vk_fusion_veto(ctx, "topk_moe_early_softmax_norm")) {
                 ctx->num_additional_fused_ops = topk_moe_early_softmax_norm.size() - 1;
                 // view of argsort writes to memory
                 ctx->fused_ops_write_mask |= 1 << 3;
@@ -18753,7 +18926,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_sigmoid_norm_bias, { i + 4, i + 10 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_sigmoid_norm_bias_edges) &&
-                       ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_SIGMOID_NORM_BIAS)) {
+                       ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_SIGMOID_NORM_BIAS) &&
+                       !vk_fusion_veto(ctx, "topk_moe_sigmoid_norm_bias")) {
                 ctx->num_additional_fused_ops = topk_moe_sigmoid_norm_bias.size() - 1;
                 // view of argsort writes to memory
                 ctx->fused_ops_write_mask |= 1 << 4;
@@ -18762,7 +18936,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_sqrt_softplus_norm_bias, { i + 5, i + 11 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_sqrt_softplus_norm_bias_edges) &&
-                       ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS)) {
+                       ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS) &&
+                       !vk_fusion_veto(ctx, "topk_moe_sqrt_softplus_norm_bias")) {
                 ctx->num_additional_fused_ops = topk_moe_sqrt_softplus_norm_bias.size() - 1;
                 // view of argsort writes to memory
                 ctx->fused_ops_write_mask |= 1 << 5;
@@ -18771,7 +18946,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_early_softmax, { i + 3, i + 4 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_early_softmax_edges) &&
-                       ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_EARLY_SOFTMAX)) {
+                       ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_EARLY_SOFTMAX) &&
+                       !vk_fusion_veto(ctx, "topk_moe_early_softmax")) {
                 ctx->num_additional_fused_ops = topk_moe_early_softmax.size() - 1;
                 // view of argsort writes to memory
                 ctx->fused_ops_write_mask |= 1 << 3;
@@ -18780,14 +18956,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_late_softmax, { i + 1, i + 5 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_late_softmax_edges) &&
-                       ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_LATE_SOFTMAX)) {
+                       ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_LATE_SOFTMAX) &&
+                       !vk_fusion_veto(ctx, "topk_moe_late_softmax")) {
                 ctx->num_additional_fused_ops = topk_moe_late_softmax.size() - 1;
                 // view of argsort writes to memory
                 ctx->fused_ops_write_mask |= 1 << 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_LATE_SOFTMAX;
                 fusion_string = "TOPK_MOE_LATE_SOFTMAX";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
-            } else if (ggml_vk_can_fuse_add_softplus_mul(ctx, cgraph, i)) {
+            } else if (ggml_vk_can_fuse_add_softplus_mul(ctx, cgraph, i) &&
+                       !vk_fusion_veto(ctx, "add_softplus_mul")) {
                 ctx->num_additional_fused_ops = 2;
                 ctx->fused_gdn_pre = true;
                 fusion_string = "ADD_SOFTPLUS_MUL";
@@ -18797,7 +18975,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // ggml_vk_tensors_overlap still rejects any overlap of theirs (they are read
                 // with a broadcast, not elementwise).
                 std::fill_n(op_srcs_fused_elementwise, 3, true);
-            } else if (ggml_vk_can_fuse_sigmoid_mul(ctx, cgraph, i)) {
+            } else if (ggml_vk_can_fuse_sigmoid_mul(ctx, cgraph, i) &&
+                       !vk_fusion_veto(ctx, "sigmoid_mul")) {
                 ctx->num_additional_fused_ops = 1;
                 ctx->fused_mul_sigmoid = true;
                 fusion_string = "SIGMOID_MUL";
@@ -18808,8 +18987,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
             if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
                 // Look for an additional scale op to fuse - occurs in deepseek2 and nemotron3 nano.
-                if (ggml_can_fuse_subgraph(cgraph, i + ctx->num_additional_fused_ops - 1, { GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_SCALE }, { i + ctx->num_additional_fused_ops + 1 }) ||
-                    ggml_can_fuse_subgraph(cgraph, i + ctx->num_additional_fused_ops, { GGML_OP_GET_ROWS, GGML_OP_SCALE }, { i + ctx->num_additional_fused_ops + 1 })) {
+                if ((ggml_can_fuse_subgraph(cgraph, i + ctx->num_additional_fused_ops - 1, { GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_SCALE }, { i + ctx->num_additional_fused_ops + 1 }) ||
+                     ggml_can_fuse_subgraph(cgraph, i + ctx->num_additional_fused_ops, { GGML_OP_GET_ROWS, GGML_OP_SCALE }, { i + ctx->num_additional_fused_ops + 1 })) &&
+                    !vk_fusion_veto(ctx, "topk_moe_scale")) {
                     ctx->fused_topk_moe_scale = true;
                     ctx->num_additional_fused_ops++;
                     op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = false;
@@ -18888,6 +19068,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_mul_sigmoid = false;
                 ctx->fused_gdn_pre = false;
             }
+        }
+
+        if (vk_fusion_list_enabled && ctx->num_additional_fused_ops > 0 && fusion_string) {
+            std::string name = fusion_string;
+            for (char & c : name) {
+                c = (char) tolower((unsigned char) c);
+            }
+            ggml_vk_fusion_list_report(name.c_str(), cgraph, i, ctx->num_additional_fused_ops + 1,
+                                       ctx->fused_topk_moe_scale ? "+topk_moe_scale" : nullptr);
         }
 
         if (fusion_count && fusion_string) {
@@ -18979,6 +19168,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     if (fusion_count) {
         if (ctx->fusion_count_add_rms) {
             fusion_counts["add_rms"] = ctx->fusion_count_add_rms;
+        }
+        // disabled:<name>=<count>: matches GGML_VK_DISABLE_FUSION_PATTERNS turned back into
+        // unfused ops, so a bisect arm shows in the tally that the knob really acted
+        for (const auto & kv : ctx->fusion_count_disabled) {
+            fusion_counts["disabled:" + kv.first] = kv.second;
         }
         std::string line = "[vk-fusion-count] graph nodes=" + std::to_string(cgraph->n_nodes);
         for (const auto & kv : fusion_counts) {
