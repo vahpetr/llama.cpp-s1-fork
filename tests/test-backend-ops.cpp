@@ -6488,8 +6488,10 @@ struct test_top_k : public test_case {
 // blocked: the production layout - cell i belongs to block i/r, the mask carries the in-block
 //   offset - so value(i) = ((i/r + 7919*row) % n_blocks) + 0.25*(i%r), unique for every cell of a
 //   row and exact in both f16 and f32 at any n_kv.
+//
+// `width` is only read by ties == 4, which needs to place its -inf cutoff below the selection width.
 static void qsa_select_init_tensors(ggml_context * ctx, int64_t n_blocks, int64_t n_kv, int64_t n_tps,
-                                    int64_t n_stream, bool blocked, int ties) {
+                                    int64_t n_stream, bool blocked, int ties, int width) {
     GGML_UNUSED(n_stream);
     const int64_t r = (n_kv + n_blocks - 1)/n_blocks;
     // The three inputs are found BY NAME, so a rename in either build_graph would silently fall
@@ -6520,9 +6522,22 @@ static void qsa_select_init_tensors(ggml_context * ctx, int64_t n_blocks, int64_
             GGML_ASSERT(t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_F32);
             std::vector<char> data(ggml_nbytes(t));
             for (int64_t row = 0; row < ggml_nrows(t); row++) {
+                // ties == 4: the masked tail every prefill ubatch boundary produces. Cells at or
+                // past a per-row cutoff are masked with -INFINITY, and the cutoff is BELOW the
+                // selection width, so the finite values do not fill the row and the selection has
+                // to reach into the masked set. score + -inf == -inf for every one of them, so the
+                // tie group at the threshold is (n_kv - cut) wide with (width - cut) slots left -
+                // by far the widest tie the deployed selection ever sees, and one no backend can
+                // resolve by luck: only an index-ordered tie-break gives the reference's answer
+                // (cells 0..width-1). Not a synthetic shape - it is what the mask does at every
+                // ubatch whose causal window is shorter than indexer_top_k.
+                const int64_t cut = std::max<int64_t>(1, width - 1 - (row % 4)*(width/8));
                 for (int64_t i = 0; i < n_kv; i++) {
                     // ties: no in-block offset, so a block's cells are indistinguishable
-                    const float v = ties ? 0.0f : blocked ? 0.25f*(float) (i % r) : (float) i;
+                    const float v = ties == 4 ? (i < cut ? 0.0f : -INFINITY)
+                                  : ties      ? 0.0f
+                                  : blocked   ? 0.25f*(float) (i % r)
+                                              : (float) i;
                     if (t->type == GGML_TYPE_F16) {
                         ((ggml_fp16_t *) data.data())[row * n_kv + i] = ggml_fp32_to_fp16(v);
                     } else {
@@ -6548,6 +6563,8 @@ static void qsa_select_init_tensors(ggml_context * ctx, int64_t n_blocks, int64_
             for (int64_t row = 0; row < ggml_nrows(t); row++) {
                 for (int64_t b = 0; b < n_blocks; b++) {
                     const int64_t v = (b + 7919*row) % n_blocks;
+                    // ties == 4 shares the ties == 1 score (one value per block): its tie group is
+                    // built by the mask, not by the score
                     data[row * n_blocks + b] = ties == 2 ? 0.0f : (float) (ties == 3 ? v/8 : v);
                 }
             }
@@ -6586,7 +6603,9 @@ struct test_topk_qsa : public test_case {
     // every cell of a block carries the identical block score exactly as qwen4exp expands it,
     // and the width cuts inside a block. 1 = one score per block (tie group = ratio cells),
     // 2 = every cell of the row equal, 3 = eight blocks share a score, so the threshold's tie
-    // group is 8*ratio cells wide with 3 slots left. Requires blocked. The ids are compared
+    // group is 8*ratio cells wide with 3 slots left, 4 = a -INFINITY mask past a per-row cutoff
+    // below the width, so the threshold value is -inf and the selection reaches into the masked
+    // set (qsa_select_init_tensors). Requires blocked. The ids are compared
     // exactly, which is only meaningful because the CPU reference resolves ties by index
     // (cmp_top_k) and the Vulkan radix-select does too.
     const int     ties;
@@ -6639,7 +6658,7 @@ struct test_topk_qsa : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
 
     void initialize_tensors(ggml_context * ctx) override {
-        qsa_select_init_tensors(ctx, n_blocks, n_kv, n_tps, n_stream, blocked, ties);
+        qsa_select_init_tensors(ctx, n_blocks, n_kv, n_tps, n_stream, blocked, ties, width);
     }
 
     // top-k output order is unspecified; compare as a set of indices
@@ -6681,7 +6700,8 @@ struct test_qsa_top_k : public test_case {
     // production cell->block layout; the only tie-free choice once n_kv > 2048 (see qsa_select_init_tensors)
     const bool      blocked;
     // as test_topk_qsa::ties: 1 = one score per block, 2 = the whole row equal, 3 = eight blocks
-    // share a score. Requires blocked.
+    // share a score, 4 = a -INFINITY mask past a per-row cutoff below the width, so the threshold
+    // value is -inf and the selection reaches into the masked set. Requires blocked.
     const int       ties;
     // the graph builds the op with an f16 mask (flash attention); GGML_TYPE_F32 covers the other
     // branch of the CPU reference. The Vulkan shader binds a float16_t mask, so an f32 case is
@@ -6719,7 +6739,7 @@ struct test_qsa_top_k : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        qsa_select_init_tensors(ctx, n_blocks, n_kv, n_tps, n_stream, blocked, ties);
+        qsa_select_init_tensors(ctx, n_blocks, n_kv, n_tps, n_stream, blocked, ties, width);
     }
 
     // top-k output order is unspecified; compare as a set of indices
@@ -10391,6 +10411,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(4096, 16384, 1, 1, 2051, true, 0, 1));
     test_cases.emplace_back(new test_topk_qsa(4096, 16384, 6, 1, 2051, true, 0, 2));
     test_cases.emplace_back(new test_topk_qsa(4096, 16384, 6, 1, 2051, true, 0, 3));
+    // ... and the tie the deployed graph hits on EVERY prefill ubatch whose causal window is
+    // shorter than the width: the mask is -INFINITY past a per-row cutoff below the width, so the
+    // k-th largest value is -inf and the selection has to pick (width - cut) cells out of a tie
+    // group (n_kv - cut) wide. ties == 4; see qsa_select_init_tensors.
+    test_cases.emplace_back(new test_topk_qsa(4096, 16384, 1, 1, 2051, true, 0, 4));
+    test_cases.emplace_back(new test_topk_qsa(4096, 16384, 6, 1, 2051, true, 0, 4));
+    // ... and the below-budget exactness path (LLAMA_QSA_BYPASS_EXHAUSTIVE=0): width == n_kv, so
+    // the selection covers every cell and the only correct answer is a permutation of 0..n_kv-1.
+    // The comparator checks exactly that per row (range + uniqueness + the reference's set).
+    // n_kv 2048 keeps it in the radix regime (k >= 1024) and inside the f16 mask ramp.
+    test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 2048, true));
 
     // [TAG_QSA_FUSED_SELECT] ... and the same selection as ONE node (GGML_OP_QSA_TOP_K, the
     // GGML_VK_QSA_FUSED_SELECT=1 graph). Deliberately the same shapes as the pattern cases above,
@@ -10408,6 +10439,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_top_k(4096, 16384, 1, 1, 2051, true, 1));
     test_cases.emplace_back(new test_qsa_top_k(4096, 16384, 6, 1, 2051, true, 2));
     test_cases.emplace_back(new test_qsa_top_k(4096, 16384, 6, 1, 2051, true, 3));
+    // the -inf masked tail and the width == n_kv selection, as above for the seven-node pattern
+    test_cases.emplace_back(new test_qsa_top_k(4096, 16384, 1, 1, 2051, true, 4));
+    test_cases.emplace_back(new test_qsa_top_k(4096, 16384, 6, 1, 2051, true, 4));
+    test_cases.emplace_back(new test_qsa_top_k(512,  2048,  2, 1, 2048, true));
     // the f32-mask branch of the CPU reference. The graph never builds this (it emits the op only
     // for the f16 flash-attention mask) and the Vulkan shader binds a float16_t mask, so this case
     // is expected to report "not supported" there rather than to run.
@@ -10423,9 +10458,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_topk_qsa(53250, 213000, 6,    1, 2051, true));
         test_cases.emplace_back(new test_topk_qsa(53250, 213000, 2048, 1, 2051, true));
         test_cases.emplace_back(new test_topk_qsa(53250, 213000, 6,    1, 2051, true, 0, 1));
+        test_cases.emplace_back(new test_topk_qsa(53250, 213000, 6,    1, 2051, true, 0, 4));
         test_cases.emplace_back(new test_qsa_top_k(53250, 213000, 6,    1, 2051, true));
         test_cases.emplace_back(new test_qsa_top_k(53250, 213000, 2048, 1, 2051, true));
         test_cases.emplace_back(new test_qsa_top_k(53250, 213000, 6,    1, 2051, true, 1));
+        test_cases.emplace_back(new test_qsa_top_k(53250, 213000, 6,    1, 2051, true, 4));
     }
 
     // exhaustive top_k tests
