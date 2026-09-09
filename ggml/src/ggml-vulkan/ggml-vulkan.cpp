@@ -2343,6 +2343,9 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // reports the first firing of a tuple, so it cannot tell "fused in 47 layers" from "fused in 12";
 // this can, per graph, and two runs (or the two arms of an A/B) can be compared line by line.
 // Cached bool: when unset the cost is one load per node.
+//
+// GGML_VK_TOPK_MOE_BOUNCE=0 restores the pre-2026-09-09 overlap veto for the topk_moe fusions
+// (see ggml_vk_topk_moe_bounce_ok below for what the default does instead).
 static const char * const vk_fusion_pattern_names[] = {
     "multi_add", "mul_mat_add_add", "mul_mat_add", "mul_mat_id_add_id_mul", "mul_mat_id_add_id",
     "mul_mat_id_mul", "rms_norm_mul_rope_view_set_rows", "rms_norm_mul_rope", "rms_norm_mul",
@@ -2355,6 +2358,7 @@ static bool vk_fusion_patterns_disabled_any = false;
 static std::vector<std::string> vk_fusion_patterns_disabled; // lower-case; trailing '*' = prefix match
 static bool vk_fusion_list_enabled = false;
 static bool vk_fusion_count_enabled = false;
+static bool vk_topk_moe_bounce_enabled = true;
 
 static bool ggml_vk_fusion_pattern_matches(const std::string & pat, const char * name) {
     if (!pat.empty() && pat.back() == '*') {
@@ -2381,6 +2385,7 @@ static inline bool vk_fusion_disabled(const char * name) {
 static void ggml_vk_fusion_patterns_init() {
     vk_fusion_list_enabled = ggml_vk_env_bool("GGML_VK_FUSION_LIST", false);
     vk_fusion_count_enabled = ggml_vk_env_bool("GGML_VK_FUSION_COUNT", false);
+    vk_topk_moe_bounce_enabled = ggml_vk_env_bool("GGML_VK_TOPK_MOE_BOUNCE", true);
     vk_fusion_patterns_disabled.clear();
     vk_fusion_patterns_disabled_any = false;
     const char * s = getenv("GGML_VK_DISABLE_FUSION_PATTERNS");
@@ -2761,6 +2766,10 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+    // The fused router writes `weights` into the pattern's GET_ROWS storage and copies it to the
+    // real destination afterwards, because that destination aliases the logits (see
+    // ggml_vk_topk_moe_bounce_ok).
+    bool fused_topk_moe_bounce {};
     // UNARY(SIGMOID) + MUL: the mul reads the sigmoid's source and applies the sigmoid itself
     bool fused_mul_sigmoid {};
     // ADD + UNARY(SOFTPLUS) + MUL: the GDN decay pre-chain, one dispatch off the ADD node
@@ -14523,6 +14532,59 @@ static void ggml_vk_soft_max_back(ggml_backend_vk_context * ctx, vk_context& sub
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SOFT_MAX_BACK, { (uint32_t)src0->ne[0], (uint32_t)ggml_nrows(src0), op_params[0], op_params[1], 0.0f, 0.0f });
 }
 
+// Index (from the first node of the pattern) of the GET_ROWS that gathers the selected probs.
+static int ggml_vk_topk_moe_get_rows_idx(topk_moe_mode mode) {
+    switch (mode) {
+    case TOPK_MOE_EARLY_SOFTMAX_NORM:      return 4;
+    case TOPK_MOE_SIGMOID_NORM_BIAS:       return 5;
+    case TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS: return 6;
+    case TOPK_MOE_EARLY_SOFTMAX:           return 4;
+    case TOPK_MOE_LATE_SOFTMAX:            return 2;
+    default:                               return -1;
+    }
+}
+
+// Why the router fusion used to come and go with the memory layout, and what the bounce does.
+//
+// ggml-alloc puts the SOFT_MAX (probs) in place over the logits and frees that block as soon as
+// the GET_ROWS has consumed the probs view. The SUM_ROWS and DIV that follow are fresh best-fit
+// allocations (a DIV whose src is a reshape *view* of the GET_ROWS never takes the in-place path:
+// ggml_gallocr_is_own() is never true for a view), so the DIV - the `weights` output of the
+// fusion - regularly lands inside the freed logits block. The overlap veto below then correctly
+// refuses to fuse: one workgroup's `weights` rows would overwrite logits rows another workgroup
+// has not read yet. But *which* layers that happens in is a function of the free-list state,
+// i.e. of every tensor allocated before the router: two graphs that differ anywhere upstream
+// (the same model with and without the QSA indexer, a different ubatch, an extra input) fuse
+// the router in different layer sets and so round the routing weights differently
+// (subgroupAdd + reciprocal multiply fused vs. soft_max + sum_rows + div unfused). That is how the
+// dense and the QSA graph of qwen4exp came to differ by 0.1..0.7 in the logits although every
+// operand of every node was bit-identical.
+//
+// The fix keeps the fusion and removes the hazard instead: when the only overlap is
+// logits <-> weights, the kernel writes `weights` into the pattern's own GET_ROWS tensor and a
+// buffer copy moves it to the real destination. The GET_ROWS storage was allocated while the
+// probs (= logits block) and the argsort were still live, so it can alias neither the logits
+// the kernel reads nor the ids it writes; once fused nothing else reads it (its only consumer,
+// the reshape feeding SUM_ROWS/DIV, is elided), and it is exactly weights-sized (the same
+// n_expert_used x n_rows f32 block, reshaped). Same shader, same values, one vkCmdCopyBuffer per
+// router per graph, and the fusion decision no longer depends on ggml-alloc placement.
+// Any other overlap (there is none the graph can produce today) still disables the fusion.
+static bool ggml_vk_topk_moe_bounce_ok(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
+    if (!vk_topk_moe_bounce_enabled || ctx->fused_topk_moe_mode == TOPK_MOE_COUNT) {
+        return false;
+    }
+    const int gr = ggml_vk_topk_moe_get_rows_idx(ctx->fused_topk_moe_mode);
+    // TOPK_MOE_EARLY_SOFTMAX's weights *is* the GET_ROWS: nothing to bounce through (and nothing
+    // to bounce: that output is allocated while the probs are live)
+    if (gr < 0 || gr == ctx->num_additional_fused_ops) {
+        return false;
+    }
+    const ggml_tensor * get_rows = cgraph->nodes[node_idx + gr];
+    const ggml_tensor * weights  = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+    return get_rows->op == GGML_OP_GET_ROWS && ggml_is_contiguous(get_rows) && ggml_is_contiguous(weights) &&
+           get_rows->type == weights->type && ggml_nbytes(get_rows) == ggml_nbytes(weights);
+}
+
 static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
     topk_moe_mode mode = ctx->fused_topk_moe_mode;
     const bool has_bias = mode == TOPK_MOE_SIGMOID_NORM_BIAS || mode == TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS;
@@ -14555,6 +14617,14 @@ static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, 
     vk_subbuffer bias_buf = ggml_vk_tensor_subbuffer(ctx, bias);
     vk_subbuffer weights_buf = ggml_vk_tensor_subbuffer(ctx, weights);
     vk_subbuffer ids_buf = ggml_vk_tensor_subbuffer(ctx, ids);
+
+    // weights aliases the logits: write it through the GET_ROWS storage (see ggml_vk_topk_moe_bounce_ok)
+    vk_subbuffer weights_dst = weights_buf;
+    if (ctx->fused_topk_moe_bounce) {
+        const ggml_tensor * bounce = cgraph->nodes[node_idx + ggml_vk_topk_moe_get_rows_idx(mode)];
+        GGML_ASSERT(bounce->op == GGML_OP_GET_ROWS && ggml_nbytes(bounce) == ggml_nbytes(weights));
+        weights_buf = ggml_vk_tensor_subbuffer(ctx, bounce);
+    }
 
     vk_op_topk_moe_push_constants pc {};
     pc.n_rows = n_rows;
@@ -14607,6 +14677,13 @@ static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, 
     std::array<uint32_t, 3> elements = { CEIL_DIV(n_rows, rows_per_block), 1, 1 };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {logits_buf, bias_buf, weights_buf, ids_buf}, pc, elements);
+
+    if (ctx->fused_topk_moe_bounce) {
+        // the copy reads what the dispatch above wrote; the consumers of `weights` are ordered
+        // behind the copy by the regular hazard tracking (weights is in the fusion's write set)
+        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_buffer_copy_async(subctx, weights_dst.buffer, weights_dst.offset, weights_buf.buffer, weights_buf.offset, ggml_nbytes(weights));
+    }
 }
 
 static void ggml_vk_rope(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx, bool backprop) {
@@ -18826,6 +18903,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
+        ctx->fused_topk_moe_bounce = false;
         ctx->fused_mul_sigmoid = false;
         ctx->fused_gdn_pre = false;
         ctx->fused_topk_qsa = false;
@@ -19023,6 +19101,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
 
             bool need_disable = false;
+            bool topk_moe_bounce = false;
+            const bool topk_moe_bounce_ok = ggml_vk_topk_moe_bounce_ok(ctx, cgraph, i);
 
             // topk_moe often overwrites the source, but for a given row all the src values are
             // loaded before anything is stored. If there's only one row, this is safe, so treat
@@ -19053,7 +19133,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                                         break;
                                     }
                                 }
-                                if (!found) {
+                                if (!found && topk_moe_bounce_ok && j == 0 && k == 0 && s == 0) {
+                                    // the logits the router reads vs. the weights it writes: route
+                                    // the weights through the GET_ROWS storage instead of unfusing
+                                    // (ggml_vk_topk_moe_bounce_ok)
+                                    topk_moe_bounce = true;
+                                } else if (!found) {
                                     // GGML_VK_FUSION_DIAG=1 names the (src, dst) pair that vetoes a
                                     // fusion; without it a fusion that silently stops firing (topk_moe
                                     // at n_tokens >= 2) is invisible in the perf log, which keeps
@@ -19078,6 +19163,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_mul_sigmoid = false;
                 ctx->fused_gdn_pre = false;
                 ctx->fused_topk_qsa = false;
+            } else if (topk_moe_bounce) {
+                ctx->fused_topk_moe_bounce = true;
+                // the GET_ROWS storage is written by the fused dispatch now: let the hazard
+                // tracking in ggml_vk_build_graph order it against earlier readers of that block
+                ctx->fused_ops_write_mask |= 1 << ggml_vk_topk_moe_get_rows_idx(ctx->fused_topk_moe_mode);
             }
         }
 
@@ -19086,14 +19176,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             for (char & c : name) {
                 c = (char) tolower((unsigned char) c);
             }
-            ggml_vk_fusion_list_report(name.c_str(), cgraph, i, ctx->num_additional_fused_ops + 1,
-                                       ctx->fused_topk_moe_scale ? "+topk_moe_scale" : nullptr);
+            const char * suffix = ctx->fused_topk_moe_scale ? (ctx->fused_topk_moe_bounce ? "+topk_moe_scale+bounce" : "+topk_moe_scale")
+                                                            : (ctx->fused_topk_moe_bounce ? "+bounce" : nullptr);
+            ggml_vk_fusion_list_report(name.c_str(), cgraph, i, ctx->num_additional_fused_ops + 1, suffix);
         }
         if (vk_fusion_count_enabled && fusion_string) {
             // a match that the overlap veto undid has num_additional_fused_ops == 0 here
             ggml_vk_fusion_count_add(fusion_counts, ctx->num_additional_fused_ops > 0 ? "" : "vetoed:", fusion_string);
             if (ctx->num_additional_fused_ops > 0 && ctx->fused_topk_moe_scale) {
                 ggml_vk_fusion_count_add(fusion_counts, "", "topk_moe_scale");
+            }
+            if (ctx->fused_topk_moe_bounce) {
+                ggml_vk_fusion_count_add(fusion_counts, "", "topk_moe_bounce");
             }
         }
 
