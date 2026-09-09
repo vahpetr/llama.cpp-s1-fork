@@ -2318,6 +2318,7 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 //   rope_view_set_rows               ROPE+VIEW+SET_ROWS
 //   hc_combine                       REPEAT+SCALE+SIGMOID+SCALE+RESHAPE+MUL+ADD   (qwen4exp hyper-connection combine)
 //   snake                            MUL+SIN+SQR+MUL+ADD
+//   topk_qsa                         GET_ROWS+PERMUTE+CONT+CPY+RESHAPE+ADD+TOP_K   (qwen4 QSA indexer selection)
 //   topk_moe_early_softmax_norm      SOFT_MAX+RESHAPE+ARGSORT+VIEW+GET_ROWS+RESHAPE+SUM_ROWS+CLAMP+DIV+RESHAPE
 //   topk_moe_sigmoid_norm_bias       SIGMOID+RESHAPE+ADD+ARGSORT+VIEW+GET_ROWS+RESHAPE+SUM_ROWS+CLAMP+DIV+RESHAPE
 //   topk_moe_sqrt_softplus_norm_bias SOFTPLUS+SQRT+RESHAPE+ADD+ARGSORT+VIEW+GET_ROWS+RESHAPE+SUM_ROWS+CLAMP+DIV+RESHAPE
@@ -2328,7 +2329,6 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 //   sigmoid_mul                      SIGMOID+MUL
 //   add_rms                          ADD that also writes the sum-of-squares partials consumed by the RMS_NORM
 //                                    right after it (ggml_vk_build_graph; decode only, rows == 1)
-// (topk_qsa of the source commit has no match site on this branch and is not listed.)
 // ggml_vk_graph_optimize's keep_pattern list is deliberately not gated: it only keeps a pattern's
 // nodes adjacent (GGML_VK_DISABLE_FUSION does not gate it either), so the node order of a run with
 // a pattern disabled is the same as with the pattern enabled.
@@ -2345,7 +2345,7 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 static const char * const vk_fusion_pattern_names[] = {
     "multi_add", "mul_mat_add_add", "mul_mat_add", "mul_mat_id_add_id_mul", "mul_mat_id_add_id",
     "mul_mat_id_mul", "rms_norm_mul_rope_view_set_rows", "rms_norm_mul_rope", "rms_norm_mul",
-    "ssm_conv_bias_silu", "ssm_conv_silu", "rope_view_set_rows", "hc_combine", "snake",
+    "ssm_conv_bias_silu", "ssm_conv_silu", "rope_view_set_rows", "hc_combine", "snake", "topk_qsa",
     "topk_moe_early_softmax_norm", "topk_moe_sigmoid_norm_bias", "topk_moe_sqrt_softplus_norm_bias",
     "topk_moe_early_softmax", "topk_moe_late_softmax", "topk_moe_scale", "add_softplus_mul",
     "sigmoid_mul", "add_rms",
@@ -19115,7 +19115,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // with a data dependency on that register. The overlap check still
                 // rejects partial overlaps (different base or size).
                 std::fill_n(op_srcs_fused_elementwise, 5, true);
-            } else if (ggml_vk_can_fuse_topk_qsa(ctx, cgraph, i)) {
+            } else if (ggml_vk_can_fuse_topk_qsa(ctx, cgraph, i) &&
+                       !vk_fusion_veto(ctx, "topk_qsa")) {
                 ctx->num_additional_fused_ops = topk_qsa_pattern.size() - 1;
                 ctx->fused_topk_qsa = true;
                 fusion_string = "TOPK_QSA";
