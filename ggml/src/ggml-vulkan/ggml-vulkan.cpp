@@ -2734,6 +2734,15 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    // [TAG_QSA_SCRATCH] GGML_VK_QSA_SCRATCH_DEDICATED=1: the fused TOPK_QSA select's gather scratch
+    // gets its own buffer instead of sharing prealloc_x with the dequant/FA staging paths.
+    // prealloc_size_qsa_hint is the largest scratch any graph handed to ggml_vk_graph_optimize would
+    // need. ggml_backend_sched optimizes every split of every graph, and the *reserve* graphs are
+    // optimized at context creation, i.e. before the first dispatch - so the first allocation is
+    // already the graph span's extent instead of being regrown once per prefill ubatch.
+    // Both stay 0 while the knob is off, and prealloc_qsa is then never created.
+    size_t prealloc_size_qsa {}, prealloc_size_qsa_hint {};
+    vk_buffer prealloc_qsa;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -2758,6 +2767,10 @@ struct ggml_backend_vk_context {
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.
     bool prealloc_x_need_sync, prealloc_y_need_sync, prealloc_split_k_need_sync;
+    // [TAG_QSA_SCRATCH] same contract as prealloc_x_need_sync, for the dedicated QSA scratch: the
+    // radix passes of one dispatch write and then re-read it, so a following dispatch that writes it
+    // again must be separated by a barrier.
+    bool prealloc_qsa_need_sync {};
 
     vk_context_ref compute_ctx;
 
@@ -4066,6 +4079,7 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
 
     if (ctx) {
         ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+        ctx->prealloc_qsa_need_sync = false; // [TAG_QSA_SCRATCH] the barrier below covers every buffer
     }
 
     subctx->s->buffer->buf.pipelineBarrier(
@@ -8186,6 +8200,8 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
+    ctx->prealloc_size_qsa = 0;      // [TAG_QSA_SCRATCH]
+    ctx->prealloc_size_qsa_hint = 0; // [TAG_QSA_SCRATCH]
     // Fixed size of 1KB, for deterministic behavior
     ctx->prealloc_size_add_rms_partials = 1024;
 
@@ -14923,6 +14939,22 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     ctx->prealloc_x_need_sync = true;
 }
 
+// [TAG_QSA_SCRATCH] GGML_VK_QSA_SCRATCH_DEDICATED=1 moves the fused TOPK_QSA select's gather scratch
+// out of the shared prealloc_x into ctx->prealloc_qsa (see the field comments). [TAG_ENV_BOOL]
+// value-parsed and cached; default off, per the QSA plan's "one A/B knob per change, off until its
+// own gate passes". With it off the fused select is byte-for-byte the code that shipped.
+static const bool vk_qsa_scratch_dedicated = ggml_vk_env_bool("GGML_VK_QSA_SCRATCH_DEDICATED", false);
+
+// Bytes the fused select's gather scratch needs for the topk_qsa pattern starting at `node_idx`
+// (the GET_ROWS): n_kv * n_tps * n_stream * 4, i.e. one float per (row, key). One definition, used
+// both by the dispatch below and by the reserve-time hint, so the two cannot drift.
+static size_t ggml_vk_topk_qsa_scratch_size(const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * get_rows = cgraph->nodes[node_idx];
+    const ggml_tensor * scores   = get_rows->src[0]; // [n_tps, n_blocks, n_stream]
+    const ggml_tensor * cell_blk = get_rows->src[1]; // [n_kv, n_stream]
+    return (size_t) cell_blk->ne[0] * (size_t) scores->ne[0] * (size_t) scores->ne[2] * sizeof(float);
+}
+
 static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * get_rows = cgraph->nodes[node_idx + 0];
     const ggml_tensor * add      = cgraph->nodes[node_idx + ctx->num_additional_fused_ops - 1];
@@ -14948,14 +14980,39 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
     GGML_ASSERT(pipeline != nullptr);
 
     // scratch holds the gathered+masked input, materialized once and reused across passes
-    const size_t scratch_size = size_t{ n_kv } * nrows * sizeof(float);
-    if (ctx->prealloc_size_x < scratch_size) {
-        ctx->prealloc_size_x = scratch_size;
-        ggml_vk_preallocate_buffers(ctx, subctx);
+    const size_t scratch_size = ggml_vk_topk_qsa_scratch_size(cgraph, node_idx); // n_kv * nrows * 4
+    if (vk_qsa_scratch_dedicated) {
+        // [TAG_QSA_SCRATCH] Size from the largest extent any optimized graph asked for, not from
+        // this dispatch: the reserve graphs were optimized before the first token, so the very first
+        // allocation is the --kv-graph-span extent and the ~100 ubatches of a long prefill find the
+        // buffer already big enough. Growth is geometric because run-time n_kv is the *padded used
+        // cells* and legitimately exceeds the span (llama-context.cpp:454-461), and an exact-fit
+        // regrow would then end the command buffer and fully sync once per ubatch.
+        size_t want = std::max(scratch_size, ctx->prealloc_size_qsa_hint);
+        if (ctx->prealloc_size_qsa < want) {
+            const size_t geometric = ctx->prealloc_size_qsa + ctx->prealloc_size_qsa / 4;
+            // ...but never past what a single storage-buffer binding can cover: scratch_buf below
+            // binds the whole buffer, so headroom we could not bind would be a validation error.
+            const size_t range_cap = (size_t) ctx->device->properties.limits.maxStorageBufferRange;
+            if (geometric > want && geometric <= range_cap) {
+                want = geometric;
+            }
+            ctx->prealloc_size_qsa = want;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_qsa_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+    } else {
+        if (ctx->prealloc_size_x < scratch_size) {
+            ctx->prealloc_size_x = scratch_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_x_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
     }
-    if (ctx->prealloc_x_need_sync) {
-        ggml_vk_sync_buffers(ctx, subctx);
-    }
+    const vk_buffer & scratch = vk_qsa_scratch_dedicated ? ctx->prealloc_qsa : ctx->prealloc_x;
 
     vk_op_topk_radix_push_constants pc { n_kv, width, nrows, n_tps, n_blocks, n_stream };
     std::array<uint32_t, 3> elements {
@@ -14963,13 +15020,17 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
         std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
         1,
     };
-    vk_subbuffer scratch_buf { ctx->prealloc_x, 0, ctx->prealloc_x->size };
+    vk_subbuffer scratch_buf { scratch, 0, scratch->size };
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
           ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
           scratch_buf }, pc, elements);
-    ctx->prealloc_x_need_sync = true;
+    if (vk_qsa_scratch_dedicated) {
+        ctx->prealloc_qsa_need_sync = true;
+    } else {
+        ctx->prealloc_x_need_sync = true;
+    }
 }
 
 static void ggml_vk_sum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -16517,6 +16578,26 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         }
         ctx->prealloc_x = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_x);
     }
+    // [TAG_QSA_SCRATCH] the dedicated fused-select scratch. Unlike prealloc_x it is never created at
+    // size 0: prealloc_size_qsa stays 0 until the first fused TOPK_QSA dispatch, so a model without
+    // the indexer - or the knob left off - allocates nothing. The GGML_LOG_INFO line is what the M2
+    // gate reads out of the server log ("one allocation of N, no growth mid-run"); it fires at most
+    // once per size change, not per graph.
+    if (ctx->prealloc_size_qsa > 0 &&
+        (ctx->prealloc_qsa == nullptr || ctx->prealloc_qsa->size < ctx->prealloc_size_qsa)) {
+        const size_t prev_size = ctx->prealloc_qsa != nullptr ? ctx->prealloc_qsa->size : 0;
+        VK_LOG_MEMORY("ggml_vk_preallocate_buffers(qsa_size: " << ctx->prealloc_size_qsa << ")");
+        GGML_LOG_INFO("ggml_vulkan: QSA scratch %s: %s (was %s, reserve hint %s)\n",
+                      prev_size == 0 ? "allocated" : "GROWN",
+                      format_size(ctx->prealloc_size_qsa).c_str(),
+                      format_size(prev_size).c_str(),
+                      format_size(ctx->prealloc_size_qsa_hint).c_str());
+        // Resize buffer
+        if (ctx->prealloc_qsa != nullptr) {
+            ggml_vk_destroy_buffer(ctx->prealloc_qsa);
+        }
+        ctx->prealloc_qsa = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_qsa);
+    }
     if (ctx->prealloc_y == nullptr || (ctx->prealloc_size_y > 0 && ctx->prealloc_y->size < ctx->prealloc_size_y)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(y_size: " << ctx->prealloc_size_y << ")");
         // Resize buffer
@@ -17196,6 +17277,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->unsynced_nodes_written.clear();
     ctx->unsynced_nodes_read.clear();
     ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+    ctx->prealloc_qsa_need_sync = false; // [TAG_QSA_SCRATCH]
 
     ggml_vk_command_pool_cleanup(ctx->device, ctx->compute_cmd_pool);
     if (ctx->device->async_use_transfer_queue) {
@@ -17239,6 +17321,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_y);
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
+    ggml_vk_destroy_buffer(ctx->prealloc_qsa); // [TAG_QSA_SCRATCH]
     ggml_vk_destroy_buffer(ctx->sync_staging);
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
@@ -17248,6 +17331,8 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
+    ctx->prealloc_size_qsa = 0;      // [TAG_QSA_SCRATCH]
+    ctx->prealloc_size_qsa_hint = 0; // [TAG_QSA_SCRATCH]
 
     for (auto& event : ctx->gc.events) {
         ctx->device->device.destroyEvent(event);
@@ -19507,11 +19592,45 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     UNUSED(backend);
 }
 
+// [TAG_QSA_SCRATCH] Record the largest fused-select scratch this graph would ask for.
+// ggml_backend_sched calls graph_optimize on every split of every graph *including the reserve
+// graphs it builds at context creation* (ggml-backend.cpp:1472, reached from both
+// ggml_backend_sched_reserve and ggml_backend_sched_graph_compute), so by the time the first
+// TOPK_QSA dispatch runs this is already the reserve span's extent. That, not the dedication
+// itself, is what turns ~100 growths across a long prefill into one allocation.
+// Only walked when the knob is on; ggml_vk_can_fuse_topk_qsa rejects at the first op compare for
+// every node that is not a QSA GET_ROWS, and its overlap veto (which needs allocated buffers, and
+// therefore cannot decide during a reserve) can only make this an over-estimate of one graph, never
+// an allocation on its own: nothing is allocated until a dispatch actually happens.
+static void ggml_vk_qsa_scratch_hint(ggml_backend_vk_context * ctx, const struct ggml_cgraph * graph) {
+    // GGML_VK_DISABLE_FUSION_PATTERNS=topk_qsa must not reserve scratch for a fusion that will not
+    // run. Tested directly rather than through vk_fusion_veto(), which would also add this graph to
+    // the GGML_VK_FUSION_COUNT tally the dispatcher owns.
+    if (vk_fusion_patterns_disabled_any && ggml_vk_fusion_disabled_slow("topk_qsa")) {
+        return;
+    }
+    const int n_ops = (int) topk_qsa_pattern.size();
+    for (int i = 0; i + n_ops <= graph->n_nodes; ++i) {
+        if (!ggml_vk_can_fuse_topk_qsa(ctx, graph, i)) {
+            continue;
+        }
+        ctx->prealloc_size_qsa_hint = std::max(ctx->prealloc_size_qsa_hint,
+                                               ggml_vk_topk_qsa_scratch_size(graph, i));
+        i += n_ops - 1;
+    }
+}
+
 // Sort the graph for improved parallelism.
 static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph)
 {
     VK_LOG_DEBUG("ggml_vk_graph_optimize(" << graph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    // [TAG_QSA_SCRATCH] deliberately above the early-out: the hint is about buffer sizing, not about
+    // node order, and GGML_VK_DISABLE_GRAPH_OPTIMIZE must not silently change how much is allocated.
+    if (vk_qsa_scratch_dedicated) {
+        ggml_vk_qsa_scratch_hint(ctx, graph);
+    }
 
     if (ctx->device->disable_graph_optimize) {
         return;
