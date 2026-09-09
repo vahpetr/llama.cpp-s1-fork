@@ -2335,6 +2335,14 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // GGML_VK_FUSION_LIST=1 prints one stderr line "[vk-fusion] name: OP1+OP2+..." the first time
 // each distinct (pattern name, fused op names) tuple fires - after the src/dst overlap veto, so
 // only fusions that were really dispatched - so the fusion sets of two runs can be diffed.
+//
+// GGML_VK_FUSION_COUNT=1 prints one stderr line per graph_compute call,
+//   [vk-fusion-count] graph nodes=N name1=c1 name2=c2 ... vetoed:name=c ...
+// with the number of times each pattern was dispatched in that graph (after the overlap veto) and,
+// as vetoed:<name>, the number of matches the veto turned back into unfused ops. FUSION_LIST only
+// reports the first firing of a tuple, so it cannot tell "fused in 47 layers" from "fused in 12";
+// this can, per graph, and two runs (or the two arms of an A/B) can be compared line by line.
+// Cached bool: when unset the cost is one load per node.
 static const char * const vk_fusion_pattern_names[] = {
     "multi_add", "mul_mat_add_add", "mul_mat_add", "mul_mat_id_add_id_mul", "mul_mat_id_add_id",
     "mul_mat_id_mul", "rms_norm_mul_rope_view_set_rows", "rms_norm_mul_rope", "rms_norm_mul",
@@ -2346,6 +2354,7 @@ static const char * const vk_fusion_pattern_names[] = {
 static bool vk_fusion_patterns_disabled_any = false;
 static std::vector<std::string> vk_fusion_patterns_disabled; // lower-case; trailing '*' = prefix match
 static bool vk_fusion_list_enabled = false;
+static bool vk_fusion_count_enabled = false;
 
 static bool ggml_vk_fusion_pattern_matches(const std::string & pat, const char * name) {
     if (!pat.empty() && pat.back() == '*') {
@@ -2371,6 +2380,7 @@ static inline bool vk_fusion_disabled(const char * name) {
 
 static void ggml_vk_fusion_patterns_init() {
     vk_fusion_list_enabled = ggml_vk_env_bool("GGML_VK_FUSION_LIST", false);
+    vk_fusion_count_enabled = ggml_vk_env_bool("GGML_VK_FUSION_COUNT", false);
     vk_fusion_patterns_disabled.clear();
     vk_fusion_patterns_disabled_any = false;
     const char * s = getenv("GGML_VK_DISABLE_FUSION_PATTERNS");
@@ -2427,6 +2437,16 @@ static void ggml_vk_fusion_list_report(const char * name, const struct ggml_cgra
     if (seen.insert(key).second) {
         fprintf(stderr, "[vk-fusion] %s\n", key.c_str());
     }
+}
+
+// GGML_VK_FUSION_COUNT: the per-graph tally. Keys are the lower-case fusion_string of the match
+// site (the same names GGML_VK_DISABLE_FUSION_PATTERNS takes), optionally prefixed.
+static void ggml_vk_fusion_count_add(std::map<std::string, int> & counts, const char * prefix, const char * fusion_string) {
+    std::string key = prefix;
+    for (const char * c = fusion_string; *c; ++c) {
+        key += (char) tolower((unsigned char) *c);
+    }
+    counts[key]++;
 }
 
 // [TAG_DMMV_RM] G50a: rows-per-workgroup knob for the dense mat-vec (dmmv) pipelines.  Same
@@ -2747,6 +2767,8 @@ struct ggml_backend_vk_context {
     bool fused_gdn_pre {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
+    // GGML_VK_FUSION_COUNT: add_rms fusions of the current graph (decided inside ggml_vk_build_graph)
+    int fusion_count_add_rms {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -16500,6 +16522,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                     // the ADD (or the whole multi_add chain) plus the RMS_NORM that consumes the partials
                     ggml_vk_fusion_list_report("add_rms", cgraph, node_idx, ctx->num_additional_fused_ops + 2);
                 }
+                if (vk_fusion_count_enabled) {
+                    ctx->fusion_count_add_rms++;
+                }
             }
         }
     }
@@ -18736,6 +18761,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     uint64_t flops_per_submit = std::min(flops_cap, (vk_flops_seed_legacy ? ctx->last_total_flops : graph_total_flops) / 40u);
     const uint64_t flops_per_submit_seed = flops_per_submit;
 
+    // GGML_VK_FUSION_COUNT tally for this graph (empty and untouched when the knob is off)
+    std::map<std::string, int> fusion_counts;
+    ctx->fusion_count_add_rms = 0;
+
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
             try {
@@ -19060,6 +19089,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ggml_vk_fusion_list_report(name.c_str(), cgraph, i, ctx->num_additional_fused_ops + 1,
                                        ctx->fused_topk_moe_scale ? "+topk_moe_scale" : nullptr);
         }
+        if (vk_fusion_count_enabled && fusion_string) {
+            // a match that the overlap veto undid has num_additional_fused_ops == 0 here
+            ggml_vk_fusion_count_add(fusion_counts, ctx->num_additional_fused_ops > 0 ? "" : "vetoed:", fusion_string);
+            if (ctx->num_additional_fused_ops > 0 && ctx->fused_topk_moe_scale) {
+                ggml_vk_fusion_count_add(fusion_counts, "", "topk_moe_scale");
+            }
+        }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
@@ -19104,6 +19140,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     ctx->last_total_flops = total_flops;
+
+    if (vk_fusion_count_enabled) {
+        if (ctx->fusion_count_add_rms) {
+            fusion_counts["add_rms"] = ctx->fusion_count_add_rms;
+        }
+        std::string line = "[vk-fusion-count] graph nodes=" + std::to_string(cgraph->n_nodes);
+        for (const auto & kv : fusion_counts) {
+            line += " " + kv.first + "=" + std::to_string(kv.second);
+        }
+        fprintf(stderr, "%s\n", line.c_str());
+    }
 
     if (vk_submit_log_enabled || vk_perf_logger_enabled) {
         GGML_LOG_INFO("ggml_vulkan: graph_compute: %d nodes, %.3f GFLOP, %u submits, threshold seed %.3f GFLOP (%s)\n",
