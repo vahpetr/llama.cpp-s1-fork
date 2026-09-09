@@ -6520,6 +6520,13 @@ struct test_topk_moe : public test_case {
     const bool bias_probs;
     const MoeGatingFunc gating_func;
     const float scale_w;
+    // Place the final weights op over the logits (view_src = logits). In a real graph ggml-alloc
+    // does this by accident: the SOFT_MAX is in place over the logits, that block is freed once
+    // the GET_ROWS consumed it, and the DIV that is the fusion's output is a fresh best-fit
+    // allocation that regularly lands in it. test-backend-ops allocates every tensor linearly, so
+    // without this the aliasing that the backends' fused-router overlap handling exists for
+    // (the Vulkan src/dst veto and its GET_ROWS bounce) is never exercised here.
+    const bool alias_logits;
     ggml_tensor * weights {};
     ggml_tensor * selected_experts {};
 
@@ -6528,17 +6535,19 @@ struct test_topk_moe : public test_case {
                   bool                   with_norm       = false,
                   bool                   bias_probs      = false,
                   MoeGatingFunc          gating_func     = GATING_FUNC_SOFTMAX,
-                  float                  scale_w         = 0.0f) :
+                  float                  scale_w         = 0.0f,
+                  bool                   alias_logits    = false) :
         ne(ne),
         n_expert_used(n_expert_used),
         with_norm(with_norm),
         bias_probs(bias_probs),
         gating_func(gating_func),
-        scale_w(scale_w) {
+        scale_w(scale_w),
+        alias_logits(alias_logits) {
         GGML_ASSERT(n_expert_used <= ne[0]);
     }
 
-    std::string vars() override { return VARS_TO_STR6(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w); }
+    std::string vars() override { return VARS_TO_STR7(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w, alias_logits); }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6552,6 +6561,20 @@ struct test_topk_moe : public test_case {
         const int n_tokens = ne[1];
 
         ggml_tensor * logits = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(logits, "logits");
+        // the op that produces the final weights (before the trailing reshape) is viewed over the
+        // logits; every reader of the logits precedes it in graph order, so the result is unchanged
+        auto alias = [&](ggml_tensor * t) {
+            if (alias_logits) {
+                GGML_ASSERT(t->view_src == nullptr && ggml_nbytes(t) <= ggml_nbytes(logits));
+                t->view_src  = logits;
+                t->view_offs = 0;
+            }
+        };
+        const bool final_is_scale    = scale_w != 0.0f;
+        const bool final_is_norm     = !final_is_scale && with_norm;
+        const bool final_is_late     = !final_is_scale && !with_norm && gating_func == GATING_FUNC_SOFTMAX_WEIGHT;
+        const bool final_is_get_rows = !final_is_scale && !with_norm && gating_func != GATING_FUNC_SOFTMAX_WEIGHT;
         ggml_tensor * probs            =
             (gating_func == GATING_FUNC_SOFTMAX) ? ggml_soft_max(ctx, logits) :
             (gating_func == GATING_FUNC_SIGMOID) ? ggml_sigmoid(ctx, logits) :
@@ -6571,10 +6594,16 @@ struct test_topk_moe : public test_case {
 
         weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens), selected_experts); // [1, n_expert_used, n_tokens]
         ggml_set_name(weights, "weights");
+        if (final_is_get_rows) {
+            alias(weights);
+        }
 
         if (gating_func == GATING_FUNC_SOFTMAX_WEIGHT) {
             weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
             weights = ggml_soft_max(ctx, weights);  // [n_expert_used, n_tokens]
+            if (final_is_late) {
+                alias(weights);
+            }
             weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
         }
 
@@ -6585,11 +6614,17 @@ struct test_topk_moe : public test_case {
 
             weights_sum = ggml_clamp(ctx, weights_sum, 6.103515625e-5, INFINITY);
             weights = ggml_div(ctx, weights, weights_sum); // [n_expert_used, n_tokens]
+            if (final_is_norm) {
+                alias(weights);
+            }
             weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
         }
 
         if (scale_w) {
             weights = ggml_scale(ctx, weights, scale_w);
+            if (final_is_scale) {
+                alias(weights);
+            }
         }
 
         ggml_set_name(weights, "weights");
@@ -10515,9 +10550,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
+                    // the production layout: the fusion's output lives inside the logits block
+                    test_cases.emplace_back(new test_topk_moe({71, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w, true));
+                    test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w, true));
                 }
             }
         }
+    }
+    // Qwen3.8-Flash-Next (qwen4exp): 512 experts, top-10, softmax + norm. n_tokens 2..6 are its
+    // speculative verify graphs, 40/46 its prefill ubatches; alias_logits reproduces where
+    // ggml-alloc puts the DIV in the real graph (Vulkan: GGML_VK_FUSION_LIST=1 shows "+bounce",
+    // GGML_VK_TOPK_MOE_BOUNCE=0|1|2 and GGML_VK_TOPK_MOE_BOUNCE_SHADER_COPY=1 select the handling).
+    test_cases.emplace_back(new test_topk_moe({512, 22, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f, false));
+    for (int n_tokens : {1, 2, 3, 4, 5, 6, 40, 46}) {
+        test_cases.emplace_back(new test_topk_moe({512, n_tokens, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f, true));
     }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));

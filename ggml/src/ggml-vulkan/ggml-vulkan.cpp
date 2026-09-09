@@ -2345,7 +2345,13 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // Cached bool: when unset the cost is one load per node.
 //
 // GGML_VK_TOPK_MOE_BOUNCE=0 restores the pre-2026-09-09 overlap veto for the topk_moe fusions
-// (see ggml_vk_topk_moe_bounce_ok below for what the default does instead).
+// (see ggml_vk_topk_moe_bounce_ok below for what the default, 1, does instead). 2 forces the
+// bounce on every fused router - aliasing or not, single-row graphs included - so the mechanism
+// itself can be exercised by test-backend-ops (-o TOPK_MOE) without the ggml-alloc coincidence
+// that triggers it in a real graph. GGML_VK_TOPK_MOE_BOUNCE_SHADER_COPY=1 moves the weights with
+// the contiguous f32 copy shader (a compute dispatch, the path every GGML_OP_CPY takes) instead
+// of vkCmdCopyBuffer (a transfer command inside the compute command buffer - CP DMA on RADV for
+// copies under 4 KiB - the one link of the bounce that no other in-graph op exercises).
 static const char * const vk_fusion_pattern_names[] = {
     "multi_add", "mul_mat_add_add", "mul_mat_add", "mul_mat_id_add_id_mul", "mul_mat_id_add_id",
     "mul_mat_id_mul", "rms_norm_mul_rope_view_set_rows", "rms_norm_mul_rope", "rms_norm_mul",
@@ -2358,7 +2364,8 @@ static bool vk_fusion_patterns_disabled_any = false;
 static std::vector<std::string> vk_fusion_patterns_disabled; // lower-case; trailing '*' = prefix match
 static bool vk_fusion_list_enabled = false;
 static bool vk_fusion_count_enabled = false;
-static bool vk_topk_moe_bounce_enabled = true;
+static int  vk_topk_moe_bounce_mode = 1;         // 0 = veto, 1 = bounce when weights aliases logits, 2 = always
+static bool vk_topk_moe_bounce_shader_copy = false;
 
 static bool ggml_vk_fusion_pattern_matches(const std::string & pat, const char * name) {
     if (!pat.empty() && pat.back() == '*') {
@@ -2385,7 +2392,15 @@ static inline bool vk_fusion_disabled(const char * name) {
 static void ggml_vk_fusion_patterns_init() {
     vk_fusion_list_enabled = ggml_vk_env_bool("GGML_VK_FUSION_LIST", false);
     vk_fusion_count_enabled = ggml_vk_env_bool("GGML_VK_FUSION_COUNT", false);
-    vk_topk_moe_bounce_enabled = ggml_vk_env_bool("GGML_VK_TOPK_MOE_BOUNCE", true);
+    {
+        const char * s = getenv("GGML_VK_TOPK_MOE_BOUNCE");
+        vk_topk_moe_bounce_mode = (s == nullptr || *s == '\0') ? 1 : std::min(2, std::max(0, atoi(s)));
+    }
+    vk_topk_moe_bounce_shader_copy = ggml_vk_env_bool("GGML_VK_TOPK_MOE_BOUNCE_SHADER_COPY", false);
+    if (vk_topk_moe_bounce_mode != 1 || vk_topk_moe_bounce_shader_copy) {
+        GGML_LOG_INFO("ggml_vulkan: topk_moe bounce mode %d (%s copy)\n", vk_topk_moe_bounce_mode,
+                      vk_topk_moe_bounce_shader_copy ? "shader" : "transfer");
+    }
     vk_fusion_patterns_disabled.clear();
     vk_fusion_patterns_disabled_any = false;
     const char * s = getenv("GGML_VK_DISABLE_FUSION_PATTERNS");
@@ -14569,8 +14584,9 @@ static int ggml_vk_topk_moe_get_rows_idx(topk_moe_mode mode) {
 // n_expert_used x n_rows f32 block, reshaped). Same shader, same values, one vkCmdCopyBuffer per
 // router per graph, and the fusion decision no longer depends on ggml-alloc placement.
 // Any other overlap (there is none the graph can produce today) still disables the fusion.
+static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise);
 static bool ggml_vk_topk_moe_bounce_ok(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
-    if (!vk_topk_moe_bounce_enabled || ctx->fused_topk_moe_mode == TOPK_MOE_COUNT) {
+    if (vk_topk_moe_bounce_mode == 0 || ctx->fused_topk_moe_mode == TOPK_MOE_COUNT) {
         return false;
     }
     const int gr = ggml_vk_topk_moe_get_rows_idx(ctx->fused_topk_moe_mode);
@@ -14581,8 +14597,13 @@ static bool ggml_vk_topk_moe_bounce_ok(const ggml_backend_vk_context * ctx, cons
     }
     const ggml_tensor * get_rows = cgraph->nodes[node_idx + gr];
     const ggml_tensor * weights  = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+    // The copy's source and destination must not overlap. That cannot happen while the DIV is the
+    // output (the GET_ROWS is still live when ggml-alloc places the DIV), but with the
+    // topk_moe_scale extension the GET_ROWS is freed right after the DIV and the SCALE output is a
+    // fresh best-fit allocation that may land in, or across the edge of, the freed GET_ROWS block.
     return get_rows->op == GGML_OP_GET_ROWS && ggml_is_contiguous(get_rows) && ggml_is_contiguous(weights) &&
-           get_rows->type == weights->type && ggml_nbytes(get_rows) == ggml_nbytes(weights);
+           get_rows->type == weights->type && ggml_nbytes(get_rows) == ggml_nbytes(weights) &&
+           !ggml_vk_tensors_overlap(get_rows, weights, false);
 }
 
 static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
@@ -14682,7 +14703,14 @@ static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, 
         // the copy reads what the dispatch above wrote; the consumers of `weights` are ordered
         // behind the copy by the regular hazard tracking (weights is in the fusion's write set)
         ggml_vk_sync_buffers(ctx, subctx);
-        ggml_vk_buffer_copy_async(subctx, weights_dst.buffer, weights_dst.offset, weights_buf.buffer, weights_buf.offset, ggml_nbytes(weights));
+        if (vk_topk_moe_bounce_shader_copy) {
+            // GGML_VK_TOPK_MOE_BOUNCE_SHADER_COPY=1: the contiguous f32 copy shader - a compute
+            // dispatch, ordered by the same compute-to-compute barriers as every other op
+            const ggml_tensor * bounce = cgraph->nodes[node_idx + ggml_vk_topk_moe_get_rows_idx(mode)];
+            ggml_vk_cpy(ctx, subctx, bounce, weights);
+        } else {
+            ggml_vk_buffer_copy_async(subctx, weights_dst.buffer, weights_dst.offset, weights_buf.buffer, weights_buf.offset, ggml_nbytes(weights));
+        }
     }
 }
 
@@ -19154,6 +19182,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                         }
                     }
                 }
+            }
+            if (vk_topk_moe_bounce_mode == 2 && topk_moe_bounce_ok && !need_disable) {
+                // GGML_VK_TOPK_MOE_BOUNCE=2: exercise the bounce on every fused router
+                topk_moe_bounce = true;
             }
             if (need_disable) {
                 ctx->num_additional_fused_ops = 0;
