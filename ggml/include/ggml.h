@@ -653,6 +653,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_KEEP_ALIVE = 32, // ...ggml-alloc keeps its memory for the whole graph (never reused in place, never freed)
     };
 
     enum ggml_tri_type {
@@ -880,6 +881,9 @@ extern "C" {
     // Tensor flags
     GGML_API void ggml_set_input(struct ggml_tensor * tensor);
     GGML_API void ggml_set_output(struct ggml_tensor * tensor);
+    // keep the tensor's memory allocated for the whole graph: ggml-alloc never lets a child reuse it in place and
+    // never returns it to the free list, so no later tensor of the graph can alias it (allocator-only, no other semantics)
+    GGML_API void ggml_set_keep_alive(struct ggml_tensor * tensor);
     GGML_API void ggml_set_param(struct ggml_tensor * tensor);
     GGML_API void ggml_set_loss(struct ggml_tensor * tensor);
 

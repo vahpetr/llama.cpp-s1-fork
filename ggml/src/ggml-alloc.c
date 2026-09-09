@@ -620,6 +620,12 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
     }
 }
 
+// graph outputs and tensors flagged GGML_TENSOR_FLAG_KEEP_ALIVE keep their memory for the whole graph:
+// the block is never handed to a child in place and never returned to the free list
+static bool ggml_gallocr_is_kept(const struct ggml_tensor * t) {
+    return (t->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_KEEP_ALIVE)) != 0;
+}
+
 static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0);
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
@@ -642,9 +648,9 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                     continue;
                 }
 
-                // outputs cannot be reused
-                if (parent->flags & GGML_TENSOR_FLAG_OUTPUT || (parent->view_src != NULL && parent->view_src->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-                    AT_PRINTF("not reusing parent %s for %s as it is an output\n", parent->name, node->name);
+                // outputs and kept-alive tensors cannot be reused
+                if (ggml_gallocr_is_kept(parent) || (parent->view_src != NULL && ggml_gallocr_is_kept(parent->view_src))) {
+                    AT_PRINTF("not reusing parent %s for %s as it is an output or kept alive\n", parent->name, node->name);
                     continue;
                 }
 
@@ -689,9 +695,9 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
 }
 
 static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * node) {
-    // graph outputs are never freed
-    if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
-        AT_PRINTF("not freeing output %s\n", node->name);
+    // graph outputs and kept-alive tensors are never freed
+    if (ggml_gallocr_is_kept(node)) {
+        AT_PRINTF("not freeing output / kept-alive tensor %s\n", node->name);
         return;
     }
 

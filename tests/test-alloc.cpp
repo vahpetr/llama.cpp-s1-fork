@@ -203,7 +203,7 @@ static void check_max_size(ggml_context * ctx) {
 }
 
 static bool can_reuse_memory(ggml_cgraph * graph, int current_i, ggml_tensor * current, ggml_tensor * other) {
-    if (other->flags & GGML_TENSOR_FLAG_OUTPUT) {
+    if (other->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_KEEP_ALIVE)) {
         return false;
     }
     // Check if `other` is still "alive", ie. an input to any node after the `current` op
@@ -411,6 +411,41 @@ static void test_reuse_and_free() {
     GGML_ASSERT(backend.context->allocated_total() <= 40 + 32 + 32);
 }
 
+// A tensor flagged GGML_TENSOR_FLAG_KEEP_ALIVE keeps its memory for the whole graph: no child takes its block
+// in place and the block is never returned to the free list, so no later tensor can alias it. The graph is the
+// MoE router in miniature: soft_max would be in place over the logits, the block is freed once the gather's
+// view has been consumed, and best-fit then drops a later fresh tensor (the normalized weights) into it - the
+// alias a fused router kernel (reads logits, writes weights in one dispatch) cannot tolerate.
+static void test_keep_alive(bool keep_alive) {
+    dummy_backend backend      = dummy_backend_init(128);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * x[5];
+    x[0] = make_input_with_size(ctx, 32);       // logits
+    x[1] = ggml_soft_max(ctx, x[0]);            // probs: in place over x0 unless x0 is kept alive
+    x[2] = ggml_view_1d(ctx, x[1], 2, 0);       // the gather reads probs through a view
+    x[3] = ggml_pad(ctx, x[2], 1, 0, 0, 0);     // 12 bytes, fresh; afterwards x1's block (= x0's) is freed
+    x[4] = ggml_pad(ctx, x[3], 1, 0, 0, 0);     // 16 bytes, fresh: best-fit takes the freed 32-byte block
+    assign_names(ctx);
+    if (keep_alive) {
+        ggml_set_keep_alive(x[0]);
+    }
+
+    ggml_gallocr_ptr galloc = allocate_graph(graph, x[4], &backend.buffer_type);
+    check_all_allocated(graph);
+    check_no_overlap(graph);
+    check_max_size(ctx);
+    if (keep_alive) {
+        GGML_ASSERT(x[1]->data != x[0]->data);        // the gating op did not take the block in place
+        GGML_ASSERT(!memory_overlap(x[0], x[1]));
+        GGML_ASSERT(!memory_overlap(x[0], x[3]));
+        GGML_ASSERT(!memory_overlap(x[0], x[4]));     // nothing later landed in the pinned block
+    } else {
+        GGML_ASSERT(x[1]->data == x[0]->data);        // the scenario the flag exists for
+        GGML_ASSERT(memory_overlap(x[0], x[4]));
+    }
+}
+
 static void test_merge_free_block(size_t max_buffer_size) {
     dummy_backend backend      = dummy_backend_init(max_buffer_size);
     auto [ctx, graph, ctx_ptr] = make_context();
@@ -598,6 +633,8 @@ int main() {
     run("test_fill_leftover_space", test_fill_leftover_space);
     run("test_view_inplace", test_view_inplace);
     run("test_reuse_and_free", test_reuse_and_free);
+    run("test_keep_alive(false)", []() { test_keep_alive(false); });
+    run("test_keep_alive(true)", []() { test_keep_alive(true); });
     run("test_merge_free_block(32)", []() { test_merge_free_block(32); });
     run("test_merge_free_block(SIZE_MAX)", []() { test_merge_free_block(SIZE_MAX); });
     run("test_prefer_already_allocated_memory", test_prefer_already_allocated_memory);

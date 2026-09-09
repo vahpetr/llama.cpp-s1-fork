@@ -1985,6 +1985,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(logits, "ffn_moe_logits_biased", il);
     }
 
+    // Keep the router input alive for the whole graph. Backends that fuse the router (gating op + argsort +
+    // gather + normalization, e.g. the Vulkan/CUDA topk_moe kernels) read `logits` and write the selected ids
+    // and the expert weights in ONE dispatch, so none of those outputs may alias `logits`. Without this flag
+    // ggml-alloc puts the gating op in place over `logits`, frees that block once the gather has consumed it,
+    // and its best-fit then regularly drops the later weights tensors (SUM_ROWS/DIV/SCALE) into it; the Vulkan
+    // backend detects the src/dst overlap and runs that layer's router unfused - a different rounding of the
+    // routing weights - and which layers are hit depends on the allocator's free-list state, i.e. on the graphs
+    // executed before and on what else is loaded, so the outputs became history- and composition-dependent.
+    // Pinning the block makes the alias impossible by construction for every router variant (the gating op
+    // gets its own transient block instead of the in-place one) at n_expert * n_tokens * 4 B per MoE layer of
+    // compute buffer. When `logits` is a shared probs_in tensor the one pinned block serves all its consumers.
+    ggml_set_keep_alive(logits);
+
     ggml_tensor * probs = nullptr;
     switch (gating_op) {
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:

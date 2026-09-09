@@ -7944,6 +7944,12 @@ void ggml_set_output(struct ggml_tensor * tensor) {
     }
 }
 
+void ggml_set_keep_alive(struct ggml_tensor * tensor) {
+    for (struct ggml_tensor * cur = tensor; cur != NULL; cur = cur->view_src) {
+        cur->flags |= GGML_TENSOR_FLAG_KEEP_ALIVE;
+    }
+}
+
 void ggml_set_param(struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor->op == GGML_OP_NONE);
     tensor->flags |= GGML_TENSOR_FLAG_PARAM;
