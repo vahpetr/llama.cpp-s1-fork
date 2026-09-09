@@ -1239,8 +1239,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // neither the ggml_cont nor the reshape below is needed either.
         // Note for the node-diff probes: this arm has no "indexer_score_tokens-<il>" node, because
         // the surface that name refers to is the one the op exists not to materialize. The
-        // selection itself is still named "indexer_top_k-<il>", so the pairing key that matters
-        // downstream is unchanged.
+        // selection keeps the name "indexer_top_k-<il>", so a diff of two runs on the SAME side of
+        // the knob still pairs it. It does NOT pair ACROSS the knob: fa_rb_nodediff's key is
+        // name|op|type|ne (scripts/bench/probe/fa_rb_nodediff.cpp:281-290) and the op differs -
+        // RESHAPE below, QSA_TOP_K here. Cross-arm equality is established by the corpus census and
+        // by qsa_fusion_replay's REPLAY_QSA_OP_SELFTEST, not by the node diff.
         ggml_tensor * top_k = ggml_qsa_top_k(ctx0, score, inp->cell_blk, kq_mask, (int) width);
         cb(top_k, "indexer_top_k", il);
 
