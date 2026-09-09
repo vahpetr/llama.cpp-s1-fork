@@ -520,80 +520,6 @@ static bool qwen4exp_qsa_bypass_exhaustive() {
     return enabled;
 }
 
-// [TAG_QSA_KEEP_ALIVE] (M2.0)
-//
-// The D-class allocation-dependent-fusion hazard bd6389362 closed on the MoE router, on the QSA
-// selection path. The Vulkan TOPK_QSA fusion (topk_qsa_pattern = GET_ROWS PERMUTE CONT CPY RESHAPE
-// ADD TOP_K, ggml-vulkan.cpp) collapses the seven nodes built at the end of build_qsa_top_k into
-// ONE radix-select dispatch that reads the gathered block scores, the cell->block map and the RAW
-// f16 mask and writes the top-k indices. Two consequences the graph has to respect:
-//
-//   * ggml_backend_vk_graph_compute vetoes the whole pattern when any src of any of its nodes that
-//     is not an earlier node of the pattern overlaps the dispatch's destination (the TOP_K); this
-//     pattern's op_srcs_fused_elementwise is all-false, so ANY overlap counts. A veto is not a
-//     wrong result, it is a *different* result: that layer's selection is then computed by seven
-//     separate kernels, with a different rounding of the same scores.
-//   * the operands the shader reads at the TOP_K node (scores, cell_blk, mask) must still hold
-//     their data there, several nodes after ggml-alloc believes their last consumer ran.
-//
-// Three blocks are freed before the TOP_K is allocated, so ggml-alloc's best-fit can drop the TOP_K
-// destination into any of them (ggml_gallocr_free_node runs in the parent-update loop of the node
-// that consumed them; ggml_dyn_tallocr_alloc then takes the smallest free block that fits):
-//
-//   1. cont(permute(score)) - the shader's `scores` operand. GGML_OP_GET_ROWS is not in
-//      ggml_op_can_inplace, so it is never taken in place and is freed as soon as the GET_ROWS (the
-//      pattern's first node) has consumed it. It is a src of a pattern node and is not itself a
-//      pattern node, so an overlap vetoes the fusion - and would be a read of the tensor being
-//      written if it ever fused.
-//   2. the f32 mask cast - freed once the ADD has consumed its reshape (the reshape is a view, so
-//      the cast dies with it), i.e. one node before the TOP_K is allocated. The fused shader never
-//      reads it (it reads the f16 mask directly), but ggml_cast sets src[1] = the cast itself, so
-//      the veto loop sees a pattern src that is not an *earlier* pattern node and unfuses the layer.
-//   3. cell_blk - the shader's index operand. One input tensor serves every layer of the ratio, so
-//      it is freed after the LAST QSA layer's GET_ROWS, i.e. inside that layer's pattern window.
-//      The veto cannot see it at all (the loop skips srcs with op == GGML_OP_NONE), so an overlap
-//      there is a silently wrong selection rather than a veto.
-//      INCOMPLETE, measured 2026-09-09: this mark does not reach the tensor the backend reads.
-//      ggml_backend_sched puts every GGML_TENSOR_FLAG_INPUT tensor on the last backend (CPU) and
-//      hands the GPU split an un-flagged *copy* of it (ggml-backend.cpp, "graph input" in
-//      ggml_backend_sched_backend_id_from_cur + the tensor_copy branch of
-//      ggml_backend_sched_split_graph, which only sets INPUT/OUTPUT on the copy when n_copies > 1),
-//      so the pin stays on the CPU-side original while the copy is what ggml-alloc recycles - the
-//      replay sees "FakeVK#leaf_118#0" as the GET_ROWS index src, and once, in the 16-token reserve
-//      graph, that copy overlapped the TOP_K destination. Closing hazard 3 needs the scheduler to
-//      carry KEEP_ALIVE onto the input copy, next to the n_copies > 1 branch that already calls
-//      ggml_set_output on it for exactly this reason. The mark is kept here because it is the right
-//      statement of intent, costs nothing, and becomes effective the moment that lands.
-//
-// Which of the three the allocator hands to the TOP_K depends on the free-list state, i.e. on every
-// tensor allocated before it and therefore on the graphs executed before - the same request-history
-// dependence bd6389362 removed from the router. ggml_set_keep_alive pins a block for the whole
-// graph (never reused in place, never returned to the free list), which makes all three impossible
-// by construction, at one un-recycled block per marked tensor.
-//
-// Not GGML_TENSOR_FLAG_OUTPUT: ggml_vk_match_ops refuses to fuse a pattern whose nodes carry
-// OUTPUT, so marking the cast that way would disable the very fusion this protects.
-//
-// Cost, per QSA layer per graph (compute-buffer bytes that can no longer be recycled):
-//     cont(permute(score))  n_tps * n_blocks * n_stream * 4 B   (n_blocks = ceil(n_kv/r))
-//     mask cast             n_kv  * n_tps    * n_stream * 4 B   <- dominates
-// plus cell_blk (n_kv * n_stream * 4 B) once per ratio, not per layer. Measured on
-// Qwen3.8-Flash-Next (12 QSA layers at ratio 4, n_ctx 16384, CPU replay of the reserve, off -> on):
-// 18.59 -> 23.98 MiB at n_ubatch 6, 50.41 -> 104.04 MiB at 46, 2244.28 -> 4597.20 MiB at 2048. The
-// deltas run above the pinned bytes themselves because a pinned block also stops every later tensor
-// from reusing it; the mask cast is ~4/5 of it and is the one the veto actually lands in.
-//
-// Default ON. LLAMA_QSA_KEEP_ALIVE=0 drops every mark: that is the pre-fix graph and the "without"
-// arm of the A/B that makes the vetoes appear.
-static bool qwen4exp_qsa_keep_alive() {
-    static const bool enabled = [] {
-        const char * s = getenv("LLAMA_QSA_KEEP_ALIVE");
-        return s == nullptr || atoi(s) != 0;
-    }();
-
-    return enabled;
-}
-
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     // [TAG_PLE_HOIST] before anything else touches gf: the CPU-resident PLE gather has to be the
@@ -1186,13 +1112,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_input(qsa->blk_cells);
             ggml_set_input(qsa->blk_pos);
             ggml_set_input(qsa->bias);
-
-            // [TAG_QSA_KEEP_ALIVE] hazard 3: the fused TOPK_QSA dispatch reads cell_blk at the
-            // TOP_K, but this one input serves every layer of the ratio, so ggml-alloc frees it
-            // right after the LAST QSA layer's GET_ROWS - inside that layer's pattern window
-            if (qwen4exp_qsa_keep_alive()) {
-                ggml_set_keep_alive(qsa->cell_blk);
-            }
         }
 
         inp = qsa.get();
@@ -1277,26 +1196,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     }
 
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
-    // [TAG_QSA_KEEP_ALIVE] hazard 1: this transient is the fused shader's `scores` operand and is
-    // freed the moment the GET_ROWS below has consumed it, i.e. at the pattern's first node
-    ggml_tensor * score_cells = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
-    if (qwen4exp_qsa_keep_alive()) {
-        ggml_set_keep_alive(score_cells);
-    }
-
-    ggml_tensor * expanded = ggml_get_rows(ctx0, score_cells, inp->cell_blk);
+    ggml_tensor * expanded = ggml_get_rows(ctx0,
+            ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
     expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
 
     if (blk_bias) {
         // flash attention keeps the mask in f16; the scores are f32
         ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
-        // [TAG_QSA_KEEP_ALIVE] hazard 2: the cast is the pattern's CPY node and ggml_cast points its
-        // own src[1] at it, so the veto loop treats it as a src that is not an earlier pattern node;
-        // it dies with its reshape at the ADD, one node before the TOP_K is allocated. Nothing marks
-        // the f32 branch: without a CPY the pattern does not match and there is nothing to protect.
-        if (mask != kq_mask && qwen4exp_qsa_keep_alive()) {
-            ggml_set_keep_alive(mask);
-        }
         expanded = ggml_add(ctx0, expanded, ggml_reshape_3d(ctx0, mask, n_kv, n_tps, n_stream));
     } else {
         expanded = ggml_add(ctx0, expanded, inp->bias);
