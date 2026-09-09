@@ -8828,7 +8828,13 @@ void ggml_compute_forward_argsort(
 struct cmp_top_k {
     const float * data;
     bool operator()(int32_t a, int32_t b) const {
-        return data[a] > data[b];
+        // equal values are ordered by index. Without it the comparator is only a weak
+        // ordering, std::partial_sort is not stable, and WHICH of an equal-valued group
+        // lands in the top k is an artifact of its heap: [5,5,5,9,7] with k=3 keeps index
+        // 1, not 0. No backend can reproduce that, so ties had to be kept out of the
+        // top_k tests; with the index tie-break the result is the well-defined top k
+        // under (value descending, index ascending) and a backend can match it exactly.
+        return data[a] > data[b] || (data[a] == data[b] && a < b);
     }
 };
 
