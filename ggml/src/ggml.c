@@ -1083,6 +1083,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "QSA_TOP_K",
 
     "UNARY",
 
@@ -1100,7 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1198,6 +1199,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "qsa_top_k(score, cell_blk, mask)",
 
     "unary(x)",
 
@@ -1215,7 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5403,6 +5405,46 @@ struct ggml_tensor * ggml_top_k(
 
     result->op     = GGML_OP_TOP_K;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_qsa_top_k
+
+struct ggml_tensor * ggml_qsa_top_k(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * cell_blk,
+        struct ggml_tensor  * mask,
+        int                   k) {
+    GGML_ASSERT(   score->type == GGML_TYPE_F32);
+    GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+    GGML_ASSERT(    mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(score));
+    GGML_ASSERT(ggml_is_contiguous(cell_blk));
+    GGML_ASSERT(ggml_is_contiguous(mask));
+
+    const int64_t n_blocks = score->ne[0];
+    const int64_t n_tps    = score->ne[1];
+    const int64_t n_stream = score->ne[2];
+    const int64_t n_kv     = cell_blk->ne[0];
+
+    GGML_ASSERT(score->ne[3] == 1);
+    GGML_ASSERT(cell_blk->ne[1] == n_stream && ggml_nrows(cell_blk) == n_stream);
+    // the mask is [n_kv, n_tps, 1, n_stream] in the graph and [n_kv, n_tps, n_stream] in the
+    // op tests; both are contiguous with the same row layout, so accept either
+    GGML_ASSERT(mask->ne[0] == n_kv && mask->ne[1] == n_tps);
+    GGML_ASSERT(ggml_nelements(mask) == n_kv*n_tps*n_stream);
+    GGML_ASSERT(n_blocks > 0 && n_kv > 0);
+    GGML_ASSERT(k > 0 && (int64_t) k <= n_kv);
+    GGML_ASSERT(n_kv <= INT32_MAX);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, k, n_tps, 1, n_stream);
+
+    result->op     = GGML_OP_QSA_TOP_K;
+    result->src[0] = score;
+    result->src[1] = cell_blk;
+    result->src[2] = mask;
 
     return result;
 }

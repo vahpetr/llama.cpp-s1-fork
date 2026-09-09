@@ -8895,6 +8895,102 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// ggml_compute_forward_qsa_top_k
+//
+// [TAG_QSA_FUSED_SELECT] the reference for GGML_OP_QSA_TOP_K: the qwen4exp indexer selection as one
+// op. Row (t, s) of the scored surface is
+//     value(i) = score[cell_blk[i, s], t, s] + mask[i, t, s]
+// and the result is its top k. Deliberately identical, arithmetic and all, to the six-node chain it
+// replaces: the same f32 add in the same order (the f16->f32 mask widening is exact), the same
+// cmp_top_k total order, and the same trailing swap of the first two ids that
+// ggml_compute_forward_top_k_f32 does. That last one is only there so the two arms of
+// GGML_VK_QSA_FUSED_SELECT are byte-identical on the CPU backend, ids included - the order within
+// the selected set is not part of the contract (see ggml_top_k), only the set is.
+//
+// The scored row is never materialized for the whole graph: one row per thread at a time, in
+// wdata. That is the memory the op exists to save, so the reference must not re-introduce it.
+static void ggml_compute_forward_qsa_top_k_f32(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * score    = dst->src[0]; // [n_blocks, n_tps, n_stream] f32
+    const ggml_tensor * cell_blk = dst->src[1]; // [n_kv, n_stream]            i32
+    const ggml_tensor * mask     = dst->src[2]; // [n_kv, n_tps, 1, n_stream]  f16/f32
+
+    GGML_ASSERT(score->nb[0]    == sizeof(float));
+    GGML_ASSERT(cell_blk->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(dst->nb[0]      == sizeof(int32_t));
+    GGML_ASSERT(ggml_is_contiguous(score));
+    GGML_ASSERT(ggml_is_contiguous(cell_blk));
+    GGML_ASSERT(ggml_is_contiguous(mask));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n_blocks = score->ne[0];
+    const int64_t n_tps    = score->ne[1];
+    const int64_t n_stream = score->ne[2];
+    const int64_t n_kv     = cell_blk->ne[0];
+    const int64_t k        = dst->ne[0];
+    const int64_t nrows    = n_tps*n_stream;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // per-thread scratch: the scored row, then its index permutation. Both 4-byte types, so one
+    // float-sized stride covers them; CACHE_LINE_SIZE_F32 keeps threads off each other's lines and
+    // is covered by the CACHE_LINE_SIZE*n_threads slack ggml_graph_plan adds (as top_k does).
+    const size_t stride = (size_t) 2*n_kv + CACHE_LINE_SIZE_F32;
+    float   * val = (float *) params->wdata + stride*ith;
+    int32_t * idx = (int32_t *) (val + n_kv);
+
+    const bool mask_f16 = mask->type == GGML_TYPE_F16;
+
+    for (int64_t row = ith; row < nrows; row += nth) {
+        const int64_t t = row % n_tps;
+        const int64_t s = row / n_tps;
+
+        const float   * sc = (const float *)   ((const char *) score->data    + s*score->nb[2] + t*score->nb[1]);
+        const int32_t * cb = (const int32_t *) ((const char *) cell_blk->data + s*cell_blk->nb[1]);
+        const char    * mk = (const char *)    mask->data + (size_t) row*n_kv*ggml_type_size(mask->type);
+
+        for (int64_t i = 0; i < n_kv; i++) {
+            const int32_t b = cb[i];
+            GGML_ASSERT(b >= 0 && b < n_blocks);
+            const float m = mask_f16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mk)[i])
+                                     : ((const float *) mk)[i];
+            val[i] = sc[b] + m;
+            idx[i] = (int32_t) i;
+        }
+
+        std::partial_sort(idx, idx + k, idx + n_kv, cmp_top_k{val});
+
+        int32_t * dst_data = (int32_t *) ((char *) dst->data + row*dst->nb[1]);
+        std::copy(idx, idx + k, dst_data);
+
+        // emphasize that the order is not important (ggml_compute_forward_top_k_f32 does the same)
+        if (k > 1) {
+            std::swap(dst_data[0], dst_data[1]);
+        }
+    }
+}
+
+void ggml_compute_forward_qsa_top_k(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_qsa_top_k_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,

@@ -1040,6 +1040,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_POST: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
+            // [TAG_QSA_FUSED_SELECT] the selection reads score[cell_blk[i]] across the whole block
+            // axis and the whole KV axis, so no per-device split of any src is meaningful here;
+            // handle_generic(scalar_only) accepts only the all-mirrored case and asserts otherwise.
+            case GGML_OP_QSA_TOP_K: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;

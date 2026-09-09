@@ -574,6 +574,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_QSA_TOP_K,
 
         GGML_OP_UNARY,
 
@@ -2414,6 +2415,32 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_top_k(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            int                   k);
+
+    // [TAG_QSA_FUSED_SELECT] qwen4exp QSA indexer selection, as ONE node.
+    //
+    // Equivalent to, and a drop-in replacement for, this six-node chain:
+    //     e = get_rows(cont(permute(score, 1,0,2,3)), cell_blk)     // per-block score -> per-cell
+    //     e = cont(permute(e, 1,0,2,3))
+    //     e = add(e, reshape(cast(mask, F32), n_kv, n_tps, n_stream))
+    //     r = top_k(e, k)
+    // i.e. element (i, t, s) of the scored row is
+    //     score[cell_blk[i, s], t, s] + mask[i, t, s]
+    // and the result names the k largest of each row. The chain materializes five tensors of
+    // [n_kv x n_tps] and [n_blocks x n_tps] extent that only ever feed the top-k; this op
+    // materializes none of them, which is the whole point of it (the backends compute the sum
+    // per element inside the selection). Selection semantics are ggml_top_k's, including its
+    // total order over ties (value descending, index ascending; -0.0 == +0.0).
+    //
+    //   score:    [n_blocks, n_tps, n_stream]  F32, contiguous  (per-BLOCK scores, unpermuted)
+    //   cell_blk: [n_kv,     n_stream]         I32, contiguous  (cell -> block map, per stream)
+    //   mask:     [n_kv, n_tps, 1, n_stream]   F16 or F32, contiguous (the raw attention mask)
+    //   result:   [k, n_tps, 1, n_stream]      I32
+    GGML_API struct ggml_tensor * ggml_qsa_top_k(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * cell_blk,
+            struct ggml_tensor  * mask,
             int                   k);
 
     GGML_API struct ggml_tensor * ggml_arange(
