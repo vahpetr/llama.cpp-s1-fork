@@ -721,6 +721,13 @@ static qwen4exp_qsa_path_mode qwen4exp_qsa_path() {
     return mode;
 }
 
+// [TAG_QSA_GATHER_MAX_WINDOWS] (M5.0 item 5) LLAMA_QSA_GATHER_MAX_WINDOWS=N > 0 re-prices the auto rule: gather iff
+// flash attention, the ubatch is above the budget (width < n_kv) and n_tps*n_stream <= N query windows - whatever
+// n_kv is (gate M4's routing grid, 2026-09-24: gather beats scan up to 64 windows at 107k). N > 128 is clamped to
+// QWEN4EXP_QSA_GATHER_MAX_TPS with a warning. LLAMA_QSA_PATH=gather|scan still overrides it. Read once, logged at
+// the first QSA graph build. Default 0 = `4*n_tps*width < n_kv`, today's rule.
+static int64_t qwen4exp_qsa_gather_max_windows();
+
 // build_attn_qsa's branch rule, shared with the [TAG_QSA_CHUNK] decision so the two cannot drift.
 // flash attention is what keeps the values as rows, so the gather needs it.
 static bool qwen4exp_qsa_use_gather(bool flash_attn, int64_t n_tps, int64_t n_stream, int64_t width, int64_t n_kv) {
@@ -738,7 +745,29 @@ static bool qwen4exp_qsa_use_gather(bool flash_attn, int64_t n_tps, int64_t n_st
         case QWEN4EXP_QSA_PATH_AUTO:
             break;
     }
+    if (const int64_t max_windows = qwen4exp_qsa_gather_max_windows(); max_windows > 0) {
+        return flash_attn && width < n_kv && n_tps*n_stream <= max_windows;
+    }
     return flash_attn && 4*n_tps*width < n_kv;
+}
+
+static int64_t qwen4exp_qsa_gather_max_windows() {
+    static const int64_t max_windows = [] {
+        const char * s = getenv("LLAMA_QSA_GATHER_MAX_WINDOWS");
+        long long v = s ? atoll(s) : 0;
+        if (v > QWEN4EXP_QSA_GATHER_MAX_TPS) {
+            LLAMA_LOG_WARN("qwen4exp_qsa_gather_max_windows: LLAMA_QSA_GATHER_MAX_WINDOWS=%lld clamped to QWEN4EXP_QSA_GATHER_MAX_TPS = %lld\n",
+                    v, (long long) QWEN4EXP_QSA_GATHER_MAX_TPS);
+            v = QWEN4EXP_QSA_GATHER_MAX_TPS;
+        }
+        if (v > 0) {
+            LLAMA_LOG_INFO("qwen4exp_qsa_gather_max_windows: LLAMA_QSA_GATHER_MAX_WINDOWS=%lld: auto routes a QSA ubatch above the budget"
+                    " to gather iff n_tps*n_stream <= %lld (flash attention)\n", v, v);
+        }
+        return (int64_t) (v > 0 ? v : 0);
+    }();
+
+    return max_windows;
 }
 
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
