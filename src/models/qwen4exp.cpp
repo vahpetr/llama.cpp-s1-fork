@@ -584,6 +584,36 @@ static int64_t qwen4exp_qsa_chunk() {
     return chunk;
 }
 
+// [TAG_QSA_GATHER_Q8] (M4.1) LLAMA_QSA_GATHER_Q8=1 makes the QSA gathers type-preserving
+// (ggml_get_rows_type, fork-only): build_qsa_gather gathers k_sel/v_sel in the cache's own type -
+// q8_0 on the deployed profile, f16 on an f16 cache - and hands them to flash attention as they
+// are, instead of expanding every selected row to f32 (ggml_get_rows) for build_attn_mha to cast
+// back to f16. The attention mask gathers of the gather branch and of [TAG_QSA_CHUNK]'s chunks
+// likewise stay f16 instead of going f16 -> f32 -> f16 through a cast.
+//
+// Exactness: every gathered row is the source row byte for byte (a q8_0 row is whole blocks, an
+// f16 row whole halves), so the selection, the mask values and the K/V bytes flash attention sees
+// are what the dense path would see; the kernel flash attention then runs is the q8_0 K/V kernel
+// the dense path runs (same rounding class) instead of the f16 kernel over rounded values. On an
+// f16 cache the knob changes no value at all (f16 -> f32 -> f16 is exact).
+//
+// Any other cache type keeps today's f32 gather. Default OFF (QSA plan section 3.3: one A/B knob
+// per change, off until its own gate passes); with it off every builder emits today's graph, node
+// for node.
+static bool qwen4exp_qsa_gather_q8() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_GATHER_Q8");
+        return s != nullptr && atoi(s) != 0;
+    }();
+
+    return enabled;
+}
+
+// the cache types [TAG_QSA_GATHER_Q8] gathers as-is
+static bool qwen4exp_qsa_gather_keeps(ggml_type type) {
+    return qwen4exp_qsa_gather_q8() && (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_F16);
+}
+
 // build_attn_qsa's branch rule, shared with the [TAG_QSA_CHUNK] decision so the two cannot drift.
 // flash attention is what keeps the values as rows, so the gather needs it.
 static bool qwen4exp_qsa_use_gather(bool flash_attn, int64_t n_tps, int64_t width, int64_t n_kv) {
@@ -1534,9 +1564,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
         ggml_tensor * bias_c = ggml_get_rows(ctx0, bias, rows);
 
         // [n_kv, nc, 1, n_stream], back in the mask's own type
-        ggml_tensor * mask_c = ggml_get_rows(ctx0, kq_mask, ggml_reshape_3d(ctx0, rows, nc, 1, n_stream));
-        if (kq_mask->type != GGML_TYPE_F32) {
-            mask_c = ggml_cast(ctx0, mask_c, kq_mask->type);
+        ggml_tensor * mask_c = nullptr;
+        if (kq_mask->type == GGML_TYPE_F16 && qwen4exp_qsa_gather_keeps(kq_mask->type)) {
+            // [TAG_QSA_GATHER_Q8] gathered as f16 rows, no f32 transient and no cast
+            mask_c = ggml_get_rows_type(ctx0, kq_mask, ggml_reshape_3d(ctx0, rows, nc, 1, n_stream), kq_mask->type);
+        } else {
+            mask_c = ggml_get_rows(ctx0, kq_mask, ggml_reshape_3d(ctx0, rows, nc, 1, n_stream));
+            if (kq_mask->type != GGML_TYPE_F32) {
+                mask_c = ggml_cast(ctx0, mask_c, kq_mask->type);
+            }
         }
 
         ggml_tensor * top_k = build_qsa_select(prep.inp, prep.pooled, q_idx, bias_c, mask_c, width, prep.blk_bias, il);
@@ -1600,8 +1636,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
     // out contiguously, so the flat index of a window is the index of its query
     ggml_tensor * idx_stream = ggml_reshape_2d(ctx0, top_k, width*n_tps, n_stream);
 
-    ggml_tensor * k_sel = ggml_get_rows(ctx0, k_cells, idx_stream);
-    ggml_tensor * v_sel = ggml_get_rows(ctx0, v_cells, idx_stream);
+    // [TAG_QSA_GATHER_Q8] in the cache's own type: a q8_0 cell row is n_head_kv*head_dim/32 whole
+    // blocks (16 at 2 x 256), so the reshape below splits it on a block boundary and the tensor
+    // stays row-major per cell (nb1 = one head's row, nb2 = one cell); build_attn_mha's permute then
+    // gives flash attention the same [head_dim, cells, heads] stride pattern the dense cache view
+    // has, with the queries on ne[3], and its f32 -> f16 cast does not fire
+    ggml_tensor * k_sel = qwen4exp_qsa_gather_keeps(k_cells->type)
+        ? ggml_get_rows_type(ctx0, k_cells, idx_stream, k_cells->type)
+        : ggml_get_rows     (ctx0, k_cells, idx_stream);
+    ggml_tensor * v_sel = qwen4exp_qsa_gather_keeps(v_cells->type)
+        ? ggml_get_rows_type(ctx0, v_cells, idx_stream, v_cells->type)
+        : ggml_get_rows     (ctx0, v_cells, idx_stream);
 
     k_sel = ggml_reshape_4d(ctx0, k_sel, k_all->ne[0], k_all->ne[1], width, n_q);
     v_sel = ggml_reshape_4d(ctx0, v_sel, v_all->ne[0], v_all->ne[1], width, n_q);
@@ -1619,9 +1664,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
 
     ggml_tensor * idx_query = ggml_reshape_3d(ctx0, top_k, width, n_q, 1);
 
-    ggml_tensor * mask = ggml_get_rows(ctx0, mask_cells, idx_query);
-
-    mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q), GGML_TYPE_F16);
+    ggml_tensor * mask = nullptr;
+    if (kq_mask->type == GGML_TYPE_F16 && qwen4exp_qsa_gather_keeps(kq_mask->type)) {
+        // [TAG_QSA_GATHER_Q8] f16 cells gathered as f16: flash attention's mask type, no cast
+        mask = ggml_get_rows_type(ctx0, mask_cells, idx_query, kq_mask->type);
+        mask = ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q);
+    } else {
+        mask = ggml_get_rows(ctx0, mask_cells, idx_query);
+        mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q), GGML_TYPE_F16);
+    }
     cb(mask, "qsa_mask_sel", il);
 
     return build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask, nullptr, nullptr, kq_scale, il);
