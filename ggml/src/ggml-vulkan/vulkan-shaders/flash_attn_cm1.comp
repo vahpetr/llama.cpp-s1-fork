@@ -273,11 +273,15 @@ void main() {
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
         if (INDEXED) {
-            barrier(); // every reader of the previous tile's idsh is done
+            // No barrier before the fill: the previous tile's last barrier (end of this loop body) orders every
+            // idsh reader of that tile, and the only `continue` reachable with INDEXED (the all -inf mask skip)
+            // follows the mask-reduce barriers, after that tile's last idsh read (the mask load).
             if (tid < Bc) {
                 const uint32_t pos = j * Bc + tid;
-                // columns >= W get cell 0: in bounds, and never live (FA_KV_END bounds them like a KV tail)
-                idsh[tid] = pos < p.split_kv ? uint32_t(data_ids[ids_offset + pos]) : 0u;
+                // columns >= W get cell 0: in bounds, and never live (FA_KV_END bounds them like a KV tail).
+                // The id is clamped to [0, KV): FA pipelines run without robustBufferAccess, so an out-of-range
+                // id (a negative one wraps to a huge uint) must never reach the K/V/mask loads.
+                idsh[tid] = pos < p.split_kv ? min(uint32_t(data_ids[ids_offset + pos]), KV - 1u) : 0u;
             }
             barrier();
         }

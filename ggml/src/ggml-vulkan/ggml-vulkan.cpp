@@ -2727,6 +2727,9 @@ class vk_perf_logger {
                 " k(" << k->ne[0] << "," << k->ne[1] << "," << k->ne[2] << "," << k->ne[3] << "), " <<
                 " v(" << v->ne[0] << "," << v->ne[1] << "," << v->ne[2] << "," << v->ne[3] << "), " <<
                 " m(" << (m?m->ne[0]:0) << "," << (m?m->ne[1]:0) << "," << (m?m->ne[2]:0) << "," << (m?m->ne[3]:0) << ")";
+            if (node->src[5]) {
+                name << " ids(" << node->src[5]->ne[0] << ")"; // [TAG_QSA_INDEXED_FA] W: indexed vs dense in the profile
+            }
             return name.str();
         }
         if (node->op == GGML_OP_TOP_K) {
@@ -11604,7 +11607,9 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t dead_words = (Bc + 31) / 32;
     const uint32_t dead = (row_split + row_tiles) * dead_words * (uint32_t) sizeof(uint32_t);
 
-    const uint32_t idsh = indexed ? Bc * (uint32_t) sizeof(uint32_t) : 0; // [TAG_QSA_INDEXED_FA] idsh[Bc]
+    // [TAG_QSA_INDEXED_FA] idsh[Bc]. The non-indexed cm1 shaders' 4 B idsh[1] is deliberately NOT counted: adding it
+    // could flip a borderline shmem_support verdict on the dense path, which must stay exactly as before.
+    const uint32_t idsh = indexed ? Bc * (uint32_t) sizeof(uint32_t) : 0;
 
     const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + dead + idsh;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
@@ -20743,6 +20748,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                                                                         op->src[1]->type, op->src[2]->type, f32acc);
                     if (tp.path != FA_COOPMAT1 ||
                         !ggml_vk_flash_attn_coopmat_shmem_support(device, tp, HSK, HSV, f32acc, op->src[1]->type, op->src[2]->type, true)) {
+                        return false;
+                    }
+                    // ids bind at binding 6 through ggml_vk_tensor_subbuffer, which asserts a
+                    // minStorageBufferOffsetAlignment-aligned offset; the ids row stride is W * 4 B (8204 at W 2051), so a
+                    // row-offset view of a bigger ids tensor would abort there - fall back instead. Task 3: the ids must be
+                    // the chunk's own QSA_TOP_K output at offset 0, never a row-offset view.
+                    const ggml_tensor * ids_base = ids->view_src ? ids->view_src : ids;
+                    const uint64_t ids_offs = ids->view_offs +
+                        ((ids_base->buffer && ggml_backend_buffer_is_vk(ids_base->buffer)) ? vk_tensor_offset(ids) : 0);
+                    if (ids_offs % device->properties.limits.minStorageBufferOffsetAlignment != 0) {
                         return false;
                     }
                 }
