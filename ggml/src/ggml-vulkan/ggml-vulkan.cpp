@@ -4125,9 +4125,8 @@ static void ggml_vk_destroy_buffer(vk_buffer& buf) {
                     if (q == nullptr || !q->handle) {
                         continue;
                     }
-                    q->handle->lock();
+                    std::lock_guard<vk_queue_handle> guard(*q->handle); // released on an exception (DeviceLost) too
                     q->handle->queue.waitIdle();
-                    q->handle->unlock();
                 }
                 VK_LOG_MEMORY("[vk-free] GGML_VK_FREE_WAIT_IDLE: queues idle before destroying " << buf->size
                         << " B, waited " << (ggml_vk_now_us() - t0_us) << " us");
@@ -11643,7 +11642,7 @@ static size_t ggml_vk_fa_dequant_staging_bytes(const ggml_tensor * k, const ggml
     return (size_t) (ggml_nelements(k) + ggml_nelements(v)) * sizeof(ggml_fp16_t);
 }
 
-static bool vk_qsa_scratch_presize_enabled();
+static bool vk_qsa_scratch_presize_fa_enabled();
 
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
@@ -11957,8 +11956,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         const uint64_t v_f16_sz = (uint64_t)ggml_nelements(v) * fp;
         if (ctx->prealloc_size_x < k_f16_sz + v_f16_sz) {
             size_t want = k_f16_sz + v_f16_sz;
-            if (vk_qsa_scratch_presize_enabled()) {
-                // [TAG_QSA_SCRATCH] (M4.2b item 4) prealloc_x is shared, and this staging (n_kv x 2 KiB per QSA-profile
+            if (vk_qsa_scratch_presize_fa_enabled()) {
+                // [TAG_QSA_SCRATCH] (M4.2b item 4, GGML_VK_QSA_SCRATCH_PRESIZE_FA=1) prealloc_x is shared, and this staging (n_kv x 2 KiB per QSA-profile
                 // layer) is its other big tenant: it crossed M2.2's QSA-only presize at n_kv ~ 87k and then grew
                 // exact-fit by 4 MiB on every prefill ubatch (64 x_size lines per 213k). Under the knob it takes the
                 // same policy as the QSA scratch: straight to the reserve hint (which now includes this term at the
@@ -15087,14 +15086,18 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 // off the fused select is byte-for-byte the code that shipped.
 // Presumes a --kv-graph-span well under maxStorageBufferRange: with the span at its default 0 the
 // hint is n_ctx-sized and can exceed what one binding covers, which the range guard below catches.
-// M4.2b item 4: the hint (ggml_vk_qsa_scratch_hint) is
+// M4.2b item 4, with GGML_VK_QSA_SCRATCH_PRESIZE_FA=1 as well (without it: the QSA term alone, M2.2): the hint is
 //   max( n_kv * n_tps * n_stream * 4       over every QSA select      (the fused-select scratch),
 //        (nelements(K) + nelements(V)) * 2 over every FA node that dequantizes K/V to f16 (the FA staging) )
 // on the graphs seen so far - first the reserve graphs, so n_kv = min(padded --kv-graph-span, cache size) - and
 // BOTH tenants (the QSA dispatch and ggml_vk_flash_attn's staging request) presize to it and grow geometrically
 // (x1.25) past it. At span 196608 / chunk 256: max(179 306 496, 402 653 184) = 384 MiB, one growth past the span.
 static const bool vk_qsa_scratch_presize = ggml_vk_env_bool("GGML_VK_QSA_SCRATCH_PRESIZE", false);
-static bool vk_qsa_scratch_presize_enabled() { return vk_qsa_scratch_presize; }
+// [TAG_QSA_SCRATCH] (M4.2b item 4, fix round 1) GGML_VK_QSA_SCRATCH_PRESIZE_FA=1 (default off; only together with
+// GGML_VK_QSA_SCRATCH_PRESIZE=1) adds the FA staging term to the hint and gives the FA staging request the same
+// presize + geometric policy. PRESIZE alone is M2.2's QSA-only hint exactly, so the two stay A/B-able.
+static const bool vk_qsa_scratch_presize_fa = vk_qsa_scratch_presize && ggml_vk_env_bool("GGML_VK_QSA_SCRATCH_PRESIZE_FA", false);
+static bool vk_qsa_scratch_presize_fa_enabled() { return vk_qsa_scratch_presize_fa; }
 
 // Bytes the fused select's gather scratch needs: n_kv * n_tps * n_stream * 4, i.e. one float per
 // (row, key). One definition for all three callers below - the pattern dispatch, the op dispatch
@@ -19848,7 +19851,7 @@ static void ggml_vk_qsa_scratch_hint(ggml_backend_vk_context * ctx, const struct
         if (node->op != GGML_OP_FLASH_ATTN_EXT) {
             continue;
         }
-        if (ggml_vk_fa_use_dequant_kv(ctx, node->src[0], node->src[1], node->src[2])) {
+        if (vk_qsa_scratch_presize_fa && ggml_vk_fa_use_dequant_kv(ctx, node->src[0], node->src[1], node->src[2])) {
             ctx->prealloc_size_qsa_hint = std::max(ctx->prealloc_size_qsa_hint,
                                                    ggml_vk_fa_dequant_staging_bytes(node->src[1], node->src[2]));
         }
