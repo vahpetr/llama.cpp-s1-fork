@@ -65,6 +65,9 @@ const bool DEADV_LDS       = (Flags & 32) != 0;
 // other's shader meaning would pad sfshstride under a GQA_TOKENS dispatch (mismatching the
 // host-side shared-memory estimate) and mis-decode the rows.  Keep new FA flags above 64.
 const bool GQA_TOKENS      = (Flags & 128) != 0;
+// [TAG_QSA_INDEXED_FA] (M6) KV tile j column c is cell ids[tok][j * Bc + c] of the token's W = p.split_kv ids
+// (binding 6, int32, contiguous [W, ne2, 1, ne3]). Host-enforced: coopmat1, plain GQA fold, split_k 1, Clamp on.
+const bool INDEXED         = (Flags & 256) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -122,6 +125,7 @@ layout (binding = 5) writeonly buffer O {D_TYPE data_o[];};
 layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
+layout (binding = 6) readonly buffer IDS {int data_ids[];}; // [TAG_QSA_INDEXED_FA] aliases MO when INDEXED
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2
@@ -216,6 +220,7 @@ ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
          q_stride, k_stride, v_stride, m_stride;
+#define FA_KV_END (INDEXED ? p.split_kv : KV) // [TAG_QSA_INDEXED_FA] W ids per token, else the KV extent
 
 void init_indices()
 {
@@ -252,6 +257,10 @@ void init_indices()
 
     start_j = split_k_index * p.split_kv / Bc;
     end_j = CEIL_DIV(min(KV, (split_k_index + 1) * p.split_kv), Bc);
+    if (INDEXED) { // the loop walks the token's id list, not the cache
+        start_j = 0;
+        end_j = CEIL_DIV(p.split_kv, Bc);
+    }
 
     // When not using grouped query attention, all rows share the same iq2, equal to gl_WorkGroupID.y.
     // When using grouped query attention, each workgroup does gqa_ratio consecutive values of iq2.

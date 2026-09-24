@@ -74,6 +74,10 @@ shared O_TYPEV4 pvsh[Br * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
+// [TAG_QSA_INDEXED_FA] this KV tile's cell ids; FA_KV_ROW(j, c) is the cache row of tile column c
+shared uint32_t idsh[INDEXED ? Bc : 1];
+#define FA_KV_ROW(j, c) (INDEXED ? idsh[(c)] : ((j) * Bc + (c)))
+
 // ZERO_DEAD_V: "this KV column is mask-suppressed for every row of this coopmat row tile",
 // as a Bc-bit column mask, one mask per row tile.  The predicate is per row tile and not per
 // Br tile because V is coopMatMulAdd's shared B operand across the MatBr rows of one tile
@@ -113,7 +117,8 @@ void stage_v_columns(const uint32_t j, const uint32_t hsv_tile, const uint32_t v
         const uint row = idx / v_cols;
         const uint col = idx % v_cols;
 
-        const uint v_row = j * Bc + row;
+        const uint v_pos = j * Bc + row;
+        const uint v_row = FA_KV_ROW(j, row);
         const uint v_col = hsv_tile * MatBc * row_split + col * 4;
 
         const uint coord = v_row * v_stride * BLOCK_SIZE_V + v_col;
@@ -124,7 +129,8 @@ void stage_v_columns(const uint32_t j, const uint32_t hsv_tile, const uint32_t v
                               ((dead_cols[t * dead_words + row / 32] & (1u << (row % 32))) != 0);
         if (row_dead) {
             kvsh[row * vsh_stride + col] = FLOAT_TYPEV4(0.0f);
-        } else if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
+        // [TAG_QSA_INDEXED_FA] (Check-in #9 a) indexed: the column is one of the W ids AND its cell is in the cache
+        } else if (!KV_bounds_check || (v_pos < FA_KV_END && (!INDEXED || v_row < KV) && v_col < HSV)) {
 #if !defined(BFLOAT16)
             if (USE_DECODE_V) {
                 kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
@@ -142,7 +148,7 @@ void stage_v_columns(const uint32_t j, const uint32_t hsv_tile, const uint32_t v
 // The V operand of one P*V coopMatMulAdd, from global memory or from the kvsh staging tile.
 #define FA_LOAD_V_TILE(staged)                                                                                       \
     if (SHMEM_STAGING == 0) {                                                                                        \
-        if (!(staged)) {                                                                                             \
+        if (!(staged) && !INDEXED) {                                                                                 \
             /* F16/BF16 values can be loaded directly from global memory */                                          \
             const uint v_tile_row = j * Bc + bc_chunk * MatBc;                                                       \
             const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;                    \
@@ -262,9 +268,19 @@ void main() {
     // shader used before the fold existed.
     const uint32_t n_valid = min(Br, N - i * Br);
 #define fa_row_live(row) (GQA_TOKENS ? (i * Br + (row) < N && !FA_ROW_PAD(i * Br + (row))) : ((row) < n_valid))
+    const uint32_t ids_offset = (iq3 * p.ne2 + gqa_iq1) * p.split_kv; // [TAG_QSA_INDEXED_FA] plain fold: token = gqa_iq1, p.ne2 = n_tps
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
+        if (INDEXED) {
+            barrier(); // every reader of the previous tile's idsh is done
+            if (tid < Bc) {
+                const uint32_t pos = j * Bc + tid;
+                // columns >= W get cell 0: in bounds, and never live (FA_KV_END bounds them like a KV tail)
+                idsh[tid] = pos < p.split_kv ? uint32_t(data_ids[ids_offset + pos]) : 0u;
+            }
+            barrier();
+        }
 
         [[unroll]] for (uint32_t idx = 0; idx < mask_cache.length(); ++idx) {
             mask_cache[idx] = f16vec4(0);
@@ -289,30 +305,30 @@ void main() {
                     uint32_t c = (idx + tid) / (Br / 4);
                     uint32_t r = (idx + tid) % (Br / 4);
                     if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
-                        if ((!KV_bounds_check || j * Bc + c < KV)) {
+                        if ((!KV_bounds_check || j * Bc + c < FA_KV_END)) {
                             f16vec4 m;
                             if (!nem1_bounds_check || i * Br + r * 4 + 3 < p.nem1) {
                                 // fa_mask_row(R) is R itself unless GQA_TOKENS makes the rows
                                 // (token, head) pairs, in which case it is the row's token.
-                                m = f16vec4(data_m[m_offset + fa_mask_row(i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 3) * m_stride + (j * Bc + c)]);
+                                m = f16vec4(data_m[m_offset + fa_mask_row(i * Br + r * 4    ) * m_stride + FA_KV_ROW(j, c)],
+                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 1) * m_stride + FA_KV_ROW(j, c)],
+                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 2) * m_stride + FA_KV_ROW(j, c)],
+                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 3) * m_stride + FA_KV_ROW(j, c)]);
                                 max_mask = max(max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2])), float(m[3]));
                             } else if (i * Br + r * 4 + 2 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + fa_mask_row(i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
+                                m = f16vec4(data_m[m_offset + fa_mask_row(i * Br + r * 4    ) * m_stride + FA_KV_ROW(j, c)],
+                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 1) * m_stride + FA_KV_ROW(j, c)],
+                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 2) * m_stride + FA_KV_ROW(j, c)],
                                             0.0);
                                 max_mask = max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2]));
                             } else if (i * Br + r * 4 + 1 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + fa_mask_row(i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
+                                m = f16vec4(data_m[m_offset + fa_mask_row(i * Br + r * 4    ) * m_stride + FA_KV_ROW(j, c)],
+                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 1) * m_stride + FA_KV_ROW(j, c)],
                                             0.0,
                                             0.0);
                                 max_mask = max(max(max_mask, float(m[0])), float(m[1]));
                             } else if (i * Br + r * 4 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + fa_mask_row(i * Br + r * 4    ) * m_stride + (j * Bc + c)],
+                                m = f16vec4(data_m[m_offset + fa_mask_row(i * Br + r * 4    ) * m_stride + FA_KV_ROW(j, c)],
                                             0.0,
                                             0.0,
                                             0.0);
@@ -346,17 +362,17 @@ void main() {
                 uint32_t c = (idx + tid) / (HSK_pad / 4);
                 if (idx + gl_WorkGroupSize.x <= Bc * HSK_pad / 4 || c < Bc) {
                     FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
-                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSK == HSK_pad || d < HSK / 4)) {
+                    if ((!KV_bounds_check || j * Bc + c < FA_KV_END) && (HSK == HSK_pad || d < HSK / 4)) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_K) {
-                            uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE_K + 4 * d;
+                            uint coord = FA_KV_ROW(j, c) * k_stride * BLOCK_SIZE_K + 4 * d;
                             uint ib = coord / BLOCK_SIZE_K;
                             uint iqs = (coord % BLOCK_SIZE_K);
                             K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
                         } else
 #endif
                         {
-                            K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
+                            K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + FA_KV_ROW(j, c) * k_stride / 4 + d]);
                         }
                     }
 
@@ -382,7 +398,7 @@ void main() {
             if (SHMEM_STAGING == 0) {
             // For quants we always need to dequant into kvsh; for f16/bf16 we can load
             // directly from global memory when alignment / bounds allow it.
-            const bool stage_k = USE_DECODE_K || KV_bounds_check || d * 16 + 16 > HSK;
+            const bool stage_k = INDEXED || USE_DECODE_K || KV_bounds_check || d * 16 + 16 > HSK;
             if (stage_k) {
                 barrier();
                 [[unroll]] for (uint32_t idx = 0; idx < Bc * MatBr / 4; idx += gl_WorkGroupSize.x) {
@@ -390,17 +406,17 @@ void main() {
                     uint32_t row = (idx + tid) / (MatBr / 4);
                     if (idx + tid < Bc * MatBr / 4) {
                         FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
-                        if ((!KV_bounds_check || j * Bc + row < KV) && (HSK == HSK_pad || d * 16 + col_vec * 4 < HSK)) {
+                        if ((!KV_bounds_check || j * Bc + row < FA_KV_END) && (HSK == HSK_pad || d * 16 + col_vec * 4 < HSK)) {
 #if !defined(BFLOAT16)
                             if (USE_DECODE_K) {
-                                uint coord = (j * Bc + row) * k_stride * BLOCK_SIZE_K + d * 16 + col_vec * 4;
+                                uint coord = FA_KV_ROW(j, row) * k_stride * BLOCK_SIZE_K + d * 16 + col_vec * 4;
                                 uint ib = coord / BLOCK_SIZE_K;
                                 uint iqs = (coord % BLOCK_SIZE_K);
                                 K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
                             } else
 #endif
                             {
-                                K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + row) * k_stride / 4 + d * 16 / 4 + col_vec]);
+                                K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + FA_KV_ROW(j, row) * k_stride / 4 + d * 16 / 4 + col_vec]);
                             }
                         }
 
@@ -458,7 +474,7 @@ void main() {
                 uint32_t c = (idx + tid) / (Br / 4);
                 uint32_t r = (idx + tid) % (Br / 4);
                 if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
-                    if (!KV_bounds_check || j * Bc + c < KV) {
+                    if (!KV_bounds_check || j * Bc + c < FA_KV_END) {
                         // Mask nem1 bounds check is handled when loading masks
                         ACC_TYPEV4 masks = ACC_TYPEV4(mask_cache[idx / WorkGroupSize]);
                         ACC_TYPEV4 slopes = ACC_TYPEV4(slope[r * 4], slope[r * 4 + 1], slope[r * 4 + 2], slope[r * 4 + 3]);
@@ -476,7 +492,7 @@ void main() {
 
             float rowmaxf = NEG_FLT_MAX_OVER_2;
             [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
-                if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
+                if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= FA_KV_END) {
                     continue;
                 }
                 rowmaxf = max(rowmaxf, float(sfsh[r_vec + (c * cols_per_iter + col_tid) * sfshstride][r_comp]));
@@ -518,7 +534,7 @@ void main() {
 
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; r += 4) {
                 const uint row = tile_row(r);
-                if (KV_bounds_check && j * Bc + col >= KV) {
+                if (KV_bounds_check && j * Bc + col >= FA_KV_END) {
                     // stored as +0 for every row, so the column stays a dead-column candidate
                     Psh[col * psh_stride + row / 4] = FLOAT_TYPEV4(0.0f);
                 } else {
@@ -573,17 +589,17 @@ void main() {
                 uint32_t c = (idx + tid) / (HSV_pad / 4);
                 if (idx + gl_WorkGroupSize.x <= Bc * HSV_pad / 4 || c < Bc) {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
-                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
+                    if ((!KV_bounds_check || j * Bc + c < FA_KV_END) && (HSV == HSV_pad || d < HSV / 4)) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
-                            uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE_V + 4 * d;
+                            uint coord = FA_KV_ROW(j, c) * v_stride * BLOCK_SIZE_V + 4 * d;
                             uint ib = coord / BLOCK_SIZE_V;
                             uint iqs = (coord % BLOCK_SIZE_V);
                             V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
                         } else
 #endif
                         {
-                            V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
+                            V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + FA_KV_ROW(j, c) * v_stride / 4 + d]);
                         }
                     }
 
