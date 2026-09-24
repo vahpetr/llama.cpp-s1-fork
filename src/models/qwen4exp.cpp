@@ -523,7 +523,7 @@ static bool qwen4exp_qsa_bypass_exhaustive() {
 // [TAG_QSA_MIN_KV] (M5.0) LLAMA_QSA_MIN_KV=N > 0 widens [TAG_QSA_BYPASS_EXHAUSTIVE] into a depth threshold: a
 // ubatch whose sequence depth (M5.0b: its deepest sequence's pos + 1, qwen4exp_qsa_depth; M5.0 compared the pool's
 // indexer n_kv) is below N runs the dense build_attn(), exactly as an exhaustive one does - the indexer K write
-// (cache_only) stays, so the history is complete for the first ubatch at n_kv >= N; no selection, no QSA mask, no
+// (cache_only) stays, so the history is complete for the first ubatch at depth >= N; no selection, no QSA mask, no
 // pooled-store plan (the store's plan is stamp-based and stateless across bypassed ubatches: every block written
 // meanwhile has no valid stamp and is pooled by the first plan above N, llama-memory-hybrid-idx.cpp qsa_store_plan).
 // The decision is per ubatch over its depth including the ubatch's own tokens: a prefill ubatch that straddles N
