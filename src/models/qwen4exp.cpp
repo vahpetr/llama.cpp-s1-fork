@@ -584,6 +584,27 @@ static int64_t qwen4exp_qsa_chunk() {
     return chunk;
 }
 
+// [TAG_QSA_CHUNK_PAD] (M4.3) LLAMA_QSA_CHUNK_PAD=1: [TAG_QSA_CHUNK] cuts the ubatch into full chunks of C queries
+// and pads the LAST one to C (its padding rows repeat the ubatch's last query), so every chunk's score GEMM and
+// selection run the same column count - gate M4 compares that against the balanced split (default 0, today's
+// graph node for node). The padding queries' ids are cut right after the selection (a view of the chunk's real
+// columns, see build_qsa_chunked): they never reach the scan mask, the attention, the output or the
+// LLAMA_QSA_DUMP_IDS hash (the cut view carries the "indexer_top_k-<il>" name). There is no gather in the chunk
+// loop, and the pooled-key store's dirty list is planned on the host from the cells, before any query is scored.
+// Only a chunked ubatch (n_tps > C) is affected.
+static bool qwen4exp_qsa_chunk_pad() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_CHUNK_PAD");
+        const bool on = s != nullptr && atoi(s) != 0;
+        if (on) {
+            LLAMA_LOG_INFO("qwen4exp_qsa_chunk_pad: LLAMA_QSA_CHUNK_PAD=1: the last query chunk is padded to the chunk size\n");
+        }
+        return on;
+    }();
+
+    return enabled;
+}
+
 // [TAG_QSA_GATHER_Q8] (M4.1) LLAMA_QSA_GATHER_Q8=1 makes the QSA gathers type-preserving
 // (ggml_get_rows_type, fork-only): build_qsa_gather gathers k_sel/v_sel in the cache's own type -
 // q8_0 on the deployed profile, f16 on an f16 cache - and hands them to flash attention as they
@@ -1760,7 +1781,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
     const int64_t n_chunks = (n_tps + prep.chunk - 1)/prep.chunk;
     const int64_t n_short  = n_tps/n_chunks;      // every chunk has n_short or n_short + 1 queries
     const int64_t n_long   = n_tps%n_chunks;      // ... and the first n_long have n_short + 1
-    const int64_t n_max    = n_short + (n_long > 0 ? 1 : 0);
+    const bool    pad      = qwen4exp_qsa_chunk_pad();
+    const int64_t n_max    = pad ? prep.chunk : n_short + (n_long > 0 ? 1 : 0);
 
     GGML_ASSERT(n_chunks > 1 && n_max <= prep.chunk);
     GGML_ASSERT(q_cur->ne[2] == n_tps*n_stream);
@@ -1776,7 +1798,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
 
     int64_t t0 = 0;
     for (int64_t c = 0; c < n_chunks; ++c) {
-        const int64_t nc = n_short + (c < n_long ? 1 : 0);
+        // [TAG_QSA_CHUNK_PAD] full chunks, the last one holding the rest; np = the queries it is scored as
+        const int64_t nc = pad ? std::min(prep.chunk, n_tps - t0) : n_short + (c < n_long ? 1 : 0);
+        const int64_t np = pad ? prep.chunk : nc;
 
         // q is a device node, so a view of it is free. The mask and the bias are graph INPUTS, and
         // ggml_backend_sched puts a view of an input on the input's (CPU) backend and uploads it as a
@@ -1785,35 +1809,61 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
         // pp reserve graph went from 1 to 8 device splits). So their chunk rows are GATHERED on the device
         // from the whole-ubatch copy the scheduler uploads anyway: get_rows of rows t0 .. t0+nc of
         // every stream. f16 -> f32 -> f16 is exact, so the chunk mask holds exactly the input's values.
-        ggml_tensor * rows = ggml_arange(ctx0, (float) t0, (float) (t0 + nc), 1.0f); // [nc]
-        if (n_stream > 1) {
-            rows = ggml_repeat_4d(ctx0, rows, nc, n_stream, 1, 1);
+        ggml_tensor * rows = ggml_arange(ctx0, (float) t0, (float) (t0 + np), 1.0f); // [np]
+        if (np > nc) {
+            // [TAG_QSA_CHUNK_PAD] the padding rows repeat the last query t0 + nc - 1 = n_tps - 1
+            rows = ggml_clamp(ctx0, rows, (float) t0, (float) (n_tps - 1));
         }
-        rows = ggml_cast(ctx0, rows, GGML_TYPE_I32); // [nc, n_stream]
+        if (n_stream > 1) {
+            rows = ggml_repeat_4d(ctx0, rows, np, n_stream, 1, 1);
+        }
+        rows = ggml_cast(ctx0, rows, GGML_TYPE_I32); // [np, n_stream]
 
-        ggml_tensor * q_idx = ggml_view_3d(ctx0, prep.q, prep.q->ne[0], n_idx_h*nc, n_stream,
-                prep.q->nb[1], prep.q->nb[2], t0*n_idx_h*prep.q->nb[1]);
+        ggml_tensor * q_idx = nullptr;
+        if (np > nc) {
+            // [TAG_QSA_CHUNK_PAD] a view would run past the ubatch: gather the rows (each query's n_idx_h heads)
+            q_idx = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, prep.q, prep.q->ne[0]*n_idx_h, n_tps, n_stream), rows);
+            q_idx = ggml_reshape_3d(ctx0, q_idx, prep.q->ne[0], n_idx_h*np, n_stream);
+        } else {
+            q_idx = ggml_view_3d(ctx0, prep.q, prep.q->ne[0], n_idx_h*nc, n_stream,
+                    prep.q->nb[1], prep.q->nb[2], t0*n_idx_h*prep.q->nb[1]);
+        }
         if (!ggml_is_contiguous(q_idx)) {
             // more than one stream interleaves the rows; the Vulkan GEMM wants contiguous batches
             q_idx = ggml_cont(ctx0, q_idx);
         }
 
-        // [n_blocks or n_kv, nc, n_stream] f32
+        // [n_blocks or n_kv, np, n_stream] f32
         ggml_tensor * bias_c = ggml_get_rows(ctx0, bias, rows);
 
-        // [n_kv, nc, 1, n_stream], back in the mask's own type
+        // [n_kv, np, 1, n_stream], back in the mask's own type
         ggml_tensor * mask_c = nullptr;
         if (kq_mask->type == GGML_TYPE_F16 && qwen4exp_qsa_gather_keeps(kq_mask->type)) {
             // [TAG_QSA_GATHER_Q8] gathered as f16 rows, no f32 transient and no cast
-            mask_c = ggml_get_rows_type(ctx0, kq_mask, ggml_reshape_3d(ctx0, rows, nc, 1, n_stream), kq_mask->type);
+            mask_c = ggml_get_rows_type(ctx0, kq_mask, ggml_reshape_3d(ctx0, rows, np, 1, n_stream), kq_mask->type);
         } else {
-            mask_c = ggml_get_rows(ctx0, kq_mask, ggml_reshape_3d(ctx0, rows, nc, 1, n_stream));
+            mask_c = ggml_get_rows(ctx0, kq_mask, ggml_reshape_3d(ctx0, rows, np, 1, n_stream));
             if (kq_mask->type != GGML_TYPE_F32) {
                 mask_c = ggml_cast(ctx0, mask_c, kq_mask->type);
             }
         }
 
         ggml_tensor * top_k = build_qsa_select(prep.inp, prep.pooled, q_idx, bias_c, mask_c, width, prep.blk_bias, il);
+
+        if (np > nc) {
+            // [TAG_QSA_CHUNK_PAD] THE CUT: from here on only the nc real queries exist - the ids and the mask rows
+            // the scan reads are views of their first nc columns, so the padding ids reach no mask, no attention
+            // and no output. The padded selection is renamed so LLAMA_QSA_DUMP_IDS hashes the cut ids instead.
+            ggml_format_name(top_k, "indexer_top_k_pad-%d", il);
+            top_k = ggml_view_4d(ctx0, top_k, width, nc, 1, n_stream, top_k->nb[1], top_k->nb[2], top_k->nb[3], 0);
+            mask_c = ggml_view_4d(ctx0, mask_c, mask_c->ne[0], nc, 1, n_stream, mask_c->nb[1], mask_c->nb[2], mask_c->nb[3], 0);
+            if (!ggml_is_contiguous(top_k)) {
+                // more than one stream: the real columns of each stream are apart
+                top_k  = ggml_cont(ctx0, top_k);
+                mask_c = ggml_cont(ctx0, mask_c);
+            }
+            cb(top_k, "indexer_top_k", il);
+        }
 
         // the attention queries of the chunk, laid out as build_attn_mha splits them into streams
         ggml_tensor * q_att = nullptr;
