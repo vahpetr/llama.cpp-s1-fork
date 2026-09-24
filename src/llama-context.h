@@ -23,6 +23,7 @@ class llama_io_write_i;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
+struct llama_qsa_ids_dump; // [TAG_QSA_DUMP_IDS]
 
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
@@ -332,6 +333,9 @@ private:
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
+
+    // [TAG_QSA_DUMP_IDS] LLAMA_QSA_DUMP_IDS=1: the eval-callback state; null when the knob is off
+    std::shared_ptr<llama_qsa_ids_dump> qsa_ids_dump;
 
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 

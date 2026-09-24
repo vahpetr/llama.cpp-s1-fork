@@ -65,6 +65,106 @@ static const char * sched_prof_ctx_name(llama_context_type ctx_type) {
     return ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main";
 }
 
+// [TAG_QSA_DUMP_IDS] (M4.2b item 5) LLAMA_QSA_DUMP_IDS=1 (default off): the QSA selection of every graph, as one
+// stderr line per (graph, layer)
+//   [qsa-ids] ctx=<main|mtp> g=<graph counter> il=<il> n_tps=<n> width=<w> fnv=<FNV-1a 64 of the i32 ids> first=<id0>
+// so two runs (chunk 256 vs 0, gather q8 vs f32) can be compared on the device: identical selection <=> identical
+// hashes at every (g, il). Installed as the context's eval callback (only if the caller set none), which asks for
+// every tensor named "indexer_top_k-<il>" - the QSA_TOP_K output, or the reshape of the unfused chain's top-k,
+// [width, n_tps, 1, n_stream] i32 - and reads it back after it is computed. A chunked layer (LLAMA_QSA_CHUNK) has
+// one such tensor per chunk; they are hashed as one stream in execution order, which for n_stream = 1 is exactly the
+// byte sequence of the whole ubatch's [width, n_tps] tensor, so chunked and unchunked hashes compare directly
+// (n_stream > 1: the chunk order interleaves streams - compare like with like). Cost: nothing when unset (one static
+// bool at context creation); when set, the scheduler cuts every split at each selection and synchronizes to read
+// it back, which also changes where backend fusions can form - compare runs that BOTH have the dump on.
+static bool llama_qsa_dump_ids_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_DUMP_IDS");
+        return s != nullptr && atoi(s) != 0;
+    }();
+
+    return enabled;
+}
+
+struct llama_qsa_ids_dump {
+    const char * ctx_name = "main";
+    uint64_t graph = 0;          // graphs computed by this context so far
+    bool     open  = false;      // a layer is being accumulated
+    int      il    = -1;
+    int64_t  width = 0;
+    int64_t  n_tps = 0;
+    int32_t  first = 0;
+    uint64_t fnv   = 0;
+    std::vector<uint8_t> buf;
+
+    void flush() {
+        if (open) {
+            fprintf(stderr, "[qsa-ids] ctx=%s g=%llu il=%d n_tps=%lld width=%lld fnv=%016llx first=%d\n", ctx_name,
+                    (unsigned long long) graph, il, (long long) n_tps, (long long) width, (unsigned long long) fnv, first);
+            open = false;
+        }
+    }
+
+    void end_graph() {
+        flush();
+        graph++;
+    }
+
+    // exactly "indexer_top_k-<il>": the views the attention takes of it are auto-named "... (view)" and must not be
+    // hashed a second time
+    static bool is_selection(const ggml_tensor * t) {
+        if (strncmp(t->name, "indexer_top_k-", 14) != 0) {
+            return false;
+        }
+        const char * p = t->name + 14;
+        if (*p == '\0') {
+            return false;
+        }
+        for (; *p; ++p) {
+            if (*p < '0' || *p > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool eval(ggml_tensor * t, bool ask, void * user_data) {
+        if (!is_selection(t)) {
+            return !ask; // ask: not needed; never reached with ask == false for a tensor we did not ask for
+        }
+        if (ask) {
+            return true;
+        }
+        auto * d = (llama_qsa_ids_dump *) user_data;
+        const int t_il = atoi(t->name + 14);
+        if (d->open && t_il != d->il) {
+            d->flush();
+        }
+        if (t->type != GGML_TYPE_I32 || !ggml_is_contiguous(t)) {
+            LLAMA_LOG_WARN("%s: %s is not a contiguous i32 tensor - not hashed\n", __func__, t->name);
+            return true;
+        }
+        if (!d->open) {
+            d->open  = true;
+            d->il    = t_il;
+            d->width = t->ne[0];
+            d->n_tps = 0;
+            d->fnv   = 0xcbf29ce484222325ull; // FNV-1a 64 offset basis
+        }
+        const size_t nb = ggml_nbytes(t);
+        d->buf.resize(nb);
+        ggml_backend_tensor_get(t, d->buf.data(), 0, nb);
+        if (d->n_tps == 0) {
+            memcpy(&d->first, d->buf.data(), sizeof(int32_t));
+        }
+        for (size_t i = 0; i < nb; ++i) {
+            d->fnv = (d->fnv ^ d->buf[i]) * 0x100000001b3ull;
+        }
+        d->n_tps += t->ne[1];
+        return true; // keep computing the split
+    }
+};
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -179,6 +279,20 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    // [TAG_QSA_DUMP_IDS]
+    if (llama_qsa_dump_ids_enabled()) {
+        if (cparams.cb_eval == nullptr) {
+            qsa_ids_dump = std::make_shared<llama_qsa_ids_dump>();
+            qsa_ids_dump->ctx_name    = sched_prof_ctx_name(params.ctx_type);
+            cparams.cb_eval           = llama_qsa_ids_dump::eval;
+            cparams.cb_eval_user_data = qsa_ids_dump.get();
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_DUMP_IDS=1: dumping the QSA selection hashes of the %s context to stderr\n",
+                    __func__, qsa_ids_dump->ctx_name);
+        } else {
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_DUMP_IDS=1 ignored: the caller installed its own eval callback\n", __func__);
+        }
+    }
 
     cparams.ctx_other = nullptr;
 
@@ -2735,6 +2849,12 @@ ggml_status llama_context::graph_compute(
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    // [TAG_QSA_DUMP_IDS] with an eval callback the scheduler computes (and calls back) synchronously, so every
+    // selection of this graph has been hashed by now
+    if (qsa_ids_dump) {
+        qsa_ids_dump->end_graph();
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
