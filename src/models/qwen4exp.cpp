@@ -551,6 +551,45 @@ static bool qwen4exp_qsa_fused_select() {
     return enabled;
 }
 
+// [TAG_QSA_CHUNK] (M4.2) LLAMA_QSA_CHUNK=C > 0 runs the query-dependent half of a QSA layer -
+// indexer score, selection, scan mask and attention - one chunk of at most C queries at a time,
+// inside the attention, and concatenates the chunk outputs along the token axis. The transformer
+// ubatch is not split (that would regroup the recurrent layers' rollback).
+//
+// What it is for: at ub 2048 the per-layer query planes ([n_blocks] and [n_kv] x n_tps: the score
+// GEMM, its relu, the head sums, the scan's fill and mask add, the fused select's scratch) are the
+// compute-buffer watermark. Built chunk after chunk, ggml-alloc frees chunk c's planes before chunk
+// c+1's are placed, so the watermark holds one chunk's planes plus the running output.
+//
+// Shape: n_chunks = ceil(n_tps / C) chunks, balanced to differ by at most one query (2050 at C 256
+// -> 7 x 228 + 2 x 227), so no chunk is small enough to reach the backends' small-N kernels
+// (mul_mat_vec at N <= 8, FA split_k). The scan/gather branch is decided ONCE for the ubatch, with
+// the unchunked rule, and only a scan ubatch is chunked; a gather ubatch (n_tps <= n_kv/(4*width))
+// is small by construction and keeps today's graph. n_tps <= C likewise keeps today's graph, node
+// for node - so decode and every short batch are untouched. Per-chunk routing is M4.3's.
+//
+// Values: 0 = off, else a chunk of at least 64 queries (smaller values are raised to 64: every chunk
+// costs ~40 graph nodes per QSA layer, and below that the chunks reach the small-N kernels anyway).
+// Default 0 = off (QSA plan section 3.3: one A/B knob per change, off until its own gate passes).
+static int64_t qwen4exp_qsa_chunk() {
+    static const int64_t chunk = [] {
+        const char * s = getenv("LLAMA_QSA_CHUNK");
+        const long long v = s ? atoll(s) : 0;
+        if (v > 0 && v < 64) {
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_CHUNK=%lld raised to 64\n", __func__, v);
+        }
+        return (int64_t) (v <= 0 ? 0 : std::max<long long>(v, 64));
+    }();
+
+    return chunk;
+}
+
+// build_attn_qsa's branch rule, shared with the [TAG_QSA_CHUNK] decision so the two cannot drift.
+// flash attention is what keeps the values as rows, so the gather needs it.
+static bool qwen4exp_qsa_use_gather(bool flash_attn, int64_t n_tps, int64_t width, int64_t n_kv) {
+    return flash_attn && 4*n_tps*width < n_kv;
+}
+
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     // [TAG_PLE_HOIST] before anything else touches gf: the CPU-resident PLE gather has to be the
@@ -1089,7 +1128,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_tensor *                           kq_mask,
         int *                                   sections,
         int                                     il,
-        bool                                    cache_only) {
+        bool                                    cache_only,
+        qsa_prep *                              prep) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
     const int64_t idx_dim  = hparams.indexer_head_size;
@@ -1202,10 +1242,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
-    // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-            ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream));
+    q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream);
+
+    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+
+    // [TAG_QSA_CHUNK] the query-independent half is done; the caller runs the selection one query
+    // chunk at a time, next to each chunk's attention (build_qsa_chunked)
+    if (prep) {
+        prep->inp      = inp;
+        prep->pooled   = pooled;
+        prep->q        = q;
+        prep->kq_mask  = kq_mask;
+        prep->width    = width;
+        prep->blk_bias = blk_bias;
+        return nullptr;
+    }
+
+    return build_qsa_select(inp, pooled, q, inp->bias, kq_mask, width, blk_bias, il);
+}
+
+// The query-dependent half of the indexer: score the queries in q against the pooled keys and
+// select `width` cells per query. q is [idx_dim, n_idx_h*n_tps, n_stream]; bias and kq_mask carry
+// the same n_tps queries (the whole ubatch, or one [TAG_QSA_CHUNK] chunk of it).
+ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
+        llm_graph_input_qsa * inp,
+        ggml_tensor *         pooled,
+        ggml_tensor *         q,
+        ggml_tensor *         bias,
+        ggml_tensor *         kq_mask,
+        int64_t               width,
+        bool                  blk_bias,
+        int                   il) {
+    const int64_t n_idx_h  = hparams.indexer_n_head;
+    const int64_t n_blocks = pooled->ne[1];
+    const int64_t n_kv     = inp->cell_blk->ne[0];
+    const int64_t n_tps    = q->ne[1]/n_idx_h;
+    const int64_t n_stream = q->ne[2];
+
+    // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
+    ggml_tensor * score = ggml_mul_mat(ctx0, pooled, q);
     score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
     score = ggml_relu(ctx0, score);
 
@@ -1223,11 +1300,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // one value per block, so it is cheaper to bias here than after the cells are expanded
     if (blk_bias) {
-        score = ggml_add(ctx0, score, inp->bias);
+        score = ggml_add(ctx0, score, bias);
     }
-
-    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
     // [TAG_QSA_FUSED_SELECT] the single-node form. Gated on exactly what the Vulkan topk_qsa
     // pattern needs (blk_bias, i.e. the per-block bias and a matching mask, and an f16 mask - the
@@ -1260,7 +1334,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
         expanded = ggml_add(ctx0, expanded, ggml_reshape_3d(ctx0, mask, n_kv, n_tps, n_stream));
     } else {
-        expanded = ggml_add(ctx0, expanded, inp->bias);
+        expanded = ggml_add(ctx0, expanded, bias);
     }
     cb(expanded, "indexer_score_tokens", il);
 
@@ -1282,7 +1356,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor *             v_cur,
         ggml_tensor *             top_k,
         float                     kq_scale,
-        int                       il) {
+        int                       il,
+        const qsa_prep *          prep) {
     // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
     // has already scored with its own query in build_qsa_top_k, so top_k is unaffected.
     if (inp->self_k_rot) {
@@ -1312,13 +1387,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
+    // [TAG_QSA_CHUNK] the caller has already decided that this ubatch takes the scan branch
+    if (prep) {
+        ggml_tensor * cur = build_qsa_chunked(inp, q_cur, *prep, kq_scale, il);
+        cb(cur, "kqv_out", il);
+
+        if (inp->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        }
+
+        return cur;
+    }
+
     const int64_t width = top_k->ne[0];
     const int64_t n_tps = top_k->ne[1];
     const int64_t n_kv  = mctx_cur->get_n_kv();
 
     // the two costs meet at 2*n_tps*width == n_kv; the margin keeps the windows small enough
     // for the compute buffer of a decode graph. flash attention is what keeps the values as rows
-    ggml_tensor * cur = cparams.flash_attn && 4*n_tps*width < n_kv
+    ggml_tensor * cur = qwen4exp_qsa_use_gather(cparams.flash_attn, n_tps, width, n_kv)
         ? build_qsa_gather(inp, q_cur, top_k, kq_scale, il)
         : build_qsa_scan  (inp, q_cur, top_k, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -1338,10 +1425,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_scan(
         ggml_tensor *             q_cur,
         ggml_tensor *             top_k,
         float                     kq_scale,
-        int                       il) {
+        int                       il,
+        ggml_tensor *             kq_mask_chunk,
+        ggml_tensor *             zeros_chunk) {
     const auto * mctx_cur = inp->mctx;
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    // [TAG_QSA_CHUNK] a query chunk brings its own rows of the mask and a view of its layer's zeros
+    ggml_tensor * kq_mask = kq_mask_chunk ? kq_mask_chunk : inp->get_kq_mask();
 
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
@@ -1355,8 +1445,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_scan(
 
     // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
     // this will be our source of zero values for unmasking top k mask elements
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    ggml_tensor * zeros = zeros_chunk;
+    if (!zeros) {
+        zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        zeros = ggml_fill(ctx0, zeros, 0.0f);
+    }
 
     // modify KQ mask by unmasking elements that are in top_k indices
     // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
@@ -1374,6 +1467,107 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_scan(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     return build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
+}
+
+// [TAG_QSA_CHUNK] the scan branch, one query chunk at a time. For each chunk, in program order:
+// the indexer score and selection of its queries (build_qsa_select over a view of the indexer q and
+// the chunk's rows of the bias and the mask, gathered on the device), then its scan attention
+// (build_qsa_scan over the same mask rows and a view of q_cur), then the running output grows by its
+// rows (a left-deep concat: the copy of the output so far is the price of keeping one chunk's planes
+// live). build_attn_mha expands each chunk's attention and the concat is expanded right after it, so
+// chunk c's nodes all precede chunk c+1's and ggml-alloc can free chunk c's planes before it places
+// chunk c+1's. Live across chunks: the pooled keys, the indexer q, the shared zeros, the running
+// output - and the whole-ubatch mask and bias uploads, which the dense layers keep anyway.
+ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             q_cur,
+        const qsa_prep &          prep,
+        float                     kq_scale,
+        int                       il) {
+    const int64_t n_idx_h  = hparams.indexer_n_head;
+    const int64_t n_stream = prep.q->ne[2];
+    const int64_t n_tps    = prep.q->ne[1]/n_idx_h;
+    const int64_t width    = prep.width;
+
+    const int64_t n_chunks = (n_tps + prep.chunk - 1)/prep.chunk;
+    const int64_t n_short  = n_tps/n_chunks;      // every chunk has n_short or n_short + 1 queries
+    const int64_t n_long   = n_tps%n_chunks;      // ... and the first n_long have n_short + 1
+    const int64_t n_max    = n_short + (n_long > 0 ? 1 : 0);
+
+    GGML_ASSERT(n_chunks > 1 && n_max <= prep.chunk);
+    GGML_ASSERT(q_cur->ne[2] == n_tps*n_stream);
+
+    ggml_tensor * kq_mask = prep.kq_mask;   // [n_kv, n_tps, 1, n_stream]
+    ggml_tensor * bias    = prep.inp->bias; // [n_blocks or n_kv, n_tps, n_stream]
+
+    // one zero source per layer, sized for the longest chunk; each chunk reads a view of it
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, width, n_max, n_stream);
+    zeros = ggml_fill(ctx0, zeros, 0.0f);
+
+    ggml_tensor * out = nullptr;
+
+    int64_t t0 = 0;
+    for (int64_t c = 0; c < n_chunks; ++c) {
+        const int64_t nc = n_short + (c < n_long ? 1 : 0);
+
+        // q is a device node, so a view of it is free. The mask and the bias are graph INPUTS, and
+        // ggml_backend_sched puts a view of an input on the input's (CPU) backend and uploads it as a
+        // split input of its own: nine [n_kv, nc] uploads per layer, all placed at the start of their
+        // split, which breaks the one-chunk-live lifetime and multiplies the splits (measured: the
+        // pp reserve graph went from 1 to 8 device splits). So their chunk rows are GATHERED on the device
+        // from the whole-ubatch copy the scheduler uploads anyway: get_rows of rows t0 .. t0+nc of
+        // every stream. f16 -> f32 -> f16 is exact, so the chunk mask holds exactly the input's values.
+        ggml_tensor * rows = ggml_arange(ctx0, (float) t0, (float) (t0 + nc), 1.0f); // [nc]
+        if (n_stream > 1) {
+            rows = ggml_repeat_4d(ctx0, rows, nc, n_stream, 1, 1);
+        }
+        rows = ggml_cast(ctx0, rows, GGML_TYPE_I32); // [nc, n_stream]
+
+        ggml_tensor * q_idx = ggml_view_3d(ctx0, prep.q, prep.q->ne[0], n_idx_h*nc, n_stream,
+                prep.q->nb[1], prep.q->nb[2], t0*n_idx_h*prep.q->nb[1]);
+        if (!ggml_is_contiguous(q_idx)) {
+            // more than one stream interleaves the rows; the Vulkan GEMM wants contiguous batches
+            q_idx = ggml_cont(ctx0, q_idx);
+        }
+
+        // [n_blocks or n_kv, nc, n_stream] f32
+        ggml_tensor * bias_c = ggml_get_rows(ctx0, bias, rows);
+
+        // [n_kv, nc, 1, n_stream], back in the mask's own type
+        ggml_tensor * mask_c = ggml_get_rows(ctx0, kq_mask, ggml_reshape_3d(ctx0, rows, nc, 1, n_stream));
+        if (kq_mask->type != GGML_TYPE_F32) {
+            mask_c = ggml_cast(ctx0, mask_c, kq_mask->type);
+        }
+
+        ggml_tensor * top_k = build_qsa_select(prep.inp, prep.pooled, q_idx, bias_c, mask_c, width, prep.blk_bias, il);
+
+        // the attention queries of the chunk, laid out as build_attn_mha splits them into streams
+        ggml_tensor * q_att = nullptr;
+        if (n_stream == 1) {
+            q_att = ggml_view_3d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], nc,
+                    q_cur->nb[1], q_cur->nb[2], t0*q_cur->nb[2]);
+        } else {
+            q_att = ggml_view_4d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], nc, n_stream,
+                    q_cur->nb[1], q_cur->nb[2], n_tps*q_cur->nb[2], t0*q_cur->nb[2]);
+            q_att = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q_att), q_cur->ne[0], q_cur->ne[1], nc*n_stream);
+        }
+
+        ggml_tensor * zeros_c = ggml_view_4d(ctx0, zeros, 1, width, nc, n_stream,
+                zeros->nb[1], zeros->nb[2], zeros->nb[3], 0);
+
+        // [n_embd_head_v*n_head, nc*n_stream], stream-major
+        ggml_tensor * o = build_qsa_scan(inp, q_att, top_k, kq_scale, il, mask_c, zeros_c);
+        o = ggml_reshape_3d(ctx0, o, o->ne[0], nc, n_stream);
+
+        out = out ? ggml_concat(ctx0, out, o, 1) : o;
+        ggml_build_forward_expand(gf, out);
+
+        t0 += nc;
+    }
+
+    GGML_ASSERT(t0 == n_tps);
+
+    return ggml_reshape_2d(ctx0, out, out->ne[0], n_tps*n_stream);
 }
 
 // Key and value traffic follows the budget instead of the whole cache. The queries ride the
@@ -1464,7 +1658,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         qsa_exhaustive = width == n_kv_idx;
     }
 
-    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, qsa_exhaustive) : nullptr;
+    // [TAG_QSA_CHUNK] chunk a scan ubatch that is longer than the chunk; the branch is decided here,
+    // once for the ubatch, with build_attn_qsa's own rule over the same n_tps, width and n_kv
+    qsa_prep prep;
+    bool     chunked = false;
+
+    if (qsa && !qsa_exhaustive && qwen4exp_qsa_chunk() > 0) {
+        const int64_t n_stream = mctx_hyb->get_n_stream();
+        const int64_t n_tps    = n_tokens/n_stream;
+        const int64_t n_kv_idx = mctx_hyb->get_idx()->get_n_kv();
+        const int64_t width    = std::min<int64_t>(n_kv_idx, (int64_t) hparams.indexer_top_k + (int64_t) qsa_ratio - 1);
+
+        chunked = n_tps > qwen4exp_qsa_chunk() &&
+            !qwen4exp_qsa_use_gather(cparams.flash_attn, n_tps, width, inp->mctx->get_n_kv());
+        prep.chunk = qwen4exp_qsa_chunk();
+    }
+
+    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, qsa_exhaustive,
+            chunked ? &prep : nullptr) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
@@ -1516,7 +1727,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    if (top_k) {
+    if (chunked) {
+        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, nullptr, kq_scale, il, &prep);
+    } else if (top_k) {
         cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, kq_scale, il);
     } else {
         cur = build_attn(inp,

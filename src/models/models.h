@@ -2321,7 +2321,20 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
-        // dense self-attention restricted to the cells that top_k names
+        // [TAG_QSA_CHUNK] what build_qsa_top_k hands the query-chunked attention instead of a
+        // selection: the query-independent half of the indexer, computed once per layer
+        struct qsa_prep {
+            llm_graph_input_qsa * inp      = nullptr;
+            ggml_tensor *         pooled   = nullptr; // [idx_dim, n_blocks, n_stream]
+            ggml_tensor *         q        = nullptr; // [idx_dim, n_idx_h*n_tps, n_stream]
+            ggml_tensor *         kq_mask  = nullptr; // [n_kv, n_tps, 1, n_stream]
+            int64_t               width    = 0;
+            bool                  blk_bias = false;
+            int64_t               chunk    = 0;       // LLAMA_QSA_CHUNK
+        };
+
+        // dense self-attention restricted to the cells that top_k names; with prep (and no
+        // top_k) the selection is made chunk by chunk inside the attention [TAG_QSA_CHUNK]
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
@@ -2329,13 +2342,25 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * v_cur,
                     ggml_tensor * top_k,
                           float   kq_scale,
-                            int   il);
+                            int   il,
+                 const qsa_prep * prep = nullptr);
 
-        // attention over the whole window, masked down to the selection
+        // attention over the whole window, masked down to the selection. A query chunk passes
+        // its own rows of the KQ mask and a view of its layer's zero source [TAG_QSA_CHUNK].
         ggml_tensor * build_qsa_scan(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * top_k,
+                          float   kq_scale,
+                            int   il,
+                    ggml_tensor * kq_mask_chunk = nullptr,
+                    ggml_tensor * zeros_chunk   = nullptr);
+
+        // [TAG_QSA_CHUNK] the scan branch one query chunk at a time, outputs concatenated
+        ggml_tensor * build_qsa_chunked(
+        llm_graph_input_attn_kv * inp,
+                    ggml_tensor * q_cur,
+                 const qsa_prep & prep,
                           float   kq_scale,
                             int   il);
 
@@ -2362,7 +2387,19 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * kq_mask,
                             int * sections,
                             int   il,
-                           bool   cache_only);
+                           bool   cache_only,
+                       qsa_prep * prep = nullptr);
+
+        // the query-dependent half of build_qsa_top_k: score + select for the queries in q
+        ggml_tensor * build_qsa_select(
+            llm_graph_input_qsa * inp,
+                    ggml_tensor * pooled,
+                    ggml_tensor * q,
+                    ggml_tensor * bias,
+                    ggml_tensor * kq_mask,
+                        int64_t   width,
+                           bool   blk_bias,
+                            int   il);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
