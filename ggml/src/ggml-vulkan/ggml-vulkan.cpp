@@ -12020,6 +12020,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             GGML_ASSERT(dst->type == GGML_TYPE_I32);
             return ctx->device->pipeline_get_rows[src0->type];
         }
+        if (dst->type == GGML_TYPE_Q8_0 && src0->type == GGML_TYPE_Q8_0) {
+            // [TAG_QSA_GATHER_Q8] whole q8_0 rows, copied as 4-byte words by the i32 gather
+            // (ggml_vk_get_rows passes the shape in words; supports_op admits word-aligned rows only)
+            return ctx->device->pipeline_get_rows[GGML_TYPE_I32];
+        }
         if (dst->type == GGML_TYPE_F16) {
             return ctx->device->pipeline_get_rows[src0->type];
         }
@@ -13264,6 +13269,29 @@ static void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = ggml_type_size(src1->type);
     const uint32_t dst_type_size = ggml_type_size(dst->type);
+
+    if (dst->type == GGML_TYPE_Q8_0 && src0->type == GGML_TYPE_Q8_0) {
+        // [TAG_QSA_GATHER_Q8] ggml_get_rows_type(a, b, GGML_TYPE_Q8_0): a row copy. The i32 gather
+        // shader copies uint elements, so src0/dst are described in 4-byte WORDS: a row of ne00
+        // values is ggml_row_size/4 words and every byte stride is divided by 4 (supports_op only
+        // admits word-aligned rows and strides; a 512-value cell is 16 blocks = 544 B = 136 words).
+        // The dispatch is still sized from src0->ne[0] values (ggml_vk_op_f32), which is always
+        // more threads than words (17/64 words per value); the shader drops i00 >= ne00.
+        // The misalignment offsets would be in the wrong unit here, so they must be zero.
+        GGML_ASSERT(get_misalign_bytes(ctx, src0) == 0 && get_misalign_bytes(ctx, dst) == 0);
+        const uint32_t w = 4;
+        const uint32_t row_words = (uint32_t)(ggml_row_size(src0->type, src0->ne[0]) / w);
+        GGML_ASSERT(row_words * w == ggml_row_size(src0->type, src0->ne[0]));
+        ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GET_ROWS, {
+            (uint32_t)(ggml_nbytes(src0) / w),
+            row_words, (uint32_t)src0->ne[1], (uint32_t)src0->ne[2], (uint32_t)src0->ne[3], 1, (uint32_t)(src0->nb[1] / w), (uint32_t)(src0->nb[2] / w), (uint32_t)(src0->nb[3] / w),
+            (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
+            row_words, (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], (uint32_t) dst->ne[3], 1, (uint32_t)( dst->nb[1] / w), (uint32_t)( dst->nb[2] / w), (uint32_t)( dst->nb[3] / w),
+            0,
+            0.0f, 0.0f, 0,
+        });
+        return;
+    }
 
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GET_ROWS, {
         (uint32_t)ggml_nelements(src0),
@@ -20562,6 +20590,24 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_GET_ROWS:
             {
+                if (op->type == GGML_TYPE_Q8_0) {
+                    // [TAG_QSA_GATHER_Q8] the type-preserving q8_0 gather (ggml_get_rows_type) is a
+                    // 4-byte word copy of whole rows: the row and every stride must be word multiples
+                    // (an even number of 34-byte blocks - the QSA cell is 16)
+                    const ggml_tensor * a = op->src[0];
+                    if (a->type != GGML_TYPE_Q8_0 || ggml_row_size(a->type, a->ne[0]) % 4 != 0) {
+                        return false;
+                    }
+                    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                        if (a->nb[i] % 4 != 0 || op->nb[i] % 4 != 0) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16 && op->type != GGML_TYPE_I32) {
+                    return false;
+                }
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -21831,7 +21877,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
         } else if (tensor->op == GGML_OP_TRANSPOSE) {
             tensor_clone = ggml_transpose(ggml_ctx, src_clone[0]);
         } else if (tensor->op == GGML_OP_GET_ROWS) {
-            tensor_clone = ggml_get_rows(ggml_ctx, src_clone[0], src_clone[1]);
+            tensor_clone = tensor->type == src_clone[0]->type && tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_I32
+                ? ggml_get_rows_type(ggml_ctx, src_clone[0], src_clone[1], tensor->type)  // [TAG_QSA_GATHER_Q8]
+                : ggml_get_rows(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_ARGSORT) {
             tensor_clone = ggml_argsort(ggml_ctx, src_clone[0], (ggml_sort_order) *(int *)tensor->op_params);
         } else if (tensor->op == GGML_OP_TOP_K) {
