@@ -11612,6 +11612,39 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     return supported;
 }
 
+// dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride - when this FA
+// node does that. [TAG_QSA_SCRATCH] (M4.2b item 4) one definition for ggml_vk_flash_attn and the prealloc_x presize
+// hint walk (ggml_vk_qsa_scratch_hint), so the two cannot drift; the expression is the one ggml_vk_flash_attn had.
+static bool ggml_vk_fa_use_dequant_kv(const ggml_backend_vk_context * ctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v) {
+    auto is_dense_kv_cache = [](const ggml_tensor * t) {
+        return t->nb[0] == ggml_type_size(t->type) &&
+               t->nb[2] == ggml_row_size(t->type, t->ne[0]) &&
+               t->nb[1] == t->nb[2] * t->ne[2] &&
+               (t->ne[3] == 1 || t->nb[3] == t->nb[1] * t->ne[1]);
+    };
+    const uint32_t neq1 = (uint32_t) q->ne[1];
+    const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
+    const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
+    return k_quant && v_quant && neq1 >= 64 &&
+           is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
+           (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
+           (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
+           ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
+           ctx->device->pipeline_dequant_transpose[v->type] != nullptr &&
+           // coopmat2 path does not benefit from the f16 scratch
+           !ctx->device->coopmat2 &&
+           // Intel Xe1 regresses, see PR 25494
+           (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
+            (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
+}
+
+// [TAG_QSA_SCRATCH] (M4.2b item 4) bytes of that f16 K/V staging in prealloc_x
+static size_t ggml_vk_fa_dequant_staging_bytes(const ggml_tensor * k, const ggml_tensor * v) {
+    return (size_t) (ggml_nelements(k) + ggml_nelements(v)) * sizeof(ggml_fp16_t);
+}
+
+static bool vk_qsa_scratch_presize_enabled();
+
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -11672,25 +11705,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16;
 
     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
-    auto is_dense_kv_cache = [](const ggml_tensor * t) {
-        return t->nb[0] == ggml_type_size(t->type) &&
-               t->nb[2] == ggml_row_size(t->type, t->ne[0]) &&
-               t->nb[1] == t->nb[2] * t->ne[2] &&
-               (t->ne[3] == 1 || t->nb[3] == t->nb[1] * t->ne[1]);
-    };
-    const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
-    const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
-    const bool use_dequant_kv = k_quant && v_quant && neq1 >= 64 &&
-                                is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
-                                (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
-                                (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
-                                ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
-                                ctx->device->pipeline_dequant_transpose[v->type] != nullptr &&
-                                // coopmat2 path does not benefit from the f16 scratch
-                                !ctx->device->coopmat2 &&
-                                // Intel Xe1 regresses, see PR 25494
-                                (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
-                                 (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
+    // ([TAG_QSA_SCRATCH] M4.2b: the condition lives in ggml_vk_fa_use_dequant_kv so the presize hint walk shares it)
+    const bool use_dequant_kv = ggml_vk_fa_use_dequant_kv(ctx, q, k, v);
     const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;
     const ggml_type v_type_eff = use_dequant_kv ? GGML_TYPE_F16 : v->type;
 
@@ -11940,7 +11956,27 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * fp;
         const uint64_t v_f16_sz = (uint64_t)ggml_nelements(v) * fp;
         if (ctx->prealloc_size_x < k_f16_sz + v_f16_sz) {
-            ctx->prealloc_size_x = k_f16_sz + v_f16_sz;
+            size_t want = k_f16_sz + v_f16_sz;
+            if (vk_qsa_scratch_presize_enabled()) {
+                // [TAG_QSA_SCRATCH] (M4.2b item 4) prealloc_x is shared, and this staging (n_kv x 2 KiB per QSA-profile
+                // layer) is its other big tenant: it crossed M2.2's QSA-only presize at n_kv ~ 87k and then grew
+                // exact-fit by 4 MiB on every prefill ubatch (64 x_size lines per 213k). Under the knob it takes the
+                // same policy as the QSA scratch: straight to the reserve hint (which now includes this term at the
+                // reserve's n_kv, i.e. the --kv-graph-span extent), geometric (x1.25) past it, within one binding.
+                const size_t range_cap = (size_t) ctx->device->properties.limits.maxStorageBufferRange;
+                want = std::max(want, std::min(ctx->prealloc_size_qsa_hint, range_cap));
+                const size_t geometric = ctx->prealloc_size_x + ctx->prealloc_size_x / 4;
+                if (geometric > want && geometric <= range_cap) {
+                    want = geometric;
+                }
+                GGML_LOG_INFO("ggml_vulkan: FA staging %s prealloc_x: %s -> %s (hint (max seen) %s; trigger n_kv=%u N=%u = %s)\n",
+                              ctx->prealloc_x_qsa_presized ? "GREW" : "presized",
+                              format_size(ctx->prealloc_size_x).c_str(), format_size(want).c_str(),
+                              format_size(ctx->prealloc_size_qsa_hint).c_str(), KV, N,
+                              format_size(k_f16_sz + v_f16_sz).c_str());
+                ctx->prealloc_x_qsa_presized = true;
+            }
+            ctx->prealloc_size_x = want;
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
         vk_pipeline tr_k = ctx->device->pipeline_dequant_transpose[k->type];
@@ -15051,7 +15087,14 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 // off the fused select is byte-for-byte the code that shipped.
 // Presumes a --kv-graph-span well under maxStorageBufferRange: with the span at its default 0 the
 // hint is n_ctx-sized and can exceed what one binding covers, which the range guard below catches.
+// M4.2b item 4: the hint (ggml_vk_qsa_scratch_hint) is
+//   max( n_kv * n_tps * n_stream * 4       over every QSA select      (the fused-select scratch),
+//        (nelements(K) + nelements(V)) * 2 over every FA node that dequantizes K/V to f16 (the FA staging) )
+// on the graphs seen so far - first the reserve graphs, so n_kv = min(padded --kv-graph-span, cache size) - and
+// BOTH tenants (the QSA dispatch and ggml_vk_flash_attn's staging request) presize to it and grow geometrically
+// (x1.25) past it. At span 196608 / chunk 256: max(179 306 496, 402 653 184) = 384 MiB, one growth past the span.
 static const bool vk_qsa_scratch_presize = ggml_vk_env_bool("GGML_VK_QSA_SCRATCH_PRESIZE", false);
+static bool vk_qsa_scratch_presize_enabled() { return vk_qsa_scratch_presize; }
 
 // Bytes the fused select's gather scratch needs: n_kv * n_tps * n_stream * 4, i.e. one float per
 // (row, key). One definition for all three callers below - the pattern dispatch, the op dispatch
@@ -19794,6 +19837,22 @@ static void ggml_vk_qsa_scratch_hint(ggml_backend_vk_context * ctx, const struct
     // GGML_OP_QSA_TOP_K node, which needs the SAME scratch (ggml_vk_qsa_scratch_bytes is one
     // definition for both). Walked first and unconditionally: the op is not a fusion, so
     // GGML_VK_DISABLE_FUSION_PATTERNS must not turn its scratch hint off.
+    // [TAG_QSA_SCRATCH] (M4.2b item 4) the hint is max(QSA fused-select scratch, FA q8_0->f16 K/V staging): the
+    // staging shares prealloc_x (ggml_vk_flash_attn) and outgrows the QSA scratch at the chunked shapes (n_kv x 2 KiB
+    // vs n_kv x chunk x 4 B per QSA layer). Taken from the graphs this hook sees, i.e. first from the reserve graphs,
+    // whose n_kv is init_full()'s min(padded --kv-graph-span, cache size) - never the whole pool when a span is set
+    // (with --kv-graph-span 0 the reserve IS the pool, as for the QSA term). Walked before the QSA forms below,
+    // which return early.
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
+        if (ggml_vk_fa_use_dequant_kv(ctx, node->src[0], node->src[1], node->src[2])) {
+            ctx->prealloc_size_qsa_hint = std::max(ctx->prealloc_size_qsa_hint,
+                                                   ggml_vk_fa_dequant_staging_bytes(node->src[1], node->src[2]));
+        }
+    }
     bool saw_op = false;
     for (int i = 0; i < graph->n_nodes; ++i) {
         if (graph->nodes[i]->op != GGML_OP_QSA_TOP_K) {
