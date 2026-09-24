@@ -1084,9 +1084,13 @@ void llama_memory_hybrid_idx_context::qsa_fill_bias(
 // [TAG_QSA_POOLED_CACHE] the pooled-key cache: plan, inputs, publication
 //
 
-static inline uint64_t qsa_mix(uint64_t h, uint64_t v) {
-    // splitmix64 finaliser over (h ^ v)
-    uint64_t z = h ^ (v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2));
+// the block stamp: every value folded in order by a multiply-add (cheap: n_blocks x ~20 values per graph),
+// then one splitmix64 finaliser per block
+static inline uint64_t qsa_fold(uint64_t h, uint64_t v) {
+    return (h ^ v) * 0x100000001b3ull + 0x9e3779b97f4a7c15ull;
+}
+
+static inline uint64_t qsa_mix(uint64_t z) {
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
     return z ^ (z >> 31);
@@ -1188,24 +1192,22 @@ int64_t llama_memory_hybrid_idx_context::qsa_store_plan(const llama_ubatch & uba
         for (int32_t b = 0; b < n_bid; ++b) {
             const int32_t * mem_cells = cur_blk_cells + b*r;
 
-            uint64_t h = qsa_mix(0x51534150u /* "QSAP" */, g);
-            h = qsa_mix(h, (uint64_t) r);
-            h = qsa_mix(h, cs.ranked ? 1 : 0);
+            uint64_t h = qsa_fold(0x51534150u /* "QSAP" */, ((uint64_t) g << 32) | ((uint64_t) r << 1) | (cs.ranked ? 1 : 0));
 
             for (int64_t k = 0; k < r; ++k) {
                 const int32_t c = mem_cells[k];
                 const auto &  e = cells.ext_get(c);
 
-                h = qsa_mix(h, (uint32_t) c);
-                h = qsa_mix(h, ss.gen[c]);
-                h = qsa_mix(h, (uint32_t) cells.pos_get(c));
-                h = qsa_mix(h, ((uint64_t) (uint32_t) e.x << 32) | (uint32_t) e.y);
+                h = qsa_fold(h, ((uint64_t) (uint32_t) c << 32) | ss.gen[c]);
+                h = qsa_fold(h, (uint32_t) cells.pos_get(c));
+                h = qsa_fold(h, ((uint64_t) (uint32_t) e.x << 32) | (uint32_t) e.y);
             }
 
             for (int64_t sec = 0; sec < 4; ++sec) {
-                h = qsa_mix(h, (uint32_t) pl.blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b]);
+                h = qsa_fold(h, (uint32_t) pl.blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b]);
             }
 
+            h = qsa_mix(h);
             h = h == 0 ? 1 : h;   // 0 is "invalid"
 
             stamps[s][b] = h;
