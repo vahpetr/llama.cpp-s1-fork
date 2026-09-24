@@ -188,7 +188,8 @@ struct kl_divergence_result {
     size_t count            = 0.0;
 };
 
-static std::pair<double, float> log_softmax(int n_vocab, const float * logits, const uint16_t * base_log_prob, int tok, kl_divergence_result & kld) {
+static std::pair<double, float> log_softmax(int n_vocab, const float * logits, const uint16_t * base_log_prob, int tok, kl_divergence_result & kld,
+        uint8_t * same_top = nullptr) {
     float max_logit = logits[0];
     int imax = 0;
     for (int i = 1; i < n_vocab; ++i) {
@@ -238,6 +239,9 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
     if (imax == imax_base) {
         ++kld.n_same_top;
     }
+    if (same_top) {
+        *same_top = imax == imax_base;
+    }
 
     const float p_base = expf(-nll_base);
     const float p = expf(-nll);
@@ -253,11 +257,11 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
 
 static void process_logits(int n_vocab, const float * logits, const int * tokens, int n_token,
         std::vector<std::thread> & workers, const std::vector<uint16_t> & base_log_probs, kl_divergence_result & kld,
-        float * kld_values, float * p_diff_values) {
+        float * kld_values, float * p_diff_values, uint8_t * same_top = nullptr) {
     std::mutex mutex;
     const int nv = 2*((n_vocab + 1)/2) + 4;
     int counter = 0;
-    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values] () {
+    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values, same_top] () {
         kl_divergence_result local_kld;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
@@ -279,7 +283,8 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 break;
             }
             lock.unlock();
-            std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs.data() + size_t(i)*nv, tokens[i+1], local_kld);
+            std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs.data() + size_t(i)*nv, tokens[i+1], local_kld,
+                    same_top ? same_top + i : nullptr);
             kld_values[i]    = (float)v.first;
             p_diff_values[i] = v.second;
         }
@@ -1791,6 +1796,23 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     const int first = n_ctx/2;
 
+    // LLAMA_KLD_DUMP=<path> (default off): one CSV row per scored position, `chunk,pos,kld,top1_same`; pos is the
+    // chunk position of the scored logit (first .. n_ctx - 2, it predicts token pos + 1), chunk counts from 1
+    std::ofstream kld_dump;
+    std::vector<uint8_t> same_top;
+    if (const char * dump = getenv("LLAMA_KLD_DUMP"); dump != nullptr && *dump) {
+        kld_dump.open(dump);
+        if (!kld_dump) {
+            LOG_ERR("%s: LLAMA_KLD_DUMP: cannot open %s\n", __func__, dump);
+            llama_batch_free(batch);
+            return;
+        }
+        kld_dump.precision(9);
+        kld_dump << "chunk,pos,kld,top1_same\n";
+        same_top.resize(n_ctx - 1 - first);
+        LOG_INF("%s: LLAMA_KLD_DUMP: per-position KLD to %s\n", __func__, dump);
+    }
+
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
         const int end   = start + n_ctx;
@@ -1869,7 +1891,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
-                    workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
+                    workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr, kld_dump.is_open() ? same_top.data() : nullptr);
+            for (int j = 0; kld_dump.is_open() && j < n_ctx - 1 - first; ++j) {
+                kld_dump << i + seq + 1 << ',' << first + j << ',' << kld_ptr[j] << ',' << (int) same_top[j] << '\n';
+            }
             p_diff_ptr += n_ctx - 1 - first;
             kld_ptr    += n_ctx - 1 - first;
 
