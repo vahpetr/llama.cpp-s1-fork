@@ -1136,6 +1136,16 @@ public:
             // [TAG_QSA_POOLED_CACHE] the dirty list's capacity is part of the topology: plan this ubatch
             // (the plan is cached, so the build and set_input see the same one). cap == n_blocks is the
             // full pool, which has no remap.
+            //
+            // Contract: qsa_store_plan is a const-context call that MUTATES the memory's (mutable) store - its
+            // pass 2 commits slot assignments (new blocks take free slots, vanished blocks free theirs, dirty
+            // slots drop to stamp 0) here, during can_reuse, before it is known whether this graph is reused
+            // or rebuilt. That is safe because (1) the plan is cached per ubatch (i_cur, ratio, n_kv, blk_bias),
+            // so the build and set_input_qsa_store reuse this very plan instead of planning again; (2) no stamp
+            // becomes valid here - the new stamps stay pending until set_input_qsa_store arms them and
+            // qsa_store_publish commits them after the graph ran; (3) a plan whose graph never carries the store
+            // update (a cache-only rebuild) is dropped unarmed, and its dirty slots are already at stamp 0, so
+            // the next plan simply pools them again.
             res &= remap == nullptr || remap->ne[0] == n_blocks*n_stream;
 
             if (res && params.ubatch.n_tokens % n_stream == 0) {
@@ -1401,9 +1411,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_format_name(st, "indexer_k_store-%d", il);
 
             if (n_stream == 1) {
-                // the selection reads the rows it just stored (an f32 copy: the same bits), so the chain is pulled
-                // into the graph where the recompute's is - at its first consumer - and `fresh` dies at the copy
-                pooled = st;
+                // the selection reads the rows it just stored (f32 copies: the same bits), so the chain is pulled
+                // into the graph where the recompute's is - at its first consumer - and `fresh` dies at the copy.
+                // The read is a real tensor (ggml_cont of the store view), not the view itself: it is the full-pool
+                // twin of the remap get_rows output of every run-time graph with cap < n_blocks - same shape, same
+                // lifetime across the [TAG_QSA_CHUNK] chunks - so the reserve (always the full pool) holds every
+                // tensor a run-time graph holds, with pooling planes at least as large (M3 fix round 1: with the
+                // bare view the reserve lacked this plane and the buffer regrew inside the graph span).
+                pooled = ggml_cont(ctx0, st);
             } else {
                 // the store view skips the other streams' rows between batches: keep the contiguous rows for the
                 // GEMM and expand the copy on its own
