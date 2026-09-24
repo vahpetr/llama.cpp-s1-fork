@@ -624,6 +624,11 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    // [TAG_QSA_INDEXED_FA] kv ids (src[5]) are fork-only: a backend without the flag would ignore them and run dense
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5] != NULL &&
+        (device->reg == NULL || ggml_backend_reg_get_proc_address(device->reg, "ggml_backend_fa_kv_ids") == NULL)) {
+        return false;
+    }
     return device->iface.supports_op(device, op);
 }
 

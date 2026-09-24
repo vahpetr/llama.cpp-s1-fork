@@ -5586,6 +5586,19 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_kv_ids(
+        struct ggml_tensor * a,
+        struct ggml_tensor * ids) {
+    if (!ids) { a->src[5] = NULL; return; }
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT && a->src[5] == NULL);
+    const struct ggml_tensor * q = a->src[0], * k = a->src[1], * mask = a->src[3];
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids));
+    GGML_ASSERT(ids->ne[0] >= 1 && ids->ne[0] <= k->ne[1]);
+    GGML_ASSERT(ids->ne[1] == q->ne[1] && ids->ne[2] == 1 && ids->ne[3] == q->ne[3]);
+    GGML_ASSERT(!mask || (mask->ne[0] == k->ne[1] && mask->ne[2] == 1));
+    a->src[5] = ids;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

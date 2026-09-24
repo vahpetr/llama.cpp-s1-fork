@@ -2492,6 +2492,14 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // [TAG_QSA_INDEXED_FA] fork-only: a per-query KV cell list as src[5]; NULL = dense (node unchanged).
+    //   ids: [W, n_batch, 1, ne3] I32, contiguous, W <= n_kv; row (t, s) names the cells query t of stream s attends,
+    //   unique within the row, each in [0, n_kv). K, V and the mask are read at those cells (mask[t, ids[c, t, 0, s]]);
+    //   a cell whose mask is -inf is dead. Backends not exporting "ggml_backend_fa_kv_ids" refuse the node.
+    GGML_API void ggml_flash_attn_ext_set_kv_ids(
+            struct ggml_tensor * a,
+            struct ggml_tensor * ids);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
