@@ -521,20 +521,20 @@ static bool qwen4exp_qsa_bypass_exhaustive() {
 }
 
 // [TAG_QSA_MIN_KV] (M5.0) LLAMA_QSA_MIN_KV=N > 0 widens [TAG_QSA_BYPASS_EXHAUSTIVE] into a depth threshold: a
-// ubatch whose indexer n_kv (the padded window, the same n_kv the budget width = min(n_kv, indexer_top_k + r - 1)
-// is taken over) is below N runs the dense build_attn(), exactly as an exhaustive one does - the indexer K write
+// ubatch whose sequence depth (M5.0b: its deepest sequence's pos + 1, qwen4exp_qsa_depth; M5.0 compared the pool's
+// indexer n_kv) is below N runs the dense build_attn(), exactly as an exhaustive one does - the indexer K write
 // (cache_only) stays, so the history is complete for the first ubatch at n_kv >= N; no selection, no QSA mask, no
 // pooled-store plan (the store's plan is stamp-based and stateless across bypassed ubatches: every block written
 // meanwhile has no valid stamp and is pooled by the first plan above N, llama-memory-hybrid-idx.cpp qsa_store_plan).
-// The decision is per ubatch over its n_kv after apply (which includes the ubatch's own cells), as for the budget:
-// a prefill ubatch that straddles N runs QSA whole. Independent of LLAMA_QSA_BYPASS_EXHAUSTIVE.
+// The decision is per ubatch over its depth including the ubatch's own tokens: a prefill ubatch that straddles N
+// runs QSA whole. Independent of LLAMA_QSA_BYPASS_EXHAUSTIVE.
 // Read once, logged at the first graph build (the reserve). Default 0 = off, today's graph node for node.
 static int64_t qwen4exp_qsa_min_kv() {
     static const int64_t min_kv = [] {
         const char * s = getenv("LLAMA_QSA_MIN_KV");
         const long long v = s ? atoll(s) : 0;
         if (v > 0) {
-            LLAMA_LOG_INFO("qwen4exp_qsa_min_kv: LLAMA_QSA_MIN_KV=%lld: QSA layers run dense attention while the indexer n_kv < %lld\n", v, v);
+            LLAMA_LOG_INFO("qwen4exp_qsa_min_kv: LLAMA_QSA_MIN_KV=%lld: QSA layers run dense attention while the ubatch's sequence depth < %lld\n", v, v);
         }
         return (int64_t) (v > 0 ? v : 0);
     }();
@@ -542,10 +542,31 @@ static int64_t qwen4exp_qsa_min_kv() {
     return min_kv;
 }
 
-// the dense-path decision of a QSA layer: the exhaustive bypass ([TAG_QSA_BYPASS_EXHAUSTIVE]) or below
-// LLAMA_QSA_MIN_KV ([TAG_QSA_MIN_KV]); shared by build_layer_attn and llm_graph_input_qsa::can_reuse
-static bool qwen4exp_qsa_dense(int64_t n_kv_idx, int64_t width) {
-    return (qwen4exp_qsa_bypass_exhaustive() && width == n_kv_idx) || n_kv_idx < qwen4exp_qsa_min_kv();
+// [TAG_QSA_MIN_KV] (M5.0b) the depth LLAMA_QSA_MIN_KV compares is the SEQUENCE's, not the pool's: under
+// --kv-unified the indexer n_kv is the pool's high-water cell, so one deep resident sequence would put every other
+// sequence "above N". The depth of a ubatch is that of its deepest sequence, max over its tokens of pos + 1 = the
+// sequence's n_past + its tokens in this ubatch (ubatch.pos[0..n_tokens) is the sequential row, the temporal one
+// under M-RoPE). A ubatch that mixes a sequence above N with ones below stays QSA (one graph; each row selects
+// among its own visible cells). A full (reserve) context has no real positions: it keeps the pool n_kv, so the
+// reserve is today's worst case.
+static int64_t qwen4exp_qsa_depth(const llama_memory_hybrid_idx_context * mctx_hyb, const llama_ubatch & ubatch, int64_t n_kv_idx) {
+    if (mctx_hyb->is_full()) {
+        return n_kv_idx;
+    }
+
+    llama_pos p_max = -1;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        p_max = std::max(p_max, ubatch.pos[i]);
+    }
+
+    return (int64_t) p_max + 1;
+}
+
+// the dense-path decision of a QSA layer: the exhaustive bypass ([TAG_QSA_BYPASS_EXHAUSTIVE], over the pool n_kv
+// the budget width is taken over) or the ubatch's sequence depth below LLAMA_QSA_MIN_KV ([TAG_QSA_MIN_KV]);
+// shared by build_layer_attn and llm_graph_input_qsa::can_reuse
+static bool qwen4exp_qsa_dense(int64_t n_kv_idx, int64_t width, int64_t depth) {
+    return (qwen4exp_qsa_bypass_exhaustive() && width == n_kv_idx) || depth < qwen4exp_qsa_min_kv();
 }
 
 // [TAG_QSA_FUSED_SELECT] GGML_VK_QSA_FUSED_SELECT=1 emits the indexer selection as ONE node
@@ -1269,13 +1290,19 @@ public:
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
 
+        // the dense decision depends on n_kv and (LLAMA_QSA_MIN_KV) on the ubatch's sequence depth, so a graph is
+        // never reused across it: not a dense graph once the window has grown past the budget or the sequence
+        // reached LLAMA_QSA_MIN_KV, and not a QSA graph for a ubatch whose sequences are all below it
+        const bool dense = qwen4exp_qsa_dense(n_kv, std::min<int64_t>(n_kv, (int64_t) bypass_top_k + (int64_t) ratio - 1),
+                qwen4exp_qsa_depth(mctx, params.ubatch, n_kv));
+
         if (cache_only) {
-            // the bypass decision itself depends on n_kv, so a graph built for the exhaustive
-            // regime must not be reused once the window has grown past the budget (or LLAMA_QSA_MIN_KV)
-            res &= qwen4exp_qsa_dense(n_kv, std::min<int64_t>(n_kv, (int64_t) bypass_top_k + (int64_t) ratio - 1));
+            res &= dense;
 
             return res;
         }
+
+        res &= !dense;
 
         res &= cell_blk->ne[0]  == n_kv;
         res &= cell_blk->ne[1]  == n_stream;
@@ -1450,7 +1477,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         inp = it->second;
 
         // every layer sharing a ratio also shares the exhaustive/not decision (it is a function of
-        // n_kv and r alone), so a cached input set can never be the wrong kind
+        // n_kv, r and the ubatch's sequence depth alone), so a cached input set can never be the wrong kind
         GGML_ASSERT(inp->cache_only == cache_only);
     } else {
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, cache_only);
@@ -2066,8 +2093,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         const int64_t n_kv_idx = mctx_hyb->get_idx()->get_n_kv();
         const int64_t width    = std::min<int64_t>(n_kv_idx, (int64_t) hparams.indexer_top_k + (int64_t) qsa_ratio - 1);
 
-        // [TAG_QSA_MIN_KV] also below LLAMA_QSA_MIN_KV
-        qsa_exhaustive = qwen4exp_qsa_dense(n_kv_idx, width);
+        // [TAG_QSA_MIN_KV] also while the ubatch's sequence depth is below LLAMA_QSA_MIN_KV
+        qsa_exhaustive = qwen4exp_qsa_dense(n_kv_idx, width, qwen4exp_qsa_depth(mctx_hyb, ubatch, n_kv_idx));
 
         // the first QSA graph a process builds is the load-time reserve (full memory, n_kv = --kv-graph-span or the
         // cache): below LLAMA_QSA_MIN_KV it reserves the dense graph, and the first QSA ubatch regrows the buffer

@@ -239,6 +239,9 @@ public:
     // [TAG_QSA_POOLED_CACHE] the pooled-key cache (nullptr = off)
     llama_qsa_pooled_store * get_qsa_store() const;
 
+    // a full context (init_full): the reserve graphs, whose ubatch carries no real positions
+    bool is_full() const { return full; }
+
     // plan this ubatch's store update: the block census, the stamps, the dirty list and the remap.
     // Returns the per-stream capacity of the dirty list, the shape the graph must be built with.
     // A full (reserve) context has no census: it returns the cold-rebuild worst case, n_blocks.
