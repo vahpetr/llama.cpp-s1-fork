@@ -520,6 +520,34 @@ static bool qwen4exp_qsa_bypass_exhaustive() {
     return enabled;
 }
 
+// [TAG_QSA_MIN_KV] (M5.0) LLAMA_QSA_MIN_KV=N > 0 widens [TAG_QSA_BYPASS_EXHAUSTIVE] into a depth threshold: a
+// ubatch whose indexer n_kv (the padded window, the same n_kv the budget width = min(n_kv, indexer_top_k + r - 1)
+// is taken over) is below N runs the dense build_attn(), exactly as an exhaustive one does - the indexer K write
+// (cache_only) stays, so the history is complete for the first ubatch at n_kv >= N; no selection, no QSA mask, no
+// pooled-store plan (the store's plan is stamp-based and stateless across bypassed ubatches: every block written
+// meanwhile has no valid stamp and is pooled by the first plan above N, llama-memory-hybrid-idx.cpp qsa_store_plan).
+// The decision is per ubatch over its n_kv after apply (which includes the ubatch's own cells), as for the budget:
+// a prefill ubatch that straddles N runs QSA whole. Independent of LLAMA_QSA_BYPASS_EXHAUSTIVE.
+// Read once, logged at the first graph build (the reserve). Default 0 = off, today's graph node for node.
+static int64_t qwen4exp_qsa_min_kv() {
+    static const int64_t min_kv = [] {
+        const char * s = getenv("LLAMA_QSA_MIN_KV");
+        const long long v = s ? atoll(s) : 0;
+        if (v > 0) {
+            LLAMA_LOG_INFO("qwen4exp_qsa_min_kv: LLAMA_QSA_MIN_KV=%lld: QSA layers run dense attention while the indexer n_kv < %lld\n", v, v);
+        }
+        return (int64_t) (v > 0 ? v : 0);
+    }();
+
+    return min_kv;
+}
+
+// the dense-path decision of a QSA layer: the exhaustive bypass ([TAG_QSA_BYPASS_EXHAUSTIVE]) or below
+// LLAMA_QSA_MIN_KV ([TAG_QSA_MIN_KV]); shared by build_layer_attn and llm_graph_input_qsa::can_reuse
+static bool qwen4exp_qsa_dense(int64_t n_kv_idx, int64_t width) {
+    return (qwen4exp_qsa_bypass_exhaustive() && width == n_kv_idx) || n_kv_idx < qwen4exp_qsa_min_kv();
+}
+
 // [TAG_QSA_FUSED_SELECT] GGML_VK_QSA_FUSED_SELECT=1 emits the indexer selection as ONE node
 // (GGML_OP_QSA_TOP_K) instead of the six that the Vulkan topk_qsa pattern matches and elides.
 //
@@ -1214,8 +1242,8 @@ public:
 
         if (cache_only) {
             // the bypass decision itself depends on n_kv, so a graph built for the exhaustive
-            // regime must not be reused once the window has grown past the budget
-            res &= (int64_t) std::min<int64_t>(n_kv, (int64_t) bypass_top_k + (int64_t) ratio - 1) == n_kv;
+            // regime must not be reused once the window has grown past the budget (or LLAMA_QSA_MIN_KV)
+            res &= qwen4exp_qsa_dense(n_kv, std::min<int64_t>(n_kv, (int64_t) bypass_top_k + (int64_t) ratio - 1));
 
             return res;
         }
@@ -2004,12 +2032,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // Keep the indexer K write (cache_only), run the dense build_attn().
     bool qsa_exhaustive = false;
 
-    if (qsa && qwen4exp_qsa_bypass_exhaustive()) {
+    if (qsa && (qwen4exp_qsa_bypass_exhaustive() || qwen4exp_qsa_min_kv() > 0)) {
         // same expression as build_qsa_top_k()'s `width`, over the same n_kv
         const int64_t n_kv_idx = mctx_hyb->get_idx()->get_n_kv();
         const int64_t width    = std::min<int64_t>(n_kv_idx, (int64_t) hparams.indexer_top_k + (int64_t) qsa_ratio - 1);
 
-        qsa_exhaustive = width == n_kv_idx;
+        // [TAG_QSA_MIN_KV] also below LLAMA_QSA_MIN_KV
+        qsa_exhaustive = qwen4exp_qsa_dense(n_kv_idx, width);
     }
 
     // [TAG_QSA_CHUNK] chunk a scan ubatch that is longer than the chunk; the branch is decided here,
