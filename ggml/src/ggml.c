@@ -3913,6 +3913,39 @@ struct ggml_tensor * ggml_get_rows(
     return result;
 }
 
+// [TAG_QSA_GATHER_Q8] the same op with the result type named by the caller. Only the two
+// type-preserving gathers the QSA gather path needs are admitted besides f32: a Q8_0 row is
+// ne[0]/32 whole blocks and an F16 row ne[0] halves, so the result is a row copy - exact by
+// construction, which is the point (the f32 result expands a q8_0 row 3.76x, and flash attention
+// then needs it cast back down). ggml_get_rows itself is untouched: every other caller expects f32.
+struct ggml_tensor * ggml_get_rows_type(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        enum ggml_type        type) {
+    if (type == GGML_TYPE_F32 || a->type == GGML_TYPE_I32) {
+        GGML_ASSERT(a->type != GGML_TYPE_I32 || type == GGML_TYPE_I32);
+        return ggml_get_rows(ctx, a, b);
+    }
+
+    GGML_ASSERT(type == a->type && "ggml_get_rows_type: the result is f32 or the source's own type");
+    GGML_ASSERT((type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0) && "ggml_get_rows_type: only f16 and q8_0 rows are copied as-is");
+    GGML_ASSERT(a->ne[0] % ggml_blck_size(type) == 0);
+    GGML_ASSERT(a->nb[0] == ggml_type_size(type));
+    GGML_ASSERT(a->ne[2] == b->ne[1]);
+    GGML_ASSERT(a->ne[3] == b->ne[2]);
+    GGML_ASSERT(b->ne[3] == 1);
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
+
+    result->op     = GGML_OP_GET_ROWS;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
 // ggml_get_rows_back
 
 struct ggml_tensor * ggml_get_rows_back(

@@ -5387,6 +5387,53 @@ static void ggml_compute_forward_get_rows_bf16(
     ggml_get_rows_finish(order);
 }
 
+// [TAG_QSA_GATHER_Q8] ggml_get_rows_type(a, b, a->type): the destination has the source's type
+// (f16 or q8_0), so each row is copied byte for byte - the whole blocks of a quantized row, never
+// a dequantization. Same visit order and thread slice as every other get_rows.
+static void ggml_compute_forward_get_rows_same_type(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int64_t nc = ne00;
+    const int64_t nr = ggml_nelements(src1);
+
+    const size_t row_bytes = ggml_row_size(src0->type, nc);
+
+    GGML_ASSERT(dst->type == src0->type);
+    GGML_ASSERT(nc % ggml_blck_size(src0->type) == 0);
+    assert(ne0  == nc);
+    assert(ne02 == ne11);
+    assert(nb00 == ggml_type_size(src0->type));
+    assert(nb0  == ggml_type_size(dst->type));
+    assert(ggml_nrows(dst) == nr);
+
+    GGML_UNUSED(nr);  // only asserted; the visit order owns the row range now
+
+    // [TAG_GET_ROWS_SORTED] page-ordered visit order + thread slice (identical work, permuted)
+    const ggml_get_rows_order order = ggml_get_rows_prepare(params, dst);
+
+    for (int64_t j = order.begin; j < order.end; ++j) {
+        const int64_t i = ggml_get_rows_at(order, j);
+
+        const int64_t i12 = i/(ne11*ne10);
+        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+        memcpy((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3,
+               (char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03, row_bytes);
+    }
+
+    ggml_get_rows_finish(order);
+}
+
 static void ggml_compute_forward_get_rows_f32(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -5432,6 +5479,12 @@ void ggml_compute_forward_get_rows(
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
+
+    // [TAG_QSA_GATHER_Q8] a type-preserving gather (ggml_get_rows_type); f32/i32 are copies already
+    if (dst->type == src0->type && src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_I32) {
+        ggml_compute_forward_get_rows_same_type(params, dst);
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_Q1_0:

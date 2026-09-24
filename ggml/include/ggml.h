@@ -1678,6 +1678,17 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
+    // [TAG_QSA_GATHER_Q8] (fork-only until upstreamed) ggml_get_rows with an explicit result type.
+    // type == GGML_TYPE_F32 is exactly ggml_get_rows (which keeps its f32 result for every caller);
+    // type == a->type (GGML_TYPE_F16 or GGML_TYPE_Q8_0) returns the rows in the source's own type,
+    // a byte copy of whole rows - no dequantization, no rounding. Rows are whole blocks by
+    // construction (ggml requires ne[0] % block size == 0 for a quantized tensor); asserted anyway.
+    GGML_API struct ggml_tensor * ggml_get_rows_type(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,     // data
+            struct ggml_tensor  * b,     // row indices
+            enum ggml_type        type); // result type: GGML_TYPE_F32, or a->type for F16 / Q8_0
+
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result
