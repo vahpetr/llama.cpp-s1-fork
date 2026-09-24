@@ -357,6 +357,9 @@ void llama_memory_hybrid_idx::clear(bool data) {
     if (mem_idx) {
         mem_idx->clear(data);
     }
+
+    // [TAG_QSA_POOLED_CACHE] invalidate every stream: data == true zeroes the raw rows behind the stamps
+    qsa_store_invalidate(-1);
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -377,6 +380,13 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    }
+
+    // [TAG_QSA_POOLED_CACHE] within a stream seq_cp is metadata only: a regrouped block changes its member
+    // list, which the stamp carries. Across streams the next update() copies the whole raw buffer of the
+    // source stream over the destination (llama_kv_cache::update): its derived entries go wholesale.
+    if (qsa_store && qsa_stream_of(seq_id_src) != qsa_stream_of(seq_id_dst)) {
+        qsa_store->reset_stream(qsa_stream_of(seq_id_dst));
     }
 }
 
@@ -437,6 +447,11 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // [TAG_QSA_POOLED_CACHE] the pooled store is not part of a slot-save file (state_write is unchanged): a
+    // restore writes raw rows behind the stamps, so the stream's derived entries go wholesale, before the
+    // read - and so on every path out of it, PARTIAL_ONLY and failure included (state_drop repeats it)
+    qsa_store_invalidate(seq_id);
+
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
 
@@ -469,6 +484,9 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
+    // [TAG_QSA_POOLED_CACHE] a half-read restore left raw rows the stamps know nothing about
+    qsa_store_invalidate(seq_id);
+
     // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
     if (seq_id < 0) {
         clear(true);
