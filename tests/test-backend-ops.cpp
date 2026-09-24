@@ -7927,7 +7927,7 @@ struct test_flash_attn_ext : public test_case {
 };
 
 // [TAG_QSA_INDEXED_FA] mask [n_kv, n_tps, 1, n_stream] f16 + ids [W, n_tps, 1, n_stream] i32; each row W unique ids
-// (a shuffled prefix, ascending if sorted). dead: 0 = 1..30 % of the row's ids -inf; 1 = row 0 keeps one live id;
+// (a shuffled prefix, ascending if sorted). dead: 0 = 0..30 % (floor) of the row's ids -inf; 1 = row 0 keeps one live id;
 // 2 = causal (query t sees cells < n_kv - n_tps + t + 1) and every list holds cell n_kv - 1; 3 = row 0 all dead.
 static void init_kv_ids_case(ggml_tensor * mask, ggml_tensor * ids, int dead, bool sorted) {
     GGML_ASSERT(mask->type == GGML_TYPE_F16 && ids->type == GGML_TYPE_I32);
@@ -7990,9 +7990,10 @@ struct test_flash_attn_ext_indexed : public test_case {
 };
 // spec §3.6: out = indexed(sorted ids) - dense(scan mask) must be +0.0 on the CPU reference (b);
 // the backend under test (a) is held to the FA rounding class, |a| <= 5e-3
+// cases must be q8_0, or f16 with n_tps < GGML_FA_TILE_Q (64): the dense node must stay off the CPU tiled path to be bit-exact
 struct test_flash_attn_ext_indexed_selfcheck : public test_case {
-    const ggml_type type_KV; const int64_t n_tps, n_kv, idx_W; const int dead;
-    std::string vars() override { return VARS_TO_STR5(type_KV, n_tps, n_kv, idx_W, dead) + ",selfcheck"; }
+    const ggml_type type_KV; const int64_t n_tps, n_kv, idx_W; const int dead; const int64_t n_stream;
+    std::string vars() override { return VARS_TO_STR6(type_KV, n_tps, n_kv, idx_W, dead, n_stream) + ",selfcheck"; }
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "FLASH_ATTN_EXT"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 0.0; }
@@ -8001,10 +8002,10 @@ struct test_flash_attn_ext_indexed_selfcheck : public test_case {
         for (size_t i = 0; i < n; ++i) { if (b[i] != 0.0f) { return 1.0; } worst = std::max(worst, (double) std::fabs(a[i])); }
         return worst <= 5e-3 ? 0.0 : worst;
     }
-    test_flash_attn_ext_indexed_selfcheck(ggml_type type_KV, int64_t n_tps, int64_t n_kv, int64_t idx_W, int dead)
-        : type_KV(type_KV), n_tps(n_tps), n_kv(n_kv), idx_W(idx_W), dead(dead) {}
+    test_flash_attn_ext_indexed_selfcheck(ggml_type type_KV, int64_t n_tps, int64_t n_kv, int64_t idx_W, int dead, int64_t n_stream = 1)
+        : type_KV(type_KV), n_tps(n_tps), n_kv(n_kv), idx_W(idx_W), dead(dead), n_stream(n_stream) {}
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const fa_indexed_io io = fa_indexed_new(ctx, type_KV, n_tps, n_kv, idx_W, 1);
+        const fa_indexed_io io = fa_indexed_new(ctx, type_KV, n_tps, n_kv, idx_W, n_stream);
         // the scan's mask, as build_qsa_scan builds it (src/models/qwen4exp.cpp:1737-1763)
         ggml_tensor * all = ggml_fill(ctx, io.m, -INFINITY);
         all = ggml_view_4d(ctx, all, 1, all->ne[0], all->ne[1], all->ne[3], all->nb[0], all->nb[1], all->nb[2], 0);
@@ -11017,7 +11018,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // [TAG_QSA_INDEXED_FA] indexed flash attention (docs/superpowers/specs/2026-09-24-indexed-fa-prefill-design.md §5)
     for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
         for (int64_t n_tps : { 9, 64, 228, 256 }) {                                                        // (a)
-            const int64_t kv_w[3][2] = { { 4096, 64 }, { 4096, 2051 }, { 20000, 2051 } };   // (n_kv, W)
+            const int64_t kv_w[4][2] = { { 4096, 64 }, { 4096, 2051 }, { 20000, 64 }, { 20000, 2051 } };   // (n_kv, W)
             for (const auto & p : kv_w) { test_cases.emplace_back(new test_flash_attn_ext_indexed(type_KV, n_tps, p[0], p[1])); }
         }
     }
@@ -11029,8 +11030,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0,   9, 4096,    1));               // (f) one id
     for (int dead : { 0, 2 }) {
         test_cases.emplace_back(new test_flash_attn_ext_indexed_selfcheck(GGML_TYPE_Q8_0, 64, 4096, 2051, dead));
+    }
+    for (int dead : { 0, 1, 2, 3 }) {
         test_cases.emplace_back(new test_flash_attn_ext_indexed_selfcheck(GGML_TYPE_F16,   9, 4096,   77, dead));
     }
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_selfcheck(GGML_TYPE_F16, 9, 4096, 77, 2, /*n_stream*/ 2));
 
     // Speculative-decode verify rounds at the Flash-Next attention shape (2 KV heads, GQA 12,
     // HSK = HSV = 256, q8_0 or f16 KV, long KV).  The upstream matrix only ever runs the GQA
