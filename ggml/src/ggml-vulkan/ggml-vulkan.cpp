@@ -1297,6 +1297,12 @@ static void ggml_vk_print_device_fault_info(const vk_device& device) {
     }
 }
 
+// [TAG_VK_FREE_WAIT_IDLE] (M4.2b item 3) buffers of at least this size get timestamped alloc/free lines in the memory
+// logger (GGML_VK_MEMORY_LOGGER) and, with GGML_VK_FREE_WAIT_IDLE=1, a queue wait before they are destroyed
+static constexpr size_t vk_big_buffer_bytes = 256ull*1024*1024;
+static int64_t ggml_vk_now_us();
+static void    ggml_vk_log_free_memory_done(size_t size, int64_t t0_us);
+
 struct vk_buffer_struct {
     vk::Buffer buffer = VK_NULL_HANDLE;
     vk::DeviceMemory device_memory = VK_NULL_HANDLE;
@@ -1313,8 +1319,12 @@ struct vk_buffer_struct {
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
+        const int64_t t0_us = size >= vk_big_buffer_bytes ? ggml_vk_now_us() : 0; // [TAG_VK_FREE_WAIT_IDLE]
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
+        if (t0_us != 0) {
+            ggml_vk_log_free_memory_done(size, t0_us);
+        }
     }
 };
 
@@ -2226,6 +2236,34 @@ static bool ggml_vk_intel_windows_driver_in_range(uint32_t driver_version, uint3
 static bool vk_memory_logger_enabled = false;
 
 #define VK_LOG_MEMORY(msg) if (vk_memory_logger_enabled) { std::cerr << "ggml_vulkan memory: " << msg << std::endl; }
+
+// [TAG_VK_FREE_WAIT_IDLE] wall-clock microseconds (the same clock as the docker log and the 1-s GTT sampler)
+static int64_t ggml_vk_now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// [TAG_VK_FREE_WAIT_IDLE] ~vk_buffer_struct of a big buffer: the moment vkFreeMemory returned. Paired with the
+// "[vk-free] destroy" line of ggml_vk_destroy_buffer it shows whether the memory was released when the backend buffer
+// was freed (refs=1: same microsecond) or later, when a retained reference dropped.
+static void ggml_vk_log_free_memory_done(size_t size, int64_t t0_us) {
+    if (!vk_memory_logger_enabled) {
+        return;
+    }
+    const int64_t t1_us = ggml_vk_now_us();
+    VK_LOG_MEMORY("[vk-free] freeMemory " << size << " B completed t_us=" << t1_us << " (vkFreeMemory took " << (t1_us - t0_us) << " us)");
+}
+
+// [TAG_VK_FREE_WAIT_IDLE] (M4.2b item 3) GGML_VK_FREE_WAIT_IDLE=1 (default off, a diagnostic): wait until the device's
+// queues are idle before a buffer of >= 256 MiB is destroyed. If the 1-s GTT spikes at a compute-buffer regrow vanish
+// with it, the old buffer's pages were held by in-flight command buffers; if they stay, it is driver/TTM reclamation
+// or accounting lag, and only fewer regrows help (GGML_ALLOC_GROW_SLACK, LLAMA_RESERVE_RUNTIME_SHAPE).
+static bool ggml_vk_free_wait_idle() {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_VK_FREE_WAIT_IDLE");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return enabled;
+}
 
 static std::string format_size(size_t size) {
     const size_t kib = 1024;
@@ -3870,6 +3908,8 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         return buf;
     }
 
+    const int64_t t0_us = vk_memory_logger_enabled && size >= vk_big_buffer_bytes ? ggml_vk_now_us() : 0; // [TAG_VK_FREE_WAIT_IDLE]
+
     vk::BufferUsageFlags usage_flags = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
     vk::MemoryAllocateFlags mem_flags {};
     if (device->buffer_device_address) {
@@ -4010,6 +4050,12 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     device->memory_logger->log_allocation(buf, size);
 
+    // [TAG_VK_FREE_WAIT_IDLE]
+    if (size >= vk_big_buffer_bytes && t0_us != 0) {
+        const int64_t t1_us = ggml_vk_now_us();
+        VK_LOG_MEMORY("[vk-alloc] " << size << " B done t_us=" << t1_us << " (create+allocate+bind took " << (t1_us - t0_us) << " us)");
+    }
+
     return buf;
 }
 
@@ -4069,6 +4115,26 @@ static void ggml_vk_destroy_buffer(vk_buffer& buf) {
 
     if (buf->device != nullptr) {
         buf->device->memory_logger->log_deallocation(buf);
+
+        // [TAG_VK_FREE_WAIT_IDLE]
+        if (buf->size >= vk_big_buffer_bytes) {
+            if (ggml_vk_free_wait_idle()) {
+                const int64_t t0_us = ggml_vk_now_us();
+                vk_device & dev = buf->device;
+                for (vk_queue * q : { dev->compute_queue.get(), dev->transfer_queue.get() }) {
+                    if (q == nullptr || !q->handle) {
+                        continue;
+                    }
+                    q->handle->lock();
+                    q->handle->queue.waitIdle();
+                    q->handle->unlock();
+                }
+                VK_LOG_MEMORY("[vk-free] GGML_VK_FREE_WAIT_IDLE: queues idle before destroying " << buf->size
+                        << " B, waited " << (ggml_vk_now_us() - t0_us) << " us");
+            }
+            VK_LOG_MEMORY("[vk-free] destroy " << buf->size << " B t_us=" << ggml_vk_now_us() << " refs=" << buf.use_count()
+                    << (buf.use_count() > 1 ? " (still referenced: vkFreeMemory runs when the last reference drops)" : ""));
+        }
     }
 
     buf.reset();
