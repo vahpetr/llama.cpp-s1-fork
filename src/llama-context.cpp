@@ -160,7 +160,7 @@ struct llama_qsa_ids_dump {
         for (size_t i = 0; i < nb; ++i) {
             d->fnv = (d->fnv ^ d->buf[i]) * 0x100000001b3ull;
         }
-        d->n_tps += t->ne[1];
+        d->n_tps += t->ne[1]*t->ne[3]; // queries x streams
         return true; // keep computing the split
     }
 };
