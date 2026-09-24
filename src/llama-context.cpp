@@ -644,6 +644,25 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
+// [TAG_RESERVE_RUNTIME_SHAPE] (M4.2b item 1) LLAMA_RESERVE_RUNTIME_SHAPE=1 (default off) adds the single-sequence
+// prefill shape to the worst-case pp reserve. graph_reserve rounds n_tokens UP to a multiple of n_seqs (2048 tokens and
+// --parallel 5 reserve 5 x 410 = 2050 tokens), a ubatch that cannot occur at run time, while the ubatch every long
+// prefill really runs is one sequence of n_ubatch tokens. A graph whose buffer need is not monotone in n_tokens is then
+// under-reserved at the reserved n_kv itself - measured with LLAMA_QSA_CHUNK=256: 2050 tokens are cut into 9 x 228
+// query chunks, 2048 into 8 x 256, and at the same n_kv 196 608 the run-time graph needs 2 381.01 MiB against the
+// 2 336.45 MiB reserve, so the compute buffer regrows from n_kv 190 464 on, 3 ubatches BEFORE the --kv-graph-span
+// (qsa_fusion_replay REPLAY_NKV_TABLE, M4.2b report). With the knob the reserve is the max over both shapes, so the
+// first regrow moves to the first ubatch that really exceeds the span. Cost: the difference, at idle (+44.56 MiB at
+// span 196 608, +75.41 MiB at 245 760 with chunk 256; 0 for a graph whose need grows with n_tokens, e.g. chunk 0).
+static bool llama_reserve_runtime_shape() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_RESERVE_RUNTIME_SHAPE");
+        return s != nullptr && atoi(s) != 0;
+    }();
+
+    return enabled;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -712,6 +731,26 @@ void llama_context::sched_reserve() {
 
         n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_pp  = ggml_graph_n_nodes(gf);
+    }
+
+    // [TAG_RESERVE_RUNTIME_SHAPE] the single-sequence prefill ubatch (see llama_reserve_runtime_shape). Allocating
+    // path: ggml-alloc only grows a single-chunk buffer, so the buffer ends at the max of both shapes. Estimate path
+    // (no_alloc): take the max of the two size estimates explicitly.
+    if (llama_reserve_runtime_shape() && n_seqs > 1) {
+        std::vector<size_t> sizes_rt(backend_buf_exp_size.size(), 0);
+
+        auto * gf = graph_reserve(n_tokens, 1, n_outputs_pp, mctx.get(),
+                model.hparams.no_alloc, model.hparams.no_alloc ? sizes_rt.data() : nullptr);
+        if (!gf) {
+            throw std::runtime_error("failed to allocate compute pp buffers (single-sequence shape)");
+        }
+        if (model.hparams.no_alloc) {
+            for (size_t i = 0; i < backend_buf_exp_size.size(); ++i) {
+                backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes_rt[i]);
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: LLAMA_RESERVE_RUNTIME_SHAPE: also reserved the %u-token single-sequence pp graph\n", __func__, n_tokens);
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
