@@ -566,7 +566,7 @@ static bool qwen4exp_qsa_fused_select() {
 // (mul_mat_vec at N <= 8, FA split_k). The scan/gather branch is decided ONCE for the ubatch, with
 // the unchunked rule, and only a scan ubatch is chunked; a gather ubatch (n_tps <= n_kv/(4*width))
 // is small by construction and keeps today's graph. n_tps <= C likewise keeps today's graph, node
-// for node - so decode and every short batch are untouched. Per-chunk routing is M4.3's.
+// for node - so decode and every short batch are untouched. The chunks stay scan-only ([TAG_QSA_PATH]).
 //
 // Values: 0 = off, else a chunk of at least 64 queries (smaller values are raised to 64: every chunk
 // costs ~40 graph nodes per QSA layer, and below that the chunks reach the small-N kernels anyway).
@@ -614,9 +614,70 @@ static bool qwen4exp_qsa_gather_keeps(ggml_type type) {
     return qwen4exp_qsa_gather_q8() && (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_F16);
 }
 
+// [TAG_QSA_PATH] (M4.3) LLAMA_QSA_PATH=auto|gather|scan forces the attention branch of every NON-chunked
+// QSA layer, for gate M4 to measure gather against scan on a grid; `auto` (the default, and any unset or
+// unknown value) is the rule below, byte for byte. Read once, logged at the first graph build (the reserve).
+//
+// gather is supported for 1 <= n_tps <= QWEN4EXP_QSA_GATHER_MAX_TPS queries per stream, at any n_kv (the
+// gathered windows are width cells per query, whatever n_kv is) and needs flash attention (build_qsa_gather
+// hands flash attention one query per window). The hard limits behind the range: the n_tps*n_stream windows
+// ride the stream axis of flash attention, which the Vulkan FA dispatches as workgroups_z = neq3
+// (ggml-vulkan.cpp ggml_vk_flash_attn, `workgroups_z = (uint32_t)neq3`) under the maxComputeWorkGroupCount[2]
+// assert of ggml_vk_dispatch_pipeline; and the gathered K and V are width*n_tps*n_stream whole cells each, a
+// compute-buffer surface linear in n_tps (width 2051, 2 x 256 q8_0 cells: 2 x 68.1 MiB at 64 queries, 2 x 136.2
+// MiB at 128). 128 covers the gate's grid (the 7-25-row band, -ub <= 64) and the fused-op probe graph that
+// llama_context::resolve_fused_ops builds at 16 tokens per sequence whatever -ub is (80 at --parallel 5, 128 at 8;
+// graph_reserve rounds n_tokens up to a multiple of n_seqs, so -ub 128 at --parallel 5 is 130 and asserts);
+// anything above it asserts rather than silently building a multi-GiB gather (a -ub 2048 prefill would be 2 x 2.1
+// GiB). scan has no range limit (it is what auto builds above the rule).
+//
+// The [TAG_QSA_CHUNK] loop stays scan-only: it exists to bound the scan's [n_kv x n_tps] planes of prefill-sized
+// ubatches, which are far outside gather's range, and its decision is `n_tps > chunk && !qwen4exp_qsa_use_gather`,
+// so a forced gather ubatch is never chunked and a forced scan ubatch is chunked exactly as an auto one is.
+enum qwen4exp_qsa_path_mode {
+    QWEN4EXP_QSA_PATH_AUTO,
+    QWEN4EXP_QSA_PATH_GATHER,
+    QWEN4EXP_QSA_PATH_SCAN,
+};
+
+static constexpr int64_t QWEN4EXP_QSA_GATHER_MAX_TPS = 128;
+
+static qwen4exp_qsa_path_mode qwen4exp_qsa_path() {
+    static const qwen4exp_qsa_path_mode mode = [] {
+        const char * s = getenv("LLAMA_QSA_PATH");
+        if (s == nullptr || *s == '\0') {
+            return QWEN4EXP_QSA_PATH_AUTO;
+        }
+        qwen4exp_qsa_path_mode m = QWEN4EXP_QSA_PATH_AUTO;
+        if (strcmp(s, "gather") == 0) {
+            m = QWEN4EXP_QSA_PATH_GATHER;
+        } else if (strcmp(s, "scan") == 0) {
+            m = QWEN4EXP_QSA_PATH_SCAN;
+        } else if (strcmp(s, "auto") != 0) {
+            LLAMA_LOG_WARN("qwen4exp_qsa_path: LLAMA_QSA_PATH=%s unknown, using auto\n", s);
+        }
+        LLAMA_LOG_INFO("qwen4exp_qsa_path: LLAMA_QSA_PATH=%s: the non-chunked QSA attention branch is %s\n", s,
+                m == QWEN4EXP_QSA_PATH_GATHER ? "forced to gather (n_tps <= 128 per stream, flash attention)" :
+                m == QWEN4EXP_QSA_PATH_SCAN   ? "forced to scan" : "the 4*n_tps*width < n_kv rule");
+        return m;
+    }();
+
+    return mode;
+}
+
 // build_attn_qsa's branch rule, shared with the [TAG_QSA_CHUNK] decision so the two cannot drift.
 // flash attention is what keeps the values as rows, so the gather needs it.
 static bool qwen4exp_qsa_use_gather(bool flash_attn, int64_t n_tps, int64_t width, int64_t n_kv) {
+    switch (qwen4exp_qsa_path()) {
+        case QWEN4EXP_QSA_PATH_GATHER:
+            GGML_ASSERT(flash_attn && "LLAMA_QSA_PATH=gather needs flash attention");
+            GGML_ASSERT(n_tps >= 1 && n_tps <= QWEN4EXP_QSA_GATHER_MAX_TPS && "LLAMA_QSA_PATH=gather supports n_tps <= 128 (the reserve rounds -ub up to a multiple of --parallel)");
+            return true;
+        case QWEN4EXP_QSA_PATH_SCAN:
+            return false;
+        case QWEN4EXP_QSA_PATH_AUTO:
+            break;
+    }
     return flash_attn && 4*n_tps*width < n_kv;
 }
 
