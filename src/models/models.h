@@ -2390,6 +2390,18 @@ struct llama_model_qwen4exp : public llama_model_base {
                            bool   cache_only,
                        qsa_prep * prep = nullptr);
 
+        // the block pooling chain over n_rows blocks per stream, shared by the recompute and the
+        // [TAG_QSA_POOLED_CACHE] dirty-block write
+        ggml_tensor * build_qsa_pool(
+                    ggml_tensor * k_all,
+                    ggml_tensor * cells,
+                    ggml_tensor * pos,
+                        int64_t   n_rows,
+                        int64_t   n_stream,
+                            int * sections,
+                     const char * name_pooled,
+                            int   il);
+
         // the query-dependent half of build_qsa_top_k: score + select for the queries in q
         ggml_tensor * build_qsa_select(
             llm_graph_input_qsa * inp,

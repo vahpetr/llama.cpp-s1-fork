@@ -11,6 +11,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -164,6 +165,13 @@ struct llama_qsa_ids_dump {
         return true; // keep computing the split
     }
 };
+
+// [TAG_QSA_POOLED_CACHE] after a graph of a hybrid-idx memory: publish or drop its pooled-key stamps
+static void llama_qsa_store_publish(llama_memory_context_i * mctx, bool ok) {
+    if (const auto * c = dynamic_cast<const llama_memory_hybrid_idx_context *>(mctx)) {
+        c->qsa_store_publish(ok);
+    }
+}
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -1617,6 +1625,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+            llama_qsa_store_publish(mctx, false); // [TAG_QSA_POOLED_CACHE]
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
@@ -1632,6 +1641,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            llama_qsa_store_publish(mctx, false); // [TAG_QSA_POOLED_CACHE]
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
@@ -1660,6 +1670,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    // [TAG_QSA_POOLED_CACHE] the graph has been submitted in its build order (raw indexer write, then the
+    // pooling of the dirty blocks into the store, then the selection that reads it): its pooled-key stamps
+    // become valid now, or its streams are invalidated if it failed. A later graph reading the store is
+    // queued after this one.
+    llama_qsa_store_publish(mctx, status == GGML_STATUS_SUCCESS);
 
     if (prof) {
         // graph_compute() is ggml_backend_sched_graph_compute_async(): on an asynchronous backend (Vulkan)
