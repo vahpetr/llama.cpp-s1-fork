@@ -5,12 +5,88 @@
 #include "llama-io.h"
 #include "llama-model.h"
 
+#include "ggml-cpp.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <stdexcept>
+
+//
+// [TAG_QSA_POOLED_CACHE] llama_qsa_pooled_store
+//
+
+// LLAMA_QSA_POOLED_CACHE=1: read once per memory, so two contexts of one process may differ (the replay probe
+// compares them side by side); a server has one memory and so one value for its lifetime
+static bool llama_qsa_pooled_cache_env() {
+    const char * s = getenv("LLAMA_QSA_POOLED_CACHE");
+    return s != nullptr && atoi(s) != 0;
+}
+
+void llama_qsa_pooled_store::reset_stream(uint32_t s) {
+    GGML_ASSERT(s < strm.size());
+
+    auto & st = strm[s];
+
+    std::fill(st.slot_of_key.begin(), st.slot_of_key.end(), -1);
+    std::fill(st.slot_key   .begin(), st.slot_key   .end(), -1);
+    std::fill(st.slot_stamp .begin(), st.slot_stamp .end(),  0);
+    std::fill(st.slot_seen  .begin(), st.slot_seen  .end(),  0);
+
+    st.free_slots.resize(n_slots);
+    for (uint32_t i = 0; i < n_slots; ++i) {
+        st.free_slots[i] = (int32_t) (n_slots - 1 - i);
+    }
+
+    // a stamp of this stream still waiting for its graph must not revive an entry
+    pending.erase(std::remove_if(pending.begin(), pending.end(),
+                [s](const pending_t & p) { return p.s == s; }), pending.end());
+
+    stats.n_reset++;
+}
+
+void llama_qsa_pooled_store::reset_all() {
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        reset_stream(s);
+    }
+}
+
+void llama_qsa_pooled_store::on_write(const llama_kv_cache::slot_info & sinfo) {
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        auto & gen = strm[sinfo.strm[s]].gen;
+
+        for (const auto idx : sinfo.idxs[s]) {
+            gen[idx]++;
+        }
+    }
+}
+
+void llama_qsa_pooled_store::publish(bool ok) {
+    if (ok && pending_armed) {
+        for (const auto & p : pending) {
+            // the slot may have been reset (and reassigned) since the plan; then its stamp stays invalid
+            strm[p.s].slot_stamp[p.slot] = p.stamp;
+        }
+
+        stats.n_publish++;
+    } else if (!ok) {
+        // a graph that failed or was aborted may have written any part of the planned rows
+        for (const uint32_t s : pending_streams) {
+            reset_stream(s);
+        }
+
+        stats.n_fail++;
+    }
+    // ok && !armed: the plan was made (can_reuse) but the graph that ran has no store update;
+    // its dirty slots were left at stamp 0 by the plan, so dropping the stamps is enough
+
+    pending.clear();
+    pending_streams.clear();
+    pending_armed = false;
+}
 
 //
 // llama_memory_hybrid_idx
@@ -38,7 +114,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-    const layer_filter_cb & filter_idx) :
+    const layer_filter_cb & filter_idx,
+                  int32_t   qsa_ratio_override) :
     llama_memory_hybrid(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
@@ -72,7 +149,126 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    if (!mem_idx || !llama_qsa_pooled_cache_env()) {
+        return;
+    }
+
+    // [TAG_QSA_POOLED_CACHE] the main QSA layers only: the layers the indexer cache holds that run with a
+    // positive effective ratio. v1 serves one ratio; a GGUF mixing ratios keeps the recompute everywhere.
+    const auto & hp = model.hparams;
+
+    std::vector<int32_t> ils;
+    uint32_t ratio = 0;
+    bool     mixed = false;
+
+    for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+        if (!filter_idx(il)) {
+            continue;
+        }
+
+        const uint32_t r = llama_hparams_qsa_ratio(hp, qsa_ratio_override, il);
+        if (r == 0) {
+            continue;
+        }
+
+        mixed |= ratio != 0 && r != ratio;
+        ratio  = r;
+
+        ils.push_back((int32_t) il);
+    }
+
+    if (ils.empty() || mixed) {
+        LLAMA_LOG_WARN("%s: LLAMA_QSA_POOLED_CACHE=1 ignored: %s\n", __func__,
+                ils.empty() ? "no QSA layer" : "the QSA layers mix compress ratios");
+        return;
+    }
+
+    auto st = std::make_unique<llama_qsa_pooled_store>();
+
+    st->ratio    = ratio;
+    st->idx_dim  = hp.indexer_head_size;
+    st->kv_size  = mem_idx->get_size();
+    st->n_stream = mem_idx->get_n_stream();
+    st->n_slots  = (st->kv_size + ratio - 1)/ratio;
+    st->n_rows   = st->n_slots + 1;
+
+    // one context per buffer type, as llama_kv_cache places its layers
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
+
+    for (const int32_t il : ils) {
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+
+        if (offload) {
+            buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
+        }
+
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(2u*ils.size()*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                throw std::runtime_error("failed to create ggml context for the QSA pooled-key cache");
+            }
+
+            it = ctx_map.emplace(buft, ggml_context_ptr(ctx)).first;
+        }
+
+        ggml_tensor * t = ggml_new_tensor_2d(it->second.get(), GGML_TYPE_F32, st->idx_dim, (int64_t) st->n_rows*st->n_stream);
+        ggml_format_name(t, "cache_qsa_pooled_l%d", il);
+
+        st->layers[il] = t;
+    }
+
+    size_t total = 0;
+
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf;
+        if (hparams_idx.no_alloc) {
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer, as llama_kv_cache does
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                t->buffer = buf;
+            }
+        } else {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        }
+        if (!buf) {
+            throw std::runtime_error("failed to allocate buffer for the QSA pooled-key cache");
+        }
+
+        // unused rows are read by the score GEMM before the bias drops them: keep them finite
+        ggml_backend_buffer_clear(buf, 0);
+
+        total += ggml_backend_buffer_get_size(buf);
+
+        LLAMA_LOG_INFO("%s: %10s QSA pooled-key cache buffer size = %8.2f MiB\n", __func__,
+                ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+
+        st->ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    st->strm.resize(st->n_stream);
+    for (auto & ss : st->strm) {
+        ss.gen        .assign(st->kv_size, 0);
+        ss.slot_of_key.assign(st->kv_size, -1);
+        ss.slot_key   .assign(st->n_slots, -1);
+        ss.slot_stamp .assign(st->n_slots,  0);
+        ss.slot_seen  .assign(st->n_slots,  0);
+    }
+
+    qsa_store = std::move(st);
+    qsa_store->reset_all();
+    qsa_store->stats.n_reset = 0;
+
+    LLAMA_LOG_INFO("%s: LLAMA_QSA_POOLED_CACHE=1: %zu layers, ratio %u, %u block slots + 1 spare row x %u streams, "
+            "idx_dim %u, f32: %zu bytes\n", __func__, ils.size(), ratio, qsa_store->n_slots, qsa_store->n_stream,
+            qsa_store->idx_dim, total);
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -217,6 +413,13 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
         }
     }
 
+    // [TAG_QSA_POOLED_CACHE] the persistent store counts as memory, like the caches it derives from
+    if (qsa_store) {
+        for (const auto & [ctx, buf] : qsa_store->ctxs_bufs) {
+            mb[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+        }
+    }
+
     return mb;
 }
 
@@ -283,6 +486,27 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
+}
+
+llama_qsa_pooled_store * llama_memory_hybrid_idx::get_qsa_store() const {
+    return qsa_store.get();
+}
+
+uint32_t llama_memory_hybrid_idx::qsa_stream_of(llama_seq_id seq_id) const {
+    // llama_kv_cache maps every sequence to stream 0 when unified, else sequence s to stream s
+    return mem_idx == nullptr || mem_idx->get_n_stream() == 1 ? 0 : (uint32_t) seq_id;
+}
+
+void llama_memory_hybrid_idx::qsa_store_invalidate(llama_seq_id seq_id) {
+    if (!qsa_store) {
+        return;
+    }
+
+    if (seq_id < 0) {
+        qsa_store->reset_all();
+    } else {
+        qsa_store->reset_stream(qsa_stream_of(seq_id));
+    }
 }
 
 //
@@ -365,6 +589,10 @@ bool llama_memory_hybrid_idx_context::apply() {
 
 const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {
     return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
+}
+
+llama_qsa_pooled_store * llama_memory_hybrid_idx_context::get_qsa_store() const {
+    return mem != nullptr ? mem->get_qsa_store() : nullptr;
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
