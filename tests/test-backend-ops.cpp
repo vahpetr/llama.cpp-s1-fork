@@ -2449,6 +2449,63 @@ struct test_get_rows : public test_case {
     }
 };
 
+// GGML_OP_GET_ROWS, type-preserving ([TAG_QSA_GATHER_Q8] ggml_get_rows_type(a, b, a->type)):
+// the result is the source's own rows, byte for byte (f16 or whole q8_0 blocks)
+struct test_get_rows_type : public test_case {
+    const ggml_type type;
+    const int n; // cols
+    const int m; // rows
+    const int r; // rows to get
+    const int be1; // batch size
+    const int be2; // batch size
+    const bool v; // view (non-contiguous src1)
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, n, m, r, be1, be2, v) + ",type_dst=" + ggml_type_name(type);
+    }
+
+    test_get_rows_type(ggml_type type = GGML_TYPE_Q8_0, int n = 512, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false)
+        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * in = ggml_new_tensor_4d(ctx, type, n, m, be1, be2);
+        ggml_set_name(in, "in");
+
+        ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r, be1, be2);
+        ggml_set_name(rows, "rows");
+        if (v) {
+            rows = ggml_view_3d(ctx, rows, r/2, be1, be2, rows->nb[1], rows->nb[2], 0);
+            ggml_set_name(rows, "view_of_rows");
+        }
+
+        ggml_tensor * out = ggml_get_rows_type(ctx, in, rows, type);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    // a row copy: anything but an exact match is a bug
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) { continue; }
+                // rows
+                std::vector<int> data(r*be1*be2);
+                for (int i = 0; i < r*be1*be2; i++) {
+                    data[i] = rand() % m;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, r * be1 * be2 * sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -9123,6 +9180,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 256, 5, 4, b, 1, v));
         }
     }
+
+    // [TAG_QSA_GATHER_Q8] type-preserving gathers (ggml_get_rows_type): q8_0 -> q8_0 and f16 -> f16
+    for (int b : {1, 7}) {
+        for (bool v : {false, true}) {
+            for (int n : {64, 256, 512}) {
+                test_cases.emplace_back(new test_get_rows_type(GGML_TYPE_Q8_0, n, 5, 4, b, 1, v));
+            }
+            for (int n : {1, 2, 256}) {
+                test_cases.emplace_back(new test_get_rows_type(GGML_TYPE_F16, n, 5, 4, b, 1, v));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_get_rows_type(GGML_TYPE_Q8_0,  32,  5, 4, 1, 1, false)); // one block: 34 B rows (Vulkan copies 4-byte words -> not supported there)
+    test_cases.emplace_back(new test_get_rows_type(GGML_TYPE_Q8_0, 512,  7, 4, 3, 2, false)); // 4-d source
+    // the QSA gather at the deployed shape: 512-value cells (2 heads x 256) of a 196 608-cell layer,
+    // 2 051 cells for each of 6 queries (an MTP verify round), one stream
+    test_cases.emplace_back(new test_get_rows_type(GGML_TYPE_Q8_0, 512, 196608, 2051*6, 1, 1, false));
+    // its mask: 1-element f16 rows of [1, n_kv, n_q], width rows per query
+    test_cases.emplace_back(new test_get_rows_type(GGML_TYPE_F16,    1, 196608, 2051, 6, 1, false));
+    // the M4.2 chunk mask: whole f16 mask rows [n_kv] of a chunk of queries
+    test_cases.emplace_back(new test_get_rows_type(GGML_TYPE_F16, 65536,   300,  228, 1, 1, false));
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
