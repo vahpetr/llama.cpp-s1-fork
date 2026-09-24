@@ -639,16 +639,18 @@ static bool qwen4exp_qsa_gather_keeps(ggml_type type) {
 // QSA layer, for gate M4 to measure gather against scan on a grid; `auto` (the default, and any unset or
 // unknown value) is the rule below, byte for byte. Read once, logged at the first graph build (the reserve).
 //
-// gather is supported for 1 <= n_tps <= QWEN4EXP_QSA_GATHER_MAX_TPS queries per stream, at any n_kv (the
+// gather is supported for 1 <= n_tps*n_stream <= QWEN4EXP_QSA_GATHER_MAX_TPS query windows in all (the gather
+// sizes K/V by width*n_q, n_q = n_tps*n_stream, whether the KV cache is unified or not), at any n_kv (the
 // gathered windows are width cells per query, whatever n_kv is) and needs flash attention (build_qsa_gather
 // hands flash attention one query per window). The hard limits behind the range: the n_tps*n_stream windows
 // ride the stream axis of flash attention, which the Vulkan FA dispatches as workgroups_z = neq3
 // (ggml-vulkan.cpp ggml_vk_flash_attn, `workgroups_z = (uint32_t)neq3`) under the maxComputeWorkGroupCount[2]
 // assert of ggml_vk_dispatch_pipeline; and the gathered K and V are width*n_tps*n_stream whole cells each, a
-// compute-buffer surface linear in n_tps (width 2051, 2 x 256 q8_0 cells: 2 x 68.1 MiB at 64 queries, 2 x 136.2
+// compute-buffer surface linear in n_q (width 2051, 2 x 256 q8_0 cells: 2 x 68.1 MiB at 64 windows, 2 x 136.2
 // MiB at 128). 128 covers the gate's grid (the 7-25-row band, -ub <= 64) and the fused-op probe graph that
-// llama_context::resolve_fused_ops builds at 16 tokens per sequence whatever -ub is (80 at --parallel 5, 128 at 8;
-// graph_reserve rounds n_tokens up to a multiple of n_seqs, so -ub 128 at --parallel 5 is 130 and asserts);
+// llama_context::resolve_fused_ops builds at 16 tokens per sequence whatever -ub is (80 at --parallel 5, 128 at 8,
+// unified or one stream per sequence alike; graph_reserve rounds n_tokens up to a multiple of n_seqs, so -ub 128
+// at --parallel 5 is 130 and asserts);
 // anything above it asserts rather than silently building a multi-GiB gather (a -ub 2048 prefill would be 2 x 2.1
 // GiB). scan has no range limit (it is what auto builds above the rule).
 //
@@ -677,9 +679,14 @@ static qwen4exp_qsa_path_mode qwen4exp_qsa_path() {
         } else if (strcmp(s, "auto") != 0) {
             LLAMA_LOG_WARN("qwen4exp_qsa_path: LLAMA_QSA_PATH=%s unknown, using auto\n", s);
         }
-        LLAMA_LOG_INFO("qwen4exp_qsa_path: LLAMA_QSA_PATH=%s: the non-chunked QSA attention branch is %s\n", s,
-                m == QWEN4EXP_QSA_PATH_GATHER ? "forced to gather (n_tps <= 128 per stream, flash attention)" :
-                m == QWEN4EXP_QSA_PATH_SCAN   ? "forced to scan" : "the 4*n_tps*width < n_kv rule");
+        if (m == QWEN4EXP_QSA_PATH_GATHER) {
+            LLAMA_LOG_INFO("qwen4exp_qsa_path: LLAMA_QSA_PATH=%s: the non-chunked QSA attention branch is forced to gather"
+                    " (flash attention, n_tps*n_stream <= QWEN4EXP_QSA_GATHER_MAX_TPS = %lld)\n", s,
+                    (long long) QWEN4EXP_QSA_GATHER_MAX_TPS);
+        } else {
+            LLAMA_LOG_INFO("qwen4exp_qsa_path: LLAMA_QSA_PATH=%s: the non-chunked QSA attention branch is %s\n", s,
+                    m == QWEN4EXP_QSA_PATH_SCAN ? "forced to scan" : "the 4*n_tps*width < n_kv rule");
+        }
         return m;
     }();
 
@@ -688,11 +695,15 @@ static qwen4exp_qsa_path_mode qwen4exp_qsa_path() {
 
 // build_attn_qsa's branch rule, shared with the [TAG_QSA_CHUNK] decision so the two cannot drift.
 // flash attention is what keeps the values as rows, so the gather needs it.
-static bool qwen4exp_qsa_use_gather(bool flash_attn, int64_t n_tps, int64_t width, int64_t n_kv) {
+static bool qwen4exp_qsa_use_gather(bool flash_attn, int64_t n_tps, int64_t n_stream, int64_t width, int64_t n_kv) {
     switch (qwen4exp_qsa_path()) {
         case QWEN4EXP_QSA_PATH_GATHER:
             GGML_ASSERT(flash_attn && "LLAMA_QSA_PATH=gather needs flash attention");
-            GGML_ASSERT(n_tps >= 1 && n_tps <= QWEN4EXP_QSA_GATHER_MAX_TPS && "LLAMA_QSA_PATH=gather supports n_tps <= 128 (the reserve rounds -ub up to a multiple of --parallel)");
+            if (n_tps < 1 || n_tps*n_stream > QWEN4EXP_QSA_GATHER_MAX_TPS) {
+                GGML_ABORT("LLAMA_QSA_PATH=gather supports 1 <= n_tps*n_stream <= %lld query windows, got %lld x %lld"
+                        " (the reserve rounds -ub up to a multiple of --parallel)",
+                        (long long) QWEN4EXP_QSA_GATHER_MAX_TPS, (long long) n_tps, (long long) n_stream);
+            }
             return true;
         case QWEN4EXP_QSA_PATH_SCAN:
             return false;
@@ -1694,7 +1705,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // the two costs meet at 2*n_tps*width == n_kv; the margin keeps the windows small enough
     // for the compute buffer of a decode graph. flash attention is what keeps the values as rows
-    ggml_tensor * cur = qwen4exp_qsa_use_gather(cparams.flash_attn, n_tps, width, n_kv)
+    ggml_tensor * cur = qwen4exp_qsa_use_gather(cparams.flash_attn, n_tps, top_k->ne[3], width, n_kv)
         ? build_qsa_gather(inp, q_cur, top_k, kq_scale, il)
         : build_qsa_scan  (inp, q_cur, top_k, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -1858,7 +1869,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
             top_k = ggml_view_4d(ctx0, top_k, width, nc, 1, n_stream, top_k->nb[1], top_k->nb[2], top_k->nb[3], 0);
             mask_c = ggml_view_4d(ctx0, mask_c, mask_c->ne[0], nc, 1, n_stream, mask_c->nb[1], mask_c->nb[2], mask_c->nb[3], 0);
             if (!ggml_is_contiguous(top_k)) {
-                // more than one stream: the real columns of each stream are apart
+                // more than one stream: the real columns of each stream are apart. The mask cont is an
+                // [n_kv, nc, 1, n_stream] f16 transient next to the padded rows. Measured (M4.3 fix round 1, reserve
+                // replay, --parallel 5 without --kv-unified, ub 2048, span 196 608: 2 x 205 -> 256 + 154 padded per
+                // stream): the knob costs +379.29 MiB there (2378.59 -> 2757.88), this cont ([196608, 154, 5] f16 =
+                // 288.8 MiB) being most of it. With a unified cache (n_stream = 1, deployed) both are views: +3.09 MiB.
                 top_k  = ggml_cont(ctx0, top_k);
                 mask_c = ggml_cont(ctx0, mask_c);
             }
@@ -2009,7 +2024,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         const int64_t width    = std::min<int64_t>(n_kv_idx, (int64_t) hparams.indexer_top_k + (int64_t) qsa_ratio - 1);
 
         chunked = n_tps > qwen4exp_qsa_chunk() &&
-            !qwen4exp_qsa_use_gather(cparams.flash_attn, n_tps, width, inp->mctx->get_n_kv());
+            !qwen4exp_qsa_use_gather(cparams.flash_attn, n_tps, n_stream, width, inp->mctx->get_n_kv());
         prep.chunk = qwen4exp_qsa_chunk();
     }
 
