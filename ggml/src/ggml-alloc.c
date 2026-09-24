@@ -944,6 +944,8 @@ static bool ggml_gallocr_reserve_n_impl(
             // that does not grow keeps its current size instead of shrinking to the new plan, so a monotone growth
             // regrows O(log) times instead of once per graph. The first allocation (no current buffer) is untouched.
             const size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+            size_t chunk_need[GGML_VBUFFER_MAX_CHUNKS] = {0}; // the exact plan, for the fallback below
+            bool slack_applied = false;
             if (cur_size > 0) {
                 const size_t max_chunk = ggml_backend_buft_get_max_size(galloc->bufts[i]);
                 new_size = 0;
@@ -951,6 +953,7 @@ static bool ggml_gallocr_reserve_n_impl(
                     struct tallocr_chunk * chunk = galloc->buf_tallocs[i]->chunks[c];
                     const size_t cur_chunk_size = ggml_vbuffer_chunk_size(galloc->buffers[i], c);
                     const size_t need = chunk->max_size;
+                    chunk_need[c] = need;
                     size_t target = need;
                     if (galloc->grow_slack > 0 && cur_chunk_size > 0) {
                         if (need > cur_chunk_size) {
@@ -962,6 +965,7 @@ static bool ggml_gallocr_reserve_n_impl(
                             target = cur_chunk_size;
                         }
                         chunk->max_size = target;
+                        slack_applied |= target != need;
                     }
                     new_size += target;
                     if (need > cur_chunk_size) {
@@ -995,6 +999,18 @@ static bool ggml_gallocr_reserve_n_impl(
             ggml_vbuffer_free(old_buffer);
             if (!no_alloc) {
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                if (galloc->buffers[i] == NULL && slack_applied) {
+                    // [TAG_ALLOC_GROW_SLACK] the slack is an optimization, the plan's need is not: a regrow must not
+                    // fail because of the headroom, so retry once at the exact fit
+                    new_size = 0;
+                    for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+                        galloc->buf_tallocs[i]->chunks[c]->max_size = chunk_need[c];
+                        new_size += chunk_need[c];
+                    }
+                    GGML_LOG_WARN("[ggml-alloc] grow buffer %d (%s): the slack-sized allocation failed, retrying at the exact fit (%zu B)\n",
+                        i, ggml_backend_buft_name(galloc->bufts[i]), new_size);
+                    galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                }
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     // the node/leaf assignments installed above already point into this buffer, and the

@@ -17,6 +17,7 @@ uint8_t * const alloc_base = (uint8_t *) 16;
 struct dummy_backend_context {
     size_t max_buffer_size = 64;
     size_t alignment       = 8;
+    size_t fail_above      = SIZE_MAX; // an allocation larger than this fails (out-of-memory simulation)
 
     ggml_backend_buffer_i              buffer_interface;
     std::vector<ggml_backend_buffer_t> buffers;
@@ -38,6 +39,9 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
+    if (size > ctx->fail_above) {
+        return nullptr;
+    }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
     return buffer;
@@ -670,7 +674,9 @@ static void test_grow_slack() {
         GGML_ASSERT(backend.context->buffers.size() == 1 && backend.context->buffers.at(0) == b1);
     }
 
-    // a smaller graph never shrinks it
+    // a smaller graph never shrinks it. (This covers the no-realloc path - no chunk grows, so the realloc branch is
+    // not entered and the buffer is kept as is, with or without slack; the slack branch that keeps a NON-growing chunk
+    // at its size is test_grow_slack_two_chunks.)
     GGML_ASSERT(slack_graph_reserve(galloc.get(), 64) == s1);
 
     // a growth past the slack: max(need, cur * 1.25)
@@ -688,6 +694,69 @@ static void test_grow_slack() {
         prev = cur;
     }
     GGML_ASSERT(n_regrow >= 1 && n_regrow <= 4); // 25 graphs, need x2 -> log(2)/log(1.25) = 3.1 regrows
+}
+
+// two chunks: the second graph grows chunk 0 and needs LESS in chunk 1. Exact fit re-allocates chunk 1 at the new,
+// smaller plan; with slack chunk 1 keeps its current size (ggml-alloc.c, the `target = cur_chunk_size` branch).
+static std::vector<size_t> two_chunk_reserve(ggml_gallocr_t galloc, dummy_backend & backend, size_t a, size_t b) {
+    auto [ctx, graph, ctx_ptr] = make_context();
+    ggml_tensor * x0 = make_input_with_size(ctx, a);
+    ggml_tensor * x1 = make_input_with_size(ctx, b);
+    ggml_tensor * y0 = ggml_scale(ctx, x0, 2.0f);
+    ggml_tensor * y1 = ggml_scale(ctx, x1, 2.0f);
+    ggml_set_output(y0);
+    ggml_set_output(y1);
+    ggml_build_forward_expand(graph, y0);
+    ggml_build_forward_expand(graph, y1);
+    GGML_ASSERT(ggml_gallocr_reserve(galloc, graph));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, graph));
+    check_all_allocated(graph);
+    std::vector<size_t> sizes;
+    for (ggml_backend_buffer_t buf : backend.context->buffers) {
+        sizes.push_back(ggml_backend_buffer_get_size(buf));
+    }
+    return sizes;
+}
+
+static void test_grow_slack_two_chunks() {
+    for (int slack : { 0, 25 }) {
+        dummy_backend    backend = dummy_backend_init(64, /*align*/ 4);
+        ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+        ggml_gallocr_set_grow_slack(galloc.get(), slack);
+        const std::vector<size_t> s0 = two_chunk_reserve(galloc.get(), backend, 40, 32);
+        const std::vector<size_t> s1 = two_chunk_reserve(galloc.get(), backend, 56, 16);
+        printf("[slack %d: %zu chunks", slack, s0.size());
+        for (size_t v : s0) printf(" %zu", v);
+        printf(" -> %zu chunks", s1.size());
+        for (size_t v : s1) printf(" %zu", v);
+        printf("] ");
+        GGML_ASSERT(s0.size() == 2 && s1.size() == 2);
+        GGML_ASSERT(s1[0] > s0[0]);          // chunk 0 grew
+        if (slack == 0) {
+            GGML_ASSERT(s1[1] < s0[1]);      // exact fit: chunk 1 follows the smaller plan
+        } else {
+            GGML_ASSERT(s1[1] == s0[1]);     // slack: the non-growing chunk keeps its size
+            GGML_ASSERT(s1[0] <= 64);        // and chunk 0's slack is capped by the max size
+        }
+    }
+}
+
+// a slack-sized regrow that the device cannot satisfy falls back to the exact fit instead of failing
+static void test_grow_slack_alloc_fallback() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_set_grow_slack(galloc.get(), 25);
+    const size_t s0   = slack_graph_reserve(galloc.get(), 400);
+    const size_t need = slack_exact_need(SIZE_MAX, 416);
+    GGML_ASSERT(need < s0 + s0/4);
+    backend.context->fail_above = need;                              // cur * 1.25 does not fit, the need does
+    GGML_ASSERT(slack_graph_reserve(galloc.get(), 416) == need);
+    backend.context->fail_above = need - 4;                          // not even the need: a clean failure
+    auto [ctx, graph, ctx_ptr] = make_context();
+    ggml_tensor * x1 = ggml_scale(ctx, make_input_with_size(ctx, 800), 2.0f);
+    ggml_set_output(x1);
+    ggml_build_forward_expand(graph, x1);
+    GGML_ASSERT(!ggml_gallocr_reserve(galloc.get(), graph));
 }
 
 static void test_grow_slack_capped() {
@@ -729,5 +798,7 @@ int main() {
     run("test_grow_slack_zero", test_grow_slack_zero);
     run("test_grow_slack", test_grow_slack);
     run("test_grow_slack_capped", test_grow_slack_capped);
+    run("test_grow_slack_two_chunks", test_grow_slack_two_chunks);
+    run("test_grow_slack_alloc_fallback", test_grow_slack_alloc_fallback);
     return 0;
 }
