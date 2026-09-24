@@ -618,6 +618,91 @@ static void test_reallocation() {
     }
 }
 
+// [TAG_ALLOC_GROW_SLACK] (M4.2b item 2) ggml_gallocr_set_grow_slack: a regrow of an existing buffer allocates
+// max(need, cur * (1 + slack/100)) capped by the buffer type's max size; the first allocation and slack 0 stay exact.
+// The graph is one input of n bytes plus a scaled copy, so the need grows monotonically with n.
+static size_t slack_graph_reserve(ggml_gallocr_t galloc, size_t n_bytes) {
+    auto [ctx, graph, ctx_ptr] = make_context();
+    ggml_tensor * x0 = make_input_with_size(ctx, n_bytes);
+    ggml_tensor * x1 = ggml_scale(ctx, x0, 2.0f);
+    ggml_set_output(x1);
+    ggml_build_forward_expand(graph, x1);
+    GGML_ASSERT(ggml_gallocr_reserve(galloc, graph));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, graph));
+    check_all_allocated(graph);
+    return ggml_gallocr_get_buffer_size(galloc, 0);
+}
+
+static size_t slack_exact_need(size_t max_buffer_size, size_t n_bytes) {
+    dummy_backend    backend = dummy_backend_init(max_buffer_size, /*align*/ 4);
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    return slack_graph_reserve(galloc.get(), n_bytes);
+}
+
+static void test_grow_slack_zero() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    GGML_ASSERT(slack_graph_reserve(galloc.get(), 400) == slack_exact_need(SIZE_MAX, 400));
+    GGML_ASSERT(slack_graph_reserve(galloc.get(), 416) == slack_exact_need(SIZE_MAX, 416)); // exact fit, today's rule
+    GGML_ASSERT(slack_graph_reserve(galloc.get(), 432) == slack_exact_need(SIZE_MAX, 432)); // ... and again
+    GGML_ASSERT(backend.context->buffers.size() == 1);
+}
+
+static void test_grow_slack() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_set_grow_slack(galloc.get(), 25);
+
+    // the first allocation is exact whatever the slack
+    const size_t s0 = slack_graph_reserve(galloc.get(), 400);
+    GGML_ASSERT(s0 == slack_exact_need(SIZE_MAX, 400));
+
+    // a small growth allocates cur * 1.25
+    const size_t s1 = slack_graph_reserve(galloc.get(), 416);
+    GGML_ASSERT(slack_exact_need(SIZE_MAX, 416) < s0 + s0/4);
+    GGML_ASSERT(s1 == s0 + s0/4);
+    ggml_backend_buffer_t b1 = backend.context->buffers.at(0);
+
+    // further growth inside the slack: no reallocation at all (same buffer object)
+    for (size_t n = 432; n <= 496; n += 16) {
+        GGML_ASSERT(slack_exact_need(SIZE_MAX, n) <= s1);
+        GGML_ASSERT(slack_graph_reserve(galloc.get(), n) == s1);
+        GGML_ASSERT(backend.context->buffers.size() == 1 && backend.context->buffers.at(0) == b1);
+    }
+
+    // a smaller graph never shrinks it
+    GGML_ASSERT(slack_graph_reserve(galloc.get(), 64) == s1);
+
+    // a growth past the slack: max(need, cur * 1.25)
+    const size_t need_big = slack_exact_need(SIZE_MAX, 4000);
+    GGML_ASSERT(slack_graph_reserve(galloc.get(), 4000) == std::max(need_big, s1 + (size_t) (s1 * 0.25)));
+
+    // a monotone growth of +4 % per graph regrows only every few graphs (exact fit would regrow on every one)
+    ggml_gallocr_ptr g2(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_set_grow_slack(g2.get(), 25);
+    int n_regrow = 0;
+    size_t prev = 0;
+    for (size_t n = 1000; n <= 2000; n += 40) {
+        const size_t cur = slack_graph_reserve(g2.get(), n);
+        n_regrow += prev != 0 && cur != prev;
+        prev = cur;
+    }
+    GGML_ASSERT(n_regrow >= 1 && n_regrow <= 4); // 25 graphs, need x2 -> log(2)/log(1.25) = 3.1 regrows
+}
+
+static void test_grow_slack_capped() {
+    // the slack is capped by the buffer type's max size, but never below the need
+    const size_t s0  = slack_exact_need(SIZE_MAX, 400);
+    const size_t n1  = slack_exact_need(SIZE_MAX, 416);
+    const size_t cap = n1 + 8;       // < s0 * 1.25
+    GGML_ASSERT(cap < s0 + s0/4);
+    dummy_backend    backend = dummy_backend_init(cap, /*align*/ 4);
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_set_grow_slack(galloc.get(), 25);
+    GGML_ASSERT(slack_graph_reserve(galloc.get(), 400) == s0);
+    GGML_ASSERT(slack_graph_reserve(galloc.get(), 416) == cap);
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -641,5 +726,8 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_grow_slack_zero", test_grow_slack_zero);
+    run("test_grow_slack", test_grow_slack);
+    run("test_grow_slack_capped", test_grow_slack_capped);
     return 0;
 }

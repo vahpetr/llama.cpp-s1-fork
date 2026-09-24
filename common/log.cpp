@@ -453,6 +453,12 @@ static int common_get_verbosity(enum ggml_log_level level) {
 
 void common_log_default_callback(enum ggml_log_level level, const char * text, void * /*user_data*/) {
     auto verbosity = common_get_verbosity(level);
+    // [TAG_ALLOC_GROW_SLACK] library INFO maps to LOG_LEVEL_TRACE above, so at the default verbosity (-lv 3) every
+    // ggml/llama INFO line is dropped - including ggml-alloc's compute-buffer regrow line, an operational event a
+    // server log must show (it never appeared in the M4.2 gate's container logs). "[ggml-alloc]" lines pass at INFO.
+    if (level == GGML_LOG_LEVEL_INFO && text != nullptr && strncmp(text, "[ggml-alloc]", 12) == 0) {
+        verbosity = LOG_LEVEL_INFO;
+    }
     if (verbosity <= common_log_verbosity_thold) {
         common_log_add(common_log_main(), level, "%s", text);
     }

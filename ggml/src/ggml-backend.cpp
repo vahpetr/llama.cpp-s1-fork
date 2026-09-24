@@ -1541,6 +1541,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+// [TAG_ALLOC_GROW_SLACK] GGML_ALLOC_GROW_SLACK=<percent>, read once (0 / unset = exact fit, today's behaviour)
+static int ggml_sched_grow_slack(void) {
+    static const int slack = [] {
+        const char * s = getenv("GGML_ALLOC_GROW_SLACK");
+        const int v = s ? atoi(s) : 0;
+        return v > 0 ? v : 0;
+    }();
+    return slack;
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
@@ -1586,7 +1596,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         // a failed reserve has already freed the old buffers, so there is nothing to fall back on and
         // nothing to retry: report it. ggml_backend_sched_alloc_graph -> GGML_STATUS_ALLOC_FAILED is
         // the only way an out-of-memory regrow can reach the caller as an error instead of a crash.
-        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+        // [TAG_ALLOC_GROW_SLACK] (M4.2b item 2) GGML_ALLOC_GROW_SLACK=<percent> (default 0 = exact fit): only THIS
+        // path - a graph that outgrew the buffers at run time - allocates the growth with slack. The explicit
+        // ggml_backend_sched_reserve (llama's worst-case reserve at load) stays exact, so the idle size is unchanged.
+        ggml_gallocr_set_grow_slack(sched->galloc, ggml_sched_grow_slack());
+        const bool reserved = ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        ggml_gallocr_set_grow_slack(sched->galloc, 0);
+        if (!reserved) {
             GGML_LOG_ERROR("%s: failed to reserve graph\n", __func__);
             return false;
         }

@@ -493,7 +493,13 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    int grow_slack; // [TAG_ALLOC_GROW_SLACK] percent, see ggml_gallocr_set_grow_slack; 0 = exact fit
 };
+
+void ggml_gallocr_set_grow_slack(ggml_gallocr_t galloc, int percent) {
+    galloc->grow_slack = percent > 0 ? percent : 0;
+}
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
@@ -929,15 +935,46 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
-            {
+            // [TAG_ALLOC_GROW_SLACK] (M4.2b item 2) a REGROW - the buffer exists and a chunk of the new plan is larger -
+            // is exact-fit by default: every chunk is allocated at the plan's max_size, so a graph that grows a little
+            // on every call (a prefill whose n_kv rises by one ubatch per graph) frees and re-allocates the whole
+            // buffer on every call. With a slack of p % (ggml_gallocr_set_grow_slack; ggml_backend_sched sets it from
+            // GGML_ALLOC_GROW_SLACK on its run-time regrow path only) a growing chunk is allocated at
+            // max(need, cur * (1 + p/100)), capped by the buffer type's max size (never below the need), and a chunk
+            // that does not grow keeps its current size instead of shrinking to the new plan, so a monotone growth
+            // regrows O(log) times instead of once per graph. The first allocation (no current buffer) is untouched.
+            const size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+            if (cur_size > 0) {
+                const size_t max_chunk = ggml_backend_buft_get_max_size(galloc->bufts[i]);
+                new_size = 0;
+                for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+                    struct tallocr_chunk * chunk = galloc->buf_tallocs[i]->chunks[c];
+                    const size_t cur_chunk_size = ggml_vbuffer_chunk_size(galloc->buffers[i], c);
+                    const size_t need = chunk->max_size;
+                    size_t target = need;
+                    if (galloc->grow_slack > 0 && cur_chunk_size > 0) {
+                        if (need > cur_chunk_size) {
+                            const size_t grown = aligned_offset(NULL,
+                                cur_chunk_size + (size_t) ((double) cur_chunk_size * galloc->grow_slack / 100.0),
+                                galloc->buf_tallocs[i]->alignment);
+                            target = MAX(need, MIN(grown, MAX(need, max_chunk)));
+                        } else {
+                            target = cur_chunk_size;
+                        }
+                        chunk->max_size = target;
+                    }
+                    new_size += target;
+                    if (need > cur_chunk_size) {
+                        // library INFO; common/log.cpp shows "[ggml-alloc]" lines at the server's default verbosity
+                        GGML_LOG_INFO("[ggml-alloc] grow buffer %d (%s) chunk %d: %zu -> %zu B (need %zu B, slack %d%%)\n",
+                            i, ggml_backend_buft_name(galloc->bufts[i]), c, cur_chunk_size, target, need, galloc->grow_slack);
+                    }
+                }
                 // [TAG_KV_GRAPH_SPAN] growing an already-allocated compute buffer costs a full backend
                 // synchronize plus a free/alloc of the whole chunk. it is the price of a capped worst-case
                 // reserve (llama.cpp's --kv-graph-span), so it must be visible in a release build too.
-                const size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
-                if (cur_size > 0) {
-                    GGML_LOG_INFO("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
-                        __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
-                }
+                GGML_LOG_INFO("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
+                    __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
             }
             // [TAG_KV_GRAPH_SPAN] entries that share a buffer type share the *same* vbuffer pointer
             // (the alias loop above copies it), so freeing entry i's buffer dangles every other entry
