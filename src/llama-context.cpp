@@ -78,6 +78,9 @@ static const char * sched_prof_ctx_name(llama_context_type ctx_type) {
 // (n_stream > 1: the chunk order interleaves streams - compare like with like). Cost: nothing when unset (one static
 // bool at context creation); when set, the scheduler cuts every split at each selection and synchronizes to read
 // it back, which also changes where backend fusions can form - compare runs that BOTH have the dump on.
+// [TAG_QSA_POOLED_CACHE] (M3) the same callback also hashes every "indexer_k-<il>" - the pooled block keys the
+// selection scores - as one `[qsa-pooled]` line per (graph, layer) (see dump_pooled), so the pooled-key cache
+// (LLAMA_QSA_POOLED_CACHE=1) and the recompute can be compared value for value, not only by the ids they select.
 static bool llama_qsa_dump_ids_enabled() {
     static const bool enabled = [] {
         const char * s = getenv("LLAMA_QSA_DUMP_IDS");
@@ -129,7 +132,50 @@ struct llama_qsa_ids_dump {
         return true;
     }
 
+    // [TAG_QSA_POOLED_CACHE] exactly "indexer_k-<il>": the pooled block keys the selection scores against,
+    // [idx_dim, n_blocks, n_stream] f32 - the recompute's rope output, or the pooled-key cache's remap of its store
+    static bool is_pooled(const ggml_tensor * t) {
+        if (strncmp(t->name, "indexer_k-", 10) != 0) {
+            return false;
+        }
+        const char * p = t->name + 10;
+        if (*p == '\0') {
+            return false;
+        }
+        for (; *p; ++p) {
+            if (*p < '0' || *p > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    //   [qsa-pooled] ctx=<main|mtp> g=<graph> il=<il> n_blocks=<n> n_stream=<ns> fnv=<FNV-1a 64 of the f32 bytes>
+    // one line per (graph, layer), printed when the tensor is computed, i.e. before that layer's selection line
+    void dump_pooled(ggml_tensor * t) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            LLAMA_LOG_WARN("%s: %s is not a contiguous f32 tensor - not hashed\n", __func__, t->name);
+            return;
+        }
+        const size_t nb = ggml_nbytes(t);
+        std::vector<uint8_t> pb(nb);
+        ggml_backend_tensor_get(t, pb.data(), 0, nb);
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (size_t i = 0; i < nb; ++i) {
+            h = (h ^ pb[i]) * 0x100000001b3ull;
+        }
+        fprintf(stderr, "[qsa-pooled] ctx=%s g=%llu il=%d n_blocks=%lld n_stream=%lld fnv=%016llx\n", ctx_name,
+                (unsigned long long) graph, atoi(t->name + 10), (long long) t->ne[1], (long long) t->ne[2],
+                (unsigned long long) h);
+    }
+
     static bool eval(ggml_tensor * t, bool ask, void * user_data) {
+        if (is_pooled(t)) {
+            if (!ask) {
+                ((llama_qsa_ids_dump *) user_data)->dump_pooled(t);
+            }
+            return true;
+        }
         if (!is_selection(t)) {
             return !ask; // ask: not needed; never reached with ask == false for a tensor we did not ask for
         }
