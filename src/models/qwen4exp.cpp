@@ -2068,6 +2068,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
         // [TAG_QSA_MIN_KV] also below LLAMA_QSA_MIN_KV
         qsa_exhaustive = qwen4exp_qsa_dense(n_kv_idx, width);
+
+        // the first QSA graph a process builds is the load-time reserve (full memory, n_kv = --kv-graph-span or the
+        // cache): below LLAMA_QSA_MIN_KV it reserves the dense graph, and the first QSA ubatch regrows the buffer
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            if (n_kv_idx < qwen4exp_qsa_min_kv()) {
+                LLAMA_LOG_WARN("%s: LLAMA_QSA_MIN_KV=%lld > the reserve's indexer n_kv %lld (--kv-graph-span or the cache size):"
+                        " the load-time reserve is the DENSE graph; the first QSA ubatch (n_kv >= %lld) regrows the compute buffer\n",
+                        __func__, (long long) qwen4exp_qsa_min_kv(), (long long) n_kv_idx, (long long) qwen4exp_qsa_min_kv());
+            }
+        }
     }
 
     // [TAG_QSA_CHUNK] chunk a scan ubatch that is longer than the chunk; the branch is decided here,
