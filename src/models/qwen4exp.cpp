@@ -12,6 +12,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -812,18 +813,29 @@ static bool qwen4exp_qsa_prefill_indexed() {
     return indexed;
 }
 
-// the knob refuses rather than let the scheduler put the node on the CPU (spec §6): ask the first backend about a small one
-static bool qwen4exp_qsa_indexed_supported(ggml_backend_sched_t sched, const ggml_tensor * k, const ggml_tensor * v, int64_t n_head) {
-    if (sched == nullptr) { return true; }
+// the knob refuses rather than let the scheduler put the node on the CPU (spec §6): ask the first backend about a small one.
+// No scheduler (an unknown backend) is a refusal. The answer is cached per (device, K/V types, heads, head dims), so the
+// stand-in node is built once, at the reserve, not per QSA layer per graph.
+static bool qwen4exp_qsa_indexed_supported(ggml_backend_sched_t sched, ggml_type type_k, ggml_type type_v,
+        int64_t d_k, int64_t d_v, int64_t n_head, int64_t n_head_kv) {
+    if (sched == nullptr) { return false; }
+    ggml_backend_t backend = ggml_backend_sched_get_backend(sched, 0);
+    using key_t = std::tuple<ggml_backend_dev_t, int, int, int64_t, int64_t, int64_t, int64_t>;
+    static std::mutex mtx;
+    static std::map<key_t, bool> answers;
+    const key_t key { ggml_backend_get_device(backend), (int) type_k, (int) type_v, d_k, d_v, n_head, n_head_kv };
+    std::lock_guard<std::mutex> lock(mtx);
+    if (auto it = answers.find(key); it != answers.end()) { return it->second; }
     ggml_init_params ip = { /*.mem_size =*/ 8*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
     ggml_context * ctx = ggml_init(ip);
-    ggml_tensor * fa = ggml_flash_attn_ext(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k->ne[0], 9, n_head, 1),
-            ggml_new_tensor_4d(ctx, k->type, k->ne[0], 256, k->ne[1], 1), ggml_new_tensor_4d(ctx, v->type, v->ne[0], 256, v->ne[1], 1),
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_k, 9, n_head, 1),
+            ggml_new_tensor_4d(ctx, type_k, d_k, 256, n_head_kv, 1), ggml_new_tensor_4d(ctx, type_v, d_v, 256, n_head_kv, 1),
             ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, 9, 1, 1), 1.0f, 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
     ggml_flash_attn_ext_set_kv_ids(fa, ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 64, 9, 1, 1));
-    const bool ok = ggml_backend_supports_op(ggml_backend_sched_get_backend(sched, 0), fa);
+    const bool ok = ggml_backend_supports_op(backend, fa);
     ggml_free(ctx);
+    answers.emplace(key, ok);
     return ok;
 }
 
@@ -1896,13 +1908,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_scan(
 
 bool llama_model_qwen4exp::graph::qsa_use_indexed(llm_graph_input_attn_kv * inp, int64_t n_tps, int il) {
     if (!qwen4exp_qsa_prefill_indexed() || !cparams.flash_attn || n_tps <= 8) { return false; } // decode/verify: never touched
-    const ggml_tensor * k = inp->mctx->get_k(ctx0, il), * v = inp->mctx->get_v(ctx0, il);
-    if (qwen4exp_qsa_indexed_supported(sched, k, v, hparams.n_head(il))) { return true; }
+    // the cache's types and the layer's shape, no K/V views: the check builds nothing in ctx0
+    const ggml_type type_k = inp->mctx->type_k(), type_v = inp->mctx->type_v();
+    if (qwen4exp_qsa_indexed_supported(sched, type_k, type_v, hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
+                hparams.n_head(il), hparams.n_head_kv(il))) {
+        return true;
+    }
     static bool warned = false;
     if (!warned) {
         warned = true;
         LLAMA_LOG_WARN("%s: LLAMA_QSA_PREFILL=indexed: the first backend does not support indexed flash attention for K/V %s/%s"
-                " - using the scan\n", __func__, ggml_type_name(k->type), ggml_type_name(v->type));
+                " - using the scan\n", __func__, ggml_type_name(type_k), ggml_type_name(type_v));
     }
     return false;
 }
@@ -2161,6 +2177,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // selection is exhaustive and QSA is the dense attention with ~40 extra nodes per layer.
     // Keep the indexer K write (cache_only), run the dense build_attn().
     bool qsa_exhaustive = false;
+
+    if (qsa) {
+        // [TAG_QSA_INDEXED_FA] read and log LLAMA_QSA_PREFILL at the first QSA layer (the reserve), whatever branch it takes
+        qwen4exp_qsa_prefill_indexed();
+    }
 
     if (qsa && (qwen4exp_qsa_bypass_exhaustive() || qwen4exp_qsa_min_kv() > 0)) {
         // same expression as build_qsa_top_k()'s `width`, over the same n_kv

@@ -1175,7 +1175,10 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il,
-            ggml_tensor * kv_ids = nullptr) const; // [TAG_QSA_INDEXED_FA] [W, n_tps, 1, n_stream] i32, flash attention only
+            ggml_tensor * kv_ids = nullptr) const; // [TAG_QSA_INDEXED_FA] flash attention only: each query row attends to
+                                                   // its own W cells. Contiguous I32 [W, n_tps, 1, n_stream] at buffer
+                                                   // offset 0 (a whole tensor, never a row-offset view: Vulkan binds it
+                                                   // aligned), ids unique within a row and in [0, n_kv)
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
