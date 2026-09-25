@@ -73,7 +73,9 @@ const bool INDEXED         = (Flags & 256) != 0;
 const uint32_t HSK_pad = (HSK + 15) & ~15;
 const uint32_t HSV_pad = (HSV + 15) & ~15;
 
-const bool KV_bounds_check = Clamp != 0;
+// [TAG_QSA_INDEXED_FA] (M6) indexed columns are bounds-masked by id (FA_KV_LIVE) whatever the host picks for Clamp;
+// INDEXED is a spec constant, false on every dense pipeline, so this costs them nothing.
+const bool KV_bounds_check = Clamp != 0 || INDEXED;
 
 layout (push_constant) uniform parameter {
     uint32_t N;
@@ -220,7 +222,6 @@ ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
          q_stride, k_stride, v_stride, m_stride;
-#define FA_KV_END (INDEXED ? p.split_kv : KV) // [TAG_QSA_INDEXED_FA] W ids per token, else the KV extent
 
 void init_indices()
 {

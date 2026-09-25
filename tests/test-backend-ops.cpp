@@ -7988,8 +7988,12 @@ struct test_flash_attn_ext_indexed : public test_case {
     }
     void initialize_tensors(ggml_context * ctx) override { fa_indexed_init(ctx, dead, sorted); }
 };
-// spec §3.6: out = indexed(sorted ids) - dense(scan mask) must be +0.0 on the CPU reference (b);
-// the backend under test (a) is held to the FA rounding class, |a| <= 5e-3
+// spec §3.6: out = concat(indexed(sorted ids) - dense(scan mask), dense) along dim 3; the difference half must be
+// +0.0 on the CPU reference (b). The backend under test (a) is held to a relative bar on its own dense half:
+// sum(diff^2) / sum(dense^2) <= 5e-5. Estimate: uniform q/k/v in [-1, 1] at scale 1/16 give a near-uniform softmax,
+// so |dense| ~ 0.58/sqrt(W) ~ 0.013 at W 2051 (the old absolute bar 5e-3 was ~1/3 of it); a dropped 3-column tail
+// tile moves the output by ~1.5e-3, a ratio ~1e-2, while the two paths differ only in f16 P rounding / summation
+// order (per element ~1e-3 relative, ratio ~1e-6), so 5e-5 separates the two by >= 20x on either side.
 // cases must be q8_0, or f16 with n_tps < GGML_FA_TILE_Q (64): the dense node must stay off the CPU tiled path to be bit-exact
 struct test_flash_attn_ext_indexed_selfcheck : public test_case {
     const ggml_type type_KV; const int64_t n_tps, n_kv, idx_W; const int dead; const int64_t n_stream;
@@ -7998,9 +8002,12 @@ struct test_flash_attn_ext_indexed_selfcheck : public test_case {
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 0.0; }
     double err(const float * a, const float * b, size_t n) override {
-        double worst = 0.0;
-        for (size_t i = 0; i < n; ++i) { if (b[i] != 0.0f) { return 1.0; } worst = std::max(worst, (double) std::fabs(a[i])); }
-        return worst <= 5e-3 ? 0.0 : worst;
+        const size_t nd = n/2; // [0, nd) = indexed - dense, [nd, n) = dense
+        double d2 = 0.0, s2 = 0.0;
+        for (size_t i = 0; i < nd; ++i) { if (b[i] != 0.0f) { return 1.0; } d2 += (double) a[i]*a[i]; }
+        for (size_t i = nd; i < n; ++i) { s2 += (double) a[i]*a[i]; }
+        if (!(s2 > 0.0)) { return 1.0; }
+        return d2/s2 <= 5e-5 ? 0.0 : d2/s2;
     }
     test_flash_attn_ext_indexed_selfcheck(ggml_type type_KV, int64_t n_tps, int64_t n_kv, int64_t idx_W, int dead, int64_t n_stream = 1)
         : type_KV(type_KV), n_tps(n_tps), n_kv(n_kv), idx_W(idx_W), dead(dead), n_stream(n_stream) {}
@@ -8015,7 +8022,8 @@ struct test_flash_attn_ext_indexed_selfcheck : public test_case {
         ggml_tensor * sm = ggml_set_rows(ctx, all, zeros, ids3);
         sm = ggml_view_4d(ctx, sm, sm->ne[1], sm->ne[2], 1, sm->ne[3], sm->nb[2], sm->nb[3], sm->nb[3], 0);
         sm = ggml_add(ctx, sm, io.m);
-        ggml_tensor * out = ggml_sub(ctx, fa_indexed_op(ctx, io, io.m, io.ids), fa_indexed_op(ctx, io, sm, nullptr));
+        ggml_tensor * dense = fa_indexed_op(ctx, io, sm, nullptr);
+        ggml_tensor * out = ggml_concat(ctx, ggml_sub(ctx, fa_indexed_op(ctx, io, io.m, io.ids), dense), dense, 3);
         ggml_set_name(out, "out");
         return out;
     }
@@ -11028,6 +11036,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_F16,    9, 4096,   77, 2, 2));         // (e)(f)(c)
     test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0, 228, 4096,   77));               // (f)
     test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0,   9, 4096,    1));               // (f) one id
+    for (int64_t n_tps : { 1, 2 }) {  // n_tps <= 8 with ids: the forced plain fold, GQA_TOKENS off
+        test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0, n_tps, 4096, 2051));
+    }
     for (int dead : { 0, 2 }) {
         test_cases.emplace_back(new test_flash_attn_ext_indexed_selfcheck(GGML_TYPE_Q8_0, 64, 4096, 2051, dead));
     }
