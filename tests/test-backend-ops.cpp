@@ -7989,11 +7989,13 @@ struct test_flash_attn_ext_indexed : public test_case {
     void initialize_tensors(ggml_context * ctx) override { fa_indexed_init(ctx, dead, sorted); }
 };
 // spec §3.6: out = concat(indexed(sorted ids) - dense(scan mask), dense) along dim 3; the difference half must be
-// +0.0 on the CPU reference (b). The backend under test (a) is held to a relative bar on its own dense half:
-// sum(diff^2) / sum(dense^2) <= 5e-5. Estimate: uniform q/k/v in [-1, 1] at scale 1/16 give a near-uniform softmax,
-// so |dense| ~ 0.58/sqrt(W) ~ 0.013 at W 2051 (the old absolute bar 5e-3 was ~1/3 of it); a dropped 3-column tail
-// tile moves the output by ~1.5e-3, a ratio ~1e-2, while the two paths differ only in f16 P rounding / summation
-// order (per element ~1e-3 relative, ratio ~1e-6), so 5e-5 separates the two by >= 20x on either side.
+// +0.0 on the CPU reference (b). The backend under test (a) is held to a relative bar on its own dense half,
+// sum(diff^2) / sum(dense^2) <= 5e-5, AND to a per-element cap max|diff| <= 5e-3 (the ratio alone would let one
+// element be off by ~0.06 at Q8_0 64/4096/2051). Estimate: uniform q/k/v in [-1, 1] at scale 1/16 give a near-uniform
+// softmax, so |dense| ~ 0.577/sqrt(W) ~ 0.013 RMS at W 2051 (the cap alone is ~1/3 of it); dropping 3 live columns
+// shifts the output by ~sqrt(3)*0.577/2051 ~ 4.9e-4 RMS, a ratio ~1.3e-3 (~25x over the bar), while the two paths
+// differ only in f16 P rounding / summation order (ratio ~1e-6). Tail-tile coverage comes from the UNSORTED indexed
+// cases (NMSE vs CPU), not from this selfcheck: its sorted ids + dead layout make the tail tile all -inf.
 // cases must be q8_0, or f16 with n_tps < GGML_FA_TILE_Q (64): the dense node must stay off the CPU tiled path to be bit-exact
 struct test_flash_attn_ext_indexed_selfcheck : public test_case {
     const ggml_type type_KV; const int64_t n_tps, n_kv, idx_W; const int dead; const int64_t n_stream;
@@ -8003,10 +8005,14 @@ struct test_flash_attn_ext_indexed_selfcheck : public test_case {
     double max_nmse_err() override { return 0.0; }
     double err(const float * a, const float * b, size_t n) override {
         const size_t nd = n/2; // [0, nd) = indexed - dense, [nd, n) = dense
-        double d2 = 0.0, s2 = 0.0;
-        for (size_t i = 0; i < nd; ++i) { if (b[i] != 0.0f) { return 1.0; } d2 += (double) a[i]*a[i]; }
+        double d2 = 0.0, s2 = 0.0, worst = 0.0;
+        for (size_t i = 0; i < nd; ++i) {
+            if (b[i] != 0.0f) { return 1.0; }
+            d2 += (double) a[i]*a[i]; worst = std::max(worst, (double) std::fabs(a[i]));
+        }
         for (size_t i = nd; i < n; ++i) { s2 += (double) a[i]*a[i]; }
         if (!(s2 > 0.0)) { return 1.0; }
+        if (worst > 5e-3) { return worst; }
         return d2/s2 <= 5e-5 ? 0.0 : d2/s2;
     }
     test_flash_attn_ext_indexed_selfcheck(ggml_type type_KV, int64_t n_tps, int64_t n_kv, int64_t idx_W, int dead, int64_t n_stream = 1)

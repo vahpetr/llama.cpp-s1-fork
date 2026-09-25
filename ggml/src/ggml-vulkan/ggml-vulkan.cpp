@@ -20752,8 +20752,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     }
                     // ids bind at binding 6 through ggml_vk_tensor_subbuffer, which asserts a
                     // minStorageBufferOffsetAlignment-aligned offset; the ids row stride is W * 4 B (8204 at W 2051), so a
-                    // row-offset view of a bigger ids tensor would abort there - fall back instead. Task 3: the ids must be
-                    // the chunk's own QSA_TOP_K output at offset 0, never a row-offset view.
+                    // row-offset view of a bigger ids tensor would abort there - fall back instead. The ids may be any
+                    // tensor or view whose offset is aligned (e.g. the chunk's own QSA_TOP_K output, or a view at offset 0).
                     const ggml_tensor * ids_base = ids->view_src ? ids->view_src : ids;
                     const uint64_t ids_offs = ids->view_offs +
                         ((ids_base->buffer && ggml_backend_buffer_is_vk(ids_base->buffer)) ? vk_tensor_offset(ids) : 0);
