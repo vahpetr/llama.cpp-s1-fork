@@ -1915,9 +1915,8 @@ bool llama_model_qwen4exp::graph::qsa_use_indexed(llm_graph_input_attn_kv * inp,
                 hparams.n_head(il), hparams.n_head_kv(il))) {
         return true;
     }
-    static bool warned = false;
-    if (!warned) {
-        warned = true;
+    static std::atomic<bool> warned{false}; // graphs may be built concurrently (several contexts): once, race-free
+    if (!warned.exchange(true)) {
         LLAMA_LOG_WARN("%s: LLAMA_QSA_PREFILL=indexed: the first backend does not support indexed flash attention for K/V %s/%s"
                 " - using the scan\n", __func__, ggml_type_name(type_k), ggml_type_name(type_v));
     }
