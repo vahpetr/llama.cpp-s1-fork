@@ -13,6 +13,7 @@
 #include <mutex>
 #include <string>
 #include <tuple>
+#include <map>
 #include <utility>
 #include <vector>
 
