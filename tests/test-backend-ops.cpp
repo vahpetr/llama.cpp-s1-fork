@@ -11336,6 +11336,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             test_cases.emplace_back(new test_concat_ssm_conv_fuse(10240, 64, 2, extra, exact));
             test_cases.emplace_back(new test_concat_ssm_conv_fuse(1027, 17, 3, extra, exact));
+            // sliding-window kernel (8 tokens per thread, 32 per workgroup, 64 channels): fewer tokens than the
+            // window, ragged token tiles, ragged channels, two sequences
+            for (int64_t n_t : { 2, 8, 9, 31, 33, 300 }) {
+                test_cases.emplace_back(new test_concat_ssm_conv_fuse(130, n_t, 2, extra, exact));
+            }
+            test_cases.emplace_back(new test_concat_ssm_conv_fuse(10240, 257, 1, extra, exact));
         }
     }
 
