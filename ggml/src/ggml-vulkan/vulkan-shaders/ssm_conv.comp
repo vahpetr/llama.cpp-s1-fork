@@ -8,6 +8,11 @@ layout(constant_id = 0) const uint BLOCK_SIZE = 32;
 layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
 layout(constant_id = 2) const bool APPLY_BIAS = false;
 layout(constant_id = 3) const bool APPLY_SILU = false;
+// TWO_SRC without APPLY_BIAS only: tokens per thread (port of halo-box 73ff93d8e, Gufo's SsmConv4 layout). The thread
+// slides the conv window along its tokens in registers, so a token costs one x load and one store instead of nc loads.
+// The bias + silu pipeline keeps the per-output form below: with the sliding window its dot + bias did not come out
+// bit-identical to the materialised-concat dispatch on RADV (CONCAT_SSM_CONV_EXACT extra=2), and qwen4exp does not use it.
+layout(constant_id = 4) const uint TOKENS_PER_THREAD = 1;
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
 
@@ -43,6 +48,60 @@ float win(uint i3, uint i1, uint j) {
 #endif
 
 void main() {
+#ifdef TWO_SRC
+    if (!APPLY_BIAS) {
+        // one thread per (channel i1, TOKENS_PER_THREAD consecutive tokens); lanes run along channels. Every output
+        // is the same expression over the same floats as the per-output form (the window element j of concat row
+        // (i1, i3) is win(i3, i1, j)), so the result is bit-identical; only the loads are shared.
+        const uint i1 = gl_GlobalInvocationID.x;
+        const uint t0 = (gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y) * TOKENS_PER_THREAD;
+        const uint i3 = gl_WorkGroupID.z;
+
+        if (i1 >= nr || t0 >= n_t || i3 >= n_s) {
+            return;
+        }
+
+        const uint src1_base = i1 * (nb11 / 4);
+
+        if (nc == 4) {
+            const vec4 k = vec4(src1[src1_base], src1[src1_base + 1], src1[src1_base + 2], src1[src1_base + 3]);
+            float w0 = win(i3, i1, t0);
+            float w1 = win(i3, i1, t0 + 1);
+            float w2 = win(i3, i1, t0 + 2);
+            [[unroll]] for (uint i = 0; i < TOKENS_PER_THREAD; i++) {
+                const uint i2 = t0 + i;
+                if (i2 >= n_t) {
+                    break;
+                }
+                const float w3 = win(i3, i1, i2 + 3);
+                float sum = dot(vec4(w0, w1, w2, w3), k);
+                if (APPLY_SILU) {
+                    sum = sum / (1.0f + exp(-sum));
+                }
+                dst[i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1] = sum;
+                w0 = w1;
+                w1 = w2;
+                w2 = w3;
+            }
+        } else {
+            for (uint i = 0; i < TOKENS_PER_THREAD; i++) {
+                const uint i2 = t0 + i;
+                if (i2 >= n_t) {
+                    break;
+                }
+                float sum = 0.0;
+                for (uint i0 = 0; i0 < nc; i0++) {
+                    sum += win(i3, i1, i2 + i0) * src1[src1_base + i0];
+                }
+                if (APPLY_SILU) {
+                    sum = sum / (1.0f + exp(-sum));
+                }
+                dst[i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1] = sum;
+            }
+        }
+        return;
+    }
+#endif
     const uint i1 = gl_GlobalInvocationID.x;
     const uint i2 = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
     const uint i3 = gl_WorkGroupID.z;

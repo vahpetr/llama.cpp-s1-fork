@@ -7902,9 +7902,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32[0], "ssm_conv_split_f32",           ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 5, sizeof(vk_op_ssm_conv_split_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32[1], "ssm_conv_split_silu_f32",      ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 5, sizeof(vk_op_ssm_conv_split_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32[2], "ssm_conv_split_bias_silu_f32", ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 5, sizeof(vk_op_ssm_conv_split_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32[0], "ssm_conv_split_f32",           ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 5, sizeof(vk_op_ssm_conv_split_push_constants), {64, 32, 1}, {64, 4, 0, 0, 8}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32[1], "ssm_conv_split_silu_f32",      ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 5, sizeof(vk_op_ssm_conv_split_push_constants), {64, 32, 1}, {64, 4, 0, 1, 8}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32[2], "ssm_conv_split_bias_silu_f32", ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 5, sizeof(vk_op_ssm_conv_split_push_constants), {32, 16, 1}, {32, 16, 1, 1, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -16429,6 +16429,10 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
 // [TAG_CONV_INPUT_SPLIT] CONCAT(state, x) at node_idx, SSM_CONV(concat, c) at node_idx + 1, optionally + SILU or
 // + ADD(bias) + SILU. Validated by ggml_vk_can_fuse_concat_ssm_conv. The conv window element j is state[j] for
 // j < sc and x[j - sc] otherwise - the float the concat would have stored there.
+// Each thread owns one channel for 8 consecutive tokens and slides the window in registers (Gufo's SsmConv4Kernel
+// layout, port of halo-box 73ff93d8e): one x load and one store per token instead of nc loads per output; the
+// pipelines' wg denominators {64, 32, 1} = 64 channels x (4 rows x 8 tokens). The bias + silu pipeline keeps the
+// per-output form ({32, 16, 1}, one token per thread): see ssm_conv.comp.
 static void ggml_vk_ssm_conv_split(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * concat = cgraph->nodes[node_idx];
     ggml_tensor * conv = cgraph->nodes[node_idx + 1];
