@@ -39,6 +39,12 @@ void main() {
         const uint t = row % p.np;
         const uint s = row / p.np;
         const uint q = p.has_rows != 0u ? uint(data_rows[s*p.np + t]) : t;
+        // the CPU reference asserts 0 <= q < n_tps; here an out-of-range row (never built by the graph: rows are an
+        // arange or its clamp) reads no table entry and yields -inf, which no selection can pick
+        if (q >= p.n_tps) {
+            data_d[row*p.n_blocks + b] = uintBitsToFloat(F32_NEG_INF);
+            continue;
+        }
 
         const uint qi   = 2u*(s*p.n_tps + q);
         const int  tail = data_qry[qi];

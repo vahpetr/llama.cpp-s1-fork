@@ -35,7 +35,10 @@ static bool llama_qsa_compact_bias_env() {
 }
 
 // [TAG_QSA_COMPACT_BIAS] LLAMA_QSA_COMPACT_BIAS_CHECK=1 (diagnostic, only with the knob on): every ubatch also fills
-// the old plane with the unchanged qsa_fill_bias and compares it bitwise with the tables expanded by the op's formula
+// the old plane with the unchanged qsa_fill_bias and compares it bitwise with the tables expanded by the op's formula.
+// Cost: a host vector of the old plane's full size, [n_blocks, n_tokens] f32 = 4*U/r B per pool cell (≈ 0.8 GiB at
+// n_kv 393216, ub 2048), allocated per set_input, plus the old O(n_blocks*U) fill - i.e. the memory the knob saves,
+// in plain host RAM. LLAMA_QSA_TAIL_ASSERT=1 with the knob on runs this check too: the tail assert lives in the old fill.
 static bool llama_qsa_compact_check_env() {
     static const bool enabled = [] {
         const char * s = getenv("LLAMA_QSA_COMPACT_BIAS_CHECK");
@@ -762,7 +765,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
             qsa_fill_bias_compact(s, ubatch, n_ns, n_blocks, r, (int32_t *) qsa_blk->data, (int32_t *) qsa_qry->data, cs);
 
-            if (llama_qsa_compact_check_env()) {
+            if (llama_qsa_compact_check_env() || qsa_tail_assert_enabled()) {
                 qsa_compact_check(s, ubatch, n_kv, n_ns, n_blocks, r, cur_cell_blk,
                         (const int32_t *) qsa_blk->data, (const int32_t *) qsa_qry->data, cs, check_plane);
             }
@@ -1649,7 +1652,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa_store(
             qsa_fill_bias_compact(s, ubatch, pl.n_ns, pl.n_blocks, ratio,
                     (int32_t *) qsa_blk->data, (int32_t *) qsa_qry->data, pl.cs[s]);
 
-            if (llama_qsa_compact_check_env()) {
+            if (llama_qsa_compact_check_env() || qsa_tail_assert_enabled()) {
                 qsa_compact_check(s, ubatch, n_kv, pl.n_ns, pl.n_blocks, ratio, pl.cell_blk.data() + s*n_kv,
                         (const int32_t *) qsa_blk->data, (const int32_t *) qsa_qry->data, pl.cs[s], check_plane);
             }
