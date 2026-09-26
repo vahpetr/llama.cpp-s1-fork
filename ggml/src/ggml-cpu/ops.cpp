@@ -9044,6 +9044,117 @@ void ggml_compute_forward_qsa_top_k(
     }
 }
 
+// ggml_compute_forward_kq_mask
+//
+// [TAG_KQ_VIS] the reference for GGML_OP_KQ_MASK: per element the predicate of
+// set_input_kq_mask_impl (src/llama-kv-cache.cpp) evaluated on the cell and token records, with
+// the same values (+0 / -inf / -|p0 - p1| for ALiBi) converted with the same ggml_fp32_to_fp16.
+
+static inline bool kq_vis_swa_masked(int32_t swa_type, int32_t n_swa, int32_t p0, int32_t p1) {
+    // a copy of llama_hparams::is_masked_swa (src/llama-hparams.h)
+    switch (swa_type) {
+        case 1: // LLAMA_SWA_TYPE_STANDARD
+            return p1 - p0 >= n_swa;
+        case 2: // LLAMA_SWA_TYPE_CHUNKED
+            return p0 < (p1 / n_swa) * n_swa;
+        case 3: // LLAMA_SWA_TYPE_SYMMETRIC
+            {
+                const int32_t half_n_swa = n_swa / 2;
+                const int32_t pos_diff   = p1 - p0;
+                return pos_diff < -half_n_swa || pos_diff > half_n_swa;
+            }
+        default:
+            return false;
+    }
+}
+
+template <typename T, T (*conv)(float)>
+static void ggml_compute_forward_kq_mask_impl(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src_cells = dst->src[0];
+    const ggml_tensor * src_toks  = dst->src[1];
+
+    const bool    causal   = ggml_get_op_params_i32(dst, 0) != 0;
+    const bool    alibi    = ggml_get_op_params_i32(dst, 1) != 0;
+    const int32_t swa_type = ggml_get_op_params_i32(dst, 2);
+    const int32_t n_swa    = ggml_get_op_params_i32(dst, 3);
+
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_tps    = dst->ne[1];
+    const int64_t n_stream = dst->ne[3];
+
+    const int32_t * cells = (const int32_t *) src_cells->data;
+    const int32_t * toks  = (const int32_t *) src_toks->data;
+
+    const T v_keep = conv(0.0f);
+    const T v_drop = conv(-INFINITY);
+
+    const int64_t nr  = n_tps*n_stream;
+    const int64_t dr  = (nr + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t s = ir / n_tps;
+        const int64_t t = ir % n_tps;
+
+        const int32_t * tk = toks  + 4*(s*n_tps + t);
+        const int32_t * cs = cells + 4*(s*n_kv);
+
+        const int32_t  p1  = tk[0];
+        const uint32_t tsm = (uint32_t) tk[1];
+        const int32_t  x1  = tk[2];
+        const int32_t  y1  = tk[3];
+
+        T * row = (T *) ((char *) dst->data + t*dst->nb[1] + s*dst->nb[3]);
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int32_t * c = cs + 4*j;
+
+            const int32_t p0 = c[0];
+
+            bool keep = ((uint32_t) c[1] & tsm) != 0;
+            if (keep && causal) {
+                // mask future tokens; at equal positions the M-RoPE 2-D order (llama_kv_cell_ext::is_2d_gt)
+                keep = p0 < p1 || (p0 == p1 && !(c[3] > y1 || (c[3] == y1 && c[2] > x1)));
+            }
+            if (keep && swa_type != 0) {
+                keep = !kq_vis_swa_masked(swa_type, n_swa, p0, p1);
+            }
+
+            if (!keep) {
+                row[j] = v_drop;
+            } else if (alibi) {
+                row[j] = conv(static_cast<float>(-std::abs(p0 - p1)));
+            } else {
+                row[j] = v_keep;
+            }
+        }
+    }
+}
+
+static inline float kq_mask_conv_f32(float v) { return v; }
+static inline ggml_fp16_t kq_mask_conv_f16(float v) { return ggml_fp32_to_fp16(v); }
+
+void ggml_compute_forward_kq_mask(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    switch (dst->type) {
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_kq_mask_impl<ggml_fp16_t, kq_mask_conv_f16>(params, dst);
+            } break;
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_kq_mask_impl<float, kq_mask_conv_f32>(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,

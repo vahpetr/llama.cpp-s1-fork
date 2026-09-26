@@ -13,6 +13,20 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+// the KQ-mask fill over explicit cells - the body of llama_kv_cache::set_input_kq_mask, as a free
+// function so tests can run it on synthetic cells. data: [n_kv, n_tps, 1, n_stream] of type (F16/F32)
+void llama_kv_cells_fill_kq_mask(
+        void * data, ggml_type type, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool causal_attn,
+        const llama_hparams & hparams, uint32_t n_swa, llama_swa_type swa_type,
+        const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream);
+
+// [TAG_KQ_VIS] the metadata fill (visibility from metadata): cells_data I32 [4, n_kv, n_stream],
+// toks_data I32 [4, n_tps, n_stream]; GGML_OP_KQ_MASK over them equals llama_kv_cells_fill_kq_mask.
+// false = the ubatch cannot be expressed (a seq id >= 32, or a stream block mixing streams)
+bool llama_kv_cells_fill_kq_vis(
+        int32_t * cells_data, int32_t * toks_data, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch,
+        const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream);
+
 //
 // llama_kv_cache
 //
@@ -231,6 +245,10 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // [TAG_KQ_VIS] the metadata GGML_OP_KQ_MASK turns into the mask set_input_kq_mask writes:
+    // cells_dst I32 [4, n_kv, n_stream], toks_dst I32 [4, n_tps, n_stream]; false = not expressible
+    bool set_input_kq_vis(ggml_tensor * cells_dst, ggml_tensor * toks_dst, const llama_ubatch * ubatch) const;
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -429,6 +447,7 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    bool set_input_kq_vis    (ggml_tensor * cells_dst, ggml_tensor * toks_dst, const llama_ubatch * ubatch) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

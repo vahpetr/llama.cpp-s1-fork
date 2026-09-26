@@ -1065,6 +1065,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "LEAKY_RELU",
     "TRI",
     "FILL",
+    "KQ_MASK",
 
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1181,6 +1182,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "leaky_relu(x)",
     "tri(x)",
     "fill(x, c)",
+    "kq_mask(cells, toks)",
 
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
@@ -1217,7 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5478,6 +5480,42 @@ struct ggml_tensor * ggml_qsa_top_k(
     result->src[0] = score;
     result->src[1] = cell_blk;
     result->src[2] = mask;
+
+    return result;
+}
+
+// ggml_kq_mask
+
+struct ggml_tensor * ggml_kq_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * toks,
+        enum ggml_type        type,
+        bool                  causal,
+        bool                  alibi,
+        int32_t               swa_type,
+        int32_t               n_swa) {
+    GGML_ASSERT(cells->type == GGML_TYPE_I32 && toks->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(cells) && ggml_is_contiguous(toks));
+    GGML_ASSERT(cells->ne[0] == 4 && toks->ne[0] == 4);
+    GGML_ASSERT(cells->ne[3] == 1 && toks->ne[3] == 1);
+    GGML_ASSERT(cells->ne[2] == toks->ne[2]);
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(swa_type >= 0 && swa_type <= 3);
+    GGML_ASSERT(swa_type == 0 || n_swa > 0);
+
+    const int64_t n_kv     = cells->ne[1];
+    const int64_t n_tps    = toks->ne[1];
+    const int64_t n_stream = cells->ne[2];
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, n_kv, n_tps, 1, n_stream);
+
+    const int32_t params[] = { causal ? 1 : 0, alibi ? 1 : 0, swa_type, n_swa };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_KQ_MASK;
+    result->src[0] = cells;
+    result->src[1] = toks;
 
     return result;
 }

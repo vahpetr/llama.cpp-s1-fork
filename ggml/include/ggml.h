@@ -556,6 +556,7 @@ extern "C" {
         GGML_OP_LEAKY_RELU,
         GGML_OP_TRI,
         GGML_OP_FILL,
+        GGML_OP_KQ_MASK,
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
@@ -2453,6 +2454,31 @@ extern "C" {
             struct ggml_tensor  * cell_blk,
             struct ggml_tensor  * mask,
             int                   k);
+
+    // [TAG_KQ_VIS] the KQ mask computed from metadata (visibility from metadata, Phase 3): the value
+    // llama_kv_cache::set_input_kq_mask writes, as a pure function of 16 B per KV cell and 16 B per token.
+    //
+    //   cells:  [4, n_kv,  n_stream] I32, contiguous: {pos (-1 = empty cell), seq bitmask (bit s = seq s,
+    //           s < 32; 0 = empty or seqless), ext.x, ext.y}
+    //   toks:   [4, n_tps, n_stream] I32, contiguous: {pos, 1u << seq, x, y}; x = y = INT32_MAX when the
+    //           ubatch has no 2-D (M-RoPE) positions, which makes the 2-D tie-break a no-op
+    //   result: [n_kv, n_tps, 1, n_stream] F16 or F32
+    //
+    //   keep(c, t) = (c.seq & t.seq) != 0
+    //             && (!causal || (c.pos <= t.pos && !(c.pos == t.pos && (c.y > t.y || (c.y == t.y && c.x > t.x)))))
+    //             && !swa_masked(swa_type, n_swa, c.pos, t.pos)            (llama_hparams::is_masked_swa)
+    //   mask     = keep ? (alibi ? -|c.pos - t.pos| : +0) : -inf
+    //
+    // swa_type: 0 none, 1 standard, 2 chunked, 3 symmetric (llama_swa_type)
+    GGML_API struct ggml_tensor * ggml_kq_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * toks,
+            enum ggml_type        type,
+            bool                  causal,
+            bool                  alibi,
+            int32_t               swa_type,
+            int32_t               n_swa);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
