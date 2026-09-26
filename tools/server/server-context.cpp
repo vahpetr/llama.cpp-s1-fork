@@ -2648,10 +2648,31 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // [TAG_CKPT_28302] (v33, upstream 5d806aa25 / #28302, de-duplication moved first so that a superseded
+        //   same-position checkpoint frees its entry before the capacity loop below could evict the oldest one).
+        //   Retention side effect: the spacing rule no longer thins a non-full list, so a slot keeps up to
+        //   n_ctx_checkpoints checkpoints (hard cap unchanged); host RAM per slot <= n_ctx_checkpoints x one
+        //   checkpoint (with [TAG_CKPT_NO_DFT]: ~112.6 MiB each on the prod model -> 0.44 GiB/slot at --ctx-checkpoints 4).
+        // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
+        {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+                if (it->n_tokens == n_tokens_new) {
+                    SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    it = slot.prompt.checkpoints.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
+        // only when the list is full, otherwise short prompts keep just the oldest checkpoint
         int64_t last = -1;
-        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+        for (auto it = slot.prompt.checkpoints.begin();
+                slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
+                it != slot.prompt.checkpoints.end(); ) {
             if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
