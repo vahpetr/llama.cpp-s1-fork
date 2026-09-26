@@ -1603,6 +1603,14 @@ std::string server_task_result_metrics::to_metrics() {
             "Speculative: replays following a rejection inside a folded round",
             (double) metrics.n_spec_fold_rejected
         }, {
+            "prompt_checkpoint_restores_total",
+            "Prompt-checkpoint restores (a new prompt resumed from a context checkpoint)",
+            (double) metrics.n_prompt_restores
+        }, {
+            "prompt_replayed_tokens_total",
+            "Common-prefix tokens re-processed because the state was restored at an earlier checkpoint",
+            (double) metrics.n_prompt_replayed_tokens
+        }, {
             "admission_deferred_total",
             "GTT headroom admission: prompts that had to wait for headroom (one per deferral episode)",
             (double) metrics.admission_deferred_total

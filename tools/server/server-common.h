@@ -478,6 +478,10 @@ struct server_metrics {
     // tokens reused from the cache need no decode, so they only have a count
     uint64_t n_prompt_cached = 0;
 
+    // [TAG_B0_RESTORE_LOG] (v33 B0) prompt-checkpoint restores and the common-prefix tokens they re-process
+    uint64_t n_prompt_restores        = 0;
+    uint64_t n_prompt_replayed_tokens = 0;
+
     uint64_t n_tokens_max = 0;
 
     uint64_t n_decode     = 0;

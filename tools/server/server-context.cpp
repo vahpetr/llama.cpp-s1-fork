@@ -335,6 +335,13 @@ struct server_slot {
     int64_t adm_t_defer_us     = 0;     // start of the current deferral
     int64_t adm_t_log_us       = 0;     // last deferral log line (rate limit)
     double  adm_projected_mib  = 0.0;   // projection of the last check
+
+    // [TAG_B0_RESTORE_LOG] (v33 B0) per-task restore telemetry, logged once the prompt's first batch is set up
+    bool    b0_pending         = false;
+    int32_t b0_n_cached_live   = 0;     // tokens held by the slot before the task (the live state)
+    int32_t b0_prefix_match    = 0;     // common prefix of the live tokens and the new prompt (after cache reuse)
+    int64_t b0_ckpt_n_tokens   = -1;    // n_tokens of the restored checkpoint, -1 = none restored
+    bool    b0_full_reset      = false; // no usable checkpoint -> full re-processing
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -539,6 +546,12 @@ struct server_slot {
         adm_t_defer_us    = 0;
         adm_t_log_us      = 0;
         adm_projected_mib = 0.0;
+
+        b0_pending       = false;
+        b0_n_cached_live = 0;
+        b0_prefix_match  = 0;
+        b0_ckpt_n_tokens = -1;
+        b0_full_reset    = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -3795,6 +3808,11 @@ private:
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
 
+                        slot.b0_pending       = true;
+                        slot.b0_n_cached_live = slot.prompt.n_tokens();
+                        slot.b0_ckpt_n_tokens = -1;
+                        slot.b0_full_reset    = false;
+
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
@@ -3920,6 +3938,8 @@ private:
                                 n_past = 0;
                             }
 
+                            slot.b0_prefix_match = n_past;
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -4014,11 +4034,13 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        slot.b0_ckpt_n_tokens = it->n_tokens;
                                         SLT_INF(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB: tgt %.3f + dft %.3f + spec %.3f)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024,
                                                 (float) it->data_tgt.size() / 1024 / 1024, (float) it->data_dft.size() / 1024 / 1024, (float) it->data_spec.size() / 1024 / 1024);
                                     }
 
                                     if (do_reset) {
+                                        slot.b0_full_reset = true;
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
@@ -4101,6 +4123,31 @@ private:
                         slot.prompt.checkpoints.clear();
 
                         slot.stats.n_prompt_cached = 0;
+
+                        slot.b0_full_reset = true;
+                    }
+
+                    // [TAG_B0_RESTORE_LOG] (v33 B0) one line per prompt-processing task: how much of the common prefix
+                    //   is re-processed. replayed = prefix_match - n_past_restored (tokens that matched the live state
+                    //   but are decoded again because the recurrent state could only be restored at an earlier point),
+                    //   ~ n_ubatch when the n - (4 + n_ubatch) checkpoint was used, ~ 4 for n - 4.
+                    if (slot.b0_pending) {
+                        slot.b0_pending = false;
+
+                        const int32_t n_restored = slot.prompt.n_tokens();
+                        const int32_t replayed   = std::max(0, slot.b0_prefix_match - n_restored);
+                        const int32_t n_new      = std::max(0, slot.task->n_tokens() - std::max(slot.b0_prefix_match, n_restored));
+
+                        metrics.n_prompt_restores       += slot.b0_ckpt_n_tokens >= 0 ? 1 : 0;
+                        metrics.n_prompt_replayed_tokens += replayed;
+
+                        const std::string ckpt_str = slot.b0_ckpt_n_tokens >= 0
+                            ? string_format("checkpoint at %" PRId64, slot.b0_ckpt_n_tokens)
+                            : slot.b0_full_reset ? std::string("no checkpoint, full reset") : std::string("live state, no checkpoint");
+
+                        SLT_INF(slot, "restore: slot %d n_past_restored=%d prefix_match=%d replayed=%d tokens (%s; cached_live=%d, new=%d, prompt=%d)\n",
+                                slot.id, n_restored, slot.b0_prefix_match, replayed, ckpt_str.c_str(),
+                                slot.b0_n_cached_live, n_new, slot.task->n_tokens());
                     }
 
                     // If using an alora, there may be uncached tokens that come
