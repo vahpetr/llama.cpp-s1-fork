@@ -1,0 +1,96 @@
+#version 450
+
+// [TAG_KQ_VIS] the flash_attn_mask_opt.comp classification (2 bits per Br x Bc tile: 1 = every
+// in-bounds element is -inf, 2 = every one is 0) computed from the metadata instead of a mask
+// plane. Same grid, same tile bounds (j0 < nem0, j1 < nem1), same min/max reduction over the same
+// f16-exact values, so the codes equal those of the plane bit for bit. nem2 is 1: z is the stream.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 128;
+layout (constant_id = 1) const uint NUM_SUBGROUPS = 4;
+layout (constant_id = 2) const uint Br = 32;
+layout (constant_id = 3) const uint Bc = 32;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer C {int data_c[];};
+layout (binding = 1) readonly buffer T {ivec4 data_t[];};
+layout (binding = 2) writeonly buffer D {uint data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint nem0;   // n_kv
+    uint nem1;   // n_tps
+    uint nbd1;
+    uint nbd3;
+    uint flags;
+    int  n_swa;
+};
+
+int kqv_cell_load(uint idx) {
+    return data_c[idx];
+}
+
+#include "kq_vis.glsl"
+
+shared float minsh[NUM_SUBGROUPS];
+shared float maxsh[NUM_SUBGROUPS];
+
+float FLT_MAX_OVER_2 = uintBitsToFloat(0x7EFFFFFF);
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint i0 = gl_WorkGroupID.x;
+    const uint i1 = gl_WorkGroupID.y;
+    const uint i3 = gl_WorkGroupID.z;
+
+    const uint cbase = i3 * 4u * nem0;
+
+    uint result = 0;
+
+    [[unroll]] for (uint block_x = 0; block_x < 16; ++block_x) {
+        float min_v = FLT_MAX_OVER_2;
+        float max_v = -FLT_MAX_OVER_2;
+        [[unroll]] for (uint i = 0; i < Br * Bc; i += BLOCK_SIZE) {
+            if ((Br * Bc % BLOCK_SIZE) != 0 && i + tid >= Br * Bc) {
+                continue;
+            }
+            uint j0 = (i + tid) % Bc;
+            uint j1 = (i + tid) / Bc;
+
+            j0 += (i0 * 16 + block_x) * Bc;
+            j1 += i1 * Br;
+
+            if (j0 < nem0 && j1 < nem1) {
+                const float f = kqv_value(cbase, nem0, j0, data_t[i3 * nem1 + j1], flags, n_swa);
+                min_v = min(min_v, f);
+                max_v = max(max_v, f);
+            }
+        }
+        min_v = subgroupMin(min_v);
+        max_v = subgroupMax(max_v);
+        if (gl_SubgroupInvocationID == 0) {
+            minsh[gl_SubgroupID] = min_v;
+            maxsh[gl_SubgroupID] = max_v;
+        }
+        barrier();
+        if (tid == 0) {
+            [[unroll]] for (uint i = 0; i < NUM_SUBGROUPS; ++i) {
+                min_v = min(min_v, minsh[i]);
+                max_v = max(max_v, maxsh[i]);
+            }
+            if (max_v <= -FLT_MAX_OVER_2) {
+                result |= 1 << (2*block_x);
+            }
+            if (min_v == 0.0f && max_v == 0.0f) {
+                result |= 2 << (2*block_x);
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        data_d[i0 + i1 * nbd1 + i3 * nbd3] = result;
+    }
+}

@@ -344,9 +344,9 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    // [TAG_KQ_VIS] LLAMA_KQ_MASK_META=1: self_kq_mask is a GGML_OP_KQ_MASK node over these inputs
+    // [TAG_KQ_VIS] LLAMA_KQ_VIS=1: self_kq_mask is a GGML_OP_KQ_MASK node over these inputs
     // instead of a host-filled input plane
-    ggml_tensor * self_kq_vis_cells = nullptr; // I32 [4, n_kv, n_stream]
+    ggml_tensor * self_kq_vis_cells = nullptr; // I32 [n_kv, 4, n_stream]
     ggml_tensor * self_kq_vis_toks  = nullptr; // I32 [4, n_batch/n_stream, n_stream]
 
     // note: assumes v_rot^2 == I

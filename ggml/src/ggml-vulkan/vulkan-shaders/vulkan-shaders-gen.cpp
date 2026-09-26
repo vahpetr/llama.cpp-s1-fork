@@ -879,6 +879,10 @@ void process_shaders() {
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
+    // [TAG_KQ_VIS] visibility from metadata
+    string_to_spv("fa_vis_opt", "flash_attn_vis_opt.comp", {});
+    string_to_spv("kq_mask_f16", "kq_mask.comp", {{"OUT_F16", "1"}});
+    string_to_spv("kq_mask_f32", "kq_mask.comp", {});
 
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});

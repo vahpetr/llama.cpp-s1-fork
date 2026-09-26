@@ -477,7 +477,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         // [TAG_KQ_VIS] the mask is a GGML_OP_KQ_MASK node: fill its metadata instead of the plane
         if (self_kq_vis_cells->buffer && self_kq_vis_toks->buffer) {
             const bool ok = mctx->set_input_kq_vis(self_kq_vis_cells, self_kq_vis_toks, ubatch);
-            GGML_ASSERT(ok && "LLAMA_KQ_MASK_META: ubatch not expressible as KQ metadata (n_seq_max <= 32 was checked at build)");
+            GGML_ASSERT(ok && "LLAMA_KQ_VIS: ubatch not expressible as KQ metadata (n_seq_max <= 32 was checked at build)");
         }
     } else if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
@@ -2770,13 +2770,13 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
-// [TAG_KQ_VIS] LLAMA_KQ_MASK_META=1 (default 0, read once per process): the plain KV attention
+// [TAG_KQ_VIS] LLAMA_KQ_VIS=1 (default 0, read once per process, here only): the plain KV attention
 // input (llm_graph_input_attn_kv) builds its mask as a GGML_OP_KQ_MASK node over 16 B/cell +
 // 16 B/token of metadata instead of a host-filled [n_kv, n_tps] plane. Same values bit for bit
 // (tests/test-kq-mask-meta.cpp); needs n_seq_max <= 32 (the seq bitmask width).
 static bool llama_kq_mask_meta_enabled() {
     static const bool enabled = [] {
-        const char * env = getenv("LLAMA_KQ_MASK_META");
+        const char * env = getenv("LLAMA_KQ_VIS");
         return env != nullptr && atoi(env) != 0;
     }();
     return enabled;
@@ -2802,7 +2802,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
             const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
             const int64_t n_tps    = ubatch.n_tokens/n_stream;
 
-            inp->self_kq_vis_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, n_kv,  n_stream);
+            inp->self_kq_vis_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, n_kv, 4, n_stream);
             inp->self_kq_vis_toks  = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, n_tps, n_stream);
             ggml_set_input(inp->self_kq_vis_cells);
             ggml_set_input(inp->self_kq_vis_toks);

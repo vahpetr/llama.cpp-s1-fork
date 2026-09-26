@@ -23,6 +23,7 @@
 #include "types.glsl"
 #include "dot_product_funcs.glsl"
 #include "flash_attn_base.glsl"
+#include "flash_attn_vis.glsl"
 #include "flash_attn_dequant.glsl"
 
 const uint32_t HSK_per_thread = HSK / D_split;
@@ -86,6 +87,9 @@ void main() {
 #endif
 
     init_indices();
+    if (VIS) {
+        fa_vis_init();
+    }
 
     const uint32_t tid = gl_LocalInvocationIndex;
     const uint32_t threads_per_rowgroup = gl_WorkGroupSize.x / row_split;
@@ -219,7 +223,7 @@ void main() {
                     uint32_t r = (idx + tid) / Bc;
                     if (idx + tid < Bc * Br) {
                         if ((!KV_bounds_check || j * Bc + c < KV) && (!nem1_bounds_check || i * Br + r < p.nem1)) {
-                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + (j * Bc + c)]);
+                            FLOAT_TYPE m = VIS ? FLOAT_TYPE(fa_vis_value(i * Br + r, j * Bc + c)) : FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + (j * Bc + c)]);
                             masksh[c * masksh_stride + r] = m;
                             max_mask = max(max_mask, float(m));
                         } else {

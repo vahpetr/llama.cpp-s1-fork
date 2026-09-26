@@ -9049,6 +9049,14 @@ void ggml_compute_forward_qsa_top_k(
 // [TAG_KQ_VIS] the reference for GGML_OP_KQ_MASK: per element the predicate of
 // set_input_kq_mask_impl (src/llama-kv-cache.cpp) evaluated on the cell and token records, with
 // the same values (+0 / -inf / -|p0 - p1| for ALiBi) converted with the same ggml_fp32_to_fp16.
+// The flash-attention "vis" branch below evaluates the same function per element.
+
+struct kq_vis_params {
+    bool    causal;
+    bool    alibi;
+    int32_t swa_type;
+    int32_t n_swa;
+};
 
 static inline bool kq_vis_swa_masked(int32_t swa_type, int32_t n_swa, int32_t p0, int32_t p1) {
     // a copy of llama_hparams::is_masked_swa (src/llama-hparams.h)
@@ -9068,15 +9076,57 @@ static inline bool kq_vis_swa_masked(int32_t swa_type, int32_t n_swa, int32_t p0
     }
 }
 
+// cs: the stream's cell planes (pos at cs[j], seqmask at cs[n_kv + j], x at cs[2*n_kv + j], y at
+// cs[3*n_kv + j]); tk: the token record {pos, 1 << seq, x, y}. Returns false for -inf, else the
+// f32 value before its f16 rounding (0 or, with ALiBi, -|p0 - p1|) in *val.
+static inline bool kq_vis_keep(const int32_t * cs, int64_t n_kv, int64_t j, const int32_t * tk,
+                               const kq_vis_params & vp, float * val) {
+    if (((uint32_t) cs[n_kv + j] & (uint32_t) tk[1]) == 0) {
+        return false;
+    }
+    const int32_t p0 = cs[j];
+    const int32_t p1 = tk[0];
+    if (vp.causal) {
+        if (p0 > p1) {
+            return false;
+        }
+        // M-RoPE: at equal positions the 2-D order (llama_kv_cell_ext::is_2d_gt); tk x = y =
+        // INT32_MAX without 2-D positions, which never compares greater
+        if (p0 == p1) {
+            const int32_t x0 = cs[2*n_kv + j];
+            const int32_t y0 = cs[3*n_kv + j];
+            if (y0 > tk[3] || (y0 == tk[3] && x0 > tk[2])) {
+                return false;
+            }
+        }
+    }
+    if (vp.swa_type != 0 && kq_vis_swa_masked(vp.swa_type, vp.n_swa, p0, p1)) {
+        return false;
+    }
+    *val = vp.alibi ? static_cast<float>(-std::abs(p0 - p1)) : 0.0f;
+    return true;
+}
+
+// the mask element as the f32 value flash attention reads from an f16 plane
+static inline float kq_vis_value_f16_as_f32(const int32_t * cs, int64_t n_kv, int64_t j, const int32_t * tk,
+                                            const kq_vis_params & vp) {
+    float v;
+    if (!kq_vis_keep(cs, n_kv, j, tk, vp, &v)) {
+        return -INFINITY;
+    }
+    return vp.alibi ? GGML_CPU_FP16_TO_FP32(ggml_fp32_to_fp16(v)) : 0.0f;
+}
+
 template <typename T, T (*conv)(float)>
 static void ggml_compute_forward_kq_mask_impl(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src_cells = dst->src[0];
     const ggml_tensor * src_toks  = dst->src[1];
 
-    const bool    causal   = ggml_get_op_params_i32(dst, 0) != 0;
-    const bool    alibi    = ggml_get_op_params_i32(dst, 1) != 0;
-    const int32_t swa_type = ggml_get_op_params_i32(dst, 2);
-    const int32_t n_swa    = ggml_get_op_params_i32(dst, 3);
+    kq_vis_params vp;
+    vp.causal   = ggml_get_op_params_i32(dst, 0) != 0;
+    vp.alibi    = ggml_get_op_params_i32(dst, 1) != 0;
+    vp.swa_type = ggml_get_op_params_i32(dst, 2);
+    vp.n_swa    = ggml_get_op_params_i32(dst, 3);
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_tps    = dst->ne[1];
@@ -9085,7 +9135,6 @@ static void ggml_compute_forward_kq_mask_impl(const ggml_compute_params * params
     const int32_t * cells = (const int32_t *) src_cells->data;
     const int32_t * toks  = (const int32_t *) src_toks->data;
 
-    const T v_keep = conv(0.0f);
     const T v_drop = conv(-INFINITY);
 
     const int64_t nr  = n_tps*n_stream;
@@ -9098,36 +9147,13 @@ static void ggml_compute_forward_kq_mask_impl(const ggml_compute_params * params
         const int64_t t = ir % n_tps;
 
         const int32_t * tk = toks  + 4*(s*n_tps + t);
-        const int32_t * cs = cells + 4*(s*n_kv);
-
-        const int32_t  p1  = tk[0];
-        const uint32_t tsm = (uint32_t) tk[1];
-        const int32_t  x1  = tk[2];
-        const int32_t  y1  = tk[3];
+        const int32_t * cs = cells + 4*n_kv*s;
 
         T * row = (T *) ((char *) dst->data + t*dst->nb[1] + s*dst->nb[3]);
 
         for (int64_t j = 0; j < n_kv; ++j) {
-            const int32_t * c = cs + 4*j;
-
-            const int32_t p0 = c[0];
-
-            bool keep = ((uint32_t) c[1] & tsm) != 0;
-            if (keep && causal) {
-                // mask future tokens; at equal positions the M-RoPE 2-D order (llama_kv_cell_ext::is_2d_gt)
-                keep = p0 < p1 || (p0 == p1 && !(c[3] > y1 || (c[3] == y1 && c[2] > x1)));
-            }
-            if (keep && swa_type != 0) {
-                keep = !kq_vis_swa_masked(swa_type, n_swa, p0, p1);
-            }
-
-            if (!keep) {
-                row[j] = v_drop;
-            } else if (alibi) {
-                row[j] = conv(static_cast<float>(-std::abs(p0 - p1)));
-            } else {
-                row[j] = v_keep;
-            }
+            float v;
+            row[j] = kq_vis_keep(cs, n_kv, j, tk, vp, &v) ? conv(v) : v_drop;
         }
     }
 }
@@ -9155,6 +9181,39 @@ void ggml_compute_forward_kq_mask(
     }
 }
 
+// [TAG_KQ_VIS] the metadata of a flash-attention node, if it has any (see ggml_flash_attn_ext_set_vis)
+struct fa_vis_src {
+    const int32_t * cells = nullptr; // [n_kv, 4, n_stream]
+    const int32_t * toks  = nullptr; // [4, n_tps, n_stream]
+    int64_t n_kv  = 0;
+    int64_t n_tps = 0;
+    int64_t n_stream = 0;
+    kq_vis_params vp = {};
+
+    bool on() const { return cells != nullptr; }
+
+    // the stream planes / token record of query row (iq1, iq3)
+    const int32_t * cs(int64_t iq3) const { return cells + 4*n_kv*(iq3 % n_stream); }
+    const int32_t * tk(int64_t iq1, int64_t iq3) const { return toks + 4*(iq1 + n_tps*(iq3 % n_stream)); }
+};
+
+static fa_vis_src fa_get_vis(const ggml_tensor * dst) {
+    fa_vis_src r;
+    if (ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM) == 0 || dst->src[6] == nullptr) {
+        return r;
+    }
+    r.cells    = (const int32_t *) dst->src[6]->data;
+    r.toks     = (const int32_t *) dst->src[7]->data;
+    r.n_kv     = dst->src[6]->ne[0];
+    r.n_tps    = dst->src[7]->ne[1];
+    r.n_stream = dst->src[6]->ne[2];
+    r.vp.causal   = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 1) != 0;
+    r.vp.alibi    = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 2) != 0;
+    r.vp.swa_type = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 3);
+    r.vp.n_swa    = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 4);
+    return r;
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9168,6 +9227,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const fa_vis_src    vis   = fa_get_vis(dst); // [TAG_KQ_VIS]
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9263,6 +9323,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         }
 
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        const int32_t * vis_cs = vis.on() ? vis.cs(iq3)      : nullptr;
+        const int32_t * vis_tk = vis.on() ? vis.tk(iq1, iq3) : nullptr;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -9280,7 +9342,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            const float mv = mp     ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) :
+                             vis_cs ? slope*kq_vis_value_f16_as_f32(vis_cs, vis.n_kv, ic, vis_tk, vis.vp) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
             }
@@ -9402,6 +9465,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const fa_vis_src    vis   = fa_get_vis(dst); // [TAG_KQ_VIS]
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9540,12 +9604,15 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             const int kv_tile = (int)std::min((int64_t)KV_TILE_SZ, nek1 - ic);
 
             // skip the tile entirely if all the masks are -inf
-            if (mask) {
+            if (mask || vis.on()) {
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
-                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                    const ggml_fp16_t * mp_row = mask ? (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : nullptr;
+                    const int32_t * vis_cs = vis.on() ? vis.cs(iq3)           : nullptr;
+                    const int32_t * vis_tk = vis.on() ? vis.tk(iq1 + tq, iq3) : nullptr;
                     for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                        mask32[tq * KV_TILE_SZ + tk] = mp_row ? slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk])
+                                                              : slope * kq_vis_value_f16_as_f32(vis_cs, vis.n_kv, ic + tk, vis_tk, vis.vp);
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
                             can_skip = false;
                         }
@@ -9595,7 +9662,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 ggml_vec_scale_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, logit_softcap);
             }
 
-            if (mask) {
+            if (mask || vis.on()) {
                 ggml_vec_add_f32(tile_rows * KV_TILE_SZ, KQ, KQ, mask32);
             }
 

@@ -1806,7 +1806,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 }
 
 // [TAG_KQ_VIS] the metadata twin of llama_kv_cells_fill_kq_mask: the records GGML_OP_KQ_MASK turns
-// into the same mask. Per cell {pos (-1 = empty), seq bitmask (bits < 32), ext.x, ext.y}, per token
+// into the same mask. Per cell (one plane per field, [n_kv, 4, n_stream]) {pos (-1 = empty), seq bitmask
+// (bits < 32), ext.x, ext.y}, per token
 // {pos, 1u << seq_id[0], x, y} (x = y = INT32_MAX without 2-D positions: no cell is 2-D greater).
 // The mask fill picks the cells per TOKEN (v_cells[seq_to_stream[seq]]); the records hold one cell
 // row per stream block, so every token of a block must map to the same stream - true for the
@@ -1848,10 +1849,14 @@ bool llama_kv_cells_fill_kq_vis(
         const auto & cells = v_cells.at(stream);
         GGML_ASSERT((int64_t) cells.size() >= n_kv);
 
-        int32_t * c = cells_data + 4*s*n_kv;
-        for (int64_t j = 0; j < n_kv; ++j, c += 4) {
+        // one plane per field: pos, seqmask, x, y
+        int32_t * c_pos = cells_data + 4*s*n_kv;
+        int32_t * c_seq = c_pos + n_kv;
+        int32_t * c_x   = c_pos + 2*n_kv;
+        int32_t * c_y   = c_pos + 3*n_kv;
+        for (int64_t j = 0; j < n_kv; ++j) {
             if (cells.is_empty(j)) {
-                c[0] = -1; c[1] = 0; c[2] = 0; c[3] = 0;
+                c_pos[j] = -1; c_seq[j] = 0; c_x[j] = 0; c_y[j] = 0;
                 continue;
             }
             uint32_t seqmask = 0;
@@ -1859,10 +1864,10 @@ bool llama_kv_cells_fill_kq_vis(
                 seqmask |= cells.seq_has(j, k) ? (1u << k) : 0u;
             }
             const auto & ext = cells.ext_get(j);
-            c[0] = cells.pos_get(j);
-            c[1] = (int32_t) seqmask;
-            c[2] = ext.x;
-            c[3] = ext.y;
+            c_pos[j] = cells.pos_get(j);
+            c_seq[j] = (int32_t) seqmask;
+            c_x[j]   = ext.x;
+            c_y[j]   = ext.y;
         }
     }
 
@@ -1872,11 +1877,11 @@ bool llama_kv_cells_fill_kq_vis(
 bool llama_kv_cache::set_input_kq_vis(ggml_tensor * cells_dst, ggml_tensor * toks_dst, const llama_ubatch * ubatch) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(cells_dst->buffer) && ggml_backend_buffer_is_host(toks_dst->buffer));
     GGML_ASSERT(cells_dst->type == GGML_TYPE_I32 && toks_dst->type == GGML_TYPE_I32);
-    GGML_ASSERT(cells_dst->ne[0] == 4 && toks_dst->ne[0] == 4 && cells_dst->ne[2] == toks_dst->ne[2]);
+    GGML_ASSERT(cells_dst->ne[1] == 4 && toks_dst->ne[0] == 4 && cells_dst->ne[2] == toks_dst->ne[2]);
     GGML_ASSERT(toks_dst->ne[1]*toks_dst->ne[2] == (int64_t) ubatch->n_tokens);
 
     return llama_kv_cells_fill_kq_vis((int32_t *) cells_dst->data, (int32_t *) toks_dst->data,
-            cells_dst->ne[1], cells_dst->ne[2], ubatch, v_cells, seq_to_stream);
+            cells_dst->ne[0], cells_dst->ne[2], ubatch, v_cells, seq_to_stream);
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

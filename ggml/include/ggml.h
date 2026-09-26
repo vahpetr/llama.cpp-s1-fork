@@ -2458,8 +2458,9 @@ extern "C" {
     // [TAG_KQ_VIS] the KQ mask computed from metadata (visibility from metadata, Phase 3): the value
     // llama_kv_cache::set_input_kq_mask writes, as a pure function of 16 B per KV cell and 16 B per token.
     //
-    //   cells:  [4, n_kv,  n_stream] I32, contiguous: {pos (-1 = empty cell), seq bitmask (bit s = seq s,
-    //           s < 32; 0 = empty or seqless), ext.x, ext.y}
+    //   cells:  [n_kv, 4, n_stream] I32, contiguous, one plane per field (structure of arrays, so a GPU
+    //           reader touches the x/y planes only at p0 == p1 ties): row 0 pos (-1 = empty cell),
+    //           row 1 seq bitmask (bit s = seq s, s < 32; 0 = empty or seqless), row 2 ext.x, row 3 ext.y
     //   toks:   [4, n_tps, n_stream] I32, contiguous: {pos, 1u << seq, x, y}; x = y = INT32_MAX when the
     //           ubatch has no 2-D (M-RoPE) positions, which makes the 2-D tie-break a no-op
     //   result: [n_kv, n_tps, 1, n_stream] F16 or F32
@@ -2479,6 +2480,40 @@ extern "C" {
             bool                  alibi,
             int32_t               swa_type,
             int32_t               n_swa);
+
+    // [TAG_KQ_VIS] flash attention that computes its mask from the ggml_kq_mask metadata instead of
+    // reading a materialized plane: the result is bit-identical to
+    //   ggml_flash_attn_ext(q, k, v, ggml_kq_mask(ctx, cells, toks, GGML_TYPE_F16, causal, alibi, swa_type, n_swa), ...)
+    // cells: [n_kv (== k->ne[1]), 4, n_stream], toks: [4, n_tps (== q->ne[1]), n_stream], n_stream == q->ne[3].
+    // The metadata sits in src[6] (cells) and src[7] (toks); src[3] (the mask) stays NULL.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_vis(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * toks,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap,
+            bool                  causal,
+            bool                  alibi,
+            int32_t               swa_type,
+            int32_t               n_swa);
+
+    // the same on an existing mask-less GGML_OP_FLASH_ATTN_EXT node (keeps its scale/max_bias/softcap)
+    GGML_API void ggml_flash_attn_ext_set_vis(
+            struct ggml_tensor * a,
+            struct ggml_tensor * cells,
+            struct ggml_tensor * toks,
+            bool                 causal,
+            bool                 alibi,
+            int32_t              swa_type,
+            int32_t              n_swa);
+
+    // op_params slots of a flash-attention node carrying the metadata (i32): [10] = 1, [11] causal,
+    // [12] alibi, [13] swa_type, [14] n_swa
+#define GGML_FA_VIS_PARAM 10
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

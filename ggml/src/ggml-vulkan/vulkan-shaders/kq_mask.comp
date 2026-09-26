@@ -1,0 +1,47 @@
+#version 450
+
+// [TAG_KQ_VIS] GGML_OP_KQ_MASK: dst[s][t][j] = kqv_value(cells, toks) (see kq_vis.glsl, ggml.h)
+
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer C {int data_c[];};
+layout (binding = 1) readonly buffer T {ivec4 data_t[];};
+#if defined(OUT_F16)
+layout (binding = 2) writeonly buffer D {float16_t data_d[];};
+#else
+layout (binding = 2) writeonly buffer D {float data_d[];};
+#endif
+
+layout (push_constant) uniform parameter {
+    uint n_kv;
+    uint n_tps;
+    uint n_stream;
+    uint flags;
+    int  n_swa;
+} p;
+
+int kqv_cell_load(uint idx) {
+    return data_c[idx];
+}
+
+#include "kq_vis.glsl"
+
+void main() {
+    const uint t = gl_WorkGroupID.y;
+    const uint s = gl_WorkGroupID.z;
+
+    const ivec4 tk    = data_t[s * p.n_tps + t];
+    const uint  cbase = s * 4u * p.n_kv;
+    const uint  obase = (s * p.n_tps + t) * p.n_kv;
+
+    for (uint j = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x; j < p.n_kv; j += gl_NumWorkGroups.x * 256u) {
+        const float v = kqv_value(cbase, p.n_kv, j, tk, p.flags, p.n_swa);
+#if defined(OUT_F16)
+        data_d[obase + j] = float16_t(v);
+#else
+        data_d[obase + j] = v;
+#endif
+    }
+}

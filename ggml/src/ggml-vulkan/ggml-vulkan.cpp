@@ -592,10 +592,12 @@ struct vk_fa_pipeline_state {
     uint32_t limit_occupancy_shmem;
     ggml_type k_type;
     ggml_type v_type;
+    // [TAG_KQ_VIS] spec constant 16 (VisNSwa): the SWA window of a metadata-masked FA, 0 otherwise
+    uint32_t vis_n_swa;
 
     bool operator<(const vk_fa_pipeline_state &b) const {
-        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type) <
-               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type);
+        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type, vis_n_swa) <
+               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type, b.vis_n_swa);
     }
 };
 
@@ -1168,6 +1170,9 @@ struct vk_device_struct {
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
+    // [TAG_KQ_VIS] the same classification from the visibility metadata, and GGML_OP_KQ_MASK
+    std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_vis_opt;
+    vk_pipeline pipeline_kq_mask_f16, pipeline_kq_mask_f32;
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     vk_pipeline pipeline_count_experts;        // N_EXPERTS_MAX = BLOCK_SIZE, counting only
@@ -2187,6 +2192,25 @@ struct vk_op_flash_attn_mask_opt_push_constants {
     uint32_t nbd1;
     uint32_t nbd2;
     uint32_t nbd3;
+};
+
+// [TAG_KQ_VIS] flash_attn_vis_opt.comp
+struct vk_op_flash_attn_vis_opt_push_constants {
+    uint32_t nem0;
+    uint32_t nem1;
+    uint32_t nbd1;
+    uint32_t nbd3;
+    uint32_t flags;
+    int32_t  n_swa;
+};
+
+// [TAG_KQ_VIS] kq_mask.comp
+struct vk_op_kq_mask_push_constants {
+    uint32_t n_kv;
+    uint32_t n_tps;
+    uint32_t n_stream;
+    uint32_t flags;
+    int32_t  n_swa;
 };
 
 // Allow pre-recording command buffers
@@ -4402,7 +4426,7 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type,
-                                                  bool gqa_tokens = false) {
+                                                  bool gqa_tokens = false, uint32_t vis_flags = 0, uint32_t vis_n_swa = 0) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -4432,11 +4456,13 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
                      // [TAG_FA_GQA_TOKENS] rows are (token, head) pairs, see flash_attn_base.glsl.
                      // Bit 64 is reserved for prod-v7-fa's CM1_SF_PAD so the two FA series cannot
                      // alias if they are ever merged; see flash_attn_base.glsl.
-                     (gqa_tokens        ? 128 : 0);
+                     (gqa_tokens        ? 128 : 0) |
+                     // [TAG_KQ_VIS] 512 VIS, 1024 causal, 2048 alibi, 4096/8192 swa type (flash_attn_vis.glsl)
+                     vis_flags;
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
-    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
+    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type, vis_n_swa};
 }
 
 // Bytes per buffer block for the FaBlockBytesK/V spec constants. F32 is fed as
@@ -4466,6 +4492,7 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
         /*13 FaTypeV         */ static_cast<uint32_t>(state.v_type),
         /*14 FaBlockBytesK   */ fa_block_bytes(state.k_type),
         /*15 FaBlockBytesV   */ fa_block_bytes(state.v_type),
+        /*16 VisNSwa         */ state.vis_n_swa,
     };
 }
 
@@ -5054,7 +5081,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
             name = aligned ? "flash_attn_f32_f16_aligned" : "flash_attn_f32_f16";
         }
-        ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
+        ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8, /* [TAG_KQ_VIS] binding 7: vis tokens */
                                 sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                 get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                 !fa_ds, !fa_ds ? fa_sgs : 0);
@@ -5090,7 +5117,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
                 name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
             }
-            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
+            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8, /* [TAG_KQ_VIS] binding 7: vis tokens */
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                     !fa_ds, !fa_ds ? fa_sgs : 0);
@@ -6065,6 +6092,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         auto BrBc = it.first;
         ggml_vk_create_pipeline(device, it.second, "fa_mask_opt", fa_mask_opt_len, fa_mask_opt_data, "main", 2, sizeof(vk_op_flash_attn_mask_opt_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, BrBc.first, BrBc.second}, 1, true, true, device->subgroup_size);
     }
+    // [TAG_KQ_VIS]
+    for (auto &it : device->pipeline_fa_vis_opt) {
+        auto BrBc = it.first;
+        ggml_vk_create_pipeline(device, it.second, "fa_vis_opt", fa_vis_opt_len, fa_vis_opt_data, "main", 3, sizeof(vk_op_flash_attn_vis_opt_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, BrBc.first, BrBc.second}, 1, true, true, device->subgroup_size);
+    }
+    ggml_vk_create_pipeline(device, device->pipeline_kq_mask_f16, "kq_mask_f16", kq_mask_f16_len, kq_mask_f16_data, "main", 3, sizeof(vk_op_kq_mask_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_kq_mask_f32, "kq_mask_f32", kq_mask_f32_len, kq_mask_f32_data, "main", 3, sizeof(vk_op_kq_mask_push_constants), {256, 1, 1}, {}, 1);
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
@@ -11663,10 +11697,30 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
     GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
 
-    const uint32_t nem0 = mask ? mask->ne[0] : 0;
-    const uint32_t nem1 = mask ? mask->ne[1] : 0;
-    const uint32_t nem2 = mask ? mask->ne[2] : 0;
-    const uint32_t nem3 = mask ? mask->ne[3] : 0;
+    // [TAG_KQ_VIS] the mask as metadata (ggml_flash_attn_ext_set_vis): binding 3 carries the cell planes
+    // [n_kv, 4, n_stream], binding 7 the token records [4, n_tps, n_stream]; the mask dimensions are
+    // the ones the plane would have ([n_kv, n_tps, 1, n_stream]), so every index stays the same.
+    const bool vis = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM) != 0 && dst->src[6] != nullptr;
+    const ggml_tensor * vis_cells = vis ? dst->src[6] : nullptr;
+    const ggml_tensor * vis_toks  = vis ? dst->src[7] : nullptr;
+    GGML_ASSERT(!vis || mask == nullptr);
+    const bool has_mask = mask != nullptr || vis;
+    uint32_t vis_flags = 0, vis_kqv_flags = 0;
+    int32_t  vis_n_swa = 0;
+    if (vis) {
+        const uint32_t causal   = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 1) != 0;
+        const uint32_t alibi    = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 2) != 0;
+        const uint32_t swa_type = (uint32_t) ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 3) & 3u;
+        vis_n_swa     = swa_type ? ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 4) : 0;
+        vis_flags     = 512u | (causal << 10) | (alibi << 11) | (swa_type << 12);
+        vis_kqv_flags = causal | (alibi << 1) | (swa_type << 2);
+        GGML_ASSERT(vis_cells->ne[0] == k->ne[1]);
+    }
+
+    const uint32_t nem0 = mask ? mask->ne[0] : vis ? (uint32_t) vis_cells->ne[0] : 0;
+    const uint32_t nem1 = mask ? mask->ne[1] : vis ? (uint32_t) vis_toks->ne[1]  : 0;
+    const uint32_t nem2 = mask ? mask->ne[2] : vis ? 1u                          : 0;
+    const uint32_t nem3 = mask ? mask->ne[3] : vis ? (uint32_t) vis_toks->ne[2]  : 0;
 
     const uint32_t HSK = nek0;
     const uint32_t HSV = nev0;
@@ -11825,11 +11879,12 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+    bool use_mask_opt = has_mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
-                                                                   gqa_tokens);
+                                                                   has_mask, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
+                                                                   gqa_tokens, vis_flags, (uint32_t) vis_n_swa);
+    GGML_ASSERT(!vis || fa_pipeline_state.path != FA_COOPMAT2);
 
     vk_pipeline pipeline = nullptr;
 
@@ -11917,7 +11972,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     if (use_mask_opt) {
         {
             std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
-            auto &pipelines = ctx->device->pipeline_fa_mask_opt;
+            // [TAG_KQ_VIS] the metadata form of the same classification
+            auto &pipelines = vis ? ctx->device->pipeline_fa_vis_opt : ctx->device->pipeline_fa_mask_opt;
             auto it = pipelines.find({Br, Bc});
             if (it != pipelines.end()) {
                 pipeline_fa_mask_opt = it->second;
@@ -11946,7 +12002,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
     vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-    vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
+    vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : vis ? ggml_vk_tensor_subbuffer(ctx, vis_cells) : q_buf;
+    vk_subbuffer vis_toks_buf = vis ? ggml_vk_tensor_subbuffer(ctx, vis_toks) : q_buf; // binding 7 (scalar/coopmat1 only)
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
 
@@ -12000,7 +12057,24 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
 
-    if (use_mask_opt)
+    if (use_mask_opt && vis)
+    {
+        // [TAG_KQ_VIS] same grid and output layout as the plane's pass below (nem2 == 1)
+        const vk_op_flash_attn_vis_opt_push_constants opt_pc = {
+            nem0,
+            nem1,
+            mask_opt_num_dwords,
+            mask_opt_num_dwords * CEIL_DIV(nem1, Br),
+            vis_kqv_flags,
+            vis_n_swa,
+        };
+
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_mask_opt,
+                                  { mask_buf, vis_toks_buf, mask_opt_buf }, opt_pc,
+                                  { mask_opt_num_dwords, CEIL_DIV(nem1, Br), nem3 });
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    else if (use_mask_opt)
     {
         const vk_op_flash_attn_mask_opt_push_constants opt_pc = {
             nem0,
@@ -12052,9 +12126,15 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         }
 
         vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf},
-                                    pc, { dispatch_x, workgroups_y, workgroups_z });
+        if (fa_pipeline_state.path == FA_COOPMAT2) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf},
+                                        pc, { dispatch_x, workgroups_y, workgroups_z });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, vis_toks_buf},
+                                        pc, { dispatch_x, workgroups_y, workgroups_z });
+        }
 
         ggml_vk_sync_buffers(ctx, subctx);
         const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr) };
@@ -12070,9 +12150,15 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
             // When using gqa, we want one actual workgroup per batch, so cancel out wg_denoms
             workgroups_x *= pipeline->wg_denoms[0];
         }
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
-                                    pc, { workgroups_x, workgroups_y, workgroups_z });
+        if (fa_pipeline_state.path == FA_COOPMAT2) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
+                                        pc, { workgroups_x, workgroups_y, workgroups_z });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, vis_toks_buf},
+                                        pc, { workgroups_x, workgroups_y, workgroups_z });
+        }
     }
 
     if (use_dequant_kv) {
@@ -15267,6 +15353,36 @@ static void ggml_vk_qsa_top_k(ggml_backend_vk_context * ctx, vk_context& subctx,
                               n_tps, n_blocks, n_stream, /*sb_blk =*/ 1, /*sb_tps =*/ n_blocks);
 }
 
+// [TAG_KQ_VIS] GGML_OP_KQ_MASK: the mask plane generated on the device from the metadata
+static void ggml_vk_kq_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * cells = dst->src[0]; // [n_kv, 4, n_stream] I32
+    const ggml_tensor * toks  = dst->src[1]; // [4, n_tps, n_stream] I32
+
+    vk_pipeline pipeline = dst->type == GGML_TYPE_F16 ? ctx->device->pipeline_kq_mask_f16 : ctx->device->pipeline_kq_mask_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t n_kv     = (uint32_t) dst->ne[0];
+    const uint32_t n_tps    = (uint32_t) dst->ne[1];
+    const uint32_t n_stream = (uint32_t) dst->ne[3];
+
+    const uint32_t causal   = ggml_get_op_params_i32(dst, 0) != 0;
+    const uint32_t alibi    = ggml_get_op_params_i32(dst, 1) != 0;
+    const uint32_t swa_type = (uint32_t) ggml_get_op_params_i32(dst, 2) & 3u;
+
+    const vk_op_kq_mask_push_constants pc = {
+        n_kv, n_tps, n_stream,
+        causal | (alibi << 1) | (swa_type << 2),
+        swa_type ? ggml_get_op_params_i32(dst, 3) : 0,
+    };
+
+    // 256 cells per workgroup, at most 1024 workgroups along x; the shader strides over the rest
+    const uint32_t wg_x = std::min(CEIL_DIV(n_kv, 256u), 1024u);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                              { ggml_vk_tensor_subbuffer(ctx, cells), ggml_vk_tensor_subbuffer(ctx, toks), ggml_vk_tensor_subbuffer(ctx, dst) },
+                              pc, { wg_x * 256u, n_tps, n_stream });
+}
+
 static void ggml_vk_sum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     vk_op_sum_rows_push_constants p = vk_op_sum_rows_push_constants_init(src0, dst, ggml_nelements(src0));
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_SUM, p);
@@ -17256,6 +17372,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     // [TAG_QSA_FUSED_SELECT] one node, three live srcs; no fusion bookkeeping and no alias veto
     case GGML_OP_QSA_TOP_K:
         ggml_vk_qsa_top_k(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_KQ_MASK:
+        ggml_vk_kq_mask(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_SUM:
@@ -20688,6 +20808,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
                     return false;
                 }
+                // [TAG_KQ_VIS] only the scalar and coopmat1 shaders read the metadata
+                if (ggml_get_op_params_i32(op, GGML_FA_VIS_PARAM) != 0 && op->src[6] != nullptr) {
+                    if (coopmat2 || op->src[3] != nullptr) {
+                        return false;
+                    }
+                    if (op->src[6]->type != GGML_TYPE_I32 || op->src[7]->type != GGML_TYPE_I32 ||
+                        !ggml_is_contiguous(op->src[6]) || !ggml_is_contiguous(op->src[7]) ||
+                        op->src[6]->ne[2] != op->src[0]->ne[3]) {
+                        return false;
+                    }
+                }
                 auto fa_kv_ok = [](ggml_type t) {
                     switch (t) {
                     case GGML_TYPE_F32:
@@ -20938,6 +21069,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return device->pipeline_topk_radix_f32 != nullptr;
             }
+        case GGML_OP_KQ_MASK:
+            // [TAG_KQ_VIS]
+            return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op) &&
+                   (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
         case GGML_OP_QSA_TOP_K:
             {
                 // [TAG_QSA_FUSED_SELECT] the same shader the topk_qsa fusion dispatches, so the
@@ -21788,6 +21924,15 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             if (src_clone[4]) {
                 ggml_flash_attn_ext_add_sinks(tensor_clone, src_clone[4]);
             }
+            if (ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM) != 0 && src_clone[6]) { // [TAG_KQ_VIS]
+                ggml_flash_attn_ext_set_vis(tensor_clone, src_clone[6], src_clone[7],
+                        ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 1) != 0, ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 2) != 0,
+                        ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 3), ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 4));
+            }
+        } else if (tensor->op == GGML_OP_KQ_MASK) { // [TAG_KQ_VIS]
+            tensor_clone = ggml_kq_mask(ggml_ctx, src_clone[0], src_clone[1], tensor->type,
+                    ggml_get_op_params_i32(tensor, 0) != 0, ggml_get_op_params_i32(tensor, 1) != 0,
+                    ggml_get_op_params_i32(tensor, 2), ggml_get_op_params_i32(tensor, 3));
         } else if (tensor->op == GGML_OP_MUL_MAT) {
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {

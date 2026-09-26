@@ -19,6 +19,7 @@
 #include "types.glsl"
 #define FA_PV_ACC_TYPE 1
 #include "flash_attn_base.glsl"
+#include "flash_attn_vis.glsl"
 #if !defined(BFLOAT16)
 #include "flash_attn_dequant.glsl"
 #endif
@@ -156,6 +157,9 @@ void stage_v_columns(const uint32_t j, const uint32_t hsv_tile, const uint32_t v
         coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);                     \
     }
 
+// [TAG_KQ_VIS] a mask element: the plane's, or the same f16 value computed from the metadata
+#define FA_MASK_LOAD(R, COL) (VIS ? float16_t(fa_vis_value((R), (COL))) : data_m[m_offset + fa_mask_row(R) * m_stride + (COL)])
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
@@ -164,6 +168,9 @@ void main() {
 #endif
 
     init_indices();
+    if (VIS) {
+        fa_vis_init();
+    }
 
     const uint32_t tid = gl_LocalInvocationIndex;
 
@@ -294,25 +301,25 @@ void main() {
                             if (!nem1_bounds_check || i * Br + r * 4 + 3 < p.nem1) {
                                 // fa_mask_row(R) is R itself unless GQA_TOKENS makes the rows
                                 // (token, head) pairs, in which case it is the row's token.
-                                m = f16vec4(data_m[m_offset + fa_mask_row(i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 3) * m_stride + (j * Bc + c)]);
+                                m = f16vec4(FA_MASK_LOAD(i * Br + r * 4, j * Bc + c),
+                                            FA_MASK_LOAD(i * Br + r * 4 + 1, j * Bc + c),
+                                            FA_MASK_LOAD(i * Br + r * 4 + 2, j * Bc + c),
+                                            FA_MASK_LOAD(i * Br + r * 4 + 3, j * Bc + c));
                                 max_mask = max(max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2])), float(m[3]));
                             } else if (i * Br + r * 4 + 2 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + fa_mask_row(i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 2) * m_stride + (j * Bc + c)],
+                                m = f16vec4(FA_MASK_LOAD(i * Br + r * 4, j * Bc + c),
+                                            FA_MASK_LOAD(i * Br + r * 4 + 1, j * Bc + c),
+                                            FA_MASK_LOAD(i * Br + r * 4 + 2, j * Bc + c),
                                             0.0);
                                 max_mask = max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2]));
                             } else if (i * Br + r * 4 + 1 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + fa_mask_row(i * Br + r * 4    ) * m_stride + (j * Bc + c)],
-                                            data_m[m_offset + fa_mask_row(i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
+                                m = f16vec4(FA_MASK_LOAD(i * Br + r * 4, j * Bc + c),
+                                            FA_MASK_LOAD(i * Br + r * 4 + 1, j * Bc + c),
                                             0.0,
                                             0.0);
                                 max_mask = max(max(max_mask, float(m[0])), float(m[1]));
                             } else if (i * Br + r * 4 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + fa_mask_row(i * Br + r * 4    ) * m_stride + (j * Bc + c)],
+                                m = f16vec4(FA_MASK_LOAD(i * Br + r * 4, j * Bc + c),
                                             0.0,
                                             0.0,
                                             0.0);

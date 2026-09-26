@@ -5497,14 +5497,14 @@ struct ggml_tensor * ggml_kq_mask(
         int32_t               n_swa) {
     GGML_ASSERT(cells->type == GGML_TYPE_I32 && toks->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(cells) && ggml_is_contiguous(toks));
-    GGML_ASSERT(cells->ne[0] == 4 && toks->ne[0] == 4);
+    GGML_ASSERT(cells->ne[1] == 4 && toks->ne[0] == 4);
     GGML_ASSERT(cells->ne[3] == 1 && toks->ne[3] == 1);
     GGML_ASSERT(cells->ne[2] == toks->ne[2]);
     GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
     GGML_ASSERT(swa_type >= 0 && swa_type <= 3);
     GGML_ASSERT(swa_type == 0 || n_swa > 0);
 
-    const int64_t n_kv     = cells->ne[1];
+    const int64_t n_kv     = cells->ne[0];
     const int64_t n_tps    = toks->ne[1];
     const int64_t n_stream = cells->ne[2];
 
@@ -5622,6 +5622,64 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+// [TAG_KQ_VIS] flash attention over the metadata
+
+void ggml_flash_attn_ext_set_vis(
+        struct ggml_tensor * a,
+        struct ggml_tensor * cells,
+        struct ggml_tensor * toks,
+        bool                 causal,
+        bool                 alibi,
+        int32_t              swa_type,
+        int32_t              n_swa) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[3] == NULL && "ggml_flash_attn_ext_set_vis: the node already has a mask");
+    GGML_ASSERT(a->src[6] == NULL && a->src[7] == NULL);
+    GGML_ASSERT(cells->type == GGML_TYPE_I32 && toks->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(cells) && ggml_is_contiguous(toks));
+
+    const struct ggml_tensor * q = a->src[0];
+    const struct ggml_tensor * k = a->src[1];
+
+    GGML_ASSERT(cells->ne[0] == k->ne[1] && cells->ne[1] == 4 && cells->ne[3] == 1);
+    GGML_ASSERT(toks->ne[0] == 4 && toks->ne[1] == q->ne[1] && toks->ne[3] == 1);
+    GGML_ASSERT(cells->ne[2] == toks->ne[2] && q->ne[3] == cells->ne[2]);
+    GGML_ASSERT(swa_type >= 0 && swa_type <= 3);
+    GGML_ASSERT(swa_type == 0 || n_swa > 0);
+
+    ggml_set_op_params_i32(a, GGML_FA_VIS_PARAM + 0, 1);
+    ggml_set_op_params_i32(a, GGML_FA_VIS_PARAM + 1, causal ? 1 : 0);
+    ggml_set_op_params_i32(a, GGML_FA_VIS_PARAM + 2, alibi ? 1 : 0);
+    ggml_set_op_params_i32(a, GGML_FA_VIS_PARAM + 3, swa_type);
+    ggml_set_op_params_i32(a, GGML_FA_VIS_PARAM + 4, n_swa);
+
+    a->src[6] = cells;
+    a->src[7] = toks;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_vis(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * toks,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap,
+        bool                  causal,
+        bool                  alibi,
+        int32_t               swa_type,
+        int32_t               n_swa) {
+    // ggml_flash_attn_ext insists on a mask for max_bias > 0; the metadata is the mask here
+    struct ggml_tensor * result = ggml_flash_attn_ext(ctx, q, k, v, NULL, scale, 0.0f, logit_softcap);
+    memcpy((float *) result->op_params + 1, &max_bias, sizeof(float));
+
+    ggml_flash_attn_ext_set_vis(result, cells, toks, causal, alibi, swa_type, n_swa);
+
+    return result;
 }
 
 // ggml_flash_attn_back

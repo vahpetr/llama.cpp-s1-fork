@@ -7926,6 +7926,197 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// [TAG_KQ_VIS] visibility metadata for GGML_OP_KQ_MASK / ggml_flash_attn_ext_vis (see ggml.h):
+// cells [n_kv, 4, n_stream] I32 planes {pos, seq bitmask, x, y}, toks [4, n_tps, n_stream] I32
+// {pos, 1 << seq, x, y}. A layout like a unified or per-stream KV cache: up to 5 sequences per stream,
+// holes, seqless used cells, shared-prefix (multi-bit) cells, and - so no query row is fully masked,
+// which would make the FA reference and the backend disagree on 0/0 - every token's own cell.
+// rope2d: tokens of one sequence share a position in runs of 4 (an image row) with distinct (x, y);
+// otherwise x = y = INT32_MAX (no 2-D positions).
+static void init_kq_vis(ggml_tensor * cells, ggml_tensor * toks, bool rope2d, uint32_t seed) {
+    const int64_t n_kv     = cells->ne[0];
+    const int64_t n_tps    = toks->ne[1];
+    const int64_t n_stream = toks->ne[2];
+    GGML_ASSERT(n_kv >= n_tps);
+
+    std::mt19937 rng(seed);
+    auto rnd = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
+
+    std::vector<int32_t> c((size_t) (4*n_kv*n_stream));
+    std::vector<int32_t> t((size_t) (4*n_tps*n_stream));
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        int32_t * c_pos = c.data() + 4*n_kv*s;
+        int32_t * c_seq = c_pos + n_kv;
+        int32_t * c_x   = c_pos + 2*n_kv;
+        int32_t * c_y   = c_pos + 3*n_kv;
+
+        const int n_seq = rnd(1, 5);
+        const int32_t depth = (int32_t) n_kv; // positions of the cached cells
+        std::vector<int32_t> next(n_seq);
+        for (int q = 0; q < n_seq; ++q) {
+            next[q] = rnd(depth/2, depth);
+        }
+
+        // cached cells
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int r = rnd(0, 99);
+            if (r < 10) { // hole
+                c_pos[j] = -1; c_seq[j] = 0; c_x[j] = 0; c_y[j] = 0;
+                continue;
+            }
+            c_pos[j] = rnd(0, depth + (int32_t) n_tps);
+            c_x[j]   = rnd(0, 3);
+            c_y[j]   = rnd(0, 3);
+            uint32_t m = r < 13 ? 0u : (1u << rnd(0, n_seq - 1)); // 3 % used without a sequence
+            if (r >= 13 && r < 30) {
+                m |= 1u << rnd(0, n_seq - 1); // shared prefix
+            }
+            c_seq[j] = (int32_t) m;
+        }
+
+        // tokens, each with its own cell at a distinct index
+        std::vector<int64_t> idx((size_t) n_kv);
+        for (int64_t j = 0; j < n_kv; ++j) idx[j] = j;
+        std::shuffle(idx.begin(), idx.end(), rng);
+        for (int64_t i = 0; i < n_tps; ++i) {
+            const int q = rnd(0, n_seq - 1);
+            int32_t * tk = t.data() + 4*(s*n_tps + i);
+            if (rope2d) {
+                tk[0] = next[q] + (int32_t) (i/4);
+                tk[2] = (int32_t) (i % 4);
+                tk[3] = (int32_t) (i % 3);
+            } else {
+                tk[0] = next[q]++;
+                tk[2] = INT32_MAX;
+                tk[3] = INT32_MAX;
+            }
+            tk[1] = (int32_t) (1u << q);
+
+            const int64_t j = idx[i];
+            c_pos[j] = tk[0];
+            c_seq[j] = (int32_t) (1u << q);
+            c_x[j]   = rope2d ? tk[2] : 0;
+            c_y[j]   = rope2d ? tk[3] : 0;
+        }
+    }
+
+    ggml_backend_tensor_set(cells, c.data(), 0, c.size()*sizeof(int32_t));
+    ggml_backend_tensor_set(toks,  t.data(), 0, t.size()*sizeof(int32_t));
+}
+
+// GGML_OP_KQ_MASK: the backend must reproduce the CPU reference bit for bit
+struct test_kq_mask : public test_case {
+    const int64_t   n_kv;
+    const int64_t   n_tps;
+    const int64_t   n_stream;
+    const ggml_type type;
+    const bool      causal;
+    const bool      alibi;
+    const int       swa_type;
+    const int       n_swa;
+    const bool      rope2d;
+
+    std::string vars() override {
+        return VARS_TO_STR9(n_kv, n_tps, n_stream, type, causal, alibi, swa_type, n_swa, rope2d);
+    }
+
+    test_kq_mask(int64_t n_kv = 1024, int64_t n_tps = 32, int64_t n_stream = 1, ggml_type type = GGML_TYPE_F16,
+                 bool causal = true, bool alibi = false, int swa_type = 0, int n_swa = 0, bool rope2d = false)
+        : n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), type(type), causal(causal), alibi(alibi),
+          swa_type(swa_type), n_swa(n_swa), rope2d(rope2d) {}
+
+    double max_err() override { return 0.0; }
+
+    // number of elements whose bits differ (the values are f16/f32 0, -inf or -|d|)
+    double err(const float * a, const float * b, size_t n) override {
+        size_t nd = 0;
+        for (size_t i = 0; i < n; ++i) {
+            nd += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        }
+        return (double) nd;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_kv, 4, n_stream);
+        ggml_set_name(cells, "cells");
+        ggml_tensor * toks = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, n_tps, n_stream);
+        ggml_set_name(toks, "toks");
+
+        ggml_tensor * out = ggml_kq_mask(ctx, cells, toks, type, causal, alibi, swa_type, n_swa);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_kq_vis(ggml_get_tensor(ctx, "cells"), ggml_get_tensor(ctx, "toks"), rope2d, 1234u + (uint32_t) (n_kv + 7*n_tps + 13*n_stream));
+    }
+};
+
+// FLASH_ATTN_EXT with the mask computed from the metadata (ggml_flash_attn_ext_vis), against the
+// CPU backend with the usual tolerance. (Bit identity plane vs metadata on ONE backend is the job of
+// test-kq-mask-meta --device, which can compare two graphs on the same device.)
+struct test_flash_attn_ext_vis : public test_case {
+    const int64_t   hs;
+    const int64_t   nh_kv;
+    const int64_t   gqa;
+    const int64_t   kv;
+    const int64_t   nb;
+    const int64_t   n_stream;
+    const ggml_type type_KV;
+    const bool      causal;
+    const float     max_bias; // > 0: ALiBi mask values (-|p0 - p1|) with slopes
+    const int       swa_type;
+    const int       n_swa;
+    const bool      rope2d;
+
+    std::string vars() override {
+        return VARS_TO_STR12(hs, nh_kv, gqa, kv, nb, n_stream, type_KV, causal, max_bias, swa_type, n_swa, rope2d);
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * nh_kv*gqa * nb * (hs + hs) * kv * n_stream;
+    }
+
+    test_flash_attn_ext_vis(int64_t hs = 256, int64_t nh_kv = 2, int64_t gqa = 12, int64_t kv = 1024, int64_t nb = 6,
+                            int64_t n_stream = 1, ggml_type type_KV = GGML_TYPE_F16, bool causal = true,
+                            float max_bias = 0.0f, int swa_type = 0, int n_swa = 0, bool rope2d = false)
+        : hs(hs), nh_kv(nh_kv), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), type_KV(type_KV), causal(causal),
+          max_bias(max_bias), swa_type(swa_type), n_swa(n_swa), rope2d(rope2d) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh_kv*gqa, n_stream);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh_kv, n_stream);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh_kv, n_stream);
+        ggml_set_name(v, "v");
+        ggml_tensor * cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, kv, 4, n_stream);
+        ggml_set_name(cells, "cells");
+        ggml_tensor * toks = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, nb, n_stream);
+        ggml_set_name(toks, "toks");
+
+        ggml_tensor * out = ggml_flash_attn_ext_vis(ctx, q, k, v, cells, toks, 1.0f/sqrtf((float) hs), max_bias, 0.0f,
+                                                    causal, max_bias > 0.0f, swa_type, n_swa);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "cells") == 0 || strcmp(t->name, "toks") == 0) {
+                continue;
+            }
+            init_tensor_uniform(t);
+        }
+        init_kq_vis(ggml_get_tensor(ctx, "cells"), ggml_get_tensor(ctx, "toks"), rope2d, 4321u + (uint32_t) (kv + 7*nb + 13*n_stream));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -10647,6 +10838,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // GGML_VK_QSA_FUSED_SELECT=1 graph). Deliberately the same shapes as the pattern cases above,
     // minus the alias modes - see test_qsa_top_k for why the alias is unreachable for a node whose
     // operands are its own srcs - so -o TOPK_QSA and -o QSA_TOP_K cover the same ground.
+    // [TAG_KQ_VIS] GGML_OP_KQ_MASK, bit for bit: every branch of the mask fill (causal / not, the three SWA
+    // kinds, ALiBi, M-RoPE ties), F16 and F32, one and three streams, the prod-like shapes
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (int64_t n_stream : { 1, 3 }) {
+            test_cases.emplace_back(new test_kq_mask(1024, 32, n_stream, type));
+            test_cases.emplace_back(new test_kq_mask(1000, 7,  n_stream, type, true,  false, 0, 0,   true));
+            test_cases.emplace_back(new test_kq_mask(1024, 32, n_stream, type, false));
+            test_cases.emplace_back(new test_kq_mask(1024, 32, n_stream, type, true,  true));
+            test_cases.emplace_back(new test_kq_mask(1024, 32, n_stream, type, true,  false, 1, 128));
+            test_cases.emplace_back(new test_kq_mask(1024, 32, n_stream, type, true,  false, 2, 256));
+            test_cases.emplace_back(new test_kq_mask(1024, 32, n_stream, type, false, false, 3, 100));
+        }
+    }
+    for (int64_t n_tps : { 1, 5, 6, 64, 2048 }) {
+        test_cases.emplace_back(new test_kq_mask(8192, n_tps, 1, GGML_TYPE_F16));
+    }
+    test_cases.emplace_back(new test_kq_mask(65536, 6, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_kq_mask(70000, 2, 1, GGML_TYPE_F16, true, true)); // ALiBi overflow to -inf
+
+    // [TAG_KQ_VIS] FLASH_ATTN_EXT over the metadata: the model's shape (24 heads over 2 KV heads, head dim 256;
+    // target q8_0 K/V, MTP draft f16), decode 1/5/6 rows (GQA fold, split_k), verify, prefill (mask-opt pass)
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int64_t nb : { 1, 2, 5, 6, 64, 512 }) {
+            for (int64_t kv : { 1024, 4096 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_vis(256, 2, 12, kv, nb, 1, type_KV));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_vis(256, 2, 12, 2048, 64, 3, type_KV));             // 3 streams
+        test_cases.emplace_back(new test_flash_attn_ext_vis(256, 2, 12, 4096, 64, 1, type_KV, true, 0.0f, 0, 0, true)); // M-RoPE ties
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_vis(256, 2, 12, 4096, 64, 1, GGML_TYPE_F16, true,  8.0f));          // ALiBi
+    test_cases.emplace_back(new test_flash_attn_ext_vis(256, 2, 12, 4096, 64, 1, GGML_TYPE_F16, true,  0.0f, 1, 512));  // SWA standard
+    test_cases.emplace_back(new test_flash_attn_ext_vis(256, 2, 12, 4096, 64, 1, GGML_TYPE_F16, true,  0.0f, 2, 1024)); // SWA chunked
+    test_cases.emplace_back(new test_flash_attn_ext_vis(256, 2, 12, 4096, 64, 1, GGML_TYPE_F16, false, 0.0f, 3, 700));  // non-causal, symmetric
+    test_cases.emplace_back(new test_flash_attn_ext_vis(128, 4, 4,  1024, 8,  2, GGML_TYPE_F16));                      // another head size
+
     test_cases.emplace_back(new test_qsa_top_k(512,  2048,  1, 1, 1500));
     test_cases.emplace_back(new test_qsa_top_k(512,  2048,  2, 1, 1500));
     test_cases.emplace_back(new test_qsa_top_k(256,  2048,  4, 2, 2000));
