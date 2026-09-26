@@ -1084,6 +1084,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "QSA_TOP_K",
+    "QSA_BIAS",
 
     "UNARY",
 
@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1200,6 +1201,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "qsa_top_k(score, cell_blk, mask)",
+    "qsa_bias(blk, qry, rows)",
 
     "unary(x)",
 
@@ -1217,7 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5478,6 +5480,45 @@ struct ggml_tensor * ggml_qsa_top_k(
     result->src[0] = score;
     result->src[1] = cell_blk;
     result->src[2] = mask;
+
+    return result;
+}
+
+// ggml_qsa_bias
+
+// [TAG_QSA_COMPACT_BIAS] see ggml.h. The reference it must equal is qsa_fill_bias's per-block branch
+// (src/llama-memory-hybrid-idx.cpp) followed by ggml_get_rows(bias, rows); the tables are filled by
+// qsa_fill_bias_compact from the same census and the same per-query tail helper.
+struct ggml_tensor * ggml_qsa_bias(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * blk,
+        struct ggml_tensor  * qry,
+        struct ggml_tensor  * rows) {
+    GGML_ASSERT(blk->type == GGML_TYPE_I32 && qry->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(blk) && ggml_is_contiguous(qry));
+    GGML_ASSERT(blk->ne[0] == 2 && qry->ne[0] == 2);
+    GGML_ASSERT(blk->ne[3] == 1 && qry->ne[3] == 1);
+
+    const int64_t n_blocks = blk->ne[1];
+    const int64_t n_stream = blk->ne[2];
+    const int64_t n_tps    = qry->ne[1];
+
+    GGML_ASSERT(qry->ne[2] == n_stream);
+    GGML_ASSERT(n_blocks > 0 && n_tps > 0 && n_stream > 0);
+
+    int64_t np = n_tps;
+    if (rows != NULL) {
+        GGML_ASSERT(rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows));
+        GGML_ASSERT(rows->ne[1] == n_stream && rows->ne[2] == 1 && rows->ne[3] == 1);
+        np = rows->ne[0];
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, np, n_stream);
+
+    result->op     = GGML_OP_QSA_BIAS;
+    result->src[0] = blk;
+    result->src[1] = qry;
+    result->src[2] = rows;
 
     return result;
 }
