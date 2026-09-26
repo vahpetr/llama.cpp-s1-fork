@@ -1796,6 +1796,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
+
+    // [TAG_MTP_CKPT_PENDING_H] (v33 B2) the cross-batch carry-over pending_h is the only MTP draft state that a
+    //   prompt checkpoint cannot rebuild from the draft KV: the draft KV entry at position p pairs (h_{p-1}, x_p), so
+    //   it is causal and the server restores it with a plain seq_rm(pos_max + 1, -1) instead of a KV copy; the next
+    //   process() call then needs h_{pos_max} (the last row of the batch before the checkpoint) to pair with
+    //   x_{pos_max + 1}. Without this stash a restore paired x_{pos_max + 1} with the hidden row of the last LIVE
+    //   position (stale), one wrong draft-KV entry that every later draft attends to (draft quality only; the target
+    //   verifies). Tagged so that common_speculative_set_state()'s broadcast cannot hand eagle3's blob to MTP.
+    static constexpr uint32_t PENDING_H_MAGIC = 0x4854504d; // "MPTH"
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        data.resize(sizeof(uint32_t) + row_bytes);
+        std::memcpy(data.data(), &PENDING_H_MAGIC, sizeof(uint32_t));
+        std::memcpy(data.data() + sizeof(uint32_t), pending_h[seq_id].data(), row_bytes);
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (data.size() != sizeof(uint32_t) + row_bytes) {
+            return;
+        }
+        uint32_t magic = 0;
+        std::memcpy(&magic, data.data(), sizeof(uint32_t));
+        if (magic != PENDING_H_MAGIC) {
+            return;
+        }
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(uint32_t), row_bytes);
+    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)

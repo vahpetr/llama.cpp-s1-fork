@@ -16,6 +16,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "../../src/llama-ext.h" // llama_get_ctx_other (v33 B2: shared-memory drafts keep the draft copy)
 
 #include <algorithm>
 #include <cstddef>
@@ -1200,6 +1201,15 @@ private:
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
+    // [TAG_CKPT_NO_DFT] (v33 B2) prompt checkpoints leave the draft KV out when it is a plain (partially
+    //   removable) KV cache of its own: it is causal, so on restore seq_rm(pos_max + 1, -1) leaves exactly the
+    //   values a checkpoint copy would have restored (only the physical cell placement differs), and the
+    //   speculative pending state (MTP pending_h, eagle3 boundary row) still travels in data_spec. The plain
+    //   KV cache ignores PARTIAL_ONLY (llama-kv-cache.cpp state_write), so the copy was the draft's WHOLE KV of
+    //   the sequence (2 KiB x n_past on the prod MTP head) in host RAM per checkpoint. Off for a draft whose
+    //   memory is recurrent (FULL/RS: it cannot be rewound) or shared with the target (ctx_other).
+    bool ckpt_skip_dft = false;
+
     common_speculative_ptr spec;
 
     bool add_bos_token = true;
@@ -1579,6 +1589,9 @@ private:
 
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+            ckpt_skip_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && llama_get_ctx_other(ctx_dft) == nullptr;
+            SRV_INF("prompt checkpoints %s the draft KV (draft seq_rm type = %d)\n",
+                    ckpt_skip_dft ? "exclude (restore = draft seq_rm)" : "include", (int) ctx_dft_seq_rm_type);
         }
 
         if (spec) {
@@ -2671,14 +2684,18 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (!ckpt_skip_dft) {
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        } // else [TAG_CKPT_NO_DFT]: data_dft stays empty, the restore rewinds the draft KV instead
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
-        SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+        SLT_INF(slot,
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB: tgt %.3f + dft %.3f + spec %.3f)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
+                (float) cur.data_tgt.size() / 1024 / 1024, (float) cur.data_dft.size() / 1024 / 1024,
+                (float) cur.data_spec.size() / 1024 / 1024);
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -3739,13 +3756,23 @@ private:
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                        if (ctx_dft && ckpt_skip_dft && it->data_dft.empty()) {
+                                            // [TAG_CKPT_NO_DFT] every surviving checkpoint is a prefix of the live tokens (the
+                                            //   pos_max > pos_next ones are erased below), so the live draft KV already holds
+                                            //   positions <= pos_max as the checkpoint saw them - drop what lies past it
+                                            if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, it->pos_max + 1, -1)) {
+                                                GGML_ABORT("failed to rewind the draft KV of seq %d to pos %d\n", slot.id, it->pos_max);
+                                            }
+                                        } else {
+                                            it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                        }
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        SLT_INF(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB: tgt %.3f + dft %.3f + spec %.3f)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024,
+                                                (float) it->data_tgt.size() / 1024 / 1024, (float) it->data_dft.size() / 1024 / 1024, (float) it->data_spec.size() / 1024 / 1024);
                                     }
 
                                     if (do_reset) {
