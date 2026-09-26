@@ -27,6 +27,9 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <thread>
+#include <chrono>
+#include <cstdlib>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -326,6 +329,12 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     size_t spec_n_committed = 0; // number of committed (already-accepted) tokens at the front of spec_draft this round
+
+    // [TAG_GTT_ADMISSION] (v33 #13) prompt admission state of this slot
+    bool    adm_deferred       = false; // the last admission check of the current prompt deferred it
+    int64_t adm_t_defer_us     = 0;     // start of the current deferral
+    int64_t adm_t_log_us       = 0;     // last deferral log line (rate limit)
+    double  adm_projected_mib  = 0.0;   // projection of the last check
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -525,6 +534,11 @@ struct server_slot {
 
         spec_is_replay = false;
         spec_n_committed = 0;
+
+        adm_deferred      = false;
+        adm_t_defer_us    = 0;
+        adm_t_log_us      = 0;
+        adm_projected_mib = 0.0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -872,6 +886,13 @@ struct server_slot {
             {"is_processing", is_processing()},
         };
 
+        if (adm_deferred || adm_projected_mib > 0.0) {
+            res["admission"] = {
+                {"deferred",      adm_deferred},
+                {"projected_mib", adm_projected_mib},
+            };
+        }
+
         // adaptive draft length (--spec-draft-n-max-adaptive): the effective n-max this slot last
         // asked the drafter for, and the cost model it came from - so a bench can see the rule work
         if (spec_n_max_last > 0) {
@@ -1209,6 +1230,30 @@ private:
     //   the sequence (2 KiB x n_past on the prod MTP head) in host RAM per checkpoint. Off for a draft whose
     //   memory is recurrent (FULL/RS: it cannot be rewound) or shared with the target (ctx_other).
     bool ckpt_skip_dft = false;
+
+    // [TAG_GTT_ADMISSION] (v33, night-1 #13) headroom admission for prefill ubatches: before a slot's prompt
+    //   tokens enter the batch, project the GTT level
+    //     used (sysfs mem_info_gtt_used) + slope x cells past the resident high-water + next staging step
+    //   and keep the slot queued while it exceeds the bar. Scheduling only - no numerics change.
+    //   env: LLAMA_GTT_ADMISSION_MIB (bar, default 104096, 0 = off), LLAMA_GTT_SLOPE_B_PER_CELL (default 18432 =
+    //   dense; PROF 26047, PROF + compact bias ~21955), LLAMA_GTT_USED_PATH (default: the first
+    //   /sys/class/drm/card*/device/mem_info_gtt_used), LLAMA_GTT_STAGING_B_PER_CELL (FA dequant staging per
+    //   pool cell, default 2048: the prealloc_x estimate), LLAMA_GTT_STAGING_STEP_MIB (explicit step override).
+    //   The step is 0.25 x prealloc_x when prealloc_x grows geometrically (GGML_VK_QSA_SCRATCH_PRESIZE=1 and
+    //   GGML_VK_QSA_SCRATCH_PRESIZE_FA=1), else 0 (exact fit: the slope already carries the growth).
+    //   prealloc_x itself lives inside the Vulkan backend (not exported), so it is estimated as
+    //   staging_b_per_cell x resident cells after the ubatch.
+    struct {
+        bool        enabled = false;
+        std::string path;
+        double      bar_mib            = 104096.0;
+        double      slope_b_per_cell   = 18432.0;
+        double      staging_b_per_cell = 2048.0;
+        double      step_override_mib  = -1.0;
+        bool        geometric          = false;
+        int64_t     hw_cells           = 0;     // resident-cell high-water seen by this server
+        bool        deferred_this_iter = false;
+    } adm;
 
     common_speculative_ptr spec;
 
@@ -1705,6 +1750,8 @@ private:
 
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
+
+        admission_init();
 
         // propagate new defaults back to caller
         params = params_base;
@@ -2644,6 +2691,173 @@ private:
         return true;
     }
 
+    static bool env_truthy(const char * name) {
+        const char * v = getenv(name);
+        if (v == nullptr || *v == '\0') {
+            return false;
+        }
+        const std::string s = v;
+        return !(s == "0" || s == "false" || s == "off" || s == "no" || s == "FALSE" || s == "OFF" || s == "NO");
+    }
+
+    static double env_double(const char * name, double def) {
+        const char * v = getenv(name);
+        if (v == nullptr || *v == '\0') {
+            return def;
+        }
+        char * end = nullptr;
+        const double d = strtod(v, &end);
+        if (end == v) {
+            SRV_WRN("ignoring unparsable %s = '%s'\n", name, v);
+            return def;
+        }
+        return d;
+    }
+
+    static bool read_u64_file(const std::string & path, uint64_t & out) {
+        std::ifstream f(path);
+        if (!f) {
+            return false;
+        }
+        uint64_t v = 0;
+        f >> v;
+        if (f.fail()) {
+            return false;
+        }
+        out = v;
+        return true;
+    }
+
+    // [TAG_GTT_ADMISSION]
+    void admission_init() {
+        adm.bar_mib            = env_double("LLAMA_GTT_ADMISSION_MIB",      104096.0);
+        adm.slope_b_per_cell   = env_double("LLAMA_GTT_SLOPE_B_PER_CELL",   18432.0);
+        adm.staging_b_per_cell = env_double("LLAMA_GTT_STAGING_B_PER_CELL", 2048.0);
+        adm.step_override_mib  = env_double("LLAMA_GTT_STAGING_STEP_MIB",   -1.0);
+        adm.geometric          = env_truthy("GGML_VK_QSA_SCRATCH_PRESIZE") && env_truthy("GGML_VK_QSA_SCRATCH_PRESIZE_FA");
+        adm.enabled            = false;
+
+        if (adm.bar_mib <= 0.0) {
+            SRV_INF("%s", "admission: GTT headroom admission disabled (LLAMA_GTT_ADMISSION_MIB = 0)\n");
+            return;
+        }
+
+        const char * env_path = getenv("LLAMA_GTT_USED_PATH");
+        if (env_path != nullptr && *env_path != '\0') {
+            adm.path = env_path;
+        } else {
+            std::vector<std::string> cands;
+            std::error_code ec;
+            for (const auto & e : std::filesystem::directory_iterator("/sys/class/drm", ec)) {
+                const std::string name = e.path().filename().string();
+                if (name.rfind("card", 0) == 0 && name.find('-') == std::string::npos) {
+                    const std::string f = e.path().string() + "/device/mem_info_gtt_used";
+                    if (std::filesystem::exists(f, ec)) {
+                        cands.push_back(f);
+                    }
+                }
+            }
+            std::sort(cands.begin(), cands.end());
+            if (!cands.empty()) {
+                adm.path = cands.front();
+            }
+        }
+
+        uint64_t used = 0;
+        if (adm.path.empty() || !read_u64_file(adm.path, used)) {
+            SRV_WRN("admission: GTT usage not readable (path = '%s') - headroom admission disabled\n", adm.path.c_str());
+            return;
+        }
+
+        adm.enabled = true;
+        SRV_INF("admission: GTT headroom admission on: bar = %.0f MiB, slope = %.0f B/cell, staging step = %s, used now = %.0f MiB (%s)\n",
+                adm.bar_mib, adm.slope_b_per_cell,
+                adm.step_override_mib >= 0.0 ? string_format("%.0f MiB (override)", adm.step_override_mib).c_str()
+                    : adm.geometric ? string_format("0.25 x %.0f B/cell x cells (geometric prealloc)", adm.staging_b_per_cell).c_str()
+                    : "0 (exact-fit prealloc)",
+                used / 1024.0 / 1024.0, adm.path.c_str());
+
+        metrics.admission_enabled = 1;
+        metrics.admission_bar_mib = adm.bar_mib;
+    }
+
+    // cells resident in the KV pool: every slot's cached tokens (idle slots keep theirs)
+    int64_t admission_resident_cells() const {
+        int64_t n = 0;
+        for (const auto & s : slots) {
+            n += s.prompt.n_tokens();
+        }
+        return n;
+    }
+
+    // returns false to keep the slot's prompt out of this batch (re-checked on the next iteration)
+    bool admission_check(server_slot & slot, int32_t n_room) {
+        const int64_t n_add = std::min<int64_t>((int64_t) slot.task->n_tokens() - slot.prompt.n_tokens(), n_room);
+        if (n_add <= 0) {
+            return true;
+        }
+
+        uint64_t used_b = 0;
+        if (!read_u64_file(adm.path, used_b)) {
+            SRV_WRN("admission: GTT usage no longer readable (path = '%s') - headroom admission disabled\n", adm.path.c_str());
+            adm.enabled = false;
+            metrics.admission_enabled = 0;
+            if (slot.adm_deferred) {
+                slot.adm_deferred = false;
+            }
+            return true;
+        }
+
+        const int64_t resident = admission_resident_cells();
+        adm.hw_cells = std::max(adm.hw_cells, resident);
+
+        const int64_t cells_after = resident + n_add;
+        const int64_t growth      = std::max<int64_t>(0, cells_after - adm.hw_cells);
+
+        const double used_mib = used_b / 1024.0 / 1024.0;
+        const double step_mib = adm.step_override_mib >= 0.0 ? adm.step_override_mib
+                              : adm.geometric ? 0.25 * adm.staging_b_per_cell * (double) cells_after / 1024.0 / 1024.0
+                              : 0.0;
+        const double projected = used_mib + adm.slope_b_per_cell * (double) growth / 1024.0 / 1024.0 + step_mib;
+
+        slot.adm_projected_mib = projected;
+
+        metrics.admission_last_used_mib      = used_mib;
+        metrics.admission_last_projected_mib = projected;
+
+        const int64_t t_now = ggml_time_us();
+
+        if (projected > adm.bar_mib) {
+            adm.deferred_this_iter = true;
+            metrics.admission_last_deferred = 1;
+
+            if (!slot.adm_deferred) {
+                slot.adm_deferred   = true;
+                slot.adm_t_defer_us = t_now;
+                slot.adm_t_log_us   = 0;
+                metrics.admission_deferred_total++;
+            }
+
+            if (slot.adm_t_log_us == 0 || t_now - slot.adm_t_log_us > 10 * 1000 * 1000) {
+                slot.adm_t_log_us = t_now;
+                SRV_WRN("admission: deferred slot %d (projected %.0f MiB > bar %.0f MiB: used %.0f + %" PRId64 " new cells x %.0f B + staging step %.0f; ubatch %" PRId64 " tokens, resident %" PRId64 ", high-water %" PRId64 ", waiting %.1f s)\n",
+                        slot.id, projected, adm.bar_mib, used_mib, growth, adm.slope_b_per_cell, step_mib,
+                        n_add, resident, adm.hw_cells, (t_now - slot.adm_t_defer_us) / 1e6);
+            }
+            return false;
+        }
+
+        metrics.admission_last_deferred = 0;
+
+        if (slot.adm_deferred) {
+            SRV_INF("admission: admitted slot %d after %.1f s (projected %.0f MiB <= bar %.0f MiB)\n",
+                    slot.id, (t_now - slot.adm_t_defer_us) / 1e6, projected, adm.bar_mib);
+            slot.adm_deferred = false;
+        }
+
+        return true;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
@@ -3194,6 +3408,12 @@ private:
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
 
+        // [TAG_GTT_ADMISSION] everything runnable is deferred: nothing to decode (the decode loop below is skipped),
+        //   so back off a little instead of spinning on NEXT_RESPONSE
+        if (adm.deferred_this_iter && batch.size() == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
         if (batch.slot_batched) {
             auto & slot_batched      = batch.slot_batched;
             auto & alora_scale       = batch.alora_scale;
@@ -3256,6 +3476,8 @@ private:
     }
 
     void pre_decode() {
+        adm.deferred_this_iter = false;
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3852,6 +4074,11 @@ private:
                         }
                     }
 
+                    // [TAG_GTT_ADMISSION] keep the prompt queued while its next ubatch would push GTT past the bar
+                    if (adm.enabled && !admission_check(slot, n_batch - batch.size())) {
+                        return;
+                    }
+
                     // note: the prompt timing is advanced in post_decode(), so it does not cover
                     //       the tokens added to the batch below
                     slot.print_timings_pp();
@@ -4013,6 +4240,10 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+
+                    if (adm.enabled) {
+                        adm.hw_cells = std::max(adm.hw_cells, admission_resident_cells());
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 

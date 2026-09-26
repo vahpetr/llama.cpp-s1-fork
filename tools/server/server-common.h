@@ -509,6 +509,14 @@ struct server_metrics {
     double   spec_adaptive_t_tok_ms = 0.0;
     double   spec_adaptive_t_dec_ms = 0.0;
 
+    // [TAG_GTT_ADMISSION] (v33 #13) prompt admission - gauges of the last check, plus a deferral counter
+    uint64_t admission_enabled            = 0;
+    uint64_t admission_last_deferred      = 0;
+    uint64_t admission_deferred_total     = 0;  // deferral episodes (one per slot prompt that had to wait)
+    double   admission_bar_mib            = 0.0;
+    double   admission_last_used_mib      = 0.0;
+    double   admission_last_projected_mib = 0.0;
+
     void init() {
         t_start = ggml_time_us();
     }
