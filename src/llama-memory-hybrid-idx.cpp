@@ -8,6 +8,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -24,6 +25,24 @@
 static bool llama_qsa_pooled_cache_env() {
     const char * s = getenv("LLAMA_QSA_POOLED_CACHE");
     return s != nullptr && atoi(s) != 0;
+}
+
+// [TAG_QSA_COMPACT_BIAS] LLAMA_QSA_COMPACT_BIAS=1: read once per memory, like LLAMA_QSA_POOLED_CACHE, so the replay
+// probe can run both arms in one process
+static bool llama_qsa_compact_bias_env() {
+    const char * s = getenv("LLAMA_QSA_COMPACT_BIAS");
+    return s != nullptr && atoi(s) != 0;
+}
+
+// [TAG_QSA_COMPACT_BIAS] LLAMA_QSA_COMPACT_BIAS_CHECK=1 (diagnostic, only with the knob on): every ubatch also fills
+// the old plane with the unchanged qsa_fill_bias and compares it bitwise with the tables expanded by the op's formula
+static bool llama_qsa_compact_check_env() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_COMPACT_BIAS_CHECK");
+        return s != nullptr && atoi(s) != 0;
+    }();
+
+    return enabled;
 }
 
 void llama_qsa_pooled_store::reset_stream(uint32_t s) {
@@ -150,6 +169,19 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
+    // [TAG_QSA_COMPACT_BIAS] the query table carries 1 << seq_id in 32 bits
+    if (mem_idx && llama_qsa_compact_bias_env()) {
+        if (n_seq_max <= 32) {
+            qsa_compact = true;
+            LLAMA_LOG_INFO("%s: LLAMA_QSA_COMPACT_BIAS=1: the QSA per-block bias is built on the device from "
+                           "per-block/per-query tables (GGML_OP_QSA_BIAS)%s\n", __func__,
+                           llama_qsa_compact_check_env() ? ", LLAMA_QSA_COMPACT_BIAS_CHECK=1" : "");
+        } else {
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_COMPACT_BIAS=1 ignored: n_seq_max = %u > 32, the plane is kept\n",
+                           __func__, n_seq_max);
+        }
+    }
+
     if (!mem_idx || !llama_qsa_pooled_cache_env()) {
         return;
     }
@@ -675,11 +707,17 @@ static bool qsa_tail_assert_enabled() {
     return enabled;
 }
 
+bool llama_memory_hybrid_idx_context::qsa_compact_bias() const {
+    return mem != nullptr && mem->qsa_compact_bias();
+}
+
 void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
         ggml_tensor * bias,
+        ggml_tensor * qsa_blk,
+        ggml_tensor * qsa_qry,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias) const {
@@ -696,21 +734,41 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
     GGML_ASSERT(n_tokens % n_ns == 0);
 
+    // [TAG_QSA_COMPACT_BIAS] exactly one of the plane and the tables
+    const bool compact = bias == nullptr;
+    GGML_ASSERT(compact == (qsa_blk != nullptr) && (qsa_blk != nullptr) == (qsa_qry != nullptr));
+    GGML_ASSERT(!compact || (blk_bias && qsa_compact_bias()));
+
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
-    float   * dst_bias      = (float   *) bias->data;
+    float   * dst_bias      = compact ? nullptr : (float *) bias->data;
 
     std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
 
     qsa_census_stream cs;
+
+    std::vector<float> check_plane;
 
     for (int64_t s = 0; s < n_ns; ++s) {
         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
 
         qsa_census   (s, ubatch, n_kv, n_ns, n_blocks, r, blk_bias, cur_cell_blk, cur_blk_cells, dst_blk_pos, cs);
-        qsa_fill_bias(s, ubatch, n_kv, n_ns, n_blocks, r, blk_bias, cur_cell_blk, dst_bias, cs);
+
+        if (compact) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(qsa_blk->buffer) && ggml_backend_buffer_is_host(qsa_qry->buffer));
+            GGML_ASSERT(qsa_blk->ne[1] == n_blocks && qsa_blk->ne[2] == n_ns && qsa_qry->ne[1] == n_tokens/n_ns);
+
+            qsa_fill_bias_compact(s, ubatch, n_ns, n_blocks, r, (int32_t *) qsa_blk->data, (int32_t *) qsa_qry->data, cs);
+
+            if (llama_qsa_compact_check_env()) {
+                qsa_compact_check(s, ubatch, n_kv, n_ns, n_blocks, r, cur_cell_blk,
+                        (const int32_t *) qsa_blk->data, (const int32_t *) qsa_qry->data, cs, check_plane);
+            }
+        } else {
+            qsa_fill_bias(s, ubatch, n_kv, n_ns, n_blocks, r, blk_bias, cur_cell_blk, dst_bias, cs);
+        }
     }
 }
 
@@ -946,6 +1004,45 @@ void llama_memory_hybrid_idx_context::qsa_census(
     }
 }
 
+// [TAG_QSA_COMPACT_BIAS] the query side of the bias, shared by qsa_fill_bias and qsa_fill_bias_compact so both
+// fills see the same integers: the query's position - or, for a ranked (M-RoPE image) census, its rank among the
+// stream's cells, found by a binary search over `order` - and the start of its incomplete tail block
+static int64_t qsa_query_pos(const llama_ubatch * ubatch, int64_t i, bool ranked, const std::vector<int32_t> & order,
+                             const llama_kv_cells & cells) {
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    int64_t q = ubatch->pos[i];
+
+    if (ranked) {
+        const llama_pos qt = ubatch->pos[i];
+        const llama_pos qy = ubatch->pos[i + n_tokens];
+        const llama_pos qx = ubatch->pos[i + n_tokens*2];
+
+        int64_t lo = 0;
+        int64_t hi = (int64_t) order.size();
+
+        while (lo < hi) {
+            const int64_t   mid = (lo + hi)/2;
+            const int32_t   c   = order[mid];
+            const llama_pos pc  = cells.pos_get(c);
+
+            if (pc < qt || (pc == qt && !cells.ext_get(c).is_2d_gt(qx, qy))) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        q = lo - 1;
+    }
+
+    return q;
+}
+
+static inline int64_t qsa_tail_start(int64_t q, int64_t r) {
+    return (q + 1)/r*r;
+}
+
 // the per-token bias of stream s from its census
 void llama_memory_hybrid_idx_context::qsa_fill_bias(
         int64_t s,
@@ -986,33 +1083,10 @@ void llama_memory_hybrid_idx_context::qsa_fill_bias(
         const int64_t      i      = s*n_tps + ii;
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
-        int64_t q = ubatch->pos[i];
-
-        if (ranked) {
-            const llama_pos qt = ubatch->pos[i];
-            const llama_pos qy = ubatch->pos[i + n_tokens];
-            const llama_pos qx = ubatch->pos[i + n_tokens*2];
-
-            int64_t lo = 0;
-            int64_t hi = (int64_t) order.size();
-
-            while (lo < hi) {
-                const int64_t   mid = (lo + hi)/2;
-                const int32_t   c   = order[mid];
-                const llama_pos pc  = cells.pos_get(c);
-
-                if (pc < qt || (pc == qt && !cells.ext_get(c).is_2d_gt(qx, qy))) {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-
-            q = lo - 1;
-        }
+        const int64_t q = qsa_query_pos(ubatch, i, ranked, order, cells);
 
         // the tail is an incomplete block and is always visible, as in the reference
-        const int64_t tail_start = (q + 1)/r*r;
+        const int64_t tail_start = qsa_tail_start(q, r);
 
         if (blk_bias) {
             // a block sits wholly inside or outside the tail, so one value covers it
@@ -1076,6 +1150,126 @@ void llama_memory_hybrid_idx_context::qsa_fill_bias(
             }
 
             cur_bias[j] = v;
+        }
+    }
+}
+
+// [TAG_QSA_COMPACT_BIAS] the tables that GGML_OP_QSA_BIAS turns back into qsa_fill_bias's per-block plane.
+// Per block b of stream s (dst_blk [2, n_blocks, n_ns]):
+//   b <  n_bid: key = bid_idx[b], vis = the seq bitmask of bid_cell[b] (the cell the old fill tests)
+//   b >= n_bid: key = INT32_MAX,  vis = ~0 for the [TAG_QSA_TAIL_FIX] spare id (tail_fix && n_bid < n_blocks &&
+//               b == n_bid: 1e9 for every query, as before), 0 for every other id (-inf, as before)
+// Per query i (dst_qry [2, n_tps, n_ns]): tail = qsa_tail_start(qsa_query_pos(...)) - the same integers the old fill
+// compares - and bit = 1 << seq_id[i][0]. The op writes (vis & bit) == 0 ? -inf : (key >= tail ? 1e9f : 0.0f).
+// When n_bid == n_blocks there is no spare id: dead_bid aliases a real block, which keeps its own entry here too.
+void llama_memory_hybrid_idx_context::qsa_fill_bias_compact(
+        int64_t s,
+        const llama_ubatch * ubatch,
+        int64_t n_ns,
+        int64_t n_blocks,
+        int64_t r,
+        int32_t * dst_blk,
+        int32_t * dst_qry,
+        const qsa_census_stream & cs) const {
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_tps    = n_tokens/n_ns;
+
+    const bool tail_fix = qsa_tail_fix_enabled();     // [TAG_QSA_TAIL_FIX]
+
+    const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
+    const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
+
+    const int32_t n_bid = cs.n_bid;
+
+    GGML_ASSERT(n_bid <= n_blocks);
+
+    const bool tail_bid_spare = n_bid < n_blocks;
+
+    int32_t * blk = dst_blk + 2*s*n_blocks;
+
+    for (int64_t b = 0; b < n_bid; ++b) {
+        const auto & set = cells.seq_set((uint32_t) cs.bid_cell[b]);
+
+        uint32_t vis = 0;
+        for (uint32_t k = 0; k < 32; ++k) {
+            vis |= set.test(k) ? 1u << k : 0u;
+        }
+
+        blk[2*b + 0] = cs.bid_idx[b];
+        blk[2*b + 1] = (int32_t) vis;
+    }
+
+    for (int64_t b = n_bid; b < n_blocks; ++b) {
+        const bool boost = tail_fix && tail_bid_spare && b == n_bid;
+
+        blk[2*b + 0] = INT32_MAX;
+        blk[2*b + 1] = (int32_t) (boost ? 0xFFFFFFFFu : 0u);
+    }
+
+    for (int64_t ii = 0; ii < n_tps; ++ii) {
+        const int64_t      i      = s*n_tps + ii;
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+        GGML_ASSERT(seq_id >= 0 && seq_id < 32);
+
+        const int64_t tail = qsa_tail_start(qsa_query_pos(ubatch, i, cs.ranked, cs.order, cells), r);
+
+        GGML_ASSERT(tail >= 0 && tail < INT32_MAX);
+
+        dst_qry[2*i + 0] = (int32_t) tail;
+        dst_qry[2*i + 1] = (int32_t) (1u << seq_id);
+    }
+}
+
+void llama_memory_hybrid_idx_context::qsa_compact_check(
+        int64_t s,
+        const llama_ubatch * ubatch,
+        int64_t n_kv,
+        int64_t n_ns,
+        int64_t n_blocks,
+        int64_t r,
+        const int32_t * cur_cell_blk,
+        const int32_t * blk,
+        const int32_t * qry,
+        const qsa_census_stream & cs,
+        std::vector<float> & plane) const {
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_tps    = n_tokens/n_ns;
+
+    // the old plane, [n_blocks, n_tokens] as the input tensor was; qsa_fill_bias writes stream s's rows
+    plane.resize((size_t) n_blocks*n_tokens);
+    qsa_fill_bias(s, ubatch, n_kv, n_ns, n_blocks, r, /*blk_bias =*/ true, cur_cell_blk, plane.data(), cs);
+
+    const int32_t * be = blk + 2*s*n_blocks;
+
+    for (int64_t ii = 0; ii < n_tps; ++ii) {
+        const int64_t  i    = s*n_tps + ii;
+        const int32_t  tail = qry[2*i + 0];
+        const uint32_t bit  = (uint32_t) qry[2*i + 1];
+
+        for (int64_t b = 0; b < n_blocks; ++b) {
+            const int32_t  key = be[2*b + 0];
+            const uint32_t vis = (uint32_t) be[2*b + 1];
+
+            // the op's formula (ggml_compute_forward_qsa_bias, qsa_bias.comp)
+            const float v_new = (vis & bit) == 0 ? -INFINITY : (key >= tail ? 1e9f : 0.0f);
+            const float v_old = plane[(size_t) i*n_blocks + b];
+
+            if (memcmp(&v_new, &v_old, sizeof(float)) != 0) {
+                GGML_ABORT("[qsa-compact-check] MISMATCH s=%lld i=%lld b=%lld old=%g new=%g (n_bid=%d n_blocks=%lld "
+                           "key=%d vis=0x%08x tail=%d bit=0x%08x)", (long long) s, (long long) i, (long long) b,
+                           (double) v_old, (double) v_new, cs.n_bid, (long long) n_blocks, key, vis, tail, bit);
+            }
+        }
+    }
+
+    // one count per ubatch: its last stream closes it
+    if (s == n_ns - 1) {
+        static std::atomic<uint64_t> n_checked { 0 };
+
+        const uint64_t n = ++n_checked;
+        if (n % 64 == 0 || n == 1) {
+            LLAMA_LOG_WARN("[qsa-compact-check] %llu ubatches identical\n", (unsigned long long) n);
         }
     }
 }
@@ -1397,6 +1591,8 @@ uint32_t llama_memory_hybrid_idx_context::qsa_store_s0() const {
 void llama_memory_hybrid_idx_context::set_input_qsa_store(
         ggml_tensor * cell_blk,
         ggml_tensor * bias,
+        ggml_tensor * qsa_blk,
+        ggml_tensor * qsa_qry,
         ggml_tensor * dirty_cells,
         ggml_tensor * dirty_pos,
         ggml_tensor * dirty_dst,
@@ -1438,9 +1634,31 @@ void llama_memory_hybrid_idx_context::set_input_qsa_store(
         memcpy(remap    ->data, pl.remap    .data(), ggml_nbytes(remap));
     }
 
-    for (int64_t s = 0; s < pl.n_ns; ++s) {
-        qsa_fill_bias(s, ubatch, n_kv, pl.n_ns, pl.n_blocks, ratio, blk_bias,
-                pl.cell_blk.data() + s*n_kv, (float *) bias->data, pl.cs[s]);
+    // [TAG_QSA_COMPACT_BIAS] exactly one of the plane and the tables
+    const bool compact = bias == nullptr;
+    GGML_ASSERT(compact == (qsa_blk != nullptr) && (qsa_blk != nullptr) == (qsa_qry != nullptr));
+    GGML_ASSERT(!compact || (blk_bias && qsa_compact_bias()));
+
+    if (compact) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(qsa_blk->buffer) && ggml_backend_buffer_is_host(qsa_qry->buffer));
+        GGML_ASSERT(qsa_blk->ne[1] == pl.n_blocks && qsa_blk->ne[2] == pl.n_ns && qsa_qry->ne[1] == ubatch->n_tokens/pl.n_ns);
+
+        std::vector<float> check_plane;
+
+        for (int64_t s = 0; s < pl.n_ns; ++s) {
+            qsa_fill_bias_compact(s, ubatch, pl.n_ns, pl.n_blocks, ratio,
+                    (int32_t *) qsa_blk->data, (int32_t *) qsa_qry->data, pl.cs[s]);
+
+            if (llama_qsa_compact_check_env()) {
+                qsa_compact_check(s, ubatch, n_kv, pl.n_ns, pl.n_blocks, ratio, pl.cell_blk.data() + s*n_kv,
+                        (const int32_t *) qsa_blk->data, (const int32_t *) qsa_qry->data, pl.cs[s], check_plane);
+            }
+        }
+    } else {
+        for (int64_t s = 0; s < pl.n_ns; ++s) {
+            qsa_fill_bias(s, ubatch, n_kv, pl.n_ns, pl.n_blocks, ratio, blk_bias,
+                    pl.cell_blk.data() + s*n_kv, (float *) bias->data, pl.cs[s]);
+        }
     }
 
     // this graph carries the store update: its stamps may be published once it has run

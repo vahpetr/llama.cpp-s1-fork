@@ -2413,6 +2413,13 @@ struct llama_model_qwen4exp : public llama_model_base {
                            bool   blk_bias,
                             int   il);
 
+        // [TAG_QSA_COMPACT_BIAS] the qsa_blk/qsa_qry inputs of LLAMA_QSA_COMPACT_BIAS=1
+        void build_qsa_compact_inputs(
+            llm_graph_input_qsa * qsa,
+                        int64_t   n_blocks,
+                        int64_t   n_tps,
+                        int64_t   n_stream);
+
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
                     ggml_tensor * cur,
