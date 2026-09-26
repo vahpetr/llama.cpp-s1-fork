@@ -1117,6 +1117,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
+    vk_pipeline pipeline_qsa_bias;       // [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
@@ -1847,6 +1848,15 @@ struct vk_op_topk_radix_push_constants {
     // its natural [n_blocks, n_tps, n_stream] layout => sb_blk = 1, sb_tps = n_blocks).
     uint32_t sb_blk;   // QSA only
     uint32_t sb_tps;   // QSA only
+};
+
+// [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS (qsa_bias.comp)
+struct vk_op_qsa_bias_push_constants {
+    uint32_t n_blocks;
+    uint32_t n_tps;
+    uint32_t np;
+    uint32_t n_stream;
+    uint32_t has_rows;
 };
 
 struct vk_op_im2col_push_constants {
@@ -6357,6 +6367,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
     }
+
+    // [TAG_QSA_COMPACT_BIAS] 256 blocks per workgroup on x, one (t, s) row per workgroup on y
+    ggml_vk_create_pipeline(device, device->pipeline_qsa_bias, "qsa_bias_f32", qsa_bias_f32_len, qsa_bias_f32_data, "main", 4, sizeof(vk_op_qsa_bias_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 
@@ -15267,6 +15280,35 @@ static void ggml_vk_qsa_top_k(ggml_backend_vk_context * ctx, vk_context& subctx,
                               n_tps, n_blocks, n_stream, /*sb_blk =*/ 1, /*sb_tps =*/ n_blocks);
 }
 
+// [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS: every operand is one of the node's own srcs and the op uses
+// no prealloc buffer, so there is no scratch and no sync bookkeeping beyond the generic one
+static void ggml_vk_qsa_bias(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * node) {
+    const ggml_tensor * blk  = node->src[0]; // [2, n_blocks, n_stream] i32
+    const ggml_tensor * qry  = node->src[1]; // [2, n_tps, n_stream]    i32
+    const ggml_tensor * rows = node->src[2]; // [np, n_stream] i32 or NULL
+
+    const uint32_t n_blocks = (uint32_t) blk->ne[1];
+    const uint32_t n_tps    = (uint32_t) qry->ne[1];
+    const uint32_t np       = (uint32_t) node->ne[1];
+    const uint32_t n_stream = (uint32_t) node->ne[2];
+    const uint32_t nrows    = np*n_stream;
+
+    vk_pipeline pipeline = ctx->device->pipeline_qsa_bias;
+    GGML_ASSERT(pipeline != nullptr);
+
+    vk_op_qsa_bias_push_constants pc { n_blocks, n_tps, np, n_stream, rows != nullptr ? 1u : 0u };
+    std::array<uint32_t, 3> elements {
+        n_blocks,
+        std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
+        1,
+    };
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, blk), ggml_vk_tensor_subbuffer(ctx, qry),
+          ggml_vk_tensor_subbuffer(ctx, rows != nullptr ? rows : qry), ggml_vk_tensor_subbuffer(ctx, node) },
+        pc, elements);
+}
+
 static void ggml_vk_sum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     vk_op_sum_rows_push_constants p = vk_op_sum_rows_push_constants_init(src0, dst, ggml_nelements(src0));
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_SUM, p);
@@ -17256,6 +17298,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     // [TAG_QSA_FUSED_SELECT] one node, three live srcs; no fusion bookkeeping and no alias veto
     case GGML_OP_QSA_TOP_K:
         ggml_vk_qsa_top_k(ctx, compute_ctx, node);
+
+        break;
+    // [TAG_QSA_COMPACT_BIAS]
+    case GGML_OP_QSA_BIAS:
+        ggml_vk_qsa_bias(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_SUM:
@@ -20973,6 +21020,26 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return device->pipeline_topk_radix_qsa != nullptr;
             }
+        case GGML_OP_QSA_BIAS:
+            {
+                // [TAG_QSA_COMPACT_BIAS] I32 contiguous tables (and rows), an F32 contiguous result
+                const ggml_tensor * blk  = op->src[0];
+                const ggml_tensor * qry  = op->src[1];
+                const ggml_tensor * rows = op->src[2];
+                if (!blk || !qry || blk->type != GGML_TYPE_I32 || qry->type != GGML_TYPE_I32 ||
+                    op->type != GGML_TYPE_F32 || !ggml_is_contiguous(blk) || !ggml_is_contiguous(qry) ||
+                    !ggml_is_contiguous(op)) {
+                    return false;
+                }
+                if (rows && (rows->type != GGML_TYPE_I32 || !ggml_is_contiguous(rows))) {
+                    return false;
+                }
+                // 32-bit element indices in the shader
+                if (ggml_nelements(op) > (int64_t) UINT32_MAX || ggml_nelements(blk) > (int64_t) UINT32_MAX) {
+                    return false;
+                }
+                return device->pipeline_qsa_bias != nullptr;
+            }
         case GGML_OP_UPSCALE:
             if (op->op_params[0] & GGML_SCALE_FLAG_ANTIALIAS) {
                 if ((op->op_params[0] & 0xFF) != GGML_SCALE_MODE_BILINEAR) {
@@ -22014,6 +22081,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_top_k(ggml_ctx, src_clone[0], tensor->ne[0]);
         } else if (tensor->op == GGML_OP_QSA_TOP_K) {
             tensor_clone = ggml_qsa_top_k(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], tensor->ne[0]);
+        } else if (tensor->op == GGML_OP_QSA_BIAS) {
+            tensor_clone = ggml_qsa_bias(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
         } else if (tensor->op == GGML_OP_SUM) {
             tensor_clone = ggml_sum(ggml_ctx, src_clone[0]);
         } else if (tensor->op == GGML_OP_SUM_ROWS) {

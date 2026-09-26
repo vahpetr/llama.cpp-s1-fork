@@ -1,0 +1,54 @@
+#version 450
+
+// [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS: the qwen4exp per-block indexer bias, rebuilt on the device
+// from the block table blk [2, n_blocks, n_stream] (key, vis) and the query table qry [2, n_tps, n_stream]
+// (tail, bit), read through rows [np, n_stream] (has_rows == 0: identity, and binding 2 is qry):
+//   dst[b, t, s] = (vis & bit) == 0 ? -inf : (key >= tail ? 1e9 : +0.0),   q = rows[t, s] or t
+// The three results are bit patterns, not arithmetic, so the tensor is bit-identical to the CPU
+// reference (ggml-cpu/ops.cpp ggml_compute_forward_qsa_bias) and to get_rows of the old f32 plane.
+
+layout(push_constant) uniform parameter {
+    uint n_blocks;
+    uint n_tps;
+    uint np;
+    uint n_stream;
+    uint has_rows;
+} p;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BLK  { int   data_blk[];  };
+layout(binding = 1) readonly  buffer QRY  { int   data_qry[];  };
+layout(binding = 2) readonly  buffer ROWS { int   data_rows[]; };
+layout(binding = 3) writeonly buffer DST  { float data_d[];    };
+
+const uint F32_NEG_INF = 0xFF800000u;
+const uint F32_1E9     = 0x4E6E6B28u; // 1e9f = 1953125 * 2^9, exact
+const uint F32_ZERO    = 0x00000000u; // +0.0f
+
+void main() {
+    const uint b = gl_GlobalInvocationID.x;
+    if (b >= p.n_blocks) {
+        return;
+    }
+
+    const uint nrows = p.np * p.n_stream;
+
+    // rows (t, s) on y; loops if the host clamped the y dimension to maxComputeWorkGroupCount[1]
+    for (uint row = gl_WorkGroupID.y; row < nrows; row += gl_NumWorkGroups.y) {
+        const uint t = row % p.np;
+        const uint s = row / p.np;
+        const uint q = p.has_rows != 0u ? uint(data_rows[s*p.np + t]) : t;
+
+        const uint qi   = 2u*(s*p.n_tps + q);
+        const int  tail = data_qry[qi];
+        const uint bit  = uint(data_qry[qi + 1u]);
+
+        const uint bi  = 2u*(s*p.n_blocks + b);
+        const int  key = data_blk[bi];
+        const uint vis = uint(data_blk[bi + 1u]);
+
+        const uint v = (vis & bit) == 0u ? F32_NEG_INF : (key >= tail ? F32_1E9 : F32_ZERO);
+        data_d[row*p.n_blocks + b] = uintBitsToFloat(v);
+    }
+}
