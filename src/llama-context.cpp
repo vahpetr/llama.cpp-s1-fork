@@ -18,6 +18,8 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -64,6 +66,44 @@ static int64_t sched_prof_n_kv(const llama_memory_context_i * mctx) {
 
 static const char * sched_prof_ctx_name(llama_context_type ctx_type) {
     return ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main";
+}
+
+// [TAG_KQVIS_PROF] LLAMA_KQ_VIS_PROF=1 (llama_kqvis_prof_enabled, llama-kv-cache.cpp): per context, windows of <= 64
+// graphs of one class and one fill mode, one WARN line each:
+//   kqvis-prof: ctx=<main|mtp> mode=<mask|vis|none|both> class=<dec|pp> win=<n> reason=<full|class|mode|idle|exit>
+//     graphs reused tok nkv_min nkv_max nkv_avg build_us inputs_us fill_us fill_avg in_wait_us in_copy_us kq_copy_us
+//     kq_kib compute_us compute_avg sync_us sync_avg n_sync t0_ms t1_ms
+// per graph: build = process_ubatch() start .. set_inputs (apply, reuse check, build + alloc); inputs = all set_inputs;
+// fill = the KQ mask / metadata fill inside it; compute = graph_compute() host time, which contains the scheduler's
+// user-input uploads (in_wait = the synchronize before each upload, in_copy = the uploads, kq_copy/kq_kib = the
+// attn_inp_kq_* part); sync = synchronize() waits with queued work (the device time not already waited in in_wait).
+// t0/t1 = unix ms of the window, so a reader attributes windows to request phases by time; a window never spans an idle
+// gap > 1.5 s of all contexts (g_kqvis_epoch), so a request's windows are closed by the next request's first graph.
+static std::atomic<int64_t>  g_kqvis_last_us{0}; // ggml_time_us() at the end of the last graph / sync, any context
+static std::atomic<uint64_t> g_kqvis_epoch{0};   // +1 at every idle gap > 1.5 s
+
+static int64_t kqvis_unix_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+void llama_context::kqvis_prof_flush(const char * reason) const {
+    const auto & w = kqvis_win;
+    if (w.graphs > 0) {
+        static const char * mode_name[4] = { "none", "mask", "vis", "both" };
+        const double g = (double) w.graphs;
+        LLAMA_LOG_WARN("kqvis-prof: ctx=%s mode=%s class=%s win=%" PRId64 " reason=%s graphs=%d reused=%d tok=%" PRId64
+                " nkv_min=%" PRId64 " nkv_max=%" PRId64 " nkv_avg=%.0f build_us=%" PRId64 " inputs_us=%" PRId64
+                " fill_us=%" PRId64 " fill_avg=%.1f in_wait_us=%" PRId64 " in_copy_us=%" PRId64 " kq_copy_us=%" PRId64
+                " kq_kib=%" PRId64 " compute_us=%" PRId64 " compute_avg=%.1f sync_us=%" PRId64 " sync_avg=%.1f n_sync=%" PRId64
+                " t0_ms=%" PRId64 " t1_ms=%" PRId64 "\n",
+                sched_prof_ctx_name(cparams.ctx_type), mode_name[w.mode & 3], w.cls == 1 ? "pp" : "dec", kqvis_n_win, reason,
+                w.graphs, w.reused, w.tokens, w.n_kv_min, w.n_kv_max, w.n_kv_sum/g, w.build_us, w.inputs_us,
+                w.fill_us, w.fill_us/g, w.in_wait_us, w.in_copy_us, w.kq_copy_us,
+                w.kq_bytes/1024, w.compute_us, w.compute_us/g, w.sync_us, w.sync_us/g, w.n_sync,
+                w.t0_ms, w.t1_ms);
+        kqvis_n_win++;
+    }
+    kqvis_win = kqvis_prof_window();
 }
 
 // [TAG_QSA_DUMP_IDS] (M4.2b item 5) LLAMA_QSA_DUMP_IDS=1 (default off): the QSA selection of every graph, as one
@@ -716,6 +756,10 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    if (llama_kqvis_prof_enabled()) {
+        kqvis_prof_flush("exit"); // [TAG_KQVIS_PROF]
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -993,7 +1037,18 @@ void llama_context::synchronize() {
         t_prof_us = ggml_time_us();
     }
 
+    // [TAG_KQVIS_PROF] the device wait for queued work, charged to the open window
+    const int64_t t_kqvis_us = (n_queued_tokens > 0 && llama_kqvis_prof_enabled()) ? ggml_time_us() : 0;
+
     ggml_backend_sched_synchronize(sched.get());
+
+    if (t_kqvis_us > 0) {
+        const int64_t t_now_us = ggml_time_us();
+        kqvis_win.sync_us += t_now_us - t_kqvis_us;
+        kqvis_win.n_sync++;
+        kqvis_win.t1_ms = kqvis_unix_ms();
+        g_kqvis_last_us.store(t_now_us);
+    }
 
     if (prof && n_queued_tokens > 0) {
         // the GPU wait for everything decode() enqueued since the previous synchronize (the async graph
@@ -1629,6 +1684,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         sched_prof.t_start_us = t_prof_us;
     }
 
+    // [TAG_KQVIS_PROF]
+    const bool kqprof = llama_kqvis_prof_enabled();
+    int64_t kq_t_start_us = 0;
+    int64_t kq_t_start_ms = 0;
+    bool    kq_reused     = false;
+    if (kqprof) {
+        kq_t_start_us = ggml_time_us();
+        kq_t_start_ms = kqvis_unix_ms();
+        const int64_t last_us = g_kqvis_last_us.load();
+        if (last_us > 0 && kq_t_start_us - last_us > 1500000) {
+            g_kqvis_epoch.fetch_add(1); // every context was idle > 1.5 s: close all open windows at their next graph
+        }
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1653,6 +1722,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        kq_reused = true;
 
         if (prof) {
             // reuse path: build = mctx->apply() + graph_params() + the can_reuse() check (+ the
@@ -1705,6 +1775,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    // [TAG_KQVIS_PROF]
+    int64_t kq_t_inputs_us = 0;
+    if (kqprof) {
+        llama_kqvis_prof_fill_tls() = llama_kqvis_prof_fill();
+        kq_t_inputs_us = ggml_time_us();
+    }
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1721,7 +1798,58 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         t_prof_us = t_now_us;
     }
 
+    int64_t kq_t_compute_us = 0;
+    if (kqprof) {
+        ggml_backend_sched_set_input_prof(sched.get(), true);
+        kq_t_compute_us = ggml_time_us();
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (kqprof) {
+        // [TAG_KQVIS_PROF] account this graph; first close the open window if the graph does not belong to it
+        const int64_t t_now_us = ggml_time_us();
+        const llama_kqvis_prof_fill fill = llama_kqvis_prof_fill_tls();
+        int64_t in_wait_us = 0, in_copy_us = 0, kq_copy_us = 0, kq_bytes = 0;
+        ggml_backend_sched_get_input_prof(sched.get(), &in_wait_us, &in_copy_us, &kq_copy_us, &kq_bytes);
+
+        const int32_t  cls   = ubatch.n_tokens >= 64 ? 1 : 0;
+        const int32_t  mode  = (fill.n_mask > 0 ? 1 : 0) | (fill.n_vis > 0 ? 2 : 0);
+        const uint64_t epoch = g_kqvis_epoch.load();
+        const int64_t  n_kv  = sched_prof_n_kv(mctx);
+
+        auto & w = kqvis_win;
+        if (w.graphs > 0) {
+            const char * reason = w.epoch != epoch ? "idle" : w.cls != cls ? "class" : w.mode != mode ? "mode" : w.graphs >= 64 ? "full" : nullptr;
+            if (reason) {
+                kqvis_prof_flush(reason);
+            }
+        }
+        if (w.graphs == 0) {
+            w.cls      = cls;
+            w.mode     = mode;
+            w.epoch    = epoch;
+            w.t0_ms    = kq_t_start_ms;
+            w.n_kv_min = n_kv;
+            w.n_kv_max = n_kv;
+        }
+        w.graphs++;
+        w.reused     += kq_reused ? 1 : 0;
+        w.tokens     += ubatch.n_tokens;
+        w.n_kv_min    = std::min(w.n_kv_min, n_kv);
+        w.n_kv_max    = std::max(w.n_kv_max, n_kv);
+        w.n_kv_sum   += n_kv;
+        w.build_us   += kq_t_inputs_us - kq_t_start_us;
+        w.inputs_us  += kq_t_compute_us - kq_t_inputs_us;
+        w.fill_us    += fill.us;
+        w.in_wait_us += in_wait_us;
+        w.in_copy_us += in_copy_us;
+        w.kq_copy_us += kq_copy_us;
+        w.kq_bytes   += kq_bytes;
+        w.compute_us += t_now_us - kq_t_compute_us;
+        w.t1_ms       = kqvis_unix_ms();
+        g_kqvis_last_us.store(t_now_us);
+    }
 
     // [TAG_QSA_POOLED_CACHE] the graph has been submitted in its build order (raw indexer write, then the
     // pooling of the dirty blocks into the store, then the selection that reads it): its pooled-key stamps

@@ -27,6 +27,20 @@ bool llama_kv_cells_fill_kq_vis(
         int32_t * cells_data, int32_t * toks_data, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch,
         const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream);
 
+// [TAG_KQVIS_PROF] LLAMA_KQ_VIS_PROF=1 (diagnostic probe, default off; read once): host time of the KQ mask fill
+// (llama_kv_cache::set_input_kq_mask) and of the visibility metadata fill (set_input_kq_vis), accumulated per thread
+// and taken by llama_context::process_ubatch after set_inputs. With the env unset each fill pays one branch.
+bool llama_kqvis_prof_enabled();
+
+struct llama_kqvis_prof_fill {
+    int64_t us     = 0; // host fill time
+    int32_t n_mask = 0; // set_input_kq_mask calls
+    int32_t n_vis  = 0; // set_input_kq_vis calls
+};
+
+// the calling thread's accumulator
+llama_kqvis_prof_fill & llama_kqvis_prof_fill_tls();
+
 //
 // llama_kv_cache
 //

@@ -412,4 +412,26 @@ private:
     } sched_prof;
 
     void sched_prof_print_ubatch(const char * ctx_name, uint32_t n_tokens, int64_t t_outputs_start_us) const;
+
+    // [TAG_KQVIS_PROF] LLAMA_KQ_VIS_PROF=1 (diagnostic probe): the open window of this context - at most 64 graphs of one
+    // class (dec: n_tokens < 64, pp: >= 64) and one fill mode, closed by the next graph that does not fit (full, other
+    // class/mode, or an idle gap > 1.5 s of every context since it started) and printed as one "kqvis-prof:" WARN line.
+    // Never touched when the env is off.
+    struct kqvis_prof_window {
+        int32_t  graphs = 0;
+        int32_t  reused = 0;
+        int32_t  cls    = -1; // 0 = dec, 1 = pp
+        int32_t  mode   = -1; // bit 0 = mask fill, bit 1 = metadata fill (0 = none)
+        uint64_t epoch  = 0;  // the global idle epoch at the first graph
+        int64_t  tokens = 0;
+        int64_t  n_kv_min = 0, n_kv_max = 0, n_kv_sum = 0;
+        int64_t  build_us = 0, inputs_us = 0, fill_us = 0;
+        int64_t  in_wait_us = 0, in_copy_us = 0, kq_copy_us = 0, kq_bytes = 0;
+        int64_t  compute_us = 0, sync_us = 0, n_sync = 0;
+        int64_t  t0_ms = 0, t1_ms = 0; // unix ms: start of the first graph, end of the last graph or sync
+    };
+    mutable kqvis_prof_window kqvis_win;
+    mutable int64_t           kqvis_n_win = 0;
+
+    void kqvis_prof_flush(const char * reason) const;
 };

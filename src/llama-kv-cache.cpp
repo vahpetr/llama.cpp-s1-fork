@@ -9,6 +9,7 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -1791,18 +1792,41 @@ void llama_kv_cells_fill_kq_mask(
     }
 }
 
+// [TAG_KQVIS_PROF]
+bool llama_kqvis_prof_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_KQ_VIS_PROF");
+        const bool on = env != nullptr && atoi(env) != 0;
+        if (on) {
+            // WARN: library INFO is dropped at the server default -lv 3
+            LLAMA_LOG_WARN("kqvis-prof: on (LLAMA_KQ_VIS_PROF=1): one 'kqvis-prof:' line per context window of <= 64 graphs "
+                    "(diagnostic probe, not for prod)\n");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+llama_kqvis_prof_fill & llama_kqvis_prof_fill_tls() {
+    static thread_local llama_kqvis_prof_fill acc;
+    return acc;
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
-    //const int64_t t_start = ggml_time_us();
+    const bool prof = llama_kqvis_prof_enabled();
+    const int64_t t_start = prof ? ggml_time_us() : 0;
 
     // dst: [n_kv, n_tps, 1, n_stream]; ne[3] = num streams in the current ubatch
     llama_kv_cells_fill_kq_mask(dst->data, dst->type, dst->ne[0], dst->ne[3], ubatch, causal_attn,
             hparams, n_swa, swa_type, v_cells, seq_to_stream);
 
-    //const int64_t t_end = ggml_time_us();
-
-    //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+    if (prof) {
+        auto & acc = llama_kqvis_prof_fill_tls();
+        acc.us += ggml_time_us() - t_start;
+        acc.n_mask++;
+    }
 }
 
 // [TAG_KQ_VIS] the metadata twin of llama_kv_cells_fill_kq_mask: the records GGML_OP_KQ_MASK turns
@@ -1880,8 +1904,19 @@ bool llama_kv_cache::set_input_kq_vis(ggml_tensor * cells_dst, ggml_tensor * tok
     GGML_ASSERT(cells_dst->ne[1] == 4 && toks_dst->ne[0] == 4 && cells_dst->ne[2] == toks_dst->ne[2]);
     GGML_ASSERT(toks_dst->ne[1]*toks_dst->ne[2] == (int64_t) ubatch->n_tokens);
 
-    return llama_kv_cells_fill_kq_vis((int32_t *) cells_dst->data, (int32_t *) toks_dst->data,
+    const bool prof = llama_kqvis_prof_enabled();
+    const int64_t t_start = prof ? ggml_time_us() : 0;
+
+    const bool ok = llama_kv_cells_fill_kq_vis((int32_t *) cells_dst->data, (int32_t *) toks_dst->data,
             cells_dst->ne[0], cells_dst->ne[2], ubatch, v_cells, seq_to_stream);
+
+    if (prof) {
+        auto & acc = llama_kqvis_prof_fill_tls();
+        acc.us += ggml_time_us() - t_start;
+        acc.n_vis++;
+    }
+
+    return ok;
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

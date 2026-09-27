@@ -160,6 +160,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
     llama_build_and_test(test-kq-mask-meta.cpp) # [TAG_KQ_VIS] uses internal llama_kv_cells / fill functions
+    llama_build(test-kq-vis-fill-bench.cpp)     # [TAG_KQVIS_PROF] CPU microbench of the KQ mask vs metadata fills (not a ctest)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)

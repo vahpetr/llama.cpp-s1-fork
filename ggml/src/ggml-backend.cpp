@@ -829,6 +829,13 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // [TAG_KQVIS_PROF] user-input upload timing of the last graph compute (ggml_backend_sched_set_input_prof)
+    bool    input_prof;
+    int64_t input_prof_wait_us;
+    int64_t input_prof_copy_us;
+    int64_t input_prof_kq_copy_us;
+    int64_t input_prof_kq_bytes;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1638,6 +1645,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     const bool prof = ggml_sched_prof_enabled();
 
+    // [TAG_KQVIS_PROF] off: one branch per user input
+    const bool iprof = sched->input_prof;
+    if (iprof) {
+        sched->input_prof_wait_us    = 0;
+        sched->input_prof_copy_us    = 0;
+        sched->input_prof_kq_copy_us = 0;
+        sched->input_prof_kq_bytes   = 0;
+    }
+
     int64_t prof_t_graph_us  = 0; // start of this graph
     int64_t prof_t_split_us  = 0; // start of the current split (before the previous-split wait + input copies)
     int64_t prof_copies_us   = 0; // sum over splits: wait for the previous split's backend + input copies
@@ -1673,13 +1689,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                const int64_t iprof_t0_us = iprof ? ggml_time_us() : 0;
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
+                const int64_t iprof_t1_us = iprof ? ggml_time_us() : 0;
                 ggml_backend_tensor_copy(input, input_cpy);
+                if (iprof) {
+                    const int64_t t_copy_us = ggml_time_us() - iprof_t1_us;
+                    sched->input_prof_wait_us += iprof_t1_us - iprof_t0_us;
+                    sched->input_prof_copy_us += t_copy_us;
+                    if (strncmp(input->name, "attn_inp_kq_", 12) == 0) {
+                        sched->input_prof_kq_copy_us += t_copy_us;
+                        sched->input_prof_kq_bytes   += (int64_t) ggml_nbytes(input);
+                    }
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2079,6 +2106,20 @@ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;
+}
+
+void ggml_backend_sched_set_input_prof(ggml_backend_sched_t sched, bool enable) {
+    GGML_ASSERT(sched);
+    sched->input_prof = enable;
+}
+
+void ggml_backend_sched_get_input_prof(ggml_backend_sched_t sched, int64_t * wait_us, int64_t * copy_us,
+                                       int64_t * kq_copy_us, int64_t * kq_bytes) {
+    GGML_ASSERT(sched);
+    *wait_us    = sched->input_prof_wait_us;
+    *copy_us    = sched->input_prof_copy_us;
+    *kq_copy_us = sched->input_prof_kq_copy_us;
+    *kq_bytes   = sched->input_prof_kq_bytes;
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {

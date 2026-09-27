@@ -330,6 +330,14 @@ extern "C" {
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
+    // [TAG_KQVIS_PROF] diagnostic (off by default): host timing of the user-input uploads of the last
+    // ggml_backend_sched_graph_compute(_async) - wait = the backend synchronize before each copy of a
+    // GGML_TENSOR_FLAG_INPUT tensor, copy = the copies themselves, kq_copy/kq_bytes = the part of copy spent on inputs
+    // named "attn_inp_kq_*" (KQ mask plane / visibility metadata). Reset at the start of every graph compute.
+    GGML_API void                 ggml_backend_sched_set_input_prof(ggml_backend_sched_t sched, bool enable);
+    GGML_API void                 ggml_backend_sched_get_input_prof(ggml_backend_sched_t sched, int64_t * wait_us, int64_t * copy_us,
+                                                                    int64_t * kq_copy_us, int64_t * kq_bytes);
+
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
