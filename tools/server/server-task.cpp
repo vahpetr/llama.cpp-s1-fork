@@ -1611,6 +1611,18 @@ std::string server_task_result_metrics::to_metrics() {
             "Common-prefix tokens re-processed because the state was restored at an earlier checkpoint",
             (double) metrics.n_prompt_replayed_tokens
         }, {
+            "prefill_chunked_steps_total",
+            "Priority chunking: steps whose prefill was capped at LLAMA_PREFILL_CHUNK_WITH_DECODE while a slot decoded",
+            (double) metrics.n_prefill_chunked_steps
+        }, {
+            "prefill_chunked_tokens_total",
+            "Priority chunking: prompt tokens decoded in capped steps (tokens per chunk = this / steps)",
+            (double) metrics.n_prefill_chunked_tokens
+        }, {
+            "prefill_chunk_deferred_token_steps_total",
+            "Priority chunking: token-steps the budget held back (per capped step, un-capped room minus tokens added; a waiting prompt counts once per step)",
+            (double) metrics.n_prefill_deferred_token_steps
+        }, {
             "admission_deferred_total",
             "GTT headroom admission: prompts that had to wait for headroom (one per deferral episode)",
             (double) metrics.admission_deferred_total
