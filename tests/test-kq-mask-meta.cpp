@@ -63,6 +63,7 @@ struct layout_desc {
     int     decode     = -1; // 1 = consecutive positions right after each seq's cells
     double  hole       = -1.0;
     const char * name  = "random";
+    bool   force_fa    = false; // run the device FA checks whatever the budget
 };
 
 struct stats_t {
@@ -435,7 +436,7 @@ ggml_backend_t g_dev = nullptr;
 
 struct dev_stats {
     uint64_t op_runs = 0, op_elems = 0, op_diff = 0, op_diff_zero_sign = 0, op_diff_non_alibi_layouts = 0;
-    uint64_t fa_runs = 0, fa_elems = 0, fa_diff = 0, fa_unsupported = 0;
+    uint64_t fa_runs = 0, fa_elems = 0, fa_diff = 0, fa_unsupported = 0, fa_bridge_diff = 0;
 };
 dev_stats g_ds;
 
@@ -490,8 +491,8 @@ std::vector<uint8_t> dev_run_op(const built_layout & L, const std::vector<int32_
 struct dev_fa {
     dev_graph g;
     ggml_tensor * q = nullptr, * k = nullptr, * v = nullptr, * m = nullptr, * tc = nullptr, * tt = nullptr;
-    ggml_tensor * o_plane = nullptr, * o_vis = nullptr;
-    ggml_cgraph * gf_plane = nullptr, * gf_vis = nullptr;
+    ggml_tensor * o_plane = nullptr, * o_vis = nullptr, * o_bridge = nullptr;
+    ggml_cgraph * gf_plane = nullptr, * gf_vis = nullptr, * gf_bridge = nullptr;
     bool supported = true;
 
     // kv_rows_fill: fill K/V with random rows in chunks (no full f32 copy of a 213k-cell cache)
@@ -511,8 +512,14 @@ struct dev_fa {
         ggml_flash_attn_ext_set_prec(o_plane, GGML_PREC_F32);
         o_vis = ggml_flash_attn_ext_vis(g.ctx, q, k, v, tc, tt, scale, fs.max_bias, fs.softcap, causal, alibi, swa_type, n_swa);
         ggml_flash_attn_ext_set_prec(o_vis, GGML_PREC_F32);
+        // the two-class bridge's plane class (LLAMA_KQ_VIS_MIN_TOKENS): GGML_OP_KQ_MASK on the device, then
+        // the unchanged plane FA
+        ggml_tensor * m_dev = ggml_kq_mask(g.ctx, tc, tt, GGML_TYPE_F16, causal, alibi, swa_type, n_swa);
+        o_bridge = ggml_flash_attn_ext(g.ctx, q, k, v, m_dev, scale, fs.max_bias, fs.softcap);
+        ggml_flash_attn_ext_set_prec(o_bridge, GGML_PREC_F32);
 
-        supported = ggml_backend_supports_op(g_dev, o_plane) && ggml_backend_supports_op(g_dev, o_vis);
+        supported = ggml_backend_supports_op(g_dev, o_plane) && ggml_backend_supports_op(g_dev, o_vis) &&
+                    ggml_backend_supports_op(g_dev, m_dev)   && ggml_backend_supports_op(g_dev, o_bridge);
         if (!supported) {
             return;
         }
@@ -545,11 +552,13 @@ struct dev_fa {
         ggml_build_forward_expand(gf_plane, o_plane);
         gf_vis = ggml_new_graph(g.ctx);
         ggml_build_forward_expand(gf_vis, o_vis);
+        gf_bridge = ggml_new_graph(g.ctx);
+        ggml_build_forward_expand(gf_bridge, o_bridge);
     }
 };
 
 void dev_check_layout(const built_layout & L, const std::vector<uint8_t> & ref, const std::vector<int32_t> & cells_rec,
-                      const std::vector<int32_t> & toks_rec, const llama_hparams & hp, std::mt19937_64 & rng, const char * name) {
+                      const std::vector<int32_t> & toks_rec, const llama_hparams & hp, std::mt19937_64 & rng, const char * name, bool force_fa) {
     // the op
     const std::vector<uint8_t> got = dev_run_op(L, cells_rec, toks_rec);
     if (!got.empty()) {
@@ -581,7 +590,7 @@ void dev_check_layout(const built_layout & L, const std::vector<uint8_t> & ref, 
     }
 
     // FA plane vs FA vis on the device
-    if (fa_budget > 0 && L.n_kv*L.n_tps*L.n_stream <= 4*fa_budget) {
+    if (force_fa || (fa_budget > 0 && L.n_kv*L.n_tps*L.n_stream <= 4*fa_budget)) {
         std::vector<uint8_t> plane((size_t) (L.n_kv*L.n_tps*L.n_stream)*2);
         llama_kv_cells_fill_kq_mask(plane.data(), GGML_TYPE_F16, L.n_kv, L.n_stream, &L.ub, L.causal,
                 hp, L.n_swa, (llama_swa_type) L.swa_type, L.v_cells, L.seq_to_stream);
@@ -598,10 +607,18 @@ void dev_check_layout(const built_layout & L, const std::vector<uint8_t> & ref, 
         }
         compute(g_dev, f.gf_plane);
         compute(g_dev, f.gf_vis);
-        const uint64_t nd = count_diff(tensor_bytes(f.o_plane), tensor_bytes(f.o_vis), true);
+        compute(g_dev, f.gf_bridge);
+        const std::vector<uint8_t> out_plane = tensor_bytes(f.o_plane);
+        const uint64_t nd  = count_diff(out_plane, tensor_bytes(f.o_vis), true);
+        const uint64_t ndb = count_diff(out_plane, tensor_bytes(f.o_bridge), true);
         g_ds.fa_runs++;
         g_ds.fa_elems += ggml_nelements(f.o_plane);
         g_ds.fa_diff  += nd;
+        g_ds.fa_bridge_diff += ndb;
+        if (ndb) {
+            fprintf(stderr, "DEVICE BRIDGE FA MISMATCH: %s: %" PRIu64 " outputs (n_kv %" PRId64 " n_tps %" PRId64 " n_stream %" PRId64 " kv %s alibi %d)\n",
+                    name, ndb, L.n_kv, L.n_tps, L.n_stream, ggml_type_name(fs.kv_type), L.alibi);
+        }
         if (nd) {
             fprintf(stderr, "DEVICE FA MISMATCH: %s: %" PRIu64 " outputs (n_kv %" PRId64 " n_tps %" PRId64 " n_stream %" PRId64 " kv %s causal %d swa %d alibi %d 2d %d)\n",
                     name, nd, L.n_kv, L.n_tps, L.n_stream, ggml_type_name(fs.kv_type), L.causal, L.swa_type, L.alibi, L.is_2d);
@@ -664,11 +681,18 @@ int run_perf(const std::vector<int64_t> & nkvs, ggml_type kv_type, int reps) {
         { "decode 1 (1 slot)",  1,    1, true  },
         { "decode 5 (5 slots)", 5,    5, false },
         { "verify 6 (1 slot)",  6,    5, true  },
+        // the LLAMA_KQ_VIS_MIN_TOKENS threshold region
+        { "ubatch 16",          16,   5, true  },
+        { "ubatch 32",          32,   5, true  },
+        { "ubatch 64",          64,   5, true  },
+        { "ubatch 128",         128,  5, true  },
+        { "ubatch 512",         512,  5, true  },
     };
     int bad = 0;
-    printf("perf: FA 24 q heads / 2 kv heads / D 256, K/V %s, median of %d interleaved runs (plane = FA + mask-opt over the f16 plane; vis = FA + metadata pass)\n",
+    printf("perf: FA 24 q heads / 2 kv heads / D 256, K/V %s, median of %d interleaved runs (plane = FA + mask-opt over the f16 plane;\n"
+           "      vis = FA + metadata pass; bridge = device GGML_OP_KQ_MASK plane + the plane FA, the LLAMA_KQ_VIS_MIN_TOKENS plane class)\n",
            ggml_type_name(kv_type), reps);
-    printf("  %-20s %8s %12s %12s %8s %10s\n", "shape", "n_kv", "plane ms", "vis ms", "delta", "diff bits");
+    printf("  %-20s %8s %12s %12s %8s %12s %8s %10s\n", "shape", "n_kv", "plane ms", "vis ms", "delta", "bridge ms", "delta", "diff bits");
     std::mt19937_64 rng(7);
     for (int64_t n_kv : nkvs) {
         for (const auto & sh : shapes) {
@@ -688,25 +712,30 @@ int run_perf(const std::vector<int64_t> & nkvs, ggml_type kv_type, int reps) {
                 continue;
             }
             // warm up (pipeline compiles, preallocations)
-            for (int w = 0; w < 2; ++w) { compute(g_dev, f.gf_plane); compute(g_dev, f.gf_vis); }
-            const uint64_t nd = count_diff(tensor_bytes(f.o_plane), tensor_bytes(f.o_vis), true);
-            std::vector<double> tp, tv;
+            for (int w = 0; w < 2; ++w) { compute(g_dev, f.gf_plane); compute(g_dev, f.gf_vis); compute(g_dev, f.gf_bridge); }
+            const std::vector<uint8_t> out_plane = tensor_bytes(f.o_plane);
+            const uint64_t nd = count_diff(out_plane, tensor_bytes(f.o_vis), true) + count_diff(out_plane, tensor_bytes(f.o_bridge), true);
+            std::vector<double> tp, tv, tb;
             for (int r = 0; r < reps; ++r) {
                 auto t0 = std::chrono::steady_clock::now();
                 compute(g_dev, f.gf_plane);
                 auto t1 = std::chrono::steady_clock::now();
                 compute(g_dev, f.gf_vis);
                 auto t2 = std::chrono::steady_clock::now();
+                compute(g_dev, f.gf_bridge);
+                auto t3 = std::chrono::steady_clock::now();
                 tp.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
                 tv.push_back(std::chrono::duration<double, std::milli>(t2 - t1).count());
+                tb.push_back(std::chrono::duration<double, std::milli>(t3 - t2).count());
             }
-            const double mp = median(tp), mv = median(tv);
-            printf("  %-20s %8" PRId64 " %12.3f %12.3f %+7.2f%% %10" PRIu64 "\n", sh.name, n_kv, mp, mv, 100.0*(mv - mp)/mp, nd);
+            const double mp = median(tp), mv = median(tv), mb = median(tb);
+            printf("  %-20s %8" PRId64 " %12.3f %12.3f %+7.2f%% %12.3f %+7.2f%% %10" PRIu64 "\n", sh.name, n_kv, mp, mv, 100.0*(mv - mp)/mp,
+                   mb, 100.0*(mb - mp)/mp, nd);
             fflush(stdout);
             bad += nd != 0;
         }
     }
-    printf("perf identity: %s\n", bad ? "FAIL (differing outputs above)" : "PASS (0 differing bits in every shape)");
+    printf("perf identity (vis and bridge vs plane): %s\n", bad ? "FAIL (differing outputs above)" : "PASS (0 differing bits in every shape)");
     return bad;
 }
 
@@ -734,7 +763,7 @@ uint64_t run_layout(const layout_desc & d, std::mt19937_64 & rng, stats_t & st, 
     const uint64_t nd = count_diff(ref, got, L.f32);
 
     if (g_dev) {
-        dev_check_layout(L, ref, cells_rec, toks_rec, hp, rng, d.name);
+        dev_check_layout(L, ref, cells_rec, toks_rec, hp, rng, d.name, d.force_fa);
     }
 
     st.layouts++;
@@ -916,6 +945,11 @@ int main(int argc, char ** argv) {
     { layout_desc d; d.name = "alibi f32";                            d.alibi = 1; d.f32 = 1; named.push_back(d); }
     { layout_desc d; d.name = "alibi f16 pos ~2^20";                  d.alibi = 1; d.f32 = 0; d.pos_base = (1 << 20) - 20000; named.push_back(d); }
     { layout_desc d; d.name = "non-causal";                           d.causal = 0; named.push_back(d); }
+    // the LLAMA_KQ_VIS_MIN_TOKENS (default 64) threshold +-1: both bridge classes on the device
+    for (int64_t n : { 63, 64, 65 }) {
+        { layout_desc d; d.name = "threshold +-1, 1 seq";  d.unified = 1; d.n_seq = 1; d.n_tps = n; d.n_kv = 2048; d.force_fa = true; named.push_back(d); }
+        { layout_desc d; d.name = "threshold +-1, 5 slots"; d.unified = 1; d.n_seq = 5; d.n_useq = 5; d.n_tps = n; d.n_kv = 2048; d.decode = 1; d.force_fa = true; named.push_back(d); }
+    }
 
     for (const auto & d : named) {
         run(d, true);
@@ -962,8 +996,10 @@ int main(int argc, char ** argv) {
                 ggml_backend_name(g_dev), g_ds.op_runs, g_ds.op_elems, g_ds.op_diff, g_ds.op_diff_zero_sign, g_ds.op_diff_non_alibi_layouts);
         printf("  DEVICE %s: FLASH_ATTN_EXT plane vs vis %" PRIu64 " layouts (D 256, 24/2 heads), %" PRIu64 " outputs, DIFFERING BITS: %" PRIu64 " (unsupported: %" PRIu64 ")\n",
                 ggml_backend_name(g_dev), g_ds.fa_runs, g_ds.fa_elems, g_ds.fa_diff, g_ds.fa_unsupported);
+        printf("  DEVICE %s: FLASH_ATTN_EXT plane vs bridge (device KQ_MASK plane + plane FA), same layouts, DIFFERING BITS: %" PRIu64 "\n",
+                ggml_backend_name(g_dev), g_ds.fa_bridge_diff);
     }
-    const bool dev_pass = !g_dev || (g_ds.op_diff == 0 && g_ds.fa_diff == 0 && g_ds.op_runs > 0 && g_ds.fa_runs > 0 && perf_bad == 0);
+    const bool dev_pass = !g_dev || (g_ds.op_diff == 0 && g_ds.fa_diff == 0 && g_ds.fa_bridge_diff == 0 && g_ds.op_runs > 0 && g_ds.fa_runs > 0 && perf_bad == 0);
     const bool pass = dev_pass && total_diff == 0 && failures == 0 && st.ctrl_detected == st.ctrl_runs && st.ctrl_runs > 0 &&
                       st.precond_rejected == st.precond_runs && st.fa_diff == 0 && !nd_fa_fail &&
                       (fa_budget == 0 || (st.fa_runs > 0 && st.fa_ctrl_detected == st.fa_ctrl_runs));

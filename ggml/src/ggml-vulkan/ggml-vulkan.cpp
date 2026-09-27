@@ -11535,6 +11535,17 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 }
 
+// [TAG_KQ_VIS] shared memory of the flash_attn_vis.glsl staging arrays: 2 buffers x Bc cell records
+// (4 x int), Br token records (ivec4) + row slots (uint), VIS_SLOTS slot tokens (ivec4) and
+// 2 x VIS_SLOTS x Bc values (float); each array is one element when the pipeline is not a metadata one
+static uint32_t ggml_vk_fa_vis_shmem(uint32_t Br, uint32_t Bc, bool vis) {
+    const uint32_t slots = Br >= 16 ? Br / 16 : 1;
+    if (!vis) {
+        return 4 * 4 + 16 + 4 + 16 + 4;
+    }
+    return 2 * Bc * 4 * 4 + Br * (16 + 4) + slots * 16 + 2 * slots * Bc * 4;
+}
+
 static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type, bool vis) {
     GGML_UNUSED(f32acc);
     // Needs to be kept up to date on shader changes
@@ -11578,9 +11589,8 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
         kblocksh_size = 0;
     }
 
-    // [TAG_KQ_VIS] flash_attn_vis.glsl staging: 4 x int[Bc] cell records + ivec4[Br] token records,
-    // one element each when the pipeline is not a metadata one
-    const uint32_t vis_sh = vis ? (Bc * 4 * 4 + Br * 16) : 5 * 16;
+    // [TAG_KQ_VIS] flash_attn_vis.glsl staging (one element per array when not a metadata pipeline)
+    const uint32_t vis_sh = ggml_vk_fa_vis_shmem(Br, Bc, vis);
 
     const uint32_t total_size = tmpsh + tmpshv4 + masksh + iq_shmem + Qf + kvsh + kblocksh_size + vis_sh;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
@@ -11641,8 +11651,8 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t dead_words = (Bc + 31) / 32;
     const uint32_t dead = (row_split + row_tiles) * dead_words * (uint32_t) sizeof(uint32_t);
 
-    // [TAG_KQ_VIS] flash_attn_vis.glsl staging, as in the scalar check
-    const uint32_t vis_sh = vis ? (Bc * 4 * 4 + Br * 16) : 5 * 16;
+    // [TAG_KQ_VIS] flash_attn_vis.glsl staging
+    const uint32_t vis_sh = ggml_vk_fa_vis_shmem(Br, Bc, vis);
 
     const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + dead + vis_sh;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
@@ -11720,7 +11730,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         const uint32_t swa_type = (uint32_t) ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 3) & 3u;
         vis_n_swa     = swa_type ? ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 4) : 0;
         vis_flags     = 512u | (causal << 10) | (alibi << 11) | (swa_type << 12);
-        vis_kqv_flags = causal | (alibi << 1) | (swa_type << 2);
+        vis_kqv_flags = causal | (alibi << 1) | (swa_type << 2) | 16u; // 16: f16 plane values (KQV_FLAG_F16)
         GGML_ASSERT(vis_cells->ne[0] == k->ne[1]);
     }
 
@@ -15379,7 +15389,7 @@ static void ggml_vk_kq_mask(ggml_backend_vk_context * ctx, vk_context& subctx, g
 
     const vk_op_kq_mask_push_constants pc = {
         n_kv, n_tps, n_stream,
-        causal | (alibi << 1) | (swa_type << 2),
+        causal | (alibi << 1) | (swa_type << 2) | (dst->type == GGML_TYPE_F16 ? 16u : 0u), // 16: KQV_FLAG_F16
         swa_type ? ggml_get_op_params_i32(dst, 3) : 0,
     };
 

@@ -10856,6 +10856,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_kq_mask(65536, 6, 1, GGML_TYPE_F16));
     test_cases.emplace_back(new test_kq_mask(70000, 2, 1, GGML_TYPE_F16, true, true)); // ALiBi overflow to -inf
+    // ALiBi distances > 2048: f16 rounds -|d| to 11 significant bits, f32 keeps it exact
+    test_cases.emplace_back(new test_kq_mask(8192, 16, 1, GGML_TYPE_F32, true,  true));
+    test_cases.emplace_back(new test_kq_mask(8192, 16, 1, GGML_TYPE_F16, true,  true));
+    test_cases.emplace_back(new test_kq_mask(8192, 16, 1, GGML_TYPE_F32, false, true, 1, 5000, true));
 
     // [TAG_KQ_VIS] FLASH_ATTN_EXT over the metadata: the model's shape (24 heads over 2 KV heads, head dim 256;
     // target q8_0 K/V, MTP draft f16), decode 1/5/6 rows (GQA fold, split_k), verify, prefill (mask-opt pass)

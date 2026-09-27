@@ -26,6 +26,36 @@
 
 // dedup helpers
 
+// [TAG_KQ_VIS] visibility from metadata - the only place its knobs are read (once per process):
+//   LLAMA_KQ_VIS=1 (default 0): the plain KV attention input (llm_graph_input_attn_kv) takes its mask
+//     from 16 B/cell + 16 B/token of metadata instead of a host-filled [n_kv, n_tps] plane. Same values
+//     bit for bit (tests/test-kq-mask-meta.cpp); needs n_seq_max <= 32 (the seq bitmask width).
+//   LLAMA_KQ_VIS_MIN_TOKENS (default 64): the two-class bridge (spec 2.4b). A ubatch with fewer tokens
+//     builds the device plane with GGML_OP_KQ_MASK from the metadata and runs the unchanged plane FA
+//     (decode keeps the plane FA's speed); a ubatch with at least that many runs FA over the metadata
+//     (ggml_flash_attn_ext_vis, no plane at all). 0 = always metadata FA; a huge value = always the plane.
+static bool llama_kq_vis_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_KQ_VIS");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static uint32_t llama_kq_vis_min_tokens() {
+    static const uint32_t n = [] {
+        const char * env = getenv("LLAMA_KQ_VIS_MIN_TOKENS");
+        return env != nullptr ? (uint32_t) strtoul(env, nullptr, 10) : 64u;
+    }();
+    return n;
+}
+
+// [TAG_KQ_VIS] the class of a ubatch: true = FA over the metadata, false = the KQ_MASK plane
+static bool llama_kq_vis_fa_class(const llama_ubatch & ubatch, const llama_cparams & cparams) {
+    return cparams.flash_attn && ubatch.n_tokens >= llama_kq_vis_min_tokens();
+}
+
+
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
@@ -503,6 +533,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    if (self_kq_vis_cells) {
+        // [TAG_KQ_VIS] the bridge class is part of the graph
+        res &= kq_vis_fa == llama_kq_vis_fa_class(params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -2567,7 +2602,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * kq_vis_cells,
+         ggml_tensor * kq_vis_toks) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2598,8 +2635,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        if (kq_vis_cells) {
+            // [TAG_KQ_VIS] the mask computed inside FA from the metadata; bit-identical to kq_mask
+            cur = ggml_flash_attn_ext_vis(ctx0, q, k, v, kq_vis_cells, kq_vis_toks, kq_scale, hparams.f_max_alibi_bias,
+                                          hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f,
+                                          cparams.causal_attn, hparams.use_alibi, (int32_t) LLAMA_SWA_TYPE_NONE, 0);
+        } else {
+            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -2770,18 +2814,6 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
-// [TAG_KQ_VIS] LLAMA_KQ_VIS=1 (default 0, read once per process, here only): the plain KV attention
-// input (llm_graph_input_attn_kv) builds its mask as a GGML_OP_KQ_MASK node over 16 B/cell +
-// 16 B/token of metadata instead of a host-filled [n_kv, n_tps] plane. Same values bit for bit
-// (tests/test-kq-mask-meta.cpp); needs n_seq_max <= 32 (the seq bitmask width).
-static bool llama_kq_mask_meta_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("LLAMA_KQ_VIS");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    return enabled;
-}
-
 static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
@@ -2797,7 +2829,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        if (llama_kq_mask_meta_enabled() && cparams.n_seq_max <= 32) {
+        if (llama_kq_vis_enabled() && cparams.n_seq_max <= 32) {
             const int64_t n_kv     = mctx_cur->get_n_kv();
             const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
             const int64_t n_tps    = ubatch.n_tokens/n_stream;
@@ -2808,6 +2840,11 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
             ggml_set_input(inp->self_kq_vis_toks);
             ggml_set_name(inp->self_kq_vis_cells, "attn_inp_kq_vis_cells");
             ggml_set_name(inp->self_kq_vis_toks,  "attn_inp_kq_vis_toks");
+
+            // [TAG_KQ_VIS] two-class bridge: at >= LLAMA_KQ_VIS_MIN_TOKENS tokens build_attn runs FA over
+            // the metadata; below, the KQ_MASK node below is the (device) plane the unchanged FA reads.
+            // The node is built either way for mask consumers other than FA; unused, it is not computed.
+            inp->kq_vis_fa = llama_kq_vis_fa_class(ubatch, cparams);
 
             inp->self_kq_mask = ggml_kq_mask(ctx0, inp->self_kq_vis_cells, inp->self_kq_vis_toks,
                     cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, cparams.causal_attn, hparams.use_alibi,
@@ -2881,7 +2918,10 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    // [TAG_KQ_VIS] the two-class bridge's metadata class: FA reads the metadata, no plane
+    ggml_tensor * cur = inp->kq_vis_fa
+        ? build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->self_kq_vis_cells, inp->self_kq_vis_toks)
+        : build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

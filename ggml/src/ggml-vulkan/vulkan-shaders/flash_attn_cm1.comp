@@ -158,7 +158,8 @@ void stage_v_columns(const uint32_t j, const uint32_t hsv_tile, const uint32_t v
     }
 
 // [TAG_KQ_VIS] a mask element: the plane's, or the same f16 value computed from the metadata
-#define FA_MASK_LOAD(R, COL) (VIS ? float16_t(fa_vis_value_sh((R) - i * Br, (COL) - j * Bc)) : data_m[m_offset + fa_mask_row(R) * m_stride + (COL)])
+// (the tile staged in buffer j & 1, see flash_attn_vis.glsl)
+#define FA_MASK_LOAD(R, COL) (VIS ? float16_t(fa_vis_value_b(j & 1u, (R) - i * Br, (COL) - j * Bc)) : data_m[m_offset + fa_mask_row(R) * m_stride + (COL)])
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
@@ -270,11 +271,37 @@ void main() {
     const uint32_t n_valid = min(Br, N - i * Br);
 #define fa_row_live(row) (GQA_TOKENS ? (i * Br + (row) < N && !FA_ROW_PAD(i * Br + (row))) : ((row) < n_valid))
 
+    // [TAG_KQ_VIS] the first tile's visibility, staged before the loop; every later tile is staged one
+    // iteration ahead (below), ordered by the barriers the previous iteration already has
+    if (VIS) {
+        if (start_j < end_j) {
+            fa_vis_stage(start_j, start_j & 1u);
+        }
+        barrier();
+    }
+
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
 
         [[unroll]] for (uint32_t idx = 0; idx < mask_cache.length(); ++idx) {
             mask_cache[idx] = f16vec4(0);
+        }
+
+        // [TAG_KQ_VIS] stage tile j + 1 into the other buffer, if the plane path will load its mask
+        // (not a mask-opt ALL_NEG_INF / ALL_ZERO tile). Buffer (j + 1) & 1 was last read by iteration
+        // j - 1's mask loads, which the all -inf test's barrier of that iteration follows; these writes
+        // are read by iteration j + 1's mask loads after this iteration's barriers (the sfsh store
+        // barrier, or the one before the ALL_NEG_INF "continue" below).
+        if (VIS && j + 1 < end_j) {
+            const uint jn = j + 1;
+            bool need = true;
+            if (USE_MASK_OPT) {
+                const uint nbits = (data_mask_opt[mo_offset + jn / 16] >> ((jn % 16) * 2)) & 0x3;
+                need = nbits != MASK_OPT_ALL_NEG_INF && nbits != MASK_OPT_ALL_ZERO;
+            }
+            if (need) {
+                fa_vis_stage(jn, jn & 1u);
+            }
         }
 
         if (MASK_ENABLE) {
@@ -285,15 +312,14 @@ void main() {
             mask_opt_bits = (mask_opt >> ((j % 16) * 2)) & 0x3;
             if (mask_opt_bits == MASK_OPT_ALL_NEG_INF) {
                 // skip this block
+                if (VIS) {
+                    barrier(); // [TAG_KQ_VIS] orders the staging of tile j + 1 above before its reads
+                }
                 continue;
             }
             // Only load if the block is not all zeros
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
                 bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
-
-                if (VIS) {
-                    fa_vis_stage_tile(j);
-                }
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
                 [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {

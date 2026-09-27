@@ -348,6 +348,7 @@ public:
     // instead of a host-filled input plane
     ggml_tensor * self_kq_vis_cells = nullptr; // I32 [n_kv, 4, n_stream]
     ggml_tensor * self_kq_vis_toks  = nullptr; // I32 [4, n_batch/n_stream, n_stream]
+    bool          kq_vis_fa         = false;   // two-class bridge: FA reads the metadata (else the KQ_MASK plane)
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -1179,7 +1180,10 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            // [TAG_KQ_VIS] with flash attention: the visibility metadata replaces kq_mask
+            ggml_tensor * kq_vis_cells = nullptr,  // I32 [n_kv, 4, n_stream]
+            ggml_tensor * kq_vis_toks  = nullptr) const; // I32 [4, n_tokens/n_stream, n_stream]
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

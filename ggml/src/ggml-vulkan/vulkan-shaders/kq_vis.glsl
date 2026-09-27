@@ -8,7 +8,8 @@
 // cells: per stream s, base = s * 4 * n_kv: pos at base + j, seq bitmask at base + n_kv + j,
 //        ext.x at base + 2 n_kv + j, ext.y at base + 3 n_kv + j
 // token: ivec4 {pos, 1 << seq, x, y} (x = y = INT32_MAX without 2-D positions)
-// flags: bit 0 causal, bit 1 alibi, bits 2..3 swa type (0 none, 1 standard, 2 chunked, 3 symmetric)
+// flags: bit 0 causal, bit 1 alibi, bits 2..3 swa type (0 none, 1 standard, 2 chunked, 3 symmetric),
+//        bit 4 f16 (the ALiBi value is rounded to f16 precision; see KQV_FLAG_F16)
 //
 // Every value returned is exactly representable in f16 (+0, -inf, or -n with n rounded to f16
 // precision), so converting it to float16_t is exact under any rounding mode: the result is the
@@ -16,16 +17,19 @@
 
 #define KQV_FLAG_CAUSAL 1u
 #define KQV_FLAG_ALIBI  2u
+// the value is an element of an f16 plane (FA, the classification, an F16 KQ_MASK): round the ALiBi
+// -|d| to f16 precision; without it (an F32 KQ_MASK) -|d| stays the exact f32 the reference writes
+#define KQV_FLAG_F16    16u
 
 float kqv_neg_inf() {
     return uintBitsToFloat(0xFF800000u);
 }
 
-// -|d| as ggml_fp32_to_fp16(float(-|d|)) produces it (round to nearest even at 11 significant bits,
-// overflow to -inf), returned as f32
-float kqv_alibi_value(const int d) {
+// -|d| as the reference produces it: with f16, ggml_fp32_to_fp16(float(-|d|)) (round to nearest even
+// at 11 significant bits, overflow to -inf), returned as f32; without, float(-|d|) itself
+float kqv_alibi_value(const int d, const bool f16) {
     uint n = uint(abs(d));
-    if (n > 2048u) {
+    if (f16 && n > 2048u) {
         const uint sh   = uint(findMSB(n)) - 10u;
         uint       q    = n >> sh;
         const uint rem  = n & ((1u << sh) - 1u);
@@ -79,7 +83,7 @@ float kqv_value_of(const int p0, const uint sm, const int x0, const int y0, cons
         return kqv_neg_inf();
     }
     if ((flags & KQV_FLAG_ALIBI) != 0u) {
-        return kqv_alibi_value(p0 - p1);
+        return kqv_alibi_value(p0 - p1, (flags & KQV_FLAG_F16) != 0u);
     }
     return 0.0;
 }
