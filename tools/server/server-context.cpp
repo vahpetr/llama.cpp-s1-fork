@@ -4569,6 +4569,10 @@ private:
 
         // [TAG_PRIO_CHUNK] one line per engaged step (a capped prompt was added or held back)
         if (prio_on && (prio_n_charged > 0 || prio_n_deferred > 0)) {
+            metrics.n_prefill_chunked_steps   += 1;
+            metrics.n_prefill_chunked_tokens  += prio_n_charged;
+            metrics.n_prefill_deferred_tokens += prio_n_deferred;
+
             SRV_INF("prio-chunk: n_gen_slots=%d n_gen_tokens=%d n_prompt_tokens=%d budget=%d slots=[%s]\n",
                     (int) generating.size(), n_gen_tokens, prio_n_charged, prio_chunk_c, prio_slots_str.c_str());
         }

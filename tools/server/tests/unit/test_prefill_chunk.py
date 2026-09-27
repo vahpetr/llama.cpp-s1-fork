@@ -124,6 +124,14 @@ def test_chunked_while_decoding():
     n_prompt_1 = body1["timings"]["prompt_n"]
     assert n_prompt_1 > 4 * C_EFF
 
+    # task 4: counters of the co-scheduled phase
+    steps_1    = metric(server, "prefill_chunked_steps_total")
+    tokens_1   = metric(server, "prefill_chunked_tokens_total")
+    deferred_1 = metric(server, "prefill_chunk_deferred_tokens_total")
+    assert steps_1 >= -(-n_prompt_1 // C_EFF)
+    assert tokens_1 == n_prompt_1
+    assert deferred_1 > 0
+
     # slot 0 is done: a new prompt on slot 1 runs in full n_batch steps again
     dec0 = metric(server, "n_decode_total")
     res = server.make_request("POST", "/completion", data={
@@ -134,11 +142,13 @@ def test_chunked_while_decoding():
     n_steps_2 = metric(server, "n_decode_total") - dec0
     assert n_steps_2 <= -(-n_prompt_2 // N_BATCH) + 1     # un-chunked: ceil(n / n_batch) prompt decodes
     assert n_prompt_2 / n_steps_2 > C_EFF                 # i.e. its steps are > C
+    assert metric(server, "prefill_chunked_steps_total") == steps_1
 
     log = full_log(server)
     assert f"LLAMA_PREFILL_CHUNK_WITH_DECODE = {C_EFF} (requested {C_REQ}, n_batch = {N_BATCH}, on)" in log
     lines = prio_lines(log)
     assert len(lines) >= 1
+    assert len(lines) == steps_1
     for n_gen_slots, n_gen_tokens, n_prompt, budget, slots in lines:
         assert n_gen_slots >= 1 and n_gen_tokens >= 1
         assert budget == C_EFF

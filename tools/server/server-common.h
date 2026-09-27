@@ -482,6 +482,12 @@ struct server_metrics {
     uint64_t n_prompt_restores        = 0;
     uint64_t n_prompt_replayed_tokens = 0;
 
+    // [TAG_PRIO_CHUNK] (E11) steps whose prefill was capped while a slot decoded, the prompt tokens they carried,
+    //   and the prompt tokens the cap held back (what the un-capped fill could have added in those steps)
+    uint64_t n_prefill_chunked_steps     = 0;
+    uint64_t n_prefill_chunked_tokens    = 0;
+    uint64_t n_prefill_deferred_tokens   = 0;
+
     uint64_t n_tokens_max = 0;
 
     uint64_t n_decode     = 0;
