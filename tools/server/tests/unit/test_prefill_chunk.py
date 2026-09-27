@@ -18,6 +18,7 @@ N_BATCH = 256
 C_REQ = 32      # requested; values in (0, 64) are raised to 64
 C_EFF = 64
 
+SPLIT_RE = re.compile(r"prio-chunk: split decode view \[0, (\d+)\) \+ prompt view \[(\d+), (\d+)\)")
 PRIO_RE = re.compile(r"prio-chunk: n_gen_slots=(\d+) n_gen_tokens=(\d+) n_prompt_tokens=(\d+) budget=(\d+) slots=\[([^\]]*)\]")
 
 
@@ -116,6 +117,7 @@ def prio_lines(log: str) -> list[tuple[int, int, int, int, str]]:
 def test_chunked_while_decoding():
     global server
     server = make_server({"LLAMA_PREFILL_CHUNK_WITH_DECODE": str(C_REQ)})
+    server.debug = True     # the split-view line is DBG
     server.start()
 
     _, body1 = co_schedule(server, PROMPT_1)
@@ -144,6 +146,14 @@ def test_chunked_while_decoding():
         assert slots.startswith("1:")
     # every prompt token of slot 1 went through a budgeted step
     assert sum(l[2] for l in lines) == n_prompt_1
+
+    # task 2: every budgeted step is decoded as two calls - the generating tokens first, then the prompt chunk
+    splits = [(int(a), int(b), int(c)) for a, b, c in SPLIT_RE.findall(log)]
+    assert len(splits) == len(lines)
+    for (n_gen_view, off2, n_total), (_, n_gen_tokens, n_prompt, _, _) in zip(splits, lines):
+        assert n_gen_view == n_gen_tokens == off2
+        assert n_total == n_gen_tokens + n_prompt
+        assert f"n_batch (effective) = {N_BATCH}, off = {off2}" in log
 
 
 # (b) single slot: the budget never engages, the output is identical to the knob unset

@@ -206,6 +206,10 @@ struct server_batch {
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
 
+    // [TAG_PRIO_CHUNK] > 0: the first n_gen tokens are the generating slots' tokens and the prefill budget was
+    //   engaged - update_slots() decodes them in views of their own before the prompt chunk
+    int32_t n_gen = 0;
+
     server_batch() {
         batch.pos = nullptr; // sentinel: uninitialized batch
     }
@@ -253,6 +257,7 @@ struct server_batch {
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
+        n_gen             = 0;
         batch_rendered    = false;
         has_embd          = false;
         if (batch.token == nullptr) {
@@ -3582,7 +3587,13 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            // [TAG_PRIO_CHUNK] with the prefill budget engaged, cut the views at the decode/prompt boundary: the
+            //   generating slots are decoded, synced and sampled (post_decode) before the prompt chunk is submitted
+            const int32_t n_end    = (batch.n_gen > 0 && off < batch.n_gen) ? batch.n_gen : batch.size();
+            const int32_t n_tokens = std::min(n_batch, n_end - off);
+            if (batch.n_gen > 0 && off == 0) {
+                SRV_DBG("prio-chunk: split decode view [0, %d) + prompt view [%d, %d)\n", batch.n_gen, batch.n_gen, batch.size());
+            }
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -4534,6 +4545,12 @@ private:
                     slot_batched = &slot;
                 }
             });
+        }
+
+        // [TAG_PRIO_CHUNK] split the decode at the decode/prompt boundary only when a budgeted chunk follows the
+        //   generating tokens (exempt prefills keep today's single-call shape)
+        if (prio_on && prio_n_charged > 0 && n_gen_tokens > 0 && n_gen_tokens < batch.size()) {
+            batch.n_gen = n_gen_tokens;
         }
 
         // [TAG_PRIO_CHUNK] one line per engaged step (a capped prompt was added or held back)
