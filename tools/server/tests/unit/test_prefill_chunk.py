@@ -298,5 +298,6 @@ def test_chunked_while_drafting():
     assert gen_c["timings"]["draft_n"] > 0
     assert gen_c["timings"]["draft_n_accepted"] > 0
     assert cnt_c["verify"] > 0
+    assert {k: cnt_c[k] for k in ("verify", "replay", "plain")} == {k: cnt_u[k] for k in ("verify", "replay", "plain")}
     assert gen_c["tokens"] == gen_u["tokens"]
     assert body_c["tokens"] == body_u["tokens"]
