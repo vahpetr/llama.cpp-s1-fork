@@ -47,8 +47,9 @@ static bool llama_kq_vis_enabled() {
         const char * env = getenv("LLAMA_KQ_VIS");
         const bool on = env != nullptr && atoi(env) != 0;
         if (on) {
-            // the proof line for the arm: printed once, at the first graph build (the load-time reserve)
-            LLAMA_LOG_INFO("kq_vis: on (LLAMA_KQ_VIS=1), min_tokens %u (LLAMA_KQ_VIS_MIN_TOKENS): ubatches with >= %u tokens run "
+            // the proof line for the arm: printed once, at the first graph build (the load-time reserve); WARN, not INFO:
+            // common_log_default_callback maps library INFO to LOG_LEVEL_TRACE (4), dropped at the server default -lv 3
+            LLAMA_LOG_WARN("kq_vis: on (LLAMA_KQ_VIS=1), min_tokens %u (LLAMA_KQ_VIS_MIN_TOKENS): ubatches with >= %u tokens run "
                     "FA over the cell/token metadata (no mask plane), smaller ones the device KQ_MASK plane; no host mask plane\n",
                     llama_kq_vis_min_tokens(), llama_kq_vis_min_tokens());
         }
