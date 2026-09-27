@@ -904,7 +904,13 @@ void llama_context::sched_reserve() {
     // [TAG_RESERVE_RUNTIME_SHAPE] the single-sequence prefill ubatch (see llama_reserve_runtime_shape). Allocating
     // path: ggml-alloc only grows a single-chunk buffer, so the buffer ends at the max of both shapes. Estimate path
     // (no_alloc): take the max of the two size estimates explicitly.
-    if (llama_reserve_runtime_shape() && n_seqs > 1) {
+    // Unified KV only: with --no-kv-unified the full-memory context spans n_seq_max KV streams, and build_attn splits
+    // the queries into k->ne[3] streams (llm_graph_context::build_attn_mha), so a single-sequence ubatch of n_tokens
+    // (not a multiple of n_stream) yields an attention output with n_stream*floor(n_tokens/n_stream) rows while the
+    // other operands keep n_tokens - GGML_ASSERT(ggml_can_repeat) in the first residual/gate op (Qwen3.8-27B, -ub 512,
+    // --parallel 5 --no-kv-unified). There a run-time single-sequence ubatch also sees one stream, not the n_seq_max
+    // the full-memory context holds, so this reserve would not match the run-time graph anyway.
+    if (llama_reserve_runtime_shape() && n_seqs > 1 && cparams.kv_unified) {
         std::vector<size_t> sizes_rt(backend_buf_exp_size.size(), 0);
 
         auto * gf = graph_reserve(n_tokens, 1, n_outputs_pp, mctx.get(),
