@@ -1873,26 +1873,10 @@ bool llama_kv_cells_fill_kq_vis(
         const auto & cells = v_cells.at(stream);
         GGML_ASSERT((int64_t) cells.size() >= n_kv);
 
-        // one plane per field: pos, seqmask, x, y
+        // one plane per field: pos, seqmask, x, y ([TAG_KQ_VIS_FILL] one branch-free pass over the cells; the seq
+        // mask is the cells' low-32 word, not 32 seq_has tests - the same bytes as the per-cell loop it replaced)
         int32_t * c_pos = cells_data + 4*s*n_kv;
-        int32_t * c_seq = c_pos + n_kv;
-        int32_t * c_x   = c_pos + 2*n_kv;
-        int32_t * c_y   = c_pos + 3*n_kv;
-        for (int64_t j = 0; j < n_kv; ++j) {
-            if (cells.is_empty(j)) {
-                c_pos[j] = -1; c_seq[j] = 0; c_x[j] = 0; c_y[j] = 0;
-                continue;
-            }
-            uint32_t seqmask = 0;
-            for (llama_seq_id k = 0; k < 32; ++k) {
-                seqmask |= cells.seq_has(j, k) ? (1u << k) : 0u;
-            }
-            const auto & ext = cells.ext_get(j);
-            c_pos[j] = cells.pos_get(j);
-            c_seq[j] = (int32_t) seqmask;
-            c_x[j]   = ext.x;
-            c_y[j]   = ext.y;
-        }
+        cells.get_vis((uint32_t) n_kv, c_pos, c_pos + n_kv, c_pos + 2*n_kv, c_pos + 3*n_kv);
     }
 
     return true;

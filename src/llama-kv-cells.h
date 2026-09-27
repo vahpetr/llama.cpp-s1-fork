@@ -146,6 +146,7 @@ public:
             ext[i].reset();
             shift[i] =  0;
             seq[i].reset();
+            seq_lo[i] = 0;
         }
 
         has_shift = false;
@@ -174,6 +175,7 @@ public:
         ext.resize(n);
         shift.resize(n);
         seq.resize(n);
+        seq_lo.resize(n);
         used.resize(n);
 
         reset();
@@ -240,6 +242,7 @@ public:
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
+            res.seq_lo[j] = seq_lo[idx];
 
             assert(shift[idx] == 0);
         }
@@ -259,6 +262,7 @@ public:
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
+            res.seq_lo[j] = seq_lo[idx];
 
             assert(shift[idx] == 0);
         }
@@ -288,6 +292,7 @@ public:
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            seq_lo[idx] = other.seq_lo[j];
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
@@ -319,6 +324,7 @@ public:
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            seq_lo[idx] = other.seq_lo[j];
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
@@ -335,6 +341,7 @@ public:
 
         seq_pos_rm(i);
         seq[i].reset();
+        seq_lo[i] = 0;
 
         pos[i] = -1;
         ext[i].reset();
@@ -352,6 +359,7 @@ public:
         assert(seq_id >= 0);
 
         seq[i].reset(seq_id);
+        seq_lo[i] &= ~seq_lo_bit(seq_id);
         seq_pos_dec(seq_id, pos[i]);
 
         if (seq[i].none()) {
@@ -376,6 +384,7 @@ public:
             seq[i].reset();
 
             seq[i].set(seq_id);
+            seq_lo[i] = seq_lo_bit(seq_id);
             seq_pos_inc(seq_id, pos[i]);
 
             return false;
@@ -384,6 +393,7 @@ public:
         if (seq[i].any()) {
             seq_pos_rm(i);
             seq[i].reset();
+            seq_lo[i] = 0;
 
             pos[i] = -1;
             ext[i].reset();
@@ -422,6 +432,35 @@ public:
         return seq[i].test(seq_id);
     }
 
+    // [TAG_KQ_VIS_FILL] sequence ids 0..31 of cell i as a bit mask (bit s = seq_has(i, s)), O(1)
+    uint32_t seq_mask32(uint32_t i) const {
+        assert(i < pos.size());
+
+        return seq_lo[i];
+    }
+
+    // [TAG_KQ_VIS_FILL] the visibility metadata of cells [0, n) as four planes (llama_kv_cells_fill_kq_vis):
+    // c_pos = pos (-1 = empty), c_seq = seq_mask32, c_x / c_y = ext.x / ext.y; an empty cell gives {-1, 0, 0, 0}.
+    // One pass, no branch per cell (the empty test is a select mask), no bitset access.
+    void get_vis(uint32_t n, int32_t * __restrict c_pos, int32_t * __restrict c_seq,
+                             int32_t * __restrict c_x,   int32_t * __restrict c_y) const {
+        assert(n <= pos.size());
+
+        const llama_pos         * __restrict p  = pos.data();
+        const uint32_t          * __restrict sl = seq_lo.data();
+        const llama_kv_cell_ext * __restrict e  = ext.data();
+
+        for (uint32_t j = 0; j < n; ++j) {
+            const llama_pos pj   = p[j];
+            const uint32_t  keep = pj == -1 ? 0u : ~0u;
+
+            c_pos[j] = pj;
+            c_seq[j] = (int32_t) (sl[j] & keep);
+            c_x[j]   = (int32_t) ((uint32_t) e[j].x & keep);
+            c_y[j]   = (int32_t) ((uint32_t) e[j].y & keep);
+        }
+    }
+
     // gather the token ids of the cells in `seqs` with position in [p0, p1)
     // the callback receives (seq_id, pos, token) for every such (cell, seq) pair
     // note: used by n-gram input embeddings to recover the tokens preceding a ubatch
@@ -454,6 +493,7 @@ public:
         assert(!seq[i].test(seq_id));
 
         seq[i].set(seq_id);
+        seq_lo[i] |= seq_lo_bit(seq_id);
         seq_pos_inc(seq_id, pos[i]);
     }
 
@@ -565,6 +605,7 @@ public:
 
         if (pos[i] < 0) {
             seq[i].reset();
+            seq_lo[i] = 0;
             pos[i] = -1;
             shift[i] = 0;
 
@@ -627,6 +668,15 @@ private:
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
+
+    // [TAG_KQ_VIS_FILL] seq_lo[i] = the low 32 bits of seq[i] (sequence ids 0..31), updated next to every write of
+    // seq[i] above, so the visibility metadata fill reads a cell's seq mask as one word (not 32 bitset tests, and
+    // without relying on the std::bitset object layout)
+    std::vector<uint32_t> seq_lo;
+
+    static uint32_t seq_lo_bit(llama_seq_id s) {
+        return s >= 0 && s < 32 ? 1u << s : 0u;
+    }
 
     // the set seq_pos[s][p] tells us how many times the position p is currently present for sequence s
     // if the position p is not present, seq_pos[s][p] is not set
