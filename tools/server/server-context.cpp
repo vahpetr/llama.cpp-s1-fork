@@ -4515,6 +4515,20 @@ private:
                         }
                     }
 
+                    // [TAG_PRIO_CHUNK] near_prompt_end bypasses the min-step rule, so C-token chunks would take a
+                    //   checkpoint at every chunk of the last n_ubatch tokens (and evict older ones). With the budget
+                    //   engaged, a checkpoint is taken only where the un-chunked schedule takes one: at a user start,
+                    //   at the first step of this prompt, or at the n - (4 + n_ubatch) / n - 4 breaks below.
+                    if (prio_cap && do_checkpoint && !is_user_start && n_tokens_start != (int32_t) slot.stats.n_prompt_cached) {
+                        bool at_break = false;
+                        for (const int offset : {4 + n_ubatch, 4}) {
+                            at_break |= n_tokens_start == slot.task->n_tokens() - std::min(n_batch, offset);
+                        }
+                        if (!at_break) {
+                            do_checkpoint = false;
+                        }
+                    }
+
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 

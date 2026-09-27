@@ -75,7 +75,7 @@ def n_decoded(s: ServerProcess, slot_id: int) -> int:
     return 0
 
 
-def co_schedule(s: ServerProcess, prompt: str, n_predict: int = 4) -> tuple[dict, dict]:
+def co_schedule(s: ServerProcess, prompt: str, n_predict: int = 4, n_gen: int = 1024) -> tuple[dict, dict]:
     """slot 0 generates a long answer; once it is decoding, slot 1 gets `prompt`. Returns both response bodies."""
     out = {}
 
@@ -83,7 +83,7 @@ def co_schedule(s: ServerProcess, prompt: str, n_predict: int = 4) -> tuple[dict
         res = s.make_request("POST", "/completion", data={
             "prompt": "Once upon a time",
             "id_slot": 0,
-            "n_predict": 1024,
+            "n_predict": n_gen,
             "ignore_eos": True,
             "cache_prompt": False,
         }, timeout=300)
@@ -105,7 +105,7 @@ def co_schedule(s: ServerProcess, prompt: str, n_predict: int = 4) -> tuple[dict
     t.join()
     assert out["gen"].status_code == 200
     # slot 0 was still decoding when slot 1's prompt finished - the whole prefill was co-scheduled
-    assert out["gen"].body["timings"]["predicted_n"] == 1024
+    assert out["gen"].body["timings"]["predicted_n"] == n_gen
     return out["gen"].body, res1.body
 
 
@@ -184,3 +184,42 @@ def test_exempt_slot_not_chunked():
     log = full_log(server)
     assert "LLAMA_PREFILL_CHUNK_EXEMPT_SLOTS = [1]" in log
     assert len(prio_lines(log)) == 0
+
+
+# (d) the checkpoint count of a chunked prompt equals the un-chunked schedule's (LFM2 = hybrid, checkpointed)
+LFM2_Q8 = "/models/_test/LFM2-350M-Q8_0.gguf"
+CKPT_RE = re.compile(r"id +1 \| task \d+ \| created context checkpoint")
+
+
+@pytest.mark.skipif(not os.path.exists(LFM2_Q8), reason="LFM2 test model not mounted")
+def test_checkpoint_count_unchanged():
+    global server
+    prompt = words(200, 13)
+
+    def run(env, co: bool) -> tuple[int, int, str]:
+        global server
+        server = make_server(env)
+        server.model_hf_repo = None     # HF resolution would win over model_file
+        server.model_hf_file = None
+        server.model_file = LFM2_Q8
+        server.fa = "off"
+        server.start()
+        if co:
+            _, body = co_schedule(server, prompt, n_gen=384)
+        else:
+            res = server.make_request("POST", "/completion", data={
+                "prompt": prompt, "id_slot": 1, "n_predict": 4, "cache_prompt": False,
+            }, timeout=300)
+            assert res.status_code == 200
+            body = res.body
+        log = full_log(server)
+        return len(CKPT_RE.findall(log)), body["timings"]["prompt_n"], log
+
+    n_chunked, n_prompt, log_chunked = run({"LLAMA_PREFILL_CHUNK_WITH_DECODE": str(C_REQ)}, co=True)
+    n_solo,    _,        _           = run(None, co=False)
+    n_co,      _,        _           = run(None, co=True)
+
+    assert n_prompt > 2 * N_BATCH
+    assert len(prio_lines(log_chunked)) >= (n_prompt - (4 + N_BATCH)) // C_EFF    # the tail really was chunked
+    assert n_chunked == n_solo
+    assert n_chunked <= n_co
