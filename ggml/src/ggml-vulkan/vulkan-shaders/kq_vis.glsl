@@ -38,7 +38,9 @@ float kqv_alibi_value(const int d) {
             return kqv_neg_inf();
         }
     }
-    return -float(n);
+    // n == 0 (p0 == p1) must stay +0: the reference computes float(-abs(0)) = float(int 0) = +0,
+    // while -float(0u) would be -0 (0x8000 in the f16 plane)
+    return n == 0u ? 0.0 : -float(n);
 }
 
 // a copy of llama_hparams::is_masked_swa

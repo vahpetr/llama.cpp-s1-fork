@@ -434,7 +434,7 @@ bool nd_fa_fail = false;
 ggml_backend_t g_dev = nullptr;
 
 struct dev_stats {
-    uint64_t op_runs = 0, op_elems = 0, op_diff = 0;
+    uint64_t op_runs = 0, op_elems = 0, op_diff = 0, op_diff_zero_sign = 0, op_diff_non_alibi_layouts = 0;
     uint64_t fa_runs = 0, fa_elems = 0, fa_diff = 0, fa_unsupported = 0;
 };
 dev_stats g_ds;
@@ -558,7 +558,25 @@ void dev_check_layout(const built_layout & L, const std::vector<uint8_t> & ref, 
         g_ds.op_elems += ref.size()/(L.f32 ? 4 : 2);
         g_ds.op_diff  += nd;
         if (nd) {
-            fprintf(stderr, "DEVICE KQ_MASK MISMATCH: %s: %" PRIu64 " elements\n", name, nd);
+            // classify: a sign-of-zero difference (+0 in the reference, -0 on the device) vs anything else
+            uint64_t n_zero_sign = 0;
+            const size_t esz = L.f32 ? 4 : 2;
+            size_t first = SIZE_MAX;
+            for (size_t i = 0; i < ref.size(); i += esz) {
+                if (memcmp(&ref[i], &got[i], esz) == 0) continue;
+                if (first == SIZE_MAX) first = i/esz;
+                float a, b;
+                if (L.f32) { memcpy(&a, &ref[i], 4); memcpy(&b, &got[i], 4); }
+                else { ggml_fp16_t ha, hb; memcpy(&ha, &ref[i], 2); memcpy(&hb, &got[i], 2); a = ggml_fp16_to_fp32(ha); b = ggml_fp16_to_fp32(hb); }
+                n_zero_sign += (a == 0.0f && b == 0.0f);
+            }
+            g_ds.op_diff_zero_sign += n_zero_sign;
+            fprintf(stderr, "DEVICE KQ_MASK MISMATCH: %s: %" PRIu64 " elements (%" PRIu64 " only the sign of a zero) "
+                    "(n_kv %" PRId64 " n_tps %" PRId64 " n_stream %" PRId64 " causal %d swa %d/%u alibi %d 2d %d f32 %d; first at %zu)\n",
+                    name, nd, n_zero_sign, L.n_kv, L.n_tps, L.n_stream, L.causal, L.swa_type, L.n_swa, L.alibi, L.is_2d, L.f32, first);
+            if (!L.alibi) {
+                g_ds.op_diff_non_alibi_layouts++;
+            }
         }
     }
 
@@ -940,8 +958,8 @@ int main(int argc, char ** argv) {
     printf("  FA negative control (one seq bit cleared): %" PRIu64 "/%" PRIu64 " detected\n", st.fa_ctrl_detected, st.fa_ctrl_runs);
 
     if (g_dev) {
-        printf("  DEVICE %s: KQ_MASK %" PRIu64 " layouts, %" PRIu64 " elements, DIFFERING: %" PRIu64 "\n",
-                ggml_backend_name(g_dev), g_ds.op_runs, g_ds.op_elems, g_ds.op_diff);
+        printf("  DEVICE %s: KQ_MASK %" PRIu64 " layouts, %" PRIu64 " elements, DIFFERING: %" PRIu64 " (sign of zero only: %" PRIu64 "; differing non-ALiBi layouts: %" PRIu64 ")\n",
+                ggml_backend_name(g_dev), g_ds.op_runs, g_ds.op_elems, g_ds.op_diff, g_ds.op_diff_zero_sign, g_ds.op_diff_non_alibi_layouts);
         printf("  DEVICE %s: FLASH_ATTN_EXT plane vs vis %" PRIu64 " layouts (D 256, 24/2 heads), %" PRIu64 " outputs, DIFFERING BITS: %" PRIu64 " (unsupported: %" PRIu64 ")\n",
                 ggml_backend_name(g_dev), g_ds.fa_runs, g_ds.fa_elems, g_ds.fa_diff, g_ds.fa_unsupported);
     }
