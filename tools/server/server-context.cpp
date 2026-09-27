@@ -342,6 +342,10 @@ struct server_slot {
     int32_t b0_prefix_match    = 0;     // common prefix of the live tokens and the new prompt (after cache reuse)
     int64_t b0_ckpt_n_tokens   = -1;    // n_tokens of the restored checkpoint, -1 = none restored
     bool    b0_full_reset      = false; // no usable checkpoint -> full re-processing
+
+    // [TAG_CKPT_PIN_RESTORED] (v33 fix round 2) n_tokens of the checkpoint this task restored (and kept), -1 = none;
+    //   the capacity eviction in create_checkpoint() skips it for the rest of the task
+    int64_t ckpt_pinned_n_tokens = -1;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -552,6 +556,8 @@ struct server_slot {
         b0_prefix_match  = 0;
         b0_ckpt_n_tokens = -1;
         b0_full_reset    = false;
+
+        ckpt_pinned_n_tokens = -1;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -2930,6 +2936,7 @@ private:
             for (auto & ckpt : slot.prompt.checkpoints) {
                 if (ckpt.n_tokens == n_tokens_new && ckpt.pos_max == pos_max && ckpt.pos_min == pos_min) {
                     ckpt.id_task = id_task;
+                    slot.ckpt_pinned_n_tokens = ckpt.n_tokens; // [TAG_CKPT_PIN_RESTORED]
                     SLT_INF(slot, "context checkpoint at n_tokens = %" PRId64 " already present - kept, no copy (size = %.3f MiB)\n",
                             ckpt.n_tokens, (float) ckpt.size() / 1024 / 1024);
                     return;
@@ -2974,14 +2981,26 @@ private:
             ++it;
         }
 
+        // [TAG_CKPT_PIN_RESTORED] (v33 fix round 2) the list is kept in ascending position order - the restore search
+        //   (rbegin, first usable) and the min-step loop above rely on it - so the checkpoint this task restored is
+        //   NOT moved to the back; instead the capacity eviction takes the oldest checkpoint other than it. Without
+        //   this, a follow-up that restores the lowest surviving checkpoint (the branch point of the conversation)
+        //   and then creates n_ctx_checkpoints new ones evicted that branch point first. Exempting all current-task
+        //   entries (like the min-step loop) would not help: after a keep, every entry the follow-up adds is
+        //   current-task too, so the fallback would again be the front.
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            auto victim = slot.prompt.checkpoints.begin();
+            if (slot.prompt.checkpoints.size() > 1 && victim->n_tokens == slot.ckpt_pinned_n_tokens) {
+                ++victim;
+            }
+            const auto & cur = *victim;
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB%s)\n",
+                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
+                    victim == slot.prompt.checkpoints.begin() ? "" : "; skipped the pinned restored checkpoint");
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(victim);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
@@ -3875,6 +3894,7 @@ private:
                         slot.b0_ckpt_n_tokens = -1;
                         slot.b0_full_reset    = false;
                         slot.b0_prefix_match  = 0;
+                        slot.ckpt_pinned_n_tokens = -1;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -4101,6 +4121,7 @@ private:
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                         slot.b0_ckpt_n_tokens = it->n_tokens;
+                                        slot.ckpt_pinned_n_tokens = it->n_tokens; // [TAG_CKPT_PIN_RESTORED]
                                         SLT_INF(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB: tgt %.3f + dft %.3f + spec %.3f)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024,
                                                 (float) it->data_tgt.size() / 1024 / 1024, (float) it->data_dft.size() / 1024 / 1024, (float) it->data_spec.size() / 1024 / 1024);
                                     }
