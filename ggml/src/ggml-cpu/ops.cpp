@@ -9181,6 +9181,82 @@ void ggml_compute_forward_kq_mask(
     }
 }
 
+// ggml_compute_forward_qsa_bias
+//
+// [TAG_QSA_COMPACT_BIAS] the reference for GGML_OP_QSA_BIAS. It must equal, bit for bit, the old
+// path: qsa_fill_bias's per-block branch (src/llama-memory-hybrid-idx.cpp) wrote, for query row i
+// and block b,
+//     b >= n_bid:  (tail_fix && n_bid < n_blocks && b == n_bid) ? 1e9f : -INFINITY
+//     b <  n_bid:  !seq_has(bid_cell[b], seq(i)) ? -INFINITY : (bid_idx[b] >= tail(i) ? 1e9f : 0.0f)
+// and the graph read it through ggml_get_rows(bias, rows). The compact tables are
+//     blk[b] = (key, vis): b < n_bid: (bid_idx[b], seq mask of bid_cell[b]);
+//                          b >= n_bid: (INT32_MAX, spare boosted ? ~0u : 0)
+//     qry[q] = (tail(q), 1u << seq(q))
+// so (vis & bit) == 0 ? -inf : (key >= tail ? 1e9f : 0.0f) reproduces every case: the boosted spare
+// row (vis ~0, key INT32_MAX >= any tail) -> 1e9, dead rows (vis 0) -> -inf, foreign rows -> -inf,
+// the rest the same integer compare. The three values are stored as constants (no arithmetic), and
+// 1e9f is exactly representable, so every backend writes the same bits.
+static void ggml_compute_forward_qsa_bias_f32(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * blk  = dst->src[0]; // [2, n_blocks, n_stream] i32
+    const ggml_tensor * qry  = dst->src[1]; // [2, n_tps, n_stream]    i32
+    const ggml_tensor * rows = dst->src[2]; // [np, n_stream] i32 or NULL
+
+    GGML_ASSERT(ggml_is_contiguous(blk) && ggml_is_contiguous(qry) && ggml_is_contiguous(dst));
+    GGML_ASSERT(rows == nullptr || ggml_is_contiguous(rows));
+
+    const int64_t n_blocks = blk->ne[1];
+    const int64_t n_tps    = qry->ne[1];
+    const int64_t np       = dst->ne[1];
+    const int64_t n_stream = dst->ne[2];
+    const int64_t nrows    = np*n_stream;
+
+    GGML_ASSERT(dst->ne[0] == n_blocks);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    for (int64_t row = ith; row < nrows; row += nth) {
+        const int64_t t = row % np;
+        const int64_t s = row / np;
+
+        const int64_t q = rows ? (int64_t) ((const int32_t *) rows->data)[s*np + t] : t;
+        GGML_ASSERT(q >= 0 && q < n_tps);
+
+        const int32_t * qe   = (const int32_t *) qry->data + 2*(s*n_tps + q);
+        const int32_t   tail = qe[0];
+        const uint32_t  bit  = (uint32_t) qe[1];
+
+        const int32_t * be = (const int32_t *) blk->data + 2*s*n_blocks;
+        float *         d  = (float *) ((char *) dst->data + s*dst->nb[2] + t*dst->nb[1]);
+
+        for (int64_t b = 0; b < n_blocks; ++b) {
+            const int32_t  key = be[2*b + 0];
+            const uint32_t vis = (uint32_t) be[2*b + 1];
+
+            d[b] = (vis & bit) == 0 ? -INFINITY : (key >= tail ? 1e9f : 0.0f);
+        }
+    }
+}
+
+void ggml_compute_forward_qsa_bias(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_I32:
+            {
+                ggml_compute_forward_qsa_bias_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // [TAG_KQ_VIS] the metadata of a flash-attention node, if it has any (see ggml_flash_attn_ext_set_vis)
 struct fa_vis_src {
     const int32_t * cells = nullptr; // [n_kv, 4, n_stream]

@@ -478,6 +478,10 @@ struct server_metrics {
     // tokens reused from the cache need no decode, so they only have a count
     uint64_t n_prompt_cached = 0;
 
+    // [TAG_B0_RESTORE_LOG] (v33 B0) prompt-checkpoint restores and the common-prefix tokens they re-process
+    uint64_t n_prompt_restores        = 0;
+    uint64_t n_prompt_replayed_tokens = 0;
+
     uint64_t n_tokens_max = 0;
 
     uint64_t n_decode     = 0;
@@ -508,6 +512,15 @@ struct server_metrics {
     uint64_t spec_adaptive_measured = 0;  // 1 = costs came from the running fit, 0 = the affine model
     double   spec_adaptive_t_tok_ms = 0.0;
     double   spec_adaptive_t_dec_ms = 0.0;
+
+    // [TAG_GTT_ADMISSION] (v33 #13) prompt admission - gauges of the last check, plus a deferral counter
+    uint64_t admission_enabled            = 0;
+    uint64_t admission_last_deferred      = 0;
+    uint64_t admission_deferred_total     = 0;  // deferral episodes (one per slot prompt that had to wait)
+    uint64_t admission_rejected_total     = 0;  // prompts rejected with 503 after LLAMA_GTT_ADMISSION_MAX_WAIT_S
+    double   admission_bar_mib            = 0.0;
+    double   admission_last_used_mib      = 0.0;
+    double   admission_last_projected_mib = 0.0;
 
     void init() {
         t_start = ggml_time_us();

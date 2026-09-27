@@ -1602,6 +1602,23 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_fold_rejected_total",
             "Speculative: replays following a rejection inside a folded round",
             (double) metrics.n_spec_fold_rejected
+        }, {
+            "prompt_checkpoint_restores_total",
+            "Prompt-checkpoint restores (a new prompt resumed from a context checkpoint)",
+            (double) metrics.n_prompt_restores
+        }, {
+            "prompt_replayed_tokens_total",
+            "Common-prefix tokens re-processed because the state was restored at an earlier checkpoint",
+            (double) metrics.n_prompt_replayed_tokens
+        }, {
+            "admission_deferred_total",
+            "GTT headroom admission: prompts that had to wait for headroom (one per deferral episode)",
+            (double) metrics.admission_deferred_total
+        },
+        {
+            "admission_rejected_total",
+            "GTT headroom admission: prompts rejected (503) after waiting longer than LLAMA_GTT_ADMISSION_MAX_WAIT_S",
+            (double) metrics.admission_rejected_total
         },
     };
 
@@ -1646,6 +1663,26 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_adaptive_cost_t_dec_ms",
             "Speculative: cost in ms of a plain 1-token decode, as used by the adaptive draft-length rule",
             metrics.spec_adaptive_t_dec_ms
+        }, {
+            "admission_enabled",
+            "GTT headroom admission: 1 when active (LLAMA_GTT_ADMISSION_MIB > 0 and the GTT usage is readable)",
+            (double) metrics.admission_enabled
+        }, {
+            "admission_bar_mib",
+            "GTT headroom admission: bar in MiB",
+            metrics.admission_bar_mib
+        }, {
+            "admission_last_used_mib",
+            "GTT headroom admission: GTT in use at the last check, MiB",
+            metrics.admission_last_used_mib
+        }, {
+            "admission_last_projected_mib",
+            "GTT headroom admission: projected GTT level of the last check, MiB",
+            metrics.admission_last_projected_mib
+        }, {
+            "admission_last_deferred",
+            "GTT headroom admission: 1 when the last check deferred a prompt ubatch",
+            (double) metrics.admission_last_deferred
         },
     };
 

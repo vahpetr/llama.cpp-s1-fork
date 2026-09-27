@@ -164,6 +164,10 @@ public:
     // the cache stream a sequence lives in
     uint32_t qsa_stream_of(llama_seq_id seq_id) const;
 
+    // [TAG_QSA_COMPACT_BIAS] LLAMA_QSA_COMPACT_BIAS=1 (read at creation, honoured only with an indexer and
+    // n_seq_max <= 32): the per-block bias travels as two small tables instead of the [n_blocks, n_tps] plane
+    bool qsa_compact_bias() const { return qsa_compact; }
+
 private:
     // [TAG_QSA_POOLED_CACHE] drop the derived entries of seq_id's stream (every stream if seq_id < 0)
     void qsa_store_invalidate(llama_seq_id seq_id);
@@ -180,6 +184,9 @@ private:
 
     // [TAG_QSA_POOLED_CACHE] mutable: the graph inputs are planned and filled through const contexts
     mutable std::unique_ptr<llama_qsa_pooled_store> qsa_store;
+
+    // [TAG_QSA_COMPACT_BIAS]
+    bool qsa_compact = false;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -232,9 +239,16 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
+    // [TAG_QSA_COMPACT_BIAS] compact (qsa_compact_bias() and blk_bias): bias is nullptr and the two tables are set
+    //   qsa_blk   I32 [2, n_blocks, ns]    per block (key = start index, INT32_MAX past n_bid; vis = seq bitmask)
+    //   qsa_qry   I32 [2, n_tokens/ns, ns] per query (tail = tail start; bit = 1 << seq_id)
+    // GGML_OP_QSA_BIAS turns them back into the per-block bias, bit for bit; otherwise both are nullptr
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       ggml_tensor * bias, ggml_tensor * qsa_blk, ggml_tensor * qsa_qry,
+                       const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
+
+    // [TAG_QSA_COMPACT_BIAS] the memory's knob (false for a context without a memory)
+    bool qsa_compact_bias() const;
 
     // [TAG_QSA_POOLED_CACHE] the pooled-key cache (nullptr = off)
     llama_qsa_pooled_store * get_qsa_store() const;
@@ -255,7 +269,8 @@ public:
     //   remap       I32 [n_blocks*ns]    the store row of each compact block id (stream offset included)
     // dirty_dst and remap are nullptr for the FULL pool (cap == n_blocks): its dirty list is every compact id in
     // order (= blk_cells/blk_pos), the graph reads the pooled rows directly and copies them to slots 0..n_blocks-1
-    void set_input_qsa_store(ggml_tensor * cell_blk, ggml_tensor * bias,
+    //   qsa_blk/qsa_qry as in set_input_qsa ([TAG_QSA_COMPACT_BIAS]; bias is then nullptr)
+    void set_input_qsa_store(ggml_tensor * cell_blk, ggml_tensor * bias, ggml_tensor * qsa_blk, ggml_tensor * qsa_qry,
                              ggml_tensor * dirty_cells, ggml_tensor * dirty_pos, ggml_tensor * dirty_dst,
                              ggml_tensor * remap, const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
 
@@ -283,6 +298,18 @@ private:
 
     void qsa_fill_bias(int64_t s, const llama_ubatch * ubatch, int64_t n_kv, int64_t n_ns, int64_t n_blocks, int64_t r,
                        bool blk_bias, const int32_t * cur_cell_blk, float * dst_bias, const qsa_census_stream & cs) const;
+
+    // [TAG_QSA_COMPACT_BIAS] the tables of stream s (dst_blk: [2, n_blocks, n_ns], dst_qry: [2, n_tps, n_ns]), from the
+    // same census and the same per-query helpers as qsa_fill_bias's per-block branch
+    void qsa_fill_bias_compact(int64_t s, const llama_ubatch * ubatch, int64_t n_ns, int64_t n_blocks, int64_t r,
+                               int32_t * dst_blk, int32_t * dst_qry, const qsa_census_stream & cs) const;
+
+    // [TAG_QSA_COMPACT_BIAS] LLAMA_QSA_COMPACT_BIAS_CHECK=1: fill the old plane with the unchanged qsa_fill_bias, expand
+    // the tables with the op's formula and GGML_ABORT on the first bit difference
+    // on stream s; `plane` is the caller's [n_blocks, n_tokens] scratch (the old plane's own size)
+    void qsa_compact_check(int64_t s, const llama_ubatch * ubatch, int64_t n_kv, int64_t n_ns, int64_t n_blocks,
+                           int64_t r, const int32_t * cur_cell_blk, const int32_t * blk, const int32_t * qry,
+                           const qsa_census_stream & cs, std::vector<float> & plane) const;
 
     // [TAG_QSA_POOLED_CACHE] the cached plan of the current ubatch
     struct qsa_plan_t {

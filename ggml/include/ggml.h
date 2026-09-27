@@ -576,6 +576,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_QSA_TOP_K,
+        GGML_OP_QSA_BIAS,   // [TAG_QSA_COMPACT_BIAS]
 
         GGML_OP_UNARY,
 
@@ -2514,6 +2515,24 @@ extern "C" {
     // op_params slots of a flash-attention node carrying the metadata (i32): [10] = 1, [11] causal,
     // [12] alibi, [13] swa_type, [14] n_swa
 #define GGML_FA_VIS_PARAM 10
+
+    // [TAG_QSA_COMPACT_BIAS] the qwen4exp per-block indexer bias, generated from two small tables
+    // instead of uploaded as an [n_blocks x n_tps] f32 plane:
+    //   dst[b, t, s] = (vis[b, s] & bit[q, s]) == 0 ? -INF : (key[b, s] >= tail[q, s] ? 1e9f : 0.0f),
+    //   q = rows ? rows[t, s] : t
+    // with (key, vis) = blk[0..1, b, s] and (tail, bit) = qry[0..1, q, s]; vis/bit are 32-bit masks
+    // stored in I32 and compared as unsigned. The three results are written as constants - no
+    // arithmetic touches them - so the tensor is bit-identical to ggml_get_rows(<the old plane>, rows).
+    //
+    //   blk:    [2, n_blocks, n_stream]  I32, contiguous  (key = block start index, INT32_MAX for the spare/dead ids)
+    //   qry:    [2, n_tps,    n_stream]  I32, contiguous  (tail = the query's tail start, bit = 1 << seq)
+    //   rows:   [np, n_stream]           I32, contiguous, or NULL (np = n_tps, identity); rows[t, s] in [0, n_tps)
+    //   result: [n_blocks, np, n_stream] F32
+    GGML_API struct ggml_tensor * ggml_qsa_bias(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * blk,
+            struct ggml_tensor  * qry,
+            struct ggml_tensor  * rows);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

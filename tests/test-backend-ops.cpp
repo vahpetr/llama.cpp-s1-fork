@@ -6954,6 +6954,116 @@ struct test_qsa_top_k : public test_case {
     }
 };
 
+// [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS: the qwen4exp per-block indexer bias built from the block table
+// blk [2, n_blocks, n_stream] (key, vis) and the query table qry [2, n_tps, n_stream] (tail, bit), read
+// through rows [np, n_stream] (NULL = identity). The op writes one of three constants (+0.0f, 1e9f, -inf)
+// and nothing else, so the backends must agree BITWISE: err() counts the elements whose bit patterns
+// differ (-inf == -inf, +0.0 != -0.0), and the bar is 0.
+//   rows_mode 0 = NULL, 1 = the arange slice t0..t0+np (a [TAG_QSA_CHUNK] chunk), 2 = the PAD chunk (arange
+//   clamped to n_tps - 1), 3 = random rows with repeats
+struct test_qsa_bias : public test_case {
+    const int64_t n_blocks;
+    const int64_t n_tps;
+    const int64_t np;
+    const int64_t n_stream;
+    const int     rows_mode;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_blocks, n_tps, np, n_stream, rows_mode);
+    }
+
+    test_qsa_bias(int64_t n_blocks = 512, int64_t n_tps = 7, int64_t np = 7, int64_t n_stream = 1, int rows_mode = 0)
+        : n_blocks(n_blocks), n_tps(n_tps), np(np), n_stream(n_stream), rows_mode(rows_mode) {
+        GGML_ASSERT(rows_mode != 0 || np == n_tps);
+        GGML_ASSERT(rows_mode != 1 || np <= n_tps);
+    }
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * blk = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 2, n_blocks, n_stream);
+        ggml_set_name(blk, "qsa_blk");
+        ggml_tensor * qry = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 2, n_tps, n_stream);
+        ggml_set_name(qry, "qsa_qry");
+        ggml_tensor * rows = nullptr;
+        if (rows_mode != 0) {
+            rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, np, n_stream);
+            ggml_set_name(rows, "qsa_rows");
+        }
+
+        ggml_tensor * out = ggml_qsa_bias(ctx, blk, qry, rows);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234 + (uint32_t) (n_blocks*31 + n_tps*7 + np*3 + n_stream + rows_mode));
+        // keys and tails are multiples of 4 (r = 4) in [0, 2^24), drawn near one base so both sides of
+        // key >= tail occur in every row
+        const int32_t base = (int32_t) (rng() % ((1u << 24) - (1u << 16))) & ~3;
+        auto near = [&]() { return base + (int32_t) (rng() % 4096)*4; };
+
+        int seen = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            const char * name = ggml_get_name(t);
+            std::vector<int32_t> data(ggml_nelements(t));
+            if (strcmp(name, "qsa_blk") == 0) {
+                seen++;
+                for (int64_t e = 0; e < n_blocks*n_stream; ++e) {
+                    const uint32_t u = rng() % 100;
+                    // ~5 % the spare/dead ids (INT32_MAX), with vis ~0 (the boosted spare) or 0 (dead)
+                    const bool spare = u < 5;
+                    uint32_t vis = rng() & 31u;                  // 5-bit sequence masks, 0 included
+                    if (u >= 95) vis = 0xFFFFFFFFu;              // every sequence (incl. bit 31)
+                    if (spare) vis = (u & 1) ? 0xFFFFFFFFu : 0u;
+                    data[2*e + 0] = spare ? INT32_MAX : near();
+                    data[2*e + 1] = (int32_t) vis;
+                }
+            } else if (strcmp(name, "qsa_qry") == 0) {
+                seen++;
+                for (int64_t e = 0; e < n_tps*n_stream; ++e) {
+                    data[2*e + 0] = near();
+                    data[2*e + 1] = (int32_t) (e == 0 ? 0x80000000u : 1u << (rng() % 5));   // one row on bit 31
+                }
+            } else if (strcmp(name, "qsa_rows") == 0) {
+                seen++;
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    const int64_t t0 = rows_mode == 1 ? (n_tps - np)/2 : rows_mode == 2 ? std::max<int64_t>(0, n_tps - np/2) : 0;
+                    for (int64_t t = 0; t < np; ++t) {
+                        int64_t q = 0;
+                        switch (rows_mode) {
+                            case 1: q = t0 + t; break;
+                            case 2: q = std::min<int64_t>(t0 + t, n_tps - 1); break;
+                            default: q = (int64_t) (rng() % (uint32_t) n_tps); break;
+                        }
+                        data[s*np + t] = (int32_t) q;
+                    }
+                }
+            } else {
+                init_tensor_uniform(t);
+                continue;
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+        // found by name: a rename would silently fall through to the uniform fill
+        GGML_ASSERT(seen == (rows_mode != 0 ? 3 : 2));
+    }
+
+    // bitwise: the number of elements whose f32 bit patterns differ
+    double err(const float * a, const float * b, size_t n) override {
+        size_t bad = 0;
+        for (size_t i = 0; i < n; ++i) {
+            bad += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        }
+        return (double) bad;
+    }
+};
+
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -10915,6 +11025,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_top_k(53250, 213000, 6,    1, 2051, true, 1));
         test_cases.emplace_back(new test_qsa_top_k(53250, 213000, 6,    1, 2051, true, 4));
     }
+
+    // [TAG_QSA_COMPACT_BIAS] the compact bias: the deployed shapes (C 128 / the reserve's balanced chunk),
+    // decode, the PAD chunk, two and five streams (n_blocks not a multiple of 256), random rows with repeats
+    test_cases.emplace_back(new test_qsa_bias(131072, 2048, 128, 1, 1));
+    test_cases.emplace_back(new test_qsa_bias(61440,  2050, 228, 1, 1));
+    test_cases.emplace_back(new test_qsa_bias(512,    7,    7,   1, 0));
+    test_cases.emplace_back(new test_qsa_bias(4096,   265,  256, 1, 2));
+    test_cases.emplace_back(new test_qsa_bias(2048,   64,   64,  2, 3));
+    test_cases.emplace_back(new test_qsa_bias(1000,   5,    5,   5, 0));
+    test_cases.emplace_back(new test_qsa_bias(1000,   40,   64,  5, 2));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {

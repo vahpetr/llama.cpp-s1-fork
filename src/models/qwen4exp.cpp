@@ -1265,11 +1265,11 @@ public:
 
         // [TAG_QSA_POOLED_CACHE] the census feeds the store's dirty list and remap instead of blk_cells/blk_pos
         if (pooled_cache) {
-            mctx->set_input_qsa_store(cell_blk, bias, dirty_cells, dirty_pos, dirty_dst, remap, ubatch, ratio, blk_bias);
+            mctx->set_input_qsa_store(cell_blk, bias, qsa_blk, qsa_qry, dirty_cells, dirty_pos, dirty_dst, remap, ubatch, ratio, blk_bias);
             return;
         }
 
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, qsa_blk, qsa_qry, ubatch, ratio, blk_bias);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -1306,8 +1306,17 @@ public:
 
         res &= cell_blk->ne[0]  == n_kv;
         res &= cell_blk->ne[1]  == n_stream;
-        res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
-        res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+
+        // [TAG_QSA_COMPACT_BIAS] a compact graph never pairs with a plane graph
+        res &= compact == (blk_bias && mctx->qsa_compact_bias());
+
+        if (compact) {
+            res &= qsa_blk->ne[1] == n_blocks && qsa_blk->ne[2] == n_stream;
+            res &= qsa_qry->ne[1] == params.ubatch.n_tokens/n_stream && qsa_qry->ne[2] == n_stream;
+        } else {
+            res &= bias->ne[0]  == (blk_bias ? n_blocks : n_kv);
+            res &= bias->ne[1]  == params.ubatch.n_tokens/n_stream;
+        }
 
         if (pooled_cache) {
             // [TAG_QSA_POOLED_CACHE] the dirty list's capacity is part of the topology: plan this ubatch
@@ -1354,7 +1363,22 @@ public:
     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
-    ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+    ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]; nullptr if compact
+
+    // [TAG_QSA_COMPACT_BIAS] LLAMA_QSA_COMPACT_BIAS=1 (and blk_bias): bias is nullptr, and GGML_OP_QSA_BIAS builds each
+    // use of it on the device from these two tables (llama_memory_hybrid_idx_context::set_input_qsa)
+    bool          compact   = false;
+    ggml_tensor * qsa_blk   = nullptr;   // I32 [2, n_blocks, n_stream]           (key, vis) per block
+    ggml_tensor * qsa_qry   = nullptr;   // I32 [2, n_tokens/n_stream, n_stream]  (tail, bit) per query
+
+    // the per-block bias of the whole ubatch (rows == nullptr) or of the query rows `rows` ([np, n_stream] I32):
+    // exactly ggml_get_rows(bias, rows) of the plane, bit for bit
+    ggml_tensor * bias_rows(ggml_context * ctx, ggml_tensor * rows) const {
+        if (compact) {
+            return ggml_qsa_bias(ctx, qsa_blk, qsa_qry, rows);
+        }
+        return rows ? ggml_get_rows(ctx, bias, rows) : bias;
+    }
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
@@ -1469,6 +1493,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                 "qsa: the pooled-key cache holds every QSA layer at the one ratio it was built for");
     }
 
+    // [TAG_QSA_COMPACT_BIAS] the per-block bias as two tables + GGML_OP_QSA_BIAS (knob read by the memory)
+    const bool compact = blk_bias && mctx_hyb->qsa_compact_bias();
+
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
 
@@ -1479,6 +1506,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // every layer sharing a ratio also shares the exhaustive/not decision (it is a function of
         // n_kv, r and the ubatch's sequence depth alone), so a cached input set can never be the wrong kind
         GGML_ASSERT(inp->cache_only == cache_only);
+        GGML_ASSERT(cache_only || inp->compact == compact);
     } else {
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, cache_only);
 
@@ -1494,17 +1522,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             qsa->pooled_cache = true;
 
             qsa->cell_blk    = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-            qsa->bias        = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+            if (compact) {
+                build_qsa_compact_inputs(qsa.get(), n_blocks, n_tps, n_stream);
+            } else {
+                qsa->bias    = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+            }
             qsa->dirty_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*cap, n_stream);
             qsa->dirty_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*cap*n_stream);
 
             ggml_set_name(qsa->cell_blk,    "qsa_cell_blk");
-            ggml_set_name(qsa->bias,        "qsa_bias");
+            if (!compact) {
+                ggml_set_name(qsa->bias,    "qsa_bias");
+            }
             ggml_set_name(qsa->dirty_cells, "qsa_dirty_cells");
             ggml_set_name(qsa->dirty_pos,   "qsa_dirty_pos");
 
             ggml_set_input(qsa->cell_blk);
-            ggml_set_input(qsa->bias);
+            if (!compact) {
+                ggml_set_input(qsa->bias);
+            }
             ggml_set_input(qsa->dirty_cells);
             ggml_set_input(qsa->dirty_pos);
 
@@ -1524,12 +1560,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
             qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
             qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-            qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+            if (compact) {
+                build_qsa_compact_inputs(qsa.get(), n_blocks, n_tps, n_stream);
+            } else {
+                qsa->bias  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+            }
 
             ggml_set_input(qsa->cell_blk);
             ggml_set_input(qsa->blk_cells);
             ggml_set_input(qsa->blk_pos);
-            ggml_set_input(qsa->bias);
+            if (!compact) {
+                ggml_set_input(qsa->bias);
+            }
         }
 
         inp = qsa.get();
@@ -1644,7 +1686,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         return nullptr;
     }
 
-    return build_qsa_select(inp, pooled, q, inp->bias, kq_mask, width, blk_bias, il);
+    ggml_tensor * bias = inp->bias_rows(ctx0, nullptr);
+    if (inp->compact) {
+        // [TAG_QSA_COMPACT_BIAS] place the QSA_BIAS node before the score chain, where the plane (a leaf) used to be
+        // available: expanded later, as src[1] of the bias ADD, it would sit between the head-sum ADDs and that ADD
+        // and split the chain the Vulkan multi_add fusion folds (the chunked path keeps its old get_rows position)
+        ggml_build_forward_expand(gf, bias);
+    }
+
+    return build_qsa_select(inp, pooled, q, bias, kq_mask, width, blk_bias, il);
+}
+
+// [TAG_QSA_COMPACT_BIAS] the two table inputs that replace the [n_blocks, n_tps, n_stream] f32 plane
+void llama_model_qwen4exp::graph::build_qsa_compact_inputs(
+        llm_graph_input_qsa * qsa,
+        int64_t               n_blocks,
+        int64_t               n_tps,
+        int64_t               n_stream) {
+    qsa->compact = true;
+    qsa->qsa_blk = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 2, n_blocks, n_stream);
+    qsa->qsa_qry = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 2, n_tps,    n_stream);
+
+    ggml_set_name(qsa->qsa_blk, "qsa_blk");
+    ggml_set_name(qsa->qsa_qry, "qsa_qry");
+
+    ggml_set_input(qsa->qsa_blk);
+    ggml_set_input(qsa->qsa_qry);
 }
 
 // The query-dependent half of the indexer: score the queries in q against the pooled keys and
@@ -1883,7 +1950,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
     GGML_ASSERT(q_cur->ne[2] == n_tps*n_stream);
 
     ggml_tensor * kq_mask = prep.kq_mask;   // [n_kv, n_tps, 1, n_stream]
-    ggml_tensor * bias    = prep.inp->bias; // [n_blocks or n_kv, n_tps, n_stream]
 
     // one zero source per layer, sized for the longest chunk; each chunk reads a view of it
     ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, width, n_max, n_stream);
@@ -1928,8 +1994,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
             q_idx = ggml_cont(ctx0, q_idx);
         }
 
-        // [n_blocks or n_kv, np, n_stream] f32
-        ggml_tensor * bias_c = ggml_get_rows(ctx0, bias, rows);
+        // [n_blocks or n_kv, np, n_stream] f32: get_rows of the plane, or [TAG_QSA_COMPACT_BIAS] QSA_BIAS over rows
+        ggml_tensor * bias_c = prep.inp->bias_rows(ctx0, rows);
 
         // [n_kv, np, 1, n_stream], back in the mask's own type
         ggml_tensor * mask_c = nullptr;

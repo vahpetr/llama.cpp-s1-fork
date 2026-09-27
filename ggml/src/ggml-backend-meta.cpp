@@ -1045,7 +1045,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             // handle_generic(scalar_only) accepts only the all-mirrored case and asserts otherwise.
             // [TAG_KQ_VIS] the mask reads every cell record against every token record: no split
             case GGML_OP_KQ_MASK:
-            case GGML_OP_QSA_TOP_K: {
+            case GGML_OP_QSA_TOP_K:
+            case GGML_OP_QSA_BIAS: { // [TAG_QSA_COMPACT_BIAS] reads whole tables
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_UNARY: {

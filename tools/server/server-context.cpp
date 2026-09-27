@@ -16,6 +16,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "../../src/llama-ext.h" // llama_get_ctx_other (v33 B2: shared-memory drafts keep the draft copy)
 
 #include <algorithm>
 #include <cstddef>
@@ -26,6 +27,9 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <thread>
+#include <chrono>
+#include <cstdlib>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -325,6 +329,23 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     size_t spec_n_committed = 0; // number of committed (already-accepted) tokens at the front of spec_draft this round
+
+    // [TAG_GTT_ADMISSION] (v33 #13) prompt admission state of this slot
+    bool    adm_deferred       = false; // the last admission check of the current prompt deferred it
+    int64_t adm_t_defer_us     = 0;     // start of the current deferral
+    int64_t adm_t_log_us       = 0;     // last deferral log line (rate limit)
+    double  adm_projected_mib  = 0.0;   // projection of the last check
+
+    // [TAG_B0_RESTORE_LOG] (v33 B0) per-task restore telemetry, logged once the prompt's first batch is set up
+    bool    b0_pending         = false;
+    int32_t b0_n_cached_live   = 0;     // tokens held by the slot before the task (the live state)
+    int32_t b0_prefix_match    = 0;     // common prefix of the live tokens and the new prompt (after cache reuse)
+    int64_t b0_ckpt_n_tokens   = -1;    // n_tokens of the restored checkpoint, -1 = none restored
+    bool    b0_full_reset      = false; // no usable checkpoint -> full re-processing
+
+    // [TAG_CKPT_PIN_RESTORED] (v33 fix round 2) n_tokens of the checkpoint this task restored (and kept), -1 = none;
+    //   the capacity eviction in create_checkpoint() skips it for the rest of the task
+    int64_t ckpt_pinned_n_tokens = -1;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -524,6 +545,19 @@ struct server_slot {
 
         spec_is_replay = false;
         spec_n_committed = 0;
+
+        adm_deferred      = false;
+        adm_t_defer_us    = 0;
+        adm_t_log_us      = 0;
+        adm_projected_mib = 0.0;
+
+        b0_pending       = false;
+        b0_n_cached_live = 0;
+        b0_prefix_match  = 0;
+        b0_ckpt_n_tokens = -1;
+        b0_full_reset    = false;
+
+        ckpt_pinned_n_tokens = -1;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -871,6 +905,13 @@ struct server_slot {
             {"is_processing", is_processing()},
         };
 
+        if (adm_deferred || adm_projected_mib > 0.0) {
+            res["admission"] = {
+                {"deferred",      adm_deferred},
+                {"projected_mib", adm_projected_mib},
+            };
+        }
+
         // adaptive draft length (--spec-draft-n-max-adaptive): the effective n-max this slot last
         // asked the drafter for, and the cost model it came from - so a bench can see the rule work
         if (spec_n_max_last > 0) {
@@ -1199,6 +1240,57 @@ private:
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
+    // [TAG_CKPT_NO_DFT] (v33 B2) prompt checkpoints leave the draft KV out when it is a plain (partially
+    //   removable) KV cache of its own: it is causal, so on restore seq_rm(pos_max + 1, -1) leaves exactly the
+    //   values a checkpoint copy would have restored (only the physical cell placement differs), and the
+    //   speculative pending state (MTP pending_h, eagle3 boundary row) still travels in data_spec. The plain
+    //   KV cache ignores PARTIAL_ONLY (llama-kv-cache.cpp state_write), so the copy was the draft's WHOLE KV of
+    //   the sequence (2 KiB x n_past on the prod MTP head) in host RAM per checkpoint. Off for a draft whose
+    //   memory is recurrent (FULL/RS: it cannot be rewound) or shared with the target (ctx_other).
+    bool ckpt_skip_dft = false;
+
+    // [TAG_GTT_ADMISSION] (v33, night-1 #13; fix round 1) headroom admission for prefill chunks. OFF unless
+    //   LLAMA_GTT_ADMISSION_MIB is set > 0 (the compose sets bar, slope and step per profile). Before a slot's prompt
+    //   tokens enter the batch:
+    //     growth    = min(max(0, resident + chunk - high_water), n_ctx - high_water)        [cells]
+    //     projected = used (sysfs mem_info_gtt_used) + slope x growth + (growth > 0 ? step : 0)
+    //   growth == 0 -> ADMIT (the chunk only refills cells the pool already had: first-fit, see below);
+    //   projected <= bar -> ADMIT; else DEFER (slot skipped this iteration, re-checked every iteration, 50 ms
+    //   back-off when nothing else runs); deferred longer than LLAMA_GTT_ADMISSION_MAX_WAIT_S (default 600,
+    //   0 = forever) -> REJECT: send_error(ERROR_TYPE_UNAVAILABLE) = HTTP 503 and the slot is released. A
+    //   stream=true request already got its 200 headers in STARTED, so it receives the error as an SSE error event.
+    //   Scheduling only - no numerics change.
+    //   resident = sum of the slots' cached tokens; high_water = its maximum over this process. Under llama_kv_cache
+    //   (the attention/indexer pool) seq_rm rewinds the head to the lowest freed cell and find_slot takes empty
+    //   cells first-fit from the head (llama-kv-cache.cpp seq_rm / find_slot), so every cell below the head is in
+    //   use and the pool's used_max_p1 grows only once all holes are refilled: used_max_p1 == max(used) == the
+    //   high-water of resident while cells are not shared between sequences. Over-count (under-projection) risk:
+    //   seq_cp-shared cells (n > 1 child slots) count once per slot. LLAMA_GTT_HOLES_FULL_CHUNK=1 instead projects
+    //   the whole chunk as growth whenever resident < high_water (conservative; it disables the growth == 0 admit
+    //   after any trim).
+    //   step (only when growth > 0), the largest of:
+    //     LLAMA_GTT_STAGING_STEP_MIB (explicit, calibrated on the device);
+    //     geometric prealloc_x (GGML_VK_QSA_SCRATCH_PRESIZE + _PRESIZE_FA): 0.25 x LLAMA_GTT_STAGING_B_PER_CELL (2048)
+    //       x cells_after;
+    //     allocator regrow slack: LLAMA_GTT_SLACK_PCT (default = GGML_ALLOC_GROW_SLACK, the percent the run-time
+    //       regrow adds to a growing compute chunk) / 100 x slope x cells_after (the growing buffers ~ slope x cells).
+    struct {
+        bool        enabled = false;
+        std::string path;
+        double      bar_mib            = 0.0;
+        double      slope_b_per_cell   = 18432.0;
+        double      staging_b_per_cell = 2048.0;
+        double      step_override_mib  = -1.0;
+        double      slack_pct          = 0.0;
+        double      max_wait_s         = 600.0;
+        bool        geometric          = false;
+        bool        holes_full_chunk   = false;
+        int64_t     hw_cells           = 0;     // resident-cell high-water seen by this server
+        bool        deferred_this_iter = false;
+    } adm;
+
+    enum admission_result { ADM_ADMIT, ADM_DEFER, ADM_REJECT };
 
     common_speculative_ptr spec;
 
@@ -1579,6 +1671,9 @@ private:
 
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+            ckpt_skip_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && llama_get_ctx_other(ctx_dft) == nullptr;
+            SRV_INF("prompt checkpoints %s the draft KV (draft seq_rm type = %d)\n",
+                    ckpt_skip_dft ? "exclude (restore = draft seq_rm)" : "include", (int) ctx_dft_seq_rm_type);
         }
 
         if (spec) {
@@ -1692,6 +1787,8 @@ private:
 
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
+
+        admission_init();
 
         // propagate new defaults back to caller
         params = params_base;
@@ -2631,14 +2728,247 @@ private:
         return true;
     }
 
+    static bool env_truthy(const char * name) {
+        const char * v = getenv(name);
+        if (v == nullptr || *v == '\0') {
+            return false;
+        }
+        const std::string s = v;
+        return !(s == "0" || s == "false" || s == "off" || s == "no" || s == "FALSE" || s == "OFF" || s == "NO");
+    }
+
+    static double env_double(const char * name, double def) {
+        const char * v = getenv(name);
+        if (v == nullptr || *v == '\0') {
+            return def;
+        }
+        char * end = nullptr;
+        const double d = strtod(v, &end);
+        if (end == v) {
+            SRV_WRN("ignoring unparsable %s = '%s'\n", name, v);
+            return def;
+        }
+        return d;
+    }
+
+    static bool read_u64_file(const std::string & path, uint64_t & out) {
+        std::ifstream f(path);
+        if (!f) {
+            return false;
+        }
+        uint64_t v = 0;
+        f >> v;
+        if (f.fail()) {
+            return false;
+        }
+        out = v;
+        return true;
+    }
+
+    // [TAG_GTT_ADMISSION]
+    void admission_init() {
+        adm.bar_mib            = env_double("LLAMA_GTT_ADMISSION_MIB",      0.0);
+        adm.slope_b_per_cell   = env_double("LLAMA_GTT_SLOPE_B_PER_CELL",   18432.0);
+        adm.staging_b_per_cell = env_double("LLAMA_GTT_STAGING_B_PER_CELL", 2048.0);
+        adm.step_override_mib  = env_double("LLAMA_GTT_STAGING_STEP_MIB",   -1.0);
+        adm.slack_pct          = env_double("LLAMA_GTT_SLACK_PCT",          env_double("GGML_ALLOC_GROW_SLACK", 0.0));
+        adm.max_wait_s         = env_double("LLAMA_GTT_ADMISSION_MAX_WAIT_S", 600.0);
+        adm.geometric          = env_truthy("GGML_VK_QSA_SCRATCH_PRESIZE") && env_truthy("GGML_VK_QSA_SCRATCH_PRESIZE_FA");
+        adm.holes_full_chunk   = env_truthy("LLAMA_GTT_HOLES_FULL_CHUNK");
+        adm.enabled            = false;
+
+        if (adm.bar_mib <= 0.0) {
+            SRV_INF("%s", "admission: GTT headroom admission off (set LLAMA_GTT_ADMISSION_MIB > 0 to enable)\n");
+            return;
+        }
+
+        const char * env_path = getenv("LLAMA_GTT_USED_PATH");
+        if (env_path != nullptr && *env_path != '\0') {
+            adm.path = env_path;
+        } else {
+            std::vector<std::string> cands;
+            std::error_code ec;
+            for (const auto & e : std::filesystem::directory_iterator("/sys/class/drm", ec)) {
+                const std::string name = e.path().filename().string();
+                if (name.rfind("card", 0) == 0 && name.find('-') == std::string::npos) {
+                    const std::string f = e.path().string() + "/device/mem_info_gtt_used";
+                    if (std::filesystem::exists(f, ec)) {
+                        cands.push_back(f);
+                    }
+                }
+            }
+            std::sort(cands.begin(), cands.end());
+            if (!cands.empty()) {
+                adm.path = cands.front();
+            }
+        }
+
+        uint64_t used = 0;
+        if (adm.path.empty() || !read_u64_file(adm.path, used)) {
+            SRV_WRN("admission: GTT usage not readable (path = '%s') - headroom admission disabled\n", adm.path.c_str());
+            return;
+        }
+
+        adm.enabled = true;
+        SRV_INF("admission: GTT headroom admission on: bar = %.0f MiB, slope = %.0f B/cell, step = max(explicit %.0f MiB, geometric %s, slack %.1f %% x slope x cells) when growing, max wait = %.0f s, holes = %s, used now = %.0f MiB (%s)\n",
+                adm.bar_mib, adm.slope_b_per_cell, std::max(0.0, adm.step_override_mib),
+                adm.geometric ? string_format("0.25 x %.0f B/cell x cells", adm.staging_b_per_cell).c_str() : "off",
+                adm.slack_pct, adm.max_wait_s, adm.holes_full_chunk ? "full chunk" : "first-fit",
+                used / 1024.0 / 1024.0, adm.path.c_str());
+
+        metrics.admission_enabled = 1;
+        metrics.admission_bar_mib = adm.bar_mib;
+    }
+
+    // cells resident in the KV pool: every slot's cached tokens (idle slots keep theirs)
+    int64_t admission_resident_cells() const {
+        int64_t n = 0;
+        for (const auto & s : slots) {
+            n += s.prompt.n_tokens();
+        }
+        return n;
+    }
+
+    // ADM_DEFER keeps the slot's prompt out of this batch (re-checked on the next iteration)
+    admission_result admission_check(server_slot & slot, int32_t n_room) {
+        const int64_t n_chunk = std::min<int64_t>((int64_t) slot.task->n_tokens() - slot.prompt.n_tokens(), n_room);
+        if (n_chunk <= 0) {
+            return ADM_ADMIT;
+        }
+
+        const int64_t t_now = ggml_time_us();
+
+        auto admitted = [&](const char * why, double projected) {
+            metrics.admission_last_deferred = 0;
+            if (slot.adm_deferred) {
+                SRV_INF("admission: admitted slot %d after %.1f s (%s, projected %.0f MiB, bar %.0f MiB)\n",
+                        slot.id, (t_now - slot.adm_t_defer_us) / 1e6, why, projected, adm.bar_mib);
+                slot.adm_deferred = false;
+            }
+            return ADM_ADMIT;
+        };
+
+        uint64_t used_b = 0;
+        if (!read_u64_file(adm.path, used_b)) {
+            SRV_WRN("admission: GTT usage no longer readable (path = '%s') - headroom admission disabled\n", adm.path.c_str());
+            adm.enabled = false;
+            metrics.admission_enabled = 0;
+            return admitted("GTT usage unreadable, admission disabled", 0.0);
+        }
+
+        const int64_t n_ctx_pool = (int64_t) llama_n_ctx(ctx_tgt);
+        const int64_t resident   = admission_resident_cells();
+        adm.hw_cells = std::max(adm.hw_cells, resident);
+
+        const int64_t cells_after = std::min(resident + n_chunk, n_ctx_pool);
+        int64_t growth = std::max<int64_t>(0, cells_after - adm.hw_cells);
+        if (adm.holes_full_chunk && resident < adm.hw_cells) {
+            growth = n_chunk;
+        }
+        growth = std::min(growth, std::max<int64_t>(0, n_ctx_pool - adm.hw_cells));
+
+        const double used_mib = used_b / 1024.0 / 1024.0;
+
+        double step_mib = 0.0;
+        if (growth > 0) {
+            step_mib = std::max(step_mib, adm.step_override_mib);
+            if (adm.geometric) {
+                step_mib = std::max(step_mib, 0.25 * adm.staging_b_per_cell * (double) cells_after / 1024.0 / 1024.0);
+            }
+            step_mib = std::max(step_mib, adm.slack_pct / 100.0 * adm.slope_b_per_cell * (double) cells_after / 1024.0 / 1024.0);
+        }
+
+        const double projected = used_mib + adm.slope_b_per_cell * (double) growth / 1024.0 / 1024.0 + step_mib;
+
+        slot.adm_projected_mib = projected;
+
+        metrics.admission_last_used_mib      = used_mib;
+        metrics.admission_last_projected_mib = projected;
+
+        if (growth == 0) {
+            return admitted("no new cells past the high-water", projected);
+        }
+
+        if (projected <= adm.bar_mib) {
+            return admitted("under the bar", projected);
+        }
+
+        if (!slot.adm_deferred) {
+            slot.adm_deferred   = true;
+            slot.adm_t_defer_us = t_now;
+            slot.adm_t_log_us   = 0;
+            metrics.admission_deferred_total++;
+        }
+
+        const double waited_s = (t_now - slot.adm_t_defer_us) / 1e6;
+
+        if (adm.max_wait_s > 0.0 && waited_s > adm.max_wait_s) {
+            SRV_WRN("admission: rejected slot %d after %.1f s (projected %.0f MiB > bar %.0f MiB, max wait %.0f s)\n",
+                    slot.id, waited_s, projected, adm.bar_mib, adm.max_wait_s);
+            slot.adm_deferred = false;
+            metrics.admission_last_deferred = 0;
+            metrics.admission_rejected_total++;
+            return ADM_REJECT;
+        }
+
+        adm.deferred_this_iter = true;
+        metrics.admission_last_deferred = 1;
+
+        if (slot.adm_t_log_us == 0 || t_now - slot.adm_t_log_us > 10 * 1000 * 1000) {
+            slot.adm_t_log_us = t_now;
+            SRV_WRN("admission: deferred slot %d (projected %.0f MiB > bar %.0f MiB: used %.0f + %" PRId64 " new cells x %.0f B + step %.0f; chunk %" PRId64 " tokens, resident %" PRId64 ", high-water %" PRId64 ", waiting %.1f s)\n",
+                    slot.id, projected, adm.bar_mib, used_mib, growth, adm.slope_b_per_cell, step_mib,
+                    n_chunk, resident, adm.hw_cells, waited_s);
+        }
+        return ADM_DEFER;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // [TAG_CKPT_KEEP_SAME_POS] (v33 fix round 1) a checkpoint that already exists at this position is the one just
+        //   restored (a checkpoint the live state has moved past is erased on the next rewind, and a prompt cannot pass
+        //   the same position twice without one), so its content is identical - keep it instead of re-copying the
+        //   recurrent state (112.6 MiB device -> host on prod) on every follow-up; only re-own it for the min-step rule.
+        {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            for (auto & ckpt : slot.prompt.checkpoints) {
+                if (ckpt.n_tokens == n_tokens_new && ckpt.pos_max == pos_max && ckpt.pos_min == pos_min) {
+                    ckpt.id_task = id_task;
+                    slot.ckpt_pinned_n_tokens = ckpt.n_tokens; // [TAG_CKPT_PIN_RESTORED]
+                    SLT_INF(slot, "context checkpoint at n_tokens = %" PRId64 " already present - kept, no copy (size = %.3f MiB)\n",
+                            ckpt.n_tokens, (float) ckpt.size() / 1024 / 1024);
+                    return;
+                }
+            }
+        }
+
+        // [TAG_CKPT_28302] (v33, upstream 5d806aa25 / #28302, de-duplication moved first so that a superseded
+        //   same-position checkpoint frees its entry before the capacity loop below could evict the oldest one).
+        //   Retention side effect: the spacing rule no longer thins a non-full list, so a slot keeps up to
+        //   n_ctx_checkpoints checkpoints (hard cap unchanged); host RAM per slot <= n_ctx_checkpoints x one
+        //   checkpoint (with [TAG_CKPT_NO_DFT]: ~112.6 MiB each on the prod model -> 0.44 GiB/slot at --ctx-checkpoints 4).
+        // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
+        {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+                if (it->n_tokens == n_tokens_new) {
+                    SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    it = slot.prompt.checkpoints.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
+        // only when the list is full, otherwise short prompts keep just the oldest checkpoint
         int64_t last = -1;
-        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+        for (auto it = slot.prompt.checkpoints.begin();
+                slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
+                it != slot.prompt.checkpoints.end(); ) {
             if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
@@ -2651,14 +2981,26 @@ private:
             ++it;
         }
 
+        // [TAG_CKPT_PIN_RESTORED] (v33 fix round 2) the list is kept in ascending position order - the restore search
+        //   (rbegin, first usable) and the min-step loop above rely on it - so the checkpoint this task restored is
+        //   NOT moved to the back; instead the capacity eviction takes the oldest checkpoint other than it. Without
+        //   this, a follow-up that restores the lowest surviving checkpoint (the branch point of the conversation)
+        //   and then creates n_ctx_checkpoints new ones evicted that branch point first. Exempting all current-task
+        //   entries (like the min-step loop) would not help: after a keep, every entry the follow-up adds is
+        //   current-task too, so the fallback would again be the front.
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            auto victim = slot.prompt.checkpoints.begin();
+            if (slot.prompt.checkpoints.size() > 1 && victim->n_tokens == slot.ckpt_pinned_n_tokens) {
+                ++victim;
+            }
+            const auto & cur = *victim;
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB%s)\n",
+                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
+                    victim == slot.prompt.checkpoints.begin() ? "" : "; skipped the pinned restored checkpoint");
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(victim);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
@@ -2671,14 +3013,18 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (!ckpt_skip_dft) {
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        } // else [TAG_CKPT_NO_DFT]: data_dft stays empty, the restore rewinds the draft KV instead
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
-        SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+        SLT_INF(slot,
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB: tgt %.3f + dft %.3f + spec %.3f)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
+                (float) cur.data_tgt.size() / 1024 / 1024, (float) cur.data_dft.size() / 1024 / 1024,
+                (float) cur.data_spec.size() / 1024 / 1024);
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -3156,6 +3502,12 @@ private:
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
 
+        // [TAG_GTT_ADMISSION] everything runnable is deferred: nothing to decode (the decode loop below is skipped),
+        //   so back off a little instead of spinning on NEXT_RESPONSE
+        if (adm.deferred_this_iter && batch.size() == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
         if (batch.slot_batched) {
             auto & slot_batched      = batch.slot_batched;
             auto & alora_scale       = batch.alora_scale;
@@ -3218,6 +3570,8 @@ private:
     }
 
     void pre_decode() {
+        adm.deferred_this_iter = false;
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3535,6 +3889,13 @@ private:
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
 
+                        slot.b0_pending       = true;
+                        slot.b0_n_cached_live = slot.prompt.n_tokens();
+                        slot.b0_ckpt_n_tokens = -1;
+                        slot.b0_full_reset    = false;
+                        slot.b0_prefix_match  = 0;
+                        slot.ckpt_pinned_n_tokens = -1;
+
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
@@ -3660,6 +4021,8 @@ private:
                                 n_past = 0;
                             }
 
+                            slot.b0_prefix_match = n_past;
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -3739,16 +4102,32 @@ private:
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                        if (ctx_dft && ckpt_skip_dft && it->data_dft.empty()) {
+                                            // [TAG_CKPT_NO_DFT] every surviving checkpoint is a prefix of the live tokens (the
+                                            //   pos_max > pos_next ones are erased below), so the live draft KV already holds
+                                            //   positions <= pos_max as the checkpoint saw them - drop what lies past it
+                                            if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, it->pos_max + 1, -1)) {
+                                                // cannot happen for a PART cache; if it does, drop the draft sequence (drafts
+                                                // degrade until it refills, the target is unaffected) instead of aborting
+                                                SLT_WRN(slot, "draft KV rewind to pos %d refused - resetting the draft sequence\n", it->pos_max);
+                                                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+                                            }
+                                        } else {
+                                            it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                        }
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        slot.b0_ckpt_n_tokens = it->n_tokens;
+                                        slot.ckpt_pinned_n_tokens = it->n_tokens; // [TAG_CKPT_PIN_RESTORED]
+                                        SLT_INF(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB: tgt %.3f + dft %.3f + spec %.3f)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024,
+                                                (float) it->data_tgt.size() / 1024 / 1024, (float) it->data_dft.size() / 1024 / 1024, (float) it->data_spec.size() / 1024 / 1024);
                                     }
 
                                     if (do_reset) {
+                                        slot.b0_full_reset = true;
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
@@ -3804,6 +4183,22 @@ private:
                         }
                     }
 
+                    // [TAG_GTT_ADMISSION] keep the prompt queued while its next ubatch would push GTT past the bar
+                    if (adm.enabled) {
+                        const auto adm_res = admission_check(slot, n_batch - batch.size());
+                        if (adm_res == ADM_DEFER) {
+                            return;
+                        }
+                        if (adm_res == ADM_REJECT) {
+                            send_error(slot,
+                                    string_format("GTT headroom: prompt deferred for more than %.0f s (projected %.0f MiB > bar %.0f MiB), retry later",
+                                        adm.max_wait_s, slot.adm_projected_mib, adm.bar_mib),
+                                    ERROR_TYPE_UNAVAILABLE);
+                            slot.release();
+                            return;
+                        }
+                    }
+
                     // note: the prompt timing is advanced in post_decode(), so it does not cover
                     //       the tokens added to the batch below
                     slot.print_timings_pp();
@@ -3826,6 +4221,31 @@ private:
                         slot.prompt.checkpoints.clear();
 
                         slot.stats.n_prompt_cached = 0;
+
+                        slot.b0_full_reset = true;
+                    }
+
+                    // [TAG_B0_RESTORE_LOG] (v33 B0) one line per prompt-processing task: how much of the common prefix
+                    //   is re-processed. replayed = prefix_match - n_past_restored (tokens that matched the live state
+                    //   but are decoded again because the recurrent state could only be restored at an earlier point),
+                    //   ~ n_ubatch when the n - (4 + n_ubatch) checkpoint was used, ~ 4 for n - 4.
+                    if (slot.b0_pending) {
+                        slot.b0_pending = false;
+
+                        const int32_t n_restored = slot.prompt.n_tokens();
+                        const int32_t replayed   = std::max(0, slot.b0_prefix_match - n_restored);
+                        const int32_t n_new      = std::max(0, slot.task->n_tokens() - std::max(slot.b0_prefix_match, n_restored));
+
+                        metrics.n_prompt_restores       += slot.b0_ckpt_n_tokens >= 0 ? 1 : 0;
+                        metrics.n_prompt_replayed_tokens += replayed;
+
+                        const std::string ckpt_str = slot.b0_ckpt_n_tokens >= 0
+                            ? string_format("checkpoint at %" PRId64, slot.b0_ckpt_n_tokens)
+                            : slot.b0_full_reset ? std::string("no checkpoint, full reset") : std::string("live state, no checkpoint");
+
+                        SLT_INF(slot, "restore: slot %d n_past_restored=%d prefix_match=%d replayed=%d tokens (%s; cached_live=%d, new=%d, prompt=%d)\n",
+                                slot.id, n_restored, slot.b0_prefix_match, replayed, ckpt_str.c_str(),
+                                slot.b0_n_cached_live, n_new, slot.task->n_tokens());
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -3965,6 +4385,10 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+
+                    if (adm.enabled) {
+                        adm.hw_cells = std::max(adm.hw_cells, admission_resident_cells());
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
