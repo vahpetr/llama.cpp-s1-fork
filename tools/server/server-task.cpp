@@ -1615,6 +1615,11 @@ std::string server_task_result_metrics::to_metrics() {
             "GTT headroom admission: prompts that had to wait for headroom (one per deferral episode)",
             (double) metrics.admission_deferred_total
         },
+        {
+            "admission_rejected_total",
+            "GTT headroom admission: prompts rejected (503) after waiting longer than LLAMA_GTT_ADMISSION_MAX_WAIT_S",
+            (double) metrics.admission_rejected_total
+        },
     };
 
     const std::vector<metric_item> gauges = {

@@ -517,6 +517,7 @@ struct server_metrics {
     uint64_t admission_enabled            = 0;
     uint64_t admission_last_deferred      = 0;
     uint64_t admission_deferred_total     = 0;  // deferral episodes (one per slot prompt that had to wait)
+    uint64_t admission_rejected_total     = 0;  // prompts rejected with 503 after LLAMA_GTT_ADMISSION_MAX_WAIT_S
     double   admission_bar_mib            = 0.0;
     double   admission_last_used_mib      = 0.0;
     double   admission_last_projected_mib = 0.0;
