@@ -59,24 +59,19 @@ bool kqv_swa_masked(const uint swa_type, const int n_swa, const int p0, const in
     return false;
 }
 
-// the mask value of cell j (of the stream whose planes start at cbase) for token record t
-float kqv_value(const uint cbase, const uint n_kv, const uint j, const ivec4 t, const uint flags, const int n_swa) {
-    const uint sm = uint(kqv_cell_load(cbase + n_kv + j));
+// the mask value for a cell record (p0, sm, x0, y0) and a token record t. x0 / y0 are read only at
+// a causal tie (p0 == t.x), so a caller may pass anything for them when p0 is no token's position.
+float kqv_value_of(const int p0, const uint sm, const int x0, const int y0, const ivec4 t, const uint flags, const int n_swa) {
     if ((sm & uint(t.y)) == 0u) {
         return kqv_neg_inf();
     }
-    const int p0 = kqv_cell_load(cbase + j);
     const int p1 = t.x;
     if ((flags & KQV_FLAG_CAUSAL) != 0u) {
         if (p0 > p1) {
             return kqv_neg_inf();
         }
-        if (p0 == p1) {
-            const int x0 = kqv_cell_load(cbase + 2u * n_kv + j);
-            const int y0 = kqv_cell_load(cbase + 3u * n_kv + j);
-            if (y0 > t.w || (y0 == t.w && x0 > t.z)) {
-                return kqv_neg_inf();
-            }
+        if (p0 == p1 && (y0 > t.w || (y0 == t.w && x0 > t.z))) {
+            return kqv_neg_inf();
         }
     }
     const uint swa_type = (flags >> 2) & 3u;
@@ -87,4 +82,21 @@ float kqv_value(const uint cbase, const uint n_kv, const uint j, const ivec4 t, 
         return kqv_alibi_value(p0 - p1);
     }
     return 0.0;
+}
+
+// the mask value of cell j (of the stream whose planes start at cbase) for token record t, loading
+// the cell planes lazily: seq bits, then pos, then x / y only at a causal tie
+float kqv_value(const uint cbase, const uint n_kv, const uint j, const ivec4 t, const uint flags, const int n_swa) {
+    const uint sm = uint(kqv_cell_load(cbase + n_kv + j));
+    if ((sm & uint(t.y)) == 0u) {
+        return kqv_neg_inf();
+    }
+    const int p0 = kqv_cell_load(cbase + j);
+    int x0 = 0;
+    int y0 = 0;
+    if ((flags & KQV_FLAG_CAUSAL) != 0u && p0 == t.x) {
+        x0 = kqv_cell_load(cbase + 2u * n_kv + j);
+        y0 = kqv_cell_load(cbase + 3u * n_kv + j);
+    }
+    return kqv_value_of(p0, sm, x0, y0, t, flags, n_swa);
 }

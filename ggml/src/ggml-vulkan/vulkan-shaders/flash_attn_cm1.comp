@@ -158,7 +158,7 @@ void stage_v_columns(const uint32_t j, const uint32_t hsv_tile, const uint32_t v
     }
 
 // [TAG_KQ_VIS] a mask element: the plane's, or the same f16 value computed from the metadata
-#define FA_MASK_LOAD(R, COL) (VIS ? float16_t(fa_vis_value((R), (COL))) : data_m[m_offset + fa_mask_row(R) * m_stride + (COL)])
+#define FA_MASK_LOAD(R, COL) (VIS ? float16_t(fa_vis_value_sh((R) - i * Br, (COL) - j * Bc)) : data_m[m_offset + fa_mask_row(R) * m_stride + (COL)])
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
@@ -290,6 +290,10 @@ void main() {
             // Only load if the block is not all zeros
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
                 bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
+
+                if (VIS) {
+                    fa_vis_stage_tile(j);
+                }
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
                 [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
