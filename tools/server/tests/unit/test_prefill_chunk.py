@@ -110,7 +110,7 @@ def co_schedule(s: ServerProcess, prompt: str, n_predict: int = 4, n_gen: int = 
 
 
 def prio_lines(log: str) -> list[tuple[int, int, int, int, str]]:
-    return [(int(m[1]), int(m[2]), int(m[3]), int(m[4]), m[5]) for m in PRIO_RE.findall(log)]
+    return [(int(m[0]), int(m[1]), int(m[2]), int(m[3]), m[4]) for m in PRIO_RE.findall(log)]
 
 
 # (a) a prompt that arrives while another slot decodes is fed in chunks of <= C; without a decoder it is not
@@ -157,6 +157,9 @@ def test_chunked_while_decoding():
     # every prompt token of slot 1 went through a budgeted step
     assert sum(l[2] for l in lines) == n_prompt_1
 
+    print(f"EVIDENCE (a): n_prompt_1={n_prompt_1} prio_lines={len(lines)} first={lines[0]} last={lines[-1]} "
+          f"counters steps={steps_1} tokens={tokens_1} deferred={deferred_1}; solo n_prompt_2={n_prompt_2} decodes={n_steps_2}")
+
     # task 2: every budgeted step is decoded as two calls - the generating tokens first, then the prompt chunk
     splits = [(int(a), int(b), int(c)) for a, b, c in SPLIT_RE.findall(log)]
     assert len(splits) == len(lines)
@@ -180,6 +183,7 @@ def test_single_slot_unchanged():
         contents.append(res.body["content"])
         log = full_log(server)
         assert len(prio_lines(log)) == 0
+    print(f"EVIDENCE (b): outputs identical={contents[0] == contents[1]} len={len(contents[0])}")
     assert contents[0] == contents[1]
 
 
@@ -229,6 +233,8 @@ def test_checkpoint_count_unchanged():
     n_solo,    _,        _           = run(None, co=False)
     n_co,      _,        _           = run(None, co=True)
 
+    print(f"EVIDENCE (d): n_prompt={n_prompt} checkpoints chunked={n_chunked} solo={n_solo} co-scheduled-unchunked={n_co} "
+          f"prio_lines={len(prio_lines(log_chunked))}")
     assert n_prompt > 2 * N_BATCH
     assert len(prio_lines(log_chunked)) >= (n_prompt - (4 + N_BATCH)) // C_EFF    # the tail really was chunked
     assert n_chunked == n_solo
