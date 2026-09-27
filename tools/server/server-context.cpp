@@ -1292,6 +1292,14 @@ private:
 
     enum admission_result { ADM_ADMIT, ADM_DEFER, ADM_REJECT };
 
+    // [TAG_PRIO_CHUNK] (E11) prefill budget while a slot decodes. LLAMA_PREFILL_CHUNK_WITH_DECODE = C > 0: in a step
+    //   that carries generating (decode/verify) tokens, the prompt tokens of the non-exempt slots are capped at C in
+    //   total (decode tokens are never charged). 0/unset = off; values in (0, 64) are raised to 64; >= n_batch = off.
+    //   LLAMA_PREFILL_CHUNK_EXEMPT_SLOTS = comma-separated slot ids whose prefill is never capped (default empty).
+    //   With no generating slot the budget never engages (full n_batch steps as before).
+    int32_t           prio_chunk_c = 0;
+    std::vector<bool> prio_chunk_exempt; // indexed by slot id
+
     common_speculative_ptr spec;
 
     bool add_bos_token = true;
@@ -1772,6 +1780,49 @@ private:
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
+        }
+
+        // [TAG_PRIO_CHUNK]
+        {
+            const int32_t n_batch = llama_n_batch(ctx_tgt);
+
+            const char * env_c = getenv("LLAMA_PREFILL_CHUNK_WITH_DECODE");
+            const int32_t c_req = (env_c && *env_c) ? atoi(env_c) : 0;
+
+            prio_chunk_c = c_req;
+            if (prio_chunk_c > 0 && prio_chunk_c < 64) {
+                prio_chunk_c = 64;
+            }
+            if (prio_chunk_c <= 0 || prio_chunk_c >= n_batch) {
+                prio_chunk_c = 0;
+            }
+
+            prio_chunk_exempt.assign(slots.size(), false);
+            std::string exempt_str;
+            const char * env_ex = getenv("LLAMA_PREFILL_CHUNK_EXEMPT_SLOTS");
+            if (env_ex && *env_ex) {
+                std::stringstream ss(env_ex);
+                std::string item;
+                while (std::getline(ss, item, ',')) {
+                    item = string_strip(item);
+                    if (item.empty()) {
+                        continue;
+                    }
+                    char * end = nullptr;
+                    const long id = strtol(item.c_str(), &end, 10);
+                    if (end == item.c_str() || *end != '\0' || id < 0 || id >= (long) slots.size()) {
+                        SRV_WRN("ignoring invalid LLAMA_PREFILL_CHUNK_EXEMPT_SLOTS entry '%s' (n_slots = %d)\n", item.c_str(), (int) slots.size());
+                        continue;
+                    }
+                    if (!prio_chunk_exempt[id]) {
+                        prio_chunk_exempt[id] = true;
+                        exempt_str += (exempt_str.empty() ? "" : ",") + std::to_string(id);
+                    }
+                }
+            }
+
+            SRV_INF("prio-chunk: LLAMA_PREFILL_CHUNK_WITH_DECODE = %d (requested %d, n_batch = %d, %s), LLAMA_PREFILL_CHUNK_EXEMPT_SLOTS = [%s]\n",
+                    prio_chunk_c, c_req, n_batch, prio_chunk_c > 0 ? "on" : "off", exempt_str.c_str());
         }
 
         if (!params_base.model_alias.empty()) {
@@ -3833,6 +3884,15 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // [TAG_PRIO_CHUNK] prefill budget of this step: engaged only when generating tokens are in the batch
+        const int32_t n_gen_tokens = batch.size();
+        const bool    prio_on      = prio_chunk_c > 0 && !generating.empty();
+
+        int32_t prio_budget_left = prio_chunk_c;
+        int32_t prio_n_charged   = 0; // prompt tokens charged to the budget in this step
+        int32_t prio_n_deferred  = 0; // prompt tokens the budget held back in this step (uncapped room - added)
+        std::string prio_slots_str;
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
@@ -3860,6 +3920,19 @@ private:
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
                     const auto & input_tokens = slot.task->tokens;
+
+                    // [TAG_PRIO_CHUNK] a non-exempt splittable prompt shares the step's prefill budget; the fill limit
+                    //   of this slot is n_batch as before, or the budget that is left on top of what is in the batch.
+                    //   Non-splittable prompts (they must fit one batch whole) are never capped - they would starve.
+                    const bool prio_cap = prio_on && slot.can_split() &&
+                        !(slot.id < (int) prio_chunk_exempt.size() && prio_chunk_exempt[slot.id]);
+
+                    if (prio_cap && prio_budget_left <= 0) {
+                        prio_n_deferred += std::max(0, std::min(slot.task->n_tokens() - slot.prompt.n_tokens(), n_batch - batch.size()));
+                        return; // the budget of this step is spent - the prompt continues next step
+                    }
+
+                    const int32_t n_fill_max = prio_cap ? std::min(n_batch, batch.size() + prio_budget_left) : n_batch;
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
@@ -4185,7 +4258,7 @@ private:
 
                     // [TAG_GTT_ADMISSION] keep the prompt queued while its next ubatch would push GTT past the bar
                     if (adm.enabled) {
-                        const auto adm_res = admission_check(slot, n_batch - batch.size());
+                        const auto adm_res = admission_check(slot, n_fill_max - batch.size());
                         if (adm_res == ADM_DEFER) {
                             return;
                         }
@@ -4325,8 +4398,11 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // [TAG_PRIO_CHUNK] what the uncapped fill could have added (for the deferred-token count)
+                    const int32_t n_room_uncapped = std::max(0, std::min(slot.task->n_tokens() - slot.prompt.n_tokens(), n_batch - batch.size()));
+
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_fill_max) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4385,6 +4461,16 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+
+                    // [TAG_PRIO_CHUNK] charge the budget; the fill was held back only if it stopped at the cap
+                    if (prio_cap) {
+                        prio_budget_left -= n_tokens_cur;
+                        prio_n_charged   += n_tokens_cur;
+                        if (n_fill_max < n_batch && batch.size() >= n_fill_max && slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                            prio_n_deferred += std::max(0, n_room_uncapped - n_tokens_cur);
+                        }
+                        prio_slots_str += string_format("%s%d:%d", prio_slots_str.empty() ? "" : ",", slot.id, n_tokens_cur);
+                    }
 
                     if (adm.enabled) {
                         adm.hw_cells = std::max(adm.hw_cells, admission_resident_cells());
@@ -4448,6 +4534,12 @@ private:
                     slot_batched = &slot;
                 }
             });
+        }
+
+        // [TAG_PRIO_CHUNK] one line per engaged step (a capped prompt was added or held back)
+        if (prio_on && (prio_n_charged > 0 || prio_n_deferred > 0)) {
+            SRV_INF("prio-chunk: n_gen_slots=%d n_gen_tokens=%d n_prompt_tokens=%d budget=%d slots=[%s]\n",
+                    (int) generating.size(), n_gen_tokens, prio_n_charged, prio_chunk_c, prio_slots_str.c_str());
         }
     }
 
