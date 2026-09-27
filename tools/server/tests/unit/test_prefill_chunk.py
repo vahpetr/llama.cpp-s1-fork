@@ -75,7 +75,7 @@ def n_decoded(s: ServerProcess, slot_id: int) -> int:
     return 0
 
 
-def co_schedule(s: ServerProcess, prompt: str, n_predict: int = 4, n_gen: int = 1024) -> tuple[dict, dict]:
+def co_schedule(s: ServerProcess, prompt: str, n_predict: int = 4, n_gen: int = 1024, extra: dict | None = None) -> tuple[dict, dict]:
     """slot 0 generates a long answer; once it is decoding, slot 1 gets `prompt`. Returns both response bodies."""
     out = {}
 
@@ -86,6 +86,7 @@ def co_schedule(s: ServerProcess, prompt: str, n_predict: int = 4, n_gen: int = 
             "n_predict": n_gen,
             "ignore_eos": True,
             "cache_prompt": False,
+            **(extra or {}),
         }, timeout=300)
         out["gen"] = res
 
@@ -100,6 +101,7 @@ def co_schedule(s: ServerProcess, prompt: str, n_predict: int = 4, n_gen: int = 
         "id_slot": 1,
         "n_predict": n_predict,
         "cache_prompt": False,
+        **(extra or {}),
     }, timeout=300)
     assert res1.status_code == 200
     t.join()
@@ -127,7 +129,7 @@ def test_chunked_while_decoding():
     # task 4: counters of the co-scheduled phase
     steps_1    = metric(server, "prefill_chunked_steps_total")
     tokens_1   = metric(server, "prefill_chunked_tokens_total")
-    deferred_1 = metric(server, "prefill_chunk_deferred_tokens_total")
+    deferred_1 = metric(server, "prefill_chunk_deferred_token_steps_total")
     assert steps_1 >= -(-n_prompt_1 // C_EFF)
     assert tokens_1 == n_prompt_1
     assert deferred_1 > 0
@@ -239,3 +241,62 @@ def test_checkpoint_count_unchanged():
     assert len(prio_lines(log_chunked)) >= (n_prompt - (4 + N_BATCH)) // C_EFF    # the tail really was chunked
     assert n_chunked == n_solo
     assert n_chunked <= n_co
+
+
+# (e) review I1: a DRAFTING slot generates while another slot's long prompt is chunked. View 1 carries the verify
+#     batch (1 + n_draft tokens), so verify/accept/restore run before the chunk; the tokens of both slots equal the
+#     un-chunked co-scheduled run at temperature 0 (stories15M_MOE + stories15M-q4_0 draft, as test_speculative.py;
+#     the slot context is capped at the model's n_ctx_train = 256, so the prompt is ~200 tokens and slot 0 makes 200)
+MODEL_DRAFT_FILE_URL = "https://huggingface.co/ggml-org/tiny-llamas/resolve/main/stories15M-q4_0.gguf"
+
+
+def test_chunked_while_drafting():
+    global server
+    draft = download_file(MODEL_DRAFT_FILE_URL)
+
+    def run(env) -> tuple[dict, dict, dict, str]:
+        global server
+        server = ServerPreset.stories15m_moe()
+        server.model_draft = draft
+        server.spec_type = "draft-simple"
+        server.spec_draft_n_min = 4
+        server.spec_draft_n_max = 8
+        server.fa = "off"
+        server.n_slots = 2
+        server.n_ctx = 512
+        server.n_batch = N_BATCH
+        server.n_ubatch = N_BATCH
+        server.temperature = 0.0
+        server.server_slots = True
+        server.server_metrics = True
+        server.env = env
+        fd, server.log_path = tempfile.mkstemp(suffix='.log')
+        os.close(fd)
+        server.start()
+        gen, body1 = co_schedule(server, words(40, 14), n_predict=8, n_gen=200, extra={"return_tokens": True})
+        counters = {k: metric(server, "spec_decode_num_" + k + "_rounds_total") for k in ("verify", "replay", "plain")}
+        counters["chunked_steps"] = metric(server, "prefill_chunked_steps_total")
+        return gen, body1, counters, full_log(server)
+
+    gen_c, body_c, cnt_c, log_c = run({"LLAMA_PREFILL_CHUNK_WITH_DECODE": str(C_REQ)})
+    gen_u, body_u, cnt_u, log_u = run(None)
+
+    lines = prio_lines(log_c)
+    print(f"EVIDENCE (e): prio_lines={len(lines)} max_gen_tokens={max(l[1] for l in lines)} "
+          f"counters chunked={cnt_c} unchunked={cnt_u} draft_n={gen_c['timings']['draft_n']} "
+          f"accepted={gen_c['timings']['draft_n_accepted']} tokens_equal={gen_c['tokens'] == gen_u['tokens']}/{body_c['tokens'] == body_u['tokens']}")
+
+    assert body_c["timings"]["prompt_n"] > 2 * C_EFF
+    # the prompt was chunked, and at least one budgeted step carried a verify batch (> 1 generating token)
+    assert len(lines) >= -(-body_c["timings"]["prompt_n"] // C_EFF)
+    assert all(0 < l[2] <= C_EFF for l in lines)
+    assert max(l[1] for l in lines) > 1
+    assert cnt_c["chunked_steps"] == len(lines)
+    assert len(prio_lines(log_u)) == 0
+
+    # speculation still works and is exact
+    assert gen_c["timings"]["draft_n"] > 0
+    assert gen_c["timings"]["draft_n_accepted"] > 0
+    assert cnt_c["verify"] > 0
+    assert gen_c["tokens"] == gen_u["tokens"]
+    assert body_c["tokens"] == body_u["tokens"]

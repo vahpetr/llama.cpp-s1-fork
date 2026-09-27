@@ -3586,12 +3586,14 @@ private:
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
+        bool prio_split_logged = false; // [TAG_PRIO_CHUNK] once per step, also when view 1 is retried
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             // [TAG_PRIO_CHUNK] with the prefill budget engaged, cut the views at the decode/prompt boundary: the
             //   generating slots are decoded, synced and sampled (post_decode) before the prompt chunk is submitted
             const int32_t n_end    = (batch.n_gen > 0 && off < batch.n_gen) ? batch.n_gen : batch.size();
             const int32_t n_tokens = std::min(n_batch, n_end - off);
-            if (batch.n_gen > 0 && off == 0) {
+            if (batch.n_gen > 0 && !prio_split_logged) {
+                prio_split_logged = true;
                 SRV_DBG("prio-chunk: split decode view [0, %d) + prompt view [%d, %d)\n", batch.n_gen, batch.n_gen, batch.size());
             }
             try {
@@ -4517,9 +4519,13 @@ private:
 
                     // [TAG_PRIO_CHUNK] near_prompt_end bypasses the min-step rule, so C-token chunks would take a
                     //   checkpoint at every chunk of the last n_ubatch tokens (and evict older ones). With the budget
-                    //   engaged, a checkpoint is taken only where the un-chunked schedule takes one: at a user start,
-                    //   at the first step of this prompt, or at the n - (4 + n_ubatch) / n - 4 breaks below.
-                    if (prio_cap && do_checkpoint && !is_user_start && n_tokens_start != (int32_t) slot.stats.n_prompt_cached) {
+                    //   engaged, a checkpoint is taken only where the un-chunked schedule takes one: at a user start
+                    //   the fill loop would break at (the last user message, or min-step past the last checkpoint - a
+                    //   chunk boundary can land on any other user start by chance), at the first step of this prompt,
+                    //   or at the n - (4 + n_ubatch) / n - 4 breaks below.
+                    const bool prio_user_break = is_user_start && (is_last_user_message || slot.prompt.checkpoints.empty() ||
+                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    if (prio_cap && do_checkpoint && !prio_user_break && n_tokens_start != (int32_t) slot.stats.n_prompt_cached) {
                         bool at_break = false;
                         for (const int offset : {4 + n_ubatch, 4}) {
                             at_break |= n_tokens_start == slot.task->n_tokens() - std::min(n_batch, offset);
@@ -4571,7 +4577,7 @@ private:
         if (prio_on && (prio_n_charged > 0 || prio_n_deferred > 0)) {
             metrics.n_prefill_chunked_steps   += 1;
             metrics.n_prefill_chunked_tokens  += prio_n_charged;
-            metrics.n_prefill_deferred_tokens += prio_n_deferred;
+            metrics.n_prefill_deferred_token_steps += prio_n_deferred;
 
             SRV_INF("prio-chunk: n_gen_slots=%d n_gen_tokens=%d n_prompt_tokens=%d budget=%d slots=[%s]\n",
                     (int) generating.size(), n_gen_tokens, prio_n_charged, prio_chunk_c, prio_slots_str.c_str());

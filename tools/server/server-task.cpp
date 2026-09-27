@@ -1619,9 +1619,9 @@ std::string server_task_result_metrics::to_metrics() {
             "Priority chunking: prompt tokens decoded in capped steps (tokens per chunk = this / steps)",
             (double) metrics.n_prefill_chunked_tokens
         }, {
-            "prefill_chunk_deferred_tokens_total",
-            "Priority chunking: prompt tokens the budget held back (un-capped room minus tokens added)",
-            (double) metrics.n_prefill_deferred_tokens
+            "prefill_chunk_deferred_token_steps_total",
+            "Priority chunking: token-steps the budget held back (per capped step, un-capped room minus tokens added; a waiting prompt counts once per step)",
+            (double) metrics.n_prefill_deferred_token_steps
         }, {
             "admission_deferred_total",
             "GTT headroom admission: prompts that had to wait for headroom (one per deferral episode)",
