@@ -9,9 +9,16 @@
 // invisible to the records), holes, seqless used cells, multi-seq cells, M-RoPE ext; ubatches unified and per-stream
 // blocks, 1-D and 2-D positions, and rejected ones (a seq id >= 32, a block mixing streams). Every check also compares
 // seq_mask32(i) against the 32 seq_has tests for EVERY cell (empty ones included), so a stale shadow word is caught
-// before a later pos_set could expose it. A negative control requires one flipped seq bit to be detected.
+// before a later pos_set could expose it.
+// Negative controls: (1) one flipped seq bit must be detected; (2) a mutant fill (get_vis<false>: no empty-cell mask) runs
+// through the same comparison and must be detected, only in the x / y planes of empty cells (the stale ext a pos_add below
+// 0 leaves behind), at least once.
+// Rebase tripwire: the write statements of seq[...] and of its shadow seq_lo[...] in src/llama-kv-cells.h (comments and
+// string literals stripped) must be equally many - on an upstream sync, every seq[ write needs its seq_lo twin.
+// Debug builds (NDEBUG undefined: asserts, incl. the seq_lo check in get_vis / seq_mask32) cap the default workload to
+// 100 rounds without the prod-sized pools; pass "full" as the third argument for the Release workload.
 //
-// usage: test-kq-vis-fill-equiv [n_rounds = 300] [seed = 42]
+// usage: test-kq-vis-fill-equiv [n_rounds = 300 (Debug: 100)] [seed = 42] [full]
 
 #include "ggml.h"
 
@@ -28,8 +35,16 @@
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <fstream>
 #include <random>
+#include <regex>
+#include <sstream>
+#include <string>
 #include <vector>
+
+#ifndef LLAMA_KV_CELLS_H_PATH
+#define LLAMA_KV_CELLS_H_PATH ""
+#endif
 
 namespace {
 
@@ -49,6 +64,7 @@ struct stats_t {
     uint64_t cells_empty = 0, cells_seqless = 0, cells_multi = 0, cells_hi_only = 0, emptied_by_shift = 0;
     uint64_t op_count[16] = {};
     uint64_t diff = 0, shadow_diff = 0, ctrl_runs = 0, ctrl_detected = 0;
+    uint64_t mut_runs = 0, mut_detected = 0, mut_words = 0, mut_misplaced = 0;
 };
 
 // mostly low ids (visible), some in [8, 32), some >= 32 (invisible to the records)
@@ -280,6 +296,72 @@ void random_op(std::vector<llama_kv_cells> & v, rng_t & rng, int n_seq_hint, boo
     }
 }
 
+// negative control 2: the real fill, then every stream block's cell planes rewritten by get_vis<false> (no empty-cell mask:
+// an empty cell keeps its stale ext in the x / y planes)
+bool fill_mutant_nomask(int32_t * cells_data, int32_t * toks_data, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch,
+        const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream) {
+    const bool ok = llama_kv_cells_fill_kq_vis(cells_data, toks_data, n_kv, n_stream, ubatch, v_cells, seq_to_stream);
+    if (!ok) {
+        return ok;
+    }
+    const int64_t n_tps = ubatch->n_tokens/n_stream;
+    for (int64_t s = 0; s < n_stream; ++s) {
+        int32_t * c = cells_data + 4*s*n_kv;
+        v_cells[seq_to_stream[ubatch->seq_id[s*n_tps][0]]].get_vis<false>((uint32_t) n_kv, c, c + n_kv, c + 2*n_kv, c + 3*n_kv);
+    }
+    return ok;
+}
+
+// rebase tripwire: count the write statements of seq[...] and seq_lo[...] in llama-kv-cells.h; 0 = equal (and > 0)
+int tripwire() {
+    std::string path = LLAMA_KV_CELLS_H_PATH;
+    if (path.empty()) {
+        path = __FILE__;
+        path = path.substr(0, path.find_last_of("/\\") + 1) + "../src/llama-kv-cells.h";
+    }
+    std::ifstream in(path);
+    if (!in) {
+        fprintf(stderr, "tripwire: cannot open %s\n", path.c_str());
+        return 1;
+    }
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string src = ss.str();
+
+    // strip // and /* */ comments and string literals
+    std::string code;
+    for (size_t i = 0; i < src.size(); ) {
+        if (src.compare(i, 2, "//") == 0) {
+            const size_t e = src.find('\n', i);
+            i = e == std::string::npos ? src.size() : e;
+        } else if (src.compare(i, 2, "/*") == 0) {
+            const size_t e = src.find("*/", i + 2);
+            i = e == std::string::npos ? src.size() : e + 2;
+        } else if (src[i] == '"') {
+            size_t j = i + 1;
+            while (j < src.size() && src[j] != '"') {
+                j += src[j] == '\\' ? 2 : 1;
+            }
+            code += "\"\"";
+            i = j + 1;
+        } else {
+            code += src[i++];
+        }
+    }
+
+    // a write: assignment (incl. compound) to an element, or a mutating bitset call on it
+    const std::regex re_seq   (R"(\bseq\s*\[[^\]]*\]\s*(?:[&|^]?=(?!=)|\.\s*(?:set|reset|flip)\s*\())");
+    const std::regex re_seq_lo(R"(\bseq_lo\s*\[[^\]]*\]\s*[&|^]?=(?!=))");
+    const auto count = [&](const std::regex & re) {
+        return (int) std::distance(std::sregex_iterator(code.begin(), code.end(), re), std::sregex_iterator());
+    };
+    const int n_seq = count(re_seq), n_lo = count(re_seq_lo);
+    const bool ok = n_seq > 0 && n_seq == n_lo;
+    printf("  rebase tripwire (%s): %d seq[...] write statements, %d seq_lo[...] write statements -> %s\n", path.c_str(), n_seq, n_lo,
+            ok ? "paired" : "MISMATCH: on upstream sync, pair every seq[ write in llama-kv-cells.h with a seq_lo update");
+    return ok ? 0 : 1;
+}
+
 struct ubatch_buf {
     std::vector<llama_pos>      pos;
     std::vector<int32_t>        n_seq_id;
@@ -386,6 +468,7 @@ void check(const std::vector<llama_kv_cells> & v, rng_t & rng, const std::vector
     for (auto & x : t_ref) x = (int32_t) rng.g();
     c_new = c_ref;
     t_new = t_ref;
+    std::vector<int32_t> c_mut = c_ref, t_mut = t_ref;
 
     const bool ok_new = llama_kv_cells_fill_kq_vis    (c_new.data(), t_new.data(), n_kv, n_blk, &b.ub, v, seq_to_stream);
     const bool ok_ref = llama_kv_cells_fill_kq_vis_ref(c_ref.data(), t_ref.data(), n_kv, n_blk, &b.ub, v, seq_to_stream);
@@ -409,6 +492,24 @@ void check(const std::vector<llama_kv_cells> & v, rng_t & rng, const std::vector
                     ok_new, ok_ref, n_kv, n_blk, n_tps, (int) is_2d, first);
         }
         st.diff++;
+    }
+
+    // negative control 2 through the same comparison: the mutant must differ only in the x / y planes of empty cells
+    if (ok_ref) {
+        const bool ok_mut = fill_mutant_nomask(c_mut.data(), t_mut.data(), n_kv, n_blk, &b.ub, v, seq_to_stream);
+        st.mut_runs++;
+        bool detected = ok_mut != ok_ref || memcmp(t_mut.data(), t_ref.data(), n_toks_i32*sizeof(int32_t)) != 0;
+        for (size_t k = 0; k < n_cells_i32; ++k) {
+            if (c_mut[k] == c_ref[k]) {
+                continue;
+            }
+            detected = true;
+            st.mut_words++;
+            const int64_t blk = (int64_t) k/(4*n_kv), plane = ((int64_t) k/n_kv)%4, j = (int64_t) k%n_kv;
+            const bool empty_xy = (plane == 2 || plane == 3) && c_ref[(size_t) (4*blk*n_kv + j)] == -1;
+            st.mut_misplaced += !empty_xy;
+        }
+        st.mut_detected += detected;
     }
 }
 
@@ -442,7 +543,12 @@ void control(rng_t & rng, stats_t & st) {
 } // namespace
 
 int main(int argc, char ** argv) {
-    const int      n_rounds = argc > 1 ? atoi(argv[1]) : 300;
+#ifdef NDEBUG
+    const bool capped = argc > 3 && std::string(argv[3]) == "capped";
+#else
+    const bool capped = !(argc > 3 && std::string(argv[3]) == "full");  // Debug: asserts + no optimization
+#endif
+    const int      n_rounds = argc > 1 ? atoi(argv[1]) : (capped ? 100 : 300);
     const uint64_t seed     = argc > 2 ? strtoull(argv[2], nullptr, 10) : 42;
 
     rng_t   rng(seed);
@@ -451,7 +557,7 @@ int main(int argc, char ** argv) {
     for (int round = 0; round < n_rounds; ++round) {
         const uint32_t ns   = 1 + (uint32_t) rng.u(4);
         // mostly small pools (many ops per cell), some large ones (the prod-sized planes)
-        const uint32_t size = round % 100 == 99 ? 131072 + (uint32_t) rng.u(262144) : 16 + (uint32_t) rng.u(rng.p(0.7) ? 512 : 8192);
+        const uint32_t size = round % 100 == 99 && !capped ? 131072 + (uint32_t) rng.u(262144) : 16 + (uint32_t) rng.u(rng.p(0.7) ? 512 : 8192);
         const int n_seq_hint = 1 + (int) rng.u(rng.p(0.7) ? 5 : 32);
 
         std::vector<uint32_t> seq_to_stream(LLAMA_MAX_SEQ);
@@ -484,8 +590,9 @@ int main(int argc, char ** argv) {
         }
     }
 
-    printf("kq-vis-fill-equiv: seed %" PRIu64 ", %d rounds, %" PRIu64 " ops, %" PRIu64 " checks, %" PRIu64 " cell records "
-           "(%.1f MiB) compared\n", seed, n_rounds, st.ops, st.checks, st.cells_cmp, st.bytes_cmp/(1024.0*1024.0));
+    printf("kq-vis-fill-equiv: seed %" PRIu64 ", %d rounds%s, %" PRIu64 " ops, %" PRIu64 " checks, %" PRIu64 " cell records "
+           "(%.1f MiB) compared\n", seed, n_rounds, capped ? " (capped: no prod-sized pools)" : "", st.ops, st.checks, st.cells_cmp,
+           st.bytes_cmp/(1024.0*1024.0));
     printf("  coverage: cells empty %" PRIu64 ", seqless used %" PRIu64 ", multi-seq %" PRIu64 ", only seq ids >= 32 %" PRIu64
            ", emptied by a shift (ext kept) %" PRIu64 "; ubatches 2-D %" PRIu64 ", multi-block %" PRIu64 ", rejected %" PRIu64 "\n",
            st.cells_empty, st.cells_seqless, st.cells_multi, st.cells_hi_only, st.emptied_by_shift, st.is_2d, st.multi_block,
@@ -495,11 +602,15 @@ int main(int argc, char ** argv) {
         printf(" %" PRIu64, st.op_count[k]);
     }
     printf("\n");
-    printf("  differing fills %" PRIu64 ", shadow mismatches %" PRIu64 ", negative control %" PRIu64 "/%" PRIu64 " detected\n",
+    printf("  differing fills %" PRIu64 ", shadow mismatches %" PRIu64 ", negative control (flipped seq bit) %" PRIu64 "/%" PRIu64 " detected\n",
            st.diff, st.shadow_diff, st.ctrl_detected, st.ctrl_runs);
+    printf("  mutant fill (no empty-cell mask): detected in %" PRIu64 "/%" PRIu64 " checks, %" PRIu64 " differing words, "
+           "%" PRIu64 " outside the x / y planes of empty cells\n", st.mut_detected, st.mut_runs, st.mut_words, st.mut_misplaced);
+    const int trip = tripwire();
 
     const bool pass = st.diff == 0 && st.shadow_diff == 0 && st.ctrl_detected == st.ctrl_runs && st.ctrl_runs > 0 &&
-        st.rejected > 0 && st.cells_seqless > 0 && st.cells_hi_only > 0 && st.is_2d > 0 && st.emptied_by_shift > 0;
+        st.rejected > 0 && st.cells_seqless > 0 && st.cells_hi_only > 0 && st.is_2d > 0 && st.emptied_by_shift > 0 &&
+        st.mut_detected > 0 && st.mut_misplaced == 0 && trip == 0;
     printf("%s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

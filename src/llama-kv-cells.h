@@ -382,9 +382,10 @@ public:
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
             seq[i].reset();
+            seq_lo[i] = 0;
 
             seq[i].set(seq_id);
-            seq_lo[i] = seq_lo_bit(seq_id);
+            seq_lo[i] |= seq_lo_bit(seq_id);
             seq_pos_inc(seq_id, pos[i]);
 
             return false;
@@ -435,6 +436,7 @@ public:
     // [TAG_KQ_VIS_FILL] sequence ids 0..31 of cell i as a bit mask (bit s = seq_has(i, s)), O(1)
     uint32_t seq_mask32(uint32_t i) const {
         assert(i < pos.size());
+        assert(seq_lo[i] == seq_lo_of_bitset(i) && "seq_lo out of step with seq: a seq[] write without its seq_lo update");
 
         return seq_lo[i];
     }
@@ -442,9 +444,18 @@ public:
     // [TAG_KQ_VIS_FILL] the visibility metadata of cells [0, n) as four planes (llama_kv_cells_fill_kq_vis):
     // c_pos = pos (-1 = empty), c_seq = seq_mask32, c_x / c_y = ext.x / ext.y; an empty cell gives {-1, 0, 0, 0}.
     // One pass, no branch per cell (the empty test is a select mask), no bitset access.
+    // MASK_EMPTY = false exists only for test-kq-vis-fill-equiv's negative control (empty cells keep their stale ext).
+    template <bool MASK_EMPTY = true>
     void get_vis(uint32_t n, int32_t * __restrict c_pos, int32_t * __restrict c_seq,
                              int32_t * __restrict c_x,   int32_t * __restrict c_y) const {
         assert(n <= pos.size());
+
+#ifndef NDEBUG
+        // rebase guard: every seq[] write must have its seq_lo twin (checked against the bitset itself)
+        for (uint32_t j = 0; j < n; ++j) {
+            assert(seq_lo[j] == seq_lo_of_bitset(j) && "seq_lo out of step with seq: a seq[] write without its seq_lo update");
+        }
+#endif
 
         const llama_pos         * __restrict p  = pos.data();
         const uint32_t          * __restrict sl = seq_lo.data();
@@ -452,7 +463,7 @@ public:
 
         for (uint32_t j = 0; j < n; ++j) {
             const llama_pos pj   = p[j];
-            const uint32_t  keep = pj == -1 ? 0u : ~0u;
+            const uint32_t  keep = !MASK_EMPTY || pj != -1 ? ~0u : 0u;
 
             c_pos[j] = pj;
             c_seq[j] = (int32_t) (sl[j] & keep);
@@ -676,6 +687,11 @@ private:
 
     static uint32_t seq_lo_bit(llama_seq_id s) {
         return s >= 0 && s < 32 ? 1u << s : 0u;
+    }
+
+    // the low 32 bits of seq[i] from the bitset itself (mask + to_ullong, no layout reliance): the debug check of seq_lo
+    uint32_t seq_lo_of_bitset(uint32_t i) const {
+        return (uint32_t) (seq[i] & seq_set_t(0xFFFFFFFFull)).to_ullong();
     }
 
     // the set seq_pos[s][p] tells us how many times the position p is currently present for sequence s
