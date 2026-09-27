@@ -34,20 +34,27 @@
 //     builds the device plane with GGML_OP_KQ_MASK from the metadata and runs the unchanged plane FA
 //     (decode keeps the plane FA's speed); a ubatch with at least that many runs FA over the metadata
 //     (ggml_flash_attn_ext_vis, no plane at all). 0 = always metadata FA; a huge value = always the plane.
-static bool llama_kq_vis_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("LLAMA_KQ_VIS");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    return enabled;
-}
-
 static uint32_t llama_kq_vis_min_tokens() {
     static const uint32_t n = [] {
         const char * env = getenv("LLAMA_KQ_VIS_MIN_TOKENS");
         return env != nullptr ? (uint32_t) strtoul(env, nullptr, 10) : 64u;
     }();
     return n;
+}
+
+static bool llama_kq_vis_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_KQ_VIS");
+        const bool on = env != nullptr && atoi(env) != 0;
+        if (on) {
+            // the proof line for the arm: printed once, at the first graph build (the load-time reserve)
+            LLAMA_LOG_INFO("kq_vis: on (LLAMA_KQ_VIS=1), min_tokens %u (LLAMA_KQ_VIS_MIN_TOKENS): ubatches with >= %u tokens run "
+                    "FA over the cell/token metadata (no mask plane), smaller ones the device KQ_MASK plane; no host mask plane\n",
+                    llama_kq_vis_min_tokens(), llama_kq_vis_min_tokens());
+        }
+        return on;
+    }();
+    return enabled;
 }
 
 // [TAG_KQ_VIS] the class of a ubatch: true = FA over the metadata, false = the KQ_MASK plane
@@ -1128,7 +1135,15 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_vis_cells) {
+        // [TAG_KQ_VIS] (LLAMA_KQ_VIS=1) the mask is computed on the device from the metadata: fill only that
+        if (inp_attn->self_kq_vis_cells->buffer && inp_attn->self_kq_vis_toks->buffer) {
+            const bool ok = mctx->get_attn()->set_input_kq_vis(inp_attn->self_kq_vis_cells, inp_attn->self_kq_vis_toks, ubatch);
+            GGML_ASSERT(ok && "LLAMA_KQ_VIS: ubatch not expressible as KQ metadata (n_seq_max <= 32 was checked at build)");
+        }
+    } else {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1162,6 +1177,11 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    if (inp_attn->self_kq_vis_cells) {
+        // [TAG_KQ_VIS] the bridge class is part of the graph
+        res &= inp_attn->kq_vis_fa == llama_kq_vis_fa_class(params.ubatch, params.cparams);
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2845,6 +2865,9 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
             // the metadata; below, the KQ_MASK node below is the (device) plane the unchanged FA reads.
             // The node is built either way for mask consumers other than FA; unused, it is not computed.
             inp->kq_vis_fa = llama_kq_vis_fa_class(ubatch, cparams);
+
+            LLAMA_LOG_DEBUG("kq_vis: graph n_tokens %u n_kv %lld n_stream %lld -> %s\n", ubatch.n_tokens, (long long) n_kv,
+                    (long long) n_stream, inp->kq_vis_fa ? "FA over metadata (no plane)" : "device KQ_MASK plane + plane FA");
 
             inp->self_kq_mask = ggml_kq_mask(ctx0, inp->self_kq_vis_cells, inp->self_kq_vis_toks,
                     cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, cparams.causal_attn, hparams.use_alibi,
