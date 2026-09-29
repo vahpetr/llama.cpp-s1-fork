@@ -163,6 +163,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-kq-vis-fill-bench.cpp)     # [TAG_KQVIS_PROF] CPU microbench of the KQ mask vs metadata fills (not a ctest)
     llama_build_and_test(test-kq-vis-fill-equiv.cpp) # [TAG_KQ_VIS_FILL] randomized fill equivalence vs the pre-P3-F1 fill
     target_compile_definitions(test-kq-vis-fill-equiv PRIVATE LLAMA_KV_CELLS_H_PATH="${PROJECT_SOURCE_DIR}/src/llama-kv-cells.h") # its rebase tripwire
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        llama_build_and_test(test-ple-direct-read.cpp) # [TAG_PLE_DIRECT] direct-read PLE gather == the mmap bytes (synthetic GGUF)
+        llama_build(test-ple-direct-bench.cpp)         # [TAG_PLE_DIRECT] gather microbench + LRU row/page cache simulation (not a ctest)
+    endif()
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)

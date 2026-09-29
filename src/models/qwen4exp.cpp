@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-ple-direct.h"
 
 #include <algorithm>
 #include <atomic>
@@ -244,6 +245,25 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+
+        // [TAG_PLE_DIRECT] LLAMA_PLE_DIRECT=1 (O_DIRECT) / 2 (buffered pread): open the row reader on the loader's
+        // descriptor of the file that holds the table, while it is still open. Unset/0 = nothing is opened and the graph
+        // is built exactly as before. The memory-fit pass (no_alloc) reads nothing, so it gets no reader.
+        const auto dp = llama_ple_direct_params::from_env();
+        if (dp.mode != 0 && per_layer_tok_embd != nullptr && !ml.no_alloc) {
+            const auto & w = ml.require_weight(ple_name.c_str());
+            std::string err;
+            auto rd = llama_ple_direct_reader::open(ml.files.at(w.idx)->file_id(), w.offs, per_layer_tok_embd->nb[1],
+                                                    per_layer_tok_embd->ne[1], dp, &err);
+            if (rd) {
+                LLAMA_LOG_WARN("ple-direct: on (LLAMA_PLE_DIRECT=%d, dequant on the %s): %s\n", dp.mode,
+                               getenv("LLAMA_PLE_DIRECT_GPU") && atoi(getenv("LLAMA_PLE_DIRECT_GPU")) ? "GPU (LLAMA_PLE_DIRECT_GPU=1)" : "CPU",
+                               rd->describe().c_str());
+                ple_direct = std::shared_ptr<llama_ple_direct_reader>(std::move(rd));
+            } else {
+                LLAMA_LOG_WARN("ple-direct: LLAMA_PLE_DIRECT=%d requested but unavailable (%s) -- mmap gather\n", dp.mode, err.c_str());
+            }
+        }
     }
 
     // MTP tensors sit in the trailing blocks; skip them entirely unless a draft head was asked for
@@ -2463,6 +2483,11 @@ public:
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
 
+    // [TAG_PLE_DIRECT] with a reader: the gathered table rows, [ple_head_dim, ple_n_heads * n_tokens] in the table's
+    // type, and `rows` becomes 0, 1, 2, ... into it; nullptr = the mmap gather (rows index the table itself)
+    ggml_tensor * stage = nullptr;
+    std::vector<int32_t> iota;
+
     const llama_model_qwen4exp & pmodel;
 
     // the predecessor tokens live in the attention KV cells (ext.tok)
@@ -2714,6 +2739,30 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     // [TAG_PLE_ROWID_DUMP] off by default; a no-op unless LLAMA_PLE_DUMP names a file
     qwen4exp_ple_rowid_dump(idx, n_tokens);
 
+    if (stage != nullptr) {
+        // [TAG_PLE_DIRECT] read the rows themselves (the same file bytes the mmap gather reads) into the staged input;
+        // the graph's CPU get_rows then dequantises stage[i] for position i. No madvise: the mapping is not touched
+        // unless a read fails (the reader then copies that row from it).
+        const size_t rs = stage->nb[1];
+        GGML_ASSERT(stage->ne[1] == (int64_t) idx.size() && rs == pmodel.per_layer_tok_embd->nb[1]);
+        const uint8_t * mapped = (const uint8_t *) pmodel.per_layer_tok_embd->data;
+        if (stage->buffer != nullptr && ggml_backend_buffer_is_host(stage->buffer)) {
+            pmodel.ple_direct->gather(idx.data(), (int64_t) idx.size(), (uint8_t *) stage->data, mapped);
+        } else {
+            std::vector<uint8_t> tmp(idx.size() * rs);
+            pmodel.ple_direct->gather(idx.data(), (int64_t) idx.size(), tmp.data(), mapped);
+            ggml_backend_tensor_set(stage, tmp.data(), 0, tmp.size());
+        }
+        if ((int64_t) iota.size() != (int64_t) idx.size()) {
+            iota.resize(idx.size());
+            for (size_t i = 0; i < iota.size(); ++i) {
+                iota[i] = (int32_t) i;
+            }
+        }
+        ggml_backend_tensor_set(rows, iota.data(), 0, iota.size()*ggml_element_size(rows));
+        return;
+    }
+
     // start the page-ins before the upload, so they overlap the rest of set_inputs and the
     // graph nodes that run ahead of blk.1's gather
     qwen4exp_ple_prefetch(pmodel.per_layer_tok_embd, idx);
@@ -2796,6 +2845,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     return conv_input;
 }
 
+// [TAG_PLE_DIRECT] LLAMA_PLE_DIRECT_GPU=1 (with LLAMA_PLE_DIRECT=1|2): leave the staged gather unpinned, so the scheduler
+// runs get_rows(stage, 0..n-1) on the GPU -- the upload is the quantised rows (110 B/row) and the graph loses its
+// mid-graph CPU split (and the GPU drain in front of it), as in upstream PR #29030. The Vulkan Q5_0 dequant computes
+// (q - 16) * d in f32 like dequantize_row_q5_0 (dequant_funcs.glsl; one rounding), but its `v*d + 0` may turn a -0.0 into
+// +0.0: equal values, a different sign of zero -- exact only once the census says so. Default 0 = pinned to the CPU.
+static bool qwen4exp_ple_direct_gpu() {
+    static const bool on = [] {
+        const char * s = getenv("LLAMA_PLE_DIRECT_GPU");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return on;
+}
+
 // [TAG_PLE_HOIST] the gather, verbatim from build_ple. Called either from the graph ctor (hoisted,
 // the default) or from build_ple itself (LLAMA_PLE_HOIST=0). Identical either way -- the only
 // difference is the position of these two nodes in gf.
@@ -2811,10 +2873,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple_gather(
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
     ggml_tensor * rows = ple_inp->rows;
+
+    // [TAG_PLE_DIRECT] with a reader the gather source is a staged input holding exactly this ubatch's rows (same type,
+    // same bytes), and the get_rows is pinned to the CPU backend -- where the mmap gather runs ("1.wgt0") -- so the
+    // split layout, the dequantisation code and every value are the same as with the table as the source
+    const auto & qmodel = static_cast<const llama_model_qwen4exp &>(model);
+    ggml_tensor * src = model.per_layer_tok_embd;
+    if (qmodel.ple_direct) {
+        ple_inp->stage = ggml_new_tensor_2d(ctx0, src->type, src->ne[0], n_heads * n_tokens);
+        ggml_set_name(ple_inp->stage, "ple_stage");
+        ggml_set_input(ple_inp->stage);
+        src = ple_inp->stage;
+    }
     res->add_input(std::move(ple_inp));
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_tensor * emb = ggml_get_rows(ctx0, src, rows);
+    if (qmodel.ple_direct && backend_cpu != nullptr && !qwen4exp_ple_direct_gpu()) {
+        ggml_backend_sched_set_tensor_backend(sched, emb, backend_cpu);
+    }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", il);
 

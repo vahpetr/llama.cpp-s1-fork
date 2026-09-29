@@ -2478,6 +2478,11 @@ struct llama_model_qwen4exp : public llama_model_base {
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    // [TAG_PLE_DIRECT] LLAMA_PLE_DIRECT=1|2: the PLE rows are read from the model file (pread / O_DIRECT + an exact
+    // LRU row cache) into a staged graph input instead of being gathered from the mmap; null = today's mmap gather.
+    // shared_ptr: the reader type stays incomplete here (src/llama-ple-direct.h).
+    std::shared_ptr<struct llama_ple_direct_reader> ple_direct;
 };
 
 struct llama_model_qwen35moe : public llama_model_base {
