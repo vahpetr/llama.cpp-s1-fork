@@ -1573,6 +1573,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                // [TAG_UP28333] a sequence that starts in this batch has no h_{-1}: pair x_0 with zeros (the ctor's
+                // value) instead of the last row of whatever ran before on this seq_id (upstream #28333). A later
+                // batch - incl. the first one after a [TAG_MTP_CKPT_PENDING_H] restore - keeps its carried row.
+                const int32_t i_first = i_batch_beg[seq_id];
+                if (batch_in.pos[i_first] == 0) {
+                    std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+                }
+
                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
             }
 
