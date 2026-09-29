@@ -38,8 +38,10 @@
 //                              [--device NAME] [--dev-layouts N (300)] [--perf] [--perf-reps N (15)] [--perf-nkv a,b,c]
 //                              [--perf-tps a,b (1,6)] [--perf-windows a,b,c (0,65536,16384)] [--perf-ref]
 //   --perf-ref: the window arms (and the dense arm up to n_kv 262144) are checked against an f64 softmax over the visible
-//   cells: nmse <= max(1e-5, the nmse of ggml's CPU FA on the same problem) - the CPU FA accumulates V in f16, so it drifts
-//   with depth; coopmat1 lands at ~1e-7, the scalar path at ~1e-4 with 65k+ visible cells (its class, dense arm alike);
+//   cells with a class-aware bar calibrated on the device's own dense arm at the same n_tps (probe_bar: coopmat1-class
+//   min(1e-5, max(1e-6, 10 x dense)), otherwise max(1e-5, 4 x dense)); the probe data carry 4 sink-like keys and one boosted
+//   live tile, and two negative controls (the reference without the sinks / without that tile) must exceed the bar;
+//   ggml's CPU FA is shown only (it accumulates V in f16);
 //   every probe row counts non-finite outputs (an all-masked split_k chunk must not leak NaN / inf into the reduce)
 
 #include "ggml.h"
@@ -681,7 +683,7 @@ double dev_compute_ms(ggml_cgraph * gf) {
 }
 
 struct dev_stats {
-    uint64_t op_runs = 0, op_diff = 0, fa_runs = 0, fa_vis_diff = 0, fa_bridge_diff = 0, unsupported = 0;
+    uint64_t op_runs = 0, op_diff = 0, fa_runs = 0, fa_vis_diff = 0, fa_bridge_diff = 0, unsupported = 0, neg_runs = 0;
 } g_ds;
 
 // one FA problem on the device: q/k/v random, the ref plane uploaded, the metadata uploaded; three graphs
@@ -692,6 +694,12 @@ struct dev_fa {
     ggml_cgraph * gf_op = nullptr, * gf_plane = nullptr, * gf_vis = nullptr, * gf_bridge = nullptr;
     bool supported = true;
     bool keep_host = false;                     // keep the host Q/K/V (the CPU reference of the skip probe)
+    // the skip probe's structure (boost_sinks > 0): every query row gets its kv head's direction u added (q = u + N(0,1)),
+    // the first boost_sinks cells get K = 0.375 u (score ≈ +6: attention sinks, ≈ 1 % of the softmax mass at 65k visible
+    // cells) and the 64 cells from boost_tile0 get K = 0.1875 u (score ≈ +3: a live tile of weight) - so that a dropped
+    // sink or a dropped live tile moves the output well past the precision class (the negative controls)
+    int64_t boost_sinks = 0;
+    int64_t boost_tile0 = -1;
     std::vector<float>       qh;
     std::vector<ggml_fp16_t> kh, vh;
 
@@ -733,10 +741,30 @@ struct dev_fa {
         std::normal_distribution<float> nd(0.0f, 1.0f);
         std::vector<float> qf((size_t) ggml_nelements(q));
         for (auto & x : qf) x = nd(g_rng);
+        std::vector<float> u;                            // [n_head_kv][D]
+        const int64_t ratio = n_head / n_head_kv;
+        if (boost_sinks > 0) {
+            u.resize((size_t) (n_head_kv*D));
+            for (auto & x : u) x = nd(g_rng);
+            for (int64_t st = 0; st < n_stream; ++st) for (int64_t h = 0; h < n_head; ++h) for (int64_t t = 0; t < n_tps; ++t) {
+                float * qr = qf.data() + ((st*n_head + h)*n_tps + t)*D;
+                for (int64_t d = 0; d < D; ++d) qr[d] += u[(size_t) ((h/ratio)*D + d)];
+            }
+        }
         ggml_backend_tensor_set(q, qf.data(), 0, ggml_nbytes(q));
         std::vector<ggml_fp16_t> kf((size_t) ggml_nelements(k));
         for (ggml_tensor * t : { k, v }) {
             for (auto & x : kf) x = ggml_fp32_to_fp16(nd(g_rng));
+            if (t == k && boost_sinks > 0) {
+                for (int64_t st = 0; st < n_stream; ++st) for (int64_t hk = 0; hk < n_head_kv; ++hk) {
+                    auto put = [&](int64_t j, float beta) {
+                        ggml_fp16_t * kr = kf.data() + ((st*n_head_kv + hk)*n_kv + j)*D;
+                        for (int64_t d = 0; d < D; ++d) kr[d] = ggml_fp32_to_fp16(beta*u[(size_t) (hk*D + d)]);
+                    };
+                    for (int64_t j = 0; j < std::min(boost_sinks, n_kv); ++j) put(j, 0.375f);
+                    for (int64_t j = std::max<int64_t>(boost_tile0, 0); boost_tile0 >= 0 && j < std::min(boost_tile0 + 64, n_kv); ++j) put(j, 0.1875f);
+                }
+            }
             ggml_backend_tensor_set(t, kf.data(), 0, ggml_nbytes(t));
             if (keep_host) {
                 (t == k ? kh : vh) = kf;
@@ -896,15 +924,28 @@ double f64_ref_nmse(const dev_fa & f, const std::vector<uint8_t> & plane_f16, co
 // order, the query tokens last; per (n_kv, n_tps, window): the device time of the bridge FA (device KQ_MASK plane +
 // plane FA, the draft's decode class) and of the metadata FA; plane / vis / bridge outputs bit for bit; non-finite
 // outputs; with ref_check the window arms against FA on the CPU backend (nmse, max |diff|)
+// the accuracy bar of a window arm, class-aware and calibrated on the device's own dense arm at the same n_tps (the last
+// n_kv <= 262144 of the probe): a high-precision device class (dense nmse <= 1e-6: coopmat1 ~8e-8) keeps
+// min(1e-5, max(1e-6, 10 x dense)); anything less precise (the scalar path, ~5e-5 .. 3e-4) is allowed only by calibration,
+// max(1e-5, 4 x dense). No CPU-FA floor (ggml's CPU FA accumulates V in f16 and is far looser at depth).
+double probe_bar(double dense_nmse) {
+    if (dense_nmse < 0) {
+        return 1e-5; // no calibration (the probe's first n_kv > 262144): the high-precision bar
+    }
+    return dense_nmse <= 1e-6 ? std::min(1e-5, std::max(1e-6, 10.0*dense_nmse)) : std::max(1e-5, 4.0*dense_nmse);
+}
+
 void run_dev_perf(const std::vector<int64_t> & nkvs, const std::vector<int64_t> & tps, const std::vector<int64_t> & wins, int reps,
                   bool ref_check, int n_threads) {
     const int64_t D = 256, n_head = 24, n_head_kv = 2;
+    std::map<int64_t, double> dense_cal; // n_tps -> the device's dense-arm nmse vs f64 at the last n_kv <= 262144
     printf("  skip probe on %s (%" PRId64 "/%" PRId64 " heads, D %" PRId64 ", f16 K/V, one sequence in position order, sink 4; ms = median of %d):\n",
            ggml_backend_name(g_dev), n_head, n_head_kv, D, reps);
-    printf("    %8s %5s %7s | %10s %10s | %8s %8s | %9s %17s | %s\n", "n_kv", "n_tps", "window", "bridge ms", "vis ms", "bridge x", "vis x",
-           "nonfinite", "nmse dev/cpu-FA", "identical");
-    printf("    (nmse vs an f64 softmax over the visible cells; dev = the device plane FA = vis = bridge bit for bit; cpu-FA = ggml's CPU FA,"
-           " f16 V accumulator)\n");
+    printf("    %8s %5s %7s | %10s %10s | %8s %8s | %9s | %9s %9s %9s | %9s %9s | %s\n", "n_kv", "n_tps", "window", "bridge ms", "vis ms",
+           "bridge x", "vis x", "nonfinite", "nmse dev", "bar", "cpu-FA", "-sink", "-tile", "identical");
+    printf("    (nmse vs an f64 softmax over the visible cells; dev = the device plane FA = vis = bridge bit for bit; bar = class-aware,"
+           " calibrated on the dense arm; -sink / -tile = the device output against a reference that drops the 4 sinks / one live"
+           " 64-cell tile - must exceed the bar; cpu-FA = ggml's CPU FA, shown only)\n");
     for (int64_t n_kv : nkvs) {
         for (int64_t n_tps : tps) {
             double dense_br = 0, dense_vis = 0;
@@ -934,6 +975,8 @@ void run_dev_perf(const std::vector<int64_t> & nkvs, const std::vector<int64_t> 
                 dev_fa f;
                 // the exact reference: every window arm; the dense arm where the f64 pass stays affordable
                 f.keep_host = ref_check && (N > 0 || n_kv <= 262144);
+                f.boost_sinks = 4;                               // sink-like keys at positions 0..3 (all arms: same data)
+                f.boost_tile0 = n_kv >= 4096 + 128 ? ((n_kv - 4096)/64)*64 : -1; // a live tile ≈ 4096 back: inside every window >= 4160
                 f.build(n_kv, n_tps, 1, D, n_head, n_head_kv, true, false, N ? 1 : 0, N, S, false, ref, cells_rec, toks_rec);
                 if (!f.supported) {
                     printf("    %8" PRId64 " %5" PRId64 " %7u | unsupported\n", n_kv, n_tps, N);
@@ -955,21 +998,44 @@ void run_dev_perf(const std::vector<int64_t> & nkvs, const std::vector<int64_t> 
                 const uint64_t nf = n_nonfinite(a) + n_nonfinite(b) + n_nonfinite(c);
                 CHECK(same, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: plane / vis / bridge outputs differ", n_kv, n_tps, N);
                 CHECK(nf == 0, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: %" PRIu64 " non-finite outputs", n_kv, n_tps, N, nf);
-                char refs[48] = "-";
+                char c_dev[16] = "-", c_bar[16] = "-", c_cpu[16] = "-", c_ns[16] = "-", c_nt[16] = "-";
                 if (f.keep_host) {
                     std::vector<uint8_t> cpu_out;
                     cpu_ref_diff(f, ref, a, D, n_tps, n_head, n_head_kv, n_kv, n_threads, &cpu_out);
                     double cpu_nmse = -1;
                     const double dev_nmse = f64_ref_nmse(f, ref, a, D, n_tps, n_head, n_head_kv, n_kv, n_threads, &cpu_nmse, &cpu_out);
-                    snprintf(refs, sizeof(refs), "%.1e %.1e", dev_nmse, cpu_nmse);
-                    // the bar: no worse than ggml's own CPU FA (the reference test-backend-ops compares backends with), floor 1e-5 -
-                    // the device kernels differ in precision class (coopmat1 ~1e-7; the scalar path ~1e-4 at 65k+ visible cells, the
-                    // same on the dense arm); a visibility error is caught bit for bit by plane (host ref mask) = vis = bridge
-                    CHECK(dev_nmse < std::max(1e-5, cpu_nmse), "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: device vs the f64 "
-                          "reference nmse %.3e > max(1e-5, CPU FA %.3e)", n_kv, n_tps, N, dev_nmse, cpu_nmse);
+                    snprintf(c_dev, sizeof(c_dev), "%.1e", dev_nmse);
+                    snprintf(c_cpu, sizeof(c_cpu), "%.1e", cpu_nmse);
+                    if (N == 0 && n_kv <= 262144) {
+                        dense_cal[n_tps] = dev_nmse; // the calibration of this n_tps
+                    }
+                    const auto it = dense_cal.find(n_tps);
+                    const double bar = probe_bar(it != dense_cal.end() ? it->second : -1.0);
+                    snprintf(c_bar, sizeof(c_bar), "%.1e", bar);
+                    CHECK(dev_nmse <= bar, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: device vs the f64 reference nmse %.3e > the "
+                          "class bar %.3e (dense-arm calibration %.3e)", n_kv, n_tps, N, dev_nmse, bar, it != dense_cal.end() ? it->second : -1.0);
+                    if (N > 0) {
+                        // negative controls: the same device output against a reference that (a) drops the 4 sink cells, (b) drops
+                        // the boosted live tile - both must exceed the bar, or the bar could not see such an error
+                        std::vector<uint8_t> r_ns = ref, r_nt = ref;
+                        for (int64_t t = 0; t < n_tps; ++t) {
+                            for (int64_t j = 0; j < std::min<int64_t>(S, n_kv); ++j) set_neg_inf(r_ns.data() + (size_t) (t*n_kv + j)*2, false);
+                            for (int64_t j = f.boost_tile0; f.boost_tile0 >= 0 && j < f.boost_tile0 + 64; ++j) set_neg_inf(r_nt.data() + (size_t) (t*n_kv + j)*2, false);
+                        }
+                        const double ns = f64_ref_nmse(f, r_ns, a, D, n_tps, n_head, n_head_kv, n_kv, n_threads, nullptr, nullptr);
+                        const double nt = f.boost_tile0 >= 0 ? f64_ref_nmse(f, r_nt, a, D, n_tps, n_head, n_head_kv, n_kv, n_threads, nullptr, nullptr) : -1.0;
+                        snprintf(c_ns, sizeof(c_ns), "%.1e", ns);
+                        snprintf(c_nt, sizeof(c_nt), "%.1e", nt);
+                        CHECK(ns > bar, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: NEGATIVE CONTROL passed - a dropped sink "
+                              "(nmse %.3e) stays under the bar %.3e", n_kv, n_tps, N, ns, bar);
+                        CHECK(f.boost_tile0 < 0 || nt > bar, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: NEGATIVE CONTROL passed - a "
+                              "dropped live tile (nmse %.3e) stays under the bar %.3e", n_kv, n_tps, N, nt, bar);
+                        g_ds.neg_runs++;
+                    }
                 }
-                printf("    %8" PRId64 " %5" PRId64 " %7u | %10.3f %10.3f | %8.2f %8.2f | %9" PRIu64 " %17s | %s\n", n_kv, n_tps, N, mb, mv,
-                       N && dense_br > 0 ? dense_br/mb : 1.0, N && dense_vis > 0 ? dense_vis/mv : 1.0, nf, refs, same ? "yes" : "NO");
+                printf("    %8" PRId64 " %5" PRId64 " %7u | %10.3f %10.3f | %8.2f %8.2f | %9" PRIu64 " | %9s %9s %9s | %9s %9s | %s\n", n_kv, n_tps, N,
+                       mb, mv, N && dense_br > 0 ? dense_br/mb : 1.0, N && dense_vis > 0 ? dense_vis/mv : 1.0, nf, c_dev, c_bar, c_cpu, c_ns, c_nt,
+                       same ? "yes" : "NO");
                 fflush(stdout);
             }
         }
@@ -1068,7 +1134,15 @@ int main(int argc, char ** argv) {
                g_ds.op_diff, g_ds.fa_vis_diff, g_ds.fa_bridge_diff, g_ds.unsupported);
         CHECK(g_ds.op_runs > 0 && g_ds.unsupported == 0, "device: %" PRIu64 " layouts unsupported", g_ds.unsupported);
         if (perf) {
+            // ascending: the dense arm (window 0) of an n_kv <= 262144 calibrates the bar before the deeper rows use it
+            std::sort(perf_nkv.begin(), perf_nkv.end());
+            std::sort(perf_win.begin(), perf_win.end());
             run_dev_perf(perf_nkv, perf_tps, perf_win, perf_reps, perf_ref, n_threads);
+            if (perf_ref) {
+                CHECK(perf_win.front() == 0 && perf_nkv.front() <= 262144, "--perf-ref needs window 0 and an n_kv <= 262144 (the calibration)");
+                CHECK(g_ds.neg_runs > 0, "--perf-ref ran no negative control");
+                printf("  skip probe: %" PRIu64 " window rows with both negative controls (dropped sinks, dropped live tile) above the bar\n", g_ds.neg_runs);
+            }
         }
         printf("  device checks: %s\n", st.fail == fail0 ? "PASS" : "FAIL");
         ggml_backend_free(g_dev);
