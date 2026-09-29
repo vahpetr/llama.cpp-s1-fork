@@ -363,6 +363,7 @@ struct llama_ple_direct_reader::impl {
     size_t  rs       = 0;
     int64_t n_rows   = 0;
     size_t  fsize    = 0;
+    size_t  page     = 4096;
     std::string notes;
 
     ple_row_cache cache;
@@ -465,7 +466,7 @@ std::unique_ptr<llama_ple_direct_reader> llama_ple_direct_reader::open(int fd_sr
     char path[64];
     snprintf(path, sizeof(path), "/proc/self/fd/%d", fd_src);
 
-    // buffered descriptor: the page-cache probe (RWF_NOWAIT) and mode 2; no readahead on it
+    // buffered descriptor: mode 2 (and the same-file check); no readahead on it
     p->fd_buf = ::open(path, O_RDONLY | O_CLOEXEC);
     if (p->fd_buf < 0) {
         return fail(std::string("re-open ") + path + ": " + strerror(errno));
@@ -474,6 +475,7 @@ std::unique_ptr<llama_ple_direct_reader> llama_ple_direct_reader::open(int fd_sr
         return fail("re-opened descriptor is not the model file");
     }
     p->fsize = (size_t) s_src.st_size;
+    p->page  = (size_t) std::max(4096L, sysconf(_SC_PAGESIZE));
     if (file_offs + (size_t) n_rows * row_size > p->fsize) {
         return fail("table extends past the end of the file");
     }
@@ -589,19 +591,33 @@ void llama_ple_direct_reader::gather(const int32_t * ids, int64_t n, uint8_t * d
         I.mrows.resize((size_t) nm * rs);
         I.served.assign(nm, 0);
 
-        // page cache first (mode 1 + nowait): a row whose pages are resident costs one non-blocking syscall
-#if defined(RWF_NOWAIT)
-        if (I.mode == 1 && I.params.nowait && !I.params.fail_reads_for_test) {
+        // page cache first (mode 1 + nowait, needs the mapping): mincore() on the page(s) of the row -- a pure lookup that
+        // can never start I/O -- and a copy through the mapping when they are all resident. (preadv2(RWF_NOWAIT) looked
+        // like the obvious probe but is not one: on a miss the kernel still starts page_cache_sync_readahead() before it
+        // returns EAGAIN, so every probe of a cold row read its 4 KiB page into the page cache on top of the O_DIRECT read
+        // -- measured 2026-09-30: 2.0 GiB of storage reads for 0.26 GiB of O_DIRECT data.) A page evicted between the
+        // mincore and the copy costs a major fault, not a wrong byte.
+        if (I.mode == 1 && I.params.nowait && mmap_rows != nullptr && !I.params.fail_reads_for_test) {
+            const uintptr_t ps = (uintptr_t) I.page;
             for (int64_t m = 0; m < nm; ++m) {
-                struct iovec iov = { I.mrows.data() + (size_t) m * rs, rs };
-                const ssize_t r = preadv2(I.fd_buf, &iov, 1, (off_t) I.row_off(id_at(I.miss[m])), RWF_NOWAIT);
-                if (r == (ssize_t) rs) {
-                    I.served[m] = 1;
-                    n_pc++;
+                const int32_t   id  = id_at(I.miss[m]);
+                const uint8_t * src = mmap_rows + (size_t) id * rs;
+                const uintptr_t b   = (uintptr_t) src & ~(ps - 1);
+                const uintptr_t e   = ((uintptr_t) src + rs + ps - 1) & ~(ps - 1);
+                unsigned char vec[4] = { 0, 0, 0, 0 };
+                if (e - b <= 4 * ps && mincore((void *) b, e - b, vec) == 0) {
+                    bool all = true;
+                    for (uintptr_t k = 0; k < (e - b) / ps; ++k) {
+                        all = all && (vec[k] & 1);
+                    }
+                    if (all) {
+                        memcpy(I.mrows.data() + (size_t) m * rs, src, rs);
+                        I.served[m] = 1;
+                        n_pc++;
+                    }
                 }
             }
         }
-#endif
         // the rest: merged, aligned (O_DIRECT) reads, in file order, spread over the pool
         const size_t A   = I.mode == 1 ? I.align : 1;
         const int    fd  = I.mode == 1 ? I.fd_dio : I.fd_buf;
@@ -715,7 +731,7 @@ std::string llama_ple_direct_reader::describe() const {
              I.mode, I.mode == 1 ? (std::string("O_DIRECT, align ") + std::to_string(I.align)).c_str() : "buffered pread, POSIX_FADV_RANDOM",
              I.cache.data_bytes >> 20, I.cache.cap, (I.cache.slot_bytes + I.cache.tab_bytes) >> 20,
              I.params.mlock_cache ? " mlock requested" : "", I.params.n_threads,
-             (I.mode == 1 && I.params.nowait) ? "on (RWF_NOWAIT)" : "off",
+             (I.mode == 1 && I.params.nowait) ? "on (mincore on the mapping)" : "off",
              I.n_rows, I.rs, I.offs, I.notes.empty() ? "" : "; ", I.notes.c_str());
     return b;
 }

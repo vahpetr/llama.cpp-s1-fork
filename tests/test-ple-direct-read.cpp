@@ -3,7 +3,7 @@
 // file-offset misalignments, the last one ending exactly at EOF (O_DIRECT short read).
 //
 // For every reader configuration -- mode 1 (O_DIRECT, falls back to buffered where the file system refuses it) with and
-// without the RWF_NOWAIT page-cache probe, mode 2 (buffered pread) -- x row cache {none, 3 rows, 1000 rows, larger
+// without the page-cache probe (mincore on the mapping), mode 2 (buffered pread) -- x row cache {none, 3 rows, 1000 rows, larger
 // than the table} x reader threads {1, 4, 16}, it gathers random and adversarial id sets (first / last rows, rows
 // straddling 512 B and 4 KiB boundaries, all-equal, runs of adjacent rows (merged reads), descending, heavy duplicates,
 // a Zipf stream of decode-sized gathers that cycles the LRU, one prefill-sized gather) and compares the output byte for
@@ -180,6 +180,7 @@ int main(int argc, char ** argv) {
 
     std::mt19937_64 rng(42);
     int n_readers = 0;
+    uint64_t pc_probe_hits = 0, pc_probe_dev = 0;
     std::string modes_seen;
     for (int mode : { 1, 2 }) {
         for (int nowait : { 0, 1 }) {
@@ -189,10 +190,15 @@ int main(int argc, char ** argv) {
             for (int64_t cache_rows : { (int64_t) 0, (int64_t) 3, (int64_t) 1000, (int64_t) 1 << 22 }) {
                 for (int th : { 1, 4, 16 }) {
                     for (size_t ti = 0; ti < tabs.size(); ++ti) {
-                        const auto & t = tabs[ti];
                         // cold file cache for every reader: the page-cache probe then meets both resident rows (those
-                        // the comparison has touched through the mapping since) and cold ones that go to the device
+                        // the comparison has touched through the mapping since) and cold ones that go to the device.
+                        // DONTNEED skips pages that are mapped, so the reference mapping is dropped and re-made around it.
+                        munmap(const_cast<uint8_t *>(map), fsize);
                         posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+                        map = (const uint8_t *) mmap(nullptr, fsize, PROT_READ, MAP_SHARED, fd, 0);
+                        CHECK(map != MAP_FAILED, "re-map failed");
+                        for (auto & tb : tabs) { tb.rows = map + tb.info.offs; }
+                        const auto & t = tabs[ti];
                         llama_ple_direct_params p;
                         p.mode        = mode;
                         p.nowait      = nowait != 0;
@@ -214,11 +220,18 @@ int main(int argc, char ** argv) {
                         char what[96];
                         snprintf(what, sizeof(what), "mode %d nowait %d cache %" PRId64 " rows threads %d", mode, nowait, cache_rows, th);
                         const bool big = th == 16;
-                        run_sets(*rd, t, id_sets(t, rng, big), nullptr, what);
-                        run_sets(*rd, t, zipf_stream(t, rng, cache_rows == 1000 ? 400 : 60), nullptr, what);
-                        run_sets(*rd, t, id_sets(t, rng, false), nullptr, what); // again, now partly cached
+                        // the probe needs the mapping; without the probe no mapping is passed, so a read that failed
+                        // would abort instead of being papered over by the fallback copy
+                        const uint8_t * mp = nowait ? t.rows : nullptr;
+                        run_sets(*rd, t, id_sets(t, rng, big), mp, what);
+                        run_sets(*rd, t, zipf_stream(t, rng, cache_rows == 1000 ? 400 : 60), mp, what);
+                        run_sets(*rd, t, id_sets(t, rng, false), mp, what); // again, now partly cached
                         const auto st = rd->stats();
                         CHECK(st.fallback_rows == 0, "%s %s: %" PRIu64 " fallback rows without a failure", t.name.c_str(), what, st.fallback_rows);
+                        if (nowait && mode == 1) {
+                            pc_probe_hits += st.pc_hits;
+                            pc_probe_dev  += st.dev_rows;
+                        }
                         if (cache_rows == 1000) {
                             CHECK(st.cache_hits > 0 && st.evictions > 0, "%s %s: the LRU was not exercised (hits %" PRIu64 ", evictions %" PRIu64 ")",
                                   t.name.c_str(), what, st.cache_hits, st.evictions);
@@ -228,7 +241,10 @@ int main(int argc, char ** argv) {
             }
         }
     }
-    printf("readers: %d configurations; effective modes: %s\n", n_readers, modes_seen.c_str());
+    printf("readers: %d configurations; effective modes: %s; page-cache probe: %" PRIu64 " rows from the page cache, %" PRIu64 " from the device\n",
+           n_readers, modes_seen.c_str(), pc_probe_hits, pc_probe_dev);
+    CHECK(modes_seen.find("mode 1") == std::string::npos || (pc_probe_hits > 0 && pc_probe_dev > 0),
+          "the page-cache probe was not exercised on both sides (%" PRIu64 " hits, %" PRIu64 " device rows)", pc_probe_hits, pc_probe_dev);
     if (modes_seen.find("mode 1") == std::string::npos) {
         printf("NOTE: O_DIRECT was refused on %s -- mode 1 fell back to buffered reads; run from a disk-backed directory to cover it\n", dir.c_str());
     }
@@ -255,7 +271,7 @@ int main(int argc, char ** argv) {
     {
         const auto & t = tabs[0];
         llama_ple_direct_params p;
-        p.mode = 1; p.cache_bytes = 300 * t.info.rs; p.n_threads = 8; p.nowait = true;
+        p.mode = 1; p.cache_bytes = 300 * t.info.rs; p.n_threads = 8; p.nowait = true;   // probe on: gathers pass the mapping
         auto rd = llama_ple_direct_reader::open(fd, t.info.offs, t.info.rs, t.info.rows, p, nullptr);
         CHECK(rd != nullptr, "open failed");
         if (rd) {
@@ -266,7 +282,7 @@ int main(int argc, char ** argv) {
                 std::vector<uint8_t> out;
                 for (const auto & ids : s) {
                     out.assign(ids.size() * t.info.rs, 0);
-                    rd->gather(ids.data(), (int64_t) ids.size(), out.data(), nullptr);
+                    rd->gather(ids.data(), (int64_t) ids.size(), out.data(), t.rows);
                     if (compare(t, ids, out) >= 0) { bad++; }
                 }
             };

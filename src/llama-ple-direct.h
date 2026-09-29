@@ -21,7 +21,8 @@ struct llama_ple_direct_params {
     int    mode        = 1;
     size_t cache_bytes = 0;       // exact LRU row cache budget in bytes of row data (0 = no cache)
     int    n_threads   = 16;      // reads in flight at most (the calling thread is one of them)
-    bool   nowait      = false;   // mode 1: serve a row the page cache already holds with preadv2(RWF_NOWAIT)
+    bool   nowait      = false;   // mode 1: serve a row whose page(s) the page cache already holds (mincore on the mapping,
+                                  // then a copy from it; never starts I/O); needs the mapping in gather()
     bool   mlock_cache = false;   // mlock() the row cache (warns and continues if the limit refuses it)
     int    stats_every = 0;       // log one stats line every N gathers (0 = only at destruction)
     int    fail_reads_for_test = 0; // test hook: every device read fails -> the mmap fallback must deliver the rows
@@ -35,7 +36,7 @@ struct llama_ple_direct_stats {
     uint64_t ids           = 0;   // ids asked for
     uint64_t unique        = 0;   // distinct ids per gather, summed
     uint64_t cache_hits    = 0;   // distinct ids served by the row cache
-    uint64_t pc_hits       = 0;   // distinct ids served by the page cache (RWF_NOWAIT, mode 1 + nowait)
+    uint64_t pc_hits       = 0;   // distinct ids served by the page cache (mincore probe, mode 1 + nowait)
     uint64_t dev_rows      = 0;   // distinct ids read from the device / buffered pread
     uint64_t dev_reads     = 0;   // read syscalls issued for them (adjacent rows are merged)
     uint64_t dev_bytes     = 0;   // bytes those reads transferred
