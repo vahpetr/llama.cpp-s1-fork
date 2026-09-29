@@ -15,10 +15,24 @@ struct llama_context;
 
 // the KQ-mask fill over explicit cells - the body of llama_kv_cache::set_input_kq_mask, as a free
 // function so tests can run it on synthetic cells. data: [n_kv, n_tps, 1, n_stream] of type (F16/F32)
+// [TAG_MTP_DRAFT_WINDOW] n_sink: sinks of a standard window (llama_hparams::is_masked_swa); win_band: the per-sequence row
+// reuse tracks only the cells whose visibility can differ between the ubatch's tokens under a standard window (the causal
+// band and the window-exit band) instead of every cell within n_swa + 32 of the first token - same values, O(n_tokens)
+// cells per row instead of O(n_swa); set for the MTP draft window, off everywhere else (today's tracking)
 void llama_kv_cells_fill_kq_mask(
         void * data, ggml_type type, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool causal_attn,
         const llama_hparams & hparams, uint32_t n_swa, llama_swa_type swa_type,
-        const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream);
+        const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream,
+        uint32_t n_sink = 0, bool win_band = false);
+
+// [TAG_MTP_DRAFT_WINDOW] the tile census of LLAMA_KQ_VIS_PROF=1 (MTP draft window on): over the first n_kv cells of every
+// stream the ubatch touches, the number of `tile`-cell tiles and of those holding at least one cell that some token of the
+// ubatch may see under (causal, n_swa, n_sink) - an upper bound per tile (a token's interval [pos_min, pos_max] per
+// sequence, the 2-D tie ignored), i.e. the tiles the device cannot skip; the rest carry no visible cell
+void llama_kv_cells_window_census(
+        int64_t n_kv, const llama_ubatch * ubatch, uint32_t n_swa, uint32_t n_sink, uint32_t tile,
+        const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream,
+        int64_t * n_tiles, int64_t * n_live);
 
 // [TAG_KQ_VIS] the metadata fill (visibility from metadata): cells_data I32 [n_kv, 4, n_stream],
 // toks_data I32 [4, n_tps, n_stream]; GGML_OP_KQ_MASK over them equals llama_kv_cells_fill_kq_mask.
@@ -256,8 +270,15 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // [TAG_MTP_DRAFT_WINDOW] win_n_swa > 0: a standard window of win_n_swa positions with win_n_sink sinks applied on top of
+    // the cache's own rule (a cache without SWA only) - the MTP draft input's window; 0 = today's fill
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
+                              uint32_t win_n_swa = 0, uint32_t win_n_sink = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // [TAG_MTP_DRAFT_WINDOW] LLAMA_KQ_VIS_PROF=1: llama_kv_cells_window_census over this cache's cells (n_kv = get_n_kv())
+    void window_census(const llama_ubatch * ubatch, uint32_t n_kv, uint32_t n_swa, uint32_t n_sink, uint32_t tile,
+                       int64_t * n_tiles, int64_t * n_live) const;
 
     // [TAG_KQ_VIS] the metadata GGML_OP_KQ_MASK turns into the mask set_input_kq_mask writes:
     // cells_dst I32 [n_kv, 4, n_stream], toks_dst I32 [4, n_tps, n_stream]; false = not expressible
@@ -460,8 +481,13 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
+                              uint32_t win_n_swa = 0, uint32_t win_n_sink = 0) const; // [TAG_MTP_DRAFT_WINDOW]
     bool set_input_kq_vis    (ggml_tensor * cells_dst, ggml_tensor * toks_dst, const llama_ubatch * ubatch) const;
+
+    // [TAG_MTP_DRAFT_WINDOW] LLAMA_KQ_VIS_PROF=1 tile census of the draft window (llama_kv_cache::window_census)
+    void window_census(const llama_ubatch * ubatch, uint32_t n_swa, uint32_t n_sink, uint32_t tile,
+                       int64_t * n_tiles, int64_t * n_live) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

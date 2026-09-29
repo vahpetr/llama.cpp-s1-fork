@@ -162,6 +162,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-kq-mask-meta.cpp) # [TAG_KQ_VIS] uses internal llama_kv_cells / fill functions
     llama_build(test-kq-vis-fill-bench.cpp)     # [TAG_KQVIS_PROF] CPU microbench of the KQ mask vs metadata fills (not a ctest)
     llama_build_and_test(test-kq-vis-fill-equiv.cpp) # [TAG_KQ_VIS_FILL] randomized fill equivalence vs the pre-P3-F1 fill
+    llama_build_and_test(test-mtp-draft-window.cpp) # [TAG_MTP_DRAFT_WINDOW] draft window predicate identity, window off = 2a8090bd4
     target_compile_definitions(test-kq-vis-fill-equiv PRIVATE LLAMA_KV_CELLS_H_PATH="${PROJECT_SOURCE_DIR}/src/llama-kv-cells.h") # its rebase tripwire
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)

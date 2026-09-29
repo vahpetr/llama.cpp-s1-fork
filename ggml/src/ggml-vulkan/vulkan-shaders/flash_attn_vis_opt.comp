@@ -26,6 +26,7 @@ layout (push_constant) uniform parameter {
     uint nbd3;
     uint flags;
     int  n_swa;
+    int  n_sink; // [TAG_MTP_DRAFT_WINDOW]
 };
 
 int kqv_cell_load(uint idx) {
@@ -63,7 +64,7 @@ void main() {
             j1 += i1 * Br;
 
             if (j0 < nem0 && j1 < nem1) {
-                const float f = kqv_value(cbase, nem0, j0, data_t[i3 * nem1 + j1], flags, n_swa);
+                const float f = kqv_value(cbase, nem0, j0, data_t[i3 * nem1 + j1], flags, n_swa, n_sink);
                 min_v = min(min_v, f);
                 max_v = max(max_v, f);
             }

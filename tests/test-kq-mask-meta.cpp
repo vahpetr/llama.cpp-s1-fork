@@ -83,6 +83,7 @@ struct built_layout {
     bool    is_2d, causal, alibi, f32;
     int     swa_type;
     uint32_t n_swa;
+    uint32_t n_sink = 0; // [TAG_MTP_DRAFT_WINDOW] sinks of a standard window
 
     std::vector<llama_kv_cells> v_cells;
     std::vector<uint32_t>       seq_to_stream;
@@ -162,6 +163,8 @@ void build(built_layout & L, const layout_desc & d, std::mt19937_64 & rng, stats
     L.f32    = d.f32    >= 0 ? d.f32    != 0 : rnd01(rng) < 0.15;
     L.swa_type = d.swa_type >= 0 ? d.swa_type : (rnd01(rng) < 0.55 ? 0 : rnd_int(rng, 1, 3));
     L.n_swa  = L.swa_type == 0 ? 0 : (uint32_t) (rnd01(rng) < 0.5 ? rnd_int(rng, 1, 64) : rnd_int(rng, 64, 4096));
+    // [TAG_MTP_DRAFT_WINDOW] a third of the standard windows carry sinks (derived, no rng draw: the layout stream is unchanged)
+    L.n_sink = (L.swa_type == 1 && L.n_swa % 3 == 0) ? 1 + L.n_swa % 61 : 0;
 
     const int max_pos_base = (1 << 20) - 20000;
     const int pos_base = d.pos_base >= 0 ? d.pos_base : (rnd01(rng) < 0.5 ? rnd_int(rng, 0, 64) : rnd_int(rng, 0, max_pos_base));
@@ -343,6 +346,7 @@ std::vector<uint8_t> run_op(const built_layout & L, const std::vector<int32_t> &
     memcpy(tt->data, toks_rec.data(),  ggml_nbytes(tt));
 
     ggml_tensor * out = ggml_kq_mask(ctx, tc, tt, L.f32 ? GGML_TYPE_F32 : GGML_TYPE_F16, L.causal, L.alibi, L.swa_type, (int32_t) L.n_swa);
+    if (L.n_sink > 0) ggml_kq_mask_set_sink(out, (int32_t) L.n_sink);
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
@@ -399,6 +403,7 @@ std::pair<std::vector<uint8_t>, std::vector<uint8_t>> run_fa(const built_layout 
     ggml_flash_attn_ext_set_prec(o_plane, GGML_PREC_F32);
     ggml_tensor * o_vis = ggml_flash_attn_ext_vis(ctx, q, k, v, tc, tt, scale, fs.max_bias, fs.softcap,
             L.causal, L.alibi, L.swa_type, (int32_t) L.n_swa);
+    if (L.n_sink > 0) ggml_flash_attn_ext_set_vis_sink(o_vis, (int32_t) L.n_sink);
     ggml_flash_attn_ext_set_prec(o_vis, GGML_PREC_F32);
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -475,6 +480,7 @@ std::vector<uint8_t> dev_run_op(const built_layout & L, const std::vector<int32_
     ggml_tensor * tc = ggml_new_tensor_3d(g.ctx, GGML_TYPE_I32, L.n_kv, 4, L.n_stream);
     ggml_tensor * tt = ggml_new_tensor_3d(g.ctx, GGML_TYPE_I32, 4, L.n_tps, L.n_stream);
     ggml_tensor * out = ggml_kq_mask(g.ctx, tc, tt, L.f32 ? GGML_TYPE_F32 : GGML_TYPE_F16, L.causal, L.alibi, L.swa_type, (int32_t) L.n_swa);
+    if (L.n_sink > 0) ggml_kq_mask_set_sink(out, (int32_t) L.n_sink);
     if (!ggml_backend_supports_op(g_dev, out)) {
         return {};
     }
@@ -496,7 +502,7 @@ struct dev_fa {
     bool supported = true;
 
     // kv_rows_fill: fill K/V with random rows in chunks (no full f32 copy of a 213k-cell cache)
-    void build(int64_t n_kv, int64_t n_tps, int64_t n_stream, const fa_shape & fs, bool causal, bool alibi, int swa_type, int n_swa,
+    void build(int64_t n_kv, int64_t n_tps, int64_t n_stream, const fa_shape & fs, bool causal, bool alibi, int swa_type, int n_swa, int n_sink,
                const std::vector<uint8_t> & plane_f16, const std::vector<int32_t> & cells_rec, const std::vector<int32_t> & toks_rec,
                std::mt19937_64 & rng) {
         g.init();
@@ -511,10 +517,12 @@ struct dev_fa {
         o_plane = ggml_flash_attn_ext(g.ctx, q, k, v, m, scale, fs.max_bias, fs.softcap);
         ggml_flash_attn_ext_set_prec(o_plane, GGML_PREC_F32);
         o_vis = ggml_flash_attn_ext_vis(g.ctx, q, k, v, tc, tt, scale, fs.max_bias, fs.softcap, causal, alibi, swa_type, n_swa);
+        if (n_sink > 0) ggml_flash_attn_ext_set_vis_sink(o_vis, n_sink);
         ggml_flash_attn_ext_set_prec(o_vis, GGML_PREC_F32);
         // the two-class bridge's plane class (LLAMA_KQ_VIS_MIN_TOKENS): GGML_OP_KQ_MASK on the device, then
         // the unchanged plane FA
         ggml_tensor * m_dev = ggml_kq_mask(g.ctx, tc, tt, GGML_TYPE_F16, causal, alibi, swa_type, n_swa);
+        if (n_sink > 0) ggml_kq_mask_set_sink(m_dev, n_sink);
         o_bridge = ggml_flash_attn_ext(g.ctx, q, k, v, m_dev, scale, fs.max_bias, fs.softcap);
         ggml_flash_attn_ext_set_prec(o_bridge, GGML_PREC_F32);
 
@@ -593,14 +601,14 @@ void dev_check_layout(const built_layout & L, const std::vector<uint8_t> & ref, 
     if (force_fa || (fa_budget > 0 && L.n_kv*L.n_tps*L.n_stream <= 4*fa_budget)) {
         std::vector<uint8_t> plane((size_t) (L.n_kv*L.n_tps*L.n_stream)*2);
         llama_kv_cells_fill_kq_mask(plane.data(), GGML_TYPE_F16, L.n_kv, L.n_stream, &L.ub, L.causal,
-                hp, L.n_swa, (llama_swa_type) L.swa_type, L.v_cells, L.seq_to_stream);
+                hp, L.n_swa, (llama_swa_type) L.swa_type, L.v_cells, L.seq_to_stream, L.n_sink);
         fa_shape fs;
         fs.D = 256; fs.n_head = 24; fs.n_head_kv = 2;
         fs.kv_type  = rnd01(rng) < 0.5 ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
         fs.max_bias = L.alibi ? 8.0f : 0.0f;
         fs.softcap  = 0.0f;
         dev_fa f;
-        f.build(L.n_kv, L.n_tps, L.n_stream, fs, L.causal, L.alibi, L.swa_type, (int) L.n_swa, plane, cells_rec, toks_rec, rng);
+        f.build(L.n_kv, L.n_tps, L.n_stream, fs, L.causal, L.alibi, L.swa_type, (int) L.n_swa, (int) L.n_sink, plane, cells_rec, toks_rec, rng);
         if (!f.supported) {
             g_ds.fa_unsupported++;
             return;
@@ -706,7 +714,7 @@ int run_perf(const std::vector<int64_t> & nkvs, ggml_type kv_type, int reps) {
 
             fa_shape fs; fs.D = 256; fs.n_head = 24; fs.n_head_kv = 2; fs.kv_type = kv_type; fs.max_bias = 0.0f; fs.softcap = 0.0f;
             dev_fa f;
-            f.build(L.n_kv, L.n_tps, 1, fs, true, false, 0, 0, plane, cells_rec, toks_rec, rng);
+            f.build(L.n_kv, L.n_tps, 1, fs, true, false, 0, 0, 0, plane, cells_rec, toks_rec, rng);
             if (!f.supported) {
                 printf("  %-20s %8" PRId64 "  not supported\n", sh.name, n_kv);
                 continue;
@@ -749,7 +757,7 @@ uint64_t run_layout(const layout_desc & d, std::mt19937_64 & rng, stats_t & st, 
     const size_t esz = L.f32 ? 4 : 2;
     std::vector<uint8_t> ref((size_t) (L.n_kv*L.n_tps*L.n_stream)*esz, 0xAB);
     llama_kv_cells_fill_kq_mask(ref.data(), L.f32 ? GGML_TYPE_F32 : GGML_TYPE_F16, L.n_kv, L.n_stream, &L.ub, L.causal,
-            hp, L.n_swa, (llama_swa_type) L.swa_type, L.v_cells, L.seq_to_stream);
+            hp, L.n_swa, (llama_swa_type) L.swa_type, L.v_cells, L.seq_to_stream, L.n_sink);
 
     std::vector<int32_t> cells_rec((size_t) (4*L.n_kv*L.n_stream), 0x5A5A5A5A);
     std::vector<int32_t> toks_rec ((size_t) (4*L.n_tps*L.n_stream), 0x5A5A5A5A);
@@ -802,7 +810,7 @@ uint64_t run_layout(const layout_desc & d, std::mt19937_64 & rng, stats_t & st, 
         // the f16 plane FA reads (the layout itself may have asked for an f32 mask)
         std::vector<uint8_t> plane((size_t) (L.n_kv*L.n_tps*L.n_stream)*2);
         llama_kv_cells_fill_kq_mask(plane.data(), GGML_TYPE_F16, L.n_kv, L.n_stream, &L.ub, L.causal,
-                hp, L.n_swa, (llama_swa_type) L.swa_type, L.v_cells, L.seq_to_stream);
+                hp, L.n_swa, (llama_swa_type) L.swa_type, L.v_cells, L.seq_to_stream, L.n_sink);
 
         fa_shape fs;
         const bool model = L.n_kv*L.n_tps*L.n_stream <= fa_budget/8 || rnd01(rng) < 0.3;

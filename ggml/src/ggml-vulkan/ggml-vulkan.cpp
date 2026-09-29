@@ -594,10 +594,12 @@ struct vk_fa_pipeline_state {
     ggml_type v_type;
     // [TAG_KQ_VIS] spec constant 16 (VisNSwa): the SWA window of a metadata-masked FA, 0 otherwise
     uint32_t vis_n_swa;
+    // [TAG_MTP_DRAFT_WINDOW] spec constant 17 (VisNSink): the sinks of a standard window, 0 otherwise
+    uint32_t vis_n_sink;
 
     bool operator<(const vk_fa_pipeline_state &b) const {
-        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type, vis_n_swa) <
-               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type, b.vis_n_swa);
+        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type, vis_n_swa, vis_n_sink) <
+               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type, b.vis_n_swa, b.vis_n_sink);
     }
 };
 
@@ -2212,6 +2214,7 @@ struct vk_op_flash_attn_vis_opt_push_constants {
     uint32_t nbd3;
     uint32_t flags;
     int32_t  n_swa;
+    int32_t  n_sink; // [TAG_MTP_DRAFT_WINDOW]
 };
 
 // [TAG_KQ_VIS] kq_mask.comp
@@ -2221,6 +2224,7 @@ struct vk_op_kq_mask_push_constants {
     uint32_t n_stream;
     uint32_t flags;
     int32_t  n_swa;
+    int32_t  n_sink; // [TAG_MTP_DRAFT_WINDOW]
 };
 
 // Allow pre-recording command buffers
@@ -4436,7 +4440,8 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type,
-                                                  bool gqa_tokens = false, uint32_t vis_flags = 0, uint32_t vis_n_swa = 0) {
+                                                  bool gqa_tokens = false, uint32_t vis_flags = 0, uint32_t vis_n_swa = 0,
+                                                  uint32_t vis_n_sink = 0) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -4472,7 +4477,7 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
-    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type, vis_n_swa};
+    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type, vis_n_swa, vis_n_sink};
 }
 
 // Bytes per buffer block for the FaBlockBytesK/V spec constants. F32 is fed as
@@ -4503,6 +4508,7 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
         /*14 FaBlockBytesK   */ fa_block_bytes(state.k_type),
         /*15 FaBlockBytesV   */ fa_block_bytes(state.v_type),
         /*16 VisNSwa         */ state.vis_n_swa,
+        /*17 VisNSink        */ state.vis_n_sink, // [TAG_MTP_DRAFT_WINDOW]
     };
 }
 
@@ -11737,11 +11743,13 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const bool has_mask = mask != nullptr || vis;
     uint32_t vis_flags = 0, vis_kqv_flags = 0;
     int32_t  vis_n_swa = 0;
+    int32_t  vis_n_sink = 0; // [TAG_MTP_DRAFT_WINDOW] standard window only
     if (vis) {
         const uint32_t causal   = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 1) != 0;
         const uint32_t alibi    = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 2) != 0;
         const uint32_t swa_type = (uint32_t) ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 3) & 3u;
         vis_n_swa     = swa_type ? ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 4) : 0;
+        vis_n_sink    = swa_type == 1u ? ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 5) : 0;
         vis_flags     = 512u | (causal << 10) | (alibi << 11) | (swa_type << 12);
         vis_kqv_flags = causal | (alibi << 1) | (swa_type << 2) | 16u; // 16: f16 plane values (KQV_FLAG_F16)
         GGML_ASSERT(vis_cells->ne[0] == k->ne[1]);
@@ -11914,7 +11922,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    has_mask, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
-                                                                   gqa_tokens, vis_flags, (uint32_t) vis_n_swa);
+                                                                   gqa_tokens, vis_flags, (uint32_t) vis_n_swa, (uint32_t) vis_n_sink);
     GGML_ASSERT(!vis || fa_pipeline_state.path != FA_COOPMAT2);
 
     vk_pipeline pipeline = nullptr;
@@ -12098,6 +12106,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
             mask_opt_num_dwords * CEIL_DIV(nem1, Br),
             vis_kqv_flags,
             vis_n_swa,
+            vis_n_sink,
         };
 
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_mask_opt,
@@ -15404,6 +15413,7 @@ static void ggml_vk_kq_mask(ggml_backend_vk_context * ctx, vk_context& subctx, g
         n_kv, n_tps, n_stream,
         causal | (alibi << 1) | (swa_type << 2) | (dst->type == GGML_TYPE_F16 ? 16u : 0u), // 16: KQV_FLAG_F16
         swa_type ? ggml_get_op_params_i32(dst, 3) : 0,
+        swa_type == 1u ? ggml_get_op_params_i32(dst, 4) : 0, // [TAG_MTP_DRAFT_WINDOW] sinks
     };
 
     // 256 cells per workgroup, at most 1024 workgroups along x; the shader strides over the rest
@@ -22013,11 +22023,13 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                 ggml_flash_attn_ext_set_vis(tensor_clone, src_clone[6], src_clone[7],
                         ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 1) != 0, ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 2) != 0,
                         ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 3), ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 4));
+                ggml_flash_attn_ext_set_vis_sink(tensor_clone, ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 5)); // [TAG_MTP_DRAFT_WINDOW]
             }
         } else if (tensor->op == GGML_OP_KQ_MASK) { // [TAG_KQ_VIS]
             tensor_clone = ggml_kq_mask(ggml_ctx, src_clone[0], src_clone[1], tensor->type,
                     ggml_get_op_params_i32(tensor, 0) != 0, ggml_get_op_params_i32(tensor, 1) != 0,
                     ggml_get_op_params_i32(tensor, 2), ggml_get_op_params_i32(tensor, 3));
+            ggml_kq_mask_set_sink(tensor_clone, ggml_get_op_params_i32(tensor, 4)); // [TAG_MTP_DRAFT_WINDOW]
         } else if (tensor->op == GGML_OP_MUL_MAT) {
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {

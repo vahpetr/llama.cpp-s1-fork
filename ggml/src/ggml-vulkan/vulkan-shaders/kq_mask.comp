@@ -20,6 +20,7 @@ layout (push_constant) uniform parameter {
     uint n_stream;
     uint flags;
     int  n_swa;
+    int  n_sink; // [TAG_MTP_DRAFT_WINDOW]
 } p;
 
 int kqv_cell_load(uint idx) {
@@ -37,7 +38,7 @@ void main() {
     const uint  obase = (s * p.n_tps + t) * p.n_kv;
 
     for (uint j = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x; j < p.n_kv; j += gl_NumWorkGroups.x * 256u) {
-        const float v = kqv_value(cbase, p.n_kv, j, tk, p.flags, p.n_swa);
+        const float v = kqv_value(cbase, p.n_kv, j, tk, p.flags, p.n_swa, p.n_sink);
 #if defined(OUT_F16)
         data_d[obase + j] = float16_t(v);
 #else

@@ -5522,6 +5522,17 @@ struct ggml_tensor * ggml_kq_mask(
     return result;
 }
 
+// [TAG_MTP_DRAFT_WINDOW]
+void ggml_kq_mask_set_sink(
+        struct ggml_tensor * a,
+        int32_t              n_sink) {
+    GGML_ASSERT(a->op == GGML_OP_KQ_MASK);
+    GGML_ASSERT(n_sink >= 0);
+    GGML_ASSERT(n_sink == 0 || ggml_get_op_params_i32(a, 2) == 1); // sinks only for the standard window
+
+    ggml_set_op_params_i32(a, 4, n_sink);
+}
+
 // ggml_qsa_bias
 
 // [TAG_QSA_COMPACT_BIAS] see ggml.h. The reference it must equal is qsa_fill_bias's per-block branch
@@ -5721,6 +5732,18 @@ struct ggml_tensor * ggml_flash_attn_ext_vis(
     ggml_flash_attn_ext_set_vis(result, cells, toks, causal, alibi, swa_type, n_swa);
 
     return result;
+}
+
+// [TAG_MTP_DRAFT_WINDOW]
+void ggml_flash_attn_ext_set_vis_sink(
+        struct ggml_tensor * a,
+        int32_t              n_sink) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(ggml_get_op_params_i32(a, GGML_FA_VIS_PARAM) != 0 && "ggml_flash_attn_ext_set_vis_sink: not a metadata FA node");
+    GGML_ASSERT(n_sink >= 0);
+    GGML_ASSERT(n_sink == 0 || ggml_get_op_params_i32(a, GGML_FA_VIS_PARAM + 3) == 1); // sinks only for the standard window
+
+    ggml_set_op_params_i32(a, GGML_FA_VIS_PARAM + 5, n_sink);
 }
 
 // ggml_flash_attn_back

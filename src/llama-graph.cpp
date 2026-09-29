@@ -16,8 +16,10 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -61,6 +63,24 @@ static bool llama_kq_vis_enabled() {
 // [TAG_KQ_VIS] the class of a ubatch: true = FA over the metadata, false = the KQ_MASK plane
 static bool llama_kq_vis_fa_class(const llama_ubatch & ubatch, const llama_cparams & cparams) {
     return cparams.flash_attn && ubatch.n_tokens >= llama_kq_vis_min_tokens();
+}
+
+// [TAG_MTP_DRAFT_WINDOW] see llama-graph.h. N is clamped to [1, 2^30] (the host fill adds 32 to it in int32), S to [0, 2^30];
+// an unparsable or non-positive N = off. The proof line is printed by llama_context at the MTP context's creation.
+const llama_mtp_draft_window & llama_mtp_draft_window_get() {
+    static const llama_mtp_draft_window w = [] {
+        llama_mtp_draft_window r;
+        const char * env_n = getenv("LLAMA_MTP_DRAFT_WINDOW");
+        const char * env_s = getenv("LLAMA_MTP_DRAFT_SINK");
+        const long long n  = env_n != nullptr ? strtoll(env_n, nullptr, 10) : 0;
+        const long long sk = env_s != nullptr ? strtoll(env_s, nullptr, 10) : 4;
+        if (n > 0) {
+            r.n_swa  = (uint32_t) std::min<long long>(n, 1ll << 30);
+            r.n_sink = (uint32_t) std::max<long long>(0, std::min<long long>(sk, 1ll << 30));
+        }
+        return r;
+    }();
+    return w;
 }
 
 
@@ -518,7 +538,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
             GGML_ASSERT(ok && "LLAMA_KQ_VIS: ubatch not expressible as KQ metadata (n_seq_max <= 32 was checked at build)");
         }
     } else if (self_kq_mask && self_kq_mask->buffer) {
-        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn, win_n_swa, win_n_sink); // [TAG_MTP_DRAFT_WINDOW]
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -1143,7 +1163,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             GGML_ASSERT(ok && "LLAMA_KQ_VIS: ubatch not expressible as KQ metadata (n_seq_max <= 32 was checked at build)");
         }
     } else {
-        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn,
+                inp_attn->win_n_swa, inp_attn->win_n_sink); // [TAG_MTP_DRAFT_WINDOW]
     }
 
     if (inp_attn->self_k_rot) {
@@ -2625,7 +2646,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                float   kq_scale,
                  int   il,
          ggml_tensor * kq_vis_cells,
-         ggml_tensor * kq_vis_toks) const {
+         ggml_tensor * kq_vis_toks,
+             int32_t   kq_vis_swa_type,
+             int32_t   kq_vis_n_swa,
+             int32_t   kq_vis_n_sink) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2658,9 +2682,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (kq_vis_cells) {
             // [TAG_KQ_VIS] the mask computed inside FA from the metadata; bit-identical to kq_mask
+            // [TAG_MTP_DRAFT_WINDOW] kq_vis_swa_type / n_swa / n_sink: the MTP draft's window (none elsewhere)
             cur = ggml_flash_attn_ext_vis(ctx0, q, k, v, kq_vis_cells, kq_vis_toks, kq_scale, hparams.f_max_alibi_bias,
                                           hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f,
-                                          cparams.causal_attn, hparams.use_alibi, (int32_t) LLAMA_SWA_TYPE_NONE, 0);
+                                          cparams.causal_attn, hparams.use_alibi, kq_vis_swa_type, kq_vis_n_swa);
+            if (kq_vis_n_sink > 0) {
+                ggml_flash_attn_ext_set_vis_sink(cur, kq_vis_n_sink);
+            }
         } else {
             cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                       hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
@@ -2850,6 +2878,13 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
+        // [TAG_MTP_DRAFT_WINDOW] the MTP draft context only; every other context keeps win_n_swa = 0
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            const llama_mtp_draft_window & win = llama_mtp_draft_window_get();
+            inp->win_n_swa  = win.n_swa;
+            inp->win_n_sink = win.n_swa > 0 ? win.n_sink : 0;
+        }
+
         if (llama_kq_vis_enabled() && cparams.n_seq_max <= 32) {
             const int64_t n_kv     = mctx_cur->get_n_kv();
             const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
@@ -2870,9 +2905,14 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
             LLAMA_LOG_DEBUG("kq_vis: graph n_tokens %u n_kv %lld n_stream %lld -> %s\n", ubatch.n_tokens, (long long) n_kv,
                     (long long) n_stream, inp->kq_vis_fa ? "FA over metadata (no plane)" : "device KQ_MASK plane + plane FA");
 
+            // [TAG_MTP_DRAFT_WINDOW] the draft's window as a standard window with sinks (none: today's node)
+            const bool win = inp->win_n_swa > 0;
             inp->self_kq_mask = ggml_kq_mask(ctx0, inp->self_kq_vis_cells, inp->self_kq_vis_toks,
                     cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, cparams.causal_attn, hparams.use_alibi,
-                    (int32_t) LLAMA_SWA_TYPE_NONE, 0);
+                    win ? (int32_t) LLAMA_SWA_TYPE_STANDARD : (int32_t) LLAMA_SWA_TYPE_NONE, win ? (int32_t) inp->win_n_swa : 0);
+            if (win && inp->win_n_sink > 0) {
+                ggml_kq_mask_set_sink(inp->self_kq_mask, (int32_t) inp->win_n_sink);
+            }
             ggml_set_name(inp->self_kq_mask, "attn_inp_kq_mask");
         } else {
             inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
@@ -2943,8 +2983,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // [TAG_KQ_VIS] the two-class bridge's metadata class: FA reads the metadata, no plane
+    // [TAG_MTP_DRAFT_WINDOW] the metadata FA carries the draft's window itself (the plane class has it in the plane)
     ggml_tensor * cur = inp->kq_vis_fa
-        ? build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->self_kq_vis_cells, inp->self_kq_vis_toks)
+        ? build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->self_kq_vis_cells, inp->self_kq_vis_toks,
+                         inp->win_n_swa > 0 ? (int32_t) LLAMA_SWA_TYPE_STANDARD : (int32_t) LLAMA_SWA_TYPE_NONE,
+                         (int32_t) inp->win_n_swa, (int32_t) inp->win_n_sink)
         : build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 

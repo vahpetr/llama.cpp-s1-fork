@@ -9056,13 +9056,14 @@ struct kq_vis_params {
     bool    alibi;
     int32_t swa_type;
     int32_t n_swa;
+    int32_t n_sink; // [TAG_MTP_DRAFT_WINDOW] standard window only: positions < n_sink are never window-masked
 };
 
-static inline bool kq_vis_swa_masked(int32_t swa_type, int32_t n_swa, int32_t p0, int32_t p1) {
+static inline bool kq_vis_swa_masked(int32_t swa_type, int32_t n_swa, int32_t n_sink, int32_t p0, int32_t p1) {
     // a copy of llama_hparams::is_masked_swa (src/llama-hparams.h)
     switch (swa_type) {
-        case 1: // LLAMA_SWA_TYPE_STANDARD
-            return p1 - p0 >= n_swa;
+        case 1: // LLAMA_SWA_TYPE_STANDARD (+ [TAG_MTP_DRAFT_WINDOW] sinks)
+            return p1 - p0 >= n_swa && p0 >= n_sink;
         case 2: // LLAMA_SWA_TYPE_CHUNKED
             return p0 < (p1 / n_swa) * n_swa;
         case 3: // LLAMA_SWA_TYPE_SYMMETRIC
@@ -9100,7 +9101,7 @@ static inline bool kq_vis_keep(const int32_t * cs, int64_t n_kv, int64_t j, cons
             }
         }
     }
-    if (vp.swa_type != 0 && kq_vis_swa_masked(vp.swa_type, vp.n_swa, p0, p1)) {
+    if (vp.swa_type != 0 && kq_vis_swa_masked(vp.swa_type, vp.n_swa, vp.n_sink, p0, p1)) {
         return false;
     }
     *val = vp.alibi ? static_cast<float>(-std::abs(p0 - p1)) : 0.0f;
@@ -9127,6 +9128,7 @@ static void ggml_compute_forward_kq_mask_impl(const ggml_compute_params * params
     vp.alibi    = ggml_get_op_params_i32(dst, 1) != 0;
     vp.swa_type = ggml_get_op_params_i32(dst, 2);
     vp.n_swa    = ggml_get_op_params_i32(dst, 3);
+    vp.n_sink   = ggml_get_op_params_i32(dst, 4); // [TAG_MTP_DRAFT_WINDOW] 0 unless ggml_kq_mask_set_sink
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_tps    = dst->ne[1];
@@ -9287,6 +9289,7 @@ static fa_vis_src fa_get_vis(const ggml_tensor * dst) {
     r.vp.alibi    = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 2) != 0;
     r.vp.swa_type = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 3);
     r.vp.n_swa    = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 4);
+    r.vp.n_sink   = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 5); // [TAG_MTP_DRAFT_WINDOW]
     return r;
 }
 

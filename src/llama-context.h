@@ -429,9 +429,13 @@ private:
         int64_t  in_wait_us = 0, in_copy_us = 0, kq_copy_us = 0, kq_bytes = 0;
         int64_t  compute_us = 0, sync_us = 0, n_sync = 0;
         int64_t  t0_ms = 0, t1_ms = 0; // unix ms: start of the first graph, end of the last graph or sync
+        // [TAG_MTP_DRAFT_WINDOW] MTP draft window on: the tile census of the sampled graphs (llama_kv_cells_window_census)
+        int32_t  win_sampled = 0;
+        int64_t  win_tiles = 0, win_live = 0, win_census_us = 0;
     };
     mutable kqvis_prof_window kqvis_win;
     mutable int64_t           kqvis_n_win = 0;
+    mutable uint64_t          kqvis_win_census_n = 0; // [TAG_MTP_DRAFT_WINDOW] draft graphs seen by the census sampler
 
     void kqvis_prof_flush(const char * reason) const;
 };

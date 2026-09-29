@@ -8126,15 +8126,17 @@ struct test_kq_mask : public test_case {
     const int       swa_type;
     const int       n_swa;
     const bool      rope2d;
+    const int       n_sink; // [TAG_MTP_DRAFT_WINDOW] sinks of a standard window (ggml_kq_mask_set_sink)
 
     std::string vars() override {
-        return VARS_TO_STR9(n_kv, n_tps, n_stream, type, causal, alibi, swa_type, n_swa, rope2d);
+        return VARS_TO_STR9(n_kv, n_tps, n_stream, type, causal, alibi, swa_type, n_swa, rope2d) +
+               (n_sink ? ",n_sink=" + std::to_string(n_sink) : std::string());
     }
 
     test_kq_mask(int64_t n_kv = 1024, int64_t n_tps = 32, int64_t n_stream = 1, ggml_type type = GGML_TYPE_F16,
-                 bool causal = true, bool alibi = false, int swa_type = 0, int n_swa = 0, bool rope2d = false)
+                 bool causal = true, bool alibi = false, int swa_type = 0, int n_swa = 0, bool rope2d = false, int n_sink = 0)
         : n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), type(type), causal(causal), alibi(alibi),
-          swa_type(swa_type), n_swa(n_swa), rope2d(rope2d) {}
+          swa_type(swa_type), n_swa(n_swa), rope2d(rope2d), n_sink(n_sink) {}
 
     double max_err() override { return 0.0; }
 
@@ -8154,6 +8156,9 @@ struct test_kq_mask : public test_case {
         ggml_set_name(toks, "toks");
 
         ggml_tensor * out = ggml_kq_mask(ctx, cells, toks, type, causal, alibi, swa_type, n_swa);
+        if (n_sink > 0) {
+            ggml_kq_mask_set_sink(out, n_sink);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -8179,9 +8184,11 @@ struct test_flash_attn_ext_vis : public test_case {
     const int       swa_type;
     const int       n_swa;
     const bool      rope2d;
+    const int       n_sink; // [TAG_MTP_DRAFT_WINDOW]
 
     std::string vars() override {
-        return VARS_TO_STR12(hs, nh_kv, gqa, kv, nb, n_stream, type_KV, causal, max_bias, swa_type, n_swa, rope2d);
+        return VARS_TO_STR12(hs, nh_kv, gqa, kv, nb, n_stream, type_KV, causal, max_bias, swa_type, n_swa, rope2d) +
+               (n_sink ? ",n_sink=" + std::to_string(n_sink) : std::string());
     }
 
     double max_nmse_err() override { return 5e-4; }
@@ -8193,9 +8200,9 @@ struct test_flash_attn_ext_vis : public test_case {
 
     test_flash_attn_ext_vis(int64_t hs = 256, int64_t nh_kv = 2, int64_t gqa = 12, int64_t kv = 1024, int64_t nb = 6,
                             int64_t n_stream = 1, ggml_type type_KV = GGML_TYPE_F16, bool causal = true,
-                            float max_bias = 0.0f, int swa_type = 0, int n_swa = 0, bool rope2d = false)
+                            float max_bias = 0.0f, int swa_type = 0, int n_swa = 0, bool rope2d = false, int n_sink = 0)
         : hs(hs), nh_kv(nh_kv), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), type_KV(type_KV), causal(causal),
-          max_bias(max_bias), swa_type(swa_type), n_swa(n_swa), rope2d(rope2d) {}
+          max_bias(max_bias), swa_type(swa_type), n_swa(n_swa), rope2d(rope2d), n_sink(n_sink) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh_kv*gqa, n_stream);
@@ -8211,6 +8218,9 @@ struct test_flash_attn_ext_vis : public test_case {
 
         ggml_tensor * out = ggml_flash_attn_ext_vis(ctx, q, k, v, cells, toks, 1.0f/sqrtf((float) hs), max_bias, 0.0f,
                                                     causal, max_bias > 0.0f, swa_type, n_swa);
+        if (n_sink > 0) {
+            ggml_flash_attn_ext_set_vis_sink(out, n_sink);
+        }
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
@@ -10970,6 +10980,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_kq_mask(8192, 16, 1, GGML_TYPE_F32, true,  true));
     test_cases.emplace_back(new test_kq_mask(8192, 16, 1, GGML_TYPE_F16, true,  true));
     test_cases.emplace_back(new test_kq_mask(8192, 16, 1, GGML_TYPE_F32, false, true, 1, 5000, true));
+    // [TAG_MTP_DRAFT_WINDOW] the MTP draft window: a standard window with sinks, draft shapes (1 / 6 rows: steps and
+    // catch-up, 64 / 2048: the metadata FA class) and a wide sink band
+    for (int n_sink : { 4, 100 }) {
+        for (int64_t n_tps : { 1, 6, 64 }) {
+            test_cases.emplace_back(new test_kq_mask(8192, n_tps, 1, GGML_TYPE_F16, true, false, 1, 2048, false, n_sink));
+        }
+        test_cases.emplace_back(new test_kq_mask(1024, 32, 3, GGML_TYPE_F32, true, false, 1, 128, false, n_sink));
+        test_cases.emplace_back(new test_kq_mask(1024, 32, 1, GGML_TYPE_F16, true, true,  1, 128, true,  n_sink));
+    }
 
     // [TAG_KQ_VIS] FLASH_ATTN_EXT over the metadata: the model's shape (24 heads over 2 KV heads, head dim 256;
     // target q8_0 K/V, MTP draft f16), decode 1/5/6 rows (GQA fold, split_k), verify, prefill (mask-opt pass)
@@ -10987,6 +11006,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_vis(256, 2, 12, 4096, 64, 1, GGML_TYPE_F16, true,  0.0f, 2, 1024)); // SWA chunked
     test_cases.emplace_back(new test_flash_attn_ext_vis(256, 2, 12, 4096, 64, 1, GGML_TYPE_F16, false, 0.0f, 3, 700));  // non-causal, symmetric
     test_cases.emplace_back(new test_flash_attn_ext_vis(128, 4, 4,  1024, 8,  2, GGML_TYPE_F16));                      // another head size
+    // [TAG_MTP_DRAFT_WINDOW] the MTP draft window (f16 draft K/V, 24/2 heads, D 256): steps (1), catch-up (6), the metadata
+    // class (64, mask-opt), 3 streams; sinks 4 and 64 over a 512-position window (most tiles fully masked -> skipped)
+    for (int n_sink : { 4, 64 }) {
+        for (int64_t nb : { 1, 6, 64 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_vis(256, 2, 12, 8192, nb, 1, GGML_TYPE_F16, true, 0.0f, 1, 512, false, n_sink));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_vis(256, 2, 12, 2048, 64, 3, GGML_TYPE_F16, true, 0.0f, 1, 300, false, n_sink));
+    }
 
     test_cases.emplace_back(new test_qsa_top_k(512,  2048,  1, 1, 1500));
     test_cases.emplace_back(new test_qsa_top_k(512,  2048,  2, 1, 1500));

@@ -2482,6 +2482,15 @@ extern "C" {
             int32_t               swa_type,
             int32_t               n_swa);
 
+    // [TAG_MTP_DRAFT_WINDOW] attention sinks for the standard window (swa_type 1): the first n_sink
+    // positions stay visible whatever the distance, i.e. swa_masked becomes
+    //     p1 - p0 >= n_swa && p0 >= n_sink
+    // (llama_hparams::is_masked_swa with n_sink). n_sink 0 (the default of every node) = the plain
+    // standard window, bit for bit. Op param slot 4 of GGML_OP_KQ_MASK.
+    GGML_API void ggml_kq_mask_set_sink(
+            struct ggml_tensor * a,
+            int32_t              n_sink);
+
     // [TAG_KQ_VIS] flash attention that computes its mask from the ggml_kq_mask metadata instead of
     // reading a materialized plane: the result is bit-identical to
     //   ggml_flash_attn_ext(q, k, v, ggml_kq_mask(ctx, cells, toks, GGML_TYPE_F16, causal, alibi, swa_type, n_swa), ...)
@@ -2512,8 +2521,13 @@ extern "C" {
             int32_t              swa_type,
             int32_t              n_swa);
 
+    // [TAG_MTP_DRAFT_WINDOW] the same sinks on a metadata flash-attention node (ggml_kq_mask_set_sink)
+    GGML_API void ggml_flash_attn_ext_set_vis_sink(
+            struct ggml_tensor * a,
+            int32_t              n_sink);
+
     // op_params slots of a flash-attention node carrying the metadata (i32): [10] = 1, [11] causal,
-    // [12] alibi, [13] swa_type, [14] n_swa
+    // [12] alibi, [13] swa_type, [14] n_swa, [15] n_sink (standard window only; 0 = none)
 #define GGML_FA_VIS_PARAM 10
 
     // [TAG_QSA_COMPACT_BIAS] the qwen4exp per-block indexer bias, generated from two small tables

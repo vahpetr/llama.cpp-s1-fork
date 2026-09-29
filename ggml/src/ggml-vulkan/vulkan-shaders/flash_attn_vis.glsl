@@ -7,9 +7,11 @@
 // all -inf skip, slope * mask, ZERO_DEAD_V, GQA_TOKENS rows, split_k) is unchanged. The host keeps
 // the mask push constants as the plane would have them: nem1 = n_tps, nem2 = 1, nem3 = n_stream.
 //
-// Flags bits: 512 VIS, 1024 causal, 2048 alibi, 4096/8192 swa type; n_swa is spec constant 16.
+// Flags bits: 512 VIS, 1024 causal, 2048 alibi, 4096/8192 swa type; n_swa is spec constant 16,
+// n_sink ([TAG_MTP_DRAFT_WINDOW], standard window only) spec constant 17.
 
 layout (constant_id = 16) const uint32_t VisNSwa = 0;
+layout (constant_id = 17) const uint32_t VisNSink = 0;
 
 const bool VIS           = (Flags & 512) != 0;
 const uint32_t VIS_FLAGS = (((Flags & 1024) != 0) ? 1u : 0u) |
@@ -119,7 +121,7 @@ void fa_vis_stage(const uint jt, const uint b) {
         if (vis_fold) {
             [[unroll]] for (uint sl = 0; sl < VIS_SLOTS; ++sl) {
                 vis_sh_val[(b * VIS_SLOTS + sl) * Bc + c] =
-                    kqv_value_of(p0, sm, x0, y0, vis_sh_slottok[sl], VIS_FLAGS, int(VisNSwa));
+                    kqv_value_of(p0, sm, x0, y0, vis_sh_slottok[sl], VIS_FLAGS, int(VisNSwa), int(VisNSink));
             }
         } else {
             vis_sh_pos[b * Bc + c] = p0;
@@ -146,7 +148,7 @@ float fa_vis_value_b(const uint b, const uint r_local, const uint c_local) {
     }
     const uint e = b * Bc + c_local;
     return kqv_value_of(vis_sh_pos[e], vis_sh_seq[e], vis_sh_x[e], vis_sh_y[e],
-                        vis_sh_tok[r_local], VIS_FLAGS, int(VisNSwa));
+                        vis_sh_tok[r_local], VIS_FLAGS, int(VisNSwa), int(VisNSink));
 }
 
 float fa_vis_value_sh(const uint r_local, const uint c_local) {

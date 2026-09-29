@@ -438,7 +438,9 @@ struct llama_hparams {
     // note: inlined on purpose for performance reasons
     // TODO: think of a better place for this function
     // TODO: pack the SWA params in a struct?
-    static bool is_masked_swa(uint32_t n_swa, llama_swa_type swa_type, llama_pos p0, llama_pos p1) {
+    // [TAG_MTP_DRAFT_WINDOW] n_sink (standard window only): positions p0 < n_sink are never window-masked
+    // (attention sinks); 0 = the plain standard window
+    static bool is_masked_swa(uint32_t n_swa, llama_swa_type swa_type, llama_pos p0, llama_pos p1, uint32_t n_sink = 0) {
         assert(p0 >= 0 && p1 >= 0);
 
         switch (swa_type) {
@@ -447,7 +449,7 @@ struct llama_hparams {
                 } break;
             case LLAMA_SWA_TYPE_STANDARD:
                 {
-                    if (p1 - p0 >= (int32_t) n_swa) {
+                    if (p1 - p0 >= (int32_t) n_swa && p0 >= (llama_pos) n_sink) {
                         return true;
                     }
                 } break;

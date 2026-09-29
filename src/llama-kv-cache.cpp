@@ -1572,6 +1572,10 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    // [TAG_MTP_DRAFT_WINDOW] sinks of a standard window, and the window-band row tracking (llama_kv_cells_fill_kq_mask)
+    uint32_t n_sink;
+    bool     win_band;
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -1584,6 +1588,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
     const uint32_t       n_swa    = args.n_swa;
     const llama_swa_type swa_type = args.swa_type;
+    const uint32_t       n_sink   = args.n_sink;   // [TAG_MTP_DRAFT_WINDOW]
+    const bool           win_band = args.win_band; // [TAG_MTP_DRAFT_WINDOW]
 
     const int64_t n_kv     = args.n_kv;
     const int64_t n_stream = args.n_stream;
@@ -1600,6 +1606,17 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
+    }
+
+    // [TAG_MTP_DRAFT_WINDOW] win_band: and the max, for the window-exit band below
+    llama_pos seq_pos_max[LLAMA_MAX_SEQ];
+    if (win_band) {
+        std::fill(seq_pos_max, seq_pos_max + LLAMA_MAX_SEQ, INT32_MIN);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+            seq_pos_max[seq_id] = std::max(seq_pos_max[seq_id], ubatch->pos[i]);
+        }
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1644,7 +1661,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     prev = true;
                 } else {
                     idxs.clear();
-                    idxs.reserve(ubatch->n_tokens + n_swa + 32);
+                    // [TAG_MTP_DRAFT_WINDOW] the window bands hold O(n_tokens) cells, not O(n_swa)
+                    idxs.reserve(win_band ? 2*ubatch->n_tokens + 64 : ubatch->n_tokens + n_swa + 32);
 
                     seq_srct[seq_id] = i;
                 }
@@ -1677,8 +1695,21 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 if (!alibi) {
                     if (!prev) {
-                        // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
-                        if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
+                        if (win_band) {
+                            // [TAG_MTP_DRAFT_WINDOW] a standard window over the rows' positions [pmin, pmax]: a cell's
+                            // value can differ between rows only in the causal band (p0 >= pmin - 32: future cells and
+                            // p0 == p1 ties) or in the window-exit band (p0 + n_swa in (pmin, pmax], +-32); any other
+                            // cell is before every row (p0 < pmin - 32) and either inside every row's window
+                            // (p0 + n_swa > pmax + 32) or outside all of them (p0 + n_swa < pmin - 32, masked unless a
+                            // sink, for every row alike) - the first row's value holds for all rows
+                            const llama_pos pmin = seq_pos_min[seq_id];
+                            const llama_pos pmax = seq_pos_max[seq_id];
+                            if (p0 + 32 >= pmin ||
+                                (p0 + (int32_t) (n_swa + 32) >= pmin && p0 + (int32_t) n_swa <= pmax + 32)) {
+                                idxs.push_back(j);
+                            }
+                        } else if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
+                            // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
                             idxs.push_back(j);
                         }
                     }
@@ -1702,9 +1733,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     }
                 }
 
-                // apply SWA if any
+                // apply SWA if any ([TAG_MTP_DRAFT_WINDOW] + the sinks of a standard window)
                 if (swa) {
-                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1, n_sink)) {
                         goto skip;
                     }
                 }
@@ -1765,8 +1796,12 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 void llama_kv_cells_fill_kq_mask(
         void * data, ggml_type type, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool causal_attn,
         const llama_hparams & hparams, uint32_t n_swa, llama_swa_type swa_type,
-        const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream) {
+        const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream,
+        uint32_t n_sink, bool win_band) {
     const uint32_t n_tokens = ubatch->n_tokens;
+
+    // [TAG_MTP_DRAFT_WINDOW] sinks and the band tracking belong to a standard window
+    GGML_ASSERT((n_sink == 0 && !win_band) || swa_type == LLAMA_SWA_TYPE_STANDARD);
 
     GGML_ASSERT(n_tokens%n_stream == 0);
 
@@ -1783,6 +1818,8 @@ void llama_kv_cells_fill_kq_mask(
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.n_sink           =*/ n_sink,
+        /*.win_band         =*/ win_band,
     };
 
     if (type == GGML_TYPE_F16) {
@@ -1812,15 +1849,81 @@ llama_kqvis_prof_fill & llama_kqvis_prof_fill_tls() {
     return acc;
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+// [TAG_MTP_DRAFT_WINDOW] see llama-kv-cache.h
+void llama_kv_cells_window_census(
+        int64_t n_kv, const llama_ubatch * ubatch, uint32_t n_swa, uint32_t n_sink, uint32_t tile,
+        const std::vector<llama_kv_cells> & v_cells, const std::vector<uint32_t> & seq_to_stream,
+        int64_t * n_tiles, int64_t * n_live) {
+    GGML_ASSERT(tile > 0);
+    *n_tiles = 0;
+    *n_live  = 0;
+
+    // per stream: the sequences of the ubatch in it, each with its token position interval
+    std::map<uint32_t, std::map<llama_seq_id, std::pair<llama_pos, llama_pos>>> streams;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_seq_id s = ubatch->seq_id[i][0];
+        auto & r = streams[seq_to_stream[s]];
+        auto it = r.find(s);
+        if (it == r.end()) {
+            r[s] = { ubatch->pos[i], ubatch->pos[i] };
+        } else {
+            it->second.first  = std::min(it->second.first,  ubatch->pos[i]);
+            it->second.second = std::max(it->second.second, ubatch->pos[i]);
+        }
+    }
+
+    for (const auto & st : streams) {
+        const llama_kv_cells & cells = v_cells.at(st.first);
+        const int64_t n = std::min<int64_t>(n_kv, cells.size());
+        for (int64_t t0 = 0; t0 < n; t0 += tile) {
+            const int64_t t1 = std::min<int64_t>(n, t0 + tile);
+            bool live = false;
+            for (int64_t j = t0; j < t1 && !live; ++j) {
+                if (cells.is_empty((uint32_t) j)) {
+                    continue;
+                }
+                const llama_pos p0 = cells.pos_get((uint32_t) j);
+                for (const auto & sq : st.second) {
+                    if (!cells.seq_has((uint32_t) j, sq.first)) {
+                        continue;
+                    }
+                    // some token t in [pmin, pmax] with p0 <= t (causal) and (p0 < n_sink or t - p0 < n_swa)
+                    const llama_pos pmin = sq.second.first;
+                    const llama_pos pmax = sq.second.second;
+                    if (p0 <= pmax && (p0 < (llama_pos) n_sink || (int64_t) p0 + n_swa > (int64_t) pmin)) {
+                        live = true;
+                        break;
+                    }
+                }
+            }
+            *n_tiles += 1;
+            *n_live  += live ? 1 : 0;
+        }
+    }
+}
+
+void llama_kv_cache::window_census(const llama_ubatch * ubatch, uint32_t n_kv, uint32_t n_swa, uint32_t n_sink, uint32_t tile,
+        int64_t * n_tiles, int64_t * n_live) const {
+    llama_kv_cells_window_census(n_kv, ubatch, n_swa, n_sink, tile, v_cells, seq_to_stream, n_tiles, n_live);
+}
+
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
+        uint32_t win_n_swa, uint32_t win_n_sink) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const bool prof = llama_kqvis_prof_enabled();
     const int64_t t_start = prof ? ggml_time_us() : 0;
 
+    if (win_n_swa > 0) {
+        // [TAG_MTP_DRAFT_WINDOW] the input's window: a standard window with sinks, over a cache without SWA of its own
+        GGML_ASSERT(swa_type == LLAMA_SWA_TYPE_NONE && "LLAMA_MTP_DRAFT_WINDOW: the draft cache already has a SWA rule");
+        llama_kv_cells_fill_kq_mask(dst->data, dst->type, dst->ne[0], dst->ne[3], ubatch, causal_attn,
+                hparams, win_n_swa, LLAMA_SWA_TYPE_STANDARD, v_cells, seq_to_stream, win_n_sink, /*win_band =*/ true);
+    } else {
     // dst: [n_kv, n_tps, 1, n_stream]; ne[3] = num streams in the current ubatch
     llama_kv_cells_fill_kq_mask(dst->data, dst->type, dst->ne[0], dst->ne[3], ubatch, causal_attn,
             hparams, n_swa, swa_type, v_cells, seq_to_stream);
+    }
 
     if (prof) {
         auto & acc = llama_kqvis_prof_fill_tls();
@@ -2977,8 +3080,14 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
-void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
+void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
+        uint32_t win_n_swa, uint32_t win_n_sink) const {
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, win_n_swa, win_n_sink);
+}
+
+void llama_kv_cache_context::window_census(const llama_ubatch * ubatch, uint32_t n_swa, uint32_t n_sink, uint32_t tile,
+        int64_t * n_tiles, int64_t * n_live) const {
+    kv->window_census(ubatch, n_kv, n_swa, n_sink, tile, n_tiles, n_live);
 }
 
 bool llama_kv_cache_context::set_input_kq_vis(ggml_tensor * cells_dst, ggml_tensor * toks_dst, const llama_ubatch * ubatch) const {

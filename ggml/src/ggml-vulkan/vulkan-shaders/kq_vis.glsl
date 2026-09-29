@@ -10,6 +10,8 @@
 // token: ivec4 {pos, 1 << seq, x, y} (x = y = INT32_MAX without 2-D positions)
 // flags: bit 0 causal, bit 1 alibi, bits 2..3 swa type (0 none, 1 standard, 2 chunked, 3 symmetric),
 //        bit 4 f16 (the ALiBi value is rounded to f16 precision; see KQV_FLAG_F16)
+// n_sink ([TAG_MTP_DRAFT_WINDOW]): standard window only - positions < n_sink are never window-masked
+// (0 = the plain standard window)
 //
 // Every value returned is exactly representable in f16 (+0, -inf, or -n with n rounded to f16
 // precision), so converting it to float16_t is exact under any rounding mode: the result is the
@@ -48,9 +50,9 @@ float kqv_alibi_value(const int d, const bool f16) {
 }
 
 // a copy of llama_hparams::is_masked_swa
-bool kqv_swa_masked(const uint swa_type, const int n_swa, const int p0, const int p1) {
+bool kqv_swa_masked(const uint swa_type, const int n_swa, const int n_sink, const int p0, const int p1) {
     if (swa_type == 1u) {
-        return p1 - p0 >= n_swa;
+        return p1 - p0 >= n_swa && p0 >= n_sink;
     }
     if (swa_type == 2u) {
         return p0 < (p1 / n_swa) * n_swa;
@@ -65,7 +67,8 @@ bool kqv_swa_masked(const uint swa_type, const int n_swa, const int p0, const in
 
 // the mask value for a cell record (p0, sm, x0, y0) and a token record t. x0 / y0 are read only at
 // a causal tie (p0 == t.x), so a caller may pass anything for them when p0 is no token's position.
-float kqv_value_of(const int p0, const uint sm, const int x0, const int y0, const ivec4 t, const uint flags, const int n_swa) {
+float kqv_value_of(const int p0, const uint sm, const int x0, const int y0, const ivec4 t, const uint flags, const int n_swa,
+                   const int n_sink) {
     if ((sm & uint(t.y)) == 0u) {
         return kqv_neg_inf();
     }
@@ -79,7 +82,7 @@ float kqv_value_of(const int p0, const uint sm, const int x0, const int y0, cons
         }
     }
     const uint swa_type = (flags >> 2) & 3u;
-    if (swa_type != 0u && kqv_swa_masked(swa_type, n_swa, p0, p1)) {
+    if (swa_type != 0u && kqv_swa_masked(swa_type, n_swa, n_sink, p0, p1)) {
         return kqv_neg_inf();
     }
     if ((flags & KQV_FLAG_ALIBI) != 0u) {
@@ -90,7 +93,7 @@ float kqv_value_of(const int p0, const uint sm, const int x0, const int y0, cons
 
 // the mask value of cell j (of the stream whose planes start at cbase) for token record t, loading
 // the cell planes lazily: seq bits, then pos, then x / y only at a causal tie
-float kqv_value(const uint cbase, const uint n_kv, const uint j, const ivec4 t, const uint flags, const int n_swa) {
+float kqv_value(const uint cbase, const uint n_kv, const uint j, const ivec4 t, const uint flags, const int n_swa, const int n_sink) {
     const uint sm = uint(kqv_cell_load(cbase + n_kv + j));
     if ((sm & uint(t.y)) == 0u) {
         return kqv_neg_inf();
@@ -102,5 +105,5 @@ float kqv_value(const uint cbase, const uint n_kv, const uint j, const ivec4 t, 
         x0 = kqv_cell_load(cbase + 2u * n_kv + j);
         y0 = kqv_cell_load(cbase + 3u * n_kv + j);
     }
-    return kqv_value_of(p0, sm, x0, y0, t, flags, n_swa);
+    return kqv_value_of(p0, sm, x0, y0, t, flags, n_swa, n_sink);
 }

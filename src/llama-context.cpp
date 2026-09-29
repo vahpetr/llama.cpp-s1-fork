@@ -79,6 +79,13 @@ static const char * sched_prof_ctx_name(llama_context_type ctx_type) {
 // attn_inp_kq_* part); sync = synchronize() waits with queued work (the device time not already waited in in_wait).
 // t0/t1 = unix ms of the window, so a reader attributes windows to request phases by time; a window never spans an idle
 // gap > 1.5 s of all contexts (g_kqvis_epoch), so a request's windows are closed by the next request's first graph.
+// [TAG_MTP_DRAFT_WINDOW] with LLAMA_MTP_DRAFT_WINDOW on, the MTP context's windows also carry a tile census (one
+// "mtp-window-prof:" WARN line next to the kqvis-prof line of the same win index): every LLAMA_MTP_WINDOW_SAMPLE-th draft
+// graph, the LLAMA_MTP_WINDOW_TILE-cell tiles over n_kv and those holding a cell some token of the ubatch may see
+// (llama_kv_cells_window_census: an upper bound of the tiles flash attention cannot skip)
+#define LLAMA_MTP_WINDOW_TILE   64u
+#define LLAMA_MTP_WINDOW_SAMPLE 16u
+
 static std::atomic<int64_t>  g_kqvis_last_us{0}; // ggml_time_us() at the end of the last graph / sync, any context
 static std::atomic<uint64_t> g_kqvis_epoch{0};   // +1 at every idle gap > 1.5 s
 
@@ -91,6 +98,15 @@ void llama_context::kqvis_prof_flush(const char * reason) const {
     if (w.graphs > 0) {
         static const char * mode_name[4] = { "none", "mask", "vis", "both" };
         const double g = (double) w.graphs;
+        if (w.win_sampled > 0) {
+            // [TAG_MTP_DRAFT_WINDOW] the tile census of this window's sampled graphs (same win index as the kqvis-prof line)
+            const llama_mtp_draft_window & mw = llama_mtp_draft_window_get();
+            LLAMA_LOG_WARN("mtp-window-prof: ctx=%s class=%s win=%" PRId64 " window=%u sink=%u tile=%u graphs=%d sampled=%d"
+                    " tiles=%" PRId64 " live=%" PRId64 " live_pct=%.2f census_us=%" PRId64 "\n",
+                    sched_prof_ctx_name(cparams.ctx_type), w.cls == 1 ? "pp" : "dec", kqvis_n_win, mw.n_swa, mw.n_sink,
+                    LLAMA_MTP_WINDOW_TILE, w.graphs, w.win_sampled, w.win_tiles, w.win_live,
+                    w.win_tiles > 0 ? 100.0*(double) w.win_live/(double) w.win_tiles : 0.0, w.win_census_us);
+        }
         LLAMA_LOG_WARN("kqvis-prof: ctx=%s mode=%s class=%s win=%" PRId64 " reason=%s graphs=%d reused=%d tok=%" PRId64
                 " nkv_min=%" PRId64 " nkv_max=%" PRId64 " nkv_avg=%.0f build_us=%" PRId64 " inputs_us=%" PRId64
                 " fill_us=%" PRId64 " fill_avg=%.1f in_wait_us=%" PRId64 " in_copy_us=%" PRId64 " kq_copy_us=%" PRId64
@@ -362,6 +378,22 @@ llama_context::llama_context(
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
+
+    // [TAG_MTP_DRAFT_WINDOW] the arm's proof line, once per process at the first MTP draft context (WARN: library INFO is
+    // dropped at the server default -lv 3)
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        static std::atomic<bool> printed{false};
+        if (!printed.exchange(true)) {
+            const llama_mtp_draft_window & mw = llama_mtp_draft_window_get();
+            if (mw.n_swa > 0) {
+                LLAMA_LOG_WARN("mtp_draft_window: on, window %u sink %u (LLAMA_MTP_DRAFT_WINDOW, LLAMA_MTP_DRAFT_SINK): the MTP "
+                        "draft sees a cell iff pos < %u or pos > query_pos - %u, per sequence; visibility only (the draft KV "
+                        "keeps every cell), fully masked FA tiles skip their K/V loads\n", mw.n_swa, mw.n_sink, mw.n_sink, mw.n_swa);
+            } else {
+                LLAMA_LOG_WARN("mtp_draft_window: off (LLAMA_MTP_DRAFT_WINDOW unset or 0): the MTP draft attends densely\n");
+            }
+        }
+    }
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -1849,6 +1881,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         w.compute_us += t_now_us - kq_t_compute_us;
         w.t1_ms       = kqvis_unix_ms();
         g_kqvis_last_us.store(t_now_us);
+
+        // [TAG_MTP_DRAFT_WINDOW] the tile census of the draft window, on every LLAMA_MTP_WINDOW_SAMPLE-th draft graph (the
+        // host scan is O(n_kv); it runs after the async submit, next to the device work)
+        const llama_mtp_draft_window & mw = llama_mtp_draft_window_get();
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mw.n_swa > 0 && (kqvis_win_census_n++ % LLAMA_MTP_WINDOW_SAMPLE) == 0) {
+            const llama_kv_cache_context * kvc = dynamic_cast<const llama_kv_cache_context *>(mctx);
+            if (kvc == nullptr) {
+                if (const auto * h = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+                    kvc = h->get_attn();
+                }
+            }
+            if (kvc != nullptr) {
+                const int64_t tc0 = ggml_time_us();
+                int64_t n_tiles = 0, n_live = 0;
+                kvc->window_census(&ubatch, mw.n_swa, mw.n_sink, LLAMA_MTP_WINDOW_TILE, &n_tiles, &n_live);
+                w.win_sampled++;
+                w.win_tiles     += n_tiles;
+                w.win_live      += n_live;
+                w.win_census_us += ggml_time_us() - tc0;
+            }
+        }
     }
 
     // [TAG_QSA_POOLED_CACHE] the graph has been submitted in its build order (raw indexer write, then the

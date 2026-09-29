@@ -93,6 +93,19 @@ struct llama_cross {
 
 struct llm_graph_params;
 
+// [TAG_MTP_DRAFT_WINDOW] LLAMA_MTP_DRAFT_WINDOW=N (default 0 = off) and LLAMA_MTP_DRAFT_SINK=S (default 4), read once per
+// process. In a LLAMA_CONTEXT_TYPE_MTP context only, the plain KV attention input (llm_graph_input_attn_kv, the
+// qwen4exp MTP head's) sees a cell iff today's rule holds AND (cell_pos < S || cell_pos > query_pos - N): a standard
+// sliding window of N positions plus S sink positions, evaluated per (cell, query token) from absolute positions, so it is
+// strictly per sequence (the sequence test comes first). Visibility only: the draft KV keeps every cell, the target
+// context is untouched. n_swa 0 = off (today's graphs, byte for byte).
+struct llama_mtp_draft_window {
+    uint32_t n_swa  = 0;
+    uint32_t n_sink = 0;
+};
+
+const llama_mtp_draft_window & llama_mtp_draft_window_get();
+
 //
 // llm_graph_input
 //
@@ -349,6 +362,11 @@ public:
     ggml_tensor * self_kq_vis_cells = nullptr; // I32 [n_kv, 4, n_stream]
     ggml_tensor * self_kq_vis_toks  = nullptr; // I32 [4, n_batch/n_stream, n_stream]
     bool          kq_vis_fa         = false;   // two-class bridge: FA reads the metadata (else the KQ_MASK plane)
+
+    // [TAG_MTP_DRAFT_WINDOW] the MTP draft's attention window (LLAMA_MTP_DRAFT_WINDOW / LLAMA_MTP_DRAFT_SINK) on top of
+    // the cache's own rule, in every mask form this input builds (host plane, KQ_MASK node, metadata FA); 0 = none
+    uint32_t win_n_swa  = 0;
+    uint32_t win_n_sink = 0;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -1183,7 +1201,11 @@ struct llm_graph_context {
                     int   il,
             // [TAG_KQ_VIS] with flash attention: the visibility metadata replaces kq_mask
             ggml_tensor * kq_vis_cells = nullptr,  // I32 [n_kv, 4, n_stream]
-            ggml_tensor * kq_vis_toks  = nullptr) const; // I32 [4, n_tokens/n_stream, n_stream]
+            ggml_tensor * kq_vis_toks  = nullptr,  // I32 [4, n_tokens/n_stream, n_stream]
+            // [TAG_MTP_DRAFT_WINDOW] the window the metadata FA applies (swa type, n_swa, sinks); 0 = none
+            int32_t       kq_vis_swa_type = 0,
+            int32_t       kq_vis_n_swa    = 0,
+            int32_t       kq_vis_n_sink   = 0) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
