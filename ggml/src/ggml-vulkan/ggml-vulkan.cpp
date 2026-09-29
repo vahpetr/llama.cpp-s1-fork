@@ -12037,6 +12037,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_subbuffer vis_toks_buf = vis ? ggml_vk_tensor_subbuffer(ctx, vis_toks) : q_buf; // binding 7 (scalar/coopmat1 only)
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+    if (use_mask_opt) {
+        // [TAG_UP29591] the mask-opt / vis-opt bits overwrite a matmul input converted into prealloc_y (upstream #29591)
+        ctx->prealloc_y_last_pipeline_used = nullptr;
+        ctx->prealloc_y_last_tensor_used = nullptr;
+    }
 
     if (use_dequant_kv) {
         const uint64_t fp = sizeof(ggml_fp16_t);
@@ -14830,6 +14835,10 @@ static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
         vk_subbuffer buf_x = { ctx->prealloc_x, 0, tmp_size };
         vk_subbuffer buf_y = { ctx->prealloc_y, 0, tmp_size };
+
+        // [TAG_UP29591] the partial results overwrite a matmul input converted into prealloc_y (upstream #29591)
+        ctx->prealloc_y_last_pipeline_used = nullptr;
+        ctx->prealloc_y_last_tensor_used = nullptr;
 
         std::array<uint32_t, 3> elements = { num_wgs, nrows_x, 1 };
 
