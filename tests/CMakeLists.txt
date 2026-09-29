@@ -361,6 +361,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+
+    # ggml_permute keeps 64-bit ne / byte strides (upstream #29227); metadata only, no_alloc
+    llama_build_and_test(test-permute-large-stride.cpp)
 endif()
 
 llama_build(test-export-graph-ops.cpp)
