@@ -390,7 +390,8 @@ llama_context::llama_context(
                         "draft sees a cell iff pos < %u or pos > query_pos - %u, per sequence; visibility only (the draft KV "
                         "keeps every cell), fully masked FA tiles skip their K/V loads\n", mw.n_swa, mw.n_sink, mw.n_sink, mw.n_swa);
             } else {
-                LLAMA_LOG_WARN("mtp_draft_window: off (LLAMA_MTP_DRAFT_WINDOW unset or 0): the MTP draft attends densely\n");
+                LLAMA_LOG_WARN("mtp_draft_window: off (%s): the MTP draft attends densely\n",
+                        mw.invalid ? "LLAMA_MTP_DRAFT_WINDOW / LLAMA_MTP_DRAFT_SINK invalid" : "LLAMA_MTP_DRAFT_WINDOW unset or 0");
             }
         }
     }

@@ -36,6 +36,10 @@
 //
 // usage: test-mtp-draft-window [n_layouts = 3000] [seed = 7] [n_threads = 4] [fa_budget = 49152]
 //                              [--device NAME] [--dev-layouts N (300)] [--perf] [--perf-reps N (15)] [--perf-nkv a,b,c]
+//                              [--perf-tps a,b (1,6)] [--perf-windows a,b,c (0,65536,16384)] [--perf-ref]
+//   --perf-ref: the window arms (and the dense arm up to n_kv 262144) are checked against an f64 softmax over the visible
+//   cells (nmse < 1e-5 required; ggml's CPU FA is shown beside it - it accumulates V in f16, so it drifts with depth);
+//   every probe row counts non-finite outputs (an all-masked split_k chunk must not leak NaN / inf into the reduce)
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -60,6 +64,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -685,6 +690,9 @@ struct dev_fa {
     ggml_tensor * m_op = nullptr, * o_plane = nullptr, * o_vis = nullptr, * o_bridge = nullptr;
     ggml_cgraph * gf_op = nullptr, * gf_plane = nullptr, * gf_vis = nullptr, * gf_bridge = nullptr;
     bool supported = true;
+    bool keep_host = false;                     // keep the host Q/K/V (the CPU reference of the skip probe)
+    std::vector<float>       qh;
+    std::vector<ggml_fp16_t> kh, vh;
 
     void build(int64_t n_kv, int64_t n_tps, int64_t n_stream, int64_t D, int64_t n_head, int64_t n_head_kv, bool causal, bool alibi,
                int swa_type, uint32_t N, uint32_t S, bool f32_plane, const std::vector<uint8_t> & plane_f16,
@@ -729,6 +737,12 @@ struct dev_fa {
         for (ggml_tensor * t : { k, v }) {
             for (auto & x : kf) x = ggml_fp32_to_fp16(nd(g_rng));
             ggml_backend_tensor_set(t, kf.data(), 0, ggml_nbytes(t));
+            if (keep_host) {
+                (t == k ? kh : vh) = kf;
+            }
+        }
+        if (keep_host) {
+            qh = std::move(qf);
         }
         ggml_backend_tensor_set(m,  plane_f16.data(), 0, ggml_nbytes(m));
         ggml_backend_tensor_set(tc, cells_rec.data(), 0, ggml_nbytes(tc));
@@ -773,15 +787,128 @@ void run_dev_layout() {
     g_ds.fa_bridge_diff += db;
 }
 
-// the skip probe at the draft's shapes
-void run_dev_perf(const std::vector<int64_t> & nkvs, int reps) {
-    printf("  skip probe on %s (24/2 heads, D 256, f16 K/V, one sequence in position order, sink 4; ms = median of %d):\n",
-           ggml_backend_name(g_dev), reps);
-    printf("    %8s %5s %7s | %10s %10s | %8s %8s | %s\n", "n_kv", "n_tps", "window", "bridge ms", "vis ms", "bridge x", "vis x", "identical");
+uint64_t n_nonfinite(const std::vector<uint8_t> & a) {
+    uint64_t n = 0;
+    for (size_t i = 0; i + 4 <= a.size(); i += 4) {
+        float x; memcpy(&x, &a[i], 4);
+        n += !std::isfinite(x);
+    }
+    return n;
+}
+
+// FA over the same Q/K/V and the ref plane on the CPU backend: {nmse, max |diff|} of the device output against it
+std::pair<double, double> cpu_ref_diff(const dev_fa & f, const std::vector<uint8_t> & plane_f16, const std::vector<uint8_t> & dev_out,
+                                       int64_t D, int64_t n_tps, int64_t n_head, int64_t n_head_kv, int64_t n_kv, int n_threads,
+                                       std::vector<uint8_t> * cpu_out) {
+    const size_t bytes = f.qh.size()*4 + f.kh.size()*2*2 + plane_f16.size() + dev_out.size();
+    ggml_init_params ip = { bytes + 16*ggml_tensor_overhead() + ggml_graph_overhead() + (64 << 20), nullptr, false };
+    ggml_context * ctx = ggml_init(ip);
+    GGML_ASSERT(ctx);
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_tps, n_head,    1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, n_kv,  n_head_kv, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, n_kv,  n_head_kv, 1);
+    ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, 1);
+    memcpy(q->data, f.qh.data(), ggml_nbytes(q));
+    memcpy(k->data, f.kh.data(), ggml_nbytes(k));
+    memcpy(v->data, f.vh.data(), ggml_nbytes(v));
+    memcpy(m->data, plane_f16.data(), ggml_nbytes(m));
+    ggml_tensor * o = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) D), 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, o);
+    GGML_ASSERT(ggml_graph_compute_with_ctx(ctx, gf, n_threads) == GGML_STATUS_SUCCESS);
+    const float * r = (const float *) o->data;
+    const float * d = (const float *) dev_out.data();
+    if (cpu_out) {
+        cpu_out->resize(ggml_nbytes(o));
+        memcpy(cpu_out->data(), o->data, cpu_out->size());
+    }
+    double se = 0, sr = 0, mx = 0;
+    for (int64_t i = 0; i < ggml_nelements(o); ++i) {
+        const double e = (double) d[i] - (double) r[i];
+        se += e*e; sr += (double) r[i]*r[i]; mx = std::max(mx, std::fabs(e));
+    }
+    ggml_free(ctx);
+    return { sr > 0 ? se/sr : se, mx };
+}
+
+// the exact reference: softmax attention in double over the cells the ref plane keeps (f16 K/V as given, f32 Q), the
+// GQA mapping of ggml (q head h reads kv head h / (n_head / n_head_kv)); returns nmse(out, f64). The CPU backend's FA
+// is NOT a reference at depth: it accumulates V in f16 (ops.cpp VKQ16), so its error grows with the visible cells
+double f64_ref_nmse(const dev_fa & f, const std::vector<uint8_t> & plane_f16, const std::vector<uint8_t> & out,
+                    int64_t D, int64_t n_tps, int64_t n_head, int64_t n_head_kv, int64_t n_kv, int n_threads, double * cpu_nmse,
+                    const std::vector<uint8_t> * cpu_out) {
+    const ggml_fp16_t * m = (const ggml_fp16_t *) plane_f16.data();
+    const float * o = (const float *) out.data();
+    const float * oc = cpu_out ? (const float *) cpu_out->data() : nullptr;
+    const double scale = 1.0/sqrt((double) D);
+    const int64_t ratio = n_head/n_head_kv;
+    std::vector<double> se(n_head*n_tps, 0.0), sr(n_head*n_tps, 0.0), sc(n_head*n_tps, 0.0);
+    auto work = [&](int64_t w0, int64_t w1) {
+        std::vector<double> sco, acc((size_t) D);
+        std::vector<int64_t> vis;
+        for (int64_t w = w0; w < w1; ++w) {
+            const int64_t h = w / n_tps, t = w % n_tps, hk = h / ratio;
+            const float * q = f.qh.data() + (h*n_tps + t)*D;
+            vis.clear();
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (!std::isinf(ggml_fp16_to_fp32(m[t*n_kv + j]))) vis.push_back(j);
+            }
+            sco.assign(vis.size(), 0.0);
+            double mx = -1e300;
+            for (size_t i = 0; i < vis.size(); ++i) {
+                const ggml_fp16_t * k = f.kh.data() + (hk*n_kv + vis[i])*D;
+                double s = 0;
+                for (int64_t d = 0; d < D; ++d) s += (double) q[d] * (double) ggml_fp16_to_fp32(k[d]);
+                sco[i] = s*scale;
+                mx = std::max(mx, sco[i]);
+            }
+            std::fill(acc.begin(), acc.end(), 0.0);
+            double L = 0;
+            for (size_t i = 0; i < vis.size(); ++i) {
+                const double p = exp(sco[i] - mx);
+                L += p;
+                const ggml_fp16_t * v = f.vh.data() + (hk*n_kv + vis[i])*D;
+                for (int64_t d = 0; d < D; ++d) acc[d] += p * (double) ggml_fp16_to_fp32(v[d]);
+            }
+            for (int64_t d = 0; d < D; ++d) {
+                const double r = acc[d]/L;
+                const size_t oi = (size_t) ((t*n_head + h)*D + d); // FA output [D, n_head, n_tps]
+                se[w] += (o[oi] - r)*(o[oi] - r);
+                sr[w] += r*r;
+                if (oc) sc[w] += (oc[oi] - r)*(oc[oi] - r);
+            }
+        }
+    };
+    const int64_t nw = n_head*n_tps;
+    const int nt = std::max(1, std::min<int>(n_threads, (int) nw));
+    std::vector<std::thread> th;
+    for (int i = 0; i < nt; ++i) th.emplace_back(work, nw*i/nt, nw*(i + 1)/nt);
+    for (auto & x : th) x.join();
+    double SE = 0, SR = 0, SC = 0;
+    for (int64_t w = 0; w < nw; ++w) { SE += se[w]; SR += sr[w]; SC += sc[w]; }
+    if (cpu_nmse) *cpu_nmse = oc ? SC/SR : -1.0;
+    return SE/SR;
+}
+
+// the skip probe at the draft's shapes: 24 q / 2 kv heads, D 256, f16 K/V, one sequence whose cells are in position
+// order, the query tokens last; per (n_kv, n_tps, window): the device time of the bridge FA (device KQ_MASK plane +
+// plane FA, the draft's decode class) and of the metadata FA; plane / vis / bridge outputs bit for bit; non-finite
+// outputs; with ref_check the window arms against FA on the CPU backend (nmse, max |diff|)
+void run_dev_perf(const std::vector<int64_t> & nkvs, const std::vector<int64_t> & tps, const std::vector<int64_t> & wins, int reps,
+                  bool ref_check, int n_threads) {
+    const int64_t D = 256, n_head = 24, n_head_kv = 2;
+    printf("  skip probe on %s (%" PRId64 "/%" PRId64 " heads, D %" PRId64 ", f16 K/V, one sequence in position order, sink 4; ms = median of %d):\n",
+           ggml_backend_name(g_dev), n_head, n_head_kv, D, reps);
+    printf("    %8s %5s %7s | %10s %10s | %8s %8s | %9s %17s | %s\n", "n_kv", "n_tps", "window", "bridge ms", "vis ms", "bridge x", "vis x",
+           "nonfinite", "nmse dev/cpu-FA", "identical");
+    printf("    (nmse vs an f64 softmax over the visible cells; dev = the device plane FA = vis = bridge bit for bit; cpu-FA = ggml's CPU FA,"
+           " f16 V accumulator)\n");
     for (int64_t n_kv : nkvs) {
-        for (int64_t n_tps : { (int64_t) 1, (int64_t) 6 }) {
+        for (int64_t n_tps : tps) {
             double dense_br = 0, dense_vis = 0;
-            for (uint32_t N : { 0u, 65536u, 16384u }) {
+            for (int64_t Nw : wins) {
+                const uint32_t N = (uint32_t) Nw;
                 const uint32_t S = N ? 4u : 0u;
                 // cells 0..n_kv-1 at positions 0..n_kv-1 of sequence 0; the tokens are the last n_tps cells
                 layout L;
@@ -804,7 +931,9 @@ void run_dev_perf(const std::vector<int64_t> & nkvs, int reps) {
                 std::vector<int32_t> cells_rec, toks_rec;
                 fill_meta(L, cells_rec, toks_rec);
                 dev_fa f;
-                f.build(n_kv, n_tps, 1, 256, 24, 2, true, false, N ? 1 : 0, N, S, false, ref, cells_rec, toks_rec);
+                // the exact reference: every window arm; the dense arm where the f64 pass stays affordable
+                f.keep_host = ref_check && (N > 0 || n_kv <= 262144);
+                f.build(n_kv, n_tps, 1, D, n_head, n_head_kv, true, false, N ? 1 : 0, N, S, false, ref, cells_rec, toks_rec);
                 if (!f.supported) {
                     printf("    %8" PRId64 " %5" PRId64 " %7u | unsupported\n", n_kv, n_tps, N);
                     continue;
@@ -822,9 +951,21 @@ void run_dev_perf(const std::vector<int64_t> & nkvs, int reps) {
                 dev_compute_ms(f.gf_plane);
                 const std::vector<uint8_t> a = dev_bytes(f.o_plane), b = dev_bytes(f.o_vis), c = dev_bytes(f.o_bridge);
                 const bool same = n_diff(a, b, 4) == 0 && n_diff(a, c, 4) == 0;
+                const uint64_t nf = n_nonfinite(a) + n_nonfinite(b) + n_nonfinite(c);
                 CHECK(same, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: plane / vis / bridge outputs differ", n_kv, n_tps, N);
-                printf("    %8" PRId64 " %5" PRId64 " %7u | %10.3f %10.3f | %8.2f %8.2f | %s\n", n_kv, n_tps, N, mb, mv,
-                       N ? dense_br/mb : 1.0, N ? dense_vis/mv : 1.0, same ? "yes" : "NO");
+                CHECK(nf == 0, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: %" PRIu64 " non-finite outputs", n_kv, n_tps, N, nf);
+                char refs[48] = "-";
+                if (f.keep_host) {
+                    std::vector<uint8_t> cpu_out;
+                    cpu_ref_diff(f, ref, a, D, n_tps, n_head, n_head_kv, n_kv, n_threads, &cpu_out);
+                    double cpu_nmse = -1;
+                    const double dev_nmse = f64_ref_nmse(f, ref, a, D, n_tps, n_head, n_head_kv, n_kv, n_threads, &cpu_nmse, &cpu_out);
+                    snprintf(refs, sizeof(refs), "%.1e %.1e", dev_nmse, cpu_nmse);
+                    CHECK(dev_nmse < 1e-5, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: device vs the f64 reference nmse %.3e (CPU FA %.3e)",
+                          n_kv, n_tps, N, dev_nmse, cpu_nmse);
+                }
+                printf("    %8" PRId64 " %5" PRId64 " %7u | %10.3f %10.3f | %8.2f %8.2f | %9" PRIu64 " %17s | %s\n", n_kv, n_tps, N, mb, mv,
+                       N && dense_br > 0 ? dense_br/mb : 1.0, N && dense_vis > 0 ? dense_vis/mv : 1.0, nf, refs, same ? "yes" : "NO");
                 fflush(stdout);
             }
         }
@@ -839,22 +980,30 @@ int main(int argc, char ** argv) {
     bool perf = false;
     int dev_layouts = 300, perf_reps = 15;
     std::vector<int64_t> perf_nkv = { 32768, 213248, 393216 };
+    std::vector<int64_t> perf_tps = { 1, 6 };
+    std::vector<int64_t> perf_win = { 0, 65536, 16384 };
+    bool perf_ref = false;
+    auto parse_list = [](const std::string & v) {
+        std::vector<int64_t> out;
+        for (size_t p0 = 0; p0 <= v.size();) {
+            const size_t p1 = v.find(',', p0);
+            out.push_back(atoll(v.substr(p0, p1 == std::string::npos ? std::string::npos : p1 - p0).c_str()));
+            if (p1 == std::string::npos) break;
+            p0 = p1 + 1;
+        }
+        return out;
+    };
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--device" && i + 1 < argc) { dev_name = argv[++i]; }
         else if (a == "--perf") { perf = true; }
         else if (a == "--dev-layouts" && i + 1 < argc) { dev_layouts = atoi(argv[++i]); }
         else if (a == "--perf-reps" && i + 1 < argc) { perf_reps = std::max(1, atoi(argv[++i])); }
-        else if (a == "--perf-nkv" && i + 1 < argc) {
-            perf_nkv.clear();
-            std::string v = argv[++i];
-            for (size_t p0 = 0; p0 <= v.size();) {
-                const size_t p1 = v.find(',', p0);
-                perf_nkv.push_back(atoll(v.substr(p0, p1 == std::string::npos ? std::string::npos : p1 - p0).c_str()));
-                if (p1 == std::string::npos) break;
-                p0 = p1 + 1;
-            }
-        } else { pos_args.push_back(a); }
+        else if (a == "--perf-nkv" && i + 1 < argc) { perf_nkv = parse_list(argv[++i]); }
+        else if (a == "--perf-tps" && i + 1 < argc) { perf_tps = parse_list(argv[++i]); }
+        else if (a == "--perf-windows" && i + 1 < argc) { perf_win = parse_list(argv[++i]); }
+        else if (a == "--perf-ref") { perf_ref = true; }
+        else { pos_args.push_back(a); }
     }
     const int      n_layouts = pos_args.size() > 0 ? atoi(pos_args[0].c_str()) : 3000;
     const uint64_t seed      = pos_args.size() > 1 ? strtoull(pos_args[1].c_str(), nullptr, 10) : 7;
@@ -915,7 +1064,7 @@ int main(int argc, char ** argv) {
                g_ds.op_diff, g_ds.fa_vis_diff, g_ds.fa_bridge_diff, g_ds.unsupported);
         CHECK(g_ds.op_runs > 0 && g_ds.unsupported == 0, "device: %" PRIu64 " layouts unsupported", g_ds.unsupported);
         if (perf) {
-            run_dev_perf(perf_nkv, perf_reps);
+            run_dev_perf(perf_nkv, perf_tps, perf_win, perf_reps, perf_ref, n_threads);
         }
         printf("  device checks: %s\n", st.fail == fail0 ? "PASS" : "FAIL");
         ggml_backend_free(g_dev);

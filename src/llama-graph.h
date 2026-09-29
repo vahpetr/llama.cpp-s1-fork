@@ -98,10 +98,11 @@ struct llm_graph_params;
 // qwen4exp MTP head's) sees a cell iff today's rule holds AND (cell_pos < S || cell_pos > query_pos - N): a standard
 // sliding window of N positions plus S sink positions, evaluated per (cell, query token) from absolute positions, so it is
 // strictly per sequence (the sequence test comes first). Visibility only: the draft KV keeps every cell, the target
-// context is untouched. n_swa 0 = off (today's graphs, byte for byte).
+// context is untouched. n_swa 0 = off: byte-identical outputs and op params (the node calls of the base commit).
 struct llama_mtp_draft_window {
-    uint32_t n_swa  = 0;
-    uint32_t n_sink = 0;
+    uint32_t n_swa   = 0;
+    uint32_t n_sink  = 0;
+    bool     invalid = false; // an env value was not a non-negative decimal integer (the window is off)
 };
 
 const llama_mtp_draft_window & llama_mtp_draft_window_get();

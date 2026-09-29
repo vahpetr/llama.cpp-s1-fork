@@ -3085,6 +3085,10 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
     kv->set_input_kq_mask(dst, ubatch, causal_attn, win_n_swa, win_n_sink);
 }
 
+llama_swa_type llama_kv_cache_context::get_swa_type() const {
+    return kv->get_swa_type();
+}
+
 void llama_kv_cache_context::window_census(const llama_ubatch * ubatch, uint32_t n_swa, uint32_t n_sink, uint32_t tile,
         int64_t * n_tiles, int64_t * n_live) const {
     kv->window_census(ubatch, n_kv, n_swa, n_sink, tile, n_tiles, n_live);

@@ -276,6 +276,8 @@ public:
                               uint32_t win_n_swa = 0, uint32_t win_n_sink = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    llama_swa_type get_swa_type() const { return swa_type; } // [TAG_MTP_DRAFT_WINDOW]
+
     // [TAG_MTP_DRAFT_WINDOW] LLAMA_KQ_VIS_PROF=1: llama_kv_cells_window_census over this cache's cells (n_kv = get_n_kv())
     void window_census(const llama_ubatch * ubatch, uint32_t n_kv, uint32_t n_swa, uint32_t n_sink, uint32_t tile,
                        int64_t * n_tiles, int64_t * n_live) const;
@@ -484,6 +486,9 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
                               uint32_t win_n_swa = 0, uint32_t win_n_sink = 0) const; // [TAG_MTP_DRAFT_WINDOW]
     bool set_input_kq_vis    (ggml_tensor * cells_dst, ggml_tensor * toks_dst, const llama_ubatch * ubatch) const;
+
+    // [TAG_MTP_DRAFT_WINDOW] the cache's own SWA rule (the draft window applies only to a cache without one)
+    llama_swa_type get_swa_type() const;
 
     // [TAG_MTP_DRAFT_WINDOW] LLAMA_KQ_VIS_PROF=1 tile census of the draft window (llama_kv_cache::window_census)
     void window_census(const llama_ubatch * ubatch, uint32_t n_swa, uint32_t n_sink, uint32_t tile,

@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -65,24 +66,52 @@ static bool llama_kq_vis_fa_class(const llama_ubatch & ubatch, const llama_cpara
     return cparams.flash_attn && ubatch.n_tokens >= llama_kq_vis_min_tokens();
 }
 
-// [TAG_MTP_DRAFT_WINDOW] see llama-graph.h. N is clamped to [1, 2^30] (the host fill adds 32 to it in int32), S to [0, 2^30];
-// an unparsable or non-positive N = off. The proof line is printed by llama_context at the MTP context's creation.
+// [TAG_MTP_DRAFT_WINDOW] see llama-graph.h. Both values must be plain non-negative decimal integers (end-pointer check:
+// "64k", "-1", "" are rejected with a WARN and the window stays off); N is clamped to 2^30 (the host fill adds 32 to it in
+// int32), S to 2^30; N 0 = off. The proof line is printed by llama_context at the MTP context's creation.
+static bool llama_mtp_parse_u(const char * s, long long & v) {
+    if (s == nullptr || *s == '\0' || *s == '-' || *s == '+') {
+        return false;
+    }
+    char * end = nullptr;
+    errno = 0;
+    v = strtoll(s, &end, 10);
+    return end != s && *end == '\0' && errno == 0 && v >= 0;
+}
+
 const llama_mtp_draft_window & llama_mtp_draft_window_get() {
     static const llama_mtp_draft_window w = [] {
         llama_mtp_draft_window r;
         const char * env_n = getenv("LLAMA_MTP_DRAFT_WINDOW");
         const char * env_s = getenv("LLAMA_MTP_DRAFT_SINK");
-        const long long n  = env_n != nullptr ? strtoll(env_n, nullptr, 10) : 0;
-        const long long sk = env_s != nullptr ? strtoll(env_s, nullptr, 10) : 4;
+        long long n = 0, sk = 4;
+        const bool ok_n = env_n == nullptr || llama_mtp_parse_u(env_n, n);
+        const bool ok_s = env_s == nullptr || llama_mtp_parse_u(env_s, sk);
+        if (!ok_n || !ok_s) {
+            LLAMA_LOG_WARN("mtp_draft_window: invalid LLAMA_MTP_DRAFT_WINDOW='%s' / LLAMA_MTP_DRAFT_SINK='%s' (non-negative decimal "
+                    "integers) - the window stays off\n", env_n ? env_n : "", env_s ? env_s : "");
+            r.invalid = true;
+            return r;
+        }
         if (n > 0) {
             r.n_swa  = (uint32_t) std::min<long long>(n, 1ll << 30);
-            r.n_sink = (uint32_t) std::max<long long>(0, std::min<long long>(sk, 1ll << 30));
+            r.n_sink = (uint32_t) std::min<long long>(sk, 1ll << 30);
         }
         return r;
     }();
     return w;
 }
 
+// [TAG_MTP_DRAFT_WINDOW] the window of an attention input built for these cparams: the MTP draft context's, else none
+static void llama_mtp_draft_window_of(const llama_cparams & cparams, uint32_t & n_swa, uint32_t & n_sink) {
+    n_swa  = 0;
+    n_sink = 0;
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        const llama_mtp_draft_window & win = llama_mtp_draft_window_get();
+        n_swa  = win.n_swa;
+        n_sink = win.n_swa > 0 ? win.n_sink : 0;
+    }
+}
 
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
@@ -565,6 +594,13 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     if (self_kq_vis_cells) {
         // [TAG_KQ_VIS] the bridge class is part of the graph
         res &= kq_vis_fa == llama_kq_vis_fa_class(params.ubatch, params.cparams);
+    }
+
+    {
+        // [TAG_MTP_DRAFT_WINDOW] so is the draft window (constant per context today; checked, not assumed)
+        uint32_t w_swa = 0, w_sink = 0;
+        llama_mtp_draft_window_of(params.cparams, w_swa, w_sink);
+        res &= win_n_swa == w_swa && win_n_sink == w_sink;
     }
 
     return res;
@@ -1203,6 +1239,13 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     if (inp_attn->self_kq_vis_cells) {
         // [TAG_KQ_VIS] the bridge class is part of the graph
         res &= inp_attn->kq_vis_fa == llama_kq_vis_fa_class(params.ubatch, params.cparams);
+    }
+
+    {
+        // [TAG_MTP_DRAFT_WINDOW] so is the draft window
+        uint32_t w_swa = 0, w_sink = 0;
+        llama_mtp_draft_window_of(params.cparams, w_swa, w_sink);
+        res &= inp_attn->win_n_swa == w_swa && inp_attn->win_n_sink == w_sink;
     }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
@@ -2879,11 +2922,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
         // [TAG_MTP_DRAFT_WINDOW] the MTP draft context only; every other context keeps win_n_swa = 0
-        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-            const llama_mtp_draft_window & win = llama_mtp_draft_window_get();
-            inp->win_n_swa  = win.n_swa;
-            inp->win_n_sink = win.n_swa > 0 ? win.n_sink : 0;
-        }
+        llama_mtp_draft_window_of(cparams, inp->win_n_swa, inp->win_n_sink);
 
         if (llama_kq_vis_enabled() && cparams.n_seq_max <= 32) {
             const int64_t n_kv     = mctx_cur->get_n_kv();
@@ -2905,8 +2944,11 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
             LLAMA_LOG_DEBUG("kq_vis: graph n_tokens %u n_kv %lld n_stream %lld -> %s\n", ubatch.n_tokens, (long long) n_kv,
                     (long long) n_stream, inp->kq_vis_fa ? "FA over metadata (no plane)" : "device KQ_MASK plane + plane FA");
 
-            // [TAG_MTP_DRAFT_WINDOW] the draft's window as a standard window with sinks (none: today's node)
+            // [TAG_MTP_DRAFT_WINDOW] the draft's window as a standard window with sinks (none: today's node); like the host
+            // fill (llama_kv_cache::set_input_kq_mask) it replaces "no SWA", never combines with a cache's own rule
             const bool win = inp->win_n_swa > 0;
+            GGML_ASSERT((!win || mctx_cur->get_swa_type() == LLAMA_SWA_TYPE_NONE) &&
+                    "LLAMA_MTP_DRAFT_WINDOW: the draft cache already has a SWA rule");
             inp->self_kq_mask = ggml_kq_mask(ctx0, inp->self_kq_vis_cells, inp->self_kq_vis_toks,
                     cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, cparams.causal_attn, hparams.use_alibi,
                     win ? (int32_t) LLAMA_SWA_TYPE_STANDARD : (int32_t) LLAMA_SWA_TYPE_NONE, win ? (int32_t) inp->win_n_swa : 0);

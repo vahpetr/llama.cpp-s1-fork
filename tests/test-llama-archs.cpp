@@ -14,6 +14,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <random>
@@ -410,6 +411,22 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+// [TAG_MTP_DRAFT_WINDOW] LLAMA_ARCHS_LOGITS_FNV=1: one line per logits vector (arch, device, config, FNV-1a 64 of the raw
+// f32 bytes) on stderr, so two processes (e.g. with and without LLAMA_MTP_DRAFT_WINDOW) can be compared bit for bit
+static void print_logits_fnv(const char * arch, const char * dev, const char * cfg, const std::vector<float> & logits) {
+    static const bool on = getenv("LLAMA_ARCHS_LOGITS_FNV") != nullptr && atoi(getenv("LLAMA_ARCHS_LOGITS_FNV")) != 0;
+    if (!on) {
+        return;
+    }
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t * b = (const uint8_t *) logits.data();
+    for (size_t i = 0; i < logits.size()*sizeof(float); ++i) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+    }
+    fprintf(stderr, "logits-fnv arch=%s device=%s config=%s n=%zu fnv=%016llx\n", arch, dev, cfg, logits.size(), (unsigned long long) h);
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -702,10 +719,12 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        print_logits_fnv(llm_arch_name(arch), "CPU-ref", config_name.c_str(), logits_cpu);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
+                        print_logits_fnv(llm_arch_name(arch), dc.label.c_str(), config_name.c_str(), logits_dev);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
