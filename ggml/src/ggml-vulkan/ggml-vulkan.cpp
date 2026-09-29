@@ -1192,6 +1192,11 @@ struct vk_device_struct {
     ggml_backend_buffer_type buffer_type;
 
     bool disable_fusion;
+    // [TAG_UP29280] GGML_VK_DISABLE_DESCRIPTOR_REUSE: always rewrite descriptor sets (the pre-#29280 behaviour)
+    bool disable_descriptor_reuse;
+    // [TAG_UP29280] bumped by every ~vk_buffer_struct before its VkBuffer is destroyed: a new buffer can get the
+    // handle of a destroyed one, so the contexts drop their cached descriptor bindings when this moves
+    std::atomic<uint64_t> buffer_destroy_count {};
     // per-fusion kill switches (all default on, GGML_VK_FUSE_<NAME>=0 turns one off)
     bool fuse_hc_combine;
     bool fuse_sigmoid_mul;
@@ -1326,6 +1331,8 @@ struct vk_buffer_struct {
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
         const int64_t t0_us = size >= vk_big_buffer_bytes ? ggml_vk_now_us() : 0; // [TAG_VK_FREE_WAIT_IDLE]
+        // [TAG_UP29280] bump before destroying, so a thread that sees the buffer gone also sees the new count
+        device->buffer_destroy_count.fetch_add(1, std::memory_order_release);
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
         if (t0_us != 0) {
@@ -2865,6 +2872,9 @@ struct ggml_backend_vk_context {
 
     std::vector<vk::DescriptorPool> descriptor_pools;
     std::vector<vk::DescriptorSet> descriptor_sets;
+    // [TAG_UP29280] last bindings written to each set; descriptor_sets is append-only so an index always names the same set
+    std::vector<std::vector<vk::DescriptorBufferInfo>> descriptor_set_bindings;
+    uint64_t descriptor_set_bindings_destroy_count {};
     uint32_t descriptor_set_idx {};
     uint32_t pipeline_descriptor_set_requirements {};
 
@@ -3667,6 +3677,7 @@ static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx
 
         pool_idx++;
     }
+    ctx->descriptor_set_bindings.resize(ctx->descriptor_sets.size()); // [TAG_UP29280]
 }
 
 static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_command_pool& p) {
@@ -7748,6 +7759,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
 
+        device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr; // [TAG_UP29280]
+
         // Per-fusion kill switches. Default on; GGML_VK_FUSE_<NAME>=0 disables exactly one
         // fusion so a single binary can A/B it (the fused and unfused paths are bit-identical).
         auto const &fuse_enabled = [](const char * name) -> bool {
@@ -8898,9 +8911,37 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
-    vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
-    vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
-    ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+    const uint32_t descriptor_set_idx = ctx->descriptor_set_idx++;
+    vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[descriptor_set_idx];
+
+    // [TAG_UP29280] (upstream #29280) the ring cursor restarts every graph, so a graph recorded again lands on the
+    // same set with the same buffers, offsets and ranges as last time: skip vkUpdateDescriptorSets then.
+    // A new buffer can get the handle of a destroyed one, so drop all cached bindings after any destroy.
+    const uint64_t destroy_count = ctx->device->buffer_destroy_count.load(std::memory_order_acquire);
+    if (ctx->descriptor_set_bindings_destroy_count != destroy_count) {
+        for (auto & b : ctx->descriptor_set_bindings) {
+            b.clear();
+        }
+        ctx->descriptor_set_bindings_destroy_count = destroy_count;
+    }
+
+    std::vector<vk::DescriptorBufferInfo> & bindings = ctx->descriptor_set_bindings[descriptor_set_idx];
+    bool same = !ctx->device->disable_descriptor_reuse && bindings.size() == descriptor_buffer_infos.size();
+    if (same) {
+        size_t i = 0;
+        for (const vk::DescriptorBufferInfo & info : descriptor_buffer_infos) {
+            const vk::DescriptorBufferInfo & prev = bindings[i++];
+            if (prev.buffer != info.buffer || prev.offset != info.offset || prev.range != info.range) {
+                same = false;
+                break;
+            }
+        }
+    }
+    if (!same) {
+        vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
+        ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+        bindings.assign(descriptor_buffer_infos.begin(), descriptor_buffer_infos.end());
+    }
 
     subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
     subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
@@ -17759,6 +17800,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     }
     ctx->descriptor_pools.clear();
     ctx->descriptor_sets.clear();
+    ctx->descriptor_set_bindings.clear(); // [TAG_UP29280]
 
     ctx->compute_cmd_pool.destroy(ctx->device->device);
     if (ctx->device->async_use_transfer_queue) {
