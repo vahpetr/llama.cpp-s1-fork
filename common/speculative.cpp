@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <iomanip>
@@ -1470,8 +1471,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         {
+            // strict, as LLAMA_MTP_DRAFT_WINDOW (0139): only a plain decimal 0 or 1 is taken; "", "-1", "on", "0x0", "2"
+            // are rejected with a WARN and the default (on) stays
             const char * s = getenv("LLAMA_MTP_CARRIER_ZERO");
-            carrier_zero = s == nullptr || atoi(s) != 0;
+            if (s != nullptr) {
+                char * end = nullptr;
+                errno = 0;
+                const long long v = (*s >= '0' && *s <= '9') ? strtoll(s, &end, 10) : -1;
+                if (end != nullptr && end != s && *end == '\0' && errno == 0 && (v == 0 || v == 1)) {
+                    carrier_zero = v == 1;
+                } else {
+                    SPC_WRN("invalid LLAMA_MTP_CARRIER_ZERO='%s' (0 or 1) - the carrier zeroing stays on\n", s);
+                }
+            }
             if (!carrier_zero) {
                 SPC_WRN("%s", "LLAMA_MTP_CARRIER_ZERO=0: the MTP carrier is NOT zeroed at a sequence start (pre-#28333 behaviour)\n");
             }
