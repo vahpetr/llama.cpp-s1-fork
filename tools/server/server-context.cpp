@@ -78,7 +78,7 @@ static common_speculative_output_limits server_output_limits(const common_params
 // It samples a CLONE of the sampler, never the live one, so turning the trace on cannot change the generated
 // output. The clone starts from the post-verification state, so for history-dependent samplers (penalties,
 // grammar) the probe is only an approximation - it is a diagnostic counter, not a correctness check.
-static std::vector<llama_token> server_sample_and_accept_replay(
+std::vector<llama_token> server_sample_and_accept_replay(
         common_sampler * smpl,
         llama_context * ctx,
         const std::vector<int> & idxs,
@@ -107,11 +107,13 @@ static std::vector<llama_token> server_sample_and_accept_replay(
     }
 
     // verify the (optional) uncommitted tail exactly like common_sampler_sample_and_accept_n
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
     for (size_t i = n_committed; i < idxs.size(); i++) {
         const llama_token id = common_sampler_sample(smpl, ctx, idxs[i]);
         common_sampler_accept(smpl, id, true);
         result.push_back(id);
-        if (i < draft.size() && id != draft[i]) {
+        // [TAG_UP29638] no draft token after an EOG either (a trailing EOG is kept, as there)
+        if (i < draft.size() && (id != draft[i] || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size()))) {
             break;
         }
     }

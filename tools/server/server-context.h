@@ -191,3 +191,14 @@ private:
     // call right before sleep to update the cached responses
     void update_cached_responses(bool is_sleeping);
 };
+
+// replay round after a checkpoint restore: re-emit the n_committed leading draft tokens, verify the rest
+// (defined in server-context.cpp; declared here for tests/test-draft-accept-eog)
+std::vector<llama_token> server_sample_and_accept_replay(
+        struct common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        size_t n_committed,
+        bool probe_mismatch,
+        int & n_mismatch);
