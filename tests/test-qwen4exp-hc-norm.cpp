@@ -8,6 +8,11 @@
 //    callback records the node order of the target graph. Every RMS_NORM whose output feeds a MUL must be followed
 //    by that MUL directly - no RMS_NORM -> RESHAPE -> MUL chain is left (the old build_hc_mix had one per mixer).
 //    Prints an FNV-1a hash of all logits so a build of the old graph can be compared (bit identity end to end).
+// C. the same fixture with one MTP block (nextn_predict_layers 1, load_mtp): prompt through the target, the draft-mtp
+//    catch-up + a 3-token draft on the LLAMA_CONTEXT_TYPE_MTP context (its graph runs build_hc_mix for the block's two
+//    mixers and the head mixer, with nextn.hc_head_norm loaded as [n_embd, hc]); the same adjacency rule on the MTP
+//    graphs and an FNV-1a hash of target + draft logits for the old-vs-new comparison. (No PLE fixture: a PLE layer
+//    needs a per-layer token table the random-model loader cannot provide - part A covers the PLE form op-level.)
 
 #include "common.h"
 #include "log.h"
@@ -17,6 +22,7 @@
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "llama-cpp.h"
+#include "speculative.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
@@ -27,6 +33,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <array>
 #include <vector>
 
 static int n_fail = 0;
@@ -136,7 +143,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 // the qwen4exp MoE fixture of test-llama-archs (get_gguf_ctx), trimmed to the keys the arch reads
-static gguf_context_ptr make_qwen4exp_meta() {
+static gguf_context_ptr make_qwen4exp_meta(bool mtp = false) {
     const llm_arch arch = LLM_ARCH_QWEN4EXP;
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
@@ -148,7 +155,10 @@ static gguf_context_ptr make_qwen4exp_meta() {
     ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab);
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,              n_ctx);
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,            n_embd);
-    ms.add_kv(LLM_KV_BLOCK_COUNT,                 n_layer);
+    ms.add_kv(LLM_KV_BLOCK_COUNT,                 n_layer + (mtp ? 1u : 0u));
+    if (mtp) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS,    uint32_t(1));
+    }
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   uint32_t(1));
     ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,         n_ff);
     ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL,     uint32_t(2));
@@ -160,7 +170,7 @@ static gguf_context_ptr make_qwen4exp_meta() {
 
     ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,      uint32_t(4));
     ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK,   uint32_t(8));
-    ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,   std::vector<uint32_t>(n_layer, 4));
+    ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,   std::vector<uint32_t>(n_layer + (mtp ? 1u : 0u), 4));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(1));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, n_embd_head);
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,      uint32_t(8));
@@ -199,6 +209,40 @@ static bool record_nodes(struct ggml_tensor * t, bool ask, void * ud) {
 }
 
 static bool silent_progress(float, void *) { return true; }
+
+// RMS_NORM -> MUL adjacency over a recorded node order: {n_rms, n_adj (followed by their MUL), n_split (MUL reads a
+// RESHAPE of it), n_hnorm (such a split on the MTP head's own h_norm of the carried row "mtp_h_input", which keeps its
+// rms_norm -> reshape -> mul form: not part of #28896)}
+static std::array<int, 4> adjacency(const std::vector<const ggml_tensor *> & nd) {
+    std::array<int, 4> c = { 0, 0, 0, 0 };
+    for (size_t i = 0; i < nd.size(); ++i) {
+        if (nd[i]->op != GGML_OP_RMS_NORM) {
+            continue;
+        }
+        c[0]++;
+        if (i + 1 < nd.size() && nd[i + 1]->op == GGML_OP_MUL && (nd[i + 1]->src[0] == nd[i] || nd[i + 1]->src[1] == nd[i])) {
+            c[1]++;
+            continue;
+        }
+        for (size_t j = i + 1; j < nd.size(); ++j) {
+            const ggml_tensor * m = nd[j];
+            if (m->op == GGML_OP_MUL && m->src[0]->op == GGML_OP_RESHAPE && m->src[0]->src[0] == nd[i]) {
+                const ggml_tensor * x = nd[i]->src[0];
+                const bool hnorm = x && x->src[0] && strcmp(ggml_get_name(x->src[0]), "mtp_h_input") == 0;
+                c[hnorm ? 3 : 2]++;
+                break;
+            }
+        }
+    }
+    return c;
+}
+
+static void fnv(uint64_t & h, const void * p, size_t n) {
+    const uint8_t * b = (const uint8_t *) p;
+    for (size_t k = 0; k < n; ++k) {
+        h = (h ^ b[k]) * 1099511628211ULL;
+    }
+}
 
 static void quiet_log(ggml_log_level level, const char * text, void *) {
     if (level >= GGML_LOG_LEVEL_ERROR) {
@@ -279,6 +323,70 @@ static void model_case() {
     }
 }
 
+static void mtp_case() {
+    gguf_context_ptr meta = make_qwen4exp_meta(true);
+
+    llama_model_params mp = llama_model_default_params();
+    mp.progress_callback = silent_progress;
+    mp.load_mtp          = true;
+    ggml_backend_dev_t devs[2] = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
+    mp.devices = devs;
+    size_t seed = 28896;
+    llama_model_ptr model(llama_model_init_from_user(meta.get(), set_tensor_data, &seed, mp));
+    GGML_ASSERT(model && "MTP model init failed");
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = 128; cp.n_batch = 64; cp.n_ubatch = 64; cp.n_seq_max = 1; cp.n_threads = 4; cp.n_threads_batch = 4;
+    llama_context_ptr ctx_tgt(llama_init_from_model(model.get(), cp));
+    GGML_ASSERT(ctx_tgt && "target context failed");
+    node_rec rec;
+    llama_context_params cd = cp;
+    cd.ctx_type = LLAMA_CONTEXT_TYPE_MTP; cd.n_rs_seq = 0;
+    cd.cb_eval = record_nodes; cd.cb_eval_user_data = &rec;
+    llama_context_ptr ctx_dft(llama_init_from_model(model.get(), cd));
+    GGML_ASSERT(ctx_dft && "MTP context failed");
+
+    common_params_speculative sp;
+    sp.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    sp.draft.n_max = 3; sp.draft.n_min = 0; sp.draft.p_min = 0.0f; sp.draft.backend_sampling = false;
+    sp.draft.ctx_tgt = ctx_tgt.get(); sp.draft.ctx_dft = ctx_dft.get();
+    common_speculative * spec = common_speculative_init(sp, 1);
+    GGML_ASSERT(spec && "draft-mtp init failed");
+
+    std::mt19937 gen(5);
+    std::uniform_int_distribution<llama_token> dis(0, 127);
+    const int n_tok = 24;
+    llama_batch b = llama_batch_init(n_tok, 0, 1);
+    for (int i = 0; i < n_tok; ++i) {
+        common_batch_add(b, dis(gen), i, { 0 }, i + 1 == n_tok);
+    }
+    GGML_ASSERT(llama_decode(ctx_tgt.get(), b) == 0);
+    GGML_ASSERT(common_speculative_process(spec, b));
+    llama_batch_free(b);
+
+    llama_tokens draft;
+    auto & dp = common_speculative_get_draft_params(spec, 0);
+    dp.drafting = true; dp.n_max = -1; dp.n_past = n_tok; dp.id_last = 7; dp.prompt = nullptr; dp.result = &draft;
+    common_speculative_draft(spec);
+
+    uint64_t h = 1469598103934665603ULL;
+    fnv(h, llama_get_logits_ith(ctx_tgt.get(), -1), 128 * sizeof(float));
+    fnv(h, llama_get_logits_ith(ctx_dft.get(), -1), 128 * sizeof(float));
+    fnv(h, draft.data(), draft.size() * sizeof(llama_token));
+    common_speculative_free(spec);
+
+    const auto c = adjacency(rec.nodes);
+    // the MTP block's two mixers + the head mixer, in each of the >= 2 MTP graphs (catch-up, draft steps)
+    const bool ok = c[2] == 0 && c[1] >= 3 && !draft.empty();
+    printf("C qwen4exp + MTP block, %zu MTP-context nodes, draft %zu tokens: RMS_NORM %d, followed by their MUL %d (want >= 3), "
+           "split by a RESHAPE %d (+ %d on the unchanged nextn.hnorm)  %s\n",
+           rec.nodes.size(), draft.size(), c[0], c[1], c[2], c[3], ok ? "ok" : "FAIL");
+    printf("C target + draft logits fnv1a %016" PRIx64 "\n", h);
+    if (!ok) {
+        n_fail++;
+    }
+}
+
 int main() {
     llama_log_set(quiet_log, nullptr);
     common_log_set_verbosity_thold(-1);
@@ -292,6 +400,7 @@ int main() {
     }
 
     model_case();
+    mtp_case();
 
     llama_backend_free();
 
