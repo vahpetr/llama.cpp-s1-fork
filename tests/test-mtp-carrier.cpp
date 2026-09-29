@@ -7,6 +7,7 @@
 //  1. fresh instance: prompt B -> draft tokens + the last draft decode's logits = reference.
 //  2. one instance:   prompt U (unrelated), then B, then B again -> both B runs must equal the reference bit for
 //     bit. Before the fix the carrier of B's x_0 was U's last hidden row, then B's own last row.
+//  2b. LLAMA_MTP_CARRIER_ZERO=0 (the A/B knob): the old behaviour comes back - B after U differs from fresh B.
 //  3. restore ([TAG_MTP_CKPT_PENDING_H], contrib 0126): after prompt P, a carrier saved with get_state and put back
 //     with set_state over a foreign one must give the same continuation draft as the uninterrupted run; the
 //     foreign carrier left in place must give a different one (the carrier is used, not zeroed, at pos > 0).
@@ -26,6 +27,7 @@
 
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -251,6 +253,19 @@ int main() {
         const draft_out b2 = draft(env, (llama_pos) P_B.size(), id_b);
         expect(same(ref, b1), "B after an unrelated request == B on a fresh instance", ref, b1);
         expect(same(ref, b2), "B after B == B on a fresh instance", ref, b2);
+    }
+
+    // 2b. the knob off: the carrier of B's x_0 is U's last row again (pre-#28333)
+    {
+        setenv("LLAMA_MTP_CARRIER_ZERO", "0", 1);
+        mtp_env env;
+        init_env(env, meta.get());
+        unsetenv("LLAMA_MTP_CARRIER_ZERO");
+        new_request(env, P_U);
+        (void) draft(env, (llama_pos) P_U.size(), id_b);
+        new_request(env, P_B);
+        const draft_out b1 = draft(env, (llama_pos) P_B.size(), id_b);
+        expect(!same(ref, b1), "LLAMA_MTP_CARRIER_ZERO=0: B after U != fresh B (old behaviour)", ref, b1);
     }
 
     // 3. restore of a checkpointed carrier (pos > 0 keeps it)

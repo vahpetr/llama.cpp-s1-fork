@@ -1370,6 +1370,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
 
+    // [TAG_UP28333] LLAMA_MTP_CARRIER_ZERO (read once per draft-mtp instance): 1 / unset = zero the carrier when a
+    // sequence starts (upstream #28333); 0 = the fork's old behaviour (the previous request's last row), for A/B gates
+    bool carrier_zero = true;
+
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
 
@@ -1464,6 +1468,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+
+        {
+            const char * s = getenv("LLAMA_MTP_CARRIER_ZERO");
+            carrier_zero = s == nullptr || atoi(s) != 0;
+            if (!carrier_zero) {
+                SPC_WRN("%s", "LLAMA_MTP_CARRIER_ZERO=0: the MTP carrier is NOT zeroed at a sequence start (pre-#28333 behaviour)\n");
+            }
+        }
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1577,7 +1589,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // value) instead of the last row of whatever ran before on this seq_id (upstream #28333). A later
                 // batch - incl. the first one after a [TAG_MTP_CKPT_PENDING_H] restore - keeps its carried row.
                 const int32_t i_first = i_batch_beg[seq_id];
-                if (batch_in.pos[i_first] == 0) {
+                if (carrier_zero && batch_in.pos[i_first] == 0) {
                     std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
                 }
 
