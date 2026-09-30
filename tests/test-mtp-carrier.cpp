@@ -5,13 +5,17 @@
 // common_speculative_process() (the MTP catch-up decode, which pairs x_0 with the carrier) -> draft.
 //
 //  1. fresh instance: prompt B -> draft tokens + the last draft decode's logits = reference.
-//  2. one instance:   prompt U (unrelated), then B, then B again -> both B runs must equal the reference bit for
-//     bit. Before the fix the carrier of B's x_0 was U's last hidden row, then B's own last row.
-//  2b. LLAMA_MTP_CARRIER_ZERO=0 (the A/B knob): the old behaviour comes back - B after U differs from fresh B.
-//  2c. an invalid value ("", "abc", "-1", "2", "0x0", " 0", "0 ") is rejected: the default (on) stays.
-//  3. restore ([TAG_MTP_CKPT_PENDING_H], contrib 0126): after prompt P, a carrier saved with get_state and put back
-//     with set_state over a foreign one must give the same continuation draft as the uninterrupted run; the
-//     foreign carrier left in place must give a different one (the carrier is used, not zeroed, at pos > 0).
+//  2. LLAMA_MTP_CARRIER_ZERO=1 (the #28333 opt-in), one instance: prompt U (unrelated), then B, then B again -> both
+//     B runs must equal the reference bit for bit. Without the zeroing the carrier of B's x_0 is U's last hidden row,
+//     then B's own last row.
+//  2b. LLAMA_MTP_CARRIER_ZERO=0 and unset (the default since the up1 gate 2026-09-30, R46): the v35 behaviour - B
+//     after U differs from fresh B.
+//  2c. an invalid value ("", "abc", "-1", "2", "0x0", " 0", "0 ", " 1", "1 ", "+1", "1x") is rejected: the default
+//     (off) stays.
+//  3. restore ([TAG_MTP_CKPT_PENDING_H], contrib 0126), under LLAMA_MTP_CARRIER_ZERO=1 so both runs start B from a
+//     zero carrier: after prompt P, a carrier saved with get_state and put back with set_state over a foreign one must
+//     give the same continuation draft as the uninterrupted run; the foreign carrier left in place must give a
+//     different one (the carrier is used, not zeroed, at pos > 0).
 
 #include "common.h"
 #include "log.h"
@@ -242,10 +246,12 @@ int main() {
         return 1;
     }
 
-    // 2. U, then B twice on one instance
+    // 2. the knob on: U, then B twice on one instance
     {
+        setenv("LLAMA_MTP_CARRIER_ZERO", "1", 1);
         mtp_env env;
         init_env(env, meta.get());
+        unsetenv("LLAMA_MTP_CARRIER_ZERO");
         new_request(env, P_U);
         (void) draft(env, (llama_pos) P_U.size(), id_b);
         new_request(env, P_B);
@@ -256,9 +262,13 @@ int main() {
         expect(same(ref, b2), "B after B == B on a fresh instance", ref, b2);
     }
 
-    // 2b. the knob off: the carrier of B's x_0 is U's last row again (pre-#28333)
-    {
-        setenv("LLAMA_MTP_CARRIER_ZERO", "0", 1);
+    // 2b. the knob off, explicit 0 and unset (the default): the carrier of B's x_0 is U's last row (pre-#28333, v35)
+    for (const char * off : { "0", (const char *) nullptr }) {
+        if (off != nullptr) {
+            setenv("LLAMA_MTP_CARRIER_ZERO", off, 1);
+        } else {
+            unsetenv("LLAMA_MTP_CARRIER_ZERO");
+        }
         mtp_env env;
         init_env(env, meta.get());
         unsetenv("LLAMA_MTP_CARRIER_ZERO");
@@ -266,11 +276,13 @@ int main() {
         (void) draft(env, (llama_pos) P_U.size(), id_b);
         new_request(env, P_B);
         const draft_out b1 = draft(env, (llama_pos) P_B.size(), id_b);
-        expect(!same(ref, b1), "LLAMA_MTP_CARRIER_ZERO=0: B after U != fresh B (old behaviour)", ref, b1);
+        expect(!same(ref, b1), off != nullptr ? "LLAMA_MTP_CARRIER_ZERO=0: B after U != fresh B (old behaviour)"
+                                              : "LLAMA_MTP_CARRIER_ZERO unset (default off): B after U != fresh B", ref, b1);
     }
 
-    // 2c. strict parsing: an invalid value keeps the default (on) - B after U == fresh B
-    for (const char * bad : { "", "abc", "-1", "2", "0x0", " 0", "0 " }) {
+    // 2c. strict parsing: an invalid value keeps the default (off) - B after U != fresh B (" 1", "1 ", "+1", "1x" would
+    //     read as 1 = on with a lenient parser)
+    for (const char * bad : { "", "abc", "-1", "2", "0x0", " 0", "0 ", " 1", "1 ", "+1", "1x" }) {
         setenv("LLAMA_MTP_CARRIER_ZERO", bad, 1);
         mtp_env env;
         init_env(env, meta.get());
@@ -279,14 +291,16 @@ int main() {
         (void) draft(env, (llama_pos) P_U.size(), id_b);
         new_request(env, P_B);
         const draft_out b1 = draft(env, (llama_pos) P_B.size(), id_b);
-        const std::string what = std::string("LLAMA_MTP_CARRIER_ZERO='") + bad + "' (invalid → on): B after U == fresh B";
-        expect(same(ref, b1), what.c_str(), ref, b1);
+        const std::string what = std::string("LLAMA_MTP_CARRIER_ZERO='") + bad + "' (invalid → off): B after U != fresh B";
+        expect(!same(ref, b1), what.c_str(), ref, b1);
     }
 
-    // 3. restore of a checkpointed carrier (pos > 0 keeps it)
+    // 3. restore of a checkpointed carrier (pos > 0 keeps it); the knob on, so B's x_0 pairs with zeros in both runs
     {
+        setenv("LLAMA_MTP_CARRIER_ZERO", "1", 1);
         mtp_env env;
         init_env(env, meta.get());
+        unsetenv("LLAMA_MTP_CARRIER_ZERO");
 
         std::vector<uint8_t> blob_u;
         new_request(env, P_U);

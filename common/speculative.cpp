@@ -1371,9 +1371,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
 
-    // [TAG_UP28333] LLAMA_MTP_CARRIER_ZERO (read once per draft-mtp instance): 1 / unset = zero the carrier when a
-    // sequence starts (upstream #28333); 0 = the fork's old behaviour (the previous request's last row), for A/B gates
-    bool carrier_zero = true;
+    // [TAG_UP28333] LLAMA_MTP_CARRIER_ZERO (read once per draft-mtp instance): 1 = zero the carrier when a sequence
+    // starts (upstream #28333, opt-in); 0 / unset = the fork's old behaviour (the previous request's last row). Default
+    // off since the up1 gate 2026-09-30: with it on, drafted census rows oracle_unresolved 10 -> 12 vs v35 (R46)
+    bool carrier_zero = false;
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1472,7 +1473,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         {
             // strict, as LLAMA_MTP_DRAFT_WINDOW (0139): only a plain decimal 0 or 1 is taken; "", "-1", "on", "0x0", "2"
-            // are rejected with a WARN and the default (on) stays
+            // are rejected with a WARN and the default (off) stays; an explicit 0 / 1 prints its proof line
             const char * s = getenv("LLAMA_MTP_CARRIER_ZERO");
             if (s != nullptr) {
                 char * end = nullptr;
@@ -1480,12 +1481,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const long long v = (*s >= '0' && *s <= '9') ? strtoll(s, &end, 10) : -1;
                 if (end != nullptr && end != s && *end == '\0' && errno == 0 && (v == 0 || v == 1)) {
                     carrier_zero = v == 1;
+                    SPC_WRN("%s", carrier_zero
+                        ? "LLAMA_MTP_CARRIER_ZERO=1: the MTP carrier is zeroed at a sequence start (#28333, opt-in)\n"
+                        : "LLAMA_MTP_CARRIER_ZERO=0: the MTP carrier is NOT zeroed at a sequence start (pre-#28333 behaviour)\n");
                 } else {
-                    SPC_WRN("invalid LLAMA_MTP_CARRIER_ZERO='%s' (0 or 1) - the carrier zeroing stays on\n", s);
+                    SPC_WRN("invalid LLAMA_MTP_CARRIER_ZERO='%s' (0 or 1) - the carrier zeroing stays off\n", s);
                 }
-            }
-            if (!carrier_zero) {
-                SPC_WRN("%s", "LLAMA_MTP_CARRIER_ZERO=0: the MTP carrier is NOT zeroed at a sequence start (pre-#28333 behaviour)\n");
             }
         }
 
@@ -1598,7 +1599,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // [TAG_UP28333] a sequence that starts in this batch has no h_{-1}: pair x_0 with zeros (the ctor's
-                // value) instead of the last row of whatever ran before on this seq_id (upstream #28333). A later
+                // value) instead of the last row of whatever ran before on this seq_id (upstream #28333; only with
+                // LLAMA_MTP_CARRIER_ZERO=1 - off by default, the v35 behaviour). A later
                 // batch - incl. the first one after a [TAG_MTP_CKPT_PENDING_H] restore - keeps its carried row.
                 const int32_t i_first = i_batch_beg[seq_id];
                 if (carrier_zero && batch_in.pos[i_first] == 0) {
