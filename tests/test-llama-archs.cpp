@@ -14,8 +14,10 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <map>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -39,12 +41,17 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return mse_a_b / mse_a_0;
 }
 
+// [TAG_POS_OFFSET] --pos-offset sets this: norm weights ~ N(1, 0.1) instead of N(0, 0.01), so the RMS-normed q and k give
+// O(1) attention scores and the rope actually moves the logits (with 0.01 gains the softmax is flat and positions vanish)
+static bool g_norm_gain_one = false;
+
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     size_t seed = *(const size_t *) userdata;
     std::hash<std::string> hasher;
     seed ^= hasher(tensor->name);
     std::mt19937 gen(seed);
-    std::normal_distribution<float> dis(0.0f, 1.0e-2f);
+    const bool gain = g_norm_gain_one && strstr(tensor->name, "norm") != nullptr;
+    std::normal_distribution<float> dis(gain ? 1.0f : 0.0f, gain ? 0.1f : 1.0e-2f);
 
     const int64_t ne = ggml_nelements(tensor);
     if (tensor->type == GGML_TYPE_F32) {
@@ -345,7 +352,8 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, const int32_t qsa_ratio = -2,
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -361,6 +369,11 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
+    if (qsa_ratio != -2) {
+        ctx_params.qsa_ratio = qsa_ratio; // [TAG_POS_OFFSET] 0 = forced dense
+    }
+    ctx_params.cb_eval           = cb_eval;
+    ctx_params.cb_eval_user_data = cb_eval_user_data;
 
     size_t tmp = seed;
     llama_model_ptr model(gguf_ctx != nullptr ?
@@ -377,14 +390,14 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 }
 
 static std::vector<float> get_logits(
-        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false, llama_pos pos_base = 0) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
     llama_batch batch = llama_batch_init(n_ctx, 0, 1);
     GGML_ASSERT(n_tokens <= n_ctx);
     for (uint32_t pos = 0; pos < n_tokens; pos++) {
-        common_batch_add(batch, tokens[pos], pos, {0}, true);
+        common_batch_add(batch, tokens[pos], pos_base + pos, {0}, true);
     }
     batch.n_tokens = n_tokens;
     if (encode) {
@@ -408,6 +421,22 @@ static std::vector<float> get_logits(
     }
     llama_batch_free(batch);
     return ret;
+}
+
+// [TAG_MTP_DRAFT_WINDOW] LLAMA_ARCHS_LOGITS_FNV=1: one line per logits vector (arch, device, config, FNV-1a 64 of the raw
+// f32 bytes) on stderr, so two processes (e.g. with and without LLAMA_MTP_DRAFT_WINDOW) can be compared bit for bit
+static void print_logits_fnv(const char * arch, const char * dev, const char * cfg, const std::vector<float> & logits) {
+    static const bool on = getenv("LLAMA_ARCHS_LOGITS_FNV") != nullptr && atoi(getenv("LLAMA_ARCHS_LOGITS_FNV")) != 0;
+    if (!on) {
+        return;
+    }
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t * b = (const uint8_t *) logits.data();
+    for (size_t i = 0; i < logits.size()*sizeof(float); ++i) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+    }
+    fprintf(stderr, "logits-fnv arch=%s device=%s config=%s n=%zu fnv=%016llx\n", arch, dev, cfg, logits.size(), (unsigned long long) h);
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -702,10 +731,12 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        print_logits_fnv(llm_arch_name(arch), "CPU-ref", config_name.c_str(), logits_cpu);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
+                        print_logits_fnv(llm_arch_name(arch), dc.label.c_str(), config_name.c_str(), logits_dev);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
@@ -751,6 +782,158 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     return all_ok ? 0 : 1;
 }
 
+// [TAG_POS_OFFSET] --pos-offset N: LLAMA_POS_OFFSET=N must be a pure positional shift. Per device (CPU, then every other
+// backend device), the 128 random tokens in two ubatches with the KV cache in between; the rope outputs Qcur/Kcur (trunk)
+// and indexer_q/indexer_k (QSA indexer queries / pooled keys) are captured (FNV-1a of every evaluation) with the eval callback:
+//   dense (context qsa_ratio 0): the run at positions N..N+127 without the knob (A) and the run at 0..127 with
+//     LLAMA_POS_OFFSET=N (B) must agree bit for bit - every captured rope output and the logits; the run at 0..127 without
+//     the knob (C) must differ from A in Qcur/Kcur (the positions do reach the rope: the angles are those of p + N).
+//   QSA (the fixture's compress ratios, qwen4exp): A cannot run (the census keys blocks on cell positions inside the cell
+//     window), so B vs C: indexer_q AND indexer_k must both differ (queries and the census' pooled-key positions moved),
+//     and with LLAMA_ROPE_PRECISE=1 in the environment (exact, translation-invariant rope) the logits must agree (NMSE <= 1e-6).
+// The fixture's norm weights are N(1, 0.1) here, so attention scores are O(1). The logits' NMSE of A vs C is informational
+// (what the fp32 rope at N does to this toy model).
+struct pos_capture {
+    std::map<std::string, uint64_t> h;
+    std::vector<uint8_t> buf;
+};
+
+static bool pos_capture_cb(struct ggml_tensor * t, bool ask, void * ud) {
+    const char * n = t->name;
+    // the rope outputs themselves: "<name>-<layer>" exactly (not their "(view)" / "(reshaped)" derivatives)
+    auto exact = [n](const char * p) {
+        const size_t l = strlen(p);
+        if (strncmp(n, p, l) != 0 || n[l] == 0) {
+            return false;
+        }
+        for (const char * c = n + l; *c; ++c) {
+            if (*c < '0' || *c > '9') {
+                return false;
+            }
+        }
+        return true;
+    };
+    const bool want = exact("Qcur-") || exact("Kcur-") || exact("indexer_q-") || exact("indexer_k-");
+    if (ask) {
+        return want;
+    }
+    if (want) {
+        auto * pc = (pos_capture *) ud;
+        pc->buf.resize(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, pc->buf.data(), 0, pc->buf.size());
+        uint64_t & h = pc->h.emplace(n, 1469598103934665603ull).first->second;
+        for (uint8_t c : pc->buf) {
+            h = (h ^ c) * 1099511628211ull;
+        }
+    }
+    return true;
+}
+
+static int test_pos_offset(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const llama_pos off) {
+    static ggml_log_level min_level;
+    min_level = log_level;
+    ggml_log_callback orig_cb;
+    void * orig_ud;
+    llama_log_get(&orig_cb, &orig_ud);
+    llama_log_set([](ggml_log_level level, const char * text, void * /*user_data*/) {
+        if (level >= min_level) {
+            fputs(text, stderr);
+        }
+    }, nullptr);
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+    g_norm_gain_one = true;
+    std::vector<std::pair<std::string, std::vector<ggml_backend_dev_t>>> devs = { { "CPU", {} } };
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devs.push_back({ ggml_backend_dev_name(dev), { dev } });
+        }
+    }
+    const char * prev = getenv("LLAMA_POS_OFFSET");
+    const std::string prev_s = prev ? prev : "";
+    const char * rp = getenv("LLAMA_ROPE_PRECISE");
+    const bool precise = rp != nullptr && atoi(rp) != 0;
+    bool all_ok = true;
+    auto count = [](const pos_capture & x, const char * prefix) {
+        size_t n = 0;
+        for (auto & kv : x.h) n += kv.first.rfind(prefix, 0) == 0;
+        return n;
+    };
+    auto n_differ = [](const pos_capture & x, const pos_capture & y, const char * prefix) {
+        size_t n = 0;
+        for (auto & kv : x.h) {
+            if (kv.first.rfind(prefix, 0) == 0) {
+                auto it = y.h.find(kv.first);
+                n += it == y.h.end() || it->second != kv.second;
+            }
+        }
+        return n;
+    };
+    for (const llm_arch & arch : llm_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) || !arch_supported(arch)) {
+            continue;
+        }
+        const bool moe = moe_mandatory(arch);
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+        for (auto & d : devs) {
+            for (const bool qsa : { false, true }) {
+                if (qsa && arch != LLM_ARCH_QWEN4EXP) {
+                    continue;
+                }
+                auto run = [&](llama_pos base, llama_pos knob, pos_capture & pc) {
+                    if (knob != 0) {
+                        setenv("LLAMA_POS_OFFSET", std::to_string(knob).c_str(), 1);
+                    } else {
+                        unsetenv("LLAMA_POS_OFFSET");
+                    }
+                    auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, d.second, LLAMA_SPLIT_MODE_LAYER, false, qsa ? -2 : 0,
+                                                pos_capture_cb, &pc);
+                    return get_logits(mc.first.get(), mc.second.get(), tokens, false, base);
+                };
+                pos_capture cb_, cc;
+                const std::vector<float> b = run(0, off, cb_);
+                const std::vector<float> c = run(0, 0, cc);
+                bool ok;
+                if (!qsa) {
+                    pos_capture ca;
+                    const std::vector<float> a = run(off, 0, ca);
+                    size_t n_diff = 0;
+                    for (size_t i = 0; i < a.size(); i++) {
+                        n_diff += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+                    }
+                    const size_t nq = count(ca, "Qcur-"), nk = count(ca, "Kcur-");
+                    const size_t ab = n_differ(ca, cb_, "Qcur-") + n_differ(ca, cb_, "Kcur-");
+                    const size_t ac = n_differ(ca, cc, "Qcur-") + n_differ(ca, cc, "Kcur-");
+                    print_logits_fnv(llm_arch_name(arch), d.first.c_str(), "dense-pos-base", a);
+                    print_logits_fnv(llm_arch_name(arch), d.first.c_str(), "dense-pos-offset", b);
+                    ok = !a.empty() && n_diff == 0 && nq > 0 && nk > 0 && ab == 0 && ac == nq + nk;
+                    printf("pos-offset %s dense %s: positions %d.. without the knob (A) vs 0.. with LLAMA_POS_OFFSET=%d (B): %zu of %zu logits differ,"
+                           " %zu of %zu rope outputs (Qcur/Kcur) differ; A vs 0.. without the knob (C): %zu of %zu rope outputs differ -> %s;"
+                           " logits NMSE A vs C %.3e%s\n", llm_arch_name(arch), d.first.c_str(), off, off, n_diff, a.size(), ab, nq + nk, ac, nq + nk,
+                           ok ? "OK" : "FAIL", nmse(c, a), precise ? " (LLAMA_ROPE_PRECISE=1)" : " (fp32 rope)");
+                } else {
+                    const double e = nmse(c, b);
+                    const size_t niq = count(cc, "indexer_q-"), nik = count(cc, "indexer_k-");
+                    const size_t dq = n_differ(cc, cb_, "indexer_q-"), dk = n_differ(cc, cb_, "indexer_k-");
+                    ok = !b.empty() && niq > 0 && nik > 0 && dq == niq && dk == nik && (!precise || e <= 1e-6);
+                    printf("pos-offset %s QSA %s: 0.. with LLAMA_POS_OFFSET=%d (B) vs without (C): indexer_q %zu of %zu and indexer_k %zu of %zu"
+                           " differ, logits NMSE %.3e -> %s\n", llm_arch_name(arch), d.first.c_str(), off, dq, niq, dk, nik, e,
+                           ok ? (precise ? "OK (LLAMA_ROPE_PRECISE=1: NMSE bar 1e-6)" : "OK (fp32 rope: NMSE informational)") : "FAIL");
+                }
+                all_ok = all_ok && ok;
+            }
+        }
+    }
+    if (prev) {
+        setenv("LLAMA_POS_OFFSET", prev_s.c_str(), 1);
+    } else {
+        unsetenv("LLAMA_POS_OFFSET");
+    }
+    llama_log_set(orig_cb, orig_ud);
+    printf("pos-offset check: %s\n", all_ok ? "PASS" : "FAIL");
+    return all_ok ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
     common_init();
@@ -760,6 +943,7 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    llama_pos pos_offset = 0; // [TAG_POS_OFFSET]
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -787,6 +971,10 @@ int main(int argc, char ** argv) {
             log_level = GGML_LOG_LEVEL_INFO;
             continue;
         }
+        if (strcmp(argv[i], "--pos-offset") == 0 && i + 1 < argc) {
+            pos_offset = std::stoi(argv[++i]);
+            continue;
+        }
         if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
             if (i + 1 < argc) {
                 out = argv[++i];
@@ -801,6 +989,9 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
+        }
+        if (pos_offset != 0) {
+            return test_pos_offset(arch, seed, log_level, pos_offset);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

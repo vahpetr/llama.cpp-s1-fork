@@ -213,6 +213,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-generate-models PROPERTIES
         FIXTURES_SETUP generate-models
     )
+    # [TAG_POS_OFFSET] LLAMA_POS_OFFSET is a pure positional shift (random qwen4exp: trunk + QSA indexer, 2 ubatches)
+    llama_test(test-llama-archs NAME test-pos-offset LABEL main ARGS -a qwen4exp -s 42 --pos-offset 1015808)
+    llama_test(test-llama-archs NAME test-pos-offset-precise LABEL main ARGS -a qwen4exp -s 42 --pos-offset 1015808)
+    set_tests_properties(test-pos-offset-precise PROPERTIES ENVIRONMENT "LLAMA_ROPE_PRECISE=1")
 
     llama_test(
         test-recurrent-state-rollback

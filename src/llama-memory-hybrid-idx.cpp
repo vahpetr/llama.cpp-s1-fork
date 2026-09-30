@@ -792,6 +792,7 @@ void llama_memory_hybrid_idx_context::qsa_census(
         qsa_census_stream & cs) const {
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t n_tps    = n_tokens/n_ns;          // tokens per stream
+    const int32_t pos_off  = llama_graph_pos_offset(); // [TAG_POS_OFFSET] the pooled keys' rope positions (0 = off)
 
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
     // from zero, so the bucket alone would pool two sequences into one block
@@ -982,7 +983,7 @@ void llama_memory_hybrid_idx_context::qsa_census(
         }
 
         for (int64_t sec = 0; sec < 4; ++sec) {
-            dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = sec_pos[sec];
+            dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = sec_pos[sec] + pos_off; // [TAG_POS_OFFSET]
         }
     }
 

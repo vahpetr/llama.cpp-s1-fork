@@ -155,6 +155,13 @@ public:
     const int64_t n_embd = 0;
 };
 
+// [TAG_POS_OFFSET] LLAMA_POS_OFFSET=N (test knob, unset/0 = off): every rope position the graphs read is p + N - the token
+// positions of llm_graph_input_pos (t/h/w of M-RoPE; the 4th, text-0 component stays) and the QSA census' block positions
+// (the indexer's pooled keys). KV cells, masks, checkpoints and slot files keep the true positions, so the shift is a pure
+// translation: exact RoPE math is translation-invariant, what changes is only the rounding of the angles. Text only (image
+// M-RoPE rows are shifted too but not verified). Read on every call (tests set it per context).
+int32_t llama_graph_pos_offset();
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}

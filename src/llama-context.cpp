@@ -570,6 +570,9 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
+    if (const int32_t off = llama_graph_pos_offset(); off != 0) { // [TAG_POS_OFFSET]
+        LLAMA_LOG_WARN("%s: pos_offset = %d (LLAMA_POS_OFFSET test knob): every rope position of this context is p + %d\n", __func__, off, off);
+    }
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);

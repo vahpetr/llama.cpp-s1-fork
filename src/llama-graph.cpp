@@ -162,9 +162,15 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+int32_t llama_graph_pos_offset() {
+    const char * e = getenv("LLAMA_POS_OFFSET");
+    return e != nullptr ? (int32_t) atoi(e) : 0;
+}
+
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
+        const int32_t off = llama_graph_pos_offset(); // [TAG_POS_OFFSET] 0 unless the test knob is set
 
         if (ubatch->token && n_pos_per_embd == 4) {
             // in case we're using M-RoPE with text tokens, convert the 1D positions to 4D
@@ -172,10 +178,18 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
             std::vector<llama_pos> pos_data(n_tokens*n_pos_per_embd);
             // copy the first dimension
             for (int i = 0; i < n_tokens; ++i) {
-                pos_data[               i] = ubatch->pos[i];
-                pos_data[    n_tokens + i] = ubatch->pos[i];
-                pos_data[2 * n_tokens + i] = ubatch->pos[i];
+                pos_data[               i] = ubatch->pos[i] + off;
+                pos_data[    n_tokens + i] = ubatch->pos[i] + off;
+                pos_data[2 * n_tokens + i] = ubatch->pos[i] + off;
                 pos_data[3 * n_tokens + i] = 0; // 4th dim is 0
+            }
+            ggml_backend_tensor_set(pos, pos_data.data(), 0, pos_data.size()*ggml_element_size(pos));
+        } else if (off != 0) { // [TAG_POS_OFFSET] 1D positions, or M-RoPE rows of embeddings (t/h/w shifted)
+            std::vector<llama_pos> pos_data(ubatch->pos, ubatch->pos + n_tokens*n_pos_per_embd);
+            for (uint32_t c = 0; c < std::min<uint32_t>(n_pos_per_embd, 3); ++c) {
+                for (int64_t i = 0; i < n_tokens; ++i) {
+                    pos_data[c*n_tokens + i] += off;
+                }
             }
             ggml_backend_tensor_set(pos, pos_data.data(), 0, pos_data.size()*ggml_element_size(pos));
         } else {
