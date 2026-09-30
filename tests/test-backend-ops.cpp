@@ -8232,9 +8232,16 @@ struct test_flash_attn_ext_vis : public test_case {
 // The second weight depends on the op in between, so no scheduler can move it before that op.
 // Upstream #29591's test (dropped there as backend-specific), plus mode 2: FA over the visibility metadata, whose
 // vis-opt pass writes the same scratch in the fork.
+// y_nc: the cases without it never reach the stale read on a KHR_coopmat device (RDNA3 / RDNA3.5): their contiguous
+// f32 input goes into prealloc_y only as MMQ's q8_1, and the coopmat matmul pipelines have no q8_1 variant, so the
+// matmul reads the input in place (with GGML_VK_DISABLE_COOPMAT=1 the q4_0 / q8_0 ones do fail without the fix). With
+// y_nc the input is a small non-contiguous view, which every device converts to f16 into prealloc_y; the op in
+// between also runs once before the first matmul, as an earlier layer's would, so it has already sized the scratch
+// (a reallocation there would clear the record and hide the stale read), and its write covers >= 25 % of the input.
 struct test_mul_mat_reuse_across_scratch : public test_case {
     const ggml_type type_w;
     const int       mode; // 0: a wide soft_max (> 16384 cols), 1: flash attention with a large mask, 2: 1 over the metadata
+    const bool      y_nc;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -8242,7 +8249,7 @@ struct test_mul_mat_reuse_across_scratch : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR2(type_w, mode);
+        return y_nc ? VARS_TO_STR3(type_w, mode, y_nc) : VARS_TO_STR2(type_w, mode);
     }
 
     double max_nmse_err() override {
@@ -8251,52 +8258,71 @@ struct test_mul_mat_reuse_across_scratch : public test_case {
 
     bool run_whole_graph() override { return true; }
 
-    test_mul_mat_reuse_across_scratch(ggml_type type_w = GGML_TYPE_Q4_0, int mode = 1)
-        : type_w(type_w), mode(mode) {}
+    test_mul_mat_reuse_across_scratch(ggml_type type_w = GGML_TYPE_Q4_0, int mode = 1, bool y_nc = false)
+        : type_w(type_w), mode(mode), y_nc(y_nc) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int64_t k = 256, m = 128, n = 64;
+        const int64_t k = y_nc ? 32 : 256, m = 128, n = y_nc ? 16 : 64;
+        const int64_t hs = 128, nq = y_nc ? 512 : n, kv = y_nc ? 2048 : 1024; // the op in between
 
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * x = nullptr;
+        if (y_nc) {
+            ggml_tensor * xb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*k, n);
+            ggml_set_name(xb, "xb");
+            x = ggml_view_2d(ctx, xb, k, n, xb->nb[1], 0);
+        } else {
+            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        }
         ggml_set_name(x, "x");
+
+        ggml_tensor * q = nullptr, * kk = nullptr, * v = nullptr, * mk = nullptr, * cells = nullptr, * toks = nullptr, * logits = nullptr;
+        if (mode == 1) {
+            const int64_t nh = 4;
+
+            q  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nq, nh);
+            kk = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, kv, nh);
+            v  = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, kv, nh);
+            mk = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, nq);
+            ggml_set_name(mk, "m");
+        } else if (mode == 2) {
+            const int64_t nh_kv = 2, gqa = 2;
+
+            q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nq, nh_kv*gqa, 1);
+            kk    = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh_kv,     1);
+            v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh_kv,     1);
+            cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, kv, 4, 1);
+            ggml_set_name(cells, "cells");
+            toks  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, nq, 1);
+            ggml_set_name(toks, "toks");
+        } else {
+            logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 20000, 4);
+        }
+
+        // the op in between; the result is zero, but only known once the op has run
+        auto op_then_zero = [&]() {
+            ggml_tensor * op = nullptr;
+            if (mode == 1) {
+                op = ggml_flash_attn_ext(ctx, q, kk, v, mk, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+                ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
+            } else if (mode == 2) {
+                op = ggml_flash_attn_ext_vis(ctx, q, kk, v, cells, toks, 1.0f/sqrtf((float) hs), 0.0f, 0.0f, true, false, 0, 0);
+                ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
+            } else {
+                op = ggml_soft_max(ctx, logits);
+            }
+            return ggml_scale(ctx, ggml_sum(ctx, op), 0.0f);
+        };
 
         ggml_tensor * w1 = ggml_new_tensor_2d(ctx, type_w, k, m);
         ggml_set_name(w1, "w1");
+        if (y_nc) {
+            ggml_tensor * w1f = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+            w1 = ggml_cpy(ctx, ggml_add(ctx, w1f, op_then_zero()), w1);
+        }
 
         ggml_tensor * y1 = ggml_mul_mat(ctx, w1, x);
 
-        ggml_tensor * between = nullptr;
-        if (mode == 1) {
-            const int64_t hs = 128, nh = 4, kv = 1024;
-
-            ggml_tensor * q  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, n,  nh);
-            ggml_tensor * kk = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, kv, nh);
-            ggml_tensor * v  = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, kv, nh);
-            ggml_tensor * mk = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, n);
-            ggml_set_name(mk, "m");
-
-            between = ggml_flash_attn_ext(ctx, q, kk, v, mk, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(between, GGML_PREC_F32);
-        } else if (mode == 2) {
-            const int64_t hs = 128, nh_kv = 2, gqa = 2, kv = 1024;
-
-            ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, n,  nh_kv*gqa, 1);
-            ggml_tensor * kk    = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh_kv,     1);
-            ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh_kv,     1);
-            ggml_tensor * cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, kv, 4, 1);
-            ggml_set_name(cells, "cells");
-            ggml_tensor * toks  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, n, 1);
-            ggml_set_name(toks, "toks");
-
-            between = ggml_flash_attn_ext_vis(ctx, q, kk, v, cells, toks, 1.0f/sqrtf((float) hs), 0.0f, 0.0f, true, false, 0, 0);
-            ggml_flash_attn_ext_set_prec(between, GGML_PREC_F32);
-        } else {
-            ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 20000, 4);
-            between = ggml_soft_max(ctx, logits);
-        }
-
-        // zero, but only known once the op in between has run
-        ggml_tensor * after = ggml_scale(ctx, ggml_sum(ctx, between), 0.0f);
+        ggml_tensor * after = op_then_zero();
 
         ggml_tensor * w2f = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
         ggml_tensor * w2  = ggml_cpy(ctx, ggml_add(ctx, w2f, after), ggml_new_tensor_2d(ctx, type_w, k, m));
@@ -8315,6 +8341,8 @@ struct test_mul_mat_reuse_across_scratch : public test_case {
                 init_tensor_kq_mask(t);
             } else if (strcmp(t->name, "cells") == 0 || strcmp(t->name, "toks") == 0) {
                 continue;
+            } else if (y_nc && strcmp(t->name, "x") == 0) {
+                continue; // a view of xb
             } else {
                 init_tensor_uniform(t);
             }
@@ -11087,9 +11115,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_vis(128, 4, 4,  1024, 8,  2, GGML_TYPE_F16));                      // another head size
 
     // [TAG_UP29591] a second matmul on the same input after an op that reuses the conversion scratch
-    for (ggml_type type_w : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
-        for (int mode : {0, 1, 2}) {
-            test_cases.emplace_back(new test_mul_mat_reuse_across_scratch(type_w, mode));
+    for (bool y_nc : {false, true}) {
+        for (ggml_type type_w : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+            for (int mode : {0, 1, 2}) {
+                test_cases.emplace_back(new test_mul_mat_reuse_across_scratch(type_w, mode, y_nc));
+            }
         }
     }
 
