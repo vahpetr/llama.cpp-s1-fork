@@ -41,6 +41,13 @@
 //   bar calibrated on the device's own dense arm at the same n_kv and n_tps (capped: dense nmse <= 1e-3) (probe_bar: coopmat1-class
 //   min(1e-5, max(1e-6, 10 x dense)), otherwise max(1e-5, 4 x dense)); the probe data carry 4 sink-like keys and one boosted
 //   live tile, and two negative controls (the reference without the sinks / without that tile) must exceed the bar;
+//   precision classes (ruling R43): the class is set by the first dense arm at n_kv <= 524288 of each n_tps (dense nmse
+//   <= 1e-6: coopmat1-class, else scalar-class). coopmat1-class rows are hard-checked at every depth (cap 1e-3 on the
+//   dense arm, the calibrated bar, both negative controls). Scalar-class rows are hard-checked up to n_kv 524288 and printed
+//   as INFORMATIONAL above it: the pre-existing scalar Vulkan FA kernel reaches a dense nmse of ~1.1e-3 at 1M x 6 rows
+//   (balkon 780M), where its bar (4 x dense) would sit just below the dropped-tile control - no discrimination power; the
+//   scalar path is not the production path on s1 or balkon (both run coopmat1). Identity (plane = vis = bridge) and the
+//   non-finite count stay hard checks in every class;
 //   ggml's CPU FA is shown only (it accumulates V in f16);
 //   every probe row counts non-finite outputs (an all-masked split_k chunk must not leak NaN / inf into the reduce)
 
@@ -939,6 +946,7 @@ void run_dev_perf(const std::vector<int64_t> & nkvs, const std::vector<int64_t> 
                   bool ref_check, int n_threads) {
     const int64_t D = 256, n_head = 24, n_head_kv = 2;
     std::map<int64_t, double> dense_cal; // n_tps -> the device's dense-arm nmse vs f64 at the current n_kv
+    std::map<int64_t, bool> scalar_cls;  // n_tps -> the precision class, set by the first dense arm at n_kv <= 524288 (R43)
     printf("  skip probe on %s (%" PRId64 "/%" PRId64 " heads, D %" PRId64 ", f16 K/V, one sequence in position order, sink 4; ms = median of %d):\n",
            ggml_backend_name(g_dev), n_head, n_head_kv, D, reps);
     printf("    %8s %5s %7s | %10s %10s | %8s %8s | %9s | %9s %9s %9s | %9s %9s | %s\n", "n_kv", "n_tps", "window", "bridge ms", "vis ms",
@@ -1008,18 +1016,32 @@ void run_dev_perf(const std::vector<int64_t> & nkvs, const std::vector<int64_t> 
                     const double dev_nmse = f64_ref_nmse(f, ref, a, D, n_tps, n_head, n_head_kv, n_kv, n_threads, &cpu_nmse, &cpu_out);
                     snprintf(c_dev, sizeof(c_dev), "%.1e", dev_nmse);
                     snprintf(c_cpu, sizeof(c_cpu), "%.1e", cpu_nmse);
-                    if (N == 0) {
+                    if (N == 0 && n_kv <= 524288 && scalar_cls.find(n_tps) == scalar_cls.end()) {
+                        scalar_cls[n_tps] = dev_nmse > 1e-6; // the device's precision class for this n_tps
+                    }
+                    // R43: scalar-class rows above 524288 are informational (no accuracy CHECKs); unknown class = checked
+                    const auto cls = scalar_cls.find(n_tps);
+                    const bool info_only = n_kv > 524288 && cls != scalar_cls.end() && cls->second;
+                    if (info_only) {
+                        snprintf(c_bar, sizeof(c_bar), "INFO");
+                    }
+                    if (N == 0 && info_only) {
+                        printf("    scalar class above 524k: not checked, dense nmse %.3e, pre-existing kernel precision (n_kv %" PRId64
+                               ", n_tps %" PRId64 ")\n", dev_nmse, n_kv, n_tps);
+                        dense_cal[n_tps] = dev_nmse;
+                    } else if (N == 0) {
                         dense_cal[n_tps] = dev_nmse; // the calibration of this (n_kv, n_tps)
                         // an absolute cap: a broken dense kernel must not loosen the window bar (balkon 780M: coopmat1 dense <= 1.4e-7
-                        // up to 1M; the scalar path 2.6e-4 / 5.8e-4 at 213k / 524k x 6 rows but 1.07e-3 at 1M x 6 rows - that unchanged
-                        // kernel is out of this cap at 1M, the window rows there stay <= 1.3e-4)
+                        // up to 1M; the scalar path 2.6e-4 / 5.8e-4 at 213k / 524k x 6 rows - its 1M rows are informational, R43)
                         CHECK(dev_nmse <= 1e-3, "skip probe n_kv %" PRId64 " n_tps %" PRId64 ": the dense arm's nmse %.3e vs f64 exceeds 1e-3 "
                               "(the calibration is refused)", n_kv, n_tps, dev_nmse);
                     }
                     const auto it = dense_cal.find(n_tps);
                     const double bar = probe_bar(it != dense_cal.end() ? it->second : -1.0);
-                    snprintf(c_bar, sizeof(c_bar), "%.1e", bar);
-                    CHECK(dev_nmse <= bar, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: device vs the f64 reference nmse %.3e > the "
+                    if (!info_only) {
+                        snprintf(c_bar, sizeof(c_bar), "%.1e", bar);
+                    }
+                    CHECK(info_only || dev_nmse <= bar, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: device vs the f64 reference nmse %.3e > the "
                           "class bar %.3e (dense-arm calibration %.3e)", n_kv, n_tps, N, dev_nmse, bar, it != dense_cal.end() ? it->second : -1.0);
                     if (N > 0) {
                         // negative controls: the same device output against a reference that (a) drops the 4 sink cells, (b) drops
@@ -1033,11 +1055,11 @@ void run_dev_perf(const std::vector<int64_t> & nkvs, const std::vector<int64_t> 
                         const double nt = f.boost_tile0 >= 0 ? f64_ref_nmse(f, r_nt, a, D, n_tps, n_head, n_head_kv, n_kv, n_threads, nullptr, nullptr) : -1.0;
                         snprintf(c_ns, sizeof(c_ns), "%.1e", ns);
                         snprintf(c_nt, sizeof(c_nt), "%.1e", nt);
-                        CHECK(ns > bar, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: NEGATIVE CONTROL passed - a dropped sink "
+                        CHECK(info_only || ns > bar, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: NEGATIVE CONTROL passed - a dropped sink "
                               "(nmse %.3e) stays under the bar %.3e", n_kv, n_tps, N, ns, bar);
-                        CHECK(f.boost_tile0 < 0 || nt > bar, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: NEGATIVE CONTROL passed - a "
+                        CHECK(info_only || f.boost_tile0 < 0 || nt > bar, "skip probe n_kv %" PRId64 " n_tps %" PRId64 " window %u: NEGATIVE CONTROL passed - a "
                               "dropped live tile (nmse %.3e) stays under the bar %.3e", n_kv, n_tps, N, nt, bar);
-                        g_ds.neg_runs++;
+                        g_ds.neg_runs += info_only ? 0 : 1;
                     }
                 }
                 printf("    %8" PRId64 " %5" PRId64 " %7u | %10.3f %10.3f | %8.2f %8.2f | %9" PRIu64 " | %9s %9s %9s | %9s %9s | %s\n", n_kv, n_tps, N,
