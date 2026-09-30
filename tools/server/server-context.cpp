@@ -3808,6 +3808,14 @@ private:
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
 
+                    // [TAG_MTP_CKPT_PENDING_H] (audit B#2b) the speculative pending state (MTP pending_h, eagle3
+                    //   boundary row) travels with the per-round checkpoint too, as with the prompt checkpoints
+                    //   (create_checkpoint): the verification's process() overwrites it with the batch's last row,
+                    //   and a restore below replays the committed tokens from this position. Taken after the
+                    //   draft, which only reads it.
+                    ckpt.data_spec.clear();
+                    common_speculative_get_state(spec.get(), slot.id, ckpt.data_spec);
+
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
 
@@ -4817,6 +4825,10 @@ private:
                         }
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+
+                        // [TAG_MTP_CKPT_PENDING_H] (audit B#2b) the carrier back to the checkpoint's: without it the
+                        //   replay paired its first token with the last row of the rejected verification batch
+                        common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
 

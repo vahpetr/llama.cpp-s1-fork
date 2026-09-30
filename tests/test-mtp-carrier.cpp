@@ -16,6 +16,11 @@
 //     zero carrier: after prompt P, a carrier saved with get_state and put back with set_state over a foreign one must
 //     give the same continuation draft as the uninterrupted run; the foreign carrier left in place must give a
 //     different one (the carrier is used, not zeroed, at pos > 0).
+//  4. per-round checkpoint fallback (audit B#2b): a verification round whose suffix is rejected on a target without
+//     partial rollback (seq_rm type FULL here; RS with a draft deeper than n_rs_seq in the server) restores
+//     slot.spec_ckpt and replays the committed tokens. With the carrier stashed in the checkpoint's data_spec and
+//     put back on the restore (server-context.cpp, [TAG_MTP_CKPT_PENDING_H]) the next draft equals the uninterrupted
+//     run's; without it (control) the replay pairs its first token with the rejected suffix's last row and differs.
 
 #include "common.h"
 #include "log.h"
@@ -202,6 +207,73 @@ static draft_out draft(mtp_env & env, llama_pos n_past, llama_token id_last) {
     return out;
 }
 
+// row 4: one verification round in the server's call order (tools/server/server-context.cpp), then the next draft.
+//   draft at n (slot.spec_ckpt.update_pos() before it, its draft-KV cells dropped after it) -> verification of
+//   [id_last, draft] -> the target keeps draft[0] and samples x != draft[1] -> [id_last, draft[0], x] is committed
+//   -> common_speculative_accept() -> the next draft. The qwen35 target of this test has n_rs_seq = 0, i.e. seq_rm type
+//   FULL, so the server takes the per-round checkpoint path.
+enum class round_kind {
+    uninterrupted,       // the committed tokens decoded directly (what a native rollback leaves behind)
+    fallback,            // per-round checkpoint -> verification -> restore -> replay of the committed tokens
+    fallback_no_carrier, // the same without the carrier in the checkpoint (the server before audit B#2b)
+};
+
+static draft_out verify_round(gguf_context * meta, round_kind kind) {
+    mtp_env env;
+    init_env(env, meta);
+
+    const std::vector<llama_token> P = tokens(40, 1);
+    const llama_pos   n       = (llama_pos) P.size();
+    const llama_token id_last = 7, id_next = 13;
+
+    new_request(env, P);
+
+    auto * mem_tgt = llama_get_memory(env.ctx_tgt.get());
+
+    common_prompt_checkpoint ckpt;
+    ckpt.update_pos(n, llama_memory_seq_pos_min(mem_tgt, 0), llama_memory_seq_pos_max(mem_tgt, 0));
+
+    const draft_out d = draft(env, n, id_last);
+    GGML_ASSERT(d.toks.size() >= 2 && "the round needs a draft of at least 2 tokens");
+
+    const llama_token x = (d.toks[1] + 1) % (llama_token) N_VOCAB; // the target's token at draft[1]: rejects draft[1..]
+    const std::vector<llama_token> committed = { id_last, d.toks[0], x };
+
+    if (kind != round_kind::uninterrupted) {
+        const bool with_carrier = kind == round_kind::fallback;
+        const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+
+        // "make checkpoints if needed": the per-round target checkpoint + the carrier, taken after the draft
+        ckpt.update_tgt(env.ctx_tgt.get(), 0, flags);
+        GGML_ASSERT(!ckpt.empty());
+        if (with_carrier) {
+            ckpt.data_spec.clear();
+            GGML_ASSERT(common_speculative_get_state(env.spec, 0, ckpt.data_spec));
+        }
+
+        // verification batch: the MTP catch-up decode leaves the carrier at its last row (draft[k-1], rejected)
+        std::vector<llama_token> verify = { id_last };
+        verify.insert(verify.end(), d.toks.begin(), d.toks.end());
+        feed(env, verify, n);
+
+        // n_rollback > 0 on a FULL target -> "accepted .. draft tokens (restore checkpoint)"
+        ckpt.load_tgt(env.ctx_tgt.get(), 0, flags);
+        ckpt.load_dft(env.ctx_dft.get(), 0, flags); // data_dft is empty: the MTP draft context rolls back with seq_rm
+        common_memory mem;
+        mem.init(env.ctx_tgt.get(), env.ctx_dft.get());
+        mem.seq_rm(0, ckpt.pos_max + 1, -1);
+        if (with_carrier) {
+            common_speculative_set_state(env.spec, 0, ckpt.data_spec);
+        }
+    }
+
+    // the replay (or the uninterrupted round): all committed tokens accepted
+    feed(env, committed, n);
+    common_speculative_accept(env.spec, 0, (uint16_t) (committed.size() - 1));
+
+    return draft(env, n + (llama_pos) committed.size(), id_next);
+}
+
 static int n_fail = 0;
 
 static bool same(const draft_out & a, const draft_out & b) {
@@ -330,6 +402,15 @@ int main() {
 
         expect(same(cont, restored), "restored carrier at pos > 0 == uninterrupted run", cont, restored);
         expect(!same(cont, foreign), "foreign carrier at pos > 0 != uninterrupted run (control)", cont, foreign);
+    }
+
+    // 4. per-round checkpoint fallback (audit B#2b)
+    {
+        const draft_out cont  = verify_round(meta.get(), round_kind::uninterrupted);
+        const draft_out fb    = verify_round(meta.get(), round_kind::fallback);
+        const draft_out stale = verify_round(meta.get(), round_kind::fallback_no_carrier);
+        expect(same(cont, fb), "per-round checkpoint fallback + replay == uninterrupted run", cont, fb);
+        expect(!same(cont, stale), "fallback without the carrier != uninterrupted (control)", cont, stale);
     }
 
     llama_backend_free();
