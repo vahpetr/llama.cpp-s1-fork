@@ -1025,6 +1025,14 @@ void process_shaders() {
     string_to_spv("rope_multi_f16", "rope_multi.comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}});
     string_to_spv("rope_multi_f32_f16", "rope_multi.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}});
 
+    // [TAG_ROPE_PRECISE] LLAMA_ROPE_PRECISE=1: double-precision angles (need shaderFloat64; vision keeps the fp32 path)
+    for (const char * m : {"norm", "neox", "multi"}) {
+        const std::string mode = m;
+        string_to_spv("rope_" + mode + "_precise_f32",     "rope_" + mode + ".comp", {{"A_TYPE", "float"},     {"ROPE_D_TYPE", "float"},     {"ROPE_PRECISE", "1"}});
+        string_to_spv("rope_" + mode + "_precise_f16",     "rope_" + mode + ".comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}, {"ROPE_PRECISE", "1"}});
+        string_to_spv("rope_" + mode + "_precise_f32_f16", "rope_" + mode + ".comp", {{"A_TYPE", "float"},     {"ROPE_D_TYPE", "float16_t"}, {"ROPE_PRECISE", "1"}});
+    }
+
     string_to_spv("rope_vision_f32", "rope_vision.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float"}});
     string_to_spv("rope_vision_f16", "rope_vision.comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}});
 

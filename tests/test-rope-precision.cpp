@@ -276,9 +276,10 @@ static const window WINDOWS[] = {
 static const int NWIN = sizeof(WINDOWS) / sizeof(WINDOWS[0]);
 
 struct pair_stats {
-    double sum2 = 0, maxabs = 0;
+    double sum = 0, sum2 = 0, maxabs = 0;
     int    n = 0;
-    void add(double e) { sum2 += e * e; maxabs = std::max(maxabs, std::fabs(e)); n++; }
+    void add(double e) { sum += e; sum2 += e * e; maxabs = std::max(maxabs, std::fabs(e)); n++; }
+    double mean() const { return n ? sum / n : 0; }
     double rms() const { return n ? std::sqrt(sum2 / n) : 0; }
 };
 
@@ -368,8 +369,8 @@ static std::vector<win_result> analyse(const char * bname, ggml_backend_t be, co
         wr.nmse_rot  = be ? (double) (se_rot / sr_rot) : NAN;
         if (g_tsv) {
             for (int j = 0; j < np; ++j) {
-                fprintf(g_tsv, "pair\t%s\t%s\t%s\t%d\t%.6e\t%.6e\n", bname, c.name, WINDOWS[w].name, j, wr.pairs[j].rms(),
-                        wr.pairs[j].maxabs);
+                fprintf(g_tsv, "pair\t%s\t%s\t%s\t%d\t%.6e\t%.6e\t%.6e\n", bname, c.name, WINDOWS[w].name, j, wr.pairs[j].rms(),
+                        wr.pairs[j].maxabs, wr.pairs[j].mean());
             }
         }
     }
@@ -395,32 +396,37 @@ static void print_summary(const char * bname, const rope_cfg & c, const std::vec
                 res[w].nmse_full, res[w].nmse_rot, res[w].mag_max);
     }
     if (per_pair) {
-        printf("  max|dθ| per pair j at 262k / 524k / 1M (rad):\n");
+        printf("  per pair j: max|dθ| at 262k / 524k / 1M, mean dθ (bias) at 1M, rad:\n");
         for (int j = 0; j < np; ++j) {
-            printf("    j %2d  λ %12.1f  %10.3e %10.3e %10.3e\n", j, (double) (TWO_PI_L / make_ref(c).freq[j]),
-                    res[3].pairs[j].maxabs, res[4].pairs[j].maxabs, res[5].pairs[j].maxabs);
+            printf("    j %2d  λ %12.1f  %10.3e %10.3e %10.3e  %+10.3e\n", j, (double) (TWO_PI_L / make_ref(c).freq[j]),
+                    res[3].pairs[j].maxabs, res[4].pairs[j].maxabs, res[5].pairs[j].maxabs, res[5].pairs[j].mean());
         }
     }
 }
 
-// relative-position consistency: q at m, k at n = m - d; error of q·k against the exact value, / (|q||k|)
+// relative-position consistency: q at m, k at n = m - d; error of q·k against the exact value, / (|q||k|). Regions: n near 0,
+// m near 262k (the trained length), 524k, 1M. rotate(p, x) → y: a backend or an emulated stack.
 struct dot_result {
     double rms = 0, maxabs = 0;
 };
 
-static std::map<std::string, dot_result> dot_test(ggml_backend_t be, const rope_cfg & c, const char * bname) {
+typedef std::function<std::vector<float>(const std::vector<int64_t> &, const std::vector<float> &)> rotate_fn;
+
+static const char * DOT_RG[] = { "near0", "near262k", "near524k", "near1M" };
+static const int64_t DOT_END[] = { 0, 262144, 524288, 1048576 };
+static const int64_t DOT_D[] = { 1, 1024, 65536 };
+
+static std::map<std::string, dot_result> dot_test(const rotate_fn & rot, const rope_cfg & c, const char * bname) {
     const rope_ref r = make_ref(c);
-    const int64_t DS[] = { 1, 1024, 65536 };
-    const char *  RG[] = { "near0", "near1M" };
     std::map<std::string, dot_result> out;
     std::mt19937 rng(99);
     std::normal_distribution<float> nd(0.0f, 1.0f);
-    for (int64_t d : DS) {
-        for (int g = 0; g < 2; ++g) {
+    for (int64_t d : DOT_D) {
+        for (int g = 0; g < 4; ++g) {
             const int T = 2 * W;
             std::vector<int64_t> p(T);
             for (int i = 0; i < W; ++i) {
-                const int64_t m = g == 0 ? i + d : (1 << 20) - W + i;
+                const int64_t m = g == 0 ? i + d : DOT_END[g] - W + i;
                 p[i]     = m;
                 p[W + i] = m - d;
             }
@@ -428,7 +434,7 @@ static std::map<std::string, dot_result> dot_test(ggml_backend_t be, const rope_
             for (auto & v : x) {
                 v = nd(rng);
             }
-            std::vector<float> y = backend_rope(be, c, x, 1, T, text_pos4(p));
+            std::vector<float> y = rot(p, x);
             std::vector<ld> yq(c.D), yk(c.D);
             double s2 = 0, mx = 0;
             for (int i = 0; i < W; ++i) {
@@ -450,7 +456,7 @@ static std::map<std::string, dot_result> dot_test(ggml_backend_t be, const rope_
                 mx = std::max(mx, std::fabs(err));
             }
             char key[64];
-            snprintf(key, sizeof(key), "d=%" PRId64 " %s", d, RG[g]);
+            snprintf(key, sizeof(key), "d=%" PRId64 " %s", d, DOT_RG[g]);
             out[key] = { std::sqrt(s2 / W), mx };
             if (g_tsv) {
                 fprintf(g_tsv, "dot\t%s\t%s\t%s\t%.6e\t%.6e\n", bname, c.name, key, std::sqrt(s2 / W), mx);
@@ -458,6 +464,53 @@ static std::map<std::string, dot_result> dot_test(ggml_backend_t be, const rope_
         }
     }
     return out;
+}
+
+static double print_dot(const char * bname, const rope_cfg & c, const std::map<std::string, dot_result> & dr) {
+    printf("  rel-pos q·k error / (|q||k|) [%s, %s], rms / max:\n", bname, c.name);
+    double worst = 0;
+    for (int64_t d : DOT_D) {
+        printf("    d=%-6" PRId64, d);
+        for (int g = 0; g < 4; ++g) {
+            char key[64];
+            snprintf(key, sizeof(key), "d=%" PRId64 " %s", d, DOT_RG[g]);
+            const dot_result & v = dr.at(key);
+            printf("  %s %.2e/%.2e", DOT_RG[g], v.rms, v.maxabs);
+            worst = std::max(worst, v.maxabs);
+        }
+        printf("\n");
+    }
+    return worst;
+}
+
+// HF/Megatron/vLLM-style rotation: fp32 angle and cos/sin; bf16 = cos/sin and the rotated q/k rounded to bf16 (a bf16
+// training step or a bf16 vLLM cache + bf16 activations)
+static rotate_fn emu_rotate(const rope_cfg & c, bool bf16) {
+    return [c, bf16](const std::vector<int64_t> & p, const std::vector<float> & x) {
+        const rope_ref r = make_ref(c);
+        const int nh = c.n_dims / 2;
+        const float ms = (float) r.mscale;
+        std::vector<float> y(x.size());
+        for (size_t t = 0; t < p.size(); ++t) {
+            const float * xr = &x[t * c.D];
+            float * yr = &y[t * c.D];
+            for (int k = 0; k < c.D; ++k) {
+                yr[k] = bf16 ? bf16_round(xr[k]) : xr[k];
+            }
+            for (int j = 0; j < nh; ++j) {
+                const float a = (float) p[t] * hf_inv_freq(r, j);
+                float cs = cosf(a) * ms, sn = sinf(a) * ms;
+                float x0 = xr[j], x1 = xr[j + nh];
+                if (bf16) {
+                    cs = bf16_round(cs); sn = bf16_round(sn); x0 = bf16_round(x0); x1 = bf16_round(x1);
+                }
+                float y0 = x0 * cs - x1 * sn, y1 = x0 * sn + x1 * cs;
+                yr[j]      = bf16 ? bf16_round(y0) : y0;
+                yr[j + nh] = bf16 ? bf16_round(y1) : y1;
+            }
+        }
+        return y;
+    };
 }
 
 // storage noise floors in the same units (q·k error / (|q||k|)): q8_0 K (target KV), f16 K (draft KV), bf16 q and k
@@ -491,8 +544,45 @@ static void storage_floors(int D) {
         s_f16 += (d16 - d0) * (d16 - d0) / (s * s);
         s_bf  += (dbf - d0) * (dbf - d0) / (s * s);
     }
-    printf("  storage floors, rms q·k error / (|q||k|), D %d: q8_0 K %.3e | f16 K %.3e | bf16 q and k %.3e\n", D,
-            std::sqrt(s_q8 / N), std::sqrt(s_f16 / N), std::sqrt(s_bf / N));
+    // weight quantization: q = W_q x, k = W_k x with W_q, W_k in Q4_K (the prod GGUF's attn_q / attn_k type), random
+    // Gaussian weights and inputs (no imatrix, no outliers) vs the f32 weights
+    const int K = 2560, NS = 256;
+    std::vector<float> wq((size_t) D * K), wk((size_t) D * K), dq((size_t) D * K), dk((size_t) D * K), x(K);
+    for (auto & v : wq) v = nd(rng);
+    for (auto & v : wk) v = nd(rng);
+    std::vector<uint8_t> qb(ggml_row_size(GGML_TYPE_Q4_K, K) * D);
+    const auto * t4 = ggml_get_type_traits(GGML_TYPE_Q4_K);
+    ggml_quantize_chunk(GGML_TYPE_Q4_K, wq.data(), qb.data(), 0, D, K, nullptr);
+    t4->to_float(qb.data(), dq.data(), (int64_t) D * K);
+    ggml_quantize_chunk(GGML_TYPE_Q4_K, wk.data(), qb.data(), 0, D, K, nullptr);
+    t4->to_float(qb.data(), dk.data(), (int64_t) D * K);
+    double s_w = 0;
+    std::vector<double> q0(D), k0(D), q1(D), k1(D);
+    for (int n = 0; n < NS; ++n) {
+        for (auto & v : x) v = nd(rng);
+        std::vector<float> x2(K);
+        for (auto & v : x2) v = nd(rng);
+        for (int r = 0; r < D; ++r) {
+            double a = 0, b = 0, c = 0, d = 0;
+            for (int e = 0; e < K; ++e) {
+                a += (double) wq[(size_t) r * K + e] * x[e];
+                b += (double) dq[(size_t) r * K + e] * x[e];
+                c += (double) wk[(size_t) r * K + e] * x2[e];
+                d += (double) dk[(size_t) r * K + e] * x2[e];
+            }
+            q0[r] = a; q1[r] = b; k0[r] = c; k1[r] = d;
+        }
+        double d0 = 0, d1 = 0, nq = 0, nk = 0;
+        for (int r = 0; r < D; ++r) {
+            d0 += q0[r] * k0[r];
+            d1 += q1[r] * k1[r];
+            nq += q0[r] * q0[r];
+            nk += k0[r] * k0[r];
+        }
+        s_w += (d1 - d0) * (d1 - d0) / (nq * nk);
+    }
+    printf("  storage floors, rms q·k error / (|q||k|), D %d: q8_0 K %.3e | f16 K %.3e | bf16 q and k %.3e | Q4_K W_q and W_k %.3e\n", D,
+            std::sqrt(s_q8 / N), std::sqrt(s_f16 / N), std::sqrt(s_bf / N), std::sqrt(s_w / NS));
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -852,6 +942,12 @@ int main(int argc, char ** argv) {
             auto res = analyse(e.first.c_str(), nullptr, c, e.second);
             print_summary(e.first.c_str(), c, res, false);
         }
+        if (c.ext_factor != 0.0f || c.D == 256) {
+            for (int bf = 0; bf < 2; ++bf) {
+                const char * en = bf ? "emu HF bf16 (cos/sin, q, k)" : "emu HF fp32";
+                print_dot(en, c, dot_test(emu_rotate(c, bf != 0), c, en));
+            }
+        }
         for (auto & be : bes) {
             auto res = analyse(be.first.c_str(), be.second, c, nullptr);
             print_summary(be.first.c_str(), c, res, c.D == 256 && c.ext_factor != 0.0f);
@@ -863,13 +959,10 @@ int main(int argc, char ** argv) {
                 }
             }
             if (c.ext_factor != 0.0f || c.D == 256) {
-                auto dr = dot_test(be.second, c, be.first.c_str());
-                printf("  rel-pos q·k error / (|q||k|), rms / max:");
-                for (auto & kv : dr) {
-                    printf("  %s %.2e/%.2e", kv.first.c_str(), kv.second.rms, kv.second.maxabs);
-                    worst_dot = std::max(worst_dot, kv.second.maxabs);
-                }
-                printf("\n");
+                ggml_backend_t b = be.second;
+                auto dr = dot_test([&](const std::vector<int64_t> & p, const std::vector<float> & x) {
+                    return backend_rope(b, c, x, 1, (int) p.size(), text_pos4(p)); }, c, be.first.c_str());
+                worst_dot = std::max(worst_dot, print_dot(be.first.c_str(), c, dr));
             }
         }
     }

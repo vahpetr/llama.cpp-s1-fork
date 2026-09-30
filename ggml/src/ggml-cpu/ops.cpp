@@ -6309,6 +6309,104 @@ static void rope_yarn(
     *sin_theta = sinf(theta) * mscale;
 }
 
+// [TAG_ROPE_PRECISE] LLAMA_ROPE_PRECISE=1: exact-math angles. The fp32 path forms theta = p * theta_scale^j as a running fp32
+// product, so its angle carries |theta| * 2^-24 per rounding plus theta_scale's own rounding times j (0.039 rad at
+// p = 2^20 for the fast pairs, tests/test-rope-precision); here theta, the YaRN mix and sin/cos are double and only the
+// cache entries are fp32.
+static bool ggml_rope_precise(void) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_ROPE_PRECISE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
+static void rope_yarn_precise(
+    double theta_extrap, float freq_scale, const float corr_dims[2], int64_t i0, float ext_factor, float mscale,
+    float * cos_theta, float * sin_theta) {
+    double theta = (double) freq_scale * theta_extrap;
+    if (ext_factor != 0.0f) {
+        const double y = ((double) (i0 / 2) - corr_dims[0]) / std::max(0.001, (double) corr_dims[1] - corr_dims[0]);
+        const double ramp_mix = (1.0 - std::min(1.0, std::max(0.0, y))) * ext_factor;
+        theta = theta * (1.0 - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    *cos_theta = (float) (cos(theta) * mscale);
+    *sin_theta = (float) (sin(theta) * mscale);
+}
+
+static void ggml_rope_cache_init_precise(
+     double theta_base, float freq_scale, const float * freq_factors, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
+     float * cache, float sin_sign, double theta_scale) {
+    double theta = theta_base;
+    for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
+        const float ff = freq_factors ? freq_factors[i0/2] : 1.0f;
+        rope_yarn_precise(theta/ff, freq_scale, corr_dims, i0, ext_factor, mscale, &cache[i0 + 0], &cache[i0 + 1]);
+        cache[i0 + 1] *= sin_sign;
+        theta *= theta_scale;
+    }
+}
+
+static void ggml_mrope_cache_init_precise(
+     double theta_base_t, double theta_base_h, double theta_base_w, double theta_base_e, int sections[4], bool is_imrope, bool indep_sects,
+     float freq_scale, const float * freq_factors, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
+     float * cache, float sin_sign, double theta_scale) {
+    double theta_t = theta_base_t;
+    double theta_h = theta_base_h;
+    double theta_w = theta_base_w;
+    double theta_e = theta_base_e;
+    int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+    int sec_w = sections[1] + sections[0];
+    int sec_e = sections[2] + sec_w;
+    GGML_ASSERT(sect_dims <= ne0);
+
+    for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
+        const float ff = freq_factors ? freq_factors[i0/2] : 1.0f;
+
+        int sector = (i0 / 2) % sect_dims;
+        if (indep_sects) {
+            if (sector == 0) {
+                theta_t = theta_base_t;
+            } else if (sector == sections[0]) {
+                theta_h = theta_base_h;
+            } else if (sector == sec_w) {
+                theta_w = theta_base_w;
+            } else if (sector == sec_e) {
+                theta_e = theta_base_e;
+            }
+        }
+
+        double theta = theta_t;
+        if (is_imrope) {
+            if (sector % 3 == 1 && sector < 3 * sections[1]) {
+                theta = theta_h;
+            } else if (sector % 3 == 2 && sector < 3 * sections[2]) {
+                theta = theta_w;
+            } else if (sector % 3 == 0 && sector < 3 * sections[0]) {
+                theta = theta_t;
+            } else {
+                theta = theta_e;
+            }
+        } else {
+            if (sector >= sections[0] && sector < sec_w) {
+                theta = theta_h;
+            } else if (sector >= sec_w && sector < sec_w + sections[2]) {
+                theta = theta_w;
+            } else if (sector >= sec_w + sections[2]) {
+                theta = theta_e;
+            }
+        }
+
+        rope_yarn_precise(theta/ff, freq_scale, corr_dims, i0, ext_factor, mscale, &cache[i0 + 0], &cache[i0 + 1]);
+        cache[i0 + 1] *= sin_sign;
+
+        theta_t *= theta_scale;
+        theta_w *= theta_scale;
+        theta_h *= theta_scale;
+        theta_e *= theta_scale;
+    }
+}
+
 static void ggml_rope_cache_init(
      float theta_base, float freq_scale, const float * freq_factors, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
      float * cache, float sin_sign, float theta_scale) {
@@ -6479,6 +6577,10 @@ static void ggml_compute_forward_rope_flt(
 
     const float theta_scale = powf(freq_base, -2.0f/n_dims);
 
+    // [TAG_ROPE_PRECISE]
+    const bool   precise       = ggml_rope_precise();
+    const double theta_scale_d = pow((double) freq_base, -2.0/n_dims);
+
     float corr_dims[2];
     ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
 
@@ -6519,7 +6621,15 @@ static void ggml_compute_forward_rope_flt(
 
                 float * cache = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32)*ith;
                 if (last_i2 != i2) {
-                    if (!mrope_used) {
+                    if (precise) {
+                        if (!mrope_used) {
+                            ggml_rope_cache_init_precise(pos[i2], freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale_d);
+                        } else {
+                            ggml_mrope_cache_init_precise(pos[i2], pos[i2 + ne2], pos[i2 + ne2 * 2], pos[i2 + ne2 * 3], sections, is_imrope, is_vision,
+                                freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale_d);
+                        }
+                    }
+                    else if (!mrope_used) {
                         const int64_t p = pos[i2];
                         ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
                     }

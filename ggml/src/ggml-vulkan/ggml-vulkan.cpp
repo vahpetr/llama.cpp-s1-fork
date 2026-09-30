@@ -1114,6 +1114,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_rope_neox_f32, pipeline_rope_neox_f16, pipeline_rope_neox_f32_f16;
     vk_pipeline pipeline_rope_multi_f32, pipeline_rope_multi_f16, pipeline_rope_multi_f32_f16;
     vk_pipeline pipeline_rope_vision_f32, pipeline_rope_vision_f16;
+    // [TAG_ROPE_PRECISE] LLAMA_ROPE_PRECISE=1 (and shaderFloat64): double-precision angles; the pipelines exist only then
+    bool rope_precise {};
+    vk_pipeline pipeline_rope_norm_precise_f32, pipeline_rope_norm_precise_f16, pipeline_rope_norm_precise_f32_f16;
+    vk_pipeline pipeline_rope_neox_precise_f32, pipeline_rope_neox_precise_f16, pipeline_rope_neox_precise_f32_f16;
+    vk_pipeline pipeline_rope_multi_precise_f32, pipeline_rope_multi_precise_f16, pipeline_rope_multi_precise_f32_f16;
     vk_pipeline pipeline_argsort_f32[num_argsort_pipelines];
     vk_pipeline pipeline_argsort_large_f32[num_argsort_pipelines];
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
@@ -6360,6 +6365,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_rope_neox_f32_f16, "rope_neox_f32_f16", rope_neox_f32_f16_len, rope_neox_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_rope_multi_f32_f16, "rope_multi_f32_f16", rope_multi_f32_f16_len, rope_multi_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
 
+    if (device->rope_precise) { // [TAG_ROPE_PRECISE]
+        ggml_vk_create_pipeline(device, device->pipeline_rope_norm_precise_f32, "rope_norm_precise_f32", rope_norm_precise_f32_len, rope_norm_precise_f32_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_rope_neox_precise_f32, "rope_neox_precise_f32", rope_neox_precise_f32_len, rope_neox_precise_f32_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_rope_multi_precise_f32, "rope_multi_precise_f32", rope_multi_precise_f32_len, rope_multi_precise_f32_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_rope_norm_precise_f16, "rope_norm_precise_f16", rope_norm_precise_f16_len, rope_norm_precise_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_rope_neox_precise_f16, "rope_neox_precise_f16", rope_neox_precise_f16_len, rope_neox_precise_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_rope_multi_precise_f16, "rope_multi_precise_f16", rope_multi_precise_f16_len, rope_multi_precise_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_rope_norm_precise_f32_f16, "rope_norm_precise_f32_f16", rope_norm_precise_f32_f16_len, rope_norm_precise_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_rope_neox_precise_f32_f16, "rope_neox_precise_f32_f16", rope_neox_precise_f32_f16_len, rope_neox_precise_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_rope_multi_precise_f32_f16, "rope_multi_precise_f32_f16", rope_multi_precise_f32_f16_len, rope_multi_precise_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
+    }
+
     for (uint32_t i = 0; i < num_argsort_pipelines; ++i) {
         uint32_t BLOCK_SIZE = 1u << std::min(i, device->max_workgroup_size_log2);
         if (i <= device->max_workgroup_size_log2 &&
@@ -7358,6 +7375,18 @@ static vk_device ggml_vk_get_device(size_t idx) {
                             getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
 
         device->shader_int64 = device_features2.features.shaderInt64;
+
+        { // [TAG_ROPE_PRECISE]
+            const char * rp = getenv("LLAMA_ROPE_PRECISE");
+            if (rp != nullptr && atoi(rp) != 0) {
+                device->rope_precise = device_features2.features.shaderFloat64;
+                if (device->rope_precise) {
+                    GGML_LOG_INFO("ggml_vulkan: LLAMA_ROPE_PRECISE=1: rope angles in double precision (norm/neox/mrope/imrope)\n");
+                } else {
+                    GGML_LOG_WARN("ggml_vulkan: LLAMA_ROPE_PRECISE=1 ignored: the device has no shaderFloat64\n");
+                }
+            }
+        }
         device->buffer_device_address = vk12_features.bufferDeviceAddress;
         device->vulkan_memory_model = vk12_features.vulkanMemoryModel;
 
@@ -12608,6 +12637,23 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             const bool is_neox = mode & GGML_ROPE_TYPE_NEOX;
             const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
             const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
+
+            if (ctx->device->rope_precise && !is_vision) { // [TAG_ROPE_PRECISE]
+                const vk_device & d = ctx->device;
+                const vk_pipeline p32     = is_neox ? d->pipeline_rope_neox_precise_f32     : is_mrope ? d->pipeline_rope_multi_precise_f32     : d->pipeline_rope_norm_precise_f32;
+                const vk_pipeline p32_f16 = is_neox ? d->pipeline_rope_neox_precise_f32_f16 : is_mrope ? d->pipeline_rope_multi_precise_f32_f16 : d->pipeline_rope_norm_precise_f32_f16;
+                const vk_pipeline p16     = is_neox ? d->pipeline_rope_neox_precise_f16     : is_mrope ? d->pipeline_rope_multi_precise_f16     : d->pipeline_rope_norm_precise_f16;
+                if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+                    return p32;
+                }
+                if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+                    return p32_f16;
+                }
+                if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
+                    return p16;
+                }
+                return nullptr;
+            }
 
             if (is_neox) {
                 if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -19201,7 +19247,10 @@ static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b
 
 static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
-    GGML_UNUSED(ctx);
+    // [TAG_ROPE_PRECISE] the fused rms_norm shader has only the fp32 angle path
+    if (ctx->device->rope_precise) {
+        return false;
+    }
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
     const ggml_tensor *mul = cgraph->nodes[node_idx + 1];
     const ggml_tensor *rope = cgraph->nodes[node_idx + 2];
