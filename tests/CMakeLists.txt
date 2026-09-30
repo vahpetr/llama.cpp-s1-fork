@@ -318,6 +318,10 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
+    # [TAG_ROPE_PRECISE] exact-reference error of GGML_OP_ROPE at positions up to 1M (report), and the LLAMA_ROPE_PRECISE=1 gate
+    llama_build_and_test(test-rope-precision.cpp)
+    add_test(NAME test-rope-precision-precise COMMAND $<TARGET_FILE:test-rope-precision> --check)
+    set_tests_properties(test-rope-precision-precise PROPERTIES ENVIRONMENT "LLAMA_ROPE_PRECISE=1" LABELS "main")
 endif()
 
 # libmtmd
