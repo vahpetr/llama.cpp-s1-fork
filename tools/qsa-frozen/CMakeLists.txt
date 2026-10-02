@@ -1,0 +1,10 @@
+# [TAG_QSA_FROZEN] llama-qsa-frozen: fill / probe / replay for the frozen-M6 isolation (~/claude-tmp/codex/m6-frozen.sh)
+set(TARGET llama-qsa-frozen)
+add_executable(${TARGET} qsa-frozen.cpp)
+# the attention cache's per-cell positions come from the internal memory classes, as in the tests
+target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(${TARGET} PRIVATE llama-common llama vendor::hash ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET} RUNTIME)
+endif()

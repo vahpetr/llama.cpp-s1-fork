@@ -814,6 +814,39 @@ static bool qwen4exp_qsa_prefill_indexed() {
     return indexed;
 }
 
+// [TAG_QSA_INDEXED_SORT] (frozen-M6 isolation, ~/claude-tmp/codex/m6-frozen.sh) LLAMA_QSA_INDEXED_SORT=1 (default 0 = node for
+// node as before): the indexed flash attention reads each row's QSA_TOP_K ids SORTED ASCENDING, i.e. walks the selected
+// cells in KV order as the scan does, so an indexed-vs-scan difference that the order explains disappears with it (the
+// radix select emits winners, then ties, each run ascending). The ids are < 2^24, so cast to F32, argsort ascending,
+// get_rows, cast to I32 is exact and keeps the set. Acts only where the indexed branch is taken (LLAMA_QSA_PREFILL=indexed).
+// Strict: unset / "" / "0" off, "1" on, anything else WARN + off. Read with LLAMA_QSA_PREFILL at the first QSA layer (the
+// reserve); logged once and only when on: `qsa_indexed_sort: on (LLAMA_QSA_INDEXED_SORT=1)`.
+static bool qwen4exp_qsa_indexed_sort() {
+    static const bool on = [] {
+        const char * s = getenv("LLAMA_QSA_INDEXED_SORT");
+        if (s == nullptr || *s == '\0' || strcmp(s, "0") == 0) { return false; }
+        if (strcmp(s, "1") != 0) {
+            LLAMA_LOG_WARN("qwen4exp_qsa_indexed_sort: LLAMA_QSA_INDEXED_SORT=%s is neither 0 nor 1: off\n", s);
+            return false;
+        }
+        LLAMA_LOG_INFO("qsa_indexed_sort: on (LLAMA_QSA_INDEXED_SORT=1): the indexed flash attention reads each row's ids sorted "
+                "ascending%s\n", qwen4exp_qsa_prefill_indexed() ? "" : " - but LLAMA_QSA_PREFILL is not indexed, so no graph uses it");
+        return true;
+    }();
+    return on;
+}
+
+// [TAG_QSA_INDEXED_SORT] each row of ids [W, n, 1, ns] I32 sorted ascending, as a fresh contiguous I32 tensor
+static ggml_tensor * qwen4exp_qsa_sort_ids(ggml_context * ctx, ggml_tensor * ids) {
+    const int64_t W = ids->ne[0];
+    const int64_t R = ids->ne[1]*ids->ne[2]*ids->ne[3];
+
+    ggml_tensor * f    = ggml_reshape_2d(ctx, ggml_cast(ctx, ids, GGML_TYPE_F32), W, R);    // exact: ids < 2^24
+    ggml_tensor * perm = ggml_argsort(ctx, f, GGML_SORT_ORDER_ASC);                          // [W, R] I32
+    ggml_tensor * val  = ggml_get_rows(ctx, ggml_reshape_3d(ctx, f, 1, W, R), perm);         // [1, W, R] F32
+    return ggml_cast(ctx, ggml_reshape_4d(ctx, val, W, ids->ne[1], ids->ne[2], ids->ne[3]), GGML_TYPE_I32);
+}
+
 // the knob refuses rather than let the scheduler put the node on the CPU (spec §6): ask the first backend about a small one.
 // No scheduler (an unknown backend) is a refusal. The answer is cached per (device, K/V types, heads, head dims), so the
 // stand-in node is built once, at the reserve, not per QSA layer per graph.
@@ -1928,6 +1961,10 @@ bool llama_model_qwen4exp::graph::qsa_use_indexed(llm_graph_input_attn_kv * inp,
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_indexed(llm_graph_input_attn_kv * inp, ggml_tensor * q_cur,
         ggml_tensor * top_k, float kq_scale, int il, ggml_tensor * kq_mask_chunk) {
     ggml_tensor * kq_mask = kq_mask_chunk ? kq_mask_chunk : inp->get_kq_mask();
+    if (qwen4exp_qsa_indexed_sort()) {
+        top_k = qwen4exp_qsa_sort_ids(ctx0, top_k); // [TAG_QSA_INDEXED_SORT]
+        cb(top_k, "indexer_top_k_sorted", il);
+    }
     return build_attn_mha(q_cur, inp->mctx->get_k(ctx0, il), inp->mctx->get_v(ctx0, il), nullptr, kq_mask, nullptr, nullptr,
             kq_scale, il, top_k);
 }
@@ -2181,6 +2218,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     if (qsa) {
         // [TAG_QSA_INDEXED_FA] read and log LLAMA_QSA_PREFILL at the first QSA layer (the reserve), whatever branch it takes
         qwen4exp_qsa_prefill_indexed();
+        qwen4exp_qsa_indexed_sort(); // [TAG_QSA_INDEXED_SORT] and its sort knob, after it
     }
 
     if (qsa && (qwen4exp_qsa_bypass_exhaustive() || qwen4exp_qsa_min_kv() > 0)) {
