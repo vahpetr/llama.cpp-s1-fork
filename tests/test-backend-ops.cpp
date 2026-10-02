@@ -7013,6 +7013,257 @@ struct test_qsa_top_k : public test_case {
     }
 };
 
+// [TAG_QSA_TOPK_V2] GGML_OP_QSA_TOP_K, EXACT: the ids AND their order, against a reference implemented
+// here from the backend's documented selection contract (topk_radix_select.comp / _v2.comp):
+//   key(x) = the order-preserving float->uint map with -0.0 folded onto +0.0,
+//   T      = the k-th largest key of the row,
+//   ids    = every cell with key > T in ascending id order, then the lowest-id cells with key == T,
+//            ascending, until k ids are out.
+// The QSA gather path sums the attention window in id order, so the order is part of what the
+// deployed graph sees - test_qsa_top_k compares sets only. The CPU backend (partial_sort, first two
+// swapped) is still checked against the reference as a SET, which validates the reference itself.
+// The two Vulkan kernels (GGML_VK_QSA_TOPK=v1|v2) both have to match it id for id, i.e. they are
+// byte-identical to each other on every case here; GGML_TEST_DUMP_IDS diffs them directly.
+//
+// Modes (value(i) = score[cell_blk[i]] + mask[i], f32 add of the f16 mask, as every backend does):
+//   random  scores U[0,8), mask -U[0,2] in f16, random cell->block map: (almost) distinct values
+//   quant   16 score levels, mask 0 / -1: wide tie groups at every threshold
+//   equal   every cell equal: the whole row is one tie group
+//   mask    -inf masked cells; on even rows the finite cells do not fill k, so T = -inf
+//   zero    -0/+0 scores and -0/+0 f16 masks around a handful of positives: T is a zero, the
+//           tie group mixes both signs (folded keys), negatives below
+//   inf     +inf / -inf scores and -inf masks (never inf + -inf): T = +inf once enough +inf cells
+//   nan     as inf plus inf + -inf = NaN cells and NaN scores of both signs. The NaN a device add
+//           produces is the device's, and the CPU comparator does not order NaN, so only the
+//           structure is checked here (ids in range, no repeats); v1 vs v2 is by dump.
+//   prod    the deployed layout: cell i in block i/4, U[0,4) block scores (4-cell tie groups),
+//           a -inf padded tail and the causal mask of the verify rows
+struct test_qsa_top_k_exact : public test_case {
+    enum { M_RANDOM, M_QUANT, M_EQUAL, M_MASK, M_ZERO, M_INF, M_NAN, M_PROD, M_COUNT };
+
+    const int64_t n_kv;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const int     width;
+    const int     mode;
+    std::vector<std::vector<int32_t>> expected; // per row, filled by initialize_tensors
+
+    static const char * mode_name(int m) {
+        static const char * names[M_COUNT] = { "random", "quant", "equal", "mask", "zero", "inf", "nan", "prod" };
+        return m >= 0 && m < M_COUNT ? names[m] : "?";
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_TOP_K_EXACT";
+    }
+
+    std::string vars() override {
+        const std::string data = mode_name(mode);
+        return VARS_TO_STR5(n_kv, n_tps, n_stream, width, data);
+    }
+
+    test_qsa_top_k_exact(int64_t n_kv, int64_t n_tps, int64_t n_stream, int width, int mode)
+        : n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), mode(mode) {
+        GGML_ASSERT(width > 0 && width <= n_kv && mode >= 0 && mode < M_COUNT);
+    }
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    int64_t n_blocks() const { return std::max<int64_t>(1, n_kv / 4); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks(), n_tps, n_stream);
+        ggml_set_name(score, "score");
+        ggml_tensor * cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
+        ggml_set_name(cell_blk, "cell_blk");
+        ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+        ggml_set_name(kq_mask, "kq_mask");
+        ggml_tensor * out = ggml_qsa_top_k(ctx, score, cell_blk, kq_mask, width);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // the backends' key: order-preserving, -0.0 == +0.0
+    static uint32_t key_of(float x) {
+        uint32_t y;
+        memcpy(&y, &x, sizeof(y));
+        if (y == 0x80000000u) {
+            y = 0u;
+        }
+        return (y & 0x80000000u) ? ~y : (y | 0x80000000u);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t nb    = n_blocks();
+        const int64_t nrows = n_tps*n_stream;
+        std::mt19937 rng(0x9e3779b9u ^ (uint32_t) (mode*7919 + n_kv*31 + n_tps*131 + n_stream*17 + width));
+        std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+        const float inf = INFINITY;
+        float qnan_pos, qnan_neg;
+        {
+            const uint32_t bp = 0x7FC00000u, bn = 0xFFC00000u;
+            memcpy(&qnan_pos, &bp, 4);
+            memcpy(&qnan_neg, &bn, 4);
+        }
+
+        std::vector<int32_t> cb(n_kv*n_stream);
+        for (int64_t s = 0; s < n_stream; s++) {
+            for (int64_t i = 0; i < n_kv; i++) {
+                cb[s*n_kv + i] = mode == M_PROD ? (int32_t) std::min(i/4, nb - 1) : (int32_t) (rng() % (uint32_t) nb);
+            }
+        }
+        std::vector<float> sc(nb*nrows);
+        for (int64_t row = 0; row < nrows; row++) {
+            for (int64_t b = 0; b < nb; b++) {
+                const float x = u01(rng);
+                float v = 0.0f;
+                switch (mode) {
+                    case M_RANDOM: v = 8.0f*x; break;
+                    case M_QUANT:  v = 0.25f*(float) (rng() % 16); break;
+                    case M_EQUAL:  v = 1.5f; break;
+                    case M_MASK:   v = 8.0f*x; break;
+                    case M_ZERO:   v = x < 0.001f ? 1.0f + u01(rng) : x < 0.25f ? -(1.0f + u01(rng)) : ((rng() & 1) ? -0.0f : 0.0f); break;
+                    case M_INF:    v = x < 0.02f ? inf : x < 0.04f ? -inf : 8.0f*u01(rng); break;
+                    case M_NAN:    v = x < 0.02f ? inf : x < 0.04f ? -inf : x < 0.05f ? qnan_pos : x < 0.06f ? qnan_neg : 8.0f*u01(rng); break;
+                    case M_PROD:   v = 4.0f*x; break;
+                }
+                sc[row*nb + b] = v;
+            }
+        }
+        std::vector<ggml_fp16_t> mk(n_kv*nrows);
+        const int64_t used = n_kv - n_kv/16;
+        for (int64_t row = 0; row < nrows; row++) {
+            const int64_t t = row % n_tps;
+            const int64_t s = row / n_tps;
+            for (int64_t i = 0; i < n_kv; i++) {
+                const float sv = sc[row*nb + cb[s*n_kv + i]];
+                float m = 0.0f;
+                switch (mode) {
+                    case M_RANDOM: m = -2.0f*u01(rng); break;
+                    case M_QUANT:  m = (rng() % 4 == 0) ? -1.0f : 0.0f; break;
+                    case M_EQUAL:  m = 0.0f; break;
+                    case M_MASK:   m = ((row % 2 == 0 && i >= width/2) || u01(rng) < 0.4f) ? -inf : 0.0f; break;
+                    case M_ZERO:   m = (rng() & 1) ? -0.0f : 0.0f; break;
+                    case M_INF:    m = (sv != inf && u01(rng) < 0.1f) ? -inf : 0.0f; break;
+                    case M_NAN:    m = u01(rng) < 0.1f ? -inf : 0.0f; break;
+                    case M_PROD:   m = i < used - (n_tps - 1 - t) ? 0.0f : -inf; break;
+                }
+                mk[row*n_kv + i] = ggml_fp32_to_fp16(m);
+            }
+        }
+
+        int seen = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            const char * name = ggml_get_name(t);
+            if (strcmp(name, "score") == 0) {
+                GGML_ASSERT(ggml_nbytes(t) == sc.size()*sizeof(float));
+                ggml_backend_tensor_set(t, sc.data(), 0, ggml_nbytes(t));
+                seen++;
+            } else if (strcmp(name, "cell_blk") == 0) {
+                GGML_ASSERT(ggml_nbytes(t) == cb.size()*sizeof(int32_t));
+                ggml_backend_tensor_set(t, cb.data(), 0, ggml_nbytes(t));
+                seen++;
+            } else if (strcmp(name, "kq_mask") == 0) {
+                GGML_ASSERT(ggml_nbytes(t) == mk.size()*sizeof(ggml_fp16_t));
+                ggml_backend_tensor_set(t, mk.data(), 0, ggml_nbytes(t));
+                seen++;
+            } else {
+                init_tensor_uniform(t, 0.0f, 0.5f);
+            }
+        }
+        GGML_ASSERT(seen == 3);
+
+        // the reference, row by row: T by nth_element over the keys, then the two classes by id
+        expected.assign(nrows, {});
+        if (mode == M_NAN) {
+            return;
+        }
+        std::vector<uint32_t> keys(n_kv), tmp(n_kv);
+        for (int64_t row = 0; row < nrows; row++) {
+            const int64_t s = row / n_tps;
+            for (int64_t i = 0; i < n_kv; i++) {
+                const float v = sc[row*nb + cb[s*n_kv + i]] + ggml_fp16_to_fp32(mk[row*n_kv + i]);
+                keys[i] = key_of(v);
+            }
+            tmp = keys;
+            std::nth_element(tmp.begin(), tmp.begin() + (width - 1), tmp.end(), std::greater<uint32_t>());
+            const uint32_t T = tmp[width - 1];
+            std::vector<int32_t> & e = expected[row];
+            e.reserve(width);
+            for (int64_t i = 0; i < n_kv; i++) {
+                if (keys[i] > T) {
+                    e.push_back((int32_t) i);
+                }
+            }
+            int64_t desired = width - (int64_t) e.size();
+            GGML_ASSERT(desired >= 1);
+            for (int64_t i = 0; i < n_kv && desired > 0; i++) {
+                if (keys[i] == T) {
+                    e.push_back((int32_t) i);
+                    desired--;
+                }
+            }
+            GGML_ASSERT((int64_t) e.size() == width);
+        }
+    }
+
+    // a: the backend under test (exact, order included), b: the CPU backend (as a set)
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_ASSERT(n % (size_t) width == 0);
+        const int64_t nrows = (int64_t) (n / (size_t) width);
+        double diff = 0.0;
+        std::vector<int32_t> ids(width), ref(width);
+        int64_t bad_row = -1, bad_col = -1;
+        for (int64_t r = 0; r < nrows; r++) {
+            const float * ar = a + r*width;
+            for (int64_t c = 0; c < width; c++) {
+                ids[c] = (int32_t) ar[c];
+                if (ids[c] < 0 || ids[c] >= n_kv) {
+                    diff += 1.0;
+                }
+            }
+            if (mode == M_NAN) {
+                std::sort(ids.begin(), ids.end());
+                if (std::adjacent_find(ids.begin(), ids.end()) != ids.end()) {
+                    diff += 1.0;
+                }
+                continue;
+            }
+            GGML_ASSERT((int64_t) expected.size() == nrows);
+            for (int64_t c = 0; c < width; c++) {
+                if (ids[c] != expected[r][c]) {
+                    diff += 1.0;
+                    if (bad_row < 0) {
+                        bad_row = r;
+                        bad_col = c;
+                    }
+                }
+            }
+            // the CPU reference's set == the reference's set
+            for (int64_t c = 0; c < width; c++) {
+                ids[c] = (int32_t) b[r*width + c];
+            }
+            ref = expected[r];
+            std::sort(ids.begin(), ids.end());
+            std::sort(ref.begin(), ref.end());
+            if (ids != ref) {
+                diff += 1.0;
+                printf("[cpu set != reference set, row %" PRId64 "] ", r);
+            }
+        }
+        if (bad_row >= 0) {
+            printf("[first order mismatch row %" PRId64 " col %" PRId64 ": got %d want %d] ", bad_row, bad_col,
+                   (int) a[bad_row*width + bad_col], expected[bad_row][bad_col]);
+        }
+        return diff;
+    }
+};
+
 // [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS: the qwen4exp per-block indexer bias built from the block table
 // blk [2, n_blocks, n_stream] (key, vis) and the query table qry [2, n_tps, n_stream] (tail, bit), read
 // through rows [np, n_stream] (NULL = identity). The op writes one of three constants (+0.0f, 1e9f, -inf)
@@ -11223,6 +11474,40 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_top_k(512,  2048,  2, 1, 2048, true, 0, GGML_TYPE_F16, 512));
     test_cases.emplace_back(new test_qsa_top_k(1024, 4096,  6, 1, 2051, true, 5, GGML_TYPE_F32, 512));
 
+    // [TAG_QSA_TOPK_V2] the selection EXACTLY - ids and order - against the contract's reference (see
+    // test_qsa_top_k_exact): every data mode at the decode/verify shapes (1 and 6 queries, k 512 and the
+    // deployed 2051) from one tile to 128 tiles of the v2 kernel, ...
+    for (int64_t n_kv : { 4096, 65536, 131072, 262144 }) {
+        for (int64_t n_tps : { 1, 6 }) {
+            for (int width : { 512, 2051 }) {
+                for (int mode = 0; mode < test_qsa_top_k_exact::M_COUNT; mode++) {
+                    test_cases.emplace_back(new test_qsa_top_k_exact(n_kv, n_tps, 1, width, mode));
+                }
+            }
+        }
+    }
+    // ... tail residues (n_kv not a multiple of the 2048-cell tile, of 256, or of 4) ...
+    for (int64_t n_kv : { 2051, 4096 + 77, 65536 + 2047, 131072 + 1000, 262144 + 1 }) {
+        for (int64_t n_tps : { 1, 6 }) {
+            for (int mode : { test_qsa_top_k_exact::M_RANDOM, test_qsa_top_k_exact::M_QUANT, test_qsa_top_k_exact::M_MASK,
+                              test_qsa_top_k_exact::M_ZERO, test_qsa_top_k_exact::M_PROD }) {
+                test_cases.emplace_back(new test_qsa_top_k_exact(n_kv, n_tps, 1, 2051, mode));
+            }
+        }
+    }
+    // ... k = 1, k = n_kv (every cell), k = n_kv - 1, two streams, a prefill-sized query batch
+    test_cases.emplace_back(new test_qsa_top_k_exact(4096,  6,  1, 1,    test_qsa_top_k_exact::M_RANDOM));
+    test_cases.emplace_back(new test_qsa_top_k_exact(4096,  6,  1, 1,    test_qsa_top_k_exact::M_EQUAL));
+    test_cases.emplace_back(new test_qsa_top_k_exact(4096,  6,  1, 4096, test_qsa_top_k_exact::M_RANDOM));
+    test_cases.emplace_back(new test_qsa_top_k_exact(4096,  6,  1, 4096, test_qsa_top_k_exact::M_QUANT));
+    test_cases.emplace_back(new test_qsa_top_k_exact(4096,  6,  1, 4095, test_qsa_top_k_exact::M_QUANT));
+    test_cases.emplace_back(new test_qsa_top_k_exact(2051,  6,  1, 2051, test_qsa_top_k_exact::M_EQUAL));
+    test_cases.emplace_back(new test_qsa_top_k_exact(65536, 3,  2, 2051, test_qsa_top_k_exact::M_RANDOM));
+    test_cases.emplace_back(new test_qsa_top_k_exact(65536, 3,  2, 2051, test_qsa_top_k_exact::M_QUANT));
+    test_cases.emplace_back(new test_qsa_top_k_exact(65536, 3,  2, 2051, test_qsa_top_k_exact::M_PROD));
+    test_cases.emplace_back(new test_qsa_top_k_exact(65536, 64, 1, 2051, test_qsa_top_k_exact::M_PROD));
+    test_cases.emplace_back(new test_qsa_top_k_exact(65536, 64, 1, 2051, test_qsa_top_k_exact::M_QUANT));
+
     // Qwen 3.8 Flash Next at the deployed context: n_kv 213000, ratio 4, width 2051, decode
     // and -ub 2048 prefill. Opt-in: the n_tps 2048 pair needs ~10 GB of backend and as much
     // host memory for the reference, and runs for a while.
@@ -11713,6 +11998,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // [TAG_QSA_TOPK_V2] the QSA selection (GGML_OP_QSA_TOP_K, width 2051) at decode (1) / verify (6) depths,
+    // deployed data layout, plus random data and prefill-chunk query batches: GGML_VK_QSA_TOPK=v1|v2 A/B
+    for (int64_t n_kv : { 65536, 131072, 262144, 524288 }) {
+        for (int64_t n_tps : { 1, 6 }) {
+            test_cases.emplace_back(new test_qsa_top_k_exact(n_kv, n_tps, 1, 2051, test_qsa_top_k_exact::M_PROD));
+        }
+    }
+    test_cases.emplace_back(new test_qsa_top_k_exact(262144, 1,   1, 2051, test_qsa_top_k_exact::M_RANDOM));
+    test_cases.emplace_back(new test_qsa_top_k_exact(262144, 6,   1, 2051, test_qsa_top_k_exact::M_RANDOM));
+    test_cases.emplace_back(new test_qsa_top_k_exact(131072, 64,  1, 2051, test_qsa_top_k_exact::M_PROD));
+    test_cases.emplace_back(new test_qsa_top_k_exact(131072, 256, 1, 2051, test_qsa_top_k_exact::M_PROD));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

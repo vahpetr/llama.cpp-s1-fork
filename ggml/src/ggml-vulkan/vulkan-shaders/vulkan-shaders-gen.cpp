@@ -1040,6 +1040,7 @@ void process_shaders() {
     string_to_spv("topk_argsort_f32", "topk_argsort.comp", {{"A_TYPE", "float"}});
     string_to_spv("topk_nary_search_f32", "topk_nary_search.comp", {{"A_TYPE", "float"}});
     string_to_spv("topk_radix_select_f32", "topk_radix_select.comp", {{"A_TYPE", "float"}});
+    string_to_spv("topk_radix_select_v2_f32", "topk_radix_select_v2.comp", {{"A_TYPE", "float"}}); // [TAG_QSA_TOPK_V2]
     string_to_spv("qsa_bias_f32", "qsa_bias.comp", {}); // [TAG_QSA_COMPACT_BIAS]
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));

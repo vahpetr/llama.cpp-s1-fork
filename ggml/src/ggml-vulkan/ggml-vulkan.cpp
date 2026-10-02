@@ -941,6 +941,13 @@ struct vk_device_struct {
     // ggml-vulkan-mmq-knobs.h); the defaults leave it unrestricted.
     uint32_t mmq_int8_min_n = 0;
     uint32_t mmq_int8_ops = GGML_VK_MMQ_INT8_OPS_ALL;
+    // [TAG_QSA_TOPK_V2] QSA selection kernel: false = v1 (topk_radix_select.comp, one workgroup per row),
+    // true = v2 (topk_radix_select_v2.comp, tiles x 256 invocations, subgroup size qsa_topk_wave).
+    // Byte-identical outputs; GGML_VK_QSA_TOPK=v1|v2 (default v2), GGML_VK_QSA_TOPK_WAVE=32|64 (default 64 where
+    // supported, else 32), GGML_VK_QSA_TOPK_CPT=4|8|16 (diagnostic, default 8).
+    bool qsa_topk_v2 = false;
+    uint32_t qsa_topk_wave = 0;
+    uint32_t qsa_topk_cpt = 8;   // cells per invocation per tile: tile = 256 * qsa_topk_cpt cells
 
     bool coopmat2;
     bool coopmat2_bf16_support {};
@@ -1135,6 +1142,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
     vk_pipeline pipeline_topk_radix_qsa_blocks; // [TAG_QSA_WHOLE_BLOCKS] ggml_qsa_top_k_blocks (f16 mask)
+    // [TAG_QSA_TOPK_V2] the distributed radix select (topk_radix_select_v2.comp): one pipeline per pass
+    // (0..3 histogram rounds, 4 count, 5 emit). Created only when qsa_topk_v2 (GGML_VK_QSA_TOPK, device init).
+    vk_pipeline pipeline_topk_v2_qsa[6];
     vk_pipeline pipeline_qsa_bias;       // [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
@@ -1879,6 +1889,26 @@ struct vk_op_topk_radix_push_constants {
     // [TAG_QSA_WHOLE_BLOCKS] QSA == 2 (ggml_qsa_top_k_blocks) only: the number of whole blocks to select
     uint32_t n_sel;
 };
+
+// [TAG_QSA_TOPK_V2] topk_radix_select_v2.comp: v1's constants, then the tiling and the scratch layout
+// (uint offsets into the bound prealloc_x: keys at 0, histograms at hist_off, tile records at rec_off)
+struct vk_op_topk_radix_v2_push_constants {
+    uint32_t ncols;
+    uint32_t k;
+    uint32_t nrows;
+    uint32_t n_tps;
+    uint32_t n_blocks;
+    uint32_t n_stream;
+    uint32_t sb_blk;
+    uint32_t sb_tps;
+    uint32_t n_tiles;
+    uint32_t hist_off;
+    uint32_t rec_off;
+};
+
+// [TAG_QSA_TOPK_V2] tile = 256 invocations x qsa_topk_cpt cells (spec constant 2 of the shader); default
+// cells per invocation (GGML_VK_QSA_TOPK_CPT overrides it, diagnostic)
+static constexpr uint32_t VK_QSA_TOPK_V2_CPT = 8;
 
 // [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS (qsa_bias.comp)
 struct vk_op_qsa_bias_push_constants {
@@ -6587,6 +6617,20 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_blocks, "topk_radix_qsa_blocks", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 2}, 1, true);
     }
 
+    // [TAG_QSA_TOPK_V2] the distributed QSA radix select: six passes, each its own pipeline (spec constant 0),
+    // 256 invocations in full subgroups of qsa_topk_wave (spec constant 1 = waves per workgroup). Dispatched
+    // as (rows, tiles) workgroups, so wg_denoms is 1. No memory-model requirement: nothing crosses invocations
+    // through a buffer inside one dispatch (keys, histograms and tile records are read in a later pass).
+    if (device->qsa_topk_v2) {
+        const uint32_t wave = device->qsa_topk_wave;
+        for (uint32_t pass = 0; pass < 6; ++pass) {
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_v2_qsa[pass], "topk_radix_v2_qsa_p" + std::to_string(pass),
+                                     topk_radix_select_v2_f32_len, topk_radix_select_v2_f32_data, "main", 5,
+                                     sizeof(vk_op_topk_radix_v2_push_constants), {1, 1, 1},
+                                     {pass, 256 / wave, device->qsa_topk_cpt}, 1, true, true, wave);
+        }
+    }
+
     // [TAG_QSA_COMPACT_BIAS] 256 blocks per workgroup on x, one (t, s) row per workgroup on y
     ggml_vk_create_pipeline(device, device->pipeline_qsa_bias, "qsa_bias_f32", qsa_bias_f32_len, qsa_bias_f32_data, "main", 4, sizeof(vk_op_qsa_bias_push_constants), {256, 1, 1}, {}, 1);
 
@@ -7937,6 +7981,69 @@ static vk_device ggml_vk_get_device(size_t idx) {
                               device->subgroup_min_size, device->subgroup_max_size, disable_mmq_cm1 ? 1 : 0,
                               mmq_int8_min_n, ggml_vk_mmq_int8_ops_name(mmq_int8_ops));
             }
+        }
+
+        // [TAG_QSA_TOPK_V2] which kernel runs the QSA selection (GGML_OP_QSA_TOP_K and the topk_qsa fusion).
+        // GGML_VK_QSA_TOPK=v1 keeps topk_radix_select.comp (one workgroup per query row); v2 (the default) is
+        // topk_radix_select_v2.comp (tiles x 256 invocations). Both give byte-identical ids and order. v2 needs
+        // subgroup basic/ballot/arithmetic in compute and a required full-subgroup size of 32 or 64
+        // (GGML_VK_QSA_TOPK_WAVE; default 64 where the device allows it, else 32); without them it falls back to v1.
+        // Strict parsing: an invalid value keeps the default with a warning. Proof line at WARN, as mmq_cm1.
+        {
+            static const int qsa_topk_sel = [] {
+                const char * s = getenv("GGML_VK_QSA_TOPK");
+                if (s == nullptr || *s == 0 || strcmp(s, "v2") == 0) {
+                    return 2;
+                }
+                if (strcmp(s, "v1") == 0) {
+                    return 1;
+                }
+                GGML_LOG_WARN("ggml_vulkan: GGML_VK_QSA_TOPK=%s ignored, expected v1 or v2 (using v2)\n", s);
+                return 2;
+            }();
+            // 0 = auto: 64 where the device allows it (measured 10-15 % faster than 32 on the 780M, RDNA3), else 32
+            static const uint32_t qsa_topk_wave_env = [] {
+                const char * s = getenv("GGML_VK_QSA_TOPK_WAVE");
+                if (s == nullptr || *s == 0) {
+                    return 0u;
+                }
+                if (strcmp(s, "32") == 0 || strcmp(s, "64") == 0) {
+                    return (uint32_t) atoi(s);
+                }
+                GGML_LOG_WARN("ggml_vulkan: GGML_VK_QSA_TOPK_WAVE=%s ignored, expected 32 or 64 (using auto)\n", s);
+                return 0u;
+            }();
+            // diagnostic: cells per invocation per tile (tile = 256 x this), 4 / 8 / 16
+            static const uint32_t qsa_topk_cpt_env = [] {
+                const char * s = getenv("GGML_VK_QSA_TOPK_CPT");
+                if (s == nullptr || *s == 0) {
+                    return VK_QSA_TOPK_V2_CPT;
+                }
+                if (strcmp(s, "4") == 0 || strcmp(s, "8") == 0 || strcmp(s, "16") == 0) {
+                    return (uint32_t) atoi(s);
+                }
+                GGML_LOG_WARN("ggml_vulkan: GGML_VK_QSA_TOPK_CPT=%s ignored, expected 4, 8 or 16 (using %u)\n", s, VK_QSA_TOPK_V2_CPT);
+                return VK_QSA_TOPK_V2_CPT;
+            }();
+            device->qsa_topk_cpt = qsa_topk_cpt_env;
+            const bool sg_ops = device->subgroup_basic && device->subgroup_ballot && device->subgroup_arithmetic;
+            const auto wave_ok = [&](uint32_t w) {
+                return device->subgroup_size_control && device->subgroup_require_full_support &&
+                       device->subgroup_min_size <= w && w <= device->subgroup_max_size;
+            };
+            const uint32_t wave = qsa_topk_wave_env != 0 ? qsa_topk_wave_env : wave_ok(64) ? 64u : 32u;
+            const bool sg_size = wave_ok(wave);
+            device->qsa_topk_wave = wave;
+            device->qsa_topk_v2   = qsa_topk_sel == 2 && sg_ops && sg_size;
+            const char * why = device->qsa_topk_v2 ? "" :
+                               qsa_topk_sel == 1 ? " (GGML_VK_QSA_TOPK=v1)" :
+                               !sg_ops ? " (v2 unsupported: subgroup basic/ballot/arithmetic)" :
+                                         " (v2 unsupported: required full subgroup size)";
+            GGML_LOG_WARN("ggml_vulkan: %s qsa_topk: %s%s (QSA select kernel; v2 = distributed radix select, tile %u cells, wg 256, "
+                          "wave %u; subgroup %u..%u, full %d)\n",
+                          device->name.c_str(), device->qsa_topk_v2 ? "v2" : "v1", why, 256 * device->qsa_topk_cpt,
+                          device->qsa_topk_wave, device->subgroup_min_size, device->subgroup_max_size,
+                          device->subgroup_require_full_support ? 1 : 0);
         }
 
         ggml_vk_load_shaders(device);
@@ -15493,26 +15600,38 @@ static const bool vk_qsa_scratch_presize = ggml_vk_env_bool("GGML_VK_QSA_SCRATCH
 static const bool vk_qsa_scratch_presize_fa = vk_qsa_scratch_presize && ggml_vk_env_bool("GGML_VK_QSA_SCRATCH_PRESIZE_FA", false);
 static bool vk_qsa_scratch_presize_fa_enabled() { return vk_qsa_scratch_presize_fa; }
 
+// [TAG_QSA_TOPK_V2] v2's scratch beyond the keys, in uints per row: the four 256-bin global histograms
+// and a (gt|above, cand|equal) record per tile (256 * qsa_topk_cpt cells).
+static size_t ggml_vk_qsa_topk_v2_row_extra(const vk_device & device, int64_t n_kv) {
+    return 4 * 256 + 2 * (size_t) CEIL_DIV(n_kv, (int64_t) (256 * device->qsa_topk_cpt));
+}
+
 // Bytes the fused select's gather scratch needs: n_kv * n_tps * n_stream * 4, i.e. one float per
-// (row, key). One definition for all three callers below - the pattern dispatch, the op dispatch
-// and the reserve-time hint - so they cannot drift.
-static size_t ggml_vk_qsa_scratch_bytes(int64_t n_kv, int64_t n_tps, int64_t n_stream) {
-    return (size_t) n_kv * (size_t) n_tps * (size_t) n_stream * sizeof(float);
+// (row, key) - v1 keeps the gathered value there, v2 its uint key - plus, for v2, the histograms and
+// tile records ([TAG_QSA_TOPK_V2]: 4 KiB + 8 B per tile per row, 0.5 % more at n_kv 262144). One definition for all three
+// callers below - the pattern dispatch, the op dispatch and the reserve-time hint - so they cannot drift.
+static size_t ggml_vk_qsa_scratch_bytes(const vk_device & device, int64_t n_kv, int64_t n_tps, int64_t n_stream) {
+    const size_t nrows = (size_t) n_tps * (size_t) n_stream;
+    size_t bytes = (size_t) n_kv * nrows * sizeof(float);
+    if (device->qsa_topk_v2) {
+        bytes += nrows * ggml_vk_qsa_topk_v2_row_extra(device, n_kv) * sizeof(uint32_t);
+    }
+    return bytes;
 }
 
 // ... for the topk_qsa PATTERN starting at `node_idx` (the GET_ROWS), whose score operand arrives
 // permuted, so n_tps is scores->ne[0].
-static size_t ggml_vk_topk_qsa_scratch_size(const ggml_cgraph * cgraph, int node_idx) {
+static size_t ggml_vk_topk_qsa_scratch_size(const vk_device & device, const ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * get_rows = cgraph->nodes[node_idx];
     const ggml_tensor * scores   = get_rows->src[0]; // [n_tps, n_blocks, n_stream]
     const ggml_tensor * cell_blk = get_rows->src[1]; // [n_kv, n_stream]
-    return ggml_vk_qsa_scratch_bytes(cell_blk->ne[0], scores->ne[0], scores->ne[2]);
+    return ggml_vk_qsa_scratch_bytes(device, cell_blk->ne[0], scores->ne[0], scores->ne[2]);
 }
 
 // ... and for a GGML_OP_QSA_TOP_K node, whose score is the unpermuted [n_blocks, n_tps, n_stream],
 // so the same selection gives the same bytes with n_tps read from ne[1] instead of ne[0].
-static size_t ggml_vk_qsa_top_k_scratch_size(const ggml_tensor * node) {
-    return ggml_vk_qsa_scratch_bytes(node->src[1]->ne[0], node->src[0]->ne[1], node->src[0]->ne[2]);
+static size_t ggml_vk_qsa_top_k_scratch_size(const vk_device & device, const ggml_tensor * node) {
+    return ggml_vk_qsa_scratch_bytes(device, node->src[1]->ne[0], node->src[0]->ne[1], node->src[0]->ne[2]);
 }
 
 // [TAG_QSA_FUSED_SELECT] one dispatch of the QSA indexer selection: gather(score, cell_blk) + mask
@@ -15537,11 +15656,15 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
 
     // [TAG_QSA_WHOLE_BLOCKS] n_sel > 0: the block-level form (QSA == 2), the same operands and the same scratch
     // (it holds one flag per block of the row instead of the gathered cells; n_blocks <= n_kv)
-    vk_pipeline pipeline = n_sel > 0 ? ctx->device->pipeline_topk_radix_qsa_blocks : ctx->device->pipeline_topk_radix_qsa;
+    // [TAG_QSA_TOPK_V2] the cell form (n_sel == 0) runs v2 when the device enabled it; the block form stays on v1
+    const bool v2 = ctx->device->qsa_topk_v2 && n_sel == 0;
+    vk_pipeline pipeline = n_sel > 0 ? ctx->device->pipeline_topk_radix_qsa_blocks :
+                           v2        ? ctx->device->pipeline_topk_v2_qsa[0] : ctx->device->pipeline_topk_radix_qsa;
     GGML_ASSERT(pipeline != nullptr);
 
-    // scratch holds the gathered+masked input, materialized once and reused across passes
-    const size_t scratch_size = ggml_vk_qsa_scratch_bytes(n_kv, n_tps, n_stream);
+    // scratch holds the gathered+masked input (v2: its keys, then the histograms and tile records),
+    // materialized once and reused across passes
+    const size_t scratch_size = ggml_vk_qsa_scratch_bytes(ctx->device, n_kv, n_tps, n_stream);
     if (vk_qsa_scratch_presize) {
         // [TAG_QSA_SCRATCH] Raise the shared prealloc_x to the largest extent any optimized graph
         // asked for, not just to what this dispatch needs. The reserve graphs were optimized before
@@ -15606,6 +15729,44 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
     }
     if (ctx->prealloc_x_need_sync) {
         ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    if (v2) {
+        // [TAG_QSA_TOPK_V2] fill (zero the four global histograms of every row), then the six passes of
+        // topk_radix_select_v2.comp, each over (rows, tiles) workgroups, with a full barrier between
+        // consecutive commands: every pass reads what the previous one wrote in other workgroups, and
+        // a dispatch boundary is the only device-wide dependency Vulkan gives. All on the GPU; no readback.
+        const uint32_t n_tiles  = (uint32_t) CEIL_DIV(n_kv, 256 * ctx->device->qsa_topk_cpt);
+        const uint64_t hist_off = (uint64_t) nrows * n_kv;
+        const uint64_t rec_off  = hist_off + (uint64_t) nrows * 4 * 256;
+        GGML_ASSERT(rec_off + (uint64_t) nrows * 2 * n_tiles <= UINT32_MAX);
+        GGML_ASSERT((rec_off + (uint64_t) nrows * 2 * n_tiles) * sizeof(uint32_t) <= ctx->prealloc_x->size);
+        GGML_ASSERT(n_tiles <= ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+
+        subctx->s->buffer->buf.fillBuffer(ctx->prealloc_x->buffer, hist_off * sizeof(uint32_t),
+                                          (vk::DeviceSize) nrows * 4 * 256 * sizeof(uint32_t), 0);
+        ggml_vk_sync_buffers(ctx, subctx);
+
+        const vk_op_topk_radix_v2_push_constants pc2 {
+            n_kv, width, nrows, n_tps, n_blocks, n_stream, sb_blk, sb_tps, n_tiles, (uint32_t) hist_off, (uint32_t) rec_off,
+        };
+        const std::array<uint32_t, 3> elements2 {
+            std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[0]), n_tiles, 1,
+        };
+        vk_subbuffer scratch_buf { ctx->prealloc_x, 0, ctx->prealloc_x->size };
+        for (uint32_t pass = 0; pass < 6; ++pass) {
+            vk_pipeline & pl = ctx->device->pipeline_topk_v2_qsa[pass];
+            ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pl,
+                { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
+                  ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
+                  scratch_buf }, pc2, elements2);
+            if (pass < 5) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+        }
+        ctx->prealloc_x_need_sync = true;
+        return;
     }
 
     vk_op_topk_radix_push_constants pc { n_kv, width, nrows, n_tps, n_blocks, n_stream, sb_blk, sb_tps, n_sel };
@@ -19073,7 +19234,7 @@ static const bool vk_fusion_diag = getenv("GGML_VK_FUSION_DIAG") != nullptr;
 
 // True if the qwen4 QSA indexer top-k can be fused at node_idx (the get_rows).
 static bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
-    if (ctx->device->disable_fusion || !ctx->device->pipeline_topk_radix_qsa) {
+    if (ctx->device->disable_fusion || (!ctx->device->pipeline_topk_radix_qsa && !ctx->device->qsa_topk_v2)) {
         return false;
     }
 
@@ -20331,7 +20492,7 @@ static void ggml_vk_qsa_scratch_hint(ggml_backend_vk_context * ctx, const struct
         }
         saw_op = true;
         ctx->prealloc_size_qsa_hint = std::max(ctx->prealloc_size_qsa_hint,
-                                               ggml_vk_qsa_top_k_scratch_size(graph->nodes[i]));
+                                               ggml_vk_qsa_top_k_scratch_size(ctx->device, graph->nodes[i]));
     }
     if (saw_op) {
         // the two forms never coexist in one graph (the knob is read once per graph build), so a
@@ -20350,7 +20511,7 @@ static void ggml_vk_qsa_scratch_hint(ggml_backend_vk_context * ctx, const struct
             continue;
         }
         ctx->prealloc_size_qsa_hint = std::max(ctx->prealloc_size_qsa_hint,
-                                               ggml_vk_topk_qsa_scratch_size(graph, i));
+                                               ggml_vk_topk_qsa_scratch_size(ctx->device, graph, i));
         i += n_ops - 1;
     }
 }
@@ -21460,7 +21621,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return n_blocks <= n_kv && ggml_get_op_params_i32(op, 1) > 0 &&
                            device->pipeline_topk_radix_qsa_blocks != nullptr;
                 }
-                return device->pipeline_topk_radix_qsa != nullptr;
+                // [TAG_QSA_TOPK_V2] the cell form: either kernel; the dispatch picks v2 when the device enabled it
+                return device->pipeline_topk_radix_qsa != nullptr || device->qsa_topk_v2;
             }
         case GGML_OP_QSA_BIAS:
             {

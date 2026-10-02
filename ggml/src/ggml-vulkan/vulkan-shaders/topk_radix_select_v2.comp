@@ -1,0 +1,384 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+#include "types.glsl"
+
+// [TAG_QSA_TOPK_V2] The QSA indexer selection (GGML_OP_QSA_TOP_K and the topk_qsa fusion) as a
+// DISTRIBUTED radix select. topk_radix_select.comp (v1) runs one workgroup per query row over all
+// n_kv cells; this splits every row into tiles of WG*CPT cells and runs one workgroup per
+// (row, tile), so a decode/verify dispatch (1..6 rows) fills the GPU instead of 1..6 CUs.
+//
+// Output contract - byte-identical to v1 for every input, ids AND order:
+//   key(x)  = the order-preserving float->uint map with -0.0 folded onto +0.0 (f2ui, as in v1)
+//   T       = the k-th largest key of the row (radix-selected 8 bits at a time, top byte first)
+//   ids     = every cell with key > T, ascending, then the lowest-id cells with key == T,
+//             ascending, until k ids are out.
+// v1 builds T with the same four 8-bit histograms and the same top-down bucket rule, then emits
+// the two classes in ascending cell order; this file reproduces both exactly, only distributed.
+//
+// One shader, six pipelines (PASS), one dispatch each, a full pipeline barrier between them:
+//   0..3  histogram round PASS of digit (key >> (24 - 8*PASS)) & 255 over the cells whose top
+//         8*PASS bits equal the threshold prefix so far. Round 0 also fuses the gather
+//         (score[cell_blk[i]] + mask[i], v1's arithmetic) + key conversion and stores the keys.
+//         Each tile counts into wave-private LDS histograms, then adds its non-zero bins into
+//         the row's global histogram with device atomics (integer sums: order-independent, so
+//         exact). Rounds 1..3 also write the tile record (gt, cand): cells strictly above the
+//         prefix so far / cells still matching it. A tile with cand == 0 is final - (gt, 0) is
+//         its (above, equal) - and every later pass skips it.
+//   4     count: tiles with cand > 0 recount (above, equal) against the full threshold T.
+//   5     emit: exclusive prefix of (above, equal) over the row's earlier tiles, then a
+//         coalesced, ballot-ranked walk of the tile in ascending cell order.
+// The global histograms are zeroed by the host (vkCmdFillBuffer) before pass 0. There is no
+// separate reduction dispatch: every workgroup of pass r re-derives (prefix, desired) from the
+// r finished global histograms (256 bins each, one load per invocation) - the same integer
+// counts give every workgroup the same answer.
+//
+// Subgroup use is size-correct for wave32 and wave64: the pipeline requires full subgroups of
+// size 256/NWAVES, and every scan is ordered by (gl_SubgroupID, gl_SubgroupInvocationID), never
+// by gl_LocalInvocationID, so no particular invocation->subgroup mapping is assumed.
+
+#define RADIX 256u
+#define WG    256u
+
+layout(constant_id = 0) const uint PASS   = 0;  // 0..3 histogram round, 4 count, 5 emit
+layout(constant_id = 1) const uint NWAVES = 8;  // WG / subgroup size (the pipeline requires that size)
+layout(constant_id = 2) const uint CPT    = 8;  // cells per invocation per tile: tile = WG*CPT cells
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer A  {float     data_a[];};   // QSA block scores (strides in sb_blk/sb_tps)
+layout (binding = 1) writeonly buffer D  {int       data_d[];};   // [k, nrows] selected cell ids
+layout (binding = 2) readonly  buffer CB {int       cell_blk[];}; // cell->block map [n_kv, n_stream]
+layout (binding = 3) readonly  buffer M  {float16_t mask[];};     // raw f16 kq_mask [n_kv, n_tps, n_stream]
+// keys [nrows, ncols] at 0 | global histograms [nrows, 4, 256] at hist_off | tile records
+// [nrows, n_tiles, 2] at rec_off (uint offsets). Only ever read across a dispatch boundary.
+layout (binding = 4) buffer S {uint scratch[];};
+
+layout (push_constant) uniform parameter {
+    uint ncols;
+    uint k;
+    uint nrows;
+    uint n_tps;
+    uint n_blocks;
+    uint n_stream;
+    uint sb_blk;
+    uint sb_tps;
+    uint n_tiles;
+    uint hist_off;
+    uint rec_off;
+} p;
+
+shared uint wh[NWAVES * RADIX];  // wave-private histograms (PASS 0..3)
+shared uint sh_scan[NWAVES];     // resolve(): per-wave partial sums
+shared uint sh_bucket;
+shared uint sh_above;
+shared uint sh_red[6][NWAVES];   // [0..1] tile reductions, [2..5] emit's double-buffered chunk counts
+
+// v1's f2ui, unchanged: -0.0 folds onto +0.0, then the usual sign flip
+uint f2ui(float x) {
+    uint y = floatBitsToUint(x);
+    if (y == 0x80000000u) {
+        y = 0u;
+    }
+    if ((y & 0x80000000u) != 0u) {
+        y ^= 0xFFFFFFFFu;
+    } else {
+        y |= 0x80000000u;
+    }
+    return y;
+}
+
+// v1's gather, unchanged: score[cell_blk[i,s], t, s] + mask[i,t,s], one f32 add
+float gather(uint row, uint i) {
+    const uint t = row % p.n_tps;
+    const uint s = row / p.n_tps;
+    const uint block = uint(cell_blk[s * p.ncols + i]);
+    const float a = data_a[s * p.n_blocks * p.n_tps + block * p.sb_blk + t * p.sb_tps];
+    const float m = float(mask[(s * p.n_tps + t) * p.ncols + i]);
+    return a + m;
+}
+
+// (prefix, desired) of `row` after its first `nr` radix rounds, from the finished global
+// histograms. v1's bucket rule: scanning bins top-down, the first bin b whose running count
+// reaches `desired`; i.e. the unique b with S(b) >= desired > S(b) - h(b), S(b) = sum_{b'>=b} h.
+// `lin` is bin b. Two barriers per round; nr is PASS-derived, so the loop is uniform.
+uvec2 resolve(const uint row, const uint nr, const uint lin) {
+    uint prefix  = 0;
+    uint desired = p.k;
+    uint h[4];
+    [[unroll]] for (uint r = 0; r < 4; ++r) {
+        h[r] = r < nr ? scratch[p.hist_off + (row * 4u + r) * RADIX + lin] : 0u;
+    }
+    [[unroll]] for (uint r = 0; r < 4; ++r) {
+        if (r < nr) {
+            const uint hv   = h[r];
+            const uint incl = subgroupInclusiveAdd(hv);
+            if (gl_SubgroupInvocationID == gl_SubgroupSize - 1) {
+                sh_scan[gl_SubgroupID] = incl;
+            }
+            barrier();
+            uint below = 0;
+            uint total = 0;
+            [[unroll]] for (uint w = 0; w < NWAVES; ++w) {
+                const uint v = sh_scan[w];
+                below += w < gl_SubgroupID ? v : 0u;
+                total += v;
+            }
+            const uint suffix = total - (below + incl) + hv;
+            if (suffix >= desired && suffix - hv < desired) {
+                sh_bucket = lin;
+                sh_above  = suffix - hv;
+            }
+            // unreachable while k <= ncols (round 0 counts every cell, round r the chosen bucket
+            // of round r-1); mirrors v1's fall-through (bucket 0, everything counted as above)
+            if (lin == 0 && total < desired) {
+                sh_bucket = 0;
+                sh_above  = total;
+            }
+            barrier();
+            prefix  |= sh_bucket << (24u - 8u * r);
+            desired -= sh_above;
+        }
+    }
+    return uvec2(prefix, desired);
+}
+
+void hist_pass(const uint row, const uint tile, const uint lin) {
+    const uint rec = p.rec_off + (row * p.n_tiles + tile) * 2u;
+    // round 1 has no record to read (round 0 writes none: every tile holds a cell)
+    if (PASS >= 2 && scratch[rec + 1u] == 0u) {
+        return; // no cell of this tile matches the prefix any more: its (gt, 0) is final
+    }
+    const uint wid = gl_SubgroupID;
+    [[unroll]] for (uint w = 0; w < NWAVES; ++w) {
+        wh[w * RADIX + lin] = 0u;
+    }
+    // resolve()'s barriers also publish the zeroed histograms; round 0 has none
+    const uvec2 st = resolve(row, PASS, lin);
+    if (PASS == 0) {
+        barrier();
+    }
+
+    const uint shift   = 24u - 8u * PASS;
+    const uint hi_mask = PASS == 0 ? 0u : (0xFFFFFFFFu << (shift + 8u));
+    const uint ph      = st.x & hi_mask;
+    const uint keys    = row * p.ncols;
+    const uint base    = tile * (WG * CPT);
+
+    uint gt   = 0;
+    uint cand = 0;
+    [[unroll]] for (uint c = 0; c < CPT; ++c) {
+        const uint i     = base + c * WG + lin;
+        const bool valid = i < p.ncols;
+        uint key = 0;
+        if (valid) {
+            if (PASS == 0) {
+                key = f2ui(gather(row, i));
+                scratch[keys + i] = key;
+            } else {
+                key = scratch[keys + i];
+            }
+        }
+        const uint top = key & hi_mask;
+        gt += (valid && top > ph) ? 1u : 0u;
+        if (valid && top == ph) {
+            cand++;
+            const uint d = (key >> shift) & (RADIX - 1u);
+            // equal-digit aggregation: the lanes sharing the first active lane's digit add once.
+            // Concentrated digits (the top byte of similar scores, masked cells, ties) are the
+            // contended case of v1's single LDS histogram; spread digits take the plain atomic.
+            const uint ld = subgroupBroadcastFirst(d);
+            if (d == ld) {
+                const uint n = subgroupBallotBitCount(subgroupBallot(true));
+                if (subgroupElect()) {
+                    atomicAdd(wh[wid * RADIX + d], n);
+                }
+            } else {
+                atomicAdd(wh[wid * RADIX + d], 1u);
+            }
+        }
+    }
+
+    gt   = subgroupAdd(gt);
+    cand = subgroupAdd(cand);
+    if (subgroupElect()) {
+        sh_red[0][wid] = gt;
+        sh_red[1][wid] = cand;
+    }
+    barrier();
+
+    uint sum = 0;
+    [[unroll]] for (uint w = 0; w < NWAVES; ++w) {
+        sum += wh[w * RADIX + lin];
+    }
+    if (sum != 0u) {
+        atomicAdd(scratch[p.hist_off + (row * 4u + PASS) * RADIX + lin], sum);
+    }
+    if (PASS >= 1 && lin == 0) {
+        uint g = 0;
+        uint n = 0;
+        [[unroll]] for (uint w = 0; w < NWAVES; ++w) {
+            g += sh_red[0][w];
+            n += sh_red[1][w];
+        }
+        scratch[rec]      = g;
+        scratch[rec + 1u] = n;
+    }
+}
+
+void count_pass(const uint row, const uint tile, const uint lin) {
+    const uint rec = p.rec_off + (row * p.n_tiles + tile) * 2u;
+    if (scratch[rec + 1u] == 0u) {
+        return; // resolved in an earlier round: (gt, 0) already is (above, equal)
+    }
+    const uvec2 st   = resolve(row, 4, lin);
+    const uint  T    = st.x;
+    const uint  keys = row * p.ncols;
+    const uint  base = tile * (WG * CPT);
+    const uint  wid  = gl_SubgroupID;
+
+    uint a = 0;
+    uint e = 0;
+    [[unroll]] for (uint c = 0; c < CPT; ++c) {
+        const uint i = base + c * WG + lin;
+        if (i < p.ncols) {
+            const uint key = scratch[keys + i];
+            a += key >  T ? 1u : 0u;
+            e += key == T ? 1u : 0u;
+        }
+    }
+    a = subgroupAdd(a);
+    e = subgroupAdd(e);
+    if (subgroupElect()) {
+        sh_red[0][wid] = a;
+        sh_red[1][wid] = e;
+    }
+    barrier();
+    if (lin == 0) {
+        uint sa = 0;
+        uint se = 0;
+        [[unroll]] for (uint w = 0; w < NWAVES; ++w) {
+            sa += sh_red[0][w];
+            se += sh_red[1][w];
+        }
+        scratch[rec]      = sa;
+        scratch[rec + 1u] = se;
+    }
+}
+
+void emit_pass(const uint row, const uint tile, const uint lin) {
+    const uint rec_row = p.rec_off + row * p.n_tiles * 2u;
+    const uint my_a    = scratch[rec_row + tile * 2u];
+    const uint my_e    = scratch[rec_row + tile * 2u + 1u];
+    if (my_a == 0u && my_e == 0u) {
+        return; // nothing of this tile is selected
+    }
+    const uvec2 st      = resolve(row, 4, lin);
+    const uint  T       = st.x;
+    const uint  desired = st.y;           // equal-to-T ids the row still takes
+    const uint  n_above = p.k - desired;  // ids strictly above T, all taken
+    const uint  wid     = gl_SubgroupID;
+
+    // exclusive prefix of the two classes over the row's earlier tiles
+    uint sa = 0;
+    uint se = 0;
+    for (uint t = lin; t < tile; t += WG) {
+        sa += scratch[rec_row + t * 2u];
+        se += scratch[rec_row + t * 2u + 1u];
+    }
+    sa = subgroupAdd(sa);
+    se = subgroupAdd(se);
+    if (subgroupElect()) {
+        sh_red[0][wid] = sa;
+        sh_red[1][wid] = se;
+    }
+    barrier();
+    uint A = 0;
+    uint E = 0;
+    [[unroll]] for (uint w = 0; w < NWAVES; ++w) {
+        A += sh_red[0][w];
+        E += sh_red[1][w];
+    }
+    if (my_a == 0u && E >= desired) {
+        return; // only ties here, and lower ids already filled the tie slots
+    }
+
+    const uint keys    = row * p.ncols;
+    const uint base    = tile * (WG * CPT);
+    const uint row_out = row * p.k;
+    uint runA = 0;
+    uint runE = 0;
+    [[unroll]] for (uint c = 0; c < CPT; ++c) {
+        // uniform: every selected cell of this tile is out
+        if (runA >= my_a && (runE >= my_e || E + runE >= desired)) {
+            break;
+        }
+        const uint  i     = base + c * WG + lin;
+        const bool  valid = i < p.ncols;
+        const uint  key   = valid ? scratch[keys + i] : 0u;
+        const bool  isA   = valid && key >  T;
+        const bool  isE   = valid && key == T;
+        const uvec4 bA    = subgroupBallot(isA);
+        const uvec4 bE    = subgroupBallot(isE);
+        const uint  cA    = subgroupBallotBitCount(bA);
+        const uint  cE    = subgroupBallotBitCount(bE);
+        const uint  rA    = subgroupBallotExclusiveBitCount(bA);
+        const uint  rE    = subgroupBallotExclusiveBitCount(bE);
+        // double-buffered by chunk parity: one barrier per chunk (a slow invocation still reading
+        // chunk c's counts is past chunk c+1's barrier before chunk c+2 rewrites them)
+        const uint q = 2u + 2u * (c & 1u);
+        if (subgroupElect()) {
+            sh_red[q][wid]      = cA;
+            sh_red[q + 1u][wid] = cE;
+        }
+        barrier();
+        uint offA = 0;
+        uint offE = 0;
+        uint totA = 0;
+        uint totE = 0;
+        [[unroll]] for (uint w = 0; w < NWAVES; ++w) {
+            const uint vA = sh_red[q][w];
+            const uint vE = sh_red[q + 1u][w];
+            offA += w < wid ? vA : 0u;
+            offE += w < wid ? vE : 0u;
+            totA += vA;
+            totE += vE;
+        }
+        if (isA) {
+            // the counts guarantee pos < n_above; the test keeps a hypothetical miscount inside
+            // this row instead of overwriting the next one (as v1)
+            const uint pos = A + runA + offA + rA;
+            if (pos < n_above) {
+                data_d[row_out + pos] = int(i);
+            }
+        }
+        if (isE) {
+            const uint pos = E + runE + offE + rE;
+            if (pos < desired) {
+                data_d[row_out + n_above + pos] = int(i);
+            }
+        }
+        runA += totA;
+        runE += totE;
+    }
+}
+
+void main() {
+    const uint lin  = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+    const uint tile = gl_WorkGroupID.y;
+    for (uint row = gl_WorkGroupID.x; row < p.nrows; row += gl_NumWorkGroups.x) {
+        if (PASS <= 3) {
+            hist_pass(row, tile, lin);
+        } else if (PASS == 4) {
+            count_pass(row, tile, lin);
+        } else {
+            emit_pass(row, tile, lin);
+        }
+        barrier(); // the next row reuses the LDS
+    }
+}
