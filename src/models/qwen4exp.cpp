@@ -1756,6 +1756,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
         score = ggml_add(ctx0, score, bias);
     }
 
+    // [TAG_QSA_WHOLE_BLOCKS] LLAMA_QSA_WHOLE_BLOCKS=1: the reference's block-level selection, always as the one node
+    // (fused select or not): the indexer_top_k/r best eligible blocks whole plus the boosted tail, ascending, the row
+    // padded with a repeat of its last id - so a query attends to 2048 + t cells, t = (q+1) mod r, where the cell
+    // form attends to 2051 (D1), and a block is never split at a tie (D2). The block form needs the per-block bias
+    // (a census-shaped score); the per-cell bias path (alibi / non-causal) keeps the cell form. The Vulkan shader
+    // binds an f16 mask; an f32 mask (no flash attention) runs the op on the CPU.
+    if (blk_bias && llama_qsa_whole_blocks()) {
+        GGML_ASSERT(kq_mask->ne[2] == 1 && hparams.indexer_top_k % inp->ratio == 0);
+        ggml_tensor * top_k = ggml_qsa_top_k_blocks(ctx0, score, inp->cell_blk, kq_mask, (int) width,
+                (int) (hparams.indexer_top_k / inp->ratio));
+        cb(top_k, "indexer_top_k", il);
+
+        return top_k;
+    }
+    if (!blk_bias && llama_qsa_whole_blocks()) {
+        static std::atomic<bool> warned { false };
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_WHOLE_BLOCKS=1 needs the per-block bias (causal, non-alibi, a full mask): "
+                           "this graph keeps the cell selection; warned once\n", __func__);
+        }
+    }
+
     // [TAG_QSA_FUSED_SELECT] the single-node form. Gated on exactly what the Vulkan topk_qsa
     // pattern needs (blk_bias, i.e. the per-block bias and a matching mask, and an f16 mask - the
     // shader's binding 3 is float16_t and the pattern likewise only matches through ggml_cast), so
@@ -2127,6 +2149,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
     } else {
         mask = ggml_get_rows(ctx0, mask_cells, idx_query);
         mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q), GGML_TYPE_F16);
+    }
+
+    // [TAG_QSA_WHOLE_BLOCKS] the block-level selection pads a row with a repeat of its last id
+    // (ggml_qsa_top_k_blocks). The scan's set_rows writes the same 0 twice, but a gathered window would
+    // count the cell twice, so mask every slot j > 0 whose id equals id[j - 1]: selected ids are distinct,
+    // so only padding repeats (and a cell-form row, distinct ids in any order, is left alone).
+    // pad = 1 - step(|id[j] - id[j-1]|), as a bias step*BIG - BIG = 0 or -BIG, -BIG -> -inf in f16.
+    if (llama_qsa_whole_blocks() && width > 1) {
+        const float big = 1e30f;
+
+        ggml_tensor * ids_f = ggml_cast(ctx0, idx_query, GGML_TYPE_F32); // [width, n_q, 1]; ids < 2^24, exact
+        ggml_tensor * cur_i = ggml_view_2d(ctx0, ids_f, width - 1, n_q, ids_f->nb[1], ids_f->nb[0]);
+        ggml_tensor * prv_i = ggml_view_2d(ctx0, ids_f, width - 1, n_q, ids_f->nb[1], 0);
+
+        ggml_tensor * pad = ggml_step(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, cur_i, prv_i)));  // [width - 1, n_q]
+        pad = ggml_scale_bias(ctx0, pad, big, -big);
+
+        // slot 0 is never padding
+        ggml_tensor * slot0 = ggml_scale(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, ids_f, 1, n_q, ids_f->nb[1], 0)), 0.0f);
+        pad = ggml_concat(ctx0, slot0, pad, 0);                                               // [width, n_q]
+
+        mask = ggml_add(ctx0, mask, ggml_cast(ctx0, ggml_reshape_4d(ctx0, pad, width, 1, 1, n_q), GGML_TYPE_F16));
     }
     cb(mask, "qsa_mask_sel", il);
 

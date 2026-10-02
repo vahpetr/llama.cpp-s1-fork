@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,38 @@
 static bool llama_qsa_pooled_cache_env() {
     const char * s = getenv("LLAMA_QSA_POOLED_CACHE");
     return s != nullptr && atoi(s) != 0;
+}
+
+// [TAG_QSA_WHOLE_BLOCKS] LLAMA_QSA_WHOLE_BLOCKS (see the header)
+int llama_qsa_whole_blocks_parse(const char * s) {
+    if (s == nullptr || s[0] == '\0' || strcmp(s, "0") == 0) {
+        return 0;
+    }
+    if (strcmp(s, "1") == 0) {
+        return 1;
+    }
+    return -1;
+}
+
+bool llama_qsa_whole_blocks() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_WHOLE_BLOCKS");
+        const int    v = llama_qsa_whole_blocks_parse(s);
+        if (v < 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_WHOLE_BLOCKS=%s is neither 0 nor 1: using 0\n", __func__, s);
+        }
+        if (v == 1) {
+            LLAMA_LOG_INFO("%s: qsa_select = whole_blocks (LLAMA_QSA_WHOLE_BLOCKS=1): per query the indexer_top_k/r best "
+                           "whole blocks + the (q+1) mod r tail cells, as the reference (ggml_qsa_top_k_blocks; padding = a "
+                           "repeat of the last id, masked in the gathered window)\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: qsa_select = cells (LLAMA_QSA_WHOLE_BLOCKS=%s): per query the top indexer_top_k + r - 1 cells\n",
+                           __func__, s != nullptr ? s : "unset");
+        }
+        return v == 1;
+    }();
+
+    return enabled;
 }
 
 // [TAG_QSA_COMPACT_BIAS] LLAMA_QSA_COMPACT_BIAS=1: read once per memory, like LLAMA_QSA_POOLED_CACHE, so the replay
@@ -172,6 +205,11 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
+    // [TAG_QSA_WHOLE_BLOCKS] read (and prove) the selection form at load
+    if (mem_idx) {
+        (void) llama_qsa_whole_blocks();
+    }
+
     // [TAG_QSA_COMPACT_BIAS] the query table carries 1 << seq_id in 32 bits
     if (mem_idx && llama_qsa_compact_bias_env()) {
         if (n_seq_max <= 32) {
@@ -1004,6 +1042,59 @@ void llama_memory_hybrid_idx_context::qsa_census(
         }
 
         cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+    }
+
+    // [TAG_QSA_WHOLE_BLOCKS] D6 (docs/verification/2026-10-03-indexer-reference-notes.md): the spare id above is
+    // boosted for EVERY query, so every unpooled visible cell is selected outside the block budget - right for the
+    // tail (the newest incomplete group of a sequence), wrong for a FRAGMENT: an incomplete group in an older bucket
+    // (a block straddling a seq_cp fork point, a position hole), which the reference never forms because it groups
+    // each query's own visible list. In the whole-block form the budget is the reference's (n_sel blocks + the
+    // tail), so a fragment - an unpooled cell that is the tail of NONE of its sequences - goes to a second unused
+    // id, which both bias fills score -inf (b > n_bid). A cell that is the tail of one of its sequences and a
+    // fragment for another keeps the boost (a per-block bias cannot tell the two queries apart; <= r - 1 cells per
+    // such group); so does every fragment when no second unused id exists (n_bid + 1 == n_blocks: the cache is full
+    // to the last block). With one sequence and no position holes there is no fragment and nothing changes.
+    if (llama_qsa_whole_blocks() && n_bid < n_blocks) {
+        const int64_t newest_rank = ranked ? (int64_t) order.size() - 1 : -1;
+
+        int64_t n_unrouted = 0;
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (blk_of[j] >= 0 || cells.is_empty(j)) {
+                continue;
+            }
+
+            const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+
+            bool tail_of_some = false;
+            if (ranked) {
+                tail_of_some = idx/r == newest_rank/r;
+            } else {
+                const auto & set = cells.seq_set((uint32_t) j);
+                for (int32_t sq = 0; sq < LLAMA_MAX_SEQ && !tail_of_some; ++sq) {
+                    tail_of_some = set.test(sq) && idx/r == (int64_t) cells.seq_pos_max(sq)/r;
+                }
+            }
+
+            if (tail_of_some) {
+                continue;
+            }
+
+            if (n_bid + 1 < n_blocks) {
+                cur_cell_blk[j] = n_bid + 1;
+            } else {
+                n_unrouted++;
+            }
+        }
+
+        if (n_unrouted > 0) {
+            static std::atomic<bool> warned { false };
+            if (!warned.exchange(true)) {
+                LLAMA_LOG_WARN("%s: LLAMA_QSA_WHOLE_BLOCKS=1: %" PRId64 " fragment cell(s) keep the tail boost: no second "
+                               "unused block id (n_bid %d + 1 == n_blocks %" PRId64 "); warned once\n",
+                               __func__, n_unrouted, n_bid, n_blocks);
+            }
+        }
     }
 }
 

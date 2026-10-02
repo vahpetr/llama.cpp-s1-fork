@@ -2456,6 +2456,28 @@ extern "C" {
             struct ggml_tensor  * mask,
             int                   k);
 
+    // [TAG_QSA_WHOLE_BLOCKS] the same node in the reference's BLOCK-level form (HF Qwen4ExpTextQSAIndexer: the
+    // top block_topk whole blocks plus the incomplete tail) instead of the k largest cells. op_params[0] = 1,
+    // op_params[1] = n_sel. Per row (t, s), with value(i) = score[cell_blk[i, s], t, s] + mask[i, t, s] as above:
+    //   tail cells      T = { i : value(i) finite and >= GGML_QSA_TAIL_MIN }   (the qwen4exp census boosts the tail +1e9)
+    //   eligible blocks E = { b : score[b, t, s] finite and < GGML_QSA_TAIL_MIN }
+    //   S = the min(n_sel, |E|) blocks of E with the largest score, equal scores to the LOWER block index (the
+    //       reference's torch.topk leaves its tie order unspecified; this one is deterministic)
+    //   selected = T  u  { i : cell_blk[i, s] in S and mask[i, t, s] > -inf }
+    // The selected ids are written in ASCENDING order (truncated to k if there are more), and every remaining slot
+    // repeats the last id written: a padding slot is a duplicate of a selected cell. A mask built with set_rows (the
+    // scan) is unaffected by it; a gathered window must mask it itself - slot j > 0 is padding iff id[j] == id[j-1].
+    // A row that selects nothing holds 0, 1, ..., k-1 (the cell form's answer for an all -inf row).
+    // Requires n_blocks <= n_kv. The order is canonical, so the backends must agree element for element.
+    #define GGML_QSA_TAIL_MIN 5.0e8f
+    GGML_API struct ggml_tensor * ggml_qsa_top_k_blocks(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * cell_blk,
+            struct ggml_tensor  * mask,
+            int                   k,
+            int                   n_sel);
+
     // [TAG_KQ_VIS] the KQ mask computed from metadata (visibility from metadata, Phase 3): the value
     // llama_kv_cache::set_input_kq_mask writes, as a pure function of 16 B per KV cell and 16 B per token.
     //

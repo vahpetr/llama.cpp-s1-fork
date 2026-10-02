@@ -8962,6 +8962,10 @@ void ggml_compute_forward_top_k(
 //
 // The scored row is never materialized for the whole graph: one row per thread at a time, in
 // wdata. That is the memory the op exists to save, so the reference must not re-introduce it.
+//
+// [TAG_QSA_WHOLE_BLOCKS] op_params[0] == 1 (ggml_qsa_top_k_blocks) is the reference's block-level form:
+// the n_sel best eligible blocks whole plus the boosted tail, ascending, padded with a repeat of the
+// last id (the contract is in ggml.h). Its order IS canonical, so no swap there.
 static void ggml_compute_forward_qsa_top_k_f32(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
@@ -8997,6 +9001,12 @@ static void ggml_compute_forward_qsa_top_k_f32(
 
     const bool mask_f16 = mask->type == GGML_TYPE_F16;
 
+    // [TAG_QSA_WHOLE_BLOCKS] op_params[0] == 1: the block-level form (ggml_qsa_top_k_blocks)
+    const bool    whole = ggml_get_op_params_i32(dst, 0) == 1;
+    const int64_t n_sel = whole ? ggml_get_op_params_i32(dst, 1) : 0;
+
+    GGML_ASSERT(!whole || (n_sel > 0 && n_blocks <= n_kv));
+
     for (int64_t row = ith; row < nrows; row += nth) {
         const int64_t t = row % n_tps;
         const int64_t s = row / n_tps;
@@ -9004,6 +9014,45 @@ static void ggml_compute_forward_qsa_top_k_f32(
         const float   * sc = (const float *)   ((const char *) score->data    + s*score->nb[2] + t*score->nb[1]);
         const int32_t * cb = (const int32_t *) ((const char *) cell_blk->data + s*cell_blk->nb[1]);
         const char    * mk = (const char *)    mask->data + (size_t) row*n_kv*ggml_type_size(mask->type);
+
+        if (whole) {
+            // the eligible blocks (finite, below the tail boost), ranked by the same total order as the cell
+            // form - score descending, block index ascending - and the first n_sel of them flagged in val[]
+            // (n_blocks <= n_kv, so both scratch rows hold a block-long array)
+            int64_t n_el = 0;
+            for (int64_t b = 0; b < n_blocks; b++) {
+                const float v = sc[b];
+                val[b] = 0.0f;
+                if (std::isfinite(v) && v < GGML_QSA_TAIL_MIN) {
+                    idx[n_el++] = (int32_t) b;
+                }
+            }
+            const int64_t n_take = std::min(n_sel, n_el);
+            std::partial_sort(idx, idx + n_take, idx + n_el, cmp_top_k{sc});
+            for (int64_t j = 0; j < n_take; j++) {
+                val[idx[j]] = 1.0f;
+            }
+
+            // the cells: the tail (boosted, visible) and the visible cells of the selected blocks, ascending
+            int32_t * dst_data = (int32_t *) ((char *) dst->data + row*dst->nb[1]);
+            int64_t   c        = 0;
+            for (int64_t i = 0; i < n_kv && c < k; i++) {
+                const int32_t b = cb[i];
+                GGML_ASSERT(b >= 0 && b < n_blocks);
+                const float m = mask_f16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mk)[i])
+                                         : ((const float *) mk)[i];
+                const float v = sc[b] + m;
+                const bool tail = std::isfinite(v) && v >= GGML_QSA_TAIL_MIN;
+                if (tail || (val[b] != 0.0f && m > -INFINITY)) {
+                    dst_data[c++] = (int32_t) i;
+                }
+            }
+            // padding: a repeat of the last selected id, or 0..k-1 when nothing was selected
+            for (int64_t j = c; j < k; j++) {
+                dst_data[j] = c > 0 ? dst_data[c - 1] : (int32_t) j;
+            }
+            continue;
+        }
 
         for (int64_t i = 0; i < n_kv; i++) {
             const int32_t b = cb[i];

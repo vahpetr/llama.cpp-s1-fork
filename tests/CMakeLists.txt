@@ -160,6 +160,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
     llama_build_and_test(test-kq-mask-meta.cpp) # [TAG_KQ_VIS] uses internal llama_kv_cells / fill functions
+    llama_build_and_test(test-qsa-select.cpp) # [TAG_QSA_WHOLE_BLOCKS] QSA_TOP_K both forms vs the HF reference port; the knob parser
     llama_build(test-kq-vis-fill-bench.cpp)     # [TAG_KQVIS_PROF] CPU microbench of the KQ mask vs metadata fills (not a ctest)
     llama_build_and_test(test-kq-vis-fill-equiv.cpp) # [TAG_KQ_VIS_FILL] randomized fill equivalence vs the pre-P3-F1 fill
     target_compile_definitions(test-kq-vis-fill-equiv PRIVATE LLAMA_KV_CELLS_H_PATH="${PROJECT_SOURCE_DIR}/src/llama-kv-cells.h") # its rebase tripwire

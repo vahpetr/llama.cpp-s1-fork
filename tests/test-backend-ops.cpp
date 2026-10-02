@@ -29,6 +29,8 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 
+#include "qsa-select-ref.h" // [TAG_QSA_WHOLE_BLOCKS] census-shaped QSA selection inputs
+
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -6701,6 +6703,46 @@ struct test_top_k : public test_case {
 // `width` is only read by ties == 4, which needs to place its -inf cutoff below the selection width.
 static void qsa_select_init_tensors(ggml_context * ctx, int64_t n_blocks, int64_t n_kv, int64_t n_tps,
                                     int64_t n_stream, bool blocked, int ties, int width) {
+    // [TAG_QSA_WHOLE_BLOCKS] ties == 5: a census-shaped selection (tests/qsa-select-ref.h) - one sequence in
+    // permuted cells, the +1e9 tail boost on the tail block and the spare dead id, -inf ids past it, a causal 0/-inf
+    // mask, ReLU-style tied block scores, stream 0 a full cache - i.e. the inputs the deployed census produces,
+    // which the whole-block form's tail / eligibility rules read. n_blocks must be ceil(n_kv / 4).
+    if (ties == 5) {
+        GGML_ASSERT(n_blocks == (n_kv + 3)/4);
+        const qsa_census_case c = qsa_census_make(n_kv, n_tps, n_stream, (uint32_t) (n_kv*31 + n_tps*7 + n_stream), false);
+        int seen = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            const char * name = ggml_get_name(t);
+            if (strcmp(name, "cell_blk") == 0) {
+                seen++;
+                ggml_backend_tensor_set(t, c.cell_blk.data(), 0, c.cell_blk.size()*sizeof(int32_t));
+            } else if (strcmp(name, "score") == 0) {
+                seen++;
+                ggml_backend_tensor_set(t, c.score.data(), 0, c.score.size()*sizeof(float));
+            } else if (strcmp(name, "kq_mask") == 0) {
+                seen++;
+                if (t->type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> h(c.mask.size());
+                    for (size_t i = 0; i < h.size(); ++i) {
+                        h[i] = ggml_fp32_to_fp16(c.mask[i]);
+                    }
+                    ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+                } else {
+                    ggml_backend_tensor_set(t, c.mask.data(), 0, c.mask.size()*sizeof(float));
+                }
+            } else {
+                init_tensor_uniform(t, 0.0f, 0.5f);
+            }
+        }
+        GGML_ASSERT(seen == 3);
+        GGML_UNUSED(blocked);
+        GGML_UNUSED(width);
+        return;
+    }
+
     GGML_UNUSED(n_stream);
     const int64_t r = (n_kv + n_blocks - 1)/n_blocks;
     // The three inputs are found BY NAME, so a rename in either build_graph would silently fall
@@ -6911,15 +6953,22 @@ struct test_qsa_top_k : public test_case {
     // branch of the CPU reference. The Vulkan shader binds a float16_t mask, so an f32 case is
     // expected to report "not supported" there rather than to run.
     const ggml_type mask_type;
+    // [TAG_QSA_WHOLE_BLOCKS] 0 = the cell form (ggml_qsa_top_k); > 0 = ggml_qsa_top_k_blocks with n_sel whole
+    // blocks. Its ids are in a canonical order (ascending, padded with a repeat of the last), so the rows are
+    // compared element for element - including the padding, which a set comparison would call a repeated id.
+    const int       n_sel;
 
     std::string vars() override {
-        return VARS_TO_STR8(n_blocks, n_kv, n_tps, n_stream, width, blocked, ties, mask_type);
+        // n_sel only when set, so the cell-form cases keep their names
+        return n_sel > 0 ? VARS_TO_STR9(n_blocks, n_kv, n_tps, n_stream, width, blocked, ties, mask_type, n_sel)
+                         : VARS_TO_STR8(n_blocks, n_kv, n_tps, n_stream, width, blocked, ties, mask_type);
     }
 
     test_qsa_top_k(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1,
-                   int width = 1500, bool blocked = false, int ties = 0, ggml_type mask_type = GGML_TYPE_F16)
+                   int width = 1500, bool blocked = false, int ties = 0, ggml_type mask_type = GGML_TYPE_F16,
+                   int n_sel = 0)
         : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), blocked(blocked),
-          ties(ties), mask_type(mask_type) {
+          ties(ties), mask_type(mask_type), n_sel(n_sel) {
         GGML_ASSERT(ties == 0 || blocked);
     }
 
@@ -6936,7 +6985,8 @@ struct test_qsa_top_k : public test_case {
         ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, mask_type, n_kv, n_tps, 1, n_stream);
         ggml_set_name(kq_mask, "kq_mask");
 
-        ggml_tensor * out = ggml_qsa_top_k(ctx, score, cell_blk, kq_mask, width);
+        ggml_tensor * out = n_sel > 0 ? ggml_qsa_top_k_blocks(ctx, score, cell_blk, kq_mask, width, n_sel)
+                                      : ggml_qsa_top_k(ctx, score, cell_blk, kq_mask, width);
         ggml_set_name(out, "out");
 
         return out;
@@ -6949,7 +6999,16 @@ struct test_qsa_top_k : public test_case {
     // top-k output order is unspecified; compare each ROW as a set of indices, and require that
     // each row is a selection out of its own n_kv cells (see cmp_ids_per_row). Only the `out`
     // tensor reaches err() here - run_whole_graph() is on, so only the graph's `out` is compared.
+    // [TAG_QSA_WHOLE_BLOCKS] the block form: element for element (canonical order), every id in range.
     double err(const float * a, const float * b, size_t n) override {
+        if (n_sel > 0) {
+            double diff = 0.0;
+            for (size_t i = 0; i < n; i++) {
+                diff += a[i] != b[i] ? 1.0 : 0.0;
+                diff += (a[i] < 0 || a[i] >= (float) n_kv) ? 1.0 : 0.0;
+            }
+            return diff;
+        }
         return cmp_ids_per_row(a, b, n, width, n_kv);
     }
 };
@@ -11143,6 +11202,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // for the f16 flash-attention mask) and the Vulkan shader binds a float16_t mask, so this case
     // is expected to report "not supported" there rather than to run.
     test_cases.emplace_back(new test_qsa_top_k(1024, 4096,  6, 1, 2051, true, 0, GGML_TYPE_F32));
+
+    // [TAG_QSA_WHOLE_BLOCKS] the census-shaped inputs (ties == 5, tests/qsa-select-ref.h) in the cell form - the
+    // deployed selection on the inputs it really gets - and in the block form (n_sel 512 = indexer_top_k / r): decode,
+    // verify and prefill-chunk rows, one and two streams (stream 0 a full cache: padding has no masked cell to use),
+    // rows with fewer complete blocks than the budget. Then the block form over the other initializations (their
+    // tie structures, no tail boost), a small budget (n_sel 50 over 64 blocks) and the f32-mask CPU branch.
+    for (int n_sel : { 0, 512 }) {
+        test_cases.emplace_back(new test_qsa_top_k(1024,  4096,  6,  1, 2051, true, 5, GGML_TYPE_F16, n_sel));
+        test_cases.emplace_back(new test_qsa_top_k(4096,  16384, 1,  1, 2051, true, 5, GGML_TYPE_F16, n_sel));
+        test_cases.emplace_back(new test_qsa_top_k(4096,  16384, 6,  2, 2051, true, 5, GGML_TYPE_F16, n_sel));
+        test_cases.emplace_back(new test_qsa_top_k(16384, 65536, 64, 1, 2051, true, 5, GGML_TYPE_F16, n_sel));
+        test_cases.emplace_back(new test_qsa_top_k(650,   2600,  8,  1, 2051, true, 5, GGML_TYPE_F16, n_sel));
+    }
+    for (int ties = 0; ties <= 4; ++ties) {
+        test_cases.emplace_back(new test_qsa_top_k(1024, 4096,  6, 1, 2051, true, ties, GGML_TYPE_F16, 512));
+        test_cases.emplace_back(new test_qsa_top_k(4096, 16384, 6, 1, 2051, true, ties, GGML_TYPE_F16, 512));
+    }
+    test_cases.emplace_back(new test_qsa_top_k(64,   256,   2, 1, 200,  true, 0, GGML_TYPE_F16, 50));
+    test_cases.emplace_back(new test_qsa_top_k(512,  2048,  2, 1, 2048, true, 0, GGML_TYPE_F16, 512));
+    test_cases.emplace_back(new test_qsa_top_k(1024, 4096,  6, 1, 2051, true, 5, GGML_TYPE_F32, 512));
 
     // Qwen 3.8 Flash Next at the deployed context: n_kv 213000, ratio 4, width 2051, decode
     // and -ub 2048 prefill. Opt-in: the n_tps 2048 pair needs ~10 GB of backend and as much

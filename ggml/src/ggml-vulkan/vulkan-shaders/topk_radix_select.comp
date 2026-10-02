@@ -19,7 +19,9 @@
 #include "types.glsl"
 
 layout(constant_id = 0) const int BLOCK_SIZE = 1024;
-layout(constant_id = 1) const int QSA = 0; // 1: fuse the qwen4 QSA indexer gather + f16 mask
+// 1: fuse the qwen4 QSA indexer gather + f16 mask; 2: [TAG_QSA_WHOLE_BLOCKS] the block-level form
+// (ggml_qsa_top_k_blocks: n_sel whole blocks + the boosted tail, ascending ids, padded - see topk_blocks)
+layout(constant_id = 1) const int QSA = 0;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -45,7 +47,11 @@ layout (push_constant) uniform parameter {
     // the permute+cont entirely. The stream stride is n_blocks*n_tps either way.
     uint sb_blk;   // QSA only
     uint sb_tps;   // QSA only
+    uint n_sel;    // QSA == 2 only: the number of whole blocks to select
 } p;
+
+// [TAG_QSA_WHOLE_BLOCKS] GGML_QSA_TAIL_MIN (ggml.h): 5e8 = 15625000 * 2^5, exact in f32
+const float QSA_TAIL_MIN = 5.0e8;
 
 #define RADIX_BITS 8
 #define RADIX_SIZE (1 << RADIX_BITS)
@@ -56,6 +62,8 @@ shared uint sh_above;
 // per-invocation counts of the two output classes, scanned in place (see topk)
 shared uint sh_gt[BLOCK_SIZE];
 shared uint sh_eq[BLOCK_SIZE];
+// [TAG_QSA_WHOLE_BLOCKS] the last (largest) selected cell id of the row: the padding value
+shared uint sh_last;
 
 // order-preserving float -> uint mapping. -0.0 is folded onto +0.0 first: its bit pattern
 // sorts strictly below +0.0, but IEEE compare - and therefore the CPU reference - calls the
@@ -222,8 +230,189 @@ void topk(const uint row) {
     }
 }
 
+// [TAG_QSA_WHOLE_BLOCKS] (QSA == 2) ---------------------------------------------------------------
+// The block-level form of the QSA selection (ggml_qsa_top_k_blocks; the contract and the CPU reference are in
+// ggml.h / ggml-cpu ops.cpp). Per row: (1) radix-select the n_sel-th largest ELIGIBLE block key - the same
+// passes as topk(), over the n_blocks block scores read straight from the score operand; (2) flag the selected
+// blocks in the row's scratch (ties at the threshold to the lowest block indices, ranked like topk()'s emit);
+// (3) one pass over the cells emits, in ascending id order, every tail cell and every visible cell of a flagged
+// block; the rest of the row repeats the last id (0..k-1 when nothing is selected).
+
+// block b of row (t, s): its (biased) score
+float blk_score(uint row, uint b) {
+    const uint t = row % p.n_tps;
+    const uint s = row / p.n_tps;
+    return data_a[s * p.n_blocks * p.n_tps + b * p.sb_blk + t * p.sb_tps];
+}
+
+// eligible = finite and below the tail boost. An eligible block's key is f2ui of its score (>= 0x00800000 for
+// every finite value); every other block gets 0, below all of them, so a 0 threshold means "fewer than n_sel
+// eligible blocks" and selects none of the ties.
+uint blk_key(uint row, uint b) {
+    const float a = blk_score(row, b);
+    return (!isinf(a) && !isnan(a) && a < QSA_TAIL_MIN) ? f2ui(a) : 0u;
+}
+
+// cell i of row (t, s) is selected: a boosted (tail) cell, or a visible cell of a flagged block
+bool cell_sel(uint row, uint i) {
+    const uint  t = row % p.n_tps;
+    const uint  s = row / p.n_tps;
+    const uint  b = uint(cell_blk[s * p.ncols + i]);
+    const float a = data_a[s * p.n_blocks * p.n_tps + b * p.sb_blk + t * p.sb_tps];
+    const float m = float(mask[(s * p.n_tps + t) * p.ncols + i]);
+    const float v = a + m;
+    if (!isinf(v) && !isnan(v) && v >= QSA_TAIL_MIN) {
+        return true;
+    }
+    return scratch[row * p.ncols + b] != 0.0 && !(isinf(m) && m < 0.0);
+}
+
+// inclusive scan of sh_gt and sh_eq over the workgroup (both share the barriers, as in topk())
+void scan_counts() {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint d = 1; d < uint(BLOCK_SIZE); d <<= 1) {
+        uint add_gt = 0;
+        uint add_eq = 0;
+        if (tid >= d) {
+            add_gt = sh_gt[tid - d];
+            add_eq = sh_eq[tid - d];
+        }
+        barrier();
+        sh_gt[tid] += add_gt;
+        sh_eq[tid] += add_eq;
+        barrier();
+    }
+}
+
+void topk_blocks(const uint row) {
+    const uint tid     = gl_LocalInvocationID.x;
+    const uint nb      = p.n_blocks;
+    const uint ncols   = p.ncols;
+    const uint row_out = row * p.k;
+    const uint row_scr = row * ncols;      // the row's scratch: one flag per block (n_blocks <= n_kv)
+
+    // (1) the n_want-th largest block key
+    const uint n_want = min(p.n_sel, nb);
+    uint prefix  = 0;
+    uint desired = n_want;
+
+    [[unroll]] for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+        for (uint i = tid; i < RADIX_SIZE; i += BLOCK_SIZE) {
+            histo[i] = 0;
+        }
+        barrier();
+
+        const uint hi_mask   = (shift + RADIX_BITS >= 32) ? 0u : (0xFFFFFFFFu << uint(shift + RADIX_BITS));
+        const uint prefix_hi = prefix & hi_mask;
+        for (uint b = tid; b < nb; b += BLOCK_SIZE) {
+            const uint key = blk_key(row, b);
+            if ((key & hi_mask) == prefix_hi) {
+                atomicAdd(histo[(key >> uint(shift)) & (RADIX_SIZE - 1)], 1u);
+            }
+        }
+        barrier();
+
+        if (tid == 0) {
+            uint acc = 0;
+            uint bk  = 0;
+            for (int bb = RADIX_SIZE - 1; bb >= 0; --bb) {
+                const uint c = histo[bb];
+                if (acc + c >= desired) { bk = uint(bb); break; }
+                acc += c;
+            }
+            sh_bucket = bk;
+            sh_above  = acc;
+        }
+        barrier();
+
+        prefix  |= sh_bucket << uint(shift);
+        desired -= sh_above;
+        barrier();
+    }
+
+    // (2) flag the blocks: every key above the threshold, and the first `n_eq` ties by block index
+    const uint thr  = prefix;
+    const uint n_eq = thr != 0u ? desired : 0u;
+
+    const uint qb  = nb / uint(BLOCK_SIZE);
+    const uint rb  = nb % uint(BLOCK_SIZE);
+    const uint blo = tid*qb + min(tid, rb);
+    const uint bhi = blo + qb + (tid < rb ? 1u : 0u);
+
+    uint cnt_eq = 0;
+    for (uint b = blo; b < bhi; ++b) {
+        cnt_eq += blk_key(row, b) == thr ? 1u : 0u;
+    }
+    sh_gt[tid] = 0;
+    sh_eq[tid] = cnt_eq;
+    barrier();
+    scan_counts();
+
+    uint pos_eq = tid == 0 ? 0 : sh_eq[tid - 1];
+    for (uint b = blo; b < bhi; ++b) {
+        const uint key = blk_key(row, b);
+        bool sel = key > thr;
+        if (key == thr) {
+            sel = pos_eq < n_eq;
+            pos_eq++;
+        }
+        scratch[row_scr + b] = sel ? 1.0 : 0.0;
+    }
+
+    // the flags are read below by other invocations than the ones that wrote them: publish
+    // ([TAG_QSA_SCRATCH_COHERENT]; QSA is a specialization constant, so this is uniform control flow)
+    controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
+    barrier();
+
+    // (3) the cells, ascending: count per contiguous range, scan, emit
+    const uint quot = ncols / uint(BLOCK_SIZE);
+    const uint rem  = ncols % uint(BLOCK_SIZE);
+    const uint lo   = tid*quot + min(tid, rem);
+    const uint hi   = lo + quot + (tid < rem ? 1u : 0u);
+
+    uint cnt  = 0;
+    uint last = 0;
+    for (uint i = lo; i < hi; ++i) {
+        if (cell_sel(row, i)) {
+            cnt++;
+            last = i;
+        }
+    }
+    sh_gt[tid] = cnt;
+    sh_eq[tid] = 0;
+    barrier();
+    scan_counts();
+
+    const uint total = sh_gt[BLOCK_SIZE - 1];
+    uint pos = tid == 0 ? 0 : sh_gt[tid - 1];
+
+    // the range holding the row's last selected cell (the largest id) publishes it
+    if (cnt > 0 && sh_gt[tid] == total) {
+        sh_last = last;
+    }
+
+    for (uint i = lo; i < hi && pos < p.k; ++i) {
+        if (cell_sel(row, i)) {
+            data_d[row_out + pos] = int(i);
+            pos++;
+        }
+    }
+    barrier();
+
+    // padding: a repeat of the last id written (= the largest selected id when total <= k), or 0..k-1
+    const uint c = min(total, p.k);
+    for (uint j = c + tid; j < p.k; j += BLOCK_SIZE) {
+        data_d[row_out + j] = total > 0 ? int(sh_last) : int(j);
+    }
+    barrier();
+}
+
 void main() {
     for (uint row = gl_WorkGroupID.y; row < p.nrows; row += gl_NumWorkGroups.y) {
-        topk(row);
+        if (QSA == 2) {
+            topk_blocks(row);
+        } else {
+            topk(row);
+        }
     }
 }

@@ -7,6 +7,18 @@
 #include <vector>
 
 //
+// [TAG_QSA_WHOLE_BLOCKS] LLAMA_QSA_WHOLE_BLOCKS=1 (default 0): the QSA selection in the reference's block-level form -
+// the indexer_top_k/r best whole blocks plus each query's (q+1) mod r tail cells (HF Qwen4ExpTextQSAIndexer, D1/D2 of
+// docs/verification/2026-10-03-indexer-reference-notes.md) - instead of the top indexer_top_k + r - 1 cells.
+// MODEL-OUTPUT knob: off is today's graph node for node.
+//
+// the parser: 0 for unset / "" / "0", 1 for "1", -1 for anything else (WARN, treated as 0)
+int  llama_qsa_whole_blocks_parse(const char * s);
+// the knob, read once per process; the first call logs the proof line `qsa_select = whole_blocks` / `qsa_select = cells`
+// (the memory calls it when it creates the indexer cache, so the line is in the load log)
+bool llama_qsa_whole_blocks();
+
+//
 // [TAG_QSA_POOLED_CACHE] (M3 v1) the pooled-key cache
 //
 // LLAMA_QSA_POOLED_CACHE=1 (read when the memory is created, default 0 = off) keeps the indexer's

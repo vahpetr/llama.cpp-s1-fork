@@ -5486,6 +5486,26 @@ struct ggml_tensor * ggml_qsa_top_k(
     return result;
 }
 
+// [TAG_QSA_WHOLE_BLOCKS] ggml_qsa_top_k_blocks: the block-level selection (see ggml.h)
+struct ggml_tensor * ggml_qsa_top_k_blocks(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * cell_blk,
+        struct ggml_tensor  * mask,
+        int                   k,
+        int                   n_sel) {
+    GGML_ASSERT(n_sel > 0);
+    // the Vulkan shader keeps one flag per block in its per-row n_kv-long scratch
+    GGML_ASSERT(score->ne[0] <= cell_blk->ne[0]);
+
+    struct ggml_tensor * result = ggml_qsa_top_k(ctx, score, cell_blk, mask, k);
+
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 1, n_sel);
+
+    return result;
+}
+
 // ggml_kq_mask
 
 struct ggml_tensor * ggml_kq_mask(

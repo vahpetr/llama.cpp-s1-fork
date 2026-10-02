@@ -1134,6 +1134,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
+    vk_pipeline pipeline_topk_radix_qsa_blocks; // [TAG_QSA_WHOLE_BLOCKS] ggml_qsa_top_k_blocks (f16 mask)
     vk_pipeline pipeline_qsa_bias;       // [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
@@ -1875,6 +1876,8 @@ struct vk_op_topk_radix_push_constants {
     // its natural [n_blocks, n_tps, n_stream] layout => sb_blk = 1, sb_tps = n_blocks).
     uint32_t sb_blk;   // QSA only
     uint32_t sb_tps;   // QSA only
+    // [TAG_QSA_WHOLE_BLOCKS] QSA == 2 (ggml_qsa_top_k_blocks) only: the number of whole blocks to select
+    uint32_t n_sel;
 };
 
 // [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS (qsa_bias.comp)
@@ -6581,6 +6584,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t BLOCK_SIZE = 1u << std::min(10u, device->max_workgroup_size_log2);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_blocks, "topk_radix_qsa_blocks", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 2}, 1, true);
     }
 
     // [TAG_QSA_COMPACT_BIAS] 256 blocks per workgroup on x, one (t, s) row per workgroup on y
@@ -15351,7 +15355,7 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
             ggml_vk_sync_buffers(ctx, subctx);
         }
 
-        vk_op_topk_radix_push_constants pc { ncols, k, nrows, 0, 0, 0, 0, 0 };
+        vk_op_topk_radix_push_constants pc { ncols, k, nrows, 0, 0, 0, 0, 0, 0 };
         std::array<uint32_t, 3> elements {
             pipeline->wg_denoms[0],
             std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
@@ -15526,12 +15530,14 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
                                       const ggml_tensor * scores, const ggml_tensor * cell_blk,
                                       const ggml_tensor * mask, ggml_tensor * top_k,
                                       uint32_t n_tps, uint32_t n_blocks, uint32_t n_stream,
-                                      uint32_t sb_blk, uint32_t sb_tps) {
+                                      uint32_t sb_blk, uint32_t sb_tps, uint32_t n_sel = 0) {
     const uint32_t n_kv  = cell_blk->ne[0];
     const uint32_t width = top_k->ne[0];
     const uint32_t nrows = n_tps * n_stream;
 
-    vk_pipeline pipeline = ctx->device->pipeline_topk_radix_qsa;
+    // [TAG_QSA_WHOLE_BLOCKS] n_sel > 0: the block-level form (QSA == 2), the same operands and the same scratch
+    // (it holds one flag per block of the row instead of the gathered cells; n_blocks <= n_kv)
+    vk_pipeline pipeline = n_sel > 0 ? ctx->device->pipeline_topk_radix_qsa_blocks : ctx->device->pipeline_topk_radix_qsa;
     GGML_ASSERT(pipeline != nullptr);
 
     // scratch holds the gathered+masked input, materialized once and reused across passes
@@ -15602,7 +15608,7 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    vk_op_topk_radix_push_constants pc { n_kv, width, nrows, n_tps, n_blocks, n_stream, sb_blk, sb_tps };
+    vk_op_topk_radix_push_constants pc { n_kv, width, nrows, n_tps, n_blocks, n_stream, sb_blk, sb_tps, n_sel };
     std::array<uint32_t, 3> elements {
         pipeline->wg_denoms[0],
         std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
@@ -15653,8 +15659,11 @@ static void ggml_vk_qsa_top_k(ggml_backend_vk_context * ctx, vk_context& subctx,
     const uint32_t n_tps    = scores->ne[1];
     const uint32_t n_stream = scores->ne[2];
 
+    // [TAG_QSA_WHOLE_BLOCKS] op_params[0] == 1: ggml_qsa_top_k_blocks, op_params[1] = n_sel
+    const uint32_t n_sel = ggml_get_op_params_i32(node, 0) == 1 ? (uint32_t) ggml_get_op_params_i32(node, 1) : 0u;
+
     ggml_vk_topk_qsa_dispatch(ctx, subctx, scores, cell_blk, mask, node,
-                              n_tps, n_blocks, n_stream, /*sb_blk =*/ 1, /*sb_tps =*/ n_blocks);
+                              n_tps, n_blocks, n_stream, /*sb_blk =*/ 1, /*sb_tps =*/ n_blocks, n_sel);
 }
 
 // [TAG_KQ_VIS] GGML_OP_KQ_MASK: the mask plane generated on the device from the metadata
@@ -21446,6 +21455,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     n_blocks <= 0 || n_kv <= 0 || op->ne[0] <= 0 || op->ne[0] > n_kv) {
                     return false;
                 }
+                // [TAG_QSA_WHOLE_BLOCKS] the block-level form keeps one flag per block in the n_kv-long row scratch
+                if (ggml_get_op_params_i32(op, 0) == 1) {
+                    return n_blocks <= n_kv && ggml_get_op_params_i32(op, 1) > 0 &&
+                           device->pipeline_topk_radix_qsa_blocks != nullptr;
+                }
                 return device->pipeline_topk_radix_qsa != nullptr;
             }
         case GGML_OP_QSA_BIAS:
@@ -22517,7 +22531,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
         } else if (tensor->op == GGML_OP_TOP_K) {
             tensor_clone = ggml_top_k(ggml_ctx, src_clone[0], tensor->ne[0]);
         } else if (tensor->op == GGML_OP_QSA_TOP_K) {
-            tensor_clone = ggml_qsa_top_k(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], tensor->ne[0]);
+            tensor_clone = ggml_get_op_params_i32(tensor, 0) == 1 // [TAG_QSA_WHOLE_BLOCKS]
+                ? ggml_qsa_top_k_blocks(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], tensor->ne[0], ggml_get_op_params_i32(tensor, 1))
+                : ggml_qsa_top_k(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], tensor->ne[0]);
         } else if (tensor->op == GGML_OP_QSA_BIAS) {
             tensor_clone = ggml_qsa_bias(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
         } else if (tensor->op == GGML_OP_SUM) {
