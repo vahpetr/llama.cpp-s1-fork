@@ -36,6 +36,29 @@ static void test(void) {
             std::numeric_limits<int32_t>::max());
 
     {
+        // draft-simple / eagle3 / draft-mtp append a token before they test n_max, so --spec-draft-n-max 0 still
+        // verifies [id_last, draft] per sequence: one slot needs 2 outputs (was 1 -> GGML_ASSERT in output_reserve)
+        common_params_speculative spec;
+        assert(common_speculative_n_max(&spec) == 0); // type none
+
+        for (const auto type : { COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE, COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,
+                                 COMMON_SPECULATIVE_TYPE_DRAFT_MTP }) {
+            spec.types = { type };
+            spec.draft.n_max = 0;
+            assert(common_speculative_n_max(&spec) == 1);
+            const auto limits = common_speculative_get_output_limits(2048, 1, common_speculative_n_max(&spec));
+            assert(limits.total == 2 && limits.per_seq == 2);
+            spec.draft.n_max = 5;
+            assert(common_speculative_n_max(&spec) == 5);
+        }
+
+        // dflash / dspark decode n_max block positions: nothing at n_max 0
+        spec.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        spec.draft.n_max = 0;
+        assert(common_speculative_n_max(&spec) == 0);
+    }
+
+    {
         common_params_speculative spec;
         spec.synth_len = 3.4;
 

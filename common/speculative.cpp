@@ -2442,6 +2442,11 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                // these drafters append a token before they test n_max, so --spec-draft-n-max 0 still drafts
+                // one token per round; report that real maximum - it sizes the verify batch's outputs
+                // (server_output_limits: n_outputs_max = n_parallel * (n_max + 1))
+                n_max = std::max(n_max, std::max(1, spec->draft.n_max));
+                break;
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
