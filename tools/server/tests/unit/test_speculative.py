@@ -178,6 +178,47 @@ def test_draft_n_ubatch_smaller_than_target():
     assert res_small.body["tokens"] == res_default.body["tokens"]
 
 
+def test_draft_sampling_probabilistic():
+    # [TAG_UP27694] --spec-draft-sampling probabilistic: at T = 0 the output is the greedy one; at T > 0 the draft is
+    # sampled and verified by rejection sampling - drafted tokens get accepted and a fixed seed reproduces the output
+    global server
+    req_t0 = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "n_predict": 32,
+        "return_tokens": True,
+    }
+    req_t = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.7,
+        "top_k": 20,
+        "seed": 4242,
+        "n_predict": 32,
+        "return_tokens": True,
+    }
+    server.start()
+    res = server.make_request("POST", "/completion", data=req_t0)
+    assert res.status_code == 200
+    tokens_greedy_t0 = res.body["tokens"]
+    server.stop()
+
+    create_server()
+    server.spec_draft_sampling = "probabilistic"
+    server.start()
+    res = server.make_request("POST", "/completion", data=req_t0)
+    assert res.status_code == 200
+    assert res.body["tokens"] == tokens_greedy_t0
+    res1 = server.make_request("POST", "/completion", data=req_t)
+    res2 = server.make_request("POST", "/completion", data=req_t)
+    assert res1.status_code == 200 and res2.status_code == 200
+    assert res1.body["timings"]["draft_n"] > 0
+    assert res1.body["timings"]["draft_n_accepted"] > 0
+    assert res1.body["tokens"] == res2.body["tokens"]
+    # a T = 0 request after the probabilistic ones is greedy again
+    res = server.make_request("POST", "/completion", data=req_t0)
+    assert res.body["tokens"] == tokens_greedy_t0
+
+
 def test_slot_ctx_not_exceeded():
     global server
     server.n_ctx = 256
