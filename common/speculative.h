@@ -80,6 +80,14 @@ struct common_speculative_draft_params {
     //   probe of max(n_min, 1) tokens that stopped early is kept as drafted - a cleared probe would count as a failed
     //   probe and could keep a cooldown alive by itself). false (the default, every other caller): unchanged.
     bool keep_short = false;
+
+    // [TAG_UP27694] candidate distribution per drafted token; set it to make draft-simple and draft-mtp sample
+    //   (only under --spec-draft-sampling probabilistic: the drafter resets it to nullptr otherwise)
+    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
+
+    // the target's temp and seed, read only when the drafter samples probabilistically
+    float    temp = 1.0f;
+    uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

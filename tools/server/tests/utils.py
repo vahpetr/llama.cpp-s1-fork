@@ -103,6 +103,7 @@ class ServerProcess:
     spec_draft_n_max: int | None = None
     spec_draft_p_min: float | None = None
     spec_draft_n_ubatch: int | None = None
+    spec_draft_sampling: str | None = None
     spec_synth_len: float | None = None
     spec_synth_rates: List[float] | None = None
     no_ui: bool | None = None
@@ -261,6 +262,8 @@ class ServerProcess:
             server_args.extend(["--spec-draft-p-min", self.spec_draft_p_min])
         if self.spec_draft_n_ubatch:
             server_args.extend(["--spec-draft-n-ubatch", self.spec_draft_n_ubatch])
+        if self.spec_draft_sampling:
+            server_args.extend(["--spec-draft-sampling", self.spec_draft_sampling])
         if self.spec_synth_len is not None:
             server_args.extend(["--spec-synth-len", self.spec_synth_len])
         if self.spec_synth_rates is not None:

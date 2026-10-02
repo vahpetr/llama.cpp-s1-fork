@@ -551,10 +551,15 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+
+    // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
+    std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    // [TAG_UP27694] the round whose committed tokens a replay re-emits was verified by rejection sampling
+    bool spec_round_rejection = false;
     size_t spec_n_committed = 0; // number of committed (already-accepted) tokens at the front of spec_draft this round
 
     // [TAG_GTT_ADMISSION] (v33 #13) prompt admission state of this slot
@@ -868,6 +873,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_round_rejection = false;
         spec_n_committed = 0;
 
         adm_deferred      = false;
@@ -1004,6 +1010,14 @@ struct server_slot {
 
     bool can_speculate() const {
         return !!spec;
+    }
+
+    // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
+    // [TAG_UP27694] stateful samplers (mirostat v1/v2, adaptive-p) would update their state with the chain's own
+    //   sample instead of the emitted token inside the rejection verifier: those keep sample-and-match
+    bool use_spec_rejection() const {
+        return task && task->params.sampling.temp > 0.0f &&
+               task->params.sampling.mirostat == 0 && task->params.sampling.adaptive_target < 0.0f;
     }
 
     void add_token(const completion_token_output & token) {
@@ -5808,6 +5822,9 @@ private:
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
 
+                    // stale candidates: a replay never reads them, a new draft refills them
+                    slot.spec_draft_q.clear();
+
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
                         if (use_ckpt_tgt) {
@@ -5930,6 +5947,15 @@ private:
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
                         };
+                        {
+                            // [TAG_UP27694] the candidates are asked for only at T > 0 under the flag; the drafter
+                            //   itself drops the request when --spec-draft-sampling is greedy (the default)
+                            auto & dpr = common_speculative_get_draft_params(spec.get(), slot.id);
+                            dpr.result_q = params_base.speculative.draft.probabilistic && slot.use_spec_rejection() ?
+                                           &slot.spec_draft_q : nullptr;
+                            dpr.temp     = slot.task->params.sampling.temp;
+                            dpr.seed     = slot.task->params.sampling.seed;
+                        }
                         // [TAG_SPEC_DRAFT_POLICY] a tput cooldown probe is kept as drafted (false on every other path)
                         common_speculative_get_draft_params(spec.get(), slot.id).keep_short = n_tput > 0 && slot.spec_tput_probe;
 
@@ -7226,6 +7252,18 @@ private:
             {
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                // [TAG_UP27694] drafters that fill no distribution (or a draft whose candidates do not line up with it)
+                //   fall back to sample-and-match; a replay re-emits its committed tokens in both modes (the fork's
+                //   server_sample_and_accept_replay, which never re-samples them - upstream's server_accept_replay is
+                //   not needed here)
+                const bool use_rejection = params_base.speculative.draft.probabilistic && slot.use_spec_rejection() &&
+                                           !slot.spec_is_replay &&
+                                           !slot.spec_draft_q.empty() && slot.spec_draft_q.size() == slot.spec_draft.size();
+                if (!slot.spec_is_replay) {
+                    // [TAG_UP27694] a replay re-emits the tokens committed by this round: remember how they were verified
+                    slot.spec_round_rejection = use_rejection && synth_probs.empty();
+                }
+
                 std::vector<llama_token> accepted;
                 if (!synth_probs.empty()) {
                     accepted = server_sample_and_accept_synth(
@@ -7234,13 +7272,20 @@ private:
                 } else if (slot.spec_is_replay) {
                     int n_mismatch = 0;
                     accepted = server_sample_and_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_view, slot.spec_draft,
-                            slot.spec_n_committed, trace > 0, n_mismatch);
+                            slot.spec_n_committed,
+                            // [TAG_UP27694] a token kept by rejection sampling is not the target's own sample, so
+                            //   the (trace-only) re-sample probe would count it as a flip: off for those rounds
+                            trace > 0 && !slot.spec_round_rejection,
+                            n_mismatch);
                     if (n_mismatch > 0) {
                         // would have been rejected again by the old code -> checkpoint restore -> replay -> ... (livelock)
                         SLT_WRN(slot, "replay: %d of %zu committed tokens re-sampled differently (batch-size dependent rounding or an inexact restore); kept the committed tokens\n",
                                 n_mismatch, slot.spec_draft.size());
                         slot.stats.n_replay_mismatch += n_mismatch;
                     }
+                } else if (use_rejection) {
+                    // [TAG_UP27694] probabilistic draft: verify by rejection sampling against the draft's candidates
+                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_view, slot.spec_draft, slot.spec_draft_q);
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_view, slot.spec_draft);
                 }
