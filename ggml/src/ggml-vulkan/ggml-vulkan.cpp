@@ -100,6 +100,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include "ggml-backend-impl.h"
 
 #include "ggml-vulkan-shaders.hpp"
+#include "ggml-vulkan-mmq-knobs.h" // [TAG_MMQ_INT8_KNOBS]
 
 // remove this once it's more widely available in the SDK
 #if !defined(VK_KHR_shader_bfloat16)
@@ -936,6 +937,10 @@ struct vk_device_struct {
     // int8 coopmat1 MMQ (upstream #27952, mul_mmq_cm1.comp): coopmat1 + int8 coopmat + RDNA3/RDNA4. The fork's
     // A/B switch GGML_VK_DISABLE_MMQ_CM1=1 clears it -> no q8_1 pipelines on coopmat1 = the pre-port path.
     bool mmq_cm1 = false;
+    // [TAG_MMQ_INT8_KNOBS] diagnostic restrictions of that path (GGML_VK_MMQ_INT8_MIN_N / GGML_VK_MMQ_INT8_OPS,
+    // ggml-vulkan-mmq-knobs.h); the defaults leave it unrestricted.
+    uint32_t mmq_int8_min_n = 0;
+    uint32_t mmq_int8_ops = GGML_VK_MMQ_INT8_OPS_ALL;
 
     bool coopmat2;
     bool coopmat2_bf16_support {};
@@ -7899,12 +7904,34 @@ static vk_device ggml_vk_get_device(size_t idx) {
             const bool cm1_arch = device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4;
             const bool cm1_ok   = device->coopmat_support && !device->coopmat2 && device->coopmat_int_support && cm1_arch;
             device->mmq_cm1 = cm1_ok && !disable_mmq_cm1;
+            // [TAG_MMQ_INT8_KNOBS] strict parsing: an invalid value keeps the default (0 / all) with a warning.
+            static const uint32_t mmq_int8_min_n = [] {
+                const char * s = getenv("GGML_VK_MMQ_INT8_MIN_N");
+                uint32_t v = 0;
+                if (!ggml_vk_parse_mmq_int8_min_n(s, v)) {
+                    GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMQ_INT8_MIN_N=%s ignored, expected decimal digits 0..4294967295 (using 0)\n", s);
+                    v = 0;
+                }
+                return v;
+            }();
+            static const uint32_t mmq_int8_ops = [] {
+                const char * s = getenv("GGML_VK_MMQ_INT8_OPS");
+                uint32_t v = GGML_VK_MMQ_INT8_OPS_ALL;
+                if (!ggml_vk_parse_mmq_int8_ops(s, v)) {
+                    GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMQ_INT8_OPS=%s ignored, expected all, none or a comma-separated list of mul_mat, mul_mat_id (using all)\n", s);
+                    v = GGML_VK_MMQ_INT8_OPS_ALL;
+                }
+                return v;
+            }();
+            device->mmq_int8_min_n = mmq_int8_min_n;
+            device->mmq_int8_ops   = mmq_int8_ops;
             if (device->coopmat_support || device->coopmat_int_support) {
                 const char * arch = device->architecture == AMD_RDNA3 ? "RDNA3" : device->architecture == AMD_RDNA4 ? "RDNA4" : "other";
-                GGML_LOG_WARN("ggml_vulkan: %s mmq_cm1: %s (int8 coopmat1 MMQ, upstream #27952; arch %s, int8 coopmat %s %ux%ux%u, subgroup %u..%u, GGML_VK_DISABLE_MMQ_CM1=%d)\n",
+                GGML_LOG_WARN("ggml_vulkan: %s mmq_cm1: %s (int8 coopmat1 MMQ, upstream #27952; arch %s, int8 coopmat %s %ux%ux%u, subgroup %u..%u, GGML_VK_DISABLE_MMQ_CM1=%d, min_n %u, ops %s)\n",
                               device->name.c_str(), device->mmq_cm1 ? "on" : (cm1_ok ? "off (GGML_VK_DISABLE_MMQ_CM1)" : "off (unsupported)"),
                               arch, device->coopmat_int_support ? "yes" : "no", device->coopmat_int_m, device->coopmat_int_n, device->coopmat_int_k,
-                              device->subgroup_min_size, device->subgroup_max_size, disable_mmq_cm1 ? 1 : 0);
+                              device->subgroup_min_size, device->subgroup_max_size, disable_mmq_cm1 ? 1 : 0,
+                              mmq_int8_min_n, ggml_vk_mmq_int8_ops_name(mmq_int8_ops));
             }
         }
 
@@ -10262,6 +10289,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // int8 coopmat1 MMQ (upstream #27952): quantize src1 to q8_1 whenever a matching pipeline exists; the lookup
     // below returns nullptr for types without one (and for every type with GGML_VK_DISABLE_MMQ_CM1=1).
     bool quantize_y = (ctx->device->integer_dot_product || ctx->device->mmq_cm1) && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+    // [TAG_MMQ_INT8_KNOBS] GGML_VK_MMQ_INT8_MIN_N / _OPS: an excluded matmul takes the pre-port dequant path.
+    if (quantize_y && ctx->device->mmq_cm1 &&
+        !ggml_vk_mmq_int8_allowed(ctx->device->mmq_int8_ops, ctx->device->mmq_int8_min_n, GGML_VK_MMQ_INT8_OP_MUL_MAT, ne11)) {
+        quantize_y = false;
+    }
 
     // Check for mmq first
     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
@@ -11219,6 +11251,12 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+    // [TAG_MMQ_INT8_KNOBS] GGML_VK_MMQ_INT8_MIN_N / _OPS on the batch's token count nei1 (the pipeline size choice's
+    // N below): an excluded matmul takes the pre-port dequant path.
+    if (quantize_y && ctx->device->mmq_cm1 &&
+        !ggml_vk_mmq_int8_allowed(ctx->device->mmq_int8_ops, ctx->device->mmq_int8_min_n, GGML_VK_MMQ_INT8_OP_MUL_MAT_ID, nei1)) {
+        quantize_y = false;
+    }
 
     // Check for mmq first
     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_id_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;

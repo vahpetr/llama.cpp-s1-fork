@@ -61,6 +61,7 @@ if (Vulkan_FOUND)
 
     ggml_add_backend_library(ggml-vulkan
                              ggml-vulkan.cpp
+                             ggml-vulkan-mmq-knobs.h
                              ../../include/ggml-vulkan.h
                             )
 
