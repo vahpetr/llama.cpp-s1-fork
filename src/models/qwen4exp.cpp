@@ -573,6 +573,26 @@ static bool qwen4exp_qsa_dense(int64_t n_kv_idx, int64_t width, int64_t depth) {
     return (qwen4exp_qsa_bypass_exhaustive() && width == n_kv_idx) || depth < qwen4exp_qsa_min_kv();
 }
 
+// [TAG_MTP_QSA] the selection budget (indexer_top_k) of layer il. TEST ONLY: LLAMA_MTP_QSA_TOP_K=N > 0 replaces it for
+// the MTP block (il >= n_layer) - a large N forces the draft selection exhaustive (width == n_kv), a small one gives a
+// tiny model a real ratio. The trunk's layers always take the GGUF value; unset = the GGUF value everywhere.
+static uint32_t qwen4exp_qsa_top_k(const llama_hparams & hparams, int il) {
+    static const long long mtp_top_k = [] {
+        const char * s = getenv("LLAMA_MTP_QSA_TOP_K");
+        const long long v = s ? atoll(s) : 0;
+        if (v > 0) {
+            LLAMA_LOG_WARN("qwen4exp_qsa_top_k: LLAMA_MTP_QSA_TOP_K=%lld: TEST ONLY - the MTP block's indexer_top_k\n", v);
+        }
+        return v > 0 ? v : 0;
+    }();
+
+    if (mtp_top_k > 0 && il >= (int) hparams.n_layer()) {
+        return (uint32_t) mtp_top_k;
+    }
+
+    return hparams.indexer_top_k;
+}
+
 // [TAG_QSA_FUSED_SELECT] GGML_VK_QSA_FUSED_SELECT=1 emits the indexer selection as ONE node
 // (GGML_OP_QSA_TOP_K) instead of the six that the Vulkan topk_qsa pattern matches and elides.
 //
@@ -1171,7 +1191,8 @@ static bool qwen4exp_mtp_ehproj_flat_enabled(int64_t n_tokens) {
 // v1 simplification: the block attends densely. The trunk's QSA only prunes context past a
 // 2048-token budget, so dense is a numerical superset; drafts are verified by the target
 // either way. The indexer tensors are still loaded so the GGUF stays complete.
-// TODO: wire up QSA here for long-context draft fidelity.
+// [TAG_MTP_QSA] LLAMA_MTP_QSA=1 (default off): the block runs the trunk's QSA path with its own indexer
+// (blk.<n_layer>.indexer.*), as SGLang's Qwen4ExpForCausalLMMTP does with index_share_for_mtp_iteration unset.
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(model, params, no_build_t{}) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
@@ -1218,7 +1239,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    auto * inp_attn = build_attn_inp_kv();
+    // [TAG_MTP_QSA] LLAMA_MTP_QSA=1: the context's memory is a llama_memory_hybrid_idx without recurrent layers
+    // (llama-model.cpp create_memory) - the block runs the trunk's QSA attention; otherwise today's dense graph
+    const auto * mctx_hyb = dynamic_cast<const llama_memory_hybrid_idx_context *>(mctx);
+
+    llm_graph_input_attn_kv * inp_attn = mctx_hyb ? build_attn_inp_kv_hyb() : build_attn_inp_kv();
 
     // grouped RMSNorm over the wide stream: normalise each hc stream, then scale the flattened
     // [hc_dim] vector with the head's gamma, exactly as build_hc_mix does
@@ -1270,6 +1295,16 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             &inject, il);
     cb(cur, "mtp_hc_attn_pre", il);
 
+    if (mctx_hyb) {
+        // [TAG_MTP_QSA] the trunk's full-attention layer, QSA included: the indexer reads the block's normed input
+        // `cur` (the HC attention mixer's output, the same tensor q/k/v are projected from), exactly as the trunk's
+        // layers do and as SGLang's Qwen4ExpAttentionDecoderLayer (is_nextn) feeds `hidden_states` after
+        // _prepare_qwen4_exp_attn (attn_hyper_connection.mix) to _compute_qsa_topk_indices (qwen4_exp.py 1388-1419,
+        // 1564-1606, 1643-1646). Below LLAMA_QSA_MIN_KV / at an exhaustive budget it is the dense build_attn() plus the
+        // indexer K write (cache_only), so the draft's indexer history is complete for the first sparse ubatch.
+        cur = build_layer_attn(inp_attn, mctx_hyb, cur, inp_pos, sections, il);
+        cb(cur, "mtp_attn_out", il);
+    } else {
     // ---- dense attention, mirroring the trunk's full-attention branch ----
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -1322,6 +1357,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     cur = build_lora_mm(layer.wo, cur, layer.wo_s);
     cb(cur, "mtp_attn_out", il);
+    } // [TAG_MTP_QSA]
 
     if (inp_out_ids) {
         cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
@@ -1668,7 +1704,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, cache_only);
 
         qsa->k_idxs        = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        qsa->bypass_top_k  = hparams.indexer_top_k;
+        qsa->bypass_top_k  = qwen4exp_qsa_top_k(hparams, il);
 
         // [TAG_QSA_BYPASS_EXHAUSTIVE] cache-only needs the K write and nothing else: skipping the
         // four layout inputs also drops their device buffers and their host-side fill
@@ -1844,7 +1880,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream);
 
     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+    const int64_t width = std::min<int64_t>(n_kv, (int64_t) qwen4exp_qsa_top_k(hparams, il) + r - 1);
 
     // [TAG_QSA_CHUNK] the query-independent half is done; the caller runs the selection one query
     // chunk at a time, next to each chunk's attention (build_qsa_chunked)
@@ -1949,12 +1985,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
     const bool vis = vis_cells != nullptr && vis_toks != nullptr && blk_bias;
 
     if (blk_bias && llama_qsa_whole_blocks()) {
-        GGML_ASSERT((vis || kq_mask->ne[2] == 1) && hparams.indexer_top_k % inp->ratio == 0);
+        GGML_ASSERT((vis || kq_mask->ne[2] == 1) && qwen4exp_qsa_top_k(hparams, il) % inp->ratio == 0);
         ggml_tensor * top_k = vis
             ? ggml_qsa_top_k_vis(ctx0, score, inp->cell_blk, vis_cells, vis_toks, (int) width,
-                    (int) (hparams.indexer_top_k / inp->ratio), cparams.causal_attn)
+                    (int) (qwen4exp_qsa_top_k(hparams, il) / inp->ratio), cparams.causal_attn)
             : ggml_qsa_top_k_blocks(ctx0, score, inp->cell_blk, kq_mask, (int) width,
-                    (int) (hparams.indexer_top_k / inp->ratio));
+                    (int) (qwen4exp_qsa_top_k(hparams, il) / inp->ratio));
         cb(top_k, "indexer_top_k", il);
 
         return top_k;
@@ -2515,7 +2551,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     if (qsa && (qwen4exp_qsa_bypass_exhaustive() || qwen4exp_qsa_min_kv() > 0)) {
         // same expression as build_qsa_top_k()'s `width`, over the same n_kv
         const int64_t n_kv_idx = mctx_hyb->get_idx()->get_n_kv();
-        const int64_t width    = std::min<int64_t>(n_kv_idx, (int64_t) hparams.indexer_top_k + (int64_t) qsa_ratio - 1);
+        const int64_t width    = std::min<int64_t>(n_kv_idx, (int64_t) qwen4exp_qsa_top_k(hparams, il) + (int64_t) qsa_ratio - 1);
 
         // [TAG_QSA_MIN_KV] also while the ubatch's sequence depth is below LLAMA_QSA_MIN_KV
         qsa_exhaustive = qwen4exp_qsa_dense(n_kv_idx, width, qwen4exp_qsa_depth(mctx_hyb, ubatch, n_kv_idx));
@@ -2542,7 +2578,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         const int64_t n_stream = mctx_hyb->get_n_stream();
         const int64_t n_tps    = n_tokens/n_stream;
         const int64_t n_kv_idx = mctx_hyb->get_idx()->get_n_kv();
-        const int64_t width    = std::min<int64_t>(n_kv_idx, (int64_t) hparams.indexer_top_k + (int64_t) qsa_ratio - 1);
+        const int64_t width    = std::min<int64_t>(n_kv_idx, (int64_t) qwen4exp_qsa_top_k(hparams, il) + (int64_t) qsa_ratio - 1);
 
         chunked = n_tps > qwen4exp_qsa_chunk() &&
             !qwen4exp_qsa_use_gather(cparams.flash_attn, n_tps, n_stream, width, inp->mctx->get_n_kv());

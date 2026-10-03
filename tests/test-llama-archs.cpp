@@ -143,7 +143,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,            n_ctx);
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
-    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    // qwen4exp carries one MTP (NextN) block past the trunk, blk.<n_layer>, as the checkpoint does: its nextn.* tensors and
+    // its own indexer (index_q_proj/index_k_proj/index_q_norm/index_k_norm), so the draft graph is covered
+    const uint32_t n_layer_nextn = arch == LLM_ARCH_QWEN4EXP ? 1 : 0;
+    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer + n_layer_nextn);
+    if (n_layer_nextn > 0) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS,  n_layer_nextn);
+    }
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -252,8 +258,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     if (arch == LLM_ARCH_QWEN4EXP) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
-        // without this the QSA layers fall back to dense and go uncovered
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+        // without this the QSA layers fall back to dense and go uncovered; the MTP block keeps 0 (conversion/qwen4exp.py)
+        std::vector<uint32_t> compress_ratios(n_layer + n_layer_nextn, 4);
+        for (uint32_t il = n_layer; il < n_layer + n_layer_nextn; il++) {
+            compress_ratios[il] = 0;
+        }
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, compress_ratios);
     }
 
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 || arch == LLM_ARCH_DEEPSEEK4 ? n_head : uint32_t(1));
@@ -353,6 +363,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
+    model_params.load_mtp = true; // a model with an MTP block (qwen4exp) creates, saves and round-trips it
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;

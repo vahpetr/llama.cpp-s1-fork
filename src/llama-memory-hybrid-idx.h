@@ -321,7 +321,9 @@ public:
                             /* the indexer cache exists only if this is given */
     const layer_filter_cb & filter_idx,
                             /* [TAG_QSA_RATIO_OVERRIDE] llama_cparams::qsa_ratio, for the pooled-key cache */
-                  int32_t   qsa_ratio_override = -1);
+                  int32_t   qsa_ratio_override = -1,
+                            /* [TAG_MTP_QSA] the indexer cache's K type; GGML_TYPE_COUNT = type_k */
+                ggml_type   type_idx = GGML_TYPE_COUNT);
 
     ~llama_memory_hybrid_idx() = default;
 
@@ -343,6 +345,10 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+
+    // [TAG_MTP_QSA] without recurrent layers the (layerless) recurrent cache holds no state: positions are the attention's
+    llama_pos seq_pos_min(llama_seq_id seq_id) const override;
+    llama_pos seq_pos_max(llama_seq_id seq_id) const override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -390,6 +396,11 @@ private:
 
     // [TAG_QSA_COMPACT_BIAS]
     bool qsa_compact = false;
+
+    // [TAG_MTP_QSA] filter_recr accepts no layer (the MTP draft context): the memory behaves as the plain attention KV
+    // cache it replaces - partial seq_rm, positions and state (PARTIAL_ONLY ignored, as llama_kv_cache does) come from
+    // the attention + indexer caches; the layerless recurrent cache is skipped
+    bool recr_none = false;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {

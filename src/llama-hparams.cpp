@@ -4,6 +4,16 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
+
+// [TAG_MTP_QSA] see llama-hparams.h
+bool llama_mtp_qsa_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_MTP_QSA");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return enabled;
+}
 
 void llama_hparams::set_swa_pattern(uint32_t n_pattern, bool dense_first) {
     if (dense_first) {

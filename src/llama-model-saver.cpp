@@ -299,7 +299,13 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,      hparams.indexer_block_size);
     add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS,    hparams.indexer_local_blocks);
     add_kv(LLM_KV_ATTENTION_INDEXER_TYPES,           hparams.is_indexer_full_impl, true);
-    add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,        hparams.is_recr_impl, true);
+    if (model->arch == LLM_ARCH_QWEN4EXP && hparams.n_layer_nextn > 0) {
+        // qwen4exp reads one recurrent flag per layer, including the nextn (MTP) layers
+        const std::vector<uint32_t> is_recr(hparams.is_recr_impl.begin(), hparams.is_recr_impl.begin() + hparams.n_layer_all);
+        add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,    is_recr);
+    } else {
+        add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,    hparams.is_recr_impl, true);
+    }
     add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,      hparams.dsv4_o_group_count);
     add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,        hparams.dsv4_o_lora_rank);
     add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, hparams.dsv4_compress_rope_base);

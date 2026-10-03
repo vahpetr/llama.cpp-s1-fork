@@ -550,6 +550,25 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+bool llm_graph_input_attn_kv_hyb::can_reuse(const llm_graph_params & params) {
+    // = llm_graph_input_attn_kv::can_reuse over the hybrid context's attention half
+    const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx)->get_attn();
+
+    this->mctx = mctx;
+
+    bool res = true;
+
+    res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+
+    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    if (self_kq_vis_cells) {
+        res &= kq_vis_fa == llama_kq_vis_fa_class(params.ubatch, params.cparams);
+    }
+
+    return res;
+}
+
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
@@ -2838,14 +2857,15 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
-static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+template <typename T = llm_graph_input_attn_kv>
+static std::unique_ptr<T> build_attn_inp_kv_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
     const llama_kv_cache_context * mctx_cur) {
 
-    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
+    auto inp = std::make_unique<T>(hparams, cparams, mctx_cur);
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
@@ -2893,6 +2913,14 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+
+    return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+}
+
+llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv_hyb() const {
+    const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
+
+    auto inp = build_attn_inp_kv_impl<llm_graph_input_attn_kv_hyb>(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
