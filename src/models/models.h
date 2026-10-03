@@ -2372,6 +2372,11 @@ struct llama_model_qwen4exp : public llama_model_base {
                           float   kq_scale,
                             int   il);
 
+        // [TAG_QSA_INDEXED_FA] the scan branch's attention read through the selection's ids; the rule that picks it
+        ggml_tensor * build_qsa_indexed(llm_graph_input_attn_kv * inp, ggml_tensor * q_cur, ggml_tensor * top_k,
+                                        float kq_scale, int il, ggml_tensor * kq_mask_chunk = nullptr);
+        bool qsa_use_indexed(llm_graph_input_attn_kv * inp, int64_t n_tps, int il); // knob && FA && n_tps > 8 && supported
+
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;

@@ -8735,6 +8735,116 @@ struct test_mul_mat_reuse_across_scratch : public test_case {
     }
 };
 
+// [TAG_QSA_INDEXED_FA] mask [n_kv, n_tps, 1, n_stream] f16 + ids [W, n_tps, 1, n_stream] i32; each row W unique ids
+// (a shuffled prefix, ascending if sorted). dead: 0 = 0..30 % (floor) of the row's ids -inf; 1 = row 0 keeps one live id;
+// 2 = causal (query t sees cells < n_kv - n_tps + t + 1) and every list holds cell n_kv - 1; 3 = row 0 all dead.
+static void init_kv_ids_case(ggml_tensor * mask, ggml_tensor * ids, int dead, bool sorted) {
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ids->type == GGML_TYPE_I32);
+    const int64_t n_kv = mask->ne[0], n_tps = mask->ne[1], n_stream = mask->ne[3], W = ids->ne[0];
+    std::mt19937 gen(4242); std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+    std::vector<float> m(n_kv*n_tps*n_stream);
+    std::vector<int32_t> id(W*n_tps*n_stream), perm(n_kv);
+    for (int64_t row = 0; row < n_tps*n_stream; ++row) {
+        const int64_t n_vis = n_kv - n_tps + row % n_tps + 1;
+        float * mr = m.data() + row*n_kv; int32_t * ir = id.data() + row*W;
+        for (int64_t c = 0; c < n_kv; ++c) { mr[c] = (dead == 2 && c >= n_vis) ? -INFINITY : dis(gen); perm[c] = (int32_t) c; }
+        std::shuffle(perm.begin(), perm.end(), gen);
+        if (dead == 2) { std::iter_swap(perm.begin(), std::find(perm.begin(), perm.end(), (int32_t) (n_kv - 1))); }
+        std::copy(perm.begin(), perm.begin() + W, ir);
+        if (sorted) { std::sort(ir, ir + W); }
+        const int64_t n_dead = dead == 0 ? W*(1 + row % 30)/100 : row != 0 ? 0 : dead == 1 ? W - 1 : dead == 3 ? W : 0;
+        for (int64_t c = 0; c < n_dead; ++c) { mr[ir[W - 1 - c]] = -INFINITY; }
+    }
+    std::vector<ggml_fp16_t> m16(m.size()); ggml_fp32_to_fp16_row(m.data(), m16.data(), m.size());
+    ggml_backend_tensor_set(mask, m16.data(), 0, m16.size()*sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(ids, id.data(), 0, id.size()*sizeof(int32_t));
+}
+// the Flash-Next attention shape: head 256, 2 KV heads, GQA 12, K/V as cache views ([D, n_head_kv, n_kv] permuted)
+struct fa_indexed_io { ggml_tensor * q, * k, * v, * m, * ids; };
+static fa_indexed_io fa_indexed_new(ggml_context * ctx, ggml_type type_KV, int64_t n_tps, int64_t n_kv, int64_t W, int64_t n_stream) {
+    fa_indexed_io io;
+    io.q   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, n_tps, 24, n_stream);
+    io.k   = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type_KV, 256, 2, n_kv, n_stream), 0, 2, 1, 3);
+    io.v   = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type_KV, 256, 2, n_kv, n_stream), 0, 2, 1, 3);
+    io.m   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream); ggml_set_name(io.m, "m");
+    io.ids = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, W, n_tps, 1, n_stream);    ggml_set_name(io.ids, "ids");
+    return io;
+}
+static ggml_tensor * fa_indexed_op(ggml_context * ctx, const fa_indexed_io & io, ggml_tensor * mask, ggml_tensor * ids) {
+    ggml_tensor * out = ggml_flash_attn_ext(ctx, io.q, io.k, io.v, mask, 1.0f/16.0f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32); ggml_flash_attn_ext_set_kv_ids(out, ids);
+    return out;
+}
+static void fa_indexed_init(ggml_context * ctx, int dead, bool sorted) {
+    ggml_tensor * m = nullptr, * ids = nullptr;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->op == GGML_OP_NONE) { if (!strcmp(t->name, "m")) { m = t; } else if (!strcmp(t->name, "ids")) { ids = t; } else { init_tensor_uniform(t); } }
+    }
+    GGML_ASSERT(m && ids); // found by name: a rename must not fall through to the uniform fill
+    init_kv_ids_case(m, ids, dead, sorted);
+}
+struct test_flash_attn_ext_indexed : public test_case {
+    const ggml_type type_KV; const int64_t n_tps, n_kv, idx_W, n_stream; const int dead; const bool sorted;
+    std::string vars() override { return VARS_TO_STR7(type_KV, n_tps, n_kv, idx_W, n_stream, dead, sorted); }
+    double max_nmse_err() override { return 5e-4; }
+    test_flash_attn_ext_indexed(ggml_type type_KV, int64_t n_tps, int64_t n_kv, int64_t idx_W, int64_t n_stream = 1, int dead = 0, bool sorted = false)
+        : type_KV(type_KV), n_tps(n_tps), n_kv(n_kv), idx_W(idx_W), n_stream(n_stream), dead(dead), sorted(sorted) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const fa_indexed_io io = fa_indexed_new(ctx, type_KV, n_tps, n_kv, idx_W, n_stream);
+        ggml_tensor * out = fa_indexed_op(ctx, io, io.m, io.ids);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override { fa_indexed_init(ctx, dead, sorted); }
+};
+// spec §3.6: out = concat(indexed(sorted ids) - dense(scan mask), dense) along dim 3; the difference half must be
+// +0.0 on the CPU reference (b). The backend under test (a) is held to a relative bar on its own dense half,
+// sum(diff^2) / sum(dense^2) <= 5e-5, AND to a per-element cap max|diff| <= 5e-3 (the ratio alone would let one
+// element be off by ~0.06 at Q8_0 64/4096/2051). Estimate: uniform q/k/v in [-1, 1] at scale 1/16 give a near-uniform
+// softmax, so |dense| ~ 0.577/sqrt(W) ~ 0.013 RMS at W 2051 (the cap alone is ~1/3 of it); dropping 3 live columns
+// shifts the output by ~sqrt(3)*0.577/2051 ~ 4.9e-4 RMS, a ratio ~1.3e-3 (~25x over the bar), while the two paths
+// differ only in f16 P rounding / summation order (ratio ~1e-6). Tail-tile coverage comes from the UNSORTED indexed
+// cases (NMSE vs CPU), not from this selfcheck: its sorted ids + dead layout make the tail tile all -inf.
+// cases must be q8_0, or f16 with n_tps < GGML_FA_TILE_Q (64): the dense node must stay off the CPU tiled path to be bit-exact
+struct test_flash_attn_ext_indexed_selfcheck : public test_case {
+    const ggml_type type_KV; const int64_t n_tps, n_kv, idx_W; const int dead; const int64_t n_stream;
+    std::string vars() override { return VARS_TO_STR6(type_KV, n_tps, n_kv, idx_W, dead, n_stream) + ",selfcheck"; }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "FLASH_ATTN_EXT"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 0.0; }
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t nd = n/2; // [0, nd) = indexed - dense, [nd, n) = dense
+        double d2 = 0.0, s2 = 0.0, worst = 0.0;
+        for (size_t i = 0; i < nd; ++i) {
+            if (b[i] != 0.0f) { return 1.0; }
+            d2 += (double) a[i]*a[i]; worst = std::max(worst, (double) std::fabs(a[i]));
+        }
+        for (size_t i = nd; i < n; ++i) { s2 += (double) a[i]*a[i]; }
+        if (!(s2 > 0.0)) { return 1.0; }
+        if (worst > 5e-3) { return worst; }
+        return d2/s2 <= 5e-5 ? 0.0 : d2/s2;
+    }
+    test_flash_attn_ext_indexed_selfcheck(ggml_type type_KV, int64_t n_tps, int64_t n_kv, int64_t idx_W, int dead, int64_t n_stream = 1)
+        : type_KV(type_KV), n_tps(n_tps), n_kv(n_kv), idx_W(idx_W), dead(dead), n_stream(n_stream) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const fa_indexed_io io = fa_indexed_new(ctx, type_KV, n_tps, n_kv, idx_W, n_stream);
+        // the scan's mask, as build_qsa_scan builds it (src/models/qwen4exp.cpp:1737-1763)
+        ggml_tensor * all = ggml_fill(ctx, io.m, -INFINITY);
+        all = ggml_view_4d(ctx, all, 1, all->ne[0], all->ne[1], all->ne[3], all->nb[0], all->nb[1], all->nb[2], 0);
+        ggml_tensor * ids3 = ggml_view_4d(ctx, io.ids, io.ids->ne[0], io.ids->ne[1], io.ids->ne[3], 1,
+                                          io.ids->nb[1], io.ids->nb[2], io.ids->ne[3]*io.ids->nb[3], 0);
+        ggml_tensor * zeros = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, ids3->ne[0], ids3->ne[1], ids3->ne[2]), 0.0f);
+        ggml_tensor * sm = ggml_set_rows(ctx, all, zeros, ids3);
+        sm = ggml_view_4d(ctx, sm, sm->ne[1], sm->ne[2], 1, sm->ne[3], sm->nb[2], sm->nb[3], sm->nb[3], 0);
+        sm = ggml_add(ctx, sm, io.m);
+        ggml_tensor * dense = fa_indexed_op(ctx, io, sm, nullptr);
+        ggml_tensor * out = ggml_concat(ctx, ggml_sub(ctx, fa_indexed_op(ctx, io, io.m, io.ids), dense), dense, 3);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override { fa_indexed_init(ctx, dead, true); }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11867,6 +11977,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 2},  1025,   1, true, true,  8, 30, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    // [TAG_QSA_INDEXED_FA] indexed flash attention (docs/superpowers/specs/2026-09-24-indexed-fa-prefill-design.md §5)
+    for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        for (int64_t n_tps : { 9, 64, 228, 256 }) {                                                        // (a)
+            const int64_t kv_w[4][2] = { { 4096, 64 }, { 4096, 2051 }, { 20000, 64 }, { 20000, 2051 } };   // (n_kv, W)
+            for (const auto & p : kv_w) { test_cases.emplace_back(new test_flash_attn_ext_indexed(type_KV, n_tps, p[0], p[1])); }
+        }
+    }
+    for (int dead : { 1, 2, 3 }) { test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0, 64, 4096, 2051, 1, dead)); } // (b)(c)
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0,  64, 4096, 2051, 1, 0, true));   // (d) sorted
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0,  64, 4096, 2051, 2));            // (e)
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_F16,    9, 4096,   77, 2, 2));         // (e)(f)(c)
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0, 228, 4096,   77));               // (f)
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0,   9, 4096,    1));               // (f) one id
+    for (int64_t n_tps : { 1, 2 }) {  // n_tps <= 8 with ids: the forced plain fold, GQA_TOKENS off
+        test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0, n_tps, 4096, 2051));
+    }
+    for (int dead : { 0, 2 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_indexed_selfcheck(GGML_TYPE_Q8_0, 64, 4096, 2051, dead));
+    }
+    for (int dead : { 0, 1, 2, 3 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_indexed_selfcheck(GGML_TYPE_F16,   9, 4096,   77, dead));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_selfcheck(GGML_TYPE_F16, 9, 4096, 77, 2, /*n_stream*/ 2));
 
     // Speculative-decode verify rounds at the Flash-Next attention shape (2 KV heads, GQA 12,
     // HSK = HSV = 256, q8_0 or f16 KV, long KV).  The upstream matrix only ever runs the GQA
