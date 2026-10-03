@@ -1161,6 +1161,26 @@ static bool qwen4exp_mtp_ehproj_flat_enabled(int64_t n_tokens) {
     return enabled && n_tokens >= min_tokens;
 }
 
+// LLAMA_MTP_HNORM=grouped|joint (default grouped = the graph before this knob, node for node).
+// The MTP head's pre_fc_norm_hidden normalises the trunk's wide carrier [hc*n_embd] before
+// fc_hidden. The checkpoint's gamma is hc*n_embd wide (10 240 on Qwen3.8-Flash-Next), and the
+// reference (SGLang qwen4_exp_mtp.py, GemmaRMSNorm(hc_count*hidden_size)) takes one RMS over all
+// hc*n_embd values; grouped takes one RMS per stream. Same gamma, same eps, in both modes.
+static bool qwen4exp_mtp_hnorm_joint() {
+    static const bool joint = [] {
+        const char * s = getenv("LLAMA_MTP_HNORM");
+        bool j = false;
+        if (s != nullptr && *s != '\0') {
+            if      (strcmp(s, "joint")   == 0) { j = true;  }
+            else if (strcmp(s, "grouped") == 0) { j = false; }
+            else { GGML_ABORT("LLAMA_MTP_HNORM=%s: expected joint or grouped", s); }
+        }
+        LLAMA_LOG_WARN("qwen4exp_mtp_hnorm: mtp_hnorm = %s (LLAMA_MTP_HNORM=%s)\n", j ? "joint" : "grouped", s ? s : "unset");
+        return j;
+    }();
+    return joint;
+}
+
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for qwen4exp.
 //
 // The head folds the next token's embedding into the trunk's wide hyper-connection residual,
@@ -1220,10 +1240,20 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     auto * inp_attn = build_attn_inp_kv();
 
-    // grouped RMSNorm over the wide stream: normalise each hc stream, then scale the flattened
-    // [hc_dim] vector with the head's gamma, exactly as build_hc_mix does
-    ggml_tensor * h_norm = ggml_rms_norm(ctx0, h_state, hparams.f_norm_rms_eps);
-    h_norm = ggml_reshape_2d(ctx0, h_norm, hc_dim, n_tokens);
+    // pre_fc_norm_hidden (blk.N.nextn.hnorm, gamma [hc_dim]) over the wide stream.
+    //   grouped (default): normalise each hc stream (n_embd values) on its own, then scale the
+    //     flattened [hc_dim] vector with the head's gamma, as build_hc_mix does.
+    //   joint (LLAMA_MTP_HNORM=joint): ONE RMSNorm over all hc_dim values per token, then the same
+    //     gamma -- the reference: SGLang qwen4_exp_mtp.py applies a plain GemmaRMSNorm(hc*hidden)
+    //     to the [T, hc*hidden] carrier before splitting it into streams for fc_hidden.
+    // See qwen4exp_mtp_hnorm_joint().
+    ggml_tensor * h_norm = nullptr;
+    if (qwen4exp_mtp_hnorm_joint()) {
+        h_norm = ggml_rms_norm(ctx0, ggml_reshape_2d(ctx0, h_state, hc_dim, n_tokens), hparams.f_norm_rms_eps);
+    } else {
+        h_norm = ggml_rms_norm(ctx0, h_state, hparams.f_norm_rms_eps);
+        h_norm = ggml_reshape_2d(ctx0, h_norm, hc_dim, n_tokens);
+    }
     h_norm = ggml_mul(ctx0, h_norm, layer.nextn.hnorm);
     h_norm = ggml_reshape_3d(ctx0, h_norm, n_embd, hc, n_tokens);
     cb(h_norm, "mtp_hnorm", il);
