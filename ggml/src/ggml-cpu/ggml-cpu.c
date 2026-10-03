@@ -1451,6 +1451,82 @@ UseGgmlGemm2:;
     }
 }
 
+// ggml_compute_forward_mul_mat_rows
+
+// [TAG_QSA_POOL_REMAP] the CPU twin of GGML_OP_MUL_MAT_ROWS: gather the named rows of src0 into the work buffer, then
+// run the unchanged ggml_compute_forward_mul_mat on that contiguous [K, M, n_b] copy. The copy is the same f32 bytes
+// get_rows writes, and the product sees the same shapes, strides and threads, so it takes the same path (llamafile
+// sgemm or the vec_dot chunks) with the same reduction order as get_rows + mul_mat: the result is bit-identical.
+static size_t ggml_mul_mat_rows_gather_size(const struct ggml_tensor * dst) {
+    const struct ggml_tensor * a    = dst->src[0];
+    const struct ggml_tensor * rows = dst->src[2];
+    // a whole number of cache lines, so the mul_mat scratch behind it starts aligned
+    return GGML_PAD(ggml_row_size(a->type, a->ne[0])*ggml_nelements(rows), CACHE_LINE_SIZE);
+}
+
+static void ggml_compute_forward_mul_mat_rows(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * a    = dst->src[0];
+          struct ggml_tensor * b    = dst->src[1];
+    const struct ggml_tensor * rows = dst->src[2];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && rows->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(rows));
+
+    const int64_t K      = a->ne[0];
+    const int64_t n_rows = a->ne[1];
+    const int64_t M      = rows->ne[0];
+    const int64_t n_b    = rows->ne[1];
+    const size_t  row_sz = ggml_row_size(a->type, K);
+    const size_t  gsize  = ggml_mul_mat_rows_gather_size(dst);
+
+    GGML_ASSERT(params->wsize >= gsize);
+
+    char *          g   = (char *) params->wdata;
+    const int32_t * ids = (const int32_t *) rows->data;
+
+    // the gather: rows split evenly across the threads
+    const int64_t n   = M*n_b;
+    const int64_t dr  = (n + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, n);
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int32_t r = ids[i];
+        GGML_ASSERT(r >= 0 && r < n_rows);
+        memcpy(g + i*row_sz, (const char *) a->data + (size_t) r*a->nb[1], row_sz);
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // get_rows' output, reshaped to [K, M, n_b]: contiguous
+    struct ggml_tensor ag = *a;
+    ag.op       = GGML_OP_NONE;
+    ag.view_src = NULL;
+    ag.data     = g;
+    ag.ne[0] = K; ag.ne[1] = M; ag.ne[2] = n_b; ag.ne[3] = 1;
+    ag.nb[0] = ggml_type_size(a->type);
+    ag.nb[1] = row_sz;
+    ag.nb[2] = row_sz*M;
+    ag.nb[3] = row_sz*M*n_b;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        ag.src[i] = NULL;
+    }
+
+    struct ggml_tensor mm = *dst;
+    mm.op     = GGML_OP_MUL_MAT;
+    mm.src[0] = &ag;
+    mm.src[1] = b;
+    mm.src[2] = NULL;
+    memset(mm.op_params, 0, sizeof(mm.op_params)); // GGML_PREC_DEFAULT, no hint: what ggml_mul_mat sets
+
+    struct ggml_compute_params pmm = *params;
+    pmm.wdata = g + gsize;
+    pmm.wsize = params->wsize - gsize;
+
+    ggml_compute_forward_mul_mat(&pmm, &mm);
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1840,6 +1916,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
+            } break;
+        case GGML_OP_MUL_MAT_ROWS:
+            {
+                ggml_compute_forward_mul_mat_rows(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2341,6 +2421,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ROWS:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;
@@ -2878,6 +2959,17 @@ struct ggml_cplan ggml_graph_plan(
 
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                        }
+                    } break;
+                case GGML_OP_MUL_MAT_ROWS:
+                    {
+                        // [TAG_QSA_POOL_REMAP] the gathered rows, then what the MUL_MAT it runs needs
+                        cur = ggml_mul_mat_rows_gather_size(node);
+
+                        const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
+
+                        if (node->src[1]->type != vec_dot_type) {
+                            cur += ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID:

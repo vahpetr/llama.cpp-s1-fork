@@ -60,6 +60,38 @@ bool llama_qsa_whole_blocks() {
     return enabled;
 }
 
+int llama_qsa_pool_remap_parse(const char * s) {
+    if (s == nullptr || s[0] == '\0' || strcmp(s, "indexed") == 0) {
+        return 1;
+    }
+    if (strcmp(s, "copy") == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+bool llama_qsa_pool_remap_indexed() {
+    static const bool indexed = [] {
+        const char * s = getenv("LLAMA_QSA_POOL_REMAP");
+        const int    v = llama_qsa_pool_remap_parse(s);
+        if (v < 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_POOL_REMAP=%s is neither copy nor indexed: using indexed\n", __func__, s);
+        }
+        // WARN: the proof line must reach the server log (INFO does not)
+        if (v != 0) {
+            LLAMA_LOG_WARN("%s: qsa_pool_remap = indexed (LLAMA_QSA_POOL_REMAP=%s): the indexer score reads the pooled-key "
+                           "store through the remap (GGML_OP_MUL_MAT_ROWS), no per-layer copy of the pool\n", __func__,
+                           s != nullptr ? s : "unset");
+        } else {
+            LLAMA_LOG_WARN("%s: qsa_pool_remap = copy (LLAMA_QSA_POOL_REMAP=copy): every QSA layer copies the pool through "
+                           "the remap (get_rows) and scores the copy (mul_mat)\n", __func__);
+        }
+        return v != 0;
+    }();
+
+    return indexed;
+}
+
 // [TAG_QSA_COMPACT_BIAS] LLAMA_QSA_COMPACT_BIAS=1: read once per memory, like LLAMA_QSA_POOLED_CACHE, so the replay
 // probe can run both arms in one process
 static bool llama_qsa_compact_bias_env() {
@@ -341,6 +373,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     LLAMA_LOG_INFO("%s: LLAMA_QSA_POOLED_CACHE=1: %zu layers, ratio %u, %u block slots + 1 spare row x %u streams, "
             "idx_dim %u, f32: %zu bytes\n", __func__, ils.size(), ratio, qsa_store->n_slots, qsa_store->n_stream,
             qsa_store->idx_dim, total);
+
+    // [TAG_QSA_POOL_REMAP] read (and prove) how the score reads the store, at load
+    (void) llama_qsa_pool_remap_indexed();
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {

@@ -577,6 +577,7 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_QSA_TOP_K,
         GGML_OP_QSA_BIAS,   // [TAG_QSA_COMPACT_BIAS]
+        GGML_OP_MUL_MAT_ROWS, // [TAG_QSA_POOL_REMAP]
 
         GGML_OP_UNARY,
 
@@ -1454,6 +1455,22 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // [TAG_QSA_POOL_REMAP] ggml_mul_mat over rows of `a` picked by `rows`, as ONE node - the get_rows copy is never
+    // materialized. Element for element, on the same backend, the result is bit-identical to
+    //     ggml_mul_mat(ggml_reshape_3d(ggml_get_rows(a, rows_flat), K, M, n_b), b)
+    // (rows_flat = the M*n_b ids of `rows` in order): every backend computes it with the kernel, tiling and K
+    // reduction order its MUL_MAT would pick for that [K, M, n_b] x [K, N, n_b] product, only the address of A's
+    // row m of batch s is a[rows[m, s]].
+    //   a:      [K, n_rows]     F32, contiguous      (any row may be named any number of times)
+    //   rows:   [M, n_b]        I32, contiguous      (0 <= rows[m, s] < n_rows)
+    //   b:      [K, N, n_b]     F32
+    //   result: [M, N, n_b]     F32: result[m, n, s] = sum_k a[k, rows[m, s]] * b[k, n, s]
+    GGML_API struct ggml_tensor * ggml_mul_mat_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * rows,
+            struct ggml_tensor  * b);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

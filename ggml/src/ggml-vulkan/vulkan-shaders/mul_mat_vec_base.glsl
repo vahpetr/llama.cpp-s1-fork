@@ -44,6 +44,13 @@ layout (push_constant) uniform parameter
 uint expert_id;
 #endif
 
+#ifdef A_ROW_IDS
+// [TAG_QSA_POOL_REMAP] GGML_OP_MUL_MAT_ROWS: row r of A in batch b is row data_row_ids[b*stride_d + r] of the bound
+// A buffer (the store). Only the row's address changes (mul_mat_vec.comp, iter / iter_aligned_nonquant).
+layout (binding = 5) readonly buffer ROW_IDS {int data_row_ids[];};
+uint a_row_ids_base;
+#endif
+
 void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #ifdef MUL_MAT_ID
     const uint expert_i0 = gl_WorkGroupID.y;
@@ -71,6 +78,11 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
             expert_id * (p.batch_stride_a / QUANT_K);
 #else
             batch_idx_a * (p.batch_stride_a / QUANT_K);
+#endif
+#ifdef A_ROW_IDS
+    // the row ids are absolute rows of the store, whatever the batch
+    a_offset = 0;
+    a_row_ids_base = batch_idx * p.stride_d;
 #endif
     b_offset =
 #ifdef MUL_MAT_ID

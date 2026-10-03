@@ -1,6 +1,7 @@
 // [TAG_QSA_WHOLE_BLOCKS] The qwen4exp QSA selection (GGML_OP_QSA_TOP_K) on the CPU against the reference.
 //
-// 1. LLAMA_QSA_WHOLE_BLOCKS parser: unset / "" / "0" -> 0, "1" -> 1, anything else -> -1.
+// 1. LLAMA_QSA_WHOLE_BLOCKS parser: unset / "" / "0" -> 0, "1" -> 1, anything else -> -1. [TAG_QSA_POOL_REMAP] the
+//    LLAMA_QSA_POOL_REMAP parser: unset / "" / "indexed" -> 1, "copy" -> 0, anything else -> -1.
 // 2. Census-shaped inputs (tests/qsa-select-ref.h: one sequence, permuted cells, the +1e9 tail boost, the spare
 //    dead id, full and partly empty caches, rows at every tail residue and with fewer complete blocks than the
 //    budget), both selection forms, against a port of HF Qwen4ExpTextQSAIndexer (512 whole blocks + the tail):
@@ -89,6 +90,14 @@ static void test_parser() {
     CHECK(llama_qsa_whole_blocks_parse("1")     == 1, "parse(1)");
     for (const char * bad : { "2", "true", "yes", " 1", "1 ", "01", "-1", "on" }) {
         CHECK(llama_qsa_whole_blocks_parse(bad) == -1, "parse(\"%s\") must be invalid", bad);
+    }
+    // [TAG_QSA_POOL_REMAP] LLAMA_QSA_POOL_REMAP: unset / "" / "indexed" -> 1 (indexed), "copy" -> 0, else -1
+    CHECK(llama_qsa_pool_remap_parse(nullptr)   == 1, "remap parse(null)");
+    CHECK(llama_qsa_pool_remap_parse("")        == 1, "remap parse(\"\")");
+    CHECK(llama_qsa_pool_remap_parse("indexed") == 1, "remap parse(indexed)");
+    CHECK(llama_qsa_pool_remap_parse("copy")    == 0, "remap parse(copy)");
+    for (const char * bad : { "0", "1", "Copy", "INDEXED", " copy", "copy ", "index", "gather", "on" }) {
+        CHECK(llama_qsa_pool_remap_parse(bad) == -1, "remap parse(\"%s\") must be invalid", bad);
     }
     printf("parser: ok\n");
 }

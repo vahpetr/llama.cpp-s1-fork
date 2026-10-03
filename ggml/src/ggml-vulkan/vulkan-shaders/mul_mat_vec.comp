@@ -70,8 +70,12 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 #endif
         uint ibi = first_row*p.ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+#ifdef A_ROW_IDS
+            const uint ib = (uint(data_row_ids[a_row_ids_base + first_row + n])*p.ncols + col)/QUANT_K; // block index
+#else
             const uint ib = (ibi + col)/QUANT_K; // block index
             ibi += p.ncols;
+#endif
 
 #if K_PER_ITER == 8
             vec4 v = dequantize4(ib, iqs, a_offset);
@@ -126,8 +130,12 @@ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
 
         uint ibi = first_row*p.ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+#ifdef A_ROW_IDS
+            const uint ib = (uint(data_row_ids[a_row_ids_base + first_row + n])*p.ncols + col)/QUANT_K; // block index
+#else
             const uint ib = (ibi + col)/QUANT_K; // block index
             ibi += p.ncols;
+#endif
 
             const vec4 v = dequantize4_2aligned(ib, iqs, a_offset);
 

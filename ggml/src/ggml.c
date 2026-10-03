@@ -1086,6 +1086,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_POST",
     "QSA_TOP_K",
     "QSA_BIAS",
+    "MUL_MAT_ROWS",
 
     "UNARY",
 
@@ -1103,7 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1204,6 +1205,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "qsa_top_k(score, cell_blk, mask)",
     "qsa_bias(blk, qry, rows)",
+    "X[rows]*Y",
 
     "unary(x)",
 
@@ -1221,7 +1223,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3316,6 +3318,33 @@ void ggml_mul_mat_set_hint(
     const int32_t hint_i32 = (int32_t) hint;
 
     ggml_set_op_params_i32(a, 1, hint_i32);
+}
+
+// ggml_mul_mat_rows
+
+// [TAG_QSA_POOL_REMAP] see ggml.h: the indexer score of the qwen4exp pooled-key cache read straight from the store
+// through the remap, instead of get_rows (a full copy of the pool per layer) + mul_mat
+struct ggml_tensor * ggml_mul_mat_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * rows,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && rows->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(rows));
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(rows->ne[2] == 1 && rows->ne[3] == 1);
+    GGML_ASSERT(b->ne[0] == a->ne[0] && b->ne[2] == rows->ne[1] && b->ne[3] == 1);
+    GGML_ASSERT(!ggml_is_transposed(b));
+
+    const int64_t ne[4] = { rows->ne[0], b->ne[1], b->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT_ROWS;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = rows;
+
+    return result;
 }
 
 // ggml_mul_mat_id

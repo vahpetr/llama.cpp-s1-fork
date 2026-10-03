@@ -7336,6 +7336,193 @@ struct test_qsa_top_k_exact : public test_case {
     }
 };
 
+// [TAG_QSA_POOL_REMAP] GGML_OP_MUL_MAT_ROWS (ggml_mul_mat_rows): the qwen4exp indexer score read from the pooled-key
+// store through the remap, instead of get_rows (a copy of the whole pool, every QSA layer) + mul_mat.
+//
+//   MUL_MAT_ROWS_EXACT  the op against get_rows + mul_mat ON THE SAME BACKEND, bit for bit - the contract of the op.
+//                       The graph computes both and returns concat(idx - copy, copy - idx) along dim 1: an element is
+//                       +0 exactly where the two results are the same float (finite data), and a sign-of-zero
+//                       difference leaves a -0 in one of the halves. The CPU computes +0 everywhere (its op IS the
+//                       gather + the unchanged mul_mat), and the two outputs are compared BITWISE (err = the number of
+//                       differing bit patterns, max 0). Shapes: every kernel the plain MUL_MAT picks for an f32 A -
+//                       the mat-vec (N <= 8 on one batch, N = 1 on several), the matmul's small / medium / large
+//                       tiles, aligned (K % 8 == 0) and unaligned K, partial tiles (M not a tile multiple), batches.
+//   MUL_MAT_ROWS        the op against the CPU backend (NMSE, as MUL_MAT). In perf mode also form 1 / 2: the two
+//                       halves of the copy path the op replaces (form 1 = the get_rows gather, form 2 = the mul_mat
+//                       of the gathered copy), so copy = form 1 + form 2 against the op's form 0.
+//
+// Data modes: random (rows drawn with repeats), perm (distinct rows in random order), ident (row = block, per stream:
+// the layout after a full rebuild), spare (the upper half of the blocks names one row: the store's spare row), quant
+// (five levels in A and B: exact ties and signed zeros in the products), prod (unit-norm keys and queries, a near-
+// identity remap with 1 % of the blocks moved, as the stable slots after a restore plus some dirty reassignments).
+struct test_mul_mat_rows : public test_case {
+    enum { M_RANDOM, M_PERM, M_IDENT, M_SPARE, M_QUANT, M_PROD, M_COUNT };
+
+    const int64_t K;
+    const int64_t M;      // rows named per batch (the blocks)
+    const int64_t N;      // columns of B (heads x queries)
+    const int64_t n_b;    // batches (streams)
+    const int     mode;
+    const bool    exact;
+    const int     form;   // 0 = the op, 1 = the copy path's get_rows alone, 2 = its mul_mat alone (perf)
+
+    static const char * mode_name(int m) {
+        static const char * names[M_COUNT] = { "random", "perm", "ident", "spare", "quant", "prod" };
+        return m >= 0 && m < M_COUNT ? names[m] : "?";
+    }
+
+    // the store: each stream owns M + M/8 + 1 rows (the slots, the spare row last)
+    int64_t rows_per_stream() const { return M + M/8 + 1; }
+    int64_t n_rows()          const { return n_b*rows_per_stream(); }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return exact ? "MUL_MAT_ROWS_EXACT" : "MUL_MAT_ROWS";
+    }
+
+    std::string vars() override {
+        const std::string data = mode_name(mode);
+        return form == 0 ? VARS_TO_STR5(K, M, N, n_b, data) : VARS_TO_STR6(K, M, N, n_b, data, form);
+    }
+
+    test_mul_mat_rows(int64_t K, int64_t M, int64_t N, int64_t n_b, int mode, bool exact, int form = 0)
+        : K(K), M(M), N(N), n_b(n_b), mode(mode), exact(exact), form(form) {
+        GGML_ASSERT(mode >= 0 && mode < M_COUNT && form >= 0 && form <= 2 && !(exact && form != 0));
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+    double max_err() override { return exact ? 0.0 : max_nmse_err(); }
+    double max_err(ggml_backend_t backend) override { GGML_UNUSED(backend); return max_err(); }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!exact) {
+            return nmse(a, b, n);
+        }
+        size_t bad = 0;
+        for (size_t i = 0; i < n; i++) {
+            bad += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        }
+        return (double) bad;
+    }
+
+    // the exact form compares only its output (the products themselves are not bitwise equal to the CPU's)
+    bool run_whole_graph() override { return exact; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return form == 1 ? 0 : (uint64_t) 2*M*N*K*n_b;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, N, n_b);
+        ggml_set_name(b, "b");
+
+        if (form == 2) {
+            ggml_tensor * pooled = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, M, n_b);
+            ggml_set_name(pooled, "pooled");
+            ggml_tensor * out = ggml_mul_mat(ctx, pooled, b);
+            ggml_set_name(out, "out");
+            return out;
+        }
+
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_rows());
+        ggml_set_name(a, "a");
+        ggml_tensor * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, M, n_b);
+        ggml_set_name(rows, "rows");
+
+        if (form == 1) {
+            ggml_tensor * out = ggml_get_rows(ctx, a, ggml_reshape_1d(ctx, rows, M*n_b));
+            ggml_set_name(out, "out");
+            return out;
+        }
+
+        ggml_tensor * idx = ggml_mul_mat_rows(ctx, a, rows, b);
+        if (!exact) {
+            ggml_set_name(idx, "out");
+            return idx;
+        }
+        ggml_set_name(idx, "idx");
+
+        // the qwen4exp copy path, node for node: get_rows of the flat remap, reshaped to [K, M, n_b], then mul_mat
+        ggml_tensor * pooled = ggml_get_rows(ctx, a, ggml_reshape_1d(ctx, rows, M*n_b));
+        pooled = ggml_reshape_3d(ctx, pooled, K, M, n_b);
+        ggml_tensor * copy = ggml_mul_mat(ctx, pooled, b);
+        ggml_set_name(copy, "copy");
+
+        ggml_tensor * out = ggml_concat(ctx, ggml_sub(ctx, idx, copy), ggml_sub(ctx, copy, idx), 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0x5bd1e995u ^ (uint32_t) (mode*7919 + K*31 + M*131 + N*17 + n_b*7 + form));
+        std::uniform_real_distribution<float> u11(-1.0f, 1.0f);
+        std::normal_distribution<float>       nrm(0.0f, 1.0f);
+
+        auto fill_f32 = [&](ggml_tensor * t, int64_t row_len) {
+            const int64_t n = ggml_nelements(t);
+            std::vector<float> v(n);
+            if (mode == M_QUANT) {
+                static const float lv[5] = { -1.0f, -0.5f, 0.0f, 0.5f, 1.0f };
+                for (auto & x : v) {
+                    x = lv[rng() % 5];
+                    if (x == 0.0f && (rng() & 1)) {
+                        x = -0.0f;
+                    }
+                }
+            } else if (mode == M_PROD) {
+                for (int64_t r = 0; r < n/row_len; r++) {
+                    double ss = 0.0;
+                    for (int64_t k = 0; k < row_len; k++) {
+                        v[r*row_len + k] = nrm(rng);
+                        ss += (double) v[r*row_len + k]*v[r*row_len + k];
+                    }
+                    const float sc = ss > 0.0 ? (float) (1.0/std::sqrt(ss)) : 1.0f;
+                    for (int64_t k = 0; k < row_len; k++) {
+                        v[r*row_len + k] *= sc;
+                    }
+                }
+            } else {
+                for (auto & x : v) {
+                    x = u11(rng);
+                }
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, n*sizeof(float));
+        };
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const char * name = ggml_get_name(t);
+            if (strcmp(name, "rows") == 0) {
+                const int64_t rps = rows_per_stream();
+                std::vector<int32_t> ids(M*n_b);
+                for (int64_t s = 0; s < n_b; s++) {
+                    std::vector<int32_t> slot(rps);
+                    for (int64_t i = 0; i < rps; i++) {
+                        slot[i] = (int32_t) i;
+                    }
+                    std::shuffle(slot.begin(), slot.end(), rng);
+                    for (int64_t m = 0; m < M; m++) {
+                        int64_t r = 0;
+                        switch (mode) {
+                            case M_PERM:  r = slot[m]; break;
+                            case M_IDENT: r = m; break;
+                            case M_SPARE: r = m < M/2 ? m : rps - 1; break;
+                            case M_PROD:  r = (rng() % 100 == 0) ? (int64_t) (rng() % (uint32_t) rps) : m; break;
+                            default:      r = (int64_t) (rng() % (uint32_t) rps); break;
+                        }
+                        ids[s*M + m] = (int32_t) (s*rps + r);
+                    }
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size()*sizeof(int32_t));
+            } else if (strcmp(name, "a") == 0 || strcmp(name, "b") == 0 || strcmp(name, "pooled") == 0) {
+                fill_f32(t, t->ne[0]);
+            } else if (t->type == GGML_TYPE_F32 && !ggml_is_view_op(t->op)) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS: the qwen4exp per-block indexer bias built from the block table
 // blk [2, n_blocks, n_stream] (key, vis) and the query table qry [2, n_tps, n_stream] (tail, bit), read
 // through rows [np, n_stream] (NULL = identity). The op writes one of three constants (+0.0f, 1e9f, -inf)
@@ -11606,6 +11793,45 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_top_k_exact(65536, 3,  2, 2051, test_qsa_top_k_exact::M_QUANT,  512));
     test_cases.emplace_back(new test_qsa_top_k_exact(65536, 64, 1, 2051, test_qsa_top_k_exact::M_CENSUS, 512));
 
+    // [TAG_QSA_POOL_REMAP] the indexed score, bit for bit against get_rows + mul_mat on the backend itself:
+    // every data mode x every kernel the plain f32 MUL_MAT picks (mat-vec N 1 / 4 / 8, matmul small N 12 / 24 / 32,
+    // medium 36 / 64, large 96 / 1024), aligned K 128 and unaligned K 72 / 70, partial tiles, a deployed-depth pool
+    for (int mode = 0; mode < test_mul_mat_rows::M_COUNT; mode++) {
+        for (int64_t N : { 1, 4, 8, 12, 24, 32, 36, 64, 96 }) {
+            for (int64_t M : { 1000, 4096 }) {
+                test_cases.emplace_back(new test_mul_mat_rows(128, M, N, 1, mode, true));
+            }
+        }
+        for (int64_t K : { 72, 70 }) {
+            for (int64_t N : { 4, 24, 36, 96 }) {
+                test_cases.emplace_back(new test_mul_mat_rows(K, 777, N, 1, mode, true));
+            }
+        }
+        // two streams: the batched mat-vec (N 1), the batched matmul (N 4 / 24)
+        for (int64_t N : { 1, 4, 24 }) {
+            test_cases.emplace_back(new test_mul_mat_rows(128, 3000, N, 2, mode, true));
+        }
+        // small M (fewer rows than one tile), a prefill chunk (N 1024)
+        test_cases.emplace_back(new test_mul_mat_rows(128, 7,    24,   1, mode, true));
+        test_cases.emplace_back(new test_mul_mat_rows(128, 1,    4,    1, mode, true));
+        test_cases.emplace_back(new test_mul_mat_rows(128, 2048, 1024, 1, mode, true));
+    }
+    // the decode / verify shapes at deployed pool depths: 131072 / 262144 / 524288 cells / 4 = blocks, Q = 1 / 2 / 6
+    for (int64_t M : { 32768, 65536, 131072 }) {
+        for (int64_t N : { 4, 8, 24 }) {
+            test_cases.emplace_back(new test_mul_mat_rows(128, M, N, 1, test_mul_mat_rows::M_PROD,   true));
+            test_cases.emplace_back(new test_mul_mat_rows(128, M, N, 1, test_mul_mat_rows::M_RANDOM, true));
+        }
+    }
+    // ... and the op against the CPU (NMSE)
+    for (int mode : { test_mul_mat_rows::M_RANDOM, test_mul_mat_rows::M_PROD }) {
+        for (int64_t N : { 1, 4, 24, 96 }) {
+            test_cases.emplace_back(new test_mul_mat_rows(128, 4096, N, 1, mode, false));
+        }
+        test_cases.emplace_back(new test_mul_mat_rows(72,  777,  24, 1, mode, false));
+        test_cases.emplace_back(new test_mul_mat_rows(128, 3000, 24, 2, mode, false));
+    }
+
     // Qwen 3.8 Flash Next at the deployed context: n_kv 213000, ratio 4, width 2051, decode
     // and -ub 2048 prefill. Opt-in: the n_tps 2048 pair needs ~10 GB of backend and as much
     // host memory for the reference, and runs for a while.
@@ -12114,6 +12340,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_qsa_top_k_exact(n_kv, n_tps, 1, 2051, test_qsa_top_k_exact::M_CENSUS, 512));
         }
     }
+
+    // [TAG_QSA_POOL_REMAP] the indexer score at decode (Q 1: N 4) / verify (Q 6: N 24) at pool depths 131072 / 262144 /
+    // 524288 cells (32768 / 65536 / 131072 blocks): the op (form 0) against the copy path it replaces, get_rows
+    // (form 1) + mul_mat of the copy (form 2); remap near-identity (prod) and fully shuffled (perm)
+    for (int64_t M : { 32768, 65536, 131072 }) {
+        for (int64_t N : { 4, 24 }) {
+            for (int form = 0; form <= 2; form++) {
+                test_cases.emplace_back(new test_mul_mat_rows(128, M, N, 1, test_mul_mat_rows::M_PROD, false, form));
+            }
+            test_cases.emplace_back(new test_mul_mat_rows(128, M, N, 1, test_mul_mat_rows::M_PERM, false, 0));
+        }
+    }
+
+    // [TAG_QSA_POOL_REMAP] the selected-K/V gather of the same verify graph ([TAG_QSA_GATHER_Q8]: q8_0 cells of 2 x 256
+    // values = 136 words copied by 512-invocation workgroups), Q = 1 / 6 windows of 2051 cells from a 524288-cell cache
+    test_cases.emplace_back(new test_get_rows_type(GGML_TYPE_Q8_0, 512, 524288, 2051,   1, 1, false));
+    test_cases.emplace_back(new test_get_rows_type(GGML_TYPE_Q8_0, 512, 524288, 2051*6, 1, 1, false));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

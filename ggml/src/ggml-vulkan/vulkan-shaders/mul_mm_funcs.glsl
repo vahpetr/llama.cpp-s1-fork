@@ -21,7 +21,11 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 #if LOAD_VEC_A == 8
             if (ALIGNED != 0) {
+#ifdef A_ROW_IDS
+                const uint idx = a_row_of(idx_m) * p.stride_a / LOAD_VEC_A + pos_a + row;
+#else
                 const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+#endif
                 const uint k_pair = row * LOAD_VEC_A / 2;
                 FLOAT_TYPEV8 aa = FLOAT_TYPEV8(data_a[idx]);
                 store_a(col, k_pair,     aa[0].xy);
@@ -32,7 +36,11 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             }
 #elif LOAD_VEC_A == 4
             if (ALIGNED != 0) {
+#ifdef A_ROW_IDS
+                const uint idx = a_row_of(idx_m) * p.stride_a / LOAD_VEC_A + pos_a + row;
+#else
                 const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+#endif
                 const uint k_pair = row * LOAD_VEC_A / 2;
                 FLOAT_TYPEV4 aa = FLOAT_TYPEV4(data_a[idx]);
                 store_a(col, k_pair,     aa.xy);
@@ -40,7 +48,11 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                 return;
             }
 #endif
+#ifdef A_ROW_IDS
+            const uint idx = a_row_of(idx_m) * p.stride_a + pos_a + row * 2;
+#else
             const uint idx = pos_a + col * p.stride_a + row * 2;
+#endif
             if (idx_m < p.M && block + row * 2 + 1 < end_k) {
                 store_a(col, row, FLOAT_TYPEV2(data_a_scalar[idx],
                                                data_a_scalar[idx + 1]));

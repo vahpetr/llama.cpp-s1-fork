@@ -1600,6 +1600,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     ggml_tensor * pooled = nullptr;
 
+    // [TAG_QSA_POOL_REMAP] LLAMA_QSA_POOL_REMAP=indexed (default): instead of `pooled`, the store and the remap the
+    // score reads it through (a dirty-list graph only; the full pool has no remap and keeps `pooled`)
+    ggml_tensor * pool_store = nullptr;
+    ggml_tensor * pool_remap = nullptr;
+
     if (pooled_cache) {
         // [TAG_QSA_POOLED_CACHE] (M3) one update per layer, before the selection (and every [TAG_QSA_CHUNK]
         // chunk of it) reads it, in the order: (i) the raw indexer write above, (ii) the pooling of the dirty
@@ -1653,14 +1658,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                     ggml_reshape_2d(ctx0, fresh, idx_dim, cap*n_stream), inp->dirty_dst);
             ggml_format_name(st, "indexer_k_store-%d", il);
 
-            pooled = ggml_get_rows(ctx0, st, inp->remap);
-            pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+            if (llama_qsa_pool_remap_indexed()) {
+                // [TAG_QSA_POOL_REMAP] no copy: (iv) is folded into the score, which reads row remap[b] of the store
+                // (after (iii), through st) for block b - ggml_mul_mat_rows, bit-identical to get_rows + mul_mat. The
+                // remap input is shared by every layer of this ratio; the store is the layer's own.
+                pool_store = st;
+                pool_remap = ggml_reshape_2d(ctx0, inp->remap, n_blocks, n_stream);
+            } else {
+                pooled = ggml_get_rows(ctx0, st, inp->remap);
+                pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+            }
         }
     } else {
         pooled = build_qsa_pool(k_all, inp->blk_cells, inp->blk_pos, n_blocks, n_stream, sections,
                 "indexer_k_pooled", il);
     }
-    cb(pooled, "indexer_k", il);
+    if (pooled) {
+        cb(pooled, "indexer_k", il);
+    }
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
@@ -1681,6 +1696,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (prep) {
         prep->inp      = inp;
         prep->pooled   = pooled;
+        prep->pool_store = pool_store;
+        prep->pool_remap = pool_remap;
         prep->q        = q;
         prep->kq_mask  = kq_mask;
         prep->width    = width;
@@ -1696,7 +1713,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_build_forward_expand(gf, bias);
     }
 
-    return build_qsa_select(inp, pooled, q, bias, kq_mask, width, blk_bias, il);
+    return build_qsa_select(inp, pooled, q, bias, kq_mask, width, blk_bias, il, pool_store, pool_remap);
 }
 
 // [TAG_QSA_COMPACT_BIAS] the two table inputs that replace the [n_blocks, n_tps, n_stream] f32 plane
@@ -1727,15 +1744,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
         ggml_tensor *         kq_mask,
         int64_t               width,
         bool                  blk_bias,
-        int                   il) {
+        int                   il,
+        ggml_tensor *         pool_store,
+        ggml_tensor *         pool_remap) {
+    GGML_ASSERT((pooled != nullptr) != (pool_store != nullptr && pool_remap != nullptr));
+
     const int64_t n_idx_h  = hparams.indexer_n_head;
-    const int64_t n_blocks = pooled->ne[1];
+    const int64_t n_blocks = pooled ? pooled->ne[1] : pool_remap->ne[0];
     const int64_t n_kv     = inp->cell_blk->ne[0];
     const int64_t n_tps    = q->ne[1]/n_idx_h;
     const int64_t n_stream = q->ne[2];
 
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled, q);
+    // [TAG_QSA_POOL_REMAP] the same product read straight from the store: [n_blocks, n_idx_h*n_tps, n_stream] either way
+    ggml_tensor * score = pooled ? ggml_mul_mat(ctx0, pooled, q) : ggml_mul_mat_rows(ctx0, pool_store, pool_remap, q);
     score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
     score = ggml_relu(ctx0, score);
 
@@ -2033,7 +2055,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
             }
         }
 
-        ggml_tensor * top_k = build_qsa_select(prep.inp, prep.pooled, q_idx, bias_c, mask_c, width, prep.blk_bias, il);
+        ggml_tensor * top_k = build_qsa_select(prep.inp, prep.pooled, q_idx, bias_c, mask_c, width, prep.blk_bias, il,
+                prep.pool_store, prep.pool_remap);
 
         if (np > nc) {
             // [TAG_QSA_CHUNK_PAD] THE CUT: from here on only the nc real queries exist - the ids and the mask rows

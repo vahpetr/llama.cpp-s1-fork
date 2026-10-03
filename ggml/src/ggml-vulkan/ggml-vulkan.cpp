@@ -988,6 +988,9 @@ struct vk_device_struct {
     vk::DescriptorSetLayout dsl;
 
     vk_matmul_pipeline pipeline_matmul_f32 {};
+    // [TAG_QSA_POOL_REMAP] GGML_OP_MUL_MAT_ROWS: pipeline_matmul_f32's twins with A's rows named by a row-id buffer
+    // (same SPIR-V defines + A_ROW_IDS, same spec constants / tiles / alignment); empty on coopmat2 devices
+    vk_matmul_pipeline pipeline_matmul_f32_rows {};
     vk_matmul_pipeline pipeline_matmul_f32_f16 {};
     vk_matmul_pipeline pipeline_matmul_bf16 {};
     vk_matmul_pipeline2 pipeline_matmul_f16;
@@ -1011,6 +1014,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+    // [TAG_QSA_POOL_REMAP] the twins of pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32][i] for GGML_OP_MUL_MAT_ROWS
+    vk_pipeline pipeline_dequant_mul_mat_vec_rows_f32_f32[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
@@ -2657,7 +2662,7 @@ static uint32_t ggml_vk_env_dmmv_rm(const char * name, uint32_t def, uint32_t ma
 }
 
 static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
-    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MUL_MAT_ROWS) {
         const uint64_t m     = node->ne[0];
         const uint64_t n     = node->ne[1];
         const uint64_t k     = node->src[1]->ne[0];
@@ -2774,13 +2779,14 @@ class vk_perf_logger {
         if (node->op == GGML_OP_UNARY) {
             return fusion_str + ggml_unary_op_name(ggml_get_unary_op(node));
         }
-        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        // [TAG_QSA_POOL_REMAP] MUL_MAT_ROWS[_VEC] f32 m=<blocks> n=<heads x queries> k=<idx_dim>, the indexer score
+        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MUL_MAT_ROWS) {
             const uint64_t m     = node->ne[0];
             const uint64_t n     = node->ne[1];
             const uint64_t k     = node->src[1]->ne[0];
             const uint64_t batch = node->ne[2] * node->ne[3];
             std::string    name  = ggml_op_name(node->op);
-            if ((node->op == GGML_OP_MUL_MAT && n <= mul_mat_vec_max_cols) ||
+            if (((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ROWS) && n <= mul_mat_vec_max_cols) ||
                 (node->op == GGML_OP_MUL_MAT_ID && node->src[2]->ne[1] == 1)) {
                 name += "_VEC";
             }
@@ -5134,6 +5140,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (!device->pipeline_matmul_f32) {
         device->pipeline_matmul_f32 = std::make_shared<vk_matmul_pipeline_struct>();
     }
+    if (!device->pipeline_matmul_f32_rows) {
+        device->pipeline_matmul_f32_rows = std::make_shared<vk_matmul_pipeline_struct>();
+    }
     if (!device->pipeline_matmul_f32_f16) {
         device->pipeline_matmul_f32_f16 = std::make_shared<vk_matmul_pipeline_struct>();
     }
@@ -5495,6 +5504,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         } \
 
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
+        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_rows, matmul_f32_f32_rows, , wg_denoms, warptile, vk_mat_mat_push_constants, 4, ); // [TAG_QSA_POOL_REMAP]
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_f16, matmul_f32_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16_f32, matmul_f16_f32, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
@@ -5683,6 +5693,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM(TYPE, PIPELINE_NAME . f32acc, NAMELC, , WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
 
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
+        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_rows, matmul_f32_f32_rows, , wg_denoms, warptile, vk_mat_mat_push_constants, 4, , 0); // [TAG_QSA_POOL_REMAP]
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_f16, matmul_f32_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16_f32, matmul_f16_f32, wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
@@ -5859,6 +5870,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC "_s", NAMELC ## _fp32_len, NAMELC ## _fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, 1);   \
 
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
+        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_rows, matmul_f32_f32_rows, , wg_denoms, warptile, vk_mat_mat_push_constants, 4, , 0); // [TAG_QSA_POOL_REMAP]
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_f16, matmul_f32_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_F16, pipeline_matmul_f16.f32acc, matmul_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_F16, pipeline_matmul_f16_f32.f32acc, matmul_f16_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
@@ -6083,6 +6095,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_f32, 1, 1}, {wg_size_subgroup, rm_f32, i+1}, 1, false, use_subgroups, force_subgroup_size);
+            // [TAG_QSA_POOL_REMAP] its GGML_OP_MUL_MAT_ROWS twin: the same everything, plus the row ids at binding 5
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_rows_f32_f32[w][i], "mul_mat_vec_rows_f32_f32_f32", arr_dmmv_rows_f32_f32_f32_len[reduc], arr_dmmv_rows_f32_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings + 1, sizeof(vk_mat_vec_push_constants), {rm_f32, 1, 1}, {wg_size_subgroup, rm_f32, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32",  arr_dmmv_f16_f32_f32_len[reduc],  arr_dmmv_f16_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f32_f32", arr_dmmv_bf16_f32_f32_len[reduc], arr_dmmv_bf16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f32_f32", arr_dmmv_q1_0_f32_f32_len[reduc], arr_dmmv_q1_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
@@ -9987,7 +10001,7 @@ static void ggml_vk_matmul(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t split_k, uint32_t batch, uint32_t ne02, uint32_t ne12, uint32_t broadcast2, uint32_t broadcast3,
-        uint32_t padded_n) {
+        uint32_t padded_n, const vk_subbuffer * row_ids = nullptr) {
         VK_LOG_DEBUG("ggml_vk_matmul(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), split_k: (" << (split_k_buffer.buffer != nullptr ? split_k_buffer.buffer->buffer : VK_NULL_HANDLE) << ", " << split_k_buffer.offset << ", " << split_k_buffer.size << "), m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", split_k: " << split_k << ", batch: " << batch << ", ne02: " << ne02 << ", ne12: " << ne12 << ", broadcast2: " << broadcast2 << ", broadcast3: " << broadcast3 << ", padded_n: " << padded_n << ")");
     if (split_k == 1) {
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(batch, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
@@ -9997,7 +10011,12 @@ static void ggml_vk_matmul(
             uint32_t groups_z = std::min(batch - base_work_group_z, ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
 
             const vk_mat_mat_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k, ne02, ne12, broadcast2, broadcast3, padded_n };
-            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, { m, n, groups_z });
+            if (row_ids) {
+                // [TAG_QSA_POOL_REMAP] a matmul_f32_f32_rows twin: the row ids at binding 3
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, *row_ids }, pc, { m, n, groups_z });
+            } else {
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, { m, n, groups_z });
+            }
             base_work_group_z += groups_z;
         }
         return;
@@ -10021,7 +10040,11 @@ static void ggml_vk_matmul(
 
         const vk_mat_mat_push_constants pc1 = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k_split, ne02, ne12, broadcast2, broadcast3, padded_n };
         // Make sure enough workgroups get assigned for split k to work
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, split_k_buffer }, pc1, { (CEIL_DIV(m, pipeline->wg_denoms[0]) * pipeline->wg_denoms[0]) * split_k, n, groups_z });
+        if (row_ids) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, split_k_buffer, *row_ids }, pc1, { (CEIL_DIV(m, pipeline->wg_denoms[0]) * pipeline->wg_denoms[0]) * split_k, n, groups_z });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, split_k_buffer }, pc1, { (CEIL_DIV(m, pipeline->wg_denoms[0]) * pipeline->wg_denoms[0]) * split_k, n, groups_z });
+        }
         base_work_group_z += groups_z;
     }
     ggml_vk_sync_buffers(ctx, subctx);
@@ -10355,7 +10378,28 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
     return pipeline;
 }
 
-static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
+// [TAG_QSA_POOL_REMAP] the twin of a pipeline_matmul_f32 pipeline in pipeline_matmul_f32_rows (same slot: s/m/l x
+// aligned/unaligned), or nullptr
+static vk_pipeline ggml_vk_matmul_f32_rows_twin(const vk_device & device, const vk_pipeline & p) {
+    const vk_matmul_pipeline & a = device->pipeline_matmul_f32;
+    const vk_matmul_pipeline & b = device->pipeline_matmul_f32_rows;
+    if (!a || !b || !p) {
+        return nullptr;
+    }
+    if (p == a->l)   { return b->l;   }
+    if (p == a->m)   { return b->m;   }
+    if (p == a->s)   { return b->s;   }
+    if (p == a->a_l) { return b->a_l; }
+    if (p == a->a_m) { return b->a_m; }
+    if (p == a->a_s) { return b->a_s; }
+    return nullptr;
+}
+
+// row_ids != nullptr [TAG_QSA_POOL_REMAP]: src0 describes the get_rows copy ([K, M, n_b], contiguous) whose buffer
+// position is the store's, row_ids_a_bytes the store's size; every decision below is made for that src0, exactly as
+// for the plain MUL_MAT, and only the chosen pipeline is swapped for its row-id twin
+static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k,
+                                  const ggml_tensor * row_ids = nullptr, uint64_t row_ids_a_bytes = 0) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
@@ -10447,6 +10491,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
 
+    if (row_ids) {
+        // [TAG_QSA_POOL_REMAP] the plain MUL_MAT's choice, on its row-id twin (supports_op guarantees the f32 x f32
+        // matmul without any conversion pass)
+        GGML_ASSERT(mmp == ctx->device->pipeline_matmul_f32 && !quantize_y && !qx_needs_dequant && !x_non_contig);
+        pipeline = ggml_vk_matmul_f32_rows_twin(ctx->device, pipeline);
+        GGML_ASSERT(pipeline != nullptr);
+    }
+
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
@@ -10460,7 +10512,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
 
-    const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
+    // [TAG_QSA_POOL_REMAP] with row ids A is bound whole: the store, not M rows of it
+    const uint64_t qx_sz = row_ids ? row_ids_a_bytes : ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
     const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
@@ -10612,6 +10665,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
+    // [TAG_QSA_POOL_REMAP] the row ids, bound whole
+    vk_subbuffer d_ids {};
+    if (row_ids) {
+        d_ids = ggml_vk_tensor_subbuffer(ctx, row_ids);
+    }
+
     // compute
     ggml_vk_matmul(
         ctx, subctx, pipeline,
@@ -10619,7 +10678,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
         ne01, ne11, ne10,
         ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
-        split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
+        split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n, row_ids ? &d_ids : nullptr
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
@@ -11264,6 +11323,112 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
+    }
+}
+
+// [TAG_QSA_POOL_REMAP] GGML_OP_MUL_MAT_ROWS = mul_mat(get_rows(a, rows) as [K, M, n_b], b) without the copy.
+// The dispatch is made for `av`, a descriptor of that copy (contiguous [K, M, n_b] f32) placed at the store's
+// buffer position, by the very rules ggml_vk_mul_mat applies to the plain MUL_MAT (mat-vec for N <= 8 columns on a
+// single batch or N == 1, else the matmul with its tile / alignment / split_k choice). Only the chosen pipeline is
+// replaced by its row-id twin, which differs from it in A's addresses alone - so the reduction order and every
+// rounding are the plain MUL_MAT's and the result is bit-identical to get_rows + mul_mat on this device.
+static void ggml_vk_mul_mat_vec_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * av,
+                                     const ggml_tensor * a, const ggml_tensor * b, const ggml_tensor * rows, ggml_tensor * dst) {
+    const uint64_t ne00 = av->ne[0];
+    const uint64_t ne01 = av->ne[1];
+    const uint64_t ne02 = av->ne[2];
+    const uint64_t ne03 = av->ne[3];
+
+    const uint64_t ne10 = b->ne[0];
+    const uint64_t ne11 = b->ne[1];
+    const uint64_t ne12 = b->ne[2];
+    const uint64_t ne13 = b->ne[3];
+
+    const uint64_t ne20 = dst->ne[0];
+    const uint64_t ne21 = dst->ne[1];
+
+    const uint64_t r2 = ne12 / ne02;
+    const uint64_t r3 = ne13 / ne03;
+
+    GGML_ASSERT(ne11 == 1 || ne12 * ne13 == 1);
+    const bool batch_n = ne11 > 1;
+
+    // the plain MUL_MAT's pipeline (ggml_vk_mul_mat_vec_q_f16: f32 A never takes the q8_1 mmvq path), then its twin
+    const vk_pipeline dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, GGML_TYPE_F32, GGML_TYPE_F32, ne11, ne20, ne00);
+    vk_pipeline twin = nullptr;
+    for (uint32_t w = 0; w < DMMV_WG_SIZE_COUNT && !twin; ++w) {
+        for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
+            if (dmmv && ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32][i] == dmmv) {
+                twin = ctx->device->pipeline_dequant_mul_mat_vec_rows_f32_f32[w][i];
+                break;
+            }
+        }
+    }
+    GGML_ASSERT(twin != nullptr);
+    if (ggml_nbytes(av) > ctx->device->properties.limits.maxStorageBufferRange) {
+        twin = ggml_vk_get_64b_indexing_pipeline(ctx, twin);
+    }
+
+    vk_subbuffer d_D  = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer d_X  = ggml_vk_tensor_subbuffer(ctx, a);
+    vk_subbuffer d_Y  = ggml_vk_tensor_subbuffer(ctx, b);
+    vk_subbuffer d_ID = ggml_vk_tensor_subbuffer(ctx, rows);
+
+    // as ggml_vk_mul_mat_vec_q_f16 for contiguous f32 A and B
+    const uint32_t stride_batch_x = batch_n ? 0 : ne00*ne01;
+    const uint32_t stride_batch_y = batch_n ? ne10 : (ne10*ne11);
+    const uint32_t stride_batch_d = batch_n ? ne20 : (ne20*ne21);
+
+    const uint32_t max_groups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+
+    uint32_t groups_x = ne01;
+    uint32_t groups_z = 1;
+
+    if (ne01 > max_groups_x) {
+        groups_z = 64;
+        groups_x = CEIL_DIV(groups_x, groups_z);
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, twin, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
+
+    uint32_t base_work_group_y = 0;
+    while (base_work_group_y < ne12 * ne13) {
+        uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+        const vk_mat_vec_push_constants pc = {
+            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+            stride_batch_x, stride_batch_y, stride_batch_d,
+            0u, base_work_group_y,
+            (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+        };
+        // the unused fusion bindings 3 and 4 alias D, as in the plain dispatch
+        ggml_vk_dispatch_pipeline(ctx, subctx, twin, { d_X, d_Y, d_D, d_D, d_D, d_ID }, pc, { groups_x, groups_y, groups_z });
+        base_work_group_y += groups_y;
+    }
+}
+
+static void ggml_vk_mul_mat_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * dst = cgraph->nodes[node_idx];
+    const ggml_tensor * a    = dst->src[0];
+    const ggml_tensor * b    = dst->src[1];
+    const ggml_tensor * rows = dst->src[2];
+
+    // the get_rows copy the plain path multiplies: [K, M, n_b] contiguous f32, at the store's buffer position (only
+    // shapes / strides / type are read from it to choose the kernel; data, buffer and offsets are the store's)
+    ggml_tensor av = *a;
+    av.ne[0] = a->ne[0];
+    av.ne[1] = rows->ne[0];
+    av.ne[2] = rows->ne[1];
+    av.ne[3] = 1;
+    av.nb[0] = ggml_type_size(a->type);
+    av.nb[1] = av.nb[0]*av.ne[0];
+    av.nb[2] = av.nb[1]*av.ne[1];
+    av.nb[3] = av.nb[2]*av.ne[2];
+
+    // ggml_vk_mul_mat's branch for an f32 A (no split of A, no Hadamard hint, not f16 / permuted)
+    if (dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && b->ne[2] * b->ne[3] == 1)) {
+        ggml_vk_mul_mat_vec_rows(ctx, subctx, &av, a, b, rows, dst);
+    } else {
+        ggml_vk_mul_mat_q_f16(ctx, subctx, &av, b, dst, false, rows, ggml_nbytes(a));
     }
 }
 
@@ -18006,6 +18171,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_mul_mat_id(ctx, compute_ctx, cgraph, node_idx);
 
         break;
+    case GGML_OP_MUL_MAT_ROWS: // [TAG_QSA_POOL_REMAP]
+        ggml_vk_mul_mat_rows(ctx, compute_ctx, cgraph, node_idx);
+
+        break;
 
     case GGML_OP_FLASH_ATTN_EXT:
         ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
@@ -21655,6 +21824,24 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 // [TAG_QSA_TOPK_V2] either kernel (both forms); the dispatch picks v2 when the device enabled it
                 return device->pipeline_topk_radix_qsa != nullptr || device->qsa_topk_v2;
             }
+        case GGML_OP_MUL_MAT_ROWS:
+            {
+                // [TAG_QSA_POOL_REMAP] the f32 x f32 product of the row-id twins: a contiguous f32 store, contiguous
+                // i32 row ids, a contiguous f32 B (the plain f32 MUL_MAT then needs no conversion pass), and no
+                // coopmat2 (whose f32 matmul converts A to f16 first: no twin exists there)
+                const ggml_tensor * a    = op->src[0];
+                const ggml_tensor * b    = op->src[1];
+                const ggml_tensor * rows = op->src[2];
+                if (device->coopmat2 || !a || !b || !rows ||
+                    a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || rows->type != GGML_TYPE_I32 || op->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(rows) || !ggml_is_contiguous(op) ||
+                    a->ne[2] != 1 || a->ne[3] != 1 || b->ne[3] != 1) {
+                    return false;
+                }
+                // A is bound whole (no M split of a huge A, as the plain MUL_MAT would do)
+                const uint64_t range = device->properties.limits.maxStorageBufferRange;
+                return ggml_nbytes(a) <= range && (uint64_t) ggml_row_size(a->type, a->ne[0])*ggml_nelements(rows) <= range;
+            }
         case GGML_OP_QSA_BIAS:
             {
                 // [TAG_QSA_COMPACT_BIAS] I32 contiguous tables (and rows), an F32 contiguous result
@@ -22503,6 +22690,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {
             tensor_clone = ggml_mul_mat_id(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
+        } else if (tensor->op == GGML_OP_MUL_MAT_ROWS) { // [TAG_QSA_POOL_REMAP]
+            tensor_clone = ggml_mul_mat_rows(ggml_ctx, src_clone[0], src_clone[2], src_clone[1]);
         } else if (tensor->op == GGML_OP_SUB) {
             tensor_clone = ggml_sub(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL) {

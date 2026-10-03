@@ -2326,6 +2326,8 @@ struct llama_model_qwen4exp : public llama_model_base {
         struct qsa_prep {
             llm_graph_input_qsa * inp      = nullptr;
             ggml_tensor *         pooled   = nullptr; // [idx_dim, n_blocks, n_stream]
+            ggml_tensor *         pool_store = nullptr; // [TAG_QSA_POOL_REMAP] instead of pooled: the store ...
+            ggml_tensor *         pool_remap = nullptr; // ... and the remap [n_blocks, n_stream] the score reads it through
             ggml_tensor *         q        = nullptr; // [idx_dim, n_idx_h*n_tps, n_stream]
             ggml_tensor *         kq_mask  = nullptr; // [n_kv, n_tps, 1, n_stream]
             int64_t               width    = 0;
@@ -2403,6 +2405,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         // the query-dependent half of build_qsa_top_k: score + select for the queries in q
+        // pooled: the [idx_dim, n_blocks, n_stream] keys, or nullptr with pool_store / pool_remap set
+        // [TAG_QSA_POOL_REMAP]: the store and the [n_blocks, n_stream] remap the score reads it through
         ggml_tensor * build_qsa_select(
             llm_graph_input_qsa * inp,
                     ggml_tensor * pooled,
@@ -2411,7 +2415,9 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * kq_mask,
                         int64_t   width,
                            bool   blk_bias,
-                            int   il);
+                            int   il,
+                    ggml_tensor * pool_store = nullptr,
+                    ggml_tensor * pool_remap = nullptr);
 
         // [TAG_QSA_COMPACT_BIAS] the qsa_blk/qsa_qry inputs of LLAMA_QSA_COMPACT_BIAS=1
         void build_qsa_compact_inputs(

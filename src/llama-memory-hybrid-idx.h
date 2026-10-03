@@ -19,6 +19,20 @@ int  llama_qsa_whole_blocks_parse(const char * s);
 bool llama_qsa_whole_blocks();
 
 //
+// [TAG_QSA_POOL_REMAP] LLAMA_QSA_POOL_REMAP=copy|indexed (default indexed) - only with LLAMA_QSA_POOLED_CACHE=1 (the
+// remap exists only there). copy: every QSA layer of a graph with a dirty list copies the whole pool into the compact
+// block order (get_rows of the store through the remap, n_blocks x idx_dim f32 read + written per layer) and scores
+// that copy (mul_mat). indexed: the score reads the store through the remap itself (GGML_OP_MUL_MAT_ROWS), the copy is
+// never made. EXACT: the backends compute MUL_MAT_ROWS with the plain MUL_MAT's kernel and reduction order, so scores,
+// selections and logits are bit-identical; the knob is an A/B and rollback switch, not a model-output knob.
+//
+// the parser: 1 = indexed for unset / "" / "indexed", 0 = copy for "copy", -1 for anything else (WARN, treated as 1)
+int  llama_qsa_pool_remap_parse(const char * s);
+// the knob, read once per process; the first call logs the proof line `qsa_pool_remap = indexed` / `= copy` at WARN
+// (the memory calls it when it creates the pooled-key cache, so the line is in the load log)
+bool llama_qsa_pool_remap_indexed();
+
+//
 // [TAG_QSA_POOLED_CACHE] (M3 v1) the pooled-key cache
 //
 // LLAMA_QSA_POOLED_CACHE=1 (read when the memory is created, default 0 = off) keeps the indexer's

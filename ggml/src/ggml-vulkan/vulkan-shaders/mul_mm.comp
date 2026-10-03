@@ -70,6 +70,13 @@ layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
 #endif
 
+#ifdef A_ROW_IDS
+// [TAG_QSA_POOL_REMAP] GGML_OP_MUL_MAT_ROWS: row m of A in batch b is row data_row_ids[b*M + m] of the bound A
+// buffer (the store), so no gathered copy of A exists. Only A's addresses change: the tiles, the shared memory,
+// the K loop and every multiply-add are this shader's, so the result is the plain MUL_MAT's bit for bit.
+layout (binding = 3) readonly buffer ROW_IDS {int data_row_ids[];};
+#endif
+
 layout (push_constant) uniform parameter
 {
     uint M;
@@ -140,6 +147,15 @@ shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
 shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #endif
 
+#ifdef A_ROW_IDS
+uint a_row_ids_base;
+
+// the A row of output row idx_m; a partial last tile's rows past M read the last named row (never stored)
+uint a_row_of(const uint idx_m) {
+    return uint(data_row_ids[a_row_ids_base + min(idx_m, p.M - 1)]);
+}
+#endif
+
 #include "mul_mm_id_funcs.glsl"
 #include "mul_mm_funcs.glsl"
 
@@ -178,6 +194,9 @@ void main() {
     const uint i02 = i12 / p.broadcast2;
 
     const uint batch_idx_a = i03 * p.ne02 + i02;
+#endif
+#ifdef A_ROW_IDS
+    a_row_ids_base = batch_idx * p.M;
 #endif
 
     const uint blocks_m = (p.M + BM - 1) / BM;
@@ -268,6 +287,10 @@ void main() {
     const uint end_k = min(p.K, (ik + 1) * p.k_split);
 #endif
 
+#ifdef A_ROW_IDS
+    // [TAG_QSA_POOL_REMAP] the K offset alone: load_a_to_shmem adds each loaded row's base from data_row_ids
+    uint pos_a = start_k / LOAD_VEC_A_EFF;
+#else
     uint pos_a =
 #ifdef MUL_MAT_ID
         expert_idx * (p.batch_stride_a / LOAD_VEC_A_EFF) +
@@ -275,6 +298,7 @@ void main() {
         batch_idx_a * (p.batch_stride_a / LOAD_VEC_A_EFF) +
 #endif
         (ir * BM * p.stride_a + start_k) / LOAD_VEC_A_EFF;
+#endif
 #ifdef MUL_MAT_ID
     uint pos_b = 0;
 #else
