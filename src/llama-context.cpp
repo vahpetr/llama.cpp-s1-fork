@@ -73,6 +73,12 @@ static const char * sched_prof_ctx_name(llama_context_type ctx_type) {
 //   kqvis-prof: ctx=<main|mtp> mode=<mask|vis|none|both> class=<dec|pp> win=<n> reason=<full|class|mode|idle|exit>
 //     graphs reused tok nkv_min nkv_max nkv_avg build_us inputs_us fill_us fill_avg in_wait_us in_copy_us kq_copy_us
 //     kq_kib compute_us compute_avg sync_us sync_avg n_sync t0_ms t1_ms
+//     plan_us n_plan plan_avg plan_inc cen_inc cen_full fb=<mark>/<shape>/<shrink>/<region>
+// [TAG_QSA_CENSUS_INC] plan_* (appended; all 0 without LLAMA_QSA_POOLED_CACHE): plan_us = the QSA store plan time of the window
+// (census + stamps + slot plan, llama_qsa_pooled_store::stats.t_plan_us; it runs inside build_us), n_plan = plans,
+// plan_avg = plan_us/n_plan, plan_inc = plans whose every stream took the incremental fast path, cen_inc / cen_full =
+// stream censuses fast / full, fb = the full ones by reason: mark (a mutator's full-census mark or the first plan), shape
+// (> 1 sequence, ranked / dup, oor), shrink (n_kv shrank), region (re-grouped region too large)
 // per graph: build = process_ubatch() start .. set_inputs (apply, reuse check, build + alloc); inputs = all set_inputs;
 // fill = the KQ mask / metadata fill inside it; compute = graph_compute() host time, which contains the scheduler's
 // user-input uploads (in_wait = the synchronize before each upload, in_copy = the uploads, kq_copy/kq_kib = the
@@ -95,12 +101,16 @@ void llama_context::kqvis_prof_flush(const char * reason) const {
                 " nkv_min=%" PRId64 " nkv_max=%" PRId64 " nkv_avg=%.0f build_us=%" PRId64 " inputs_us=%" PRId64
                 " fill_us=%" PRId64 " fill_avg=%.1f in_wait_us=%" PRId64 " in_copy_us=%" PRId64 " kq_copy_us=%" PRId64
                 " kq_kib=%" PRId64 " compute_us=%" PRId64 " compute_avg=%.1f sync_us=%" PRId64 " sync_avg=%.1f n_sync=%" PRId64
-                " t0_ms=%" PRId64 " t1_ms=%" PRId64 "\n",
+                " t0_ms=%" PRId64 " t1_ms=%" PRId64
+                " plan_us=%" PRId64 " n_plan=%" PRId64 " plan_avg=%.1f plan_inc=%" PRId64 " cen_inc=%" PRId64
+                " cen_full=%" PRId64 " fb=%" PRId64 "/%" PRId64 "/%" PRId64 "/%" PRId64 "\n",
                 sched_prof_ctx_name(cparams.ctx_type), mode_name[w.mode & 3], w.cls == 1 ? "pp" : "dec", kqvis_n_win, reason,
                 w.graphs, w.reused, w.tokens, w.n_kv_min, w.n_kv_max, w.n_kv_sum/g, w.build_us, w.inputs_us,
                 w.fill_us, w.fill_us/g, w.in_wait_us, w.in_copy_us, w.kq_copy_us,
                 w.kq_bytes/1024, w.compute_us, w.compute_us/g, w.sync_us, w.sync_us/g, w.n_sync,
-                w.t0_ms, w.t1_ms);
+                w.t0_ms, w.t1_ms,
+                w.plan_us, w.n_plan, w.n_plan > 0 ? (double) w.plan_us/w.n_plan : 0.0, w.n_plan_inc, w.n_cen_inc,
+                w.n_cen_full, w.n_cen_fb[1], w.n_cen_fb[2], w.n_cen_fb[3], w.n_cen_fb[4]);
         kqvis_n_win++;
     }
     kqvis_win = kqvis_prof_window();
@@ -257,6 +267,16 @@ static void llama_qsa_store_publish(llama_memory_context_i * mctx, bool ok) {
     if (const auto * c = dynamic_cast<const llama_memory_hybrid_idx_context *>(mctx)) {
         c->qsa_store_publish(ok);
     }
+}
+
+// [TAG_QSA_CENSUS_INC] the plan counters of a hybrid-idx memory's store (zeros without one), for the kqvis-prof window
+static llama_qsa_pooled_store::stats_t llama_qsa_store_stats(llama_memory_context_i * mctx) {
+    if (const auto * c = dynamic_cast<const llama_memory_hybrid_idx_context *>(mctx)) {
+        if (const auto * st = c->get_qsa_store()) {
+            return st->stats;
+        }
+    }
+    return llama_qsa_pooled_store::stats_t();
 }
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
@@ -1689,7 +1709,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     int64_t kq_t_start_us = 0;
     int64_t kq_t_start_ms = 0;
     bool    kq_reused     = false;
+    llama_qsa_pooled_store::stats_t kq_plan0;
     if (kqprof) {
+        kq_plan0      = llama_qsa_store_stats(mctx);
         kq_t_start_us = ggml_time_us();
         kq_t_start_ms = kqvis_unix_ms();
         const int64_t last_us = g_kqvis_last_us.load();
@@ -1848,6 +1870,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         w.kq_bytes   += kq_bytes;
         w.compute_us += t_now_us - kq_t_compute_us;
         w.t1_ms       = kqvis_unix_ms();
+        {
+            const auto p1 = llama_qsa_store_stats(mctx);
+            w.plan_us    += (int64_t) (p1.t_plan_us  - kq_plan0.t_plan_us);
+            w.n_plan     += (int64_t) (p1.n_plan     - kq_plan0.n_plan);
+            w.n_plan_inc += (int64_t) (p1.n_plan_inc - kq_plan0.n_plan_inc);
+            w.n_cen_inc  += (int64_t) (p1.n_cen_inc  - kq_plan0.n_cen_inc);
+            w.n_cen_full += (int64_t) (p1.n_cen_full - kq_plan0.n_cen_full);
+            for (int k = 0; k < 5; ++k) {
+                w.n_cen_fb[k] += (int64_t) (p1.n_cen_fb[k] - kq_plan0.n_cen_fb[k]);
+            }
+        }
         g_kqvis_last_us.store(t_now_us);
     }
 

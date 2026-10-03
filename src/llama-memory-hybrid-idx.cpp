@@ -92,6 +92,59 @@ bool llama_qsa_pool_remap_indexed() {
     return indexed;
 }
 
+// [TAG_QSA_CENSUS_INC] LLAMA_QSA_CENSUS_INC / LLAMA_QSA_CENSUS_CHECK (see the header)
+int llama_qsa_census_inc_parse(const char * s) {
+    if (s == nullptr || s[0] == '\0' || strcmp(s, "0") == 0) {
+        return 0;
+    }
+    if (strcmp(s, "1") == 0) {
+        return 1;
+    }
+    return -1;
+}
+
+static bool llama_qsa_census_check_env() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_CENSUS_CHECK");
+        const int    v = llama_qsa_census_inc_parse(s);
+        if (v < 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_CENSUS_CHECK=%s is neither 0 nor 1: using 0\n", __func__, s);
+        }
+        return v == 1;
+    }();
+
+    return enabled;
+}
+
+bool llama_qsa_census_inc() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_CENSUS_INC");
+        const int    v = llama_qsa_census_inc_parse(s);
+        if (v < 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_CENSUS_INC=%s is neither 0 nor 1: using 0\n", __func__, s);
+        }
+        // WARN: the proof line must reach the server log (INFO does not)
+        if (v == 1) {
+            LLAMA_LOG_WARN("%s: qsa_census = incremental (LLAMA_QSA_CENSUS_INC=1): the block census / stamps / slot plan "
+                           "re-group only the cells past the lowest touched position (persistent per-stream state)%s\n",
+                           __func__, llama_qsa_census_check_env() ?
+                           "; LLAMA_QSA_CENSUS_CHECK=1: every plan also runs the full path and aborts on the first "
+                           "differing element" : "");
+        } else {
+            LLAMA_LOG_WARN("%s: qsa_census = full (LLAMA_QSA_CENSUS_INC=%s): every plan takes the full census of every "
+                           "cell%s\n", __func__, s != nullptr ? s : "unset",
+                           llama_qsa_census_check_env() ? "; LLAMA_QSA_CENSUS_CHECK=1 ignored (needs INC=1)" : "");
+        }
+        return v == 1;
+    }();
+
+    return enabled;
+}
+
+bool llama_qsa_census_check() {
+    return llama_qsa_census_inc() && llama_qsa_census_check_env();
+}
+
 // [TAG_QSA_COMPACT_BIAS] LLAMA_QSA_COMPACT_BIAS=1: read once per memory, like LLAMA_QSA_POOLED_CACHE, so the replay
 // probe can run both arms in one process
 static bool llama_qsa_compact_bias_env() {
@@ -132,6 +185,9 @@ void llama_qsa_pooled_store::reset_stream(uint32_t s) {
     pending.erase(std::remove_if(pending.begin(), pending.end(),
                 [s](const pending_t & p) { return p.s == s; }), pending.end());
 
+    // [TAG_QSA_CENSUS_INC] the slots the census state refers to are gone
+    inc_mark_all(s);
+
     stats.n_reset++;
 }
 
@@ -148,6 +204,80 @@ void llama_qsa_pooled_store::on_write(const llama_kv_cache::slot_info & sinfo) {
         for (const auto idx : sinfo.idxs[s]) {
             gen[idx]++;
         }
+    }
+}
+
+// [TAG_QSA_CENSUS_INC] the marks
+void llama_qsa_pooled_store::inc_mark_all(uint32_t s) {
+    if (!inc) {
+        return;
+    }
+
+    GGML_ASSERT(s < strm.size());
+
+    auto & c = strm[s].cen;
+
+    c.inc_all    = true;
+    c.valid      = false;
+    c.inc_lo_pos = INT32_MAX;
+    c.written.clear();
+}
+
+void llama_qsa_pooled_store::inc_mark_all_streams() {
+    for (uint32_t s = 0; s < (uint32_t) strm.size(); ++s) {
+        inc_mark_all(s);
+    }
+}
+
+void llama_qsa_pooled_store::inc_mark_pos(uint32_t s, llama_pos p0) {
+    if (!inc) {
+        return;
+    }
+
+    GGML_ASSERT(s < strm.size());
+
+    auto & c = strm[s].cen;
+
+    c.inc_lo_pos = std::min<llama_pos>(c.inc_lo_pos, std::max<llama_pos>(p0, 0));
+}
+
+void llama_qsa_pooled_store::inc_mark_write_pre(uint32_t s, const llama_kv_cells & cells, const std::vector<uint32_t> & idxs) {
+    if (!inc) {
+        return;
+    }
+
+    for (const uint32_t idx : idxs) {
+        if (!cells.is_empty(idx)) {
+            // llama_kv_cache::apply_ubatch removes the old cell and purges positions of its sequence (seq_rm inside
+            // the cache, past the wrappers): the census state cannot follow that cheaply
+            inc_mark_all(s);
+            return;
+        }
+    }
+}
+
+void llama_qsa_pooled_store::inc_mark_write_post(uint32_t s, const llama_kv_cells & cells, const std::vector<uint32_t> & idxs) {
+    if (!inc) {
+        return;
+    }
+
+    GGML_ASSERT(s < strm.size());
+
+    auto & c = strm[s].cen;
+
+    if (c.inc_all) {
+        return;
+    }
+
+    // a long run of writes with no plan in between (dense prefill below LLAMA_QSA_MIN_KV) is cheaper as a full census
+    if (c.written.size() + idxs.size() > kv_size/4 + 64) {
+        inc_mark_all(s);
+        return;
+    }
+
+    for (const uint32_t idx : idxs) {
+        c.written.push_back((int32_t) idx);
+        c.inc_lo_pos = std::min<llama_pos>(c.inc_lo_pos, cells.pos_get(idx));
     }
 }
 
@@ -366,6 +496,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         ss.slot_seen  .assign(st->n_slots,  0);
     }
 
+    // [TAG_QSA_CENSUS_INC] read (and prove) the census mode at load
+    st->inc = llama_qsa_census_inc();
+
     qsa_store = std::move(st);
     qsa_store->reset_all();
     qsa_store->stats.n_reset = 0;
@@ -480,6 +613,17 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         mem_idx->seq_rm(seq_id, p0, p1);
     }
 
+    // [TAG_QSA_CENSUS_INC] the positions >= p0 of seq_id's stream (every stream for seq_id < 0) may have lost cells
+    if (qsa_store) {
+        if (seq_id < 0) {
+            for (uint32_t s = 0; s < qsa_store->n_stream; ++s) {
+                qsa_store->inc_mark_pos(s, p0);
+            }
+        } else {
+            qsa_store->inc_mark_pos(qsa_stream_of(seq_id), p0);
+        }
+    }
+
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
 
@@ -496,6 +640,11 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
     if (qsa_store && qsa_stream_of(seq_id_src) != qsa_stream_of(seq_id_dst)) {
         qsa_store->reset_stream(qsa_stream_of(seq_id_dst));
     }
+
+    // [TAG_QSA_CENSUS_INC] a second sequence on the cells: the full census (reset_stream above marks the cross-stream case)
+    if (qsa_store) {
+        qsa_store->inc_mark_all(qsa_stream_of(seq_id_dst));
+    }
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
@@ -503,6 +652,11 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
+    }
+
+    // [TAG_QSA_CENSUS_INC] every stream may lose sequences
+    if (qsa_store) {
+        qsa_store->inc_mark_all_streams();
     }
 }
 
@@ -512,6 +666,15 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
     if (mem_idx) {
         mem_idx->seq_add(seq_id, p0, p1, shift);
     }
+
+    // [TAG_QSA_CENSUS_INC] positions move (and cells may empty)
+    if (qsa_store) {
+        if (seq_id < 0) {
+            qsa_store->inc_mark_all_streams();
+        } else {
+            qsa_store->inc_mark_all(qsa_stream_of(seq_id));
+        }
+    }
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -519,6 +682,15 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
 
     if (mem_idx) {
         mem_idx->seq_div(seq_id, p0, p1, d);
+    }
+
+    // [TAG_QSA_CENSUS_INC] positions move
+    if (qsa_store) {
+        if (seq_id < 0) {
+            qsa_store->inc_mark_all_streams();
+        } else {
+            qsa_store->inc_mark_all(qsa_stream_of(seq_id));
+        }
     }
 }
 
@@ -680,7 +852,8 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
     mem(mem),
     // update() applies a pending cross-stream seq_cp, else the copy keeps stale indexer keys
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        mem->get_mem_idx()->init_update(lctx, optimize)) {}
+        mem->get_mem_idx()->init_update(lctx, optimize)),
+    is_update(true) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
@@ -711,6 +884,25 @@ bool llama_memory_hybrid_idx_context::next() {
 bool llama_memory_hybrid_idx_context::apply() {
     bool res = llama_memory_hybrid_context::apply();
 
+    auto * st = get_qsa_store();
+
+    // [TAG_QSA_CENSUS_INC] the cells of a write (per slot-info stream), for the marks around it
+    auto write_cells = [&](uint32_t s) -> const llama_kv_cells & {
+        const auto & sinfo = sinfos_idx_copy[i_cur];
+        const auto & ub    = get_ubatch();
+        return mem->get_mem_idx()->get_cells(ub.seq_id[s*sinfo.size()][0]);
+    };
+
+    const bool write = st != nullptr && st->inc && ctx_idx && i_cur < sinfos_idx_copy.size();
+
+    if (write) {
+        // an overwrite of a used cell (and the purge it triggers inside the cache) forces a full census
+        const auto & sinfo = sinfos_idx_copy[i_cur];
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            st->inc_mark_write_pre(sinfo.strm[s], write_cells(s), sinfo.idxs[s]);
+        }
+    }
+
     if (ctx_idx) {
         res = res & ctx_idx->apply();
     }
@@ -718,8 +910,20 @@ bool llama_memory_hybrid_idx_context::apply() {
     // [TAG_QSA_POOLED_CACHE] the committed write path: this ubatch's raw indexer keys go into these cells
     // (cpy_k in build_qsa_top_k), so every block holding one of them must be pooled again. Batch planning
     // (llama_kv_cache::prepare applies and restores cell metadata around find_slot) never gets here.
-    if (auto * st = get_qsa_store(); st != nullptr && i_cur < sinfos_idx_copy.size()) {
+    if (st != nullptr && i_cur < sinfos_idx_copy.size()) {
         st->on_write(sinfos_idx_copy[i_cur]);
+    }
+
+    if (write) {
+        const auto & sinfo = sinfos_idx_copy[i_cur];
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            st->inc_mark_write_post(sinfo.strm[s], write_cells(s), sinfo.idxs[s]);
+        }
+    }
+
+    // [TAG_QSA_CENSUS_INC] a K-shift / stream copy update: the full census
+    if (st != nullptr && is_update) {
+        st->inc_mark_all_streams();
     }
 
     qsa_plan.valid = false;
@@ -851,21 +1055,19 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 // the block census of stream s: which complete group of r cells is which compact block id, the cells of
 // each block (cur_blk_cells), the block of each cell (cur_cell_blk) and the rope positions (dst_blk_pos,
 // all streams, sec-major). The caller zero-fills dst_blk_pos once for all streams.
-void llama_memory_hybrid_idx_context::qsa_census(
-        int64_t s,
-        const llama_ubatch * ubatch,
+void llama_qsa_census_full(
+        const llama_kv_cells & cells,
+        bool is_pos_2d,
         int64_t n_kv,
-        int64_t n_ns,
         int64_t n_blocks,
         int64_t r,
         bool blk_bias,
         int32_t * cur_cell_blk,
         int32_t * cur_blk_cells,
-        int32_t * dst_blk_pos,
-        qsa_census_stream & cs) const {
-    const int64_t n_tokens = ubatch->n_tokens;
-    const int64_t n_tps    = n_tokens/n_ns;          // tokens per stream
-
+        int32_t * blk_pos,
+        int64_t pos_stride,
+        llama_qsa_census_stream & cs,
+        llama_qsa_census_flags * flags) {
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
     // from zero, so the bucket alone would pool two sequences into one block
     GGML_ASSERT(r <= 64);
@@ -888,10 +1090,6 @@ void llama_memory_hybrid_idx_context::qsa_census(
 
     std::vector<int32_t> & bid_idx  = cs.bid_idx;
     std::vector<int32_t> & bid_cell = cs.bid_cell;
-
-    // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
-    const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
-    const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
 
     std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
 
@@ -983,7 +1181,7 @@ void llama_memory_hybrid_idx_context::qsa_census(
     group_cells();
 
     // mrope repeats one position across an image, so rank cells instead of using the position
-    if (dup && ubatch->is_pos_2d() && one_seq) {
+    if (dup && is_pos_2d && one_seq) {
         order.clear();
         order.reserve(n_kv);
 
@@ -1055,7 +1253,7 @@ void llama_memory_hybrid_idx_context::qsa_census(
         }
 
         for (int64_t sec = 0; sec < 4; ++sec) {
-            dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = sec_pos[sec];
+            blk_pos[sec*pos_stride + b] = sec_pos[sec];
         }
     }
 
@@ -1131,6 +1329,35 @@ void llama_memory_hybrid_idx_context::qsa_census(
             }
         }
     }
+
+    if (flags) {
+        flags->one_seq = one_seq;
+        flags->dup     = dup;
+        flags->oor     = oor;
+    }
+}
+
+// the block census of stream s of the ubatch (dst_blk_pos: all streams, sec-major; the caller zero-fills it once)
+void llama_memory_hybrid_idx_context::qsa_census(
+        int64_t s,
+        const llama_ubatch * ubatch,
+        int64_t n_kv,
+        int64_t n_ns,
+        int64_t n_blocks,
+        int64_t r,
+        bool blk_bias,
+        int32_t * cur_cell_blk,
+        int32_t * cur_blk_cells,
+        int32_t * dst_blk_pos,
+        qsa_census_stream & cs) const {
+    const int64_t n_tps = ubatch->n_tokens/n_ns;          // tokens per stream
+
+    // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
+    const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
+    const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
+
+    llama_qsa_census_full(cells, ubatch->is_pos_2d(), n_kv, n_blocks, r, blk_bias, cur_cell_blk, cur_blk_cells,
+                          dst_blk_pos + s*n_blocks, n_blocks*n_ns, cs);
 }
 
 // [TAG_QSA_COMPACT_BIAS] the query side of the bias, shared by qsa_fill_bias and qsa_fill_bias_compact so both
@@ -1432,39 +1659,46 @@ static int64_t qsa_store_cap(int64_t need, int64_t n_blocks) {
     return std::min<int64_t>(cap, n_blocks);
 }
 
-int64_t llama_memory_hybrid_idx_context::qsa_store_plan(const llama_ubatch & ubatch, uint32_t ratio, int64_t n_kv, bool blk_bias) const {
-    llama_qsa_pooled_store * st = get_qsa_store();
-    GGML_ASSERT(st != nullptr && ratio == st->ratio);
+// [TAG_QSA_CENSUS_INC] the per-stream views of a full-path plan: its own arrays
+static void llama_qsa_plan_views_own(llama_qsa_plan & pl) {
+    const int64_t n_ns     = pl.n_ns;
+    const int64_t n_kv     = pl.n_kv;
+    const int64_t n_blocks = pl.n_blocks;
+    const int64_t r        = pl.ratio;
 
-    const int64_t r        = ratio;
-    const int64_t n_blocks = (n_kv + r - 1)/r;
+    pl.v_cell_blk .resize(n_ns);
+    pl.v_blk_cells.resize(n_ns);
+    pl.v_remap    .resize(n_ns);
+    pl.v_blk_pos  .resize(n_ns);
+    pl.v_cs       .resize(n_ns);
 
-    if (full) {
-        // the reserve graphs: every block may be dirty at once (the first selection after the exhaustive
-        // bypass, a restore, a shift), so size for the cold rebuild: the full pool
-        return n_blocks;
+    pl.v_pos_stride = n_blocks*n_ns;
+
+    for (int64_t s = 0; s < n_ns; ++s) {
+        pl.v_cell_blk [s] = pl.cell_blk .data() + s*n_kv;
+        pl.v_blk_cells[s] = pl.blk_cells.data() + s*(r*n_blocks);
+        pl.v_remap    [s] = pl.remap    .data() + s*n_blocks;
+        pl.v_blk_pos  [s] = pl.blk_pos  .data() + s*n_blocks;
+        pl.v_cs       [s] = &pl.cs[s];
     }
+}
 
-    auto & pl = qsa_plan;
+// today's plan (the body of qsa_store_plan before [TAG_QSA_CENSUS_INC]), unchanged but for its inputs: the cells and
+// cache stream of each ubatch stream come in `in`, the census is llama_qsa_census_full
+int64_t llama_qsa_plan_full(llama_qsa_pooled_store & st_ref, const llama_qsa_plan_in & in, llama_qsa_plan & pl,
+                            std::vector<std::vector<uint64_t>> * stamps_out) {
+    llama_qsa_pooled_store * st = &st_ref;
 
-    if (pl.valid && pl.i_ubatch == i_cur && pl.ratio == ratio && pl.n_kv == n_kv && pl.blk_bias == blk_bias) {
-        return pl.cap;
-    }
+    const uint32_t ratio    = st->ratio;
+    const int64_t  r        = ratio;
+    const int64_t  n_kv     = in.n_kv;
+    const int64_t  n_blocks = (n_kv + r - 1)/r;
+    const bool     blk_bias = in.blk_bias;
 
-    const int64_t t_start_us = ggml_time_us();
-
-    // a plan whose graph never reported back (an exception, an optimizer path) must not publish later
-    if (!st->pending.empty() || !st->pending_streams.empty()) {
-        st->publish(st->pending_armed ? false : true);
-    }
-
-    const int64_t n_ns     = get_n_stream();
-    const int64_t n_tokens = ubatch.n_tokens;
-    GGML_ASSERT(n_tokens % n_ns == 0);
-    const int64_t n_tps    = n_tokens/n_ns;
+    const int64_t n_ns     = in.n_ns;
 
     pl.valid    = false;
-    pl.i_ubatch = i_cur;
+    pl.inc      = false;
     pl.ratio    = ratio;
     pl.n_kv     = n_kv;
     pl.n_blocks = n_blocks;
@@ -1492,11 +1726,11 @@ int64_t llama_memory_hybrid_idx_context::qsa_store_plan(const llama_ubatch & uba
 
         auto & cs = pl.cs[s];
 
-        qsa_census(s, &ubatch, n_kv, n_ns, n_blocks, r, blk_bias, cur_cell_blk, cur_blk_cells, pl.blk_pos.data(), cs);
+        const auto &   cells = *in.cells[s];
+        const uint32_t g     = in.g[s];
 
-        const llama_seq_id seq_of_stream = ubatch.seq_id[s*n_tps][0];
-        const uint32_t     g             = mem->qsa_stream_of(seq_of_stream);
-        const auto &       cells         = mem->get_mem_idx()->get_cells(seq_of_stream);
+        llama_qsa_census_full(cells, in.is_pos_2d, n_kv, n_blocks, r, blk_bias, cur_cell_blk, cur_blk_cells,
+                              pl.blk_pos.data() + s*n_blocks, n_blocks*n_ns, cs);
 
         GGML_ASSERT(g < st->n_stream);
         GGML_ASSERT((s == 0 || g == strm_of[0] + s) && "qsa: the ubatch streams are one contiguous range (get_k)");
@@ -1698,7 +1932,14 @@ int64_t llama_memory_hybrid_idx_context::qsa_store_plan(const llama_ubatch & uba
         }
     }
 
-    pl.valid = true;
+    pl.valid  = true;
+    pl.serial = serial;
+
+    llama_qsa_plan_views_own(pl);
+
+    if (stamps_out) {
+        *stamps_out = std::move(stamps);
+    }
 
     st->stats.n_plan++;
     st->stats.n_full     += full_pool;
@@ -1707,9 +1948,1024 @@ int64_t llama_memory_hybrid_idx_context::qsa_store_plan(const llama_ubatch & uba
     st->stats.last_dirty  = full_pool ? n_bid_all : n_dirty_all;
     st->stats.last_cap    = (uint32_t) cap;
     st->stats.last_n_bid  = n_bid_all;
-    st->stats.t_plan_us  += ggml_time_us() - t_start_us;
 
     return cap;
+}
+
+//
+// [TAG_QSA_CENSUS_INC] the incremental census + plan
+//
+
+// the stamp of block b: the full path's pass-1 formula, value for value
+static uint64_t qsa_block_stamp(const llama_kv_cells & cells, const std::vector<uint32_t> & gen, uint32_t g, int64_t r,
+                                bool ranked, const int32_t * mem_cells, const int32_t * blk_pos, int64_t pos_stride, int64_t b) {
+    uint64_t h = qsa_fold(0x51534150u /* "QSAP" */, ((uint64_t) g << 32) | ((uint64_t) r << 1) | (ranked ? 1 : 0));
+
+    for (int64_t k = 0; k < r; ++k) {
+        const int32_t c = mem_cells[k];
+        const auto &  e = cells.ext_get(c);
+
+        h = qsa_fold(h, ((uint64_t) (uint32_t) c << 32) | gen[c]);
+        h = qsa_fold(h, (uint32_t) cells.pos_get(c));
+        h = qsa_fold(h, ((uint64_t) (uint32_t) e.x << 32) | (uint32_t) e.y);
+    }
+
+    for (int64_t sec = 0; sec < 4; ++sec) {
+        h = qsa_fold(h, (uint32_t) blk_pos[sec*pos_stride + b]);
+    }
+
+    h = qsa_mix(h);
+    return h == 0 ? 1 : h;   // 0 is "invalid"
+}
+
+static bool qsa_one_seq(const llama_kv_cells & cells) {
+    int n_seq_present = 0;
+
+    for (int sq = 0; sq < LLAMA_MAX_SEQ && n_seq_present < 2; ++sq) {
+        if (cells.seq_pos_min(sq) >= 0) {
+            n_seq_present++;
+        }
+    }
+
+    return n_seq_present <= 1;
+}
+
+// per ubatch stream, what pass 1 leaves for pass 2
+struct qsa_inc_stream_work {
+    bool    fast      = false;
+    int32_t region_b0 = 0;                          // fast: the first re-grouped block id (all ids below are kept)
+    std::vector<int32_t> slot_of;                   // the slot block region_b0 + k owns already, -1
+    std::vector<std::pair<int32_t, int32_t>> old_region; // fast: (slot, key cell) of the last census's blocks >= region_b0
+    std::vector<int32_t> carry_dirty;               // fast: the prefix blocks (< region_b0) whose stamp is not committed
+};
+
+// the fast census of one stream: false (nothing changed) unless the census state can be extended exactly - one sequence,
+// no ranked / dup / oor census, no n_kv shrink, no full-census mark, a re-grouped region not larger than ~1/8 of the
+// blocks. On true, C holds the census of the current cells, as llama_qsa_census_full would write it, with blk_pos at
+// stride n_slots; ws.region_b0 / old_region describe what changed for the slot plan.
+// returns LLAMA_QSA_CEN_FAST or the reason of the fallback (llama_qsa_pooled_store::stats_t::n_cen_fb)
+static int llama_qsa_census_inc(llama_qsa_pooled_store & st, uint32_t g, const llama_kv_cells & cells, int64_t n_kv,
+                                 int64_t n_blocks, int64_t r, qsa_inc_stream_work & ws) {
+    auto & C = st.strm[g].cen;
+
+    if (C.inc_all || !C.valid) {
+        return LLAMA_QSA_CEN_FB_MARK;
+    }
+    if (!C.inc_ok) {
+        return LLAMA_QSA_CEN_FB_SHAPE;
+    }
+    if (n_kv < C.n_kv) {
+        return LLAMA_QSA_CEN_FB_SHRINK;
+    }
+
+    if (!qsa_one_seq(cells)) {
+        return LLAMA_QSA_CEN_FB_SHAPE;
+    }
+
+    const int32_t n_bid_old = C.cs.n_bid;
+
+    const int64_t lo_pb = std::min<int64_t>(C.tail_pb, C.inc_lo_pos == INT32_MAX ? INT64_MAX : (int64_t) C.inc_lo_pos/r);
+
+    // block ids ascend with the position bucket (one group per bucket with one sequence)
+    const int32_t region_b0 = (int32_t) (std::lower_bound(C.cs.bid_idx.begin(), C.cs.bid_idx.begin() + n_bid_old,
+                (int32_t) std::min<int64_t>(lo_pb*r, INT32_MAX)) - C.cs.bid_idx.begin());
+
+    if (n_bid_old - region_b0 > std::max<int32_t>(64, n_bid_old/8)) {
+        return LLAMA_QSA_CEN_FB_REGION;
+    }
+
+    // the candidate cells: the cells of the re-grouped blocks, the unpooled cells, the written cells, the cells n_kv adds
+    if (C.seen.size() != st.kv_size) {
+        C.seen.assign(st.kv_size, 0);
+        C.seen_epoch = 0;
+    }
+    if (++C.seen_epoch == 0) {
+        std::fill(C.seen.begin(), C.seen.end(), 0);
+        C.seen_epoch = 1;
+    }
+    const uint32_t ep = C.seen_epoch;
+
+    std::vector<int32_t> cand;
+    cand.reserve((size_t) (n_bid_old - region_b0)*r + C.unpooled.size() + C.written.size() + (size_t) (n_kv - C.n_kv));
+
+    auto add = [&](int32_t j) {
+        if (j < 0 || j >= n_kv || C.seen[j] == ep) {
+            return;
+        }
+        C.seen[j] = ep;
+        cand.push_back(j);
+    };
+
+    for (int64_t b = region_b0; b < n_bid_old; ++b) {
+        for (int64_t k = 0; k < r; ++k) {
+            add(C.blk_cells[b*r + k]);
+        }
+    }
+    for (const int32_t j : C.unpooled) {
+        add(j);
+    }
+    for (const int32_t j : C.written) {
+        add(j);
+    }
+    for (int64_t j = C.n_kv; j < n_kv; ++j) {
+        add((int32_t) j);
+    }
+
+    std::vector<std::pair<llama_pos, int32_t>> region;   // (pos, cell) of the non-empty candidates
+    std::vector<int32_t>                       emptied;  // the empty candidates
+
+    region.reserve(cand.size());
+
+    for (const int32_t j : cand) {
+        if (cells.is_empty(j)) {
+            emptied.push_back(j);
+            continue;
+        }
+
+        const llama_pos p  = cells.pos_get(j);
+        const int64_t   pb = p/r;
+
+        if (pb < lo_pb || pb >= n_blocks) {
+            // below the region: a mutator left no mark (cannot happen with the marks in place);
+            // past the window: oor, the full census handles (and asserts) it
+            return LLAMA_QSA_CEN_FB_SHAPE;
+        }
+
+        region.emplace_back(p, j);
+    }
+
+    std::sort(region.begin(), region.end());
+
+    // group the region by position bucket; a repeated position is a dup census -> the full path
+    struct grp_t {
+        int64_t  pb;
+        uint64_t mask;
+        int32_t  first;     // the lowest cell index (the full census scans j ascending)
+        size_t   i0, i1;    // [i0, i1) in region
+    };
+
+    const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
+
+    std::vector<grp_t> grps;
+
+    for (size_t i = 0; i < region.size(); ) {
+        const int64_t pb = region[i].first/r;
+
+        grp_t gr = { pb, 0, INT32_MAX, i, i };
+
+        for (; i < region.size() && region[i].first/r == pb; ++i) {
+            const uint64_t bit = uint64_t(1) << (region[i].first % r);
+            if (gr.mask & bit) {
+                return LLAMA_QSA_CEN_FB_SHAPE;
+            }
+            gr.mask |= bit;
+            gr.first = std::min(gr.first, region[i].second);
+        }
+
+        gr.i1 = i;
+        grps.push_back(gr);
+    }
+
+    //
+    // commit: no failure past this point
+    //
+
+    const uint32_t n_rows  = st.n_rows;
+    const int64_t  stride  = st.n_slots;
+
+    ws.fast      = true;
+    ws.region_b0 = region_b0;
+    ws.old_region.clear();
+
+    for (int64_t b = region_b0; b < n_bid_old; ++b) {
+        ws.old_region.emplace_back(C.remap[b] - (int32_t) (g*n_rows), C.blk_cells[b*r]);
+    }
+
+    auto & cs = C.cs;
+
+    cs.blk_of.resize(n_kv, -1);
+    for (const int32_t j : cand) {
+        cs.blk_of[j] = -1;
+    }
+
+    cs.bid_idx .resize(region_b0);
+    cs.bid_cell.resize(region_b0);
+
+    for (const auto & gr : grps) {
+        if (gr.mask != slots_full) {
+            continue;
+        }
+
+        const int32_t b = (int32_t) cs.bid_idx.size();
+
+        cs.bid_idx .push_back((int32_t) (gr.pb*r));
+        cs.bid_cell.push_back(gr.first);
+
+        for (size_t i = gr.i0; i < gr.i1; ++i) {
+            cs.blk_of[region[i].second] = b;
+        }
+    }
+
+    const int32_t n_bid_new = (int32_t) cs.bid_idx.size();
+    const int32_t max_bid   = std::max(n_bid_old, n_bid_new);
+
+    GGML_ASSERT(n_bid_new <= n_blocks);
+
+    // blk_cells: zero the re-grouped and vanished ids, write the new blocks
+    C.blk_cells.resize(r*n_blocks, 0);
+    std::fill(C.blk_cells.begin() + r*region_b0, C.blk_cells.begin() + r*max_bid, 0);
+
+    // blk_pos: stride n_slots, so an n_kv growth moves nothing
+    for (int64_t sec = 0; sec < 4; ++sec) {
+        std::fill(C.blk_pos.begin() + sec*stride + region_b0, C.blk_pos.begin() + sec*stride + max_bid, 0);
+    }
+
+    std::vector<int32_t> unpooled;
+
+    for (const auto & [p, j] : region) {
+        const int32_t b = cs.blk_of[j];
+
+        if (b >= 0) {
+            C.blk_cells[b*r + (p % r)] = j;
+        } else {
+            unpooled.push_back(j);
+        }
+    }
+
+    for (int32_t b = region_b0; b < n_bid_new; ++b) {
+        for (int64_t sec = 0; sec < 4; ++sec) {
+            C.blk_pos[sec*stride + b] = cs.bid_idx[b];
+        }
+    }
+
+    // cell_blk: the candidates; every unpooled / empty cell when the dead id moves
+    const int32_t dead_old = n_bid_old < C.n_blocks ? n_bid_old : (int32_t) C.n_blocks - 1;
+    const int32_t dead_new = n_bid_new < n_blocks   ? n_bid_new : (int32_t) n_blocks   - 1;
+
+    C.cell_blk.resize(n_kv);
+
+    for (const int32_t j : cand) {
+        C.cell_blk[j] = cs.blk_of[j] >= 0 ? cs.blk_of[j] : dead_new;
+    }
+
+    for (const int32_t j : emptied) {
+        C.empty.push_back(j);
+    }
+
+    if (dead_new != dead_old) {
+        // compact the empty list (written cells leave it lazily) and move every empty cell to the new dead id
+        if (++C.seen_epoch == 0) {
+            std::fill(C.seen.begin(), C.seen.end(), 0);
+            C.seen_epoch = 1;
+        }
+        const uint32_t ep2 = C.seen_epoch;
+
+        size_t n = 0;
+        for (size_t i = 0; i < C.empty.size(); ++i) {
+            const int32_t j = C.empty[i];
+            if (C.seen[j] == ep2 || !cells.is_empty(j)) {
+                continue;
+            }
+            C.seen[j] = ep2;
+            C.empty[n++] = j;
+            C.cell_blk[j] = dead_new;
+        }
+        C.empty.resize(n);
+    }
+
+    // [TAG_QSA_WHOLE_BLOCKS] the fragment routing of the full census, over the unpooled cells (all in the region)
+    if (llama_qsa_whole_blocks() && n_bid_new < n_blocks) {
+        int64_t n_unrouted = 0;
+
+        for (const int32_t j : unpooled) {
+            const int64_t idx = cells.pos_get(j);
+
+            bool tail_of_some = false;
+            const auto & set = cells.seq_set((uint32_t) j);
+            for (int32_t sq = 0; sq < LLAMA_MAX_SEQ && !tail_of_some; ++sq) {
+                tail_of_some = set.test(sq) && idx/r == (int64_t) cells.seq_pos_max(sq)/r;
+            }
+
+            if (tail_of_some) {
+                continue;
+            }
+
+            if (n_bid_new + 1 < n_blocks) {
+                C.cell_blk[j] = n_bid_new + 1;
+            } else {
+                n_unrouted++;
+            }
+        }
+
+        if (n_unrouted > 0) {
+            static std::atomic<bool> warned { false };
+            if (!warned.exchange(true)) {
+                LLAMA_LOG_WARN("%s: LLAMA_QSA_WHOLE_BLOCKS=1: %" PRId64 " fragment cell(s) keep the tail boost: no second "
+                               "unused block id (n_bid %d + 1 == n_blocks %" PRId64 "); warned once\n",
+                               __func__, n_unrouted, n_bid_new, n_blocks);
+            }
+        }
+    }
+
+    // the stamps of the new blocks
+    const auto & gen = st.strm[g].gen;
+
+    C.stamps.resize(region_b0);
+    for (int32_t b = region_b0; b < n_bid_new; ++b) {
+        C.stamps.push_back(qsa_block_stamp(cells, gen, g, r, false, C.blk_cells.data() + b*r, C.blk_pos.data(), stride, b));
+    }
+
+    int64_t tail_pb = n_bid_new > 0 ? cs.bid_idx[n_bid_new - 1]/r + 1 : 0;
+    if (!unpooled.empty()) {
+        tail_pb = INT64_MAX;
+        for (const int32_t j : unpooled) {
+            tail_pb = std::min<int64_t>(tail_pb, cells.pos_get(j)/r);
+        }
+    }
+
+    cs.n_bid  = n_bid_new;
+    cs.ranked = false;
+
+    C.unpooled   = std::move(unpooled);
+    C.tail_pb    = tail_pb;
+    C.n_kv       = n_kv;
+    C.n_blocks   = n_blocks;
+    C.inc_lo_pos = INT32_MAX;
+    C.written.clear();
+
+    return LLAMA_QSA_CEN_FAST;
+}
+
+int64_t llama_qsa_plan_inc(llama_qsa_pooled_store & st, const llama_qsa_plan_in & in, llama_qsa_plan & pl) {
+    GGML_ASSERT(st.inc);
+
+    const uint32_t ratio    = st.ratio;
+    const int64_t  r        = ratio;
+    const int64_t  n_kv     = in.n_kv;
+    const int64_t  n_blocks = (n_kv + r - 1)/r;
+    const bool     blk_bias = in.blk_bias;
+    const int64_t  n_ns     = in.n_ns;
+    const int64_t  stride   = st.n_slots;   // blk_pos stride of the census state
+
+    GGML_ASSERT(n_blocks <= (int64_t) st.n_slots);
+
+    pl.valid    = false;
+    pl.inc      = true;
+    pl.ratio    = ratio;
+    pl.n_kv     = n_kv;
+    pl.n_blocks = n_blocks;
+    pl.n_ns     = n_ns;
+    pl.blk_bias = blk_bias;
+
+    pl.cell_blk .clear();
+    pl.blk_cells.clear();
+    pl.blk_pos  .clear();
+    pl.cs       .clear();
+    pl.remap    .clear();
+
+    std::vector<uint32_t>            strm_of(n_ns);
+    std::vector<qsa_inc_stream_work> work(n_ns);
+
+    size_t   need        = 1;
+    uint32_t n_dirty_all = 0;
+    uint32_t n_bid_all   = 0;
+    bool     all_fast    = true;
+
+    // pass 1: the census (fast or full) into the stream's census state, the stamps, the slots blocks own, the dirty count
+    for (int64_t s = 0; s < n_ns; ++s) {
+        const auto &   cells = *in.cells[s];
+        const uint32_t g     = in.g[s];
+
+        GGML_ASSERT(g < st.n_stream);
+        GGML_ASSERT((s == 0 || g == strm_of[0] + s) && "qsa: the ubatch streams are one contiguous range (get_k)");
+
+        strm_of[s] = g;
+
+        auto & ss = st.strm[g];
+        auto & C  = ss.cen;
+        auto & ws = work[s];
+
+        const int why = llama_qsa_census_inc(st, g, cells, n_kv, n_blocks, r, ws);
+
+        if (why == LLAMA_QSA_CEN_FAST) {
+            st.stats.n_cen_inc++;
+        } else {
+            all_fast = false;
+            st.stats.n_cen_full++;
+            st.stats.n_cen_fb[why]++;
+
+            ws = qsa_inc_stream_work();
+
+            C.cell_blk .resize(n_kv);
+            C.blk_cells.resize(r*n_blocks);
+            C.blk_pos  .assign(4*stride, 0);
+
+            llama_qsa_census_flags fl;
+            llama_qsa_census_full(cells, in.is_pos_2d, n_kv, n_blocks, r, blk_bias, C.cell_blk.data(), C.blk_cells.data(),
+                                  C.blk_pos.data(), stride, C.cs, &fl);
+
+            C.n_kv     = n_kv;
+            C.n_blocks = n_blocks;
+            C.inc_ok   = fl.one_seq && !C.cs.ranked && !fl.dup && !fl.oor;
+
+            C.unpooled.clear();
+            C.empty   .clear();
+            C.tail_pb = 0;
+
+            if (C.inc_ok) {
+                int64_t tail_pb = INT64_MAX;
+
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    if (cells.is_empty(j)) {
+                        C.empty.push_back((int32_t) j);
+                    } else if (C.cs.blk_of[j] < 0) {
+                        C.unpooled.push_back((int32_t) j);
+                        tail_pb = std::min<int64_t>(tail_pb, cells.pos_get(j)/r);
+                    }
+                }
+
+                if (C.unpooled.empty()) {
+                    tail_pb = C.cs.n_bid > 0 ? C.cs.bid_idx[C.cs.n_bid - 1]/r + 1 : 0;
+                }
+
+                C.tail_pb = tail_pb;
+            }
+
+            C.stamps.resize(C.cs.n_bid);
+            for (int32_t b = 0; b < C.cs.n_bid; ++b) {
+                C.stamps[b] = qsa_block_stamp(cells, ss.gen, g, r, C.cs.ranked, C.blk_cells.data() + b*r, C.blk_pos.data(),
+                                              stride, b);
+            }
+
+            C.inc_all    = false;
+            C.inc_lo_pos = INT32_MAX;
+            C.written.clear();
+            C.carry  .clear();
+        }
+
+        const int32_t n_bid = C.cs.n_bid;
+
+        // the slots the (re-grouped) blocks own already, and the dirty count
+        size_t n_dirty = 0;
+
+        ws.slot_of.assign(n_bid - ws.region_b0, -1);
+
+        for (int32_t b = ws.region_b0; b < n_bid; ++b) {
+            const int32_t key  = C.blk_cells[(int64_t) b*r];
+            const int32_t slot = ss.slot_of_key[key];
+
+            if (slot >= 0 && ss.slot_key[slot] == key) {
+                ws.slot_of[b - ws.region_b0] = slot;
+            }
+
+            n_dirty += ws.slot_of[b - ws.region_b0] < 0 || ss.slot_stamp[ws.slot_of[b - ws.region_b0]] != C.stamps[b];
+        }
+
+        if (ws.fast) {
+            // a kept block is dirty only if the last plan left its stamp uncommitted
+            for (const int32_t b : C.carry) {
+                if (b >= ws.region_b0) {
+                    break;
+                }
+
+                const int32_t slot = C.remap[b] - (int32_t) (g*st.n_rows);
+
+                if (ss.slot_stamp[slot] != C.stamps[b]) {
+                    ws.carry_dirty.push_back(b);
+                }
+            }
+
+            n_dirty += ws.carry_dirty.size();
+        }
+
+        need = std::max(need, n_dirty + (n_bid < n_blocks ? 1 : 0));
+
+        n_dirty_all += (uint32_t) n_dirty;
+        n_bid_all   += (uint32_t) n_bid;
+    }
+
+    const int64_t cap = qsa_store_cap((int64_t) need, n_blocks);
+    GGML_ASSERT(cap >= (int64_t) need);
+
+    const bool full_pool = cap == n_blocks;
+
+    pl.cap  = cap;
+    pl.full = full_pool;
+    pl.s0   = strm_of[0];
+
+    const uint32_t serial = ++st.serial;
+
+    std::vector<std::vector<std::pair<int32_t, int32_t>>> dirty(n_ns);
+
+    // pass 2: the slot assignment, the dirty list, the pending stamps (the full path's order)
+    for (int64_t s = 0; s < n_ns; ++s) {
+        const uint32_t g = strm_of[s];
+
+        auto & ss = st.strm[g];
+        auto & C  = ss.cen;
+        auto & ws = work[s];
+
+        const int32_t n_bid = C.cs.n_bid;
+        const int32_t row0  = (int32_t) (g*st.n_rows);
+
+        C.remap.resize(n_blocks);
+
+        if (full_pool) {
+            for (uint32_t slot = 0; slot < st.n_slots; ++slot) {
+                if (ss.slot_key[slot] >= 0) {
+                    ss.slot_of_key[ss.slot_key[slot]] = -1;
+                }
+                ss.slot_key[slot]   = -1;
+                ss.slot_stamp[slot] = 0;
+            }
+
+            ss.free_slots.clear();
+            for (int32_t slot = (int32_t) st.n_slots - 1; slot >= n_bid; --slot) {
+                ss.free_slots.push_back(slot);
+            }
+
+            for (int32_t b = 0; b < n_bid; ++b) {
+                const int32_t key = C.blk_cells[(int64_t) b*r];
+
+                ss.slot_key[b]      = key;
+                ss.slot_of_key[key] = b;
+                ss.slot_seen[b]     = serial;
+
+                C.remap[b] = row0 + b;
+
+                dirty[s].emplace_back(b, b);
+                st.pending.push_back({ g, b, C.stamps[b] });
+            }
+        } else if (!ws.fast) {
+            // the full path's pass 2
+            for (int32_t b = 0; b < n_bid; ++b) {
+                if (ws.slot_of[b] >= 0) {
+                    ss.slot_seen[ws.slot_of[b]] = serial;
+                }
+            }
+
+            for (uint32_t slot = 0; slot < st.n_slots; ++slot) {
+                const int32_t key = ss.slot_key[slot];
+
+                if (key >= 0 && ss.slot_seen[slot] != serial) {
+                    ss.slot_of_key[key] = -1;
+                    ss.slot_key[slot]   = -1;
+                    ss.slot_stamp[slot] = 0;
+                    ss.free_slots.push_back((int32_t) slot);
+                }
+            }
+
+            for (int32_t b = 0; b < n_bid; ++b) {
+                int32_t slot = ws.slot_of[b];
+
+                if (slot < 0) {
+                    GGML_ASSERT(!ss.free_slots.empty() && "qsa: more complete blocks than block slots");
+
+                    slot = ss.free_slots.back();
+                    ss.free_slots.pop_back();
+
+                    const int32_t key = C.blk_cells[(int64_t) b*r];
+
+                    ss.slot_key[slot]   = key;
+                    ss.slot_of_key[key] = slot;
+                    ss.slot_stamp[slot] = 0;
+                    ss.slot_seen[slot]  = serial;
+                }
+
+                C.remap[b] = row0 + slot;
+
+                if (ss.slot_stamp[slot] != C.stamps[b]) {
+                    ss.slot_stamp[slot] = 0;
+
+                    dirty[s].emplace_back(slot, b);
+
+                    st.pending.push_back({ g, slot, C.stamps[b] });
+                }
+            }
+        } else {
+            // fast: only the re-grouped region changes owners. The slots owned before this plan are exactly the last
+            // census's blocks (a reset forces the full census), so the vanished ones are the old region blocks whose key
+            // cell no new block has - freed in ascending slot order, as the full path's scan frees them
+            std::vector<int32_t> kept;
+            for (const int32_t slot : ws.slot_of) {
+                if (slot >= 0) {
+                    kept.push_back(slot);
+                }
+            }
+            std::sort(kept.begin(), kept.end());
+
+            std::vector<int32_t> vanished;
+            for (const auto & [slot, key] : ws.old_region) {
+                GGML_ASSERT(slot >= 0 && ss.slot_key[slot] == key && "qsa: census state out of step with the slots");
+
+                if (!std::binary_search(kept.begin(), kept.end(), slot)) {
+                    vanished.push_back(slot);
+                }
+            }
+            std::sort(vanished.begin(), vanished.end());
+
+            for (const int32_t slot : vanished) {
+                ss.slot_of_key[ss.slot_key[slot]] = -1;
+                ss.slot_key[slot]   = -1;
+                ss.slot_stamp[slot] = 0;
+                ss.free_slots.push_back(slot);
+            }
+
+            // the kept blocks with an uncommitted stamp (ids ascending, all below the region)
+            for (const int32_t b : ws.carry_dirty) {
+                const int32_t slot = C.remap[b] - row0;
+
+                ss.slot_stamp[slot] = 0;
+
+                dirty[s].emplace_back(slot, b);
+
+                st.pending.push_back({ g, slot, C.stamps[b] });
+            }
+
+            for (int32_t b = ws.region_b0; b < n_bid; ++b) {
+                int32_t slot = ws.slot_of[b - ws.region_b0];
+
+                if (slot < 0) {
+                    GGML_ASSERT(!ss.free_slots.empty() && "qsa: more complete blocks than block slots");
+
+                    slot = ss.free_slots.back();
+                    ss.free_slots.pop_back();
+
+                    const int32_t key = C.blk_cells[(int64_t) b*r];
+
+                    ss.slot_key[slot]   = key;
+                    ss.slot_of_key[key] = slot;
+                    ss.slot_stamp[slot] = 0;
+                    ss.slot_seen[slot]  = serial;
+                }
+
+                C.remap[b] = row0 + slot;
+
+                if (ss.slot_stamp[slot] != C.stamps[b]) {
+                    ss.slot_stamp[slot] = 0;
+
+                    dirty[s].emplace_back(slot, b);
+
+                    st.pending.push_back({ g, slot, C.stamps[b] });
+                }
+            }
+        }
+
+        for (int64_t b = n_bid; b < n_blocks; ++b) {
+            C.remap[b] = row0 + (int32_t) st.n_slots;
+        }
+
+        C.carry.clear();
+        for (const auto & d : dirty[s]) {
+            C.carry.push_back(d.second);
+        }
+
+        C.valid = true;
+
+        st.pending_streams.push_back(g);
+    }
+
+    // the dirty list (the full path's fill)
+    pl.dirty_cells.assign(r*cap*n_ns, 0);
+    pl.dirty_pos  .assign(4*cap*n_ns, 0);
+    pl.dirty_dst  .resize(cap*n_ns);
+
+    for (int64_t s = 0; s < n_ns; ++s) {
+        const uint32_t g = strm_of[s];
+        const auto &   C = st.strm[g].cen;
+
+        for (int64_t e = 0; e < cap; ++e) {
+            if (e < (int64_t) dirty[s].size()) {
+                const int32_t slot = dirty[s][e].first;
+                const int32_t b    = dirty[s][e].second;
+
+                for (int64_t k = 0; k < r; ++k) {
+                    pl.dirty_cells[s*(r*cap) + e*r + k] = C.blk_cells[b*r + k];
+                }
+
+                for (int64_t sec = 0; sec < 4; ++sec) {
+                    pl.dirty_pos[sec*(cap*n_ns) + s*cap + e] = C.blk_pos[sec*stride + b];
+                }
+
+                pl.dirty_dst[s*cap + e] = (int32_t) (g*st.n_rows + slot);
+            } else {
+                pl.dirty_dst[s*cap + e] = (int32_t) (g*st.n_rows + st.n_slots);
+            }
+        }
+    }
+
+    // the views: the stream's census state
+    pl.v_cell_blk .resize(n_ns);
+    pl.v_blk_cells.resize(n_ns);
+    pl.v_remap    .resize(n_ns);
+    pl.v_blk_pos  .resize(n_ns);
+    pl.v_cs       .resize(n_ns);
+
+    pl.v_pos_stride = stride;
+
+    for (int64_t s = 0; s < n_ns; ++s) {
+        const auto & C = st.strm[strm_of[s]].cen;
+
+        pl.v_cell_blk [s] = C.cell_blk .data();
+        pl.v_blk_cells[s] = C.blk_cells.data();
+        pl.v_remap    [s] = C.remap    .data();
+        pl.v_blk_pos  [s] = C.blk_pos  .data();
+        pl.v_cs       [s] = &C.cs;
+    }
+
+    pl.valid  = true;
+    pl.serial = serial;
+
+    st.stats.n_plan++;
+    st.stats.n_plan_inc  += all_fast;
+    st.stats.n_full      += full_pool;
+    st.stats.n_dirty     += full_pool ? n_bid_all : n_dirty_all;
+    st.stats.n_valid     += full_pool ? 0 : n_bid_all - n_dirty_all;
+    st.stats.last_dirty   = full_pool ? n_bid_all : n_dirty_all;
+    st.stats.last_cap     = (uint32_t) cap;
+    st.stats.last_n_bid   = n_bid_all;
+
+    return cap;
+}
+
+void llama_qsa_store_save(const llama_qsa_pooled_store & st, llama_qsa_store_snapshot & snap) {
+    snap.strm            = st.strm;
+    snap.serial          = st.serial;
+    snap.pending         = st.pending;
+    snap.pending_streams = st.pending_streams;
+    snap.pending_armed   = st.pending_armed;
+    snap.stats           = st.stats;
+}
+
+void llama_qsa_store_restore(llama_qsa_pooled_store & st, const llama_qsa_store_snapshot & snap) {
+    st.strm            = snap.strm;
+    st.serial          = snap.serial;
+    st.pending         = snap.pending;
+    st.pending_streams = snap.pending_streams;
+    st.pending_armed   = snap.pending_armed;
+    st.stats           = snap.stats;
+}
+
+template <typename T>
+static bool qsa_cmp_arr(std::string & out, const char * what, int64_t s, const T * a, const T * b, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        if (memcmp(&a[i], &b[i], sizeof(T)) != 0) {
+            out = std::string(what) + " s=" + std::to_string(s) + " i=" + std::to_string(i) +
+                  " full=" + std::to_string(a[i]) + " inc=" + std::to_string(b[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename T>
+static bool qsa_cmp_vec(std::string & out, const char * what, int64_t s, const std::vector<T> & a, const std::vector<T> & b) {
+    if (a.size() != b.size()) {
+        out = std::string(what) + " s=" + std::to_string(s) + " size full=" + std::to_string(a.size()) +
+              " inc=" + std::to_string(b.size());
+        return false;
+    }
+    return qsa_cmp_arr(out, what, s, a.data(), b.data(), (int64_t) a.size());
+}
+
+std::string llama_qsa_plan_compare(const llama_qsa_plan & ref, const std::vector<std::vector<uint64_t>> & ref_stamps,
+                                   const llama_qsa_pooled_store & st_ref, const llama_qsa_plan & inc,
+                                   const llama_qsa_pooled_store & st_inc, uint32_t ratio,
+                                   const std::vector<std::vector<uint64_t>> * inc_stamps) {
+    std::string out;
+
+    const int64_t r = ratio;
+
+#define QSA_CMP_SCALAR(name, a, b) \
+    if ((a) != (b)) { return std::string(name) + " full=" + std::to_string(a) + " inc=" + std::to_string(b); }
+
+    QSA_CMP_SCALAR("valid",    ref.valid,    inc.valid);
+    QSA_CMP_SCALAR("cap",      ref.cap,      inc.cap);
+    QSA_CMP_SCALAR("full",     ref.full,     inc.full);
+    QSA_CMP_SCALAR("s0",       ref.s0,       inc.s0);
+    QSA_CMP_SCALAR("n_kv",     ref.n_kv,     inc.n_kv);
+    QSA_CMP_SCALAR("n_blocks", ref.n_blocks, inc.n_blocks);
+    QSA_CMP_SCALAR("n_ns",     ref.n_ns,     inc.n_ns);
+
+    const int64_t n_kv     = ref.n_kv;
+    const int64_t n_blocks = ref.n_blocks;
+
+    for (int64_t s = 0; s < ref.n_ns; ++s) {
+        if (!qsa_cmp_arr(out, "cell_blk",  s, ref.v_cell_blk [s], inc.v_cell_blk [s], n_kv))       { return out; }
+        if (!qsa_cmp_arr(out, "blk_cells", s, ref.v_blk_cells[s], inc.v_blk_cells[s], r*n_blocks)) { return out; }
+        for (int64_t sec = 0; sec < 4; ++sec) {
+            if (!qsa_cmp_arr(out, sec == 0 ? "blk_pos[0]" : sec == 1 ? "blk_pos[1]" : sec == 2 ? "blk_pos[2]" : "blk_pos[3]", s,
+                             ref.v_blk_pos[s] + sec*ref.v_pos_stride, inc.v_blk_pos[s] + sec*inc.v_pos_stride, n_blocks)) {
+                return out;
+            }
+        }
+        if (!qsa_cmp_arr(out, "remap", s, ref.v_remap[s], inc.v_remap[s], n_blocks)) { return out; }
+
+        const auto & a = *ref.v_cs[s];
+        const auto & b = *inc.v_cs[s];
+
+        QSA_CMP_SCALAR("cs.n_bid",  a.n_bid,  b.n_bid);
+        QSA_CMP_SCALAR("cs.ranked", a.ranked, b.ranked);
+        if (!qsa_cmp_arr(out, "cs.bid_idx",  s, a.bid_idx .data(), b.bid_idx .data(), a.n_bid)) { return out; }
+        if (!qsa_cmp_arr(out, "cs.bid_cell", s, a.bid_cell.data(), b.bid_cell.data(), a.n_bid)) { return out; }
+        if ((int64_t) b.blk_of.size() < n_kv) {
+            return "cs.blk_of s=" + std::to_string(s) + " inc size " + std::to_string(b.blk_of.size());
+        }
+        if (!qsa_cmp_arr(out, "cs.blk_of", s, a.blk_of.data(), b.blk_of.data(), n_kv)) { return out; }
+        if (a.ranked) {
+            if (!qsa_cmp_vec(out, "cs.order", s, a.order, b.order)) { return out; }
+            if (!qsa_cmp_vec(out, "cs.rank",  s, a.rank,  b.rank))  { return out; }
+        }
+
+        // every block's stamp
+        const uint32_t g = ref.s0 + (uint32_t) s;
+        if (!qsa_cmp_vec(out, "stamps", s, ref_stamps[s], inc.inc ? st_inc.strm[g].cen.stamps : (*inc_stamps)[s])) { return out; }
+    }
+
+    if (!qsa_cmp_vec(out, "dirty_cells", -1, ref.dirty_cells, inc.dirty_cells)) { return out; }
+    if (!qsa_cmp_vec(out, "dirty_pos",   -1, ref.dirty_pos,   inc.dirty_pos))   { return out; }
+    if (!qsa_cmp_vec(out, "dirty_dst",   -1, ref.dirty_dst,   inc.dirty_dst))   { return out; }
+
+    // the store: the planned streams' slot state, the pending stamps
+    if (!qsa_cmp_vec(out, "pending_streams", -1, st_ref.pending_streams, st_inc.pending_streams)) { return out; }
+
+    for (const uint32_t g : st_ref.pending_streams) {
+        const auto & a = st_ref.strm[g];
+        const auto & b = st_inc.strm[g];
+
+        if (!qsa_cmp_vec(out, "slot_key",    g, a.slot_key,    b.slot_key))    { return out; }
+        if (!qsa_cmp_vec(out, "slot_of_key", g, a.slot_of_key, b.slot_of_key)) { return out; }
+        if (!qsa_cmp_vec(out, "slot_stamp",  g, a.slot_stamp,  b.slot_stamp))  { return out; }
+        if (!qsa_cmp_vec(out, "free_slots",  g, a.free_slots,  b.free_slots))  { return out; }
+    }
+
+    QSA_CMP_SCALAR("pending.size", st_ref.pending.size(), st_inc.pending.size());
+    for (size_t i = 0; i < st_ref.pending.size(); ++i) {
+        const auto & a = st_ref.pending[i];
+        const auto & b = st_inc.pending[i];
+        if (a.s != b.s || a.slot != b.slot || a.stamp != b.stamp) {
+            return "pending i=" + std::to_string(i) + " full=(" + std::to_string(a.s) + "," + std::to_string(a.slot) + "," +
+                   std::to_string(a.stamp) + ") inc=(" + std::to_string(b.s) + "," + std::to_string(b.slot) + "," +
+                   std::to_string(b.stamp) + ")";
+        }
+    }
+
+    QSA_CMP_SCALAR("serial", st_ref.serial, st_inc.serial);
+
+#undef QSA_CMP_SCALAR
+
+    return "";
+}
+
+std::string llama_qsa_census_state_check(const llama_qsa_pooled_store & st, uint32_t g, const llama_kv_cells & cells) {
+    const auto & C = st.strm[g].cen;
+
+    if (!C.valid || !C.inc_ok) {
+        return "";
+    }
+
+    const int64_t r = st.ratio;
+
+    std::vector<uint8_t> in_unpooled(C.n_kv, 0);
+    std::vector<uint8_t> in_empty   (C.n_kv, 0);
+
+    for (const int32_t j : C.unpooled) {
+        if (j < 0 || j >= C.n_kv || in_unpooled[j]) {
+            return "census state g=" + std::to_string(g) + ": unpooled list holds cell " + std::to_string(j) + " twice / out of range";
+        }
+        in_unpooled[j] = 1;
+    }
+    for (const int32_t j : C.empty) {
+        if (j >= 0 && j < C.n_kv) {
+            in_empty[j] = 1;
+        }
+    }
+
+    for (int64_t j = 0; j < C.n_kv; ++j) {
+        if (cells.is_empty(j)) {
+            if (!in_empty[j]) {
+                return "census state g=" + std::to_string(g) + ": empty cell " + std::to_string(j) + " not in the empty list";
+            }
+            if (in_unpooled[j]) {
+                return "census state g=" + std::to_string(g) + ": empty cell " + std::to_string(j) + " in the unpooled list";
+            }
+            continue;
+        }
+
+        const bool unp = C.cs.blk_of[j] < 0;
+
+        if (unp != (in_unpooled[j] != 0)) {
+            return "census state g=" + std::to_string(g) + ": cell " + std::to_string(j) + " unpooled=" + std::to_string(unp) +
+                   " but list=" + std::to_string(in_unpooled[j]);
+        }
+        if (unp && cells.pos_get(j)/r < C.tail_pb) {
+            return "census state g=" + std::to_string(g) + ": unpooled cell " + std::to_string(j) + " below tail_pb " +
+                   std::to_string(C.tail_pb);
+        }
+    }
+
+    return "";
+}
+
+int64_t llama_memory_hybrid_idx_context::qsa_store_plan(const llama_ubatch & ubatch, uint32_t ratio, int64_t n_kv, bool blk_bias) const {
+    llama_qsa_pooled_store * st = get_qsa_store();
+    GGML_ASSERT(st != nullptr && ratio == st->ratio);
+
+    const int64_t r        = ratio;
+    const int64_t n_blocks = (n_kv + r - 1)/r;
+
+    if (full) {
+        // the reserve graphs: every block may be dirty at once (the first selection after the exhaustive
+        // bypass, a restore, a shift), so size for the cold rebuild: the full pool
+        return n_blocks;
+    }
+
+    auto & pl = qsa_plan;
+
+    if (pl.valid && pl.i_ubatch == i_cur && pl.ratio == ratio && pl.n_kv == n_kv && pl.blk_bias == blk_bias) {
+        return pl.cap;
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+
+    // a plan whose graph never reported back (an exception, an optimizer path) must not publish later
+    if (!st->pending.empty() || !st->pending_streams.empty()) {
+        st->publish(st->pending_armed ? false : true);
+    }
+
+    const int64_t n_ns     = get_n_stream();
+    const int64_t n_tokens = ubatch.n_tokens;
+    GGML_ASSERT(n_tokens % n_ns == 0);
+    const int64_t n_tps    = n_tokens/n_ns;
+
+    llama_qsa_plan_in in;
+    in.n_ns      = n_ns;
+    in.is_pos_2d = ubatch.is_pos_2d();
+    in.n_kv      = n_kv;
+    in.blk_bias  = blk_bias;
+    in.cells.resize(n_ns);
+    in.g    .resize(n_ns);
+
+    for (int64_t s = 0; s < n_ns; ++s) {
+        const llama_seq_id seq_of_stream = ubatch.seq_id[s*n_tps][0];
+
+        in.cells[s] = &mem->get_mem_idx()->get_cells(seq_of_stream);
+        in.g    [s] = mem->qsa_stream_of(seq_of_stream);
+    }
+
+    pl.valid = false;
+
+    if (!st->inc) {
+        llama_qsa_plan_full(*st, in, pl);
+    } else if (!llama_qsa_census_check()) {
+        llama_qsa_plan_inc(*st, in, pl);
+    } else {
+        // [TAG_QSA_CENSUS_INC] LLAMA_QSA_CENSUS_CHECK=1: the full path on the store as it is, then the incremental path on
+        // the same starting state; the incremental result is kept
+        llama_qsa_store_snapshot before;
+        llama_qsa_store_save(*st, before);
+
+        llama_qsa_plan                     ref;
+        std::vector<std::vector<uint64_t>> ref_stamps;
+        llama_qsa_plan_full(*st, in, ref, &ref_stamps);
+
+        // the full path's store, for the comparison (moved out: only the planned streams' slot state is compared)
+        llama_qsa_store_snapshot after_ref;
+        llama_qsa_store_save(*st, after_ref);
+        llama_qsa_store_restore(*st, before);
+
+        llama_qsa_plan_inc(*st, in, pl);
+
+        llama_qsa_pooled_store st_ref_view;
+        st_ref_view.ratio   = st->ratio;
+        st_ref_view.n_slots = st->n_slots;
+        st_ref_view.n_rows  = st->n_rows;
+        llama_qsa_store_restore(st_ref_view, after_ref);
+
+        std::string diff = llama_qsa_plan_compare(ref, ref_stamps, st_ref_view, pl, *st, ratio);
+        for (int64_t s = 0; s < n_ns && diff.empty(); ++s) {
+            diff = llama_qsa_census_state_check(*st, in.g[s], *in.cells[s]);
+        }
+        if (!diff.empty()) {
+            GGML_ABORT("[qsa-census-check] MISMATCH %s (n_kv=%lld n_ns=%lld plan %llu)", diff.c_str(), (long long) n_kv,
+                       (long long) n_ns, (unsigned long long) st->stats.n_plan);
+        }
+
+        static std::atomic<uint64_t> n_checked { 0 };
+
+        const uint64_t n = ++n_checked;
+        if (n % 16 == 0 || n <= 4) {
+            LLAMA_LOG_WARN("[qsa-census-check] %llu plans identical (fast-path stream censuses %llu, full %llu)\n",
+                           (unsigned long long) n, (unsigned long long) st->stats.n_cen_inc,
+                           (unsigned long long) st->stats.n_cen_full);
+        }
+    }
+
+    pl.i_ubatch = i_cur;
+
+    st->stats.t_plan_us += ggml_time_us() - t_start_us;
+
+    return pl.cap;
 }
 
 uint32_t llama_memory_hybrid_idx_context::qsa_store_s0() const {
@@ -1751,7 +3007,14 @@ void llama_memory_hybrid_idx_context::set_input_qsa_store(
     GGML_ASSERT(ggml_backend_buffer_is_host(dirty_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(dirty_pos->buffer));
 
-    memcpy(cell_blk   ->data, pl.cell_blk   .data(), ggml_nbytes(cell_blk));
+    // [TAG_QSA_CENSUS_INC] the census arrays are read through the per-stream views (the plan's own arrays, or the store's
+    // census state, which this plan wrote and no later plan has touched yet)
+    GGML_ASSERT(!pl.inc || pl.serial == st->serial);
+    GGML_ASSERT(ggml_nbytes(cell_blk) == (size_t) (n_kv*pl.n_ns)*sizeof(int32_t));
+
+    for (int64_t s = 0; s < pl.n_ns; ++s) {
+        memcpy((int32_t *) cell_blk->data + s*n_kv, pl.v_cell_blk[s], n_kv*sizeof(int32_t));
+    }
     memcpy(dirty_cells->data, pl.dirty_cells.data(), ggml_nbytes(dirty_cells));
     memcpy(dirty_pos  ->data, pl.dirty_pos  .data(), ggml_nbytes(dirty_pos));
 
@@ -1760,7 +3023,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa_store(
         GGML_ASSERT(ggml_backend_buffer_is_host(dirty_dst->buffer) && ggml_backend_buffer_is_host(remap->buffer));
 
         memcpy(dirty_dst->data, pl.dirty_dst.data(), ggml_nbytes(dirty_dst));
-        memcpy(remap    ->data, pl.remap    .data(), ggml_nbytes(remap));
+        for (int64_t s = 0; s < pl.n_ns; ++s) {
+            memcpy((int32_t *) remap->data + s*pl.n_blocks, pl.v_remap[s], pl.n_blocks*sizeof(int32_t));
+        }
     }
 
     // [TAG_QSA_COMPACT_BIAS] exactly one of the plane and the tables
@@ -1776,17 +3041,17 @@ void llama_memory_hybrid_idx_context::set_input_qsa_store(
 
         for (int64_t s = 0; s < pl.n_ns; ++s) {
             qsa_fill_bias_compact(s, ubatch, pl.n_ns, pl.n_blocks, ratio,
-                    (int32_t *) qsa_blk->data, (int32_t *) qsa_qry->data, pl.cs[s]);
+                    (int32_t *) qsa_blk->data, (int32_t *) qsa_qry->data, *pl.v_cs[s]);
 
             if (llama_qsa_compact_check_env() || qsa_tail_assert_enabled()) {
-                qsa_compact_check(s, ubatch, n_kv, pl.n_ns, pl.n_blocks, ratio, pl.cell_blk.data() + s*n_kv,
-                        (const int32_t *) qsa_blk->data, (const int32_t *) qsa_qry->data, pl.cs[s], check_plane);
+                qsa_compact_check(s, ubatch, n_kv, pl.n_ns, pl.n_blocks, ratio, pl.v_cell_blk[s],
+                        (const int32_t *) qsa_blk->data, (const int32_t *) qsa_qry->data, *pl.v_cs[s], check_plane);
             }
         }
     } else {
         for (int64_t s = 0; s < pl.n_ns; ++s) {
             qsa_fill_bias(s, ubatch, n_kv, pl.n_ns, pl.n_blocks, ratio, blk_bias,
-                    pl.cell_blk.data() + s*n_kv, (float *) bias->data, pl.cs[s]);
+                    pl.v_cell_blk[s], (float *) bias->data, *pl.v_cs[s]);
         }
     }
 

@@ -429,6 +429,9 @@ private:
         int64_t  in_wait_us = 0, in_copy_us = 0, kq_copy_us = 0, kq_bytes = 0;
         int64_t  compute_us = 0, sync_us = 0, n_sync = 0;
         int64_t  t0_ms = 0, t1_ms = 0; // unix ms: start of the first graph, end of the last graph or sync
+        // [TAG_QSA_CENSUS_INC] the QSA store plans of the window (deltas of llama_qsa_pooled_store::stats)
+        int64_t  plan_us = 0, n_plan = 0, n_plan_inc = 0, n_cen_inc = 0, n_cen_full = 0;
+        int64_t  n_cen_fb[5] = {};
     };
     mutable kqvis_prof_window kqvis_win;
     mutable int64_t           kqvis_n_win = 0;

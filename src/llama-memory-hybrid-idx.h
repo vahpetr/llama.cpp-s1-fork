@@ -4,6 +4,7 @@
 
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 //
@@ -31,6 +32,61 @@ int  llama_qsa_pool_remap_parse(const char * s);
 // the knob, read once per process; the first call logs the proof line `qsa_pool_remap = indexed` / `= copy` at WARN
 // (the memory calls it when it creates the pooled-key cache, so the line is in the load log)
 bool llama_qsa_pool_remap_indexed();
+
+//
+// [TAG_QSA_CENSUS_INC] LLAMA_QSA_CENSUS_INC=1 (default 0) - only with LLAMA_QSA_POOLED_CACHE=1 (the plan exists only
+// there). The block census + stamps + slot plan of every graph keep a persistent per-stream state in the pooled store
+// and re-group only the cells at or past the lowest position touched since the last plan (appends, MTP rollback); a
+// stream whose state cannot be extended (more than one sequence, an M-RoPE ranked or duplicated census, a cell past the
+// window, an n_kv shrink, or a mark that forces it: seq_cp / seq_keep / seq_add / seq_div / clear / state_read /
+// state_drop / invalidate / K-shift or stream-copy update / overwrite of a used cell) gets the full census, as before.
+// EXACT: every plan output (cell_blk, blk_cells, blk_pos, remap, dirty_*, cap, the census stream, the stamps, the slot
+// assignment and free-slot order) is byte-identical to the full path's; LLAMA_QSA_CENSUS_CHECK=1 runs both per plan and
+// aborts on the first differing element. Off is today's code path.
+//
+// the parser: 0 for unset / "" / "0", 1 for "1", -1 for anything else (WARN, treated as 0)
+int  llama_qsa_census_inc_parse(const char * s);
+// the knobs, read once per process; the first call logs the proof line `qsa_census = incremental (LLAMA_QSA_CENSUS_INC=1)`
+// / `qsa_census = full (...)` at WARN (the memory calls it when it creates the pooled-key cache, so the line is in the
+// load log). CHECK is honoured only with INC on.
+bool llama_qsa_census_inc();
+bool llama_qsa_census_check();
+
+// what the per-token bias fill needs from the block census of one stream
+struct llama_qsa_census_stream {
+    int32_t n_bid  = 0;
+    bool    ranked = false;
+    std::vector<int32_t> bid_idx;
+    std::vector<int32_t> bid_cell;
+    std::vector<int32_t> order;
+    std::vector<int32_t> rank;
+    std::vector<int32_t> blk_of;
+};
+
+// [TAG_QSA_CENSUS_INC] why a stream census took the full path (stats n_cen_fb, the kqvis-prof line)
+enum {
+    LLAMA_QSA_CEN_FAST      = 0,
+    LLAMA_QSA_CEN_FB_MARK   = 1, // a full-census mark (seq_cp/keep/add/div, clear, state_read/drop, reset, update, overwrite,
+                                 // a write run past kv_size/4) or the first plan
+    LLAMA_QSA_CEN_FB_SHAPE  = 2, // more than one sequence, ranked / dup census, a cell past the window
+    LLAMA_QSA_CEN_FB_SHRINK = 3, // n_kv shrank
+    LLAMA_QSA_CEN_FB_REGION = 4, // the re-grouped region is > max(64, n_bid/8) blocks
+    LLAMA_QSA_CEN_FB_COUNT  = 5,
+};
+
+// properties of a census the incremental path needs (out-parameter of llama_qsa_census_full)
+struct llama_qsa_census_flags {
+    bool one_seq = false;
+    bool dup     = false;
+    bool oor     = false;
+};
+
+// the full block census of one stream (the body of llama_memory_hybrid_idx_context::qsa_census): which complete group
+// of r cells is which compact block id, the cells of each block (blk_cells [r*n_blocks]), the block of each cell
+// (cell_blk [n_kv]) and the rope positions: blk_pos[sec*pos_stride + b] (the caller zero-fills them)
+void llama_qsa_census_full(const llama_kv_cells & cells, bool is_pos_2d, int64_t n_kv, int64_t n_blocks, int64_t r,
+                           bool blk_bias, int32_t * cell_blk, int32_t * blk_cells, int32_t * blk_pos, int64_t pos_stride,
+                           llama_qsa_census_stream & cs, llama_qsa_census_flags * flags = nullptr);
 
 //
 // [TAG_QSA_POOLED_CACHE] (M3 v1) the pooled-key cache
@@ -72,6 +128,35 @@ struct llama_qsa_pooled_store {
         std::vector<uint64_t> slot_stamp;   // [n_slots] committed stamp, 0 = invalid
         std::vector<uint32_t> slot_seen;    // [n_slots] census serial that last saw the owner
         std::vector<int32_t>  free_slots;   // stack, pops the lowest free slot first after a reset
+
+        // [TAG_QSA_CENSUS_INC] the census of this stream's last plan (inc mode only) and the marks since then
+        struct census_t {
+            bool    valid    = false;  // the arrays hold the census + plan of this stream's last plan
+            bool    inc_ok   = false;  // ... and the fast path may extend it: one seq, not ranked, no dup, no oor
+            int64_t n_kv     = 0;
+            int64_t n_blocks = 0;
+
+            std::vector<int32_t>  cell_blk;   // [n_kv]
+            std::vector<int32_t>  blk_cells;  // [r*n_blocks]
+            std::vector<int32_t>  blk_pos;    // [4*n_blocks], sec-major
+            std::vector<int32_t>  remap;      // [n_blocks] store row (stream offset included)
+            std::vector<uint64_t> stamps;     // [n_bid]
+            llama_qsa_census_stream cs;
+
+            std::vector<int32_t> unpooled;    // the non-empty cells without a block (all at pb >= tail_pb)
+            std::vector<int32_t> empty;       // the empty cells < n_kv
+            int64_t              tail_pb = 0; // every non-empty cell below tail_pb*r is in a complete block
+            std::vector<int32_t> carry;       // block ids of the last plan's dirty list (their stamps may be unpublished)
+
+            // marks since the last plan
+            bool                 inc_all    = true;       // the next plan of this stream takes the full census
+            llama_pos            inc_lo_pos = INT32_MAX;  // the lowest position touched (written, removed)
+            std::vector<int32_t> written;                 // cells written
+
+            // scratch: per-cell dedup epoch
+            std::vector<uint32_t> seen;
+            uint32_t              seen_epoch = 0;
+        } cen;
     };
 
     std::vector<stream_state> strm;
@@ -99,6 +184,10 @@ struct llama_qsa_pooled_store {
         uint64_t n_publish     = 0;
         uint64_t n_fail        = 0;
         uint64_t t_plan_us     = 0;
+        uint64_t n_plan_inc    = 0;  // [TAG_QSA_CENSUS_INC] plans of which every stream took the fast path
+        uint64_t n_cen_inc     = 0;  // [TAG_QSA_CENSUS_INC] stream censuses: fast path / full
+        uint64_t n_cen_full    = 0;
+        uint64_t n_cen_fb[LLAMA_QSA_CEN_FB_COUNT] = {}; // full censuses by reason (index 0 unused)
         uint32_t last_dirty    = 0;  // of the last plan, all streams
         uint32_t last_cap      = 0;
         uint32_t last_n_bid    = 0;
@@ -108,7 +197,95 @@ struct llama_qsa_pooled_store {
     void reset_all();
     void on_write(const struct llama_kv_cache::slot_info & sinfo); // bump the generations of the written cells
     void publish(bool ok);              // commit or drop the pending stamps
+
+    // [TAG_QSA_CENSUS_INC] the marks every mutator of the indexer cells leaves (no-ops unless `inc`)
+    bool inc = false;
+    void inc_mark_all(uint32_t s);                       // the next census of stream s is a full one
+    void inc_mark_all_streams();
+    void inc_mark_pos(uint32_t s, llama_pos p0);         // positions >= p0 were removed (seq_rm)
+    // before a write: a written cell that is in use (an overwrite, which may purge other cells) forces a full census
+    void inc_mark_write_pre (uint32_t s, const llama_kv_cells & cells, const std::vector<uint32_t> & idxs);
+    // after a write: the written cells and their new positions
+    void inc_mark_write_post(uint32_t s, const llama_kv_cells & cells, const std::vector<uint32_t> & idxs);
 };
+
+// [TAG_QSA_CENSUS_INC] the plan of one ubatch (the census, the stamps, the slot assignment, the dirty list, the remap)
+struct llama_qsa_plan {
+    bool     valid    = false;
+    size_t   i_ubatch = 0;
+    uint32_t ratio    = 0;
+    int64_t  n_kv     = 0;
+    int64_t  n_blocks = 0;
+    int64_t  n_ns     = 0;
+    bool     blk_bias = false;
+    int64_t  cap      = 0;
+    bool     full     = false;   // cap == n_blocks: every block pooled, slots in compact order
+    uint32_t s0       = 0;       // the cache stream of ubatch stream 0
+    bool     inc      = false;   // the views point into the store's per-stream census (inc mode)
+    uint32_t serial   = 0;       // the store serial of this plan
+
+    // the full path's own arrays (all ubatch streams; inc mode leaves them empty)
+    std::vector<int32_t> cell_blk;
+    std::vector<int32_t> blk_cells;
+    std::vector<int32_t> blk_pos;
+    std::vector<llama_qsa_census_stream> cs;
+    std::vector<int32_t> remap;
+
+    std::vector<int32_t> dirty_cells;
+    std::vector<int32_t> dirty_pos;
+    std::vector<int32_t> dirty_dst;
+
+    // per ubatch stream: where the census arrays are (set by both paths; read by the inputs and the check)
+    std::vector<const int32_t *>                 v_cell_blk;   // [n_kv]
+    std::vector<const int32_t *>                 v_blk_cells;  // [r*n_blocks]
+    std::vector<const int32_t *>                 v_remap;      // [n_blocks]
+    std::vector<const int32_t *>                 v_blk_pos;    // value (sec, b) = v_blk_pos[s][sec*v_pos_stride + b]
+    int64_t                                      v_pos_stride = 0;
+    std::vector<const llama_qsa_census_stream *> v_cs;
+};
+
+// [TAG_QSA_CENSUS_INC] the inputs of a plan: per ubatch stream its cells and its cache stream
+struct llama_qsa_plan_in {
+    int64_t n_ns      = 0;
+    bool    is_pos_2d = false;
+    int64_t n_kv      = 0;
+    bool    blk_bias  = false;
+    std::vector<const llama_kv_cells *> cells;  // [n_ns]
+    std::vector<uint32_t>               g;      // [n_ns] cache stream
+};
+
+// the full path (today's plan, unchanged); stamps_out (optional) receives every block's stamp per ubatch stream
+int64_t llama_qsa_plan_full(llama_qsa_pooled_store & st, const llama_qsa_plan_in & in, llama_qsa_plan & pl,
+                            std::vector<std::vector<uint64_t>> * stamps_out = nullptr);
+// the incremental path (st.inc must be set): per stream the fast census when its marks allow it, else the full census
+int64_t llama_qsa_plan_inc(llama_qsa_pooled_store & st, const llama_qsa_plan_in & in, llama_qsa_plan & pl);
+
+// the store state a plan changes, for the check (and the tests): copy out / back
+struct llama_qsa_store_snapshot {
+    std::vector<llama_qsa_pooled_store::stream_state> strm;
+    uint32_t serial = 0;
+    std::vector<llama_qsa_pooled_store::pending_t> pending;
+    std::vector<uint32_t> pending_streams;
+    bool pending_armed = false;
+    llama_qsa_pooled_store::stats_t stats;
+};
+void llama_qsa_store_save   (const llama_qsa_pooled_store & st, llama_qsa_store_snapshot & snap);
+void llama_qsa_store_restore(llama_qsa_pooled_store & st, const llama_qsa_store_snapshot & snap);
+
+// the census state of cache stream g against its invariants after a plan (check mode, tests): the unpooled list is exactly
+// the non-empty cells without a block, every empty cell < n_kv is in the empty list, no non-empty cell below tail_pb*r is
+// unpooled; "" when they hold (inc_ok streams only)
+std::string llama_qsa_census_state_check(const llama_qsa_pooled_store & st, uint32_t g, const llama_kv_cells & cells);
+
+// the first difference between a full-path plan (+ its stamps and its store) and an incremental one (+ its store), as a
+// readable string; "" when byte-identical. Compares cap/full/s0, per stream cell_blk, blk_cells, blk_pos, remap, the census
+// stream (n_bid, ranked, bid_idx, bid_cell, blk_of, order/rank when ranked), dirty_cells/pos/dst, every block's stamp, and
+// of the planned cache streams slot_key, slot_of_key, slot_stamp, free_slots, plus pending (in order) and pending_streams.
+// (slot_seen is the full path's scratch and is not compared.)
+std::string llama_qsa_plan_compare(const llama_qsa_plan & ref, const std::vector<std::vector<uint64_t>> & ref_stamps,
+                                   const llama_qsa_pooled_store & st_ref, const llama_qsa_plan & inc,
+                                   const llama_qsa_pooled_store & st_inc, uint32_t r,
+                                   const std::vector<std::vector<uint64_t>> * inc_stamps = nullptr); // for a full-path `inc`
 
 //
 // llama_memory_hybrid_idx
@@ -307,15 +484,7 @@ public:
     void qsa_store_publish(bool ok) const;
 
     // what the per-token bias fill needs from the block census of one stream
-    struct qsa_census_stream {
-        int32_t n_bid  = 0;
-        bool    ranked = false;
-        std::vector<int32_t> bid_idx;
-        std::vector<int32_t> bid_cell;
-        std::vector<int32_t> order;
-        std::vector<int32_t> rank;
-        std::vector<int32_t> blk_of;
-    };
+    using qsa_census_stream = llama_qsa_census_stream;
 
 private:
     void qsa_census(int64_t s, const llama_ubatch * ubatch, int64_t n_kv, int64_t n_ns, int64_t n_blocks, int64_t r,
@@ -338,28 +507,7 @@ private:
                            const qsa_census_stream & cs, std::vector<float> & plane) const;
 
     // [TAG_QSA_POOLED_CACHE] the cached plan of the current ubatch
-    struct qsa_plan_t {
-        bool     valid    = false;
-        size_t   i_ubatch = 0;
-        uint32_t ratio    = 0;
-        int64_t  n_kv     = 0;
-        int64_t  n_blocks = 0;
-        int64_t  n_ns     = 0;
-        bool     blk_bias = false;
-        int64_t  cap      = 0;
-        bool     full     = false;   // cap == n_blocks: every block pooled, slots in compact order
-        uint32_t s0       = 0;       // the cache stream of ubatch stream 0
-
-        std::vector<int32_t> cell_blk;
-        std::vector<int32_t> blk_cells;
-        std::vector<int32_t> blk_pos;
-        std::vector<qsa_census_stream> cs;
-
-        std::vector<int32_t> dirty_cells;
-        std::vector<int32_t> dirty_pos;
-        std::vector<int32_t> dirty_dst;
-        std::vector<int32_t> remap;
-    };
+    using qsa_plan_t = llama_qsa_plan;
 
     mutable qsa_plan_t qsa_plan;
 
@@ -381,4 +529,7 @@ private:
 
     // mirrors the base class's ubatch cursor, which is private there
     size_t i_cur = 0;
+
+    // [TAG_QSA_CENSUS_INC] an update context (K-shift / stream copies): its apply() forces a full census
+    bool is_update = false;
 };
