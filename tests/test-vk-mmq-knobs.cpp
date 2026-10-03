@@ -9,6 +9,9 @@
 //     items, unknown names, upper case, spaces and "all"/"none" inside a list rejected, output untouched.
 //  3. the proof-line names round-trip, and ggml_vk_mmq_int8_allowed() = (op in mask) && n >= min_n; the defaults
 //     allow every call (= the behaviour before the knobs).
+//  4. [TAG_MMQ_INT8_Q16] MODE: absent / empty / "q8" -> q8 (default); "q16" -> q16; anything else rejected, output
+//     untouched; names round-trip. The q16 split is exact and in int8 range for every x_q in [-32639, 32639], and the
+//     i32 / f32 bounds of the two-pass accumulation (docs/verification/2026-10-03-int8-q16.md) hold.
 
 #include "../ggml/src/ggml-vulkan/ggml-vulkan-mmq-knobs.h"
 
@@ -127,6 +130,49 @@ int main() {
     CHECK(!ggml_vk_mmq_int8_allowed(MID, 32, MID, 31));
     CHECK(ggml_vk_mmq_int8_allowed(MID, 32, MID, 32));
     CHECK(!ggml_vk_mmq_int8_allowed(MID, 32, MM, 32));
+
+    // 4. MODE
+    for (const char * s : { (const char *) nullptr, "", "q8" }) {
+        uint32_t v = SENTINEL;
+        CHECK(ggml_vk_parse_mmq_int8_mode(s, v) && v == GGML_VK_MMQ_INT8_MODE_Q8);
+    }
+    {
+        uint32_t v = SENTINEL;
+        CHECK(ggml_vk_parse_mmq_int8_mode("q16", v) && v == GGML_VK_MMQ_INT8_MODE_Q16);
+    }
+    for (const char * s : { "Q16", "q16 ", " q16", "16", "q4", "q8,q16", "int16", "1", "0", "on", "q" }) {
+        uint32_t v = SENTINEL;
+        if (ggml_vk_parse_mmq_int8_mode(s, v) || v != SENTINEL) {
+            fprintf(stderr, "FAIL mode \"%s\": accepted or output touched (v=%u)\n", s, v);
+            n_fail++;
+        }
+    }
+    CHECK(strcmp(ggml_vk_mmq_int8_mode_name(GGML_VK_MMQ_INT8_MODE_Q8), "q8") == 0);
+    CHECK(strcmp(ggml_vk_mmq_int8_mode_name(GGML_VK_MMQ_INT8_MODE_Q16), "q16") == 0);
+    {
+        int n_split_bad = 0;
+        for (int32_t xq = -GGML_VK_MMQ_Q16_MAX; xq <= GGML_VK_MMQ_Q16_MAX; ++xq) {
+            int32_t hi = 0, lo = 0;
+            ggml_vk_mmq_q16_split(xq, hi, lo);
+            if (hi < -127 || hi > 127 || lo < -128 || lo > 127 || hi * 256 + lo != xq) {
+                n_split_bad++;
+            }
+        }
+        CHECK(n_split_bad == 0);
+        // one past the range would need hi = 128
+        int32_t hi = 0, lo = 0;
+        ggml_vk_mmq_q16_split(GGML_VK_MMQ_Q16_MAX + 1, hi, lo);
+        CHECK(hi == 128);
+        // bounds: per 32-value block, |acc_hi| <= 32*128*127, |acc_lo| <= 32*128*128, |v| <= 32*128*32639 < 2^31;
+        // 4/5-bit and q6_K (16-value sub-block, |code| <= 32) codes keep |v| < 2^24 (exact f32), |S| <= 32*32639 < 2^24
+        const int64_t q16max = GGML_VK_MMQ_Q16_MAX;
+        CHECK(32LL * 128 * q16max < (1LL << 31));
+        CHECK(32LL * 128 * 127 * 256 + 32LL * 128 * 128 < (1LL << 31));
+        CHECK(32LL * 15 * q16max < (1LL << 24));   // q4_K / q4_1 raw nibbles 0..15
+        CHECK(32LL * 16 * q16max < (1LL << 24));   // q5_0 -16..15, q4_0 -8..7
+        CHECK(16LL * 32 * q16max < (1LL << 24));   // q6_K -32..31 in 16-value sub-blocks
+        CHECK(32LL * q16max < (1LL << 24));        // the exact block sum S
+    }
 
     if (n_fail == 0) {
         printf("test-vk-mmq-knobs: OK\n");

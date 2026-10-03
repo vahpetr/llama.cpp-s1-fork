@@ -508,6 +508,28 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr) {
 
 // ===== B-side: load and store =====
 
+#ifdef MMQ_Q16
+// [TAG_MMQ_INT8_Q16] block_q16_x4: qs = the high int8 term, ql = the low one, d = f32 scale, s = exact int sum
+struct block_b_prefetch {
+    ivec4 qs;
+    ivec4 ql;
+    float d;
+#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+    int s;
+#endif
+};
+
+block_b_prefetch block_b_load(uint ib_outer, uint ib_inner, uint loadr) {
+    block_b_prefetch blk;
+    blk.qs = data_b[ib_outer].qh[ib_inner * 2 + loadr];
+    blk.ql = data_b[ib_outer].ql[ib_inner * 2 + loadr];
+    blk.d = data_b[ib_outer].d[ib_inner];
+#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+    blk.s = data_b[ib_outer].s[ib_inner];
+#endif
+    return blk;
+}
+#else
 struct block_b_prefetch {
     ivec4 qs;
     float16_t d;
@@ -525,6 +547,7 @@ block_b_prefetch block_b_load(uint ib_outer, uint ib_inner, uint loadr) {
 #endif
     return blk;
 }
+#endif
 
 void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
     const ivec4 v = in_bounds ? blk.qs : ivec4(0);
@@ -533,6 +556,13 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
     buf_b_qs[base + 1] = v.y;
     buf_b_qs[base + 2] = v.z;
     buf_b_qs[base + 3] = v.w;
+#ifdef MMQ_Q16
+    const ivec4 vl = in_bounds ? blk.ql : ivec4(0);
+    buf_b_ql[base    ] = vl.x;
+    buf_b_ql[base + 1] = vl.y;
+    buf_b_ql[base + 2] = vl.z;
+    buf_b_ql[base + 3] = vl.w;
+#endif
     if (loadr == 0) {
         buf_b_d[ks * BN + buf_ib] = in_bounds ? float(blk.d) : 0.0f;
 #if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)

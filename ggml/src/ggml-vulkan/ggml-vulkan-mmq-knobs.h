@@ -12,6 +12,11 @@
 //                                N <= 9 equals the default.
 //   GGML_VK_MMQ_INT8_OPS=<list>  restrict the int8 path to these ops: "all" (default), "none", or a comma-separated
 //                                list of "mul_mat" and "mul_mat_id" (exact lower case, no spaces).
+//   GGML_VK_MMQ_INT8_MODE=q8|q16 [TAG_MMQ_INT8_Q16] the activation format of that path: "q8" (default) = q8_1 as
+//                                upstream (one int8 per value, f16 scale and f16 scale*sum); "q16" = two int8 terms per
+//                                value, x ~= d * (256 * hi + lo), |256 * hi + lo| <= 32639, f32 scale, exact int32 block
+//                                sum (activation error <= amax / 65278 ~ amax * 2^-16, below f16), and two int8 WMMA
+//                                passes per tile combined in i32. Not a restriction: the same calls take the int8 path.
 //
 // Absent or empty = the default (as [TAG_ENV_BOOL]); an invalid value keeps the default and is warned about. Both are
 // read once at device init and printed in the mmq_cm1 proof line. A matmul they exclude takes quantize_y = false, i.e.
@@ -92,6 +97,37 @@ static inline const char * ggml_vk_mmq_int8_ops_name(uint32_t mask) {
         case GGML_VK_MMQ_INT8_OP_MUL_MAT_ID: return "mul_mat_id";
         default:                             return "none";
     }
+}
+
+enum : uint32_t {
+    GGML_VK_MMQ_INT8_MODE_Q8  = 0,
+    GGML_VK_MMQ_INT8_MODE_Q16 = 1,
+};
+
+// nullptr / "" -> true, out = GGML_VK_MMQ_INT8_MODE_Q8 (the default). "q8" / "q16" (exact lower case) -> true, out =
+// the mode. Anything else -> false, out untouched.
+static inline bool ggml_vk_parse_mmq_int8_mode(const char * s, uint32_t & out) {
+    if (s == nullptr || *s == '\0' || strcmp(s, "q8") == 0) {
+        out = GGML_VK_MMQ_INT8_MODE_Q8;
+        return true;
+    }
+    if (strcmp(s, "q16") == 0) {
+        out = GGML_VK_MMQ_INT8_MODE_Q16;
+        return true;
+    }
+    return false;
+}
+
+static inline const char * ggml_vk_mmq_int8_mode_name(uint32_t mode) {
+    return mode == GGML_VK_MMQ_INT8_MODE_Q16 ? "q16" : "q8";
+}
+
+// The q16 split as quantize_q8_1.comp (Q16) does it, for the CPU test: x_q in [-GGML_VK_MMQ_Q16_MAX, GGML_VK_MMQ_Q16_MAX]
+// -> hi = (x_q + 128) >> 8 (floor), lo = x_q - 256 * hi; then hi in [-127, 127], lo in [-128, 127], 256 * hi + lo == x_q.
+#define GGML_VK_MMQ_Q16_MAX 32639
+static inline void ggml_vk_mmq_q16_split(int32_t xq, int32_t & hi, int32_t & lo) {
+    hi = (xq + 128) >> 8;
+    lo = xq - hi * 256;
 }
 
 // The per-call decision: may this matmul (op = GGML_VK_MMQ_INT8_OP_*, N as above) take the int8 path? It still needs

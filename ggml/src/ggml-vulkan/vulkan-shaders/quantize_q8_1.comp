@@ -24,7 +24,15 @@ layout(constant_id = 0) const uint GROUP_SIZE = 32;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {vec4 data_a[];};
+#if defined(Q16)
+// [TAG_MMQ_INT8_Q16] two-term int8 format for the int8 coopmat1 MMQ q16 mode (x4 layout only)
 #ifndef QBLOCK_X4
+#error "Q16 needs QBLOCK_X4"
+#endif
+layout (binding = 1) writeonly buffer D {block_q16_x4 data_b[];};
+// x_q = 256 * hi + lo with hi = (x_q + 128) >> 8 in [-127, 127] and lo in [-128, 127] for |x_q| <= 127 * 256 + 127
+#define Q16_MAX 32639.0
+#elif !defined(QBLOCK_X4)
 layout (binding = 1) writeonly buffer D {block_q8_1_packed32 data_b[];};
 #else
 layout (binding = 1) writeonly buffer D {block_q8_1_x4 data_b[];};
@@ -77,6 +85,17 @@ void quantize(const uint wgid) {
     const float amax = subgroupClusteredMax(thread_max, 8);
 #endif
 
+#if defined(Q16)
+    // the f32 d is stored as is, so x - d * x_q <= d / 2 = amax / 65278 (~ amax * 2^-16) per value
+    const float d = amax / Q16_MAX;
+    const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+    vals = clamp(round(vals * d_inv), -Q16_MAX, Q16_MAX);
+    const ivec4 xq = ivec4(vals);
+    const ivec4 xhi = (xq + 128) >> 8;
+    const ivec4 xlo = xq - (xhi << 8);
+    data_b[ibx4_outer].qh[ibx4_inner * 8 + iqs] = pack32(i8vec4(xhi));
+    data_b[ibx4_outer].ql[ibx4_inner * 8 + iqs] = pack32(i8vec4(xlo));
+#else
     const float d = amax / 127.0;
     const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
     vals = round(vals * d_inv);
@@ -85,6 +104,7 @@ void quantize(const uint wgid) {
     data_b[ib].qs[iqs] = pack32(i8vec4(round(vals)));
 #else
     data_b[ibx4_outer].qs[ibx4_inner * 8 + iqs] = pack32(i8vec4(round(vals)));
+#endif
 #endif
 
 #ifndef USE_SUBGROUPS
@@ -110,7 +130,11 @@ void quantize(const uint wgid) {
         const float sum = shmem[tid];
 #endif
 
-#ifndef QBLOCK_X4
+#if defined(Q16)
+        // sum of 32 integers with |x_q| <= 32639: every partial sum is an integer below 2^24, so the f32 reduction is exact
+        data_b[ibx4_outer].d[ibx4_inner] = d;
+        data_b[ibx4_outer].s[ibx4_inner] = int(sum);
+#elif !defined(QBLOCK_X4)
         data_b[ib].ds = f16vec2(vec2(d, sum * d));
 #else
         data_b[ibx4_outer].ds[ibx4_inner] = f16vec2(vec2(d, sum * d));

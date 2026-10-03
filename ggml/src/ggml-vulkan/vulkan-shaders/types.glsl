@@ -269,6 +269,26 @@ struct block_q8_1_x4_packed128
     ivec4 qs[8];
 };
 
+// [TAG_MMQ_INT8_Q16] two-term int8 activation format of the int8 coopmat1 MMQ path (GGML_VK_MMQ_INT8_MODE=q16):
+// 4 blocks of 32 values, x ~= d * (256 * qh + ql) with x_q = 256 * qh + ql in [-32639, 32639], qh in [-127, 127],
+// ql in [-128, 127]; d = amax / 32639 in f32 and s = sum(x_q) as an exact int32 (no f16 rounding of either).
+// 288 bytes per 128 values, std430 offsets d 0, s 16, qh 32, ql 160 in both views.
+struct block_q16_x4
+{
+    float d[4];
+    int32_t s[4];
+    int32_t qh[32];
+    int32_t ql[32];
+};
+
+struct block_q16_x4_packed128
+{
+    vec4 d;
+    ivec4 s;
+    ivec4 qh[8];
+    ivec4 ql[8];
+};
+
 // K-quants
 #define QUANT_K_Q2_K 256
 

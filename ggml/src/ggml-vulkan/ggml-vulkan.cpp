@@ -941,6 +941,11 @@ struct vk_device_struct {
     // ggml-vulkan-mmq-knobs.h); the defaults leave it unrestricted.
     uint32_t mmq_int8_min_n = 0;
     uint32_t mmq_int8_ops = GGML_VK_MMQ_INT8_OPS_ALL;
+    // [TAG_MMQ_INT8_Q16] activation format of that path (GGML_VK_MMQ_INT8_MODE=q8|q16, default q8 = upstream q8_1).
+    // q16 = two int8 terms per value + f32 scale + exact int32 block sum (block_q16_x4), two WMMA passes per tile.
+    // Only set while mmq_cm1 is on: then the q8_1 mat-mat pipelines are the *_q8_1_cm1_q16 variants and their src1 is
+    // quantized with pipeline_quantize_q16_x4; the mat-vec q8_1 paths (MMVQ) keep q8_1.
+    uint32_t mmq_int8_mode = GGML_VK_MMQ_INT8_MODE_Q8;
     // [TAG_QSA_TOPK_V2] QSA selection kernel: false = v1 (topk_radix_select.comp, one workgroup per row),
     // true = v2 (topk_radix_select_v2.comp, tiles x 256 invocations, subgroup size qsa_topk_wave).
     // Byte-identical outputs; GGML_VK_QSA_TOPK=v1|v2 (default v2), GGML_VK_QSA_TOPK_WAVE=32|64 (default 64 where
@@ -1007,6 +1012,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    vk_pipeline pipeline_quantize_q16_x4;   // [TAG_MMQ_INT8_Q16]
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -4724,14 +4730,19 @@ static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const 
     const uint32_t BN         = warptile[2];
     const uint32_t WARP       = warptile[10];
 
+    // [TAG_MMQ_INT8_Q16] the q16 variant: an extra B buffer (buf_b_ql) and BK_STEP 2 for mul_mat too (mul_mmq_cm1.comp)
+    const bool     q16     = device->mmq_cm1 && device->mmq_int8_mode == GGML_VK_MMQ_INT8_MODE_Q16;
     const uint32_t BK      = 32;
-    const uint32_t BK_STEP = mul_mat_id ? 2u : 4u;
+    const uint32_t BK_STEP = (mul_mat_id || q16) ? 2u : 4u;
     const uint32_t QPITCH  = BK_STEP * (BK / 4u) + 4u;
     const uint32_t KSCALES = kscales2 ? 2u : 1u;
 
     uint32_t total = 0;
     total += BM * QPITCH * (uint32_t)sizeof(uint32_t);   // buf_a_qs
     total += BN * QPITCH * (uint32_t)sizeof(uint32_t);   // buf_b_qs
+    if (q16) {
+        total += BN * QPITCH * (uint32_t)sizeof(uint32_t); // [TAG_MMQ_INT8_Q16] buf_b_ql (the low int8 term)
+    }
     total += has_dm ? (BM * BK_STEP * 2u * (uint32_t)sizeof(float))   // buf_a_dm (vec2)
                     : (BM * BK_STEP * KSCALES * (uint32_t)sizeof(float)); // buf_a_d
     total += BN * BK_STEP * (uint32_t)sizeof(float);     // buf_b_d
@@ -5086,8 +5097,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool is_k_quant = (t == GGML_TYPE_Q2_K || t == GGML_TYPE_Q3_K ||
                                      t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
                                      t == GGML_TYPE_Q6_K);
+            // [TAG_MMQ_INT8_Q16] the q16 mode puts the d+m types on the 256-invocation k tiles (see CREATE_MMQ_CM1)
             const bool cm1_k_tile = (t == GGML_TYPE_Q3_K || t == GGML_TYPE_Q6_K ||
-                                     t == GGML_TYPE_NVFP4);
+                                     t == GGML_TYPE_NVFP4) ||
+                                    (use_cm1_int && device->mmq_int8_mode == GGML_VK_MMQ_INT8_MODE_Q16 &&
+                                     (t == GGML_TYPE_Q4_1 || t == GGML_TYPE_Q5_1 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K));
 
             const auto & s_int   = use_cm1_int ? (cm1_k_tile ? s_warptile_mmq_cm1_int_k : s_warptile_mmq_cm1_int)
                                                : (is_k_quant  ? s_warptile_mmq_int_k     : s_warptile_mmq_int);
@@ -5543,29 +5557,41 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // DEVICE_ARCH), required subgroup size pinned to the warptile WARP element, full subgroups, no aligned variant.
         // Only created when device->mmq_cm1 (GGML_VK_DISABLE_MMQ_CM1=1 -> none: the q8_1 lookup returns nullptr and
         // ggml_vk_mul_mat_q_f16 / _id_q_f16 take the pre-port f16/f32 dequant coopmat1 path).
+        // [TAG_MMQ_INT8_Q16] GGML_VK_MMQ_INT8_MODE=q16 puts the *_cm1_q16 variant (two-term int8 src1, block_q16_x4) into
+        // the same slots; ggml_vk_mul_mat{,_id}_q_f16 then quantize src1 with pipeline_quantize_q16_x4.
+        const bool mmq_q16 = device->mmq_int8_mode == GGML_VK_MMQ_INT8_MODE_Q16;
+        // q16: the d+m types (q4_1 q5_1 q4_K q5_K) take the k tiles (L 64 x 128 with 256 invocations instead of 128 x 128
+        // with 512): the 512-invocation tile is held to 128 VGPRs and spills (780M, BK_STEP 2: q4_K 49, q5_K 64 VGPRs;
+        // with the k tile none, -6 / -17 % time); the others spill little (q8_0 21, q5_0 19) and are faster on the L tile
+        const auto & l_warptile_mmq_cm1_int_q = mmq_q16 ? l_warptile_mmq_cm1_int_k : l_warptile_mmq_cm1_int;
+        const auto & m_warptile_mmq_cm1_int_q = mmq_q16 ? m_warptile_mmq_cm1_int_k : m_warptile_mmq_cm1_int;
+        const auto & s_warptile_mmq_cm1_int_q = mmq_q16 ? s_warptile_mmq_cm1_int_k : s_warptile_mmq_cm1_int;
+        const auto & l_mmq_cm1_wg_denoms_q = mmq_q16 ? l_mmq_cm1_wg_denoms_k : l_mmq_wg_denoms;
+        const auto & m_mmq_cm1_wg_denoms_q = mmq_q16 ? m_mmq_cm1_wg_denoms_k : m_mmq_wg_denoms;
+        const auto & s_mmq_cm1_wg_denoms_q = mmq_q16 ? s_mmq_cm1_wg_denoms_k : s_mmq_wg_denoms;
 #define CREATE_MMQ_CM1(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
         if (device->mul_mat ## ID ## _l_int[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->l, #NAMELC "_cm1_l", NAMELC ## _cm1_len, NAMELC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, 1, false, true, l_ ## WARPTILE[10]); \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->l, mmq_q16 ? #NAMELC "_cm1_q16_l" : #NAMELC "_cm1_l", mmq_q16 ? NAMELC ## _cm1_q16_len : NAMELC ## _cm1_len, mmq_q16 ? NAMELC ## _cm1_q16_data : NAMELC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, 1, false, true, l_ ## WARPTILE[10]); \
         if (device->mul_mat ## ID ## _m_int[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->m, #NAMELC "_cm1_m", NAMELC ## _cm1_len, NAMELC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, m_ ## WARPTILE, 1, false, true, m_ ## WARPTILE[10]); \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->m, mmq_q16 ? #NAMELC "_cm1_q16_m" : #NAMELC "_cm1_m", mmq_q16 ? NAMELC ## _cm1_q16_len : NAMELC ## _cm1_len, mmq_q16 ? NAMELC ## _cm1_q16_data : NAMELC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, m_ ## WARPTILE, 1, false, true, m_ ## WARPTILE[10]); \
         if (device->mul_mat ## ID ## _s_int[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->s, #NAMELC "_cm1_s", NAMELC ## _cm1_len, NAMELC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, 1, false, true, s_ ## WARPTILE[10]); \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->s, mmq_q16 ? #NAMELC "_cm1_q16_s" : #NAMELC "_cm1_s", mmq_q16 ? NAMELC ## _cm1_q16_len : NAMELC ## _cm1_len, mmq_q16 ? NAMELC ## _cm1_q16_data : NAMELC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, 1, false, true, s_ ## WARPTILE[10]); \
 
         // Some quants are not performant on RDNA4, those fall back to FP16 matmul
         const bool rdna4 = device->architecture == AMD_RDNA4;
 
         if (device->mmq_cm1) {
             CREATE_MMQ_CM1(GGML_TYPE_Q4_0,   pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0],   matmul_q4_0_q8_1,   mmq_wg_denoms,         warptile_mmq_cm1_int,   vk_mat_mat_push_constants, 3, );
-            if (!rdna4) { CREATE_MMQ_CM1(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_1], matmul_q4_1_q8_1, mmq_wg_denoms, warptile_mmq_cm1_int, vk_mat_mat_push_constants, 3, ); }
+            if (!rdna4) { CREATE_MMQ_CM1(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_1], matmul_q4_1_q8_1, mmq_cm1_wg_denoms_q, warptile_mmq_cm1_int_q, vk_mat_mat_push_constants, 3, ); }
             CREATE_MMQ_CM1(GGML_TYPE_Q5_0,   pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_0],   matmul_q5_0_q8_1,   mmq_wg_denoms,         warptile_mmq_cm1_int,   vk_mat_mat_push_constants, 3, );
-            if (!rdna4) { CREATE_MMQ_CM1(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_1], matmul_q5_1_q8_1, mmq_wg_denoms, warptile_mmq_cm1_int, vk_mat_mat_push_constants, 3, ); }
+            if (!rdna4) { CREATE_MMQ_CM1(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_1], matmul_q5_1_q8_1, mmq_cm1_wg_denoms_q, warptile_mmq_cm1_int_q, vk_mat_mat_push_constants, 3, ); }
             CREATE_MMQ_CM1(GGML_TYPE_Q8_0,   pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q8_0],   matmul_q8_0_q8_1,   mmq_wg_denoms,         warptile_mmq_cm1_int,   vk_mat_mat_push_constants, 3, );
             CREATE_MMQ_CM1(GGML_TYPE_IQ4_NL, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_NL], matmul_iq4_nl_q8_1, mmq_wg_denoms,         warptile_mmq_cm1_int,   vk_mat_mat_push_constants, 3, );
             CREATE_MMQ_CM1(GGML_TYPE_IQ4_XS, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_XS], matmul_iq4_xs_q8_1, mmq_wg_denoms,         warptile_mmq_cm1_int,   vk_mat_mat_push_constants, 3, );
             CREATE_MMQ_CM1(GGML_TYPE_MXFP4,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_MXFP4],  matmul_mxfp4_q8_1,  mmq_wg_denoms,         warptile_mmq_cm1_int,   vk_mat_mat_push_constants, 3, );
             CREATE_MMQ_CM1(GGML_TYPE_Q3_K,   pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q3_K],   matmul_q3_k_q8_1,   mmq_cm1_wg_denoms_k,   warptile_mmq_cm1_int_k, vk_mat_mat_push_constants, 3, );
-            if (!rdna4) { CREATE_MMQ_CM1(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_K], matmul_q4_k_q8_1, mmq_wg_denoms, warptile_mmq_cm1_int, vk_mat_mat_push_constants, 3, ); }
-            if (!rdna4) { CREATE_MMQ_CM1(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_K], matmul_q5_k_q8_1, mmq_wg_denoms, warptile_mmq_cm1_int, vk_mat_mat_push_constants, 3, ); }
+            if (!rdna4) { CREATE_MMQ_CM1(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_K], matmul_q4_k_q8_1, mmq_cm1_wg_denoms_q, warptile_mmq_cm1_int_q, vk_mat_mat_push_constants, 3, ); }
+            if (!rdna4) { CREATE_MMQ_CM1(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_K], matmul_q5_k_q8_1, mmq_cm1_wg_denoms_q, warptile_mmq_cm1_int_q, vk_mat_mat_push_constants, 3, ); }
             CREATE_MMQ_CM1(GGML_TYPE_Q6_K,   pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q6_K],   matmul_q6_k_q8_1,   mmq_cm1_wg_denoms_k,   warptile_mmq_cm1_int_k, vk_mat_mat_push_constants, 3, );
             if (!rdna4) { CREATE_MMQ_CM1(GGML_TYPE_NVFP4, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_NVFP4], matmul_nvfp4_q8_1, mmq_cm1_wg_denoms_k, warptile_mmq_cm1_int_k, vk_mat_mat_push_constants, 3, ); }
         }
@@ -5616,16 +5642,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         if (device->mmq_cm1) {
             CREATE_MMQ_CM1(GGML_TYPE_Q4_0,   pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_0],   matmul_id_subgroup_q4_0_q8_1,   mmq_wg_denoms,       warptile_mmq_cm1_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
-            CREATE_MMQ_CM1(GGML_TYPE_Q4_1,   pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_1],   matmul_id_subgroup_q4_1_q8_1,   mmq_wg_denoms,       warptile_mmq_cm1_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+            CREATE_MMQ_CM1(GGML_TYPE_Q4_1,   pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_1],   matmul_id_subgroup_q4_1_q8_1,   mmq_cm1_wg_denoms_q, warptile_mmq_cm1_int_q,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
             CREATE_MMQ_CM1(GGML_TYPE_Q5_0,   pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q5_0],   matmul_id_subgroup_q5_0_q8_1,   mmq_wg_denoms,       warptile_mmq_cm1_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
-            CREATE_MMQ_CM1(GGML_TYPE_Q5_1,   pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q5_1],   matmul_id_subgroup_q5_1_q8_1,   mmq_wg_denoms,       warptile_mmq_cm1_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+            CREATE_MMQ_CM1(GGML_TYPE_Q5_1,   pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q5_1],   matmul_id_subgroup_q5_1_q8_1,   mmq_cm1_wg_denoms_q, warptile_mmq_cm1_int_q,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
             CREATE_MMQ_CM1(GGML_TYPE_Q8_0,   pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q8_0],   matmul_id_subgroup_q8_0_q8_1,   mmq_wg_denoms,       warptile_mmq_cm1_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
             CREATE_MMQ_CM1(GGML_TYPE_IQ4_NL, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_IQ4_NL], matmul_id_subgroup_iq4_nl_q8_1, mmq_wg_denoms,       warptile_mmq_cm1_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
             CREATE_MMQ_CM1(GGML_TYPE_IQ4_XS, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_IQ4_XS], matmul_id_subgroup_iq4_xs_q8_1, mmq_wg_denoms,       warptile_mmq_cm1_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
             CREATE_MMQ_CM1(GGML_TYPE_MXFP4,  pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_MXFP4],  matmul_id_subgroup_mxfp4_q8_1,  mmq_wg_denoms,       warptile_mmq_cm1_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
             CREATE_MMQ_CM1(GGML_TYPE_Q3_K,   pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q3_K],   matmul_id_subgroup_q3_k_q8_1,   mmq_cm1_wg_denoms_k, warptile_mmq_cm1_int_k, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
-            CREATE_MMQ_CM1(GGML_TYPE_Q4_K,   pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_K],   matmul_id_subgroup_q4_k_q8_1,   mmq_wg_denoms,       warptile_mmq_cm1_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
-            CREATE_MMQ_CM1(GGML_TYPE_Q5_K,   pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q5_K],   matmul_id_subgroup_q5_k_q8_1,   mmq_wg_denoms,       warptile_mmq_cm1_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+            CREATE_MMQ_CM1(GGML_TYPE_Q4_K,   pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_K],   matmul_id_subgroup_q4_k_q8_1,   mmq_cm1_wg_denoms_q, warptile_mmq_cm1_int_q,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+            CREATE_MMQ_CM1(GGML_TYPE_Q5_K,   pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q5_K],   matmul_id_subgroup_q5_k_q8_1,   mmq_cm1_wg_denoms_q, warptile_mmq_cm1_int_q,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
             CREATE_MMQ_CM1(GGML_TYPE_Q6_K,   pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q6_K],   matmul_id_subgroup_q6_k_q8_1,   mmq_cm1_wg_denoms_k, warptile_mmq_cm1_int_k, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
             if (!rdna4) { CREATE_MMQ_CM1(GGML_TYPE_NVFP4, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_NVFP4], matmul_id_subgroup_nvfp4_q8_1, mmq_cm1_wg_denoms_k, warptile_mmq_cm1_int_k, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id); }
         }
@@ -6336,6 +6362,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
     } else {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_len, quantize_q8_1_x4_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
+    }
+    // [TAG_MMQ_INT8_Q16] src1 quantizer of the q16 mode (block_q16_x4); only the int8 coopmat1 MMQ reads it
+    if (device->mmq_cm1 && device->mmq_int8_mode == GGML_VK_MMQ_INT8_MODE_Q16) {
+        if (device->subgroup_clustered && device->subgroup_require_full_support) {
+            ggml_vk_create_pipeline(device, device->pipeline_quantize_q16_x4, "quantize_q16_x4", quantize_q16_x4_subgroup_len, quantize_q16_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
+        } else {
+            ggml_vk_create_pipeline(device, device->pipeline_quantize_q16_x4, "quantize_q16_x4", quantize_q16_x4_len, quantize_q16_x4_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
+        }
     }
 
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
@@ -7985,15 +8019,26 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 }
                 return v;
             }();
+            // [TAG_MMQ_INT8_Q16] GGML_VK_MMQ_INT8_MODE=q8|q16, strict as the knobs above (invalid -> q8 + WARN)
+            static const uint32_t mmq_int8_mode = [] {
+                const char * s = getenv("GGML_VK_MMQ_INT8_MODE");
+                uint32_t v = GGML_VK_MMQ_INT8_MODE_Q8;
+                if (!ggml_vk_parse_mmq_int8_mode(s, v)) {
+                    GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMQ_INT8_MODE=%s ignored, expected q8 or q16 (using q8)\n", s);
+                    v = GGML_VK_MMQ_INT8_MODE_Q8;
+                }
+                return v;
+            }();
             device->mmq_int8_min_n = mmq_int8_min_n;
             device->mmq_int8_ops   = mmq_int8_ops;
+            device->mmq_int8_mode  = device->mmq_cm1 ? mmq_int8_mode : GGML_VK_MMQ_INT8_MODE_Q8;
             if (device->coopmat_support || device->coopmat_int_support) {
                 const char * arch = device->architecture == AMD_RDNA3 ? "RDNA3" : device->architecture == AMD_RDNA4 ? "RDNA4" : "other";
-                GGML_LOG_WARN("ggml_vulkan: %s mmq_cm1: %s (int8 coopmat1 MMQ, upstream #27952; arch %s, int8 coopmat %s %ux%ux%u, subgroup %u..%u, GGML_VK_DISABLE_MMQ_CM1=%d, min_n %u, ops %s)\n",
+                GGML_LOG_WARN("ggml_vulkan: %s mmq_cm1: %s (int8 coopmat1 MMQ, upstream #27952; arch %s, int8 coopmat %s %ux%ux%u, subgroup %u..%u, GGML_VK_DISABLE_MMQ_CM1=%d, min_n %u, ops %s, mode %s)\n",
                               device->name.c_str(), device->mmq_cm1 ? "on" : (cm1_ok ? "off (GGML_VK_DISABLE_MMQ_CM1)" : "off (unsupported)"),
                               arch, device->coopmat_int_support ? "yes" : "no", device->coopmat_int_m, device->coopmat_int_n, device->coopmat_int_k,
                               device->subgroup_min_size, device->subgroup_max_size, disable_mmq_cm1 ? 1 : 0,
-                              mmq_int8_min_n, ggml_vk_mmq_int8_ops_name(mmq_int8_ops));
+                              mmq_int8_min_n, ggml_vk_mmq_int8_ops_name(mmq_int8_ops), ggml_vk_mmq_int8_mode_name(mmq_int8_mode));
             }
         }
 
@@ -10322,10 +10367,13 @@ static vk_pipeline ggml_vk_get_quantize_pipeline(ggml_backend_vk_context * ctx, 
     }
 }
 
-static void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne) {
+// [TAG_MMQ_INT8_Q16] pipeline = nullptr -> q8_1 x4; the q16 mode passes pipeline_quantize_q16_x4 (same dispatch shape)
+static void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne, vk_pipeline pipeline = nullptr) {
     VK_LOG_DEBUG("ggml_vk_quantize_q8_1(" << "buffer in size=" << in.buffer->size << ", buffer out size=" << out.buffer->size << ", " << ne << ")");
 
-    vk_pipeline pipeline = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    if (!pipeline) {
+        pipeline = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    }
 
     const uint32_t num_blocks = CEIL_DIV(ne, pipeline->wg_denoms[0]);
     // clamp the number of elements to the max workgroup count. The shader will iterate over the total number of blocks.
@@ -10440,6 +10488,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // Not implemented
     GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
 
+    // [TAG_MMQ_INT8_Q16] on an mmq_cm1 device every q8_1 mat-mat pipeline is an int8 coopmat1 one; in the q16 mode
+    // it reads block_q16_x4 (288 bytes per 128 values instead of q8_1 x4's 144), quantized by pipeline_quantize_q16_x4.
+    const bool mmq_q16 = quantize_y && ctx->device->mmq_cm1 && ctx->device->mmq_int8_mode == GGML_VK_MMQ_INT8_MODE_Q16;
+    const uint64_t qy_x4_bytes = mmq_q16 ? 288 : 144;
+
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
@@ -10463,7 +10516,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
     const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
-    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
+    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) / 128 * qy_x4_bytes) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
     const uint64_t d_sz = sizeof(float) * d_ne;
 
     vk_pipeline to_fp16_vk_0 = nullptr;
@@ -10484,7 +10537,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
 
     if (quantize_y) {
-        to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+        to_q8_1 = mmq_q16 ? ctx->device->pipeline_quantize_q16_x4 : ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
     }
 
     {
@@ -10554,7 +10607,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         GGML_ASSERT(d_Y->size >= y_sz);
     } else if (quantize_y) {
         d_Y = ctx->prealloc_y;
-        GGML_ASSERT(d_Y->size >= CEIL_DIV(y_sz, 144) * 144);
+        GGML_ASSERT(d_Y->size >= CEIL_DIV(y_sz, qy_x4_bytes) * qy_x4_bytes);
     } else {
         d_Y = d_Qy;
         y_buf_offset = qy_buf_offset;
@@ -10594,7 +10647,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne, to_q8_1);
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
             ctx->prealloc_y_last_decode_vector_staging = false;
@@ -11403,6 +11456,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // Not implemented
     GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
 
+    // [TAG_MMQ_INT8_Q16] on an mmq_cm1 device every q8_1 mat-mat pipeline is an int8 coopmat1 one; in the q16 mode
+    // it reads block_q16_x4 (288 bytes per 128 values instead of q8_1 x4's 144), quantized by pipeline_quantize_q16_x4.
+    const bool mmq_q16 = quantize_y && ctx->device->mmq_cm1 && ctx->device->mmq_int8_mode == GGML_VK_MMQ_INT8_MODE_Q16;
+    const uint64_t qy_x4_bytes = mmq_q16 ? 288 : 144;
+
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, nei1, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
@@ -11451,7 +11509,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * ggml_nelements(src1) / ggml_blck_size(src1->type);
     const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
-    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
+    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) / 128 * qy_x4_bytes) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
     const uint64_t ids_sz = nbi2;
     const uint64_t d_sz = sizeof(float) * d_ne;
 
@@ -11490,7 +11548,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
 
     if (quantize_y) {
-        to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+        to_q8_1 = mmq_q16 ? ctx->device->pipeline_quantize_q16_x4 : ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
     }
     // the hoisting variant is the only one that pays for the per-expert scratch arrays
     vk_pipeline count_experts = hoist_row_ids ? ctx->device->pipeline_count_experts_hoist
@@ -11569,7 +11627,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         GGML_ASSERT(d_Y->size >= y_sz);
     } else if (quantize_y) {
         d_Y = ctx->prealloc_y;
-        GGML_ASSERT(d_Y->size >= CEIL_DIV(y_sz, 144) * 144);
+        GGML_ASSERT(d_Y->size >= CEIL_DIV(y_sz, qy_x4_bytes) * qy_x4_bytes);
     } else {
         d_Y = d_Qy;
         y_buf_offset = qy_buf_offset;
@@ -11641,7 +11699,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne, to_q8_1);
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
             ctx->prealloc_y_last_decode_vector_staging = false;

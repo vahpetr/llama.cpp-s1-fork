@@ -295,6 +295,153 @@ static double nmse(const float * a, const float * b, size_t n) {
     return mse_a_b / mse_a_0;
 }
 
+// [TAG_MMQ_INT8_Q16] exact fp64 reference of a MUL_MAT / MUL_MAT_ID node, computed from its sources as they sit in
+// their backend (the compare callback passes the CPU copy): src0 dequantized with its type traits, src1 read as is,
+// products summed in fp64. Output in the node's (contiguous) element order. Empty for any other op or an unsupported
+// source layout. Used by err_vs_exact() cases and by the GGML_TEST_ERRSTAT=1 diagnostic: the CPU backend itself
+// quantizes src1 for quantized weights (q8_K for the K-quants), so "vs the CPU" is not "vs f32".
+static std::vector<uint8_t> tensor_bytes(const ggml_tensor * t) {
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+    return buf;
+}
+
+static double tensor_elem_f64(const ggml_tensor * t, const uint8_t * p) {
+    switch (t->type) {
+        case GGML_TYPE_F32:  return *(const float *) p;
+        case GGML_TYPE_F16:  return ggml_fp16_to_fp32(*(const ggml_fp16_t *) p);
+        case GGML_TYPE_BF16: return ggml_bf16_to_fp32(*(const ggml_bf16_t *) p);
+        default: GGML_ABORT("exact_mul_mat_ref: unsupported element type %s", ggml_type_name(t->type));
+    }
+}
+
+// row r of a src0 matrix (ne00 values starting at byte offset off) as floats
+static void src0_row_f32(const ggml_tensor * a, const std::vector<uint8_t> & buf, size_t off, std::vector<float> & row) {
+    const int64_t k = a->ne[0];
+    row.resize(k);
+    if (ggml_blck_size(a->type) > 1) {
+        GGML_ASSERT(a->nb[0] == ggml_type_size(a->type));
+        ggml_get_type_traits(a->type)->to_float(buf.data() + off, row.data(), k);
+    } else {
+        for (int64_t l = 0; l < k; ++l) {
+            row[l] = (float) tensor_elem_f64(a, buf.data() + off + l * a->nb[0]);
+        }
+    }
+}
+
+static std::vector<double> exact_mul_mat_ref(const ggml_tensor * t) {
+    std::vector<double> out;
+    if (t->op != GGML_OP_MUL_MAT && t->op != GGML_OP_MUL_MAT_ID) {
+        return out;
+    }
+    const ggml_tensor * a = t->src[0];
+    const ggml_tensor * b = t->src[1];
+    if (b->type != GGML_TYPE_F32 && b->type != GGML_TYPE_F16 && b->type != GGML_TYPE_BF16) {
+        return out;
+    }
+    if (ggml_blck_size(a->type) == 1 && a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_BF16) {
+        return out;
+    }
+    const std::vector<uint8_t> abuf = tensor_bytes(a);
+    const std::vector<uint8_t> bbuf = tensor_bytes(b);
+    const int64_t K = a->ne[0];
+    const int64_t M = a->ne[1];
+    // src1 as contiguous doubles [ne13][ne12][ne11][K]
+    std::vector<double> bd((size_t) ggml_nelements(b));
+    {
+        size_t i = 0;
+        for (int64_t i3 = 0; i3 < b->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < b->ne[2]; ++i2) {
+                for (int64_t i1 = 0; i1 < b->ne[1]; ++i1) {
+                    for (int64_t i0 = 0; i0 < b->ne[0]; ++i0) {
+                        bd[i++] = tensor_elem_f64(b, bbuf.data() + i0 * b->nb[0] + i1 * b->nb[1] + i2 * b->nb[2] + i3 * b->nb[3]);
+                    }
+                }
+            }
+        }
+    }
+    out.assign((size_t) ggml_nelements(t), 0.0);
+    std::vector<float> row;
+    auto dot = [&](const double * bc) {
+        double acc = 0.0;
+        for (int64_t l = 0; l < K; ++l) {
+            acc += (double) row[l] * bc[l];
+        }
+        return acc;
+    };
+    if (t->op == GGML_OP_MUL_MAT) {
+        const int64_t N = b->ne[1];
+        const int64_t r2 = b->ne[2] / a->ne[2];
+        const int64_t r3 = b->ne[3] / a->ne[3];
+        for (int64_t i03 = 0; i03 < a->ne[3]; ++i03) {
+            for (int64_t i02 = 0; i02 < a->ne[2]; ++i02) {
+                for (int64_t i = 0; i < M; ++i) {
+                    src0_row_f32(a, abuf, i * a->nb[1] + i02 * a->nb[2] + i03 * a->nb[3], row);
+                    for (int64_t i3 = i03 * r3; i3 < (i03 + 1) * r3; ++i3) {
+                        for (int64_t i2 = i02 * r2; i2 < (i02 + 1) * r2; ++i2) {
+                            for (int64_t j = 0; j < N; ++j) {
+                                const double * bc = bd.data() + ((i3 * b->ne[2] + i2) * N + j) * K;
+                                out[((i3 * t->ne[2] + i2) * t->ne[1] + j) * t->ne[0] + i] = dot(bc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        const ggml_tensor * ids = t->src[2];
+        const std::vector<uint8_t> ibuf = tensor_bytes(ids);
+        const int64_t n_used = ids->ne[0];
+        const int64_t n_tok  = ids->ne[1];
+        std::vector<std::vector<std::pair<int64_t, int64_t>>> per_expert(a->ne[2]);
+        for (int64_t tk = 0; tk < n_tok; ++tk) {
+            for (int64_t e = 0; e < n_used; ++e) {
+                const int32_t id = *(const int32_t *) (ibuf.data() + e * ids->nb[0] + tk * ids->nb[1]);
+                GGML_ASSERT(id >= 0 && id < a->ne[2]);
+                per_expert[id].emplace_back(e, tk);
+            }
+        }
+        for (int64_t x = 0; x < a->ne[2]; ++x) {
+            if (per_expert[x].empty()) {
+                continue;
+            }
+            for (int64_t i = 0; i < M; ++i) {
+                src0_row_f32(a, abuf, i * a->nb[1] + x * a->nb[2], row);
+                for (const auto & et : per_expert[x]) {
+                    const double * bc = bd.data() + (et.second * b->ne[1] + et.first % b->ne[1]) * K;
+                    out[(et.second * t->ne[1] + et.first) * t->ne[0] + i] = dot(bc);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// [TAG_MMQ_INT8_Q16] GGML_TEST_ERRSTAT=1: one "ERRSTAT" line per MUL_MAT / MUL_MAT_ID node with the error of the
+// backend under test and of the CPU against exact_mul_mat_ref (diagnostic only; pass/fail is unchanged)
+static bool errstat_enabled() {
+    static const bool e = getenv("GGML_TEST_ERRSTAT") != nullptr;
+    return e;
+}
+
+struct err_stats {
+    double nmse;     // mse(ref, x) / mse(ref, 0); inf when ref == 0 and x != 0
+    double max_abs;  // max |ref - x|
+    double rms_ref;  // sqrt(mse(ref, 0))
+};
+
+template <typename X>
+static err_stats compute_err_stats(const double * ref, const X * x, size_t n) {
+    double se = 0.0, s0 = 0.0, ma = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        const double d = ref[i] - (double) x[i];
+        se += d * d;
+        s0 += ref[i] * ref[i];
+        ma  = std::max(ma, std::fabs(d));
+    }
+    return { s0 > 0.0 ? se / s0 : (se > 0.0 ? INFINITY : 0.0), ma, n ? std::sqrt(s0 / n) : 0.0 };
+}
+
 // difference between 2 sets (Jaccard distance, 0 - no difference, 1 - no overlap)
 template <typename T>
 static double jdst(const T * a, const T * b, size_t n) {
@@ -1313,6 +1460,19 @@ struct test_case {
         return nmse(a, b, n);
     }
 
+    // [TAG_MMQ_INT8_Q16] true: MUL_MAT / MUL_MAT_ID nodes are judged by err_exact() against exact_mul_mat_ref() of
+    // the CPU copy's sources instead of err() against the CPU backend's own (activation-quantizing) result
+    virtual bool err_vs_exact() {
+        return false;
+    }
+
+    // a = backend under test, ref = exact. An all-zero reference has no NMSE: then the error is max |a| (so a
+    // max_err() of 0 demands exact zeros); otherwise NMSE.
+    virtual double err_exact(const float * a, const double * ref, size_t n) {
+        const err_stats st = compute_err_stats(ref, a, n);
+        return st.rms_ref == 0.0 ? st.max_abs : st.nmse;
+    }
+
     virtual float grad_eps() {
         return 1e-1f;
     }
@@ -1622,7 +1782,29 @@ struct test_case {
                 }
             }
 
-            double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            const bool is_mm = t1->op == GGML_OP_MUL_MAT || t1->op == GGML_OP_MUL_MAT_ID;
+            std::vector<double> ex;
+            if (is_mm && (ud->tc->err_vs_exact() || errstat_enabled())) {
+                ex = exact_mul_mat_ref(t2);  // t2 = the CPU copy
+            }
+            const bool have_ex = !ex.empty() && ex.size() == f1.size();
+            double err = (ud->tc->err_vs_exact() && have_ex) ? ud->tc->err_exact(f1.data(), ex.data(), f1.size())
+                                                             : ud->tc->err(f1.data(), f2.data(), f1.size());
+            if (is_mm && errstat_enabled()) {
+                // [TAG_MMQ_INT8_Q16] diagnostic line, see errstat_enabled()
+                std::vector<double> f2d(f2.begin(), f2.end());
+                const err_stats bc = compute_err_stats(f2d.data(), f1.data(), f1.size());
+                printf("ERRSTAT %s(%s) node=%s be=%s n=%zu err=%.3e | be~cpu: nmse=%.3e maxabs=%.3e",
+                       ud->tc->current_op_name.c_str(), ud->tc->vars().c_str(), ggml_get_name(t1), bn1, f1.size(), err, bc.nmse, bc.max_abs);
+                if (have_ex) {
+                    const err_stats be = compute_err_stats(ex.data(), f1.data(), f1.size());
+                    const err_stats ce = compute_err_stats(ex.data(), f2.data(), f2.size());
+                    printf(" | be~exact: nmse=%.3e maxabs=%.3e | cpu~exact: nmse=%.3e maxabs=%.3e | rms_exact=%.3e",
+                           be.nmse, be.max_abs, ce.nmse, ce.max_abs, be.rms_ref);
+                }
+                printf("\n");
+                fflush(stdout);
+            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
@@ -5113,6 +5295,189 @@ struct test_mul_mat_id : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats, router);
+    }
+};
+
+// [TAG_MMQ_INT8_Q16] adversarial MUL_MAT / MUL_MAT_ID cases for the int8 coopmat1 MMQ path (contrib 0137; the q16 mode
+// of 0156), judged against the exact fp64 reference (err_vs_exact) - not against the CPU backend, which quantizes the
+// activations itself (q8_K for the K-quants) and is no f32 reference. Select with -o MUL_MAT_ADV.
+//   weights  W_ZERO_UNIT: q4_K with d = dmin = 1 and sc = m = q = 1 in every sub-block -> every weight dequantizes to 0
+//            W_ZERO_REAL: q4_K with d = dmin = f16(0.0123), sc = 2, m = 14, q = 7 (sc * q == m) -> exactly 0 as well
+//            W_RANDN    : N(0,1) weights quantized to type_a by the reference quantizer (no imatrix), fixed seed
+//   acts     A_ONE = 1, A_POS = U(0.5,1.5), A_SYM = U(-1,1), A_NEAR1 = U(0.9,1.1),
+//            A_OUTLIER = U(-1,1) with channel 5 of every column = +100 (one value 100x the others in its block)
+//   n_mats   0 = MUL_MAT [k, m] x [k, n]; > 0 = MUL_MAT_ID with n_mats experts (all of the same pattern), 2 used per
+//            token, broadcast src1 (as the MoE gate/up projections), n tokens
+// Pass rule: zero weights must give exactly 0 when the int8 path is exact for them - GGML_VK_MMQ_INT8_MODE=q16 or
+// GGML_VK_DISABLE_MMQ_CM1=1 (the f16 dequant path) in the environment; under the default q8 (half(d), half(d*sum),
+// audit B#3) they only report. W_RANDN: NMSE vs exact <= 1e-6 under q16, else <= 5e-4 (q8 ~1e-5..1.3e-4 measured).
+enum mm_adv_w { MM_ADV_W_ZERO_UNIT, MM_ADV_W_ZERO_REAL, MM_ADV_W_RANDN };
+enum mm_adv_a { MM_ADV_A_ONE, MM_ADV_A_POS, MM_ADV_A_SYM, MM_ADV_A_NEAR1, MM_ADV_A_OUTLIER };
+
+static bool mm_adv_exact_int8_env() {
+    static const bool v = [] {
+        const char * mode = getenv("GGML_VK_MMQ_INT8_MODE");
+        const char * dis  = getenv("GGML_VK_DISABLE_MMQ_CM1");
+        return (mode && strcmp(mode, "q16") == 0) || (dis && strcmp(dis, "1") == 0);
+    }();
+    return v;
+}
+
+static bool mm_adv_q16_env() {
+    static const bool v = [] {
+        const char * mode = getenv("GGML_VK_MMQ_INT8_MODE");
+        const char * dis  = getenv("GGML_VK_DISABLE_MMQ_CM1");
+        return mode && strcmp(mode, "q16") == 0 && !(dis && strcmp(dis, "1") == 0);
+    }();
+    return v;
+}
+
+struct test_mul_mat_adv : public test_case {
+    const ggml_type type_a;
+    const std::string w;  // weight pattern name
+    const std::string a;  // activation pattern name
+    const int64_t m, n, k;
+    const int n_mats;
+    const int w_pat;
+    const int a_pat;
+
+    static const char * w_name(int p) { static const char * nm[] = {"zero_unit", "zero_real", "randn"}; return nm[p]; }
+    static const char * a_name(int p) { static const char * nm[] = {"one", "pos", "sym", "near1", "outlier"}; return nm[p]; }
+
+    test_mul_mat_adv(ggml_type type_a, int w_pat, int a_pat, int64_t m, int64_t n, int64_t k, int n_mats = 0)
+        : type_a(type_a), w(w_name(w_pat)), a(a_name(a_pat)), m(m), n(n), k(k), n_mats(n_mats), w_pat(w_pat), a_pat(a_pat) {
+        GGML_ASSERT(w_pat == MM_ADV_W_RANDN || type_a == GGML_TYPE_Q4_K);
+        GGML_ASSERT(n_mats == 0 || n_mats >= 2);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ADV";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, w, a, m, n, k, n_mats);
+    }
+
+    bool err_vs_exact() override {
+        return true;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        if (w_pat != MM_ADV_W_RANDN) {
+            return mm_adv_exact_int8_env() ? 0.0 : INFINITY;
+        }
+        return mm_adv_q16_env() ? 1e-6 : 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out;
+        if (n_mats == 0) {
+            ggml_tensor * ta = ggml_new_tensor_2d(ctx, type_a, k, m);
+            ggml_set_name(ta, "a");
+            ggml_tensor * tb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_set_name(tb, "b");
+            out = ggml_mul_mat(ctx, ta, tb);
+        } else {
+            ggml_tensor * ta = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+            ggml_set_name(ta, "a");
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n);
+            ggml_set_name(ids, "ids");
+            ggml_tensor * tb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+            ggml_set_name(tb, "b");
+            out = ggml_mul_mat_id(ctx, ta, tb, ids);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    static void q4k_encode_block(uint8_t * blk, float d, float dmin, int sc, int mn, int q) {
+        // block_q4_K: half d, half dmin, uint8 scales[12] (6-bit sc / m packed as quantize_row_q4_K_ref), uint8 qs[128]
+        const ggml_fp16_t hd = ggml_fp32_to_fp16(d), hm = ggml_fp32_to_fp16(dmin);
+        memcpy(blk + 0, &hd, 2);
+        memcpy(blk + 2, &hm, 2);
+        uint8_t * scales = blk + 4;
+        memset(scales, 0, 12);
+        for (int j = 0; j < 8; ++j) {
+            const uint8_t ls = (uint8_t) sc, lm = (uint8_t) mn;
+            if (j < 4) {
+                scales[j] |= ls & 63;
+                scales[j + 4] |= lm & 63;
+            } else {
+                scales[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                scales[j - 4] |= ((ls >> 4) << 6);
+                scales[j - 0] |= ((lm >> 4) << 6);
+            }
+        }
+        memset(blk + 16, (uint8_t) ((q & 0xF) | ((q & 0xF) << 4)), 128);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(20261003u + 97u * w_pat + 13u * a_pat + 7u * (uint32_t) type_a + 3u * (uint32_t) n_mats);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string nm = t->name;
+            if (nm == "a") {
+                const int64_t rows = ggml_nrows(t);
+                std::vector<uint8_t> wq(ggml_nbytes(t));
+                if (w_pat == MM_ADV_W_RANDN) {
+                    std::normal_distribution<float> nd(0.0f, 1.0f);
+                    std::vector<float> wf(k * rows);
+                    for (float & v : wf) {
+                        v = nd(rng);
+                    }
+                    ggml_quantize_chunk(type_a, wf.data(), wq.data(), 0, rows, k, nullptr);
+                } else {
+                    GGML_ASSERT(ggml_type_size(GGML_TYPE_Q4_K) == 144 && ggml_blck_size(GGML_TYPE_Q4_K) == 256);
+                    for (int64_t ib = 0; ib < k * rows / 256; ++ib) {
+                        if (w_pat == MM_ADV_W_ZERO_UNIT) {
+                            q4k_encode_block(wq.data() + ib * 144, 1.0f, 1.0f, 1, 1, 1);
+                        } else {
+                            q4k_encode_block(wq.data() + ib * 144, 0.0123f, 0.0123f, 2, 14, 7);
+                        }
+                    }
+                    std::vector<float> wd(k * rows);
+                    ggml_get_type_traits(type_a)->to_float(wq.data(), wd.data(), k * rows);
+                    for (float v : wd) {
+                        GGML_ASSERT(v == 0.0f && "zero-weight construction must dequantize to exactly 0");
+                    }
+                }
+                ggml_backend_tensor_set(t, wq.data(), 0, wq.size());
+            } else if (nm == "b") {
+                std::vector<float> x(ggml_nelements(t));
+                std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+                for (size_t idx = 0; idx < x.size(); ++idx) {
+                    const int64_t i = (int64_t) (idx % (size_t) k);
+                    const float r = u01(rng);
+                    float v = 0.0f;
+                    switch (a_pat) {
+                        case MM_ADV_A_ONE:     v = 1.0f; break;
+                        case MM_ADV_A_POS:     v = 0.5f + r; break;
+                        case MM_ADV_A_SYM:     v = 2.0f * r - 1.0f; break;
+                        case MM_ADV_A_NEAR1:   v = 0.9f + 0.2f * r; break;
+                        case MM_ADV_A_OUTLIER: v = i == 5 ? 100.0f : 2.0f * r - 1.0f; break;
+                    }
+                    x[idx] = v;
+                }
+                ggml_backend_tensor_set(t, x.data(), 0, x.size() * sizeof(float));
+            } else if (nm == "ids") {
+                // two distinct experts per token, uniform
+                std::uniform_int_distribution<int32_t> ue(0, n_mats - 1);
+                std::vector<int32_t> ids(2 * n);
+                for (int64_t tk = 0; tk < n; ++tk) {
+                    const int32_t e0 = ue(rng);
+                    int32_t e1 = ue(rng);
+                    while (e1 == e0) {
+                        e1 = ue(rng);
+                    }
+                    ids[2 * tk] = e0;
+                    ids[2 * tk + 1] = e1;
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -12087,6 +12452,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [TAG_MMQ_INT8_Q16] adversarial int8 MMQ cases vs the exact reference (-o MUL_MAT_ADV): zero-weight cancellation
+    // (q4_K, K = 256 / 4096, dense and MoE), real weights with zero-mean / DC-biased / outlier activations
+    for (int64_t kk : {256, 4096}) {
+        for (int ap : {MM_ADV_A_ONE, MM_ADV_A_POS, MM_ADV_A_SYM}) {
+            test_cases.emplace_back(new test_mul_mat_adv(GGML_TYPE_Q4_K, MM_ADV_W_ZERO_UNIT, ap, 128, 64, kk));
+            test_cases.emplace_back(new test_mul_mat_adv(GGML_TYPE_Q4_K, MM_ADV_W_ZERO_REAL, ap, 128, 64, kk));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_adv(GGML_TYPE_Q4_K, MM_ADV_W_ZERO_REAL, MM_ADV_A_POS, 128, 64, 4096, 4));
+    test_cases.emplace_back(new test_mul_mat_adv(GGML_TYPE_Q4_K, MM_ADV_W_ZERO_UNIT, MM_ADV_A_SYM, 128, 64, 4096, 4));
+    for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0}) {
+        for (int ap : {MM_ADV_A_SYM, MM_ADV_A_POS, MM_ADV_A_NEAR1, MM_ADV_A_ONE, MM_ADV_A_OUTLIER}) {
+            test_cases.emplace_back(new test_mul_mat_adv(ta, MM_ADV_W_RANDN, ap, 128, 64, 4096));
+        }
+        test_cases.emplace_back(new test_mul_mat_adv(ta, MM_ADV_W_RANDN, MM_ADV_A_SYM, 128, 64, 4096, 4));
+        test_cases.emplace_back(new test_mul_mat_adv(ta, MM_ADV_W_RANDN, MM_ADV_A_OUTLIER, 128, 64, 4096, 4));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -12096,6 +12479,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // [TAG_MMQ_INT8_Q16] prefill-shape GEMMs for the int8 MMQ mode A/B (GGML_VK_MMQ_INT8_MODE=q8|q16 vs
+    // GGML_VK_DISABLE_MMQ_CM1=1): n = 2048 tokens, dense m = 2560 at K = 5120 / 2560 / 640, and the 512-expert top-10
+    // MoE projections of a hidden-2560 / expert-640 model (gate/up m = 640, K = 2560; down m = 2560, K = 640). K = 640
+    // is no multiple of 256: those rows exist only as q5_0 / q8_0 (the K-quant cases report "not supported")
+    for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0}) {
+        for (int64_t kk : {5120, 2560, 640}) {
+            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 2560, 2048, kk, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 512, 10, true,  640, 2048, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 512, 10, false, 2560, 2048, 640));
+    }
 
     // [TAG_QSA_TOPK_V2] the QSA selection (GGML_OP_QSA_TOP_K, width 2051) at decode (1) / verify (6) depths,
     // deployed data layout, plus random data and prefill-chunk query batches: GGML_VK_QSA_TOPK=v1|v2 A/B
