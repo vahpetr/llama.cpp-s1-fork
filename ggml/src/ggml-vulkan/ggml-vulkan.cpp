@@ -1145,6 +1145,9 @@ struct vk_device_struct {
     // [TAG_QSA_TOPK_V2] the distributed radix select (topk_radix_select_v2.comp): one pipeline per pass
     // (0..3 histogram rounds, 4 count, 5 emit). Created only when qsa_topk_v2 (GGML_VK_QSA_TOPK, device init).
     vk_pipeline pipeline_topk_v2_qsa[6];
+    // [TAG_QSA_TOPK_V2] [TAG_QSA_WHOLE_BLOCKS] the same shader in the block-level form (spec constant 3 = 1): passes
+    // 0..4 over the block keys, 5 flag, 6 cell count, 7 cell emit
+    vk_pipeline pipeline_topk_v2_qsa_blocks[8];
     vk_pipeline pipeline_qsa_bias;       // [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
@@ -1901,9 +1904,14 @@ struct vk_op_topk_radix_v2_push_constants {
     uint32_t n_stream;
     uint32_t sb_blk;
     uint32_t sb_tps;
-    uint32_t n_tiles;
+    uint32_t n_tiles;   // tiles over the selection domain: the cells, or (block form) the blocks
     uint32_t hist_off;
     uint32_t rec_off;
+    uint32_t n_sel;     // block form: whole blocks to select (0 = cell form)
+    uint32_t n_tiles_c; // block form: tiles over the cells (passes 6, 7)
+    uint32_t rec2_off;  // block form: the cell-tile records
+    uint32_t bits_off;  // block form: the per-row block bitmaps (selected, could-be-tail)
+    uint32_t nw;        // block form: words per bitmap
 };
 
 // [TAG_QSA_TOPK_V2] tile = 256 invocations x qsa_topk_cpt cells (spec constant 2 of the shader); default
@@ -6627,7 +6635,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline2(device, device->pipeline_topk_v2_qsa[pass], "topk_radix_v2_qsa_p" + std::to_string(pass),
                                      topk_radix_select_v2_f32_len, topk_radix_select_v2_f32_data, "main", 5,
                                      sizeof(vk_op_topk_radix_v2_push_constants), {1, 1, 1},
-                                     {pass, 256 / wave, device->qsa_topk_cpt}, 1, true, true, wave);
+                                     {pass, 256 / wave, device->qsa_topk_cpt, 0}, 1, true, true, wave);
+        }
+        for (uint32_t pass = 0; pass < 8; ++pass) {
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_v2_qsa_blocks[pass], "topk_radix_v2_qsa_blocks_p" + std::to_string(pass),
+                                     topk_radix_select_v2_f32_len, topk_radix_select_v2_f32_data, "main", 5,
+                                     sizeof(vk_op_topk_radix_v2_push_constants), {1, 1, 1},
+                                     {pass, 256 / wave, device->qsa_topk_cpt, 1}, 1, true, true, wave);
         }
     }
 
@@ -15600,21 +15614,27 @@ static const bool vk_qsa_scratch_presize = ggml_vk_env_bool("GGML_VK_QSA_SCRATCH
 static const bool vk_qsa_scratch_presize_fa = vk_qsa_scratch_presize && ggml_vk_env_bool("GGML_VK_QSA_SCRATCH_PRESIZE_FA", false);
 static bool vk_qsa_scratch_presize_fa_enabled() { return vk_qsa_scratch_presize_fa; }
 
-// [TAG_QSA_TOPK_V2] v2's scratch beyond the keys, in uints per row: the four 256-bin global histograms
-// and a (gt|above, cand|equal) record per tile (256 * qsa_topk_cpt cells).
-static size_t ggml_vk_qsa_topk_v2_row_extra(const vk_device & device, int64_t n_kv) {
-    return 4 * 256 + 2 * (size_t) CEIL_DIV(n_kv, (int64_t) (256 * device->qsa_topk_cpt));
+// [TAG_QSA_TOPK_V2] v2's scratch beyond the keys, in uints per row: the four 256-bin global histograms, a
+// (gt|above, cand|equal) record per tile (256 * qsa_topk_cpt cells) and a (count, last) record per cell tile,
+// both sized for n_kv (n_blocks <= n_kv); the block form ([TAG_QSA_WHOLE_BLOCKS]) adds two block bitmaps of one
+// bit per tile-padded n_kv (n_kv / 16 words).
+static size_t ggml_vk_qsa_topk_v2_row_extra(const vk_device & device, int64_t n_kv, bool blocks) {
+    const size_t tile    = 256 * device->qsa_topk_cpt;
+    const size_t n_tiles = (size_t) CEIL_DIV(n_kv, (int64_t) tile);
+    return 4 * 256 + 4 * n_tiles + (blocks ? 2 * n_tiles * tile / 32 : 0);
 }
 
 // Bytes the fused select's gather scratch needs: n_kv * n_tps * n_stream * 4, i.e. one float per
 // (row, key) - v1 keeps the gathered value there, v2 its uint key - plus, for v2, the histograms and
-// tile records ([TAG_QSA_TOPK_V2]: 4 KiB + 8 B per tile per row, 0.5 % more at n_kv 262144). One definition for all three
+// tile records ([TAG_QSA_TOPK_V2]: 4 KiB + 16 B per tile per row, 0.5 % more at n_kv 262144; the block form +6.25 %
+// for its bitmaps). One definition for all three
 // callers below - the pattern dispatch, the op dispatch and the reserve-time hint - so they cannot drift.
-static size_t ggml_vk_qsa_scratch_bytes(const vk_device & device, int64_t n_kv, int64_t n_tps, int64_t n_stream) {
+static size_t ggml_vk_qsa_scratch_bytes(const vk_device & device, int64_t n_kv, int64_t n_tps, int64_t n_stream,
+                                        bool blocks = false) {
     const size_t nrows = (size_t) n_tps * (size_t) n_stream;
     size_t bytes = (size_t) n_kv * nrows * sizeof(float);
     if (device->qsa_topk_v2) {
-        bytes += nrows * ggml_vk_qsa_topk_v2_row_extra(device, n_kv) * sizeof(uint32_t);
+        bytes += nrows * ggml_vk_qsa_topk_v2_row_extra(device, n_kv, blocks) * sizeof(uint32_t);
     }
     return bytes;
 }
@@ -15631,7 +15651,8 @@ static size_t ggml_vk_topk_qsa_scratch_size(const vk_device & device, const ggml
 // ... and for a GGML_OP_QSA_TOP_K node, whose score is the unpermuted [n_blocks, n_tps, n_stream],
 // so the same selection gives the same bytes with n_tps read from ne[1] instead of ne[0].
 static size_t ggml_vk_qsa_top_k_scratch_size(const vk_device & device, const ggml_tensor * node) {
-    return ggml_vk_qsa_scratch_bytes(device, node->src[1]->ne[0], node->src[0]->ne[1], node->src[0]->ne[2]);
+    return ggml_vk_qsa_scratch_bytes(device, node->src[1]->ne[0], node->src[0]->ne[1], node->src[0]->ne[2],
+                                     /*blocks =*/ ggml_get_op_params_i32(node, 0) == 1); // [TAG_QSA_WHOLE_BLOCKS]
 }
 
 // [TAG_QSA_FUSED_SELECT] one dispatch of the QSA indexer selection: gather(score, cell_blk) + mask
@@ -15656,15 +15677,15 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
 
     // [TAG_QSA_WHOLE_BLOCKS] n_sel > 0: the block-level form (QSA == 2), the same operands and the same scratch
     // (it holds one flag per block of the row instead of the gathered cells; n_blocks <= n_kv)
-    // [TAG_QSA_TOPK_V2] the cell form (n_sel == 0) runs v2 when the device enabled it; the block form stays on v1
-    const bool v2 = ctx->device->qsa_topk_v2 && n_sel == 0;
-    vk_pipeline pipeline = n_sel > 0 ? ctx->device->pipeline_topk_radix_qsa_blocks :
-                           v2        ? ctx->device->pipeline_topk_v2_qsa[0] : ctx->device->pipeline_topk_radix_qsa;
+    // [TAG_QSA_TOPK_V2] both forms run v2 when the device enabled it
+    const bool v2 = ctx->device->qsa_topk_v2;
+    vk_pipeline pipeline = v2        ? (n_sel > 0 ? ctx->device->pipeline_topk_v2_qsa_blocks[0] : ctx->device->pipeline_topk_v2_qsa[0]) :
+                           n_sel > 0 ? ctx->device->pipeline_topk_radix_qsa_blocks : ctx->device->pipeline_topk_radix_qsa;
     GGML_ASSERT(pipeline != nullptr);
 
     // scratch holds the gathered+masked input (v2: its keys, then the histograms and tile records),
     // materialized once and reused across passes
-    const size_t scratch_size = ggml_vk_qsa_scratch_bytes(ctx->device, n_kv, n_tps, n_stream);
+    const size_t scratch_size = ggml_vk_qsa_scratch_bytes(ctx->device, n_kv, n_tps, n_stream, n_sel > 0);
     if (vk_qsa_scratch_presize) {
         // [TAG_QSA_SCRATCH] Raise the shared prealloc_x to the largest extent any optimized graph
         // asked for, not just to what this dispatch needs. The reserve graphs were optimized before
@@ -15732,16 +15753,24 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
     }
 
     if (v2) {
-        // [TAG_QSA_TOPK_V2] fill (zero the four global histograms of every row), then the six passes of
-        // topk_radix_select_v2.comp, each over (rows, tiles) workgroups, with a full barrier between
-        // consecutive commands: every pass reads what the previous one wrote in other workgroups, and
-        // a dispatch boundary is the only device-wide dependency Vulkan gives. All on the GPU; no readback.
-        const uint32_t n_tiles  = (uint32_t) CEIL_DIV(n_kv, 256 * ctx->device->qsa_topk_cpt);
-        const uint64_t hist_off = (uint64_t) nrows * n_kv;
-        const uint64_t rec_off  = hist_off + (uint64_t) nrows * 4 * 256;
-        GGML_ASSERT(rec_off + (uint64_t) nrows * 2 * n_tiles <= UINT32_MAX);
-        GGML_ASSERT((rec_off + (uint64_t) nrows * 2 * n_tiles) * sizeof(uint32_t) <= ctx->prealloc_x->size);
-        GGML_ASSERT(n_tiles <= ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+        // [TAG_QSA_TOPK_V2] fill (zero the four global histograms of every row), then the passes of
+        // topk_radix_select_v2.comp - six for the cell form, eight for the block form ([TAG_QSA_WHOLE_BLOCKS]) -
+        // each over (rows, tiles) workgroups, with a full barrier between consecutive commands: every pass
+        // reads what the previous one wrote in other workgroups, and a dispatch boundary is the only
+        // device-wide dependency Vulkan gives. All on the GPU; no readback.
+        const uint32_t tile      = 256 * ctx->device->qsa_topk_cpt;
+        const uint32_t n_tiles_c = (uint32_t) CEIL_DIV(n_kv, tile);
+        const uint32_t n_tiles   = n_sel > 0 ? (uint32_t) CEIL_DIV(n_blocks, tile) : n_tiles_c; // the selection domain
+        const uint64_t hist_off  = (uint64_t) nrows * n_kv;
+        const uint64_t rec_off   = hist_off + (uint64_t) nrows * 4 * 256;
+        const uint64_t rec2_off  = rec_off + (uint64_t) nrows * 2 * n_tiles_c;
+        const uint64_t bits_off  = rec2_off + (uint64_t) nrows * 2 * n_tiles_c;
+        const uint32_t nw        = n_tiles_c * tile / 32; // >= the block tiles' range (n_blocks <= n_kv)
+        const uint64_t end_off   = bits_off + (n_sel > 0 ? (uint64_t) nrows * 2 * nw : 0);
+        GGML_ASSERT(n_sel == 0 || n_blocks <= n_kv);
+        GGML_ASSERT(end_off <= UINT32_MAX);
+        GGML_ASSERT(end_off * sizeof(uint32_t) <= ctx->prealloc_x->size);
+        GGML_ASSERT(n_tiles_c <= ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
 
         subctx->s->buffer->buf.fillBuffer(ctx->prealloc_x->buffer, hist_off * sizeof(uint32_t),
                                           (vk::DeviceSize) nrows * 4 * 256 * sizeof(uint32_t), 0);
@@ -15749,19 +15778,21 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
 
         const vk_op_topk_radix_v2_push_constants pc2 {
             n_kv, width, nrows, n_tps, n_blocks, n_stream, sb_blk, sb_tps, n_tiles, (uint32_t) hist_off, (uint32_t) rec_off,
+            n_sel, n_tiles_c, (uint32_t) rec2_off, (uint32_t) bits_off, nw,
         };
-        const std::array<uint32_t, 3> elements2 {
-            std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[0]), n_tiles, 1,
-        };
+        const uint32_t n_x    = std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+        const uint32_t n_pass = n_sel > 0 ? 8 : 6;
         vk_subbuffer scratch_buf { ctx->prealloc_x, 0, ctx->prealloc_x->size };
-        for (uint32_t pass = 0; pass < 6; ++pass) {
-            vk_pipeline & pl = ctx->device->pipeline_topk_v2_qsa[pass];
+        for (uint32_t pass = 0; pass < n_pass; ++pass) {
+            vk_pipeline & pl = n_sel > 0 ? ctx->device->pipeline_topk_v2_qsa_blocks[pass] : ctx->device->pipeline_topk_v2_qsa[pass];
+            // passes 6 and 7 of the block form walk the cells, every other pass the selection domain
+            const std::array<uint32_t, 3> elements2 { n_x, pass >= 6 ? n_tiles_c : n_tiles, 1 };
             ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
             ggml_vk_dispatch_pipeline(ctx, subctx, pl,
                 { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
                   ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
                   scratch_buf }, pc2, elements2);
-            if (pass < 5) {
+            if (pass + 1 < n_pass) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
         }
@@ -21619,9 +21650,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 // [TAG_QSA_WHOLE_BLOCKS] the block-level form keeps one flag per block in the n_kv-long row scratch
                 if (ggml_get_op_params_i32(op, 0) == 1) {
                     return n_blocks <= n_kv && ggml_get_op_params_i32(op, 1) > 0 &&
-                           device->pipeline_topk_radix_qsa_blocks != nullptr;
+                           (device->pipeline_topk_radix_qsa_blocks != nullptr || device->qsa_topk_v2);
                 }
-                // [TAG_QSA_TOPK_V2] the cell form: either kernel; the dispatch picks v2 when the device enabled it
+                // [TAG_QSA_TOPK_V2] either kernel (both forms); the dispatch picks v2 when the device enabled it
                 return device->pipeline_topk_radix_qsa != nullptr || device->qsa_topk_v2;
             }
         case GGML_OP_QSA_BIAS:

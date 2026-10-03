@@ -7038,18 +7038,29 @@ struct test_qsa_top_k : public test_case {
 //           structure is checked here (ids in range, no repeats); v1 vs v2 is by dump.
 //   prod    the deployed layout: cell i in block i/4, U[0,4) block scores (4-cell tie groups),
 //           a -inf padded tail and the causal mask of the verify rows
+//   census  the census-shaped inputs of tests/qsa-select-ref.h (ReLU-tied block scores, +1e9 tail boost on the
+//           tail block and the spare id, -inf ids past it, permuted cells, causal 0/-inf mask; n_blocks =
+//           ceil(n_kv/4)) - what the deployed graph feeds the op
+//
+// [TAG_QSA_WHOLE_BLOCKS] n_sel > 0 builds the block-level form (ggml_qsa_top_k_blocks) instead, against its own
+// reference from the ggml.h contract: eligible blocks (score finite and < GGML_QSA_TAIL_MIN), the min(n_sel, |E|)
+// best by (key desc, block asc), selected cells = tail (value finite and >= GGML_QSA_TAIL_MIN) + the visible cells
+// (mask not -inf) of those blocks, ascending, truncated to k, padded with the largest selected id (or 0..k-1). That
+// order is canonical, so the CPU backend is compared element for element as well; every mode applies, NaN included
+// (eligibility and the tail test reject NaN whatever its bits, and the masks are 0 / -inf).
 struct test_qsa_top_k_exact : public test_case {
-    enum { M_RANDOM, M_QUANT, M_EQUAL, M_MASK, M_ZERO, M_INF, M_NAN, M_PROD, M_COUNT };
+    enum { M_RANDOM, M_QUANT, M_EQUAL, M_MASK, M_ZERO, M_INF, M_NAN, M_PROD, M_CENSUS, M_COUNT };
 
     const int64_t n_kv;
     const int64_t n_tps;
     const int64_t n_stream;
     const int     width;
     const int     mode;
+    const int     n_sel; // 0 = the cell form, > 0 = the block-level form
     std::vector<std::vector<int32_t>> expected; // per row, filled by initialize_tensors
 
     static const char * mode_name(int m) {
-        static const char * names[M_COUNT] = { "random", "quant", "equal", "mask", "zero", "inf", "nan", "prod" };
+        static const char * names[M_COUNT] = { "random", "quant", "equal", "mask", "zero", "inf", "nan", "prod", "census" };
         return m >= 0 && m < M_COUNT ? names[m] : "?";
     }
 
@@ -7060,18 +7071,20 @@ struct test_qsa_top_k_exact : public test_case {
 
     std::string vars() override {
         const std::string data = mode_name(mode);
-        return VARS_TO_STR5(n_kv, n_tps, n_stream, width, data);
+        // n_sel only when set, so the cell-form cases keep their names
+        return n_sel > 0 ? VARS_TO_STR6(n_kv, n_tps, n_stream, width, data, n_sel)
+                         : VARS_TO_STR5(n_kv, n_tps, n_stream, width, data);
     }
 
-    test_qsa_top_k_exact(int64_t n_kv, int64_t n_tps, int64_t n_stream, int width, int mode)
-        : n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), mode(mode) {
-        GGML_ASSERT(width > 0 && width <= n_kv && mode >= 0 && mode < M_COUNT);
+    test_qsa_top_k_exact(int64_t n_kv, int64_t n_tps, int64_t n_stream, int width, int mode, int n_sel = 0)
+        : n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), mode(mode), n_sel(n_sel) {
+        GGML_ASSERT(width > 0 && width <= n_kv && mode >= 0 && mode < M_COUNT && n_sel >= 0);
     }
 
     double max_err() override { return 0.0; }
     bool run_whole_graph() override { return true; }
 
-    int64_t n_blocks() const { return std::max<int64_t>(1, n_kv / 4); }
+    int64_t n_blocks() const { return mode == M_CENSUS ? (n_kv + 3)/4 : std::max<int64_t>(1, n_kv / 4); }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks(), n_tps, n_stream);
@@ -7080,7 +7093,8 @@ struct test_qsa_top_k_exact : public test_case {
         ggml_set_name(cell_blk, "cell_blk");
         ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
         ggml_set_name(kq_mask, "kq_mask");
-        ggml_tensor * out = ggml_qsa_top_k(ctx, score, cell_blk, kq_mask, width);
+        ggml_tensor * out = n_sel > 0 ? ggml_qsa_top_k_blocks(ctx, score, cell_blk, kq_mask, width, n_sel)
+                                      : ggml_qsa_top_k(ctx, score, cell_blk, kq_mask, width);
         ggml_set_name(out, "out");
         return out;
     }
@@ -7109,13 +7123,23 @@ struct test_qsa_top_k_exact : public test_case {
         }
 
         std::vector<int32_t> cb(n_kv*n_stream);
-        for (int64_t s = 0; s < n_stream; s++) {
+        std::vector<float> sc(nb*nrows);
+        std::vector<ggml_fp16_t> mk(n_kv*nrows);
+        if (mode == M_CENSUS) {
+            const qsa_census_case c = qsa_census_make(n_kv, n_tps, n_stream, (uint32_t) (n_kv*31 + n_tps*7 + n_stream + width), false);
+            GGML_ASSERT(c.n_blocks == nb && c.score.size() == sc.size() && c.cell_blk.size() == cb.size() && c.mask.size() == mk.size());
+            cb = c.cell_blk;
+            sc = c.score;
+            for (size_t i = 0; i < mk.size(); i++) {
+                mk[i] = ggml_fp32_to_fp16(c.mask[i]);
+            }
+        }
+        for (int64_t s = 0; s < n_stream && mode != M_CENSUS; s++) {
             for (int64_t i = 0; i < n_kv; i++) {
                 cb[s*n_kv + i] = mode == M_PROD ? (int32_t) std::min(i/4, nb - 1) : (int32_t) (rng() % (uint32_t) nb);
             }
         }
-        std::vector<float> sc(nb*nrows);
-        for (int64_t row = 0; row < nrows; row++) {
+        for (int64_t row = 0; row < nrows && mode != M_CENSUS; row++) {
             for (int64_t b = 0; b < nb; b++) {
                 const float x = u01(rng);
                 float v = 0.0f;
@@ -7132,9 +7156,8 @@ struct test_qsa_top_k_exact : public test_case {
                 sc[row*nb + b] = v;
             }
         }
-        std::vector<ggml_fp16_t> mk(n_kv*nrows);
         const int64_t used = n_kv - n_kv/16;
-        for (int64_t row = 0; row < nrows; row++) {
+        for (int64_t row = 0; row < nrows && mode != M_CENSUS; row++) {
             const int64_t t = row % n_tps;
             const int64_t s = row / n_tps;
             for (int64_t i = 0; i < n_kv; i++) {
@@ -7178,8 +7201,50 @@ struct test_qsa_top_k_exact : public test_case {
         }
         GGML_ASSERT(seen == 3);
 
-        // the reference, row by row: T by nth_element over the keys, then the two classes by id
         expected.assign(nrows, {});
+
+        // [TAG_QSA_WHOLE_BLOCKS] the block-level reference (the ggml.h contract, the GPU's visibility test)
+        if (n_sel > 0) {
+            std::vector<int32_t> el;
+            std::vector<uint8_t> flag(nb);
+            for (int64_t row = 0; row < nrows; row++) {
+                const int64_t s  = row / n_tps;
+                const float * rs = sc.data() + row*nb;
+                el.clear();
+                for (int64_t b = 0; b < nb; b++) {
+                    if (std::isfinite(rs[b]) && rs[b] < GGML_QSA_TAIL_MIN) {
+                        el.push_back((int32_t) b);
+                    }
+                }
+                const size_t n_take = std::min<size_t>((size_t) n_sel, el.size());
+                std::partial_sort(el.begin(), el.begin() + n_take, el.end(), [&](int32_t x, int32_t y) {
+                    const uint32_t kx = key_of(rs[x]), ky = key_of(rs[y]);
+                    return kx > ky || (kx == ky && x < y);
+                });
+                std::fill(flag.begin(), flag.end(), 0);
+                for (size_t j = 0; j < n_take; j++) {
+                    flag[el[j]] = 1;
+                }
+                std::vector<int32_t> & e = expected[row];
+                for (int64_t i = 0; i < n_kv && (int64_t) e.size() < width; i++) {
+                    const int32_t b = cb[s*n_kv + i];
+                    const float   m = ggml_fp16_to_fp32(mk[row*n_kv + i]);
+                    const float   v = rs[b] + m;
+                    const bool tail    = std::isfinite(v) && v >= GGML_QSA_TAIL_MIN;
+                    const bool visible = !(std::isinf(m) && m < 0.0f);
+                    if (tail || (flag[b] && visible)) {
+                        e.push_back((int32_t) i);
+                    }
+                }
+                const int64_t c = (int64_t) e.size();
+                for (int64_t j = c; j < width; j++) {
+                    e.push_back(c > 0 ? e[c - 1] : (int32_t) j);
+                }
+            }
+            return;
+        }
+
+        // the reference, row by row: T by nth_element over the keys, then the two classes by id
         if (mode == M_NAN) {
             return;
         }
@@ -7227,7 +7292,7 @@ struct test_qsa_top_k_exact : public test_case {
                     diff += 1.0;
                 }
             }
-            if (mode == M_NAN) {
+            if (mode == M_NAN && n_sel == 0) {
                 std::sort(ids.begin(), ids.end());
                 if (std::adjacent_find(ids.begin(), ids.end()) != ids.end()) {
                     diff += 1.0;
@@ -7244,9 +7309,16 @@ struct test_qsa_top_k_exact : public test_case {
                     }
                 }
             }
-            // the CPU reference's set == the reference's set
+            // the CPU reference's set == the reference's set (block form: its canonical order too)
             for (int64_t c = 0; c < width; c++) {
                 ids[c] = (int32_t) b[r*width + c];
+            }
+            if (n_sel > 0) {
+                if (ids != expected[r]) {
+                    diff += 1.0;
+                    printf("[cpu != reference, row %" PRId64 "] ", r);
+                }
+                continue;
             }
             ref = expected[r];
             std::sort(ids.begin(), ids.end());
@@ -11507,6 +11579,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_top_k_exact(65536, 3,  2, 2051, test_qsa_top_k_exact::M_PROD));
     test_cases.emplace_back(new test_qsa_top_k_exact(65536, 64, 1, 2051, test_qsa_top_k_exact::M_PROD));
     test_cases.emplace_back(new test_qsa_top_k_exact(65536, 64, 1, 2051, test_qsa_top_k_exact::M_QUANT));
+    // [TAG_QSA_WHOLE_BLOCKS] ... and the block-level form (ggml_qsa_top_k_blocks), element for element: every data
+    // mode at the decode / verify shapes with the deployed (k 2051, 512 blocks) and a truncating (k 512, 128 blocks)
+    // budget, tail residues, more blocks requested than exist, one tie group, k = 1, two streams, 64 rows
+    for (int64_t n_kv : { 4096, 65536, 131072, 262144 }) {
+        for (int64_t n_tps : { 1, 6 }) {
+            for (const auto & kb : { std::pair<int, int>{ 2051, 512 }, std::pair<int, int>{ 512, 128 } }) {
+                for (int mode = 0; mode < test_qsa_top_k_exact::M_COUNT; mode++) {
+                    test_cases.emplace_back(new test_qsa_top_k_exact(n_kv, n_tps, 1, kb.first, mode, kb.second));
+                }
+            }
+        }
+    }
+    for (int64_t n_kv : { 2051, 4096 + 77, 65536 + 2047, 262144 + 1 }) {
+        for (int64_t n_tps : { 1, 6 }) {
+            for (int mode : { test_qsa_top_k_exact::M_CENSUS, test_qsa_top_k_exact::M_QUANT, test_qsa_top_k_exact::M_PROD }) {
+                test_cases.emplace_back(new test_qsa_top_k_exact(n_kv, n_tps, 1, 2051, mode, 512));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_qsa_top_k_exact(1024,  6,  1, 1024, test_qsa_top_k_exact::M_CENSUS, 512));
+    test_cases.emplace_back(new test_qsa_top_k_exact(4096,  6,  1, 4096, test_qsa_top_k_exact::M_EQUAL,  1024));
+    test_cases.emplace_back(new test_qsa_top_k_exact(4096,  6,  1, 4096, test_qsa_top_k_exact::M_MASK,   1024));
+    test_cases.emplace_back(new test_qsa_top_k_exact(4096,  6,  1, 1,    test_qsa_top_k_exact::M_RANDOM, 1));
+    test_cases.emplace_back(new test_qsa_top_k_exact(65536, 3,  2, 2051, test_qsa_top_k_exact::M_CENSUS, 512));
+    test_cases.emplace_back(new test_qsa_top_k_exact(65536, 3,  2, 2051, test_qsa_top_k_exact::M_QUANT,  512));
+    test_cases.emplace_back(new test_qsa_top_k_exact(65536, 64, 1, 2051, test_qsa_top_k_exact::M_CENSUS, 512));
 
     // Qwen 3.8 Flash Next at the deployed context: n_kv 213000, ratio 4, width 2051, decode
     // and -ub 2048 prefill. Opt-in: the n_tps 2048 pair needs ~10 GB of backend and as much
@@ -12010,6 +12108,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_qsa_top_k_exact(262144, 6,   1, 2051, test_qsa_top_k_exact::M_RANDOM));
     test_cases.emplace_back(new test_qsa_top_k_exact(131072, 64,  1, 2051, test_qsa_top_k_exact::M_PROD));
     test_cases.emplace_back(new test_qsa_top_k_exact(131072, 256, 1, 2051, test_qsa_top_k_exact::M_PROD));
+    // [TAG_QSA_WHOLE_BLOCKS] the block-level form at the same depths, census-shaped inputs, 512 blocks
+    for (int64_t n_kv : { 131072, 262144, 524288 }) {
+        for (int64_t n_tps : { 1, 6 }) {
+            test_cases.emplace_back(new test_qsa_top_k_exact(n_kv, n_tps, 1, 2051, test_qsa_top_k_exact::M_CENSUS, 512));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
