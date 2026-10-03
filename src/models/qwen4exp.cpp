@@ -593,6 +593,23 @@ static uint32_t qwen4exp_qsa_top_k(const llama_hparams & hparams, int il) {
     return hparams.indexer_top_k;
 }
 
+// [TAG_MTP_QSA] LLAMA_MTP_QSA_MAX_UBATCH=N (default 8): the MTP block runs the QSA selection only for ubatches of <= N
+// tokens (the draft decode steps); a larger ubatch (catch-up / prompt-size process()) takes the dense build_attn() plus the
+// indexer K write (cache_only), so the MTP context's load-time reserve (n_ubatch tokens) stays today's dense graph instead
+// of the trunk's QSA prefill reservation. 0 = no limit (slice 1: every ubatch through QSA). The trunk is never affected.
+static int64_t qwen4exp_mtp_qsa_max_ubatch() {
+    static const int64_t v = [] {
+        const char * s = getenv("LLAMA_MTP_QSA_MAX_UBATCH");
+        const long long n = s ? atoll(s) : 8;
+        if (s) {
+            LLAMA_LOG_WARN("qwen4exp_mtp_qsa_max_ubatch: LLAMA_MTP_QSA_MAX_UBATCH=%s: MTP ubatches %s run dense\n", s,
+                    n > 0 ? "above it" : "never (0 = no limit)");
+        }
+        return (int64_t) (n > 0 ? n : 0);
+    }();
+    return v;
+}
+
 // [TAG_QSA_FUSED_SELECT] GGML_VK_QSA_FUSED_SELECT=1 emits the indexer selection as ONE node
 // (GGML_OP_QSA_TOP_K) instead of the six that the Vulkan topk_qsa pattern matches and elides.
 //
@@ -2650,6 +2667,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
                         __func__, (long long) qwen4exp_qsa_min_kv(), (long long) n_kv_idx, (long long) qwen4exp_qsa_min_kv());
             }
         }
+    }
+
+    // [TAG_MTP_QSA] the MTP block: a ubatch above LLAMA_MTP_QSA_MAX_UBATCH (catch-up / prompt-size process(), and the
+    // load-time reserve) is dense + the indexer K write, so every draft row still lands in the indexer cache
+    if (qsa && il >= (int) hparams.n_layer() && qwen4exp_mtp_qsa_max_ubatch() > 0 && n_tokens > qwen4exp_mtp_qsa_max_ubatch()) {
+        qsa_exhaustive = true;
     }
 
     // [TAG_QSA_CHUNK] chunk a scan ubatch that is longer than the chunk; the branch is decided here,

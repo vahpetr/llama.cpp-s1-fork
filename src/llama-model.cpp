@@ -2453,8 +2453,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     const char * s_min_kv = getenv("LLAMA_QSA_MIN_KV");
                     const long long min_kv = s_min_kv ? std::max(0LL, atoll(s_min_kv)) : 0;
 
-                    LLAMA_LOG_WARN("%s: mtp_qsa = on (LLAMA_MTP_QSA=1, ratio %u, min_kv %lld)\n", __func__,
-                            llama_hparams_qsa_ratio(hparams, cparams.qsa_ratio, hparams.n_layer()), min_kv);
+                    // [TAG_MTP_QSA] slice 2: ubatches above max_ubatch (LLAMA_MTP_QSA_MAX_UBATCH, default 8; 0 = none) run dense
+                    const char * s_max_ub = getenv("LLAMA_MTP_QSA_MAX_UBATCH");
+                    const long long max_ub = s_max_ub ? std::max(0LL, atoll(s_max_ub)) : 8;
+
+                    LLAMA_LOG_WARN("%s: mtp_qsa = on (LLAMA_MTP_QSA=1, ratio %u, min_kv %lld, max_ubatch %lld)\n", __func__,
+                            llama_hparams_qsa_ratio(hparams, cparams.qsa_ratio, hparams.n_layer()), min_kv, max_ub);
 
                     // the MTP block is the only attention layer, and the only indexer layer; no recurrent layer
                     res = new llama_memory_hybrid_idx(

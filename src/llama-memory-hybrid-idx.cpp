@@ -698,18 +698,10 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     // [TAG_MTP_QSA] no recurrent layer: nothing can refuse a partial removal, as in the plain KV cache this replaces
     if (recr_none) {
         // the layerless recurrent cache only tracks the sequence's last position; drop it whole, so the next
-        // find_slot does not see a position gap (it holds no state to keep)
+        // find_slot does not see a position gap (it holds no state to keep). The indexer + census marks follow below.
         get_mem_recr()->seq_rm(seq_id, -1, -1);
-
-        if (mem_idx) {
-            mem_idx->seq_rm(seq_id, p0, p1);
-        }
-
-        return get_mem_attn()->seq_rm(seq_id, p0, p1);
-    }
-
-    // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
-    if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
+    } else if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
+        // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
         return false;
     }
 
