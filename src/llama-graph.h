@@ -363,6 +363,15 @@ public:
     const llama_kv_cache_context * mctx;
 };
 
+// [TAG_MTP_QSA] the attention input of a llama_memory_hybrid(_idx) context whose graph builds no recurrent layer (the
+// qwen4exp MTP draft under LLAMA_MTP_QSA=1): llm_graph_input_attn_kv over the hybrid's attention context
+class llm_graph_input_attn_kv_hyb : public llm_graph_input_attn_kv {
+public:
+    using llm_graph_input_attn_kv::llm_graph_input_attn_kv;
+
+    bool can_reuse(const llm_graph_params & params) override;
+};
+
 // V-less input for the KV cache
 // ref: https://github.com/ggml-org/llama.cpp/pull/19067
 class llm_graph_input_attn_k : public llm_graph_input_i {
@@ -1208,6 +1217,8 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
+    // [TAG_MTP_QSA] the same input over a llama_memory_hybrid context's attention cache (no recurrent input)
+    llm_graph_input_attn_kv * build_attn_inp_kv_hyb() const;
 
     // [TAG_MTP_CATCHUP_NOATTN] the store half of build_attn(llm_graph_input_attn_kv *, ...) alone: the K/V Hadamard
     // rotations and the cpy_k/cpy_v roots, node for node as build_attn emits them, without the attention (the KQ

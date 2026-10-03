@@ -2434,7 +2434,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
 
-                if (llm_arch_is_recurrent(arch)) {
+                // [TAG_MTP_QSA] LLAMA_MTP_QSA=1: the qwen4exp MTP draft block runs QSA at the trunk's ratio, so its
+                // context gets the indexer cache (+ the pooled-key store) next to the draft KV
+                const bool mtp_qsa = mtp_on_hybrid_qwen && arch == LLM_ARCH_QWEN4EXP && llama_mtp_qsa_enabled() &&
+                    hparams.n_layer_nextn == 1 && hparams.indexer_head_size > 0 &&
+                    hparams.swa_type == LLAMA_SWA_TYPE_NONE &&
+                    llama_hparams_qsa_ratio(hparams, cparams.qsa_ratio, hparams.n_layer()) > 0;
+
+                if (mtp_on_hybrid_qwen && llama_mtp_qsa_enabled() && !mtp_qsa) {
+                    LLAMA_LOG_WARN("%s: mtp_qsa = off (LLAMA_MTP_QSA=1 ignored: %s)\n", __func__,
+                            arch != LLM_ARCH_QWEN4EXP ? "not a qwen4exp model" :
+                            hparams.n_layer_nextn != 1 ? "the model does not have exactly one MTP block" :
+                            hparams.indexer_head_size == 0 ? "the model has no indexer" :
+                            "the trunk's effective compress ratio is 0 (dense)");
+                }
+
+                if (mtp_qsa) {
+                    const char * s_min_kv = getenv("LLAMA_QSA_MIN_KV");
+                    const long long min_kv = s_min_kv ? std::max(0LL, atoll(s_min_kv)) : 0;
+
+                    LLAMA_LOG_WARN("%s: mtp_qsa = on (LLAMA_MTP_QSA=1, ratio %u, min_kv %lld)\n", __func__,
+                            llama_hparams_qsa_ratio(hparams, cparams.qsa_ratio, hparams.n_layer()), min_kv);
+
+                    // the MTP block is the only attention layer, and the only indexer layer; no recurrent layer
+                    res = new llama_memory_hybrid_idx(
+                            /* model             */ *this,
+                            /* attn_type_k       */ params.type_k,
+                            /* attn_type_v       */ params.type_v,
+                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_n_pad        */ 1,
+                            /* attn_n_swa        */ hparams.n_swa,
+                            /* attn_swa_type     */ hparams.swa_type,
+                            /* recurrent_type_k  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* n_seq_max         */ cparams.n_seq_max,
+                            /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* offload           */ cparams.offload_kqv,
+                            /* unified           */ cparams.kv_unified,
+                            /* filter_attn       */ [&](uint32_t il) { return il >= hparams.n_layer(); },
+                            /* filter_recr       */ [&](uint32_t)    { return false; },
+                            /* filter_idx        */ [&](uint32_t il) { return il >= hparams.n_layer(); },
+                            /* qsa_ratio         */ cparams.qsa_ratio,
+                            /* type_idx          */ GGML_TYPE_Q8_0);
+                } else if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
                             *this,
                             GGML_TYPE_F32,

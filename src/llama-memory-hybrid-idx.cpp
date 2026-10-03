@@ -350,7 +350,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
     const layer_filter_cb & filter_idx,
-                  int32_t   qsa_ratio_override) :
+                  int32_t   qsa_ratio_override,
+                ggml_type   type_idx) :
     llama_memory_hybrid(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
@@ -381,10 +382,19 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         LLAMA_LOG_INFO("%s: creating indexer KV cache (K only), size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, type_idx == GGML_TYPE_COUNT ? type_k : type_idx, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
+    // [TAG_MTP_QSA] no recurrent layer at all: the attention + indexer caches carry the whole state
+    recr_none = true;
+    for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+        if (filter_recr && filter_recr(il)) {
+            recr_none = false;
+            break;
+        }
+    }
+
     // [TAG_QSA_WHOLE_BLOCKS] read (and prove) the selection form at load
     if (mem_idx) {
         (void) llama_qsa_whole_blocks();
@@ -415,7 +425,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     uint32_t ratio = 0;
     bool     mixed = false;
 
-    for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+    // [TAG_MTP_QSA] n_layer_all: the MTP context's indexer holds the trailing block; filter_idx picks the context's layers
+    for (uint32_t il = 0; il < hp.n_layer_all; ++il) {
         if (!filter_idx(il)) {
             continue;
         }
@@ -684,6 +695,19 @@ void llama_memory_hybrid_idx::clear(bool data) {
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // [TAG_MTP_QSA] no recurrent layer: nothing can refuse a partial removal, as in the plain KV cache this replaces
+    if (recr_none) {
+        // the layerless recurrent cache only tracks the sequence's last position; drop it whole, so the next
+        // find_slot does not see a position gap (it holds no state to keep)
+        get_mem_recr()->seq_rm(seq_id, -1, -1);
+
+        if (mem_idx) {
+            mem_idx->seq_rm(seq_id, p0, p1);
+        }
+
+        return get_mem_attn()->seq_rm(seq_id, p0, p1);
+    }
+
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
@@ -705,6 +729,14 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     }
 
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
+}
+
+llama_pos llama_memory_hybrid_idx::seq_pos_min(llama_seq_id seq_id) const {
+    return recr_none ? get_mem_attn()->seq_pos_min(seq_id) : llama_memory_hybrid::seq_pos_min(seq_id);
+}
+
+llama_pos llama_memory_hybrid_idx::seq_pos_max(llama_seq_id seq_id) const {
+    return recr_none ? get_mem_attn()->seq_pos_max(seq_id) : llama_memory_hybrid::seq_pos_max(seq_id);
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -797,6 +829,16 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 }
 
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    // [TAG_MTP_QSA] the MTP draft memory: the draft KV's own semantics (llama_kv_cache writes its cells whatever the
+    // PARTIAL_ONLY flag says), and the indexer section follows it the same way; no recurrent section
+    if (recr_none) {
+        get_mem_attn()->state_write(io, seq_id, flags);
+        if (mem_idx) {
+            mem_idx->state_write(io, seq_id, flags);
+        }
+        return;
+    }
+
     llama_memory_hybrid::state_write(io, seq_id, flags);
 
     // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
@@ -824,6 +866,15 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     llama_kv_cache::slot_info_vec_t sinfos_attn;
 
     try {
+        // [TAG_MTP_QSA] mirrors state_write's recr_none branch: attention (whatever PARTIAL_ONLY says), then the indexer
+        if (recr_none) {
+            get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
+            if (mem_idx) {
+                mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+            }
+            return;
+        }
+
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
         }

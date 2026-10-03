@@ -489,7 +489,33 @@ static_assert(std::is_trivially_copyable<llama_hparams>::value, "llama_hparams m
 //                         indexer; recurrent layers and models without indexer tensors stay at 0
 // Kept as a free function (not a member) because llama_hparams must stay trivially copyable and
 // the override does not belong to the model - two contexts of the same model may disagree on it.
+// [TAG_MTP_QSA] LLAMA_MTP_QSA=1 (default 0, read once per process): the single MTP draft block (il == n_layer, with
+// n_layer_nextn == 1) runs QSA at the trunk's ratio - its own indexer (blk.<n_layer>.indexer.*), an indexer cache in the
+// MTP context's memory (llama_memory_hybrid_idx without recurrent layers, llama-model.cpp create_memory) and the trunk's
+// selection / attention path (qwen4exp graph_mtp -> build_layer_attn). Off: today's dense draft, node for node.
+bool llama_mtp_qsa_enabled();
+
+static inline uint32_t llama_hparams_qsa_ratio(const llama_hparams & hparams, int32_t ratio_override, uint32_t il);
+
+// [TAG_MTP_QSA] the trunk's effective ratio: that of its first full-attention layer with a positive one (0 = none)
+static inline uint32_t llama_hparams_qsa_ratio_trunk(const llama_hparams & hparams, int32_t ratio_override) {
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (hparams.is_recr(il)) {
+            continue;
+        }
+        const uint32_t r = llama_hparams_qsa_ratio(hparams, ratio_override, il);
+        if (r > 0) {
+            return r;
+        }
+    }
+    return 0;
+}
+
 static inline uint32_t llama_hparams_qsa_ratio(const llama_hparams & hparams, int32_t ratio_override, uint32_t il) {
+    // [TAG_MTP_QSA] the MTP block takes the trunk's ratio under the knob; without it, the unchanged rules below
+    if (il == hparams.n_layer() && hparams.n_layer_nextn == 1 && hparams.indexer_head_size > 0 && llama_mtp_qsa_enabled()) {
+        return llama_hparams_qsa_ratio_trunk(hparams, ratio_override);
+    }
     if (ratio_override < 0) {
         return hparams.dsv4_compress_ratios[il];
     }

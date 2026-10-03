@@ -3391,7 +3391,9 @@ public:
         for (const auto & winfo : winfos) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
+            // [TAG_MTP_QSA] elements, not blocks: ggml_element_size is the BLOCK size of a quantized type, so the old
+            // size/element_size made a q8_0 view 1/32 of the range (an ON_DEVICE state of a q8_0 cache lost 31/32 of it)
+            const int64_t n = winfo.size/ggml_type_size(winfo.tensor->type)*ggml_blck_size(winfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -3522,7 +3524,9 @@ public:
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
-            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
+            // [TAG_MTP_QSA] elements, not blocks: ggml_element_size is the BLOCK size of a quantized type, so the old
+            // size/element_size made a q8_0 view 1/32 of the range (an ON_DEVICE state of a q8_0 cache lost 31/32 of it)
+            const int64_t n = rinfo.size/ggml_type_size(rinfo.tensor->type)*ggml_blck_size(rinfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
