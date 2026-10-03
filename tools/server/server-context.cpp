@@ -1277,6 +1277,14 @@ private:
     //       x cells_after;
     //     allocator regrow slack: LLAMA_GTT_SLACK_PCT (default = GGML_ALLOC_GROW_SLACK, the percent the run-time
     //       regrow adds to a growing compute chunk) / 100 x slope x cells_after (the growing buffers ~ slope x cells).
+    //   [TAG_QSA_VIS] (A4 T4) + once (only when growth > 0): LLAMA_GTT_ONCE_MIB (default 0 = off) = what is still to be
+    //     allocated ONCE after load, not per cell - with --kv-graph-span 0 every compute buffer is reserved at load and
+    //     LLAMA_QSA_VIS=1 + LLAMA_QSA_PREFILL=indexed leave no per-cell FA staging, so the run-time growth is the one-time
+    //     prealloc_x presize to the reserve hint (the QSA select scratch, pool x 1 026 B/cell at C 256) at the first
+    //     >= 64-token FA / QSA dispatch, plus first-use objects. Pending part = max(0, once - (used - used at init)): it
+    //     vanishes as soon as GTT has grown that much since admission_init. The A4 brain layout then runs with a small
+    //     slope (first-use, allocator rounding) and LLAMA_GTT_STAGING_B_PER_CELL=0 (no geometric prealloc_x growth: the
+    //     presize covers every graph of the span) instead of the dense 2 560 B/cell + 0.25 x 2 048 B/cell step.
     struct {
         bool        enabled = false;
         std::string path;
@@ -1285,6 +1293,8 @@ private:
         double      staging_b_per_cell = 2048.0;
         double      step_override_mib  = -1.0;
         double      slack_pct          = 0.0;
+        double      once_mib           = 0.0;   // [TAG_QSA_VIS] LLAMA_GTT_ONCE_MIB
+        double      used_init_mib      = 0.0;   // GTT used at admission_init (the baseline of the pending once part)
         double      max_wait_s         = 600.0;
         bool        geometric          = false;
         bool        holes_full_chunk   = false;
@@ -2774,6 +2784,7 @@ private:
         adm.staging_b_per_cell = env_double("LLAMA_GTT_STAGING_B_PER_CELL", 2048.0);
         adm.step_override_mib  = env_double("LLAMA_GTT_STAGING_STEP_MIB",   -1.0);
         adm.slack_pct          = env_double("LLAMA_GTT_SLACK_PCT",          env_double("GGML_ALLOC_GROW_SLACK", 0.0));
+        adm.once_mib           = std::max(0.0, env_double("LLAMA_GTT_ONCE_MIB", 0.0)); // [TAG_QSA_VIS]
         adm.max_wait_s         = env_double("LLAMA_GTT_ADMISSION_MAX_WAIT_S", 600.0);
         adm.geometric          = env_truthy("GGML_VK_QSA_SCRATCH_PRESIZE") && env_truthy("GGML_VK_QSA_SCRATCH_PRESIZE_FA");
         adm.holes_full_chunk   = env_truthy("LLAMA_GTT_HOLES_FULL_CHUNK");
@@ -2812,11 +2823,17 @@ private:
         }
 
         adm.enabled = true;
+        adm.used_init_mib = used / 1024.0 / 1024.0;
         SRV_INF("admission: GTT headroom admission on: bar = %.0f MiB, slope = %.0f B/cell, step = max(explicit %.0f MiB, geometric %s, slack %.1f %% x slope x cells) when growing, max wait = %.0f s, holes = %s, used now = %.0f MiB (%s)\n",
                 adm.bar_mib, adm.slope_b_per_cell, std::max(0.0, adm.step_override_mib),
                 adm.geometric ? string_format("0.25 x %.0f B/cell x cells", adm.staging_b_per_cell).c_str() : "off",
                 adm.slack_pct, adm.max_wait_s, adm.holes_full_chunk ? "full chunk" : "first-fit",
                 used / 1024.0 / 1024.0, adm.path.c_str());
+        if (adm.once_mib > 0.0) {
+            // the proof line of the A4 accounting (a WARN, visible at the server's default verbosity)
+            SRV_WRN("admission: + once %.0f MiB (LLAMA_GTT_ONCE_MIB) while GTT has grown less than that since now (%.0f MiB)\n",
+                    adm.once_mib, adm.used_init_mib);
+        }
 
         metrics.admission_enabled = 1;
         metrics.admission_bar_mib = adm.bar_mib;
@@ -2880,7 +2897,11 @@ private:
             step_mib = std::max(step_mib, adm.slack_pct / 100.0 * adm.slope_b_per_cell * (double) cells_after / 1024.0 / 1024.0);
         }
 
-        const double projected = used_mib + adm.slope_b_per_cell * (double) growth / 1024.0 / 1024.0 + step_mib;
+        // [TAG_QSA_VIS] the one-time allocation still pending (LLAMA_GTT_ONCE_MIB), only for a growing chunk like the step
+        const double once_mib = growth > 0 && adm.once_mib > 0.0
+            ? std::max(0.0, adm.once_mib - std::max(0.0, used_mib - adm.used_init_mib)) : 0.0;
+
+        const double projected = used_mib + adm.slope_b_per_cell * (double) growth / 1024.0 / 1024.0 + step_mib + once_mib;
 
         slot.adm_projected_mib = projected;
 
@@ -2918,8 +2939,8 @@ private:
 
         if (slot.adm_t_log_us == 0 || t_now - slot.adm_t_log_us > 10 * 1000 * 1000) {
             slot.adm_t_log_us = t_now;
-            SRV_WRN("admission: deferred slot %d (projected %.0f MiB > bar %.0f MiB: used %.0f + %" PRId64 " new cells x %.0f B + step %.0f; chunk %" PRId64 " tokens, resident %" PRId64 ", high-water %" PRId64 ", waiting %.1f s)\n",
-                    slot.id, projected, adm.bar_mib, used_mib, growth, adm.slope_b_per_cell, step_mib,
+            SRV_WRN("admission: deferred slot %d (projected %.0f MiB > bar %.0f MiB: used %.0f + %" PRId64 " new cells x %.0f B + step %.0f + once %.0f; chunk %" PRId64 " tokens, resident %" PRId64 ", high-water %" PRId64 ", waiting %.1f s)\n",
+                    slot.id, projected, adm.bar_mib, used_mib, growth, adm.slope_b_per_cell, step_mib, once_mib,
                     n_chunk, resident, adm.hw_cells, waited_s);
         }
         return ADM_DEFER;

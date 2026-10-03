@@ -284,8 +284,9 @@ void main() {
     const uint32_t ids_offset = (iq3 * p.ne2 + gqa_iq1) * p.split_kv; // [TAG_QSA_INDEXED_FA] plain fold: token = gqa_iq1, p.ne2 = n_tps
 
     // [TAG_KQ_VIS] the first tile's visibility, staged before the loop; every later tile is staged one
-    // iteration ahead (below), ordered by the barriers the previous iteration already has
-    if (VIS) {
+    // iteration ahead (below), ordered by the barriers the previous iteration already has.
+    // [TAG_QSA_VIS] INDEXED stages each tile with its ids instead (the idsh fill below)
+    if (VIS && !INDEXED) {
         if (start_j < end_j) {
             fa_vis_stage(start_j, start_j & 1u);
         }
@@ -303,7 +304,14 @@ void main() {
                 // Columns >= W and out-of-range ids (a negative one wraps to a huge uint) get the sentinel KV:
                 // FA_KV_LIVE bounds them like a KV tail (P = +0, K/V/mask never loaded), instead of attending a
                 // clamped - possibly live - cell KV-1. FA_KV_ROW clamps the address separately.
-                idsh[tid] = pos < p.split_kv ? min(uint32_t(data_ids[ids_offset + pos]), KV) : KV;
+                const uint32_t cell = pos < p.split_kv ? min(uint32_t(data_ids[ids_offset + pos]), KV) : KV;
+                idsh[tid] = cell;
+                if (VIS) {
+                    // [TAG_QSA_VIS] (A4 T4) the tile's visibility from the records of the cells its ids name, into buffer
+                    // j & 1 (FA_MASK_LOAD's); its last reads were iteration j - 2's mask loads, behind that iteration's
+                    // barriers, and the barrier below orders these writes before this tile's mask loads
+                    fa_vis_stage_cell(cell, tid, j & 1u);
+                }
             }
             barrier();
         }
@@ -317,7 +325,7 @@ void main() {
         // j - 1's mask loads, which the all -inf test's barrier of that iteration follows; these writes
         // are read by iteration j + 1's mask loads after this iteration's barriers (the sfsh store
         // barrier, or the one before the ALL_NEG_INF "continue" below).
-        if (VIS && j + 1 < end_j) {
+        if (VIS && !INDEXED && j + 1 < end_j) {
             const uint jn = j + 1;
             bool need = true;
             if (USE_MASK_OPT) {

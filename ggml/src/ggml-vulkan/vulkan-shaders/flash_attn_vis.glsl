@@ -130,6 +130,26 @@ void fa_vis_stage(const uint jt, const uint b) {
     }
 }
 
+// [TAG_QSA_VIS] INDEXED (M6, flash_attn_cm1.comp): stage tile column c of buffer b from the cell its id names - `cell` is
+// idsh[c], a cache row in [0, KV) or the dead sentinel KV, for which fa_vis_load_cell reads nothing (seq bits 0: -inf;
+// a dead column's mask is never loaded anyway). The same records and values fa_vis_stage writes for a dense tile, one
+// invocation per column, no barrier (the idsh fill's barrier orders it before the mask loads).
+void fa_vis_stage_cell(const uint cell, const uint c, const uint b) {
+    int p0; uint sm; int x0; int y0;
+    fa_vis_load_cell(cell, p0, sm, x0, y0);
+    if (vis_fold) {
+        [[unroll]] for (uint sl = 0; sl < VIS_SLOTS; ++sl) {
+            vis_sh_val[(b * VIS_SLOTS + sl) * Bc + c] =
+                kqv_value_of(p0, sm, x0, y0, vis_sh_slottok[sl], VIS_FLAGS, int(VisNSwa));
+        }
+    } else {
+        vis_sh_pos[b * Bc + c] = p0;
+        vis_sh_seq[b * Bc + c] = sm;
+        vis_sh_x  [b * Bc + c] = x0;
+        vis_sh_y  [b * Bc + c] = y0;
+    }
+}
+
 // the scalar shader: stage KV tile j into buffer 0 and wait (workgroup-uniform call)
 void fa_vis_stage_tile(const uint j) {
     fa_vis_stage(j, 0u);

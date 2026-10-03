@@ -1148,6 +1148,11 @@ struct vk_device_struct {
     // [TAG_QSA_TOPK_V2] [TAG_QSA_WHOLE_BLOCKS] the same shader in the block-level form (spec constant 3 = 1): passes
     // 0..4 over the block keys, 5 flag, 6 cell count, 7 cell emit
     vk_pipeline pipeline_topk_v2_qsa_blocks[8];
+    // [TAG_QSA_VIS] (A4 T3) the same selections over the visibility metadata (ggml_qsa_top_k_vis): the QSA_VIS SPIR-V
+    // variants of both kernels, binding 3 = the cell planes, binding 5 = the token records (6 bindings)
+    vk_pipeline pipeline_topk_radix_qsa_vis, pipeline_topk_radix_qsa_blocks_vis;
+    vk_pipeline pipeline_topk_v2_qsa_vis[6];
+    vk_pipeline pipeline_topk_v2_qsa_blocks_vis[8];
     vk_pipeline pipeline_qsa_bias;       // [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
@@ -1203,6 +1208,7 @@ struct vk_device_struct {
     // [TAG_KQ_VIS] the same classification from the visibility metadata, and GGML_OP_KQ_MASK
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_vis_opt;
     vk_pipeline pipeline_kq_mask_f16, pipeline_kq_mask_f32;
+    vk_pipeline pipeline_kq_mask_ids_f16; // [TAG_QSA_VIS] ggml_kq_mask_ids (the QSA gather's window mask)
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     vk_pipeline pipeline_count_experts;        // N_EXPERTS_MAX = BLOCK_SIZE, counting only
@@ -2284,6 +2290,16 @@ struct vk_op_kq_mask_push_constants {
     uint32_t n_stream;
     uint32_t flags;
     int32_t  n_swa;
+};
+
+// [TAG_QSA_VIS] kq_mask.comp's IDS variant (ggml_kq_mask_ids): the same constants + the ids per row
+struct vk_op_kq_mask_ids_push_constants {
+    uint32_t n_kv;
+    uint32_t n_tps;
+    uint32_t n_stream;
+    uint32_t flags;
+    int32_t  n_swa;
+    uint32_t n_w;
 };
 
 // Allow pre-recording command buffers
@@ -6336,6 +6352,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     ggml_vk_create_pipeline(device, device->pipeline_kq_mask_f16, "kq_mask_f16", kq_mask_f16_len, kq_mask_f16_data, "main", 3, sizeof(vk_op_kq_mask_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_kq_mask_f32, "kq_mask_f32", kq_mask_f32_len, kq_mask_f32_data, "main", 3, sizeof(vk_op_kq_mask_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_kq_mask_ids_f16, "kq_mask_ids_f16", kq_mask_ids_f16_len, kq_mask_ids_f16_data, "main", 4, sizeof(vk_op_kq_mask_ids_push_constants), {256, 1, 1}, {}, 1); // [TAG_QSA_VIS]
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
@@ -6628,6 +6645,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_blocks, "topk_radix_qsa_blocks", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 2}, 1, true);
+        // [TAG_QSA_VIS] the metadata forms (spec constant 2 = VIS_CAUSAL: causal visibility, the only one the graph builds)
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_vis, "topk_radix_qsa_vis", topk_radix_select_vis_f32_len, topk_radix_select_vis_f32_data, "main", 6, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1, 1}, 1, true);
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_blocks_vis, "topk_radix_qsa_blocks_vis", topk_radix_select_vis_f32_len, topk_radix_select_vis_f32_data, "main", 6, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 2, 1}, 1, true);
     }
 
     // [TAG_QSA_TOPK_V2] the distributed QSA radix select: six passes, each its own pipeline (spec constant 0),
@@ -6647,6 +6667,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                      topk_radix_select_v2_f32_len, topk_radix_select_v2_f32_data, "main", 5,
                                      sizeof(vk_op_topk_radix_v2_push_constants), {1, 1, 1},
                                      {pass, 256 / wave, device->qsa_topk_cpt, 1}, 1, true, true, wave);
+        }
+        // [TAG_QSA_VIS] the metadata forms: the QSA_VIS variant, spec constant 4 = VIS_CAUSAL (causal visibility)
+        for (uint32_t pass = 0; pass < 6; ++pass) {
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_v2_qsa_vis[pass], "topk_radix_v2_qsa_vis_p" + std::to_string(pass),
+                                     topk_radix_select_v2_vis_f32_len, topk_radix_select_v2_vis_f32_data, "main", 6,
+                                     sizeof(vk_op_topk_radix_v2_push_constants), {1, 1, 1},
+                                     {pass, 256 / wave, device->qsa_topk_cpt, 0, 1}, 1, true, true, wave);
+        }
+        for (uint32_t pass = 0; pass < 8; ++pass) {
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_v2_qsa_blocks_vis[pass], "topk_radix_v2_qsa_blocks_vis_p" + std::to_string(pass),
+                                     topk_radix_select_v2_vis_f32_len, topk_radix_select_v2_vis_f32_data, "main", 6,
+                                     sizeof(vk_op_topk_radix_v2_push_constants), {1, 1, 1},
+                                     {pass, 256 / wave, device->qsa_topk_cpt, 1, 1}, 1, true, true, wave);
         }
     }
 
@@ -15697,7 +15730,8 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
                                       const ggml_tensor * scores, const ggml_tensor * cell_blk,
                                       const ggml_tensor * mask, ggml_tensor * top_k,
                                       uint32_t n_tps, uint32_t n_blocks, uint32_t n_stream,
-                                      uint32_t sb_blk, uint32_t sb_tps, uint32_t n_sel = 0) {
+                                      uint32_t sb_blk, uint32_t sb_tps, uint32_t n_sel = 0,
+                                      const ggml_tensor * vis_toks = nullptr) {
     const uint32_t n_kv  = cell_blk->ne[0];
     const uint32_t width = top_k->ne[0];
     const uint32_t nrows = n_tps * n_stream;
@@ -15706,8 +15740,12 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
     // (it holds one flag per block of the row instead of the gathered cells; n_blocks <= n_kv)
     // [TAG_QSA_TOPK_V2] both forms run v2 when the device enabled it
     const bool v2 = ctx->device->qsa_topk_v2;
-    vk_pipeline pipeline = v2        ? (n_sel > 0 ? ctx->device->pipeline_topk_v2_qsa_blocks[0] : ctx->device->pipeline_topk_v2_qsa[0]) :
-                           n_sel > 0 ? ctx->device->pipeline_topk_radix_qsa_blocks : ctx->device->pipeline_topk_radix_qsa;
+    // [TAG_QSA_VIS] vis_toks != NULL: `mask` is the cell planes and the QSA_VIS pipelines read the metadata (binding 5 = toks)
+    const bool vis = vis_toks != nullptr;
+    vk_pipeline pipeline = v2        ? (n_sel > 0 ? (vis ? ctx->device->pipeline_topk_v2_qsa_blocks_vis[0] : ctx->device->pipeline_topk_v2_qsa_blocks[0])
+                                                  : (vis ? ctx->device->pipeline_topk_v2_qsa_vis[0]        : ctx->device->pipeline_topk_v2_qsa[0])) :
+                           n_sel > 0 ? (vis ? ctx->device->pipeline_topk_radix_qsa_blocks_vis : ctx->device->pipeline_topk_radix_qsa_blocks)
+                                     : (vis ? ctx->device->pipeline_topk_radix_qsa_vis        : ctx->device->pipeline_topk_radix_qsa);
     GGML_ASSERT(pipeline != nullptr);
 
     // scratch holds the gathered+masked input (v2: its keys, then the histograms and tile records),
@@ -15811,10 +15849,17 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
         const uint32_t n_pass = n_sel > 0 ? 8 : 6;
         vk_subbuffer scratch_buf { ctx->prealloc_x, 0, ctx->prealloc_x->size };
         for (uint32_t pass = 0; pass < n_pass; ++pass) {
-            vk_pipeline & pl = n_sel > 0 ? ctx->device->pipeline_topk_v2_qsa_blocks[pass] : ctx->device->pipeline_topk_v2_qsa[pass];
+            vk_pipeline & pl = n_sel > 0 ? (vis ? ctx->device->pipeline_topk_v2_qsa_blocks_vis[pass] : ctx->device->pipeline_topk_v2_qsa_blocks[pass])
+                                         : (vis ? ctx->device->pipeline_topk_v2_qsa_vis[pass]        : ctx->device->pipeline_topk_v2_qsa[pass]);
             // passes 6 and 7 of the block form walk the cells, every other pass the selection domain
             const std::array<uint32_t, 3> elements2 { n_x, pass >= 6 ? n_tiles_c : n_tiles, 1 };
             ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
+            if (vis) {
+                ggml_vk_dispatch_pipeline(ctx, subctx, pl,
+                    { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
+                      ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
+                      scratch_buf, ggml_vk_tensor_subbuffer(ctx, vis_toks) }, pc2, elements2);
+            } else
             ggml_vk_dispatch_pipeline(ctx, subctx, pl,
                 { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
                   ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
@@ -15835,6 +15880,12 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
     };
     vk_subbuffer scratch_buf { ctx->prealloc_x, 0, ctx->prealloc_x->size };
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    if (vis) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
+              ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
+              scratch_buf, ggml_vk_tensor_subbuffer(ctx, vis_toks) }, pc, elements);
+    } else
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
           ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
@@ -15881,14 +15932,46 @@ static void ggml_vk_qsa_top_k(ggml_backend_vk_context * ctx, vk_context& subctx,
     // [TAG_QSA_WHOLE_BLOCKS] op_params[0] == 1: ggml_qsa_top_k_blocks, op_params[1] = n_sel
     const uint32_t n_sel = ggml_get_op_params_i32(node, 0) == 1 ? (uint32_t) ggml_get_op_params_i32(node, 1) : 0u;
 
+    // [TAG_QSA_VIS] op_params[2] == 1 (ggml_qsa_top_k_vis): src[2] is the cell planes, src[3] the token records
+    const ggml_tensor * vis_toks = ggml_get_op_params_i32(node, 2) == 1 ? node->src[3] : nullptr;
+
     ggml_vk_topk_qsa_dispatch(ctx, subctx, scores, cell_blk, mask, node,
-                              n_tps, n_blocks, n_stream, /*sb_blk =*/ 1, /*sb_tps =*/ n_blocks, n_sel);
+                              n_tps, n_blocks, n_stream, /*sb_blk =*/ 1, /*sb_tps =*/ n_blocks, n_sel, vis_toks);
 }
 
 // [TAG_KQ_VIS] GGML_OP_KQ_MASK: the mask plane generated on the device from the metadata
 static void ggml_vk_kq_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * cells = dst->src[0]; // [n_kv, 4, n_stream] I32
     const ggml_tensor * toks  = dst->src[1]; // [4, n_tps, n_stream] I32
+
+    // [TAG_QSA_VIS] ggml_kq_mask_ids: [W, 1, 1, n_tps*n_stream], one (t, s) row per workgroup row, W ids per row
+    if (dst->src[2] != nullptr) {
+        const ggml_tensor * ids = dst->src[2];
+        vk_pipeline pl = ctx->device->pipeline_kq_mask_ids_f16;
+        GGML_ASSERT(dst->type == GGML_TYPE_F16 && pl != nullptr);
+        ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
+
+        const uint32_t n_w    = (uint32_t) dst->ne[0];
+        const uint32_t n_kv_c = (uint32_t) cells->ne[0];
+        const uint32_t n_tps_t = (uint32_t) toks->ne[1];
+        const uint32_t n_str  = (uint32_t) cells->ne[2];
+
+        const uint32_t causal_i   = ggml_get_op_params_i32(dst, 0) != 0;
+        const uint32_t alibi_i    = ggml_get_op_params_i32(dst, 1) != 0;
+        const uint32_t swa_type_i = (uint32_t) ggml_get_op_params_i32(dst, 2) & 3u;
+        const vk_op_kq_mask_ids_push_constants pci = {
+            n_kv_c, n_tps_t, n_str,
+            causal_i | (alibi_i << 1) | (swa_type_i << 2) | 16u, // 16: KQV_FLAG_F16
+            swa_type_i ? ggml_get_op_params_i32(dst, 3) : 0,
+            n_w,
+        };
+        const uint32_t wg_x = std::min(CEIL_DIV(n_w, 256u), 1024u);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pl,
+                                  { ggml_vk_tensor_subbuffer(ctx, cells), ggml_vk_tensor_subbuffer(ctx, toks), ggml_vk_tensor_subbuffer(ctx, dst),
+                                    ggml_vk_tensor_subbuffer(ctx, ids) },
+                                  pci, { wg_x * 256u, n_tps_t, n_str });
+        return;
+    }
 
     vk_pipeline pipeline = dst->type == GGML_TYPE_F16 ? ctx->device->pipeline_kq_mask_f16 : ctx->device->pipeline_kq_mask_f32;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -21665,6 +21748,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_KQ_MASK:
             // [TAG_KQ_VIS]
+            if (op->src[2] != nullptr) {
+                // [TAG_QSA_VIS] ggml_kq_mask_ids: the f16 IDS variant only (the gather's window mask is f16)
+                if (op->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_I32 || !ggml_is_contiguous(op->src[2]) ||
+                    device->pipeline_kq_mask_ids_f16 == nullptr) {
+                    return false;
+                }
+            }
             return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op) &&
                    (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
@@ -21681,6 +21771,31 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const ggml_tensor * mask     = op->src[2];
                 if (!scores || !cell_blk || !mask) {
                     return false;
+                }
+                // [TAG_QSA_VIS] ggml_qsa_top_k_vis: src[2] = the cell planes, src[3] = the token records; the QSA_VIS
+                // pipelines are built for causal visibility only
+                if (ggml_get_op_params_i32(op, 2) == 1) {
+                    const ggml_tensor * toks = op->src[3];
+                    if (!toks || mask->type != GGML_TYPE_I32 || toks->type != GGML_TYPE_I32 ||
+                        !ggml_is_contiguous(mask) || !ggml_is_contiguous(toks) ||
+                        ggml_get_op_params_i32(op, 3) != 1 || scores->type != GGML_TYPE_F32 ||
+                        cell_blk->type != GGML_TYPE_I32 || op->type != GGML_TYPE_I32 ||
+                        !ggml_is_contiguous(scores) || !ggml_is_contiguous(cell_blk) || !ggml_is_contiguous(op)) {
+                        return false;
+                    }
+                    const int64_t n_kv = cell_blk->ne[0];
+                    if (mask->ne[0] != n_kv || mask->ne[1] != 4 || mask->ne[2] != scores->ne[2] ||
+                        toks->ne[0] != 4 || toks->ne[1] != scores->ne[1] || toks->ne[2] != scores->ne[2] ||
+                        op->ne[0] <= 0 || op->ne[0] > n_kv) {
+                        return false;
+                    }
+                    if (ggml_get_op_params_i32(op, 0) == 1) {
+                        return scores->ne[0] <= n_kv && ggml_get_op_params_i32(op, 1) > 0 &&
+                               (device->qsa_topk_v2 ? device->pipeline_topk_v2_qsa_blocks_vis[0] != nullptr
+                                                    : device->pipeline_topk_radix_qsa_blocks_vis != nullptr);
+                    }
+                    return device->qsa_topk_v2 ? device->pipeline_topk_v2_qsa_vis[0] != nullptr
+                                               : device->pipeline_topk_radix_qsa_vis != nullptr;
                 }
                 if (scores->type != GGML_TYPE_F32 || cell_blk->type != GGML_TYPE_I32 ||
                     mask->type != GGML_TYPE_F16 || op->type != GGML_TYPE_I32) {
@@ -22561,7 +22676,11 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                 ggml_flash_attn_ext_set_kv_ids(tensor_clone, src_clone[5]); // [TAG_QSA_INDEXED_FA]
             }
         } else if (tensor->op == GGML_OP_KQ_MASK) { // [TAG_KQ_VIS]
-            tensor_clone = ggml_kq_mask(ggml_ctx, src_clone[0], src_clone[1], tensor->type,
+            tensor_clone = src_clone[2] // [TAG_QSA_VIS] ggml_kq_mask_ids
+                ? ggml_kq_mask_ids(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], tensor->type,
+                    ggml_get_op_params_i32(tensor, 0) != 0, ggml_get_op_params_i32(tensor, 1) != 0,
+                    ggml_get_op_params_i32(tensor, 2), ggml_get_op_params_i32(tensor, 3))
+                : ggml_kq_mask(ggml_ctx, src_clone[0], src_clone[1], tensor->type,
                     ggml_get_op_params_i32(tensor, 0) != 0, ggml_get_op_params_i32(tensor, 1) != 0,
                     ggml_get_op_params_i32(tensor, 2), ggml_get_op_params_i32(tensor, 3));
         } else if (tensor->op == GGML_OP_MUL_MAT) {
@@ -22788,6 +22907,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_argsort(ggml_ctx, src_clone[0], (ggml_sort_order) *(int *)tensor->op_params);
         } else if (tensor->op == GGML_OP_TOP_K) {
             tensor_clone = ggml_top_k(ggml_ctx, src_clone[0], tensor->ne[0]);
+        } else if (tensor->op == GGML_OP_QSA_TOP_K && ggml_get_op_params_i32(tensor, 2) == 1) { // [TAG_QSA_VIS]
+            tensor_clone = ggml_qsa_top_k_vis(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], tensor->ne[0],
+                    ggml_get_op_params_i32(tensor, 0) == 1 ? ggml_get_op_params_i32(tensor, 1) : 0, ggml_get_op_params_i32(tensor, 3) != 0);
         } else if (tensor->op == GGML_OP_QSA_TOP_K) {
             tensor_clone = ggml_get_op_params_i32(tensor, 0) == 1 // [TAG_QSA_WHOLE_BLOCKS]
                 ? ggml_qsa_top_k_blocks(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], tensor->ne[0], ggml_get_op_params_i32(tensor, 1))

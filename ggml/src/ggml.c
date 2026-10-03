@@ -5506,6 +5506,52 @@ struct ggml_tensor * ggml_qsa_top_k_blocks(
     return result;
 }
 
+// [TAG_QSA_VIS] ggml_qsa_top_k_vis: the selection over the metadata (see ggml.h)
+struct ggml_tensor * ggml_qsa_top_k_vis(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * cell_blk,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * toks,
+        int                   k,
+        int                   n_sel,
+        bool                  causal) {
+    GGML_ASSERT(   score->type == GGML_TYPE_F32);
+    GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+    GGML_ASSERT(cells->type == GGML_TYPE_I32 && toks->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(score) && ggml_is_contiguous(cell_blk));
+    GGML_ASSERT(ggml_is_contiguous(cells) && ggml_is_contiguous(toks));
+
+    const int64_t n_blocks = score->ne[0];
+    const int64_t n_tps    = score->ne[1];
+    const int64_t n_stream = score->ne[2];
+    const int64_t n_kv     = cell_blk->ne[0];
+
+    GGML_ASSERT(score->ne[3] == 1);
+    GGML_ASSERT(cell_blk->ne[1] == n_stream && ggml_nrows(cell_blk) == n_stream);
+    GGML_ASSERT(cells->ne[0] == n_kv && cells->ne[1] == 4 && cells->ne[2] == n_stream && cells->ne[3] == 1);
+    GGML_ASSERT(toks->ne[0] == 4 && toks->ne[1] == n_tps && toks->ne[2] == n_stream && toks->ne[3] == 1);
+    GGML_ASSERT(n_blocks > 0 && n_kv > 0);
+    GGML_ASSERT(k > 0 && (int64_t) k <= n_kv);
+    GGML_ASSERT(n_kv <= INT32_MAX);
+    GGML_ASSERT(n_sel >= 0 && (n_sel == 0 || n_blocks <= n_kv));
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, k, n_tps, 1, n_stream);
+
+    ggml_set_op_params_i32(result, 0, n_sel > 0 ? 1 : 0);
+    ggml_set_op_params_i32(result, 1, n_sel);
+    ggml_set_op_params_i32(result, 2, 1);
+    ggml_set_op_params_i32(result, 3, causal ? 1 : 0);
+
+    result->op     = GGML_OP_QSA_TOP_K;
+    result->src[0] = score;
+    result->src[1] = cell_blk;
+    result->src[2] = cells;
+    result->src[3] = toks;
+
+    return result;
+}
+
 // ggml_kq_mask
 
 struct ggml_tensor * ggml_kq_mask(
@@ -5538,6 +5584,46 @@ struct ggml_tensor * ggml_kq_mask(
     result->op     = GGML_OP_KQ_MASK;
     result->src[0] = cells;
     result->src[1] = toks;
+
+    return result;
+}
+
+// [TAG_QSA_VIS] ggml_kq_mask_ids: the KQ mask at the selected cells (see ggml.h)
+struct ggml_tensor * ggml_kq_mask_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * toks,
+        struct ggml_tensor  * ids,
+        enum ggml_type        type,
+        bool                  causal,
+        bool                  alibi,
+        int32_t               swa_type,
+        int32_t               n_swa) {
+    GGML_ASSERT(cells->type == GGML_TYPE_I32 && toks->type == GGML_TYPE_I32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(cells) && ggml_is_contiguous(toks) && ggml_is_contiguous(ids));
+    GGML_ASSERT(cells->ne[1] == 4 && toks->ne[0] == 4);
+    GGML_ASSERT(cells->ne[3] == 1 && toks->ne[3] == 1);
+    GGML_ASSERT(cells->ne[2] == toks->ne[2]);
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(swa_type >= 0 && swa_type <= 3);
+    GGML_ASSERT(swa_type == 0 || n_swa > 0);
+
+    const int64_t n_tps    = toks->ne[1];
+    const int64_t n_stream = cells->ne[2];
+
+    GGML_ASSERT(ids->ne[1] == n_tps && ids->ne[2] == 1 && ids->ne[3] == n_stream);
+    GGML_ASSERT(ids->ne[0] >= 1 && ids->ne[0] <= cells->ne[0]);
+
+    // ggml_kq_mask's op and op_params, with the ids as src[2] and the gathered shape
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, ids->ne[0], 1, 1, n_tps*n_stream);
+
+    const int32_t params[] = { causal ? 1 : 0, alibi ? 1 : 0, swa_type, n_swa };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_KQ_MASK;
+    result->src[0] = cells;
+    result->src[1] = toks;
+    result->src[2] = ids;
 
     return result;
 }

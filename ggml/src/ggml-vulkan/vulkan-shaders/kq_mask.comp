@@ -1,6 +1,7 @@
 #version 450
 
 // [TAG_KQ_VIS] GGML_OP_KQ_MASK: dst[s][t][j] = kqv_value(cells, toks) (see kq_vis.glsl, ggml.h)
+// [TAG_QSA_VIS] IDS (ggml_kq_mask_ids): dst[q][c] = the plane's element at (cell ids[q][c], row q), q = s * n_tps + t
 
 #extension GL_EXT_shader_16bit_storage : require
 
@@ -13,6 +14,9 @@ layout (binding = 2) writeonly buffer D {float16_t data_d[];};
 #else
 layout (binding = 2) writeonly buffer D {float data_d[];};
 #endif
+#if defined(IDS)
+layout (binding = 3) readonly buffer I {int data_i[];};
+#endif
 
 layout (push_constant) uniform parameter {
     uint n_kv;
@@ -20,6 +24,9 @@ layout (push_constant) uniform parameter {
     uint n_stream;
     uint flags;
     int  n_swa;
+#if defined(IDS)
+    uint n_w;   // ids per row
+#endif
 } p;
 
 int kqv_cell_load(uint idx) {
@@ -31,6 +38,27 @@ int kqv_cell_load(uint idx) {
 void main() {
     const uint t = gl_WorkGroupID.y;
     const uint s = gl_WorkGroupID.z;
+
+#if defined(IDS)
+    {
+        const uint  q     = s * p.n_tps + t;
+        const ivec4 tk    = data_t[q];
+        const uint  cbase = s * 4u * p.n_kv;
+        const uint  obase = q * p.n_w;
+
+        for (uint c = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x; c < p.n_w; c += gl_NumWorkGroups.x * 256u) {
+            const uint  j = uint(data_i[obase + c]);
+            // an id outside [0, n_kv) is not read and gives -inf (ggml.h; the CPU reference does the same)
+            const float v = j < p.n_kv ? kqv_value(cbase, p.n_kv, j, tk, p.flags, p.n_swa) : kqv_neg_inf();
+#if defined(OUT_F16)
+            data_d[obase + c] = float16_t(v);
+#else
+            data_d[obase + c] = v;
+#endif
+        }
+        return;
+    }
+#endif
 
     const ivec4 tk    = data_t[s * p.n_tps + t];
     const uint  cbase = s * 4u * p.n_kv;
