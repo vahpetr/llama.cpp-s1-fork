@@ -2495,6 +2495,26 @@ extern "C" {
             int                   k,
             int                   n_sel);
 
+    // [TAG_QSA_VIS] (A4 T3) ggml_qsa_top_k (n_sel == 0) / ggml_qsa_top_k_blocks (n_sel > 0) over the visibility
+    // metadata instead of a mask plane: element (i, t, s) of a scored row is
+    //     score[cell_blk[i, s], t, s] + m,   m = ggml_kq_mask(cells, toks, GGML_TYPE_F16, causal, false, 0, 0)[i, t, s]
+    // with m (+0 or -inf, exact in f16) computed per element - the same f32 add, so the ids and their order are those of
+    // the plane form over that mask, for every backend. No ALiBi, no SWA (the per-block bias the selection needs is
+    // causal and ALiBi-free).
+    //   cells: [n_kv, 4, n_stream] I32 (ggml_kq_mask's cell planes, n_kv == cell_blk->ne[0])
+    //   toks:  [4, n_tps, n_stream] I32 (the token records of the score's n_tps rows: for a chunk of queries, the rows
+    //          gathered from the ubatch's records with ggml_get_rows)
+    //   op_params: [0] form (1 = blocks), [1] n_sel, [2] = 1 (vis), [3] causal; src[2] = cells, src[3] = toks
+    GGML_API struct ggml_tensor * ggml_qsa_top_k_vis(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * cell_blk,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * toks,
+            int                   k,
+            int                   n_sel,
+            bool                  causal);
+
     // [TAG_KQ_VIS] the KQ mask computed from metadata (visibility from metadata, Phase 3): the value
     // llama_kv_cache::set_input_kq_mask writes, as a pure function of 16 B per KV cell and 16 B per token.
     //
@@ -2515,6 +2535,21 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * cells,
             struct ggml_tensor  * toks,
+            enum ggml_type        type,
+            bool                  causal,
+            bool                  alibi,
+            int32_t               swa_type,
+            int32_t               n_swa);
+
+    // [TAG_QSA_VIS] (A4 T4) the mask at selected cells only: result [W, 1, 1, n_tps*n_stream] with element (c, 0, 0, s*n_tps + t)
+    // = ggml_kq_mask(cells, toks, type, causal, alibi, swa_type, n_swa)[ids[c, t, 0, s], t, 0, s] - bit-identical to
+    // ggml_get_rows of that plane at the ids (the QSA decode gather's window mask) without the [n_kv, n_tps] plane.
+    //   ids: [W, n_tps, 1, n_stream] I32, contiguous; an id outside [0, n_kv) is not read and gives -inf. src[2] = ids.
+    GGML_API struct ggml_tensor * ggml_kq_mask_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * toks,
+            struct ggml_tensor  * ids,
             enum ggml_type        type,
             bool                  causal,
             bool                  alibi,
@@ -2610,6 +2645,17 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // [TAG_QSA_INDEXED_FA] fork-only: a per-query KV cell list as src[5]; NULL = dense (node unchanged).
+    //   ids: [W, n_batch, 1, ne3] I32, contiguous, W <= n_kv; row (t, s) names the cells query t of stream s attends,
+    //   unique within the row, each in [0, n_kv). K, V and the mask are read at those cells (mask[t, ids[c, t, 0, s]]);
+    //   a cell whose mask is -inf is dead. Backends not exporting "ggml_backend_fa_kv_ids" refuse the node.
+    //   [TAG_QSA_VIS] an id outside [0, n_kv) (e.g. -1) is a dead column too: never read, never counted - the way a
+    //   caller masks a repeated id (the [TAG_QSA_WHOLE_BLOCKS] padding). With ggml_flash_attn_ext_set_vis the mask of
+    //   column c is the metadata's value at cell ids[c, t, 0, s].
+    GGML_API void ggml_flash_attn_ext_set_kv_ids(
+            struct ggml_tensor * a,
+            struct ggml_tensor * ids);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

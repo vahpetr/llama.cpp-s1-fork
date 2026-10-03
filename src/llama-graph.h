@@ -1181,7 +1181,13 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il,
-            // [TAG_KQ_VIS] with flash attention: the visibility metadata replaces kq_mask
+            ggml_tensor * kv_ids = nullptr,        // [TAG_QSA_INDEXED_FA] flash attention only: each query row attends to
+                                                   // its own W cells. Contiguous I32 [W, n_tps, 1, n_stream] at a buffer
+                                                   // offset aligned to minStorageBufferOffsetAlignment (Vulkan binds it
+                                                   // there; its supports_op refuses a misaligned one, e.g. a row-offset
+                                                   // view), ids unique within a row and in [0, n_kv)
+            // [TAG_KQ_VIS] with flash attention: the visibility metadata replaces kq_mask (composes with kv_ids:
+            // the visibility of cell ids[c, t] for query t)
             ggml_tensor * kq_vis_cells = nullptr,  // I32 [n_kv, 4, n_stream]
             ggml_tensor * kq_vis_toks  = nullptr) const; // I32 [4, n_tokens/n_stream, n_stream]
 

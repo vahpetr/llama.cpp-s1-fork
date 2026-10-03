@@ -2333,6 +2333,9 @@ struct llama_model_qwen4exp : public llama_model_base {
             int64_t               width    = 0;
             bool                  blk_bias = false;
             int64_t               chunk    = 0;       // LLAMA_QSA_CHUNK
+            // [TAG_QSA_VIS] (A4) non-null: the ubatch reads the visibility metadata instead of kq_mask (qsa_use_vis)
+            ggml_tensor *         vis_cells = nullptr; // [n_kv, 4, n_stream] I32
+            ggml_tensor *         vis_toks  = nullptr; // [4, n_tps, n_stream] I32 (the whole ubatch's token records)
         };
 
         // dense self-attention restricted to the cells that top_k names; with prep (and no
@@ -2345,7 +2348,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * top_k,
                           float   kq_scale,
                             int   il,
-                 const qsa_prep * prep = nullptr);
+                 const qsa_prep * prep = nullptr,
+                           bool   vis  = false); // [TAG_QSA_VIS] unchunked: the indexed / gather attention reads the metadata
 
         // attention over the whole window, masked down to the selection. A query chunk passes
         // its own rows of the KQ mask and a view of its layer's zero source [TAG_QSA_CHUNK].
@@ -2372,7 +2376,18 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * q_cur,
                     ggml_tensor * top_k,
                           float   kq_scale,
-                            int   il);
+                            int   il,
+                           bool   vis = false); // [TAG_QSA_VIS] the window mask from ggml_kq_mask_ids, not the plane
+
+        // [TAG_QSA_INDEXED_FA] the scan branch's attention read through the selection's ids; the rule that picks it
+        // [TAG_QSA_VIS] vis_toks non-null: FA over the metadata (inp's cell planes + these token records of q_cur's rows)
+        ggml_tensor * build_qsa_indexed(llm_graph_input_attn_kv * inp, ggml_tensor * q_cur, ggml_tensor * top_k,
+                                        float kq_scale, int il, ggml_tensor * kq_mask_chunk = nullptr,
+                                        ggml_tensor * vis_toks = nullptr);
+        // knob && FA && n_tps > 8 && supported (vis: the indexed FA over the metadata)
+        bool qsa_use_indexed(llm_graph_input_attn_kv * inp, int64_t n_tps, int il, bool vis = false);
+        // [TAG_QSA_VIS] LLAMA_QSA_VIS && the KQ_VIS metadata class && fused select && indexed FA over the metadata supported
+        bool qsa_use_vis(llm_graph_input_attn_kv * inp, int64_t n_tps, int il);
 
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
@@ -2390,7 +2405,9 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il,
                            bool   cache_only,
-                       qsa_prep * prep = nullptr);
+                       qsa_prep * prep = nullptr,
+                    ggml_tensor * vis_cells = nullptr,  // [TAG_QSA_VIS] both non-null: select over the metadata
+                    ggml_tensor * vis_toks  = nullptr);
 
         // the block pooling chain over n_rows blocks per stream, shared by the recompute and the
         // [TAG_QSA_POOLED_CACHE] dirty-block write
@@ -2417,7 +2434,9 @@ struct llama_model_qwen4exp : public llama_model_base {
                            bool   blk_bias,
                             int   il,
                     ggml_tensor * pool_store = nullptr,
-                    ggml_tensor * pool_remap = nullptr);
+                    ggml_tensor * pool_remap = nullptr,
+                    ggml_tensor * vis_cells  = nullptr,  // [TAG_QSA_VIS] both non-null: ggml_qsa_top_k_vis over q's rows
+                    ggml_tensor * vis_toks   = nullptr); //   (vis_toks = their token records)
 
         // [TAG_QSA_COMPACT_BIAS] the qsa_blk/qsa_qry inputs of LLAMA_QSA_COMPACT_BIAS=1
         void build_qsa_compact_inputs(

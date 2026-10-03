@@ -300,6 +300,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-qsa-frozen.cpp) # [TAG_QSA_FROZEN] llama-qsa-frozen core (capture / replay) + the LLAMA_QSA_INDEXED_SORT chain, CPU
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

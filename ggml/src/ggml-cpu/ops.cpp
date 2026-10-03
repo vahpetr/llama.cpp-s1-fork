@@ -8948,157 +8948,8 @@ void ggml_compute_forward_top_k(
     }
 }
 
-// ggml_compute_forward_qsa_top_k
-//
-// [TAG_QSA_FUSED_SELECT] the reference for GGML_OP_QSA_TOP_K: the qwen4exp indexer selection as one
-// op. Row (t, s) of the scored surface is
-//     value(i) = score[cell_blk[i, s], t, s] + mask[i, t, s]
-// and the result is its top k. Deliberately identical, arithmetic and all, to the six-node chain it
-// replaces: the same f32 add in the same order (the f16->f32 mask widening is exact), the same
-// cmp_top_k total order, and the same trailing swap of the first two ids that
-// ggml_compute_forward_top_k_f32 does. That last one is only there so the two arms of
-// GGML_VK_QSA_FUSED_SELECT are byte-identical on the CPU backend, ids included - the order within
-// the selected set is not part of the contract (see ggml_top_k), only the set is.
-//
-// The scored row is never materialized for the whole graph: one row per thread at a time, in
-// wdata. That is the memory the op exists to save, so the reference must not re-introduce it.
-//
-// [TAG_QSA_WHOLE_BLOCKS] op_params[0] == 1 (ggml_qsa_top_k_blocks) is the reference's block-level form:
-// the n_sel best eligible blocks whole plus the boosted tail, ascending, padded with a repeat of the
-// last id (the contract is in ggml.h). Its order IS canonical, so no swap there.
-static void ggml_compute_forward_qsa_top_k_f32(
-    const ggml_compute_params * params,
-    ggml_tensor * dst) {
-
-    const ggml_tensor * score    = dst->src[0]; // [n_blocks, n_tps, n_stream] f32
-    const ggml_tensor * cell_blk = dst->src[1]; // [n_kv, n_stream]            i32
-    const ggml_tensor * mask     = dst->src[2]; // [n_kv, n_tps, 1, n_stream]  f16/f32
-
-    GGML_ASSERT(score->nb[0]    == sizeof(float));
-    GGML_ASSERT(cell_blk->nb[0] == sizeof(int32_t));
-    GGML_ASSERT(dst->nb[0]      == sizeof(int32_t));
-    GGML_ASSERT(ggml_is_contiguous(score));
-    GGML_ASSERT(ggml_is_contiguous(cell_blk));
-    GGML_ASSERT(ggml_is_contiguous(mask));
-    GGML_ASSERT(ggml_is_contiguous(dst));
-
-    const int64_t n_blocks = score->ne[0];
-    const int64_t n_tps    = score->ne[1];
-    const int64_t n_stream = score->ne[2];
-    const int64_t n_kv     = cell_blk->ne[0];
-    const int64_t k        = dst->ne[0];
-    const int64_t nrows    = n_tps*n_stream;
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    // per-thread scratch: the scored row, then its index permutation. Both 4-byte types, so one
-    // float-sized stride covers them; CACHE_LINE_SIZE_F32 keeps threads off each other's lines and
-    // is covered by the CACHE_LINE_SIZE*n_threads slack ggml_graph_plan adds (as top_k does).
-    const size_t stride = (size_t) 2*n_kv + CACHE_LINE_SIZE_F32;
-    float   * val = (float *) params->wdata + stride*ith;
-    int32_t * idx = (int32_t *) (val + n_kv);
-
-    const bool mask_f16 = mask->type == GGML_TYPE_F16;
-
-    // [TAG_QSA_WHOLE_BLOCKS] op_params[0] == 1: the block-level form (ggml_qsa_top_k_blocks)
-    const bool    whole = ggml_get_op_params_i32(dst, 0) == 1;
-    const int64_t n_sel = whole ? ggml_get_op_params_i32(dst, 1) : 0;
-
-    GGML_ASSERT(!whole || (n_sel > 0 && n_blocks <= n_kv));
-
-    for (int64_t row = ith; row < nrows; row += nth) {
-        const int64_t t = row % n_tps;
-        const int64_t s = row / n_tps;
-
-        const float   * sc = (const float *)   ((const char *) score->data    + s*score->nb[2] + t*score->nb[1]);
-        const int32_t * cb = (const int32_t *) ((const char *) cell_blk->data + s*cell_blk->nb[1]);
-        const char    * mk = (const char *)    mask->data + (size_t) row*n_kv*ggml_type_size(mask->type);
-
-        if (whole) {
-            // the eligible blocks (finite, below the tail boost), ranked by the same total order as the cell
-            // form - score descending, block index ascending - and the first n_sel of them flagged in val[]
-            // (n_blocks <= n_kv, so both scratch rows hold a block-long array)
-            int64_t n_el = 0;
-            for (int64_t b = 0; b < n_blocks; b++) {
-                const float v = sc[b];
-                val[b] = 0.0f;
-                if (std::isfinite(v) && v < GGML_QSA_TAIL_MIN) {
-                    idx[n_el++] = (int32_t) b;
-                }
-            }
-            const int64_t n_take = std::min(n_sel, n_el);
-            std::partial_sort(idx, idx + n_take, idx + n_el, cmp_top_k{sc});
-            for (int64_t j = 0; j < n_take; j++) {
-                val[idx[j]] = 1.0f;
-            }
-
-            // the cells: the tail (boosted, visible) and the visible cells of the selected blocks, ascending
-            int32_t * dst_data = (int32_t *) ((char *) dst->data + row*dst->nb[1]);
-            int64_t   c        = 0;
-            for (int64_t i = 0; i < n_kv && c < k; i++) {
-                const int32_t b = cb[i];
-                GGML_ASSERT(b >= 0 && b < n_blocks);
-                const float m = mask_f16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mk)[i])
-                                         : ((const float *) mk)[i];
-                const float v = sc[b] + m;
-                const bool tail = std::isfinite(v) && v >= GGML_QSA_TAIL_MIN;
-                if (tail || (val[b] != 0.0f && m > -INFINITY)) {
-                    dst_data[c++] = (int32_t) i;
-                }
-            }
-            // padding: a repeat of the last selected id, or 0..k-1 when nothing was selected
-            for (int64_t j = c; j < k; j++) {
-                dst_data[j] = c > 0 ? dst_data[c - 1] : (int32_t) j;
-            }
-            continue;
-        }
-
-        for (int64_t i = 0; i < n_kv; i++) {
-            const int32_t b = cb[i];
-            GGML_ASSERT(b >= 0 && b < n_blocks);
-            const float m = mask_f16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mk)[i])
-                                     : ((const float *) mk)[i];
-            val[i] = sc[b] + m;
-            idx[i] = (int32_t) i;
-        }
-
-        std::partial_sort(idx, idx + k, idx + n_kv, cmp_top_k{val});
-
-        int32_t * dst_data = (int32_t *) ((char *) dst->data + row*dst->nb[1]);
-        std::copy(idx, idx + k, dst_data);
-
-        // emphasize that the order is not important (ggml_compute_forward_top_k_f32 does the same)
-        if (k > 1) {
-            std::swap(dst_data[0], dst_data[1]);
-        }
-    }
-}
-
-void ggml_compute_forward_qsa_top_k(
-    const ggml_compute_params * params,
-    ggml_tensor * dst) {
-
-    const ggml_tensor * src0 = dst->src[0];
-
-    switch (src0->type) {
-        case GGML_TYPE_F32:
-            {
-                ggml_compute_forward_qsa_top_k_f32(params, dst);
-            } break;
-        default:
-            {
-                GGML_ABORT("fatal error");
-            }
-    }
-}
-
-// ggml_compute_forward_kq_mask
-//
-// [TAG_KQ_VIS] the reference for GGML_OP_KQ_MASK: per element the predicate of
-// set_input_kq_mask_impl (src/llama-kv-cache.cpp) evaluated on the cell and token records, with
-// the same values (+0 / -inf / -|p0 - p1| for ALiBi) converted with the same ggml_fp32_to_fp16.
-// The flash-attention "vis" branch below evaluates the same function per element.
+// [TAG_KQ_VIS] the visibility predicate on the cell / token records (GGML_OP_KQ_MASK below, the flash-attention
+// "vis" branch and [TAG_QSA_VIS] the QSA_TOP_K metadata form)
 
 struct kq_vis_params {
     bool    causal;
@@ -9166,6 +9017,171 @@ static inline float kq_vis_value_f16_as_f32(const int32_t * cs, int64_t n_kv, in
     return vp.alibi ? GGML_CPU_FP16_TO_FP32(ggml_fp32_to_fp16(v)) : 0.0f;
 }
 
+// ggml_compute_forward_qsa_top_k
+//
+// [TAG_QSA_FUSED_SELECT] the reference for GGML_OP_QSA_TOP_K: the qwen4exp indexer selection as one
+// op. Row (t, s) of the scored surface is
+//     value(i) = score[cell_blk[i, s], t, s] + mask[i, t, s]
+// and the result is its top k. Deliberately identical, arithmetic and all, to the six-node chain it
+// replaces: the same f32 add in the same order (the f16->f32 mask widening is exact), the same
+// cmp_top_k total order, and the same trailing swap of the first two ids that
+// ggml_compute_forward_top_k_f32 does. That last one is only there so the two arms of
+// GGML_VK_QSA_FUSED_SELECT are byte-identical on the CPU backend, ids included - the order within
+// the selected set is not part of the contract (see ggml_top_k), only the set is.
+//
+// The scored row is never materialized for the whole graph: one row per thread at a time, in
+// wdata. That is the memory the op exists to save, so the reference must not re-introduce it.
+//
+// [TAG_QSA_WHOLE_BLOCKS] op_params[0] == 1 (ggml_qsa_top_k_blocks) is the reference's block-level form:
+// the n_sel best eligible blocks whole plus the boosted tail, ascending, padded with a repeat of the
+// last id (the contract is in ggml.h). Its order IS canonical, so no swap there.
+static void ggml_compute_forward_qsa_top_k_f32(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * score    = dst->src[0]; // [n_blocks, n_tps, n_stream] f32
+    const ggml_tensor * cell_blk = dst->src[1]; // [n_kv, n_stream]            i32
+    const ggml_tensor * mask     = dst->src[2]; // [n_kv, n_tps, 1, n_stream]  f16/f32 - or [TAG_QSA_VIS] the cell planes
+    // [TAG_QSA_VIS] op_params[2] == 1 (ggml_qsa_top_k_vis): src[2] = cells [n_kv, 4, n_stream], src[3] = toks
+    // [4, n_tps, n_stream]; the mask element is the f16 plane's value computed from them (kq_vis_value_f16_as_f32)
+    const bool    vis   = ggml_get_op_params_i32(dst, 2) == 1;
+    kq_vis_params vp    = {};
+    vp.causal           = ggml_get_op_params_i32(dst, 3) != 0;
+    const int32_t * vtk = vis ? (const int32_t *) dst->src[3]->data : nullptr;
+
+    GGML_ASSERT(score->nb[0]    == sizeof(float));
+    GGML_ASSERT(cell_blk->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(dst->nb[0]      == sizeof(int32_t));
+    GGML_ASSERT(ggml_is_contiguous(score));
+    GGML_ASSERT(ggml_is_contiguous(cell_blk));
+    GGML_ASSERT(ggml_is_contiguous(mask));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n_blocks = score->ne[0];
+    const int64_t n_tps    = score->ne[1];
+    const int64_t n_stream = score->ne[2];
+    const int64_t n_kv     = cell_blk->ne[0];
+    const int64_t k        = dst->ne[0];
+    const int64_t nrows    = n_tps*n_stream;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // per-thread scratch: the scored row, then its index permutation. Both 4-byte types, so one
+    // float-sized stride covers them; CACHE_LINE_SIZE_F32 keeps threads off each other's lines and
+    // is covered by the CACHE_LINE_SIZE*n_threads slack ggml_graph_plan adds (as top_k does).
+    const size_t stride = (size_t) 2*n_kv + CACHE_LINE_SIZE_F32;
+    float   * val = (float *) params->wdata + stride*ith;
+    int32_t * idx = (int32_t *) (val + n_kv);
+
+    const bool mask_f16 = !vis && mask->type == GGML_TYPE_F16;
+
+    // [TAG_QSA_WHOLE_BLOCKS] op_params[0] == 1: the block-level form (ggml_qsa_top_k_blocks)
+    const bool    whole = ggml_get_op_params_i32(dst, 0) == 1;
+    const int64_t n_sel = whole ? ggml_get_op_params_i32(dst, 1) : 0;
+
+    GGML_ASSERT(!whole || (n_sel > 0 && n_blocks <= n_kv));
+
+    for (int64_t row = ith; row < nrows; row += nth) {
+        const int64_t t = row % n_tps;
+        const int64_t s = row / n_tps;
+
+        const float   * sc = (const float *)   ((const char *) score->data    + s*score->nb[2] + t*score->nb[1]);
+        const int32_t * cb = (const int32_t *) ((const char *) cell_blk->data + s*cell_blk->nb[1]);
+        const char    * mk = vis ? nullptr : (const char *) mask->data + (size_t) row*n_kv*ggml_type_size(mask->type);
+        // [TAG_QSA_VIS] the stream's cell planes and the row's token record
+        const int32_t * vcs = vis ? (const int32_t *) mask->data + 4*n_kv*s : nullptr;
+        const int32_t * vtr = vis ? vtk + 4*(s*n_tps + t) : nullptr;
+        auto mask_at = [&](int64_t i) -> float {
+            return vis      ? kq_vis_value_f16_as_f32(vcs, n_kv, i, vtr, vp) :
+                   mask_f16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mk)[i]) : ((const float *) mk)[i];
+        };
+
+        if (whole) {
+            // the eligible blocks (finite, below the tail boost), ranked by the same total order as the cell
+            // form - score descending, block index ascending - and the first n_sel of them flagged in val[]
+            // (n_blocks <= n_kv, so both scratch rows hold a block-long array)
+            int64_t n_el = 0;
+            for (int64_t b = 0; b < n_blocks; b++) {
+                const float v = sc[b];
+                val[b] = 0.0f;
+                if (std::isfinite(v) && v < GGML_QSA_TAIL_MIN) {
+                    idx[n_el++] = (int32_t) b;
+                }
+            }
+            const int64_t n_take = std::min(n_sel, n_el);
+            std::partial_sort(idx, idx + n_take, idx + n_el, cmp_top_k{sc});
+            for (int64_t j = 0; j < n_take; j++) {
+                val[idx[j]] = 1.0f;
+            }
+
+            // the cells: the tail (boosted, visible) and the visible cells of the selected blocks, ascending
+            int32_t * dst_data = (int32_t *) ((char *) dst->data + row*dst->nb[1]);
+            int64_t   c        = 0;
+            for (int64_t i = 0; i < n_kv && c < k; i++) {
+                const int32_t b = cb[i];
+                GGML_ASSERT(b >= 0 && b < n_blocks);
+                const float m = mask_at(i);
+                const float v = sc[b] + m;
+                const bool tail = std::isfinite(v) && v >= GGML_QSA_TAIL_MIN;
+                if (tail || (val[b] != 0.0f && m > -INFINITY)) {
+                    dst_data[c++] = (int32_t) i;
+                }
+            }
+            // padding: a repeat of the last selected id, or 0..k-1 when nothing was selected
+            for (int64_t j = c; j < k; j++) {
+                dst_data[j] = c > 0 ? dst_data[c - 1] : (int32_t) j;
+            }
+            continue;
+        }
+
+        for (int64_t i = 0; i < n_kv; i++) {
+            const int32_t b = cb[i];
+            GGML_ASSERT(b >= 0 && b < n_blocks);
+            const float m = mask_at(i);
+            val[i] = sc[b] + m;
+            idx[i] = (int32_t) i;
+        }
+
+        std::partial_sort(idx, idx + k, idx + n_kv, cmp_top_k{val});
+
+        int32_t * dst_data = (int32_t *) ((char *) dst->data + row*dst->nb[1]);
+        std::copy(idx, idx + k, dst_data);
+
+        // emphasize that the order is not important (ggml_compute_forward_top_k_f32 does the same)
+        if (k > 1) {
+            std::swap(dst_data[0], dst_data[1]);
+        }
+    }
+}
+
+void ggml_compute_forward_qsa_top_k(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_qsa_top_k_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_kq_mask
+//
+// [TAG_KQ_VIS] the reference for GGML_OP_KQ_MASK: per element the predicate of
+// set_input_kq_mask_impl (src/llama-kv-cache.cpp) evaluated on the cell and token records, with
+// the same values (+0 / -inf / -|p0 - p1| for ALiBi) converted with the same ggml_fp32_to_fp16.
+// The flash-attention "vis" branch below evaluates the same function per element.
+
+// (the kq_vis helpers are above, before ggml_compute_forward_qsa_top_k, which uses them too)
+
 template <typename T, T (*conv)(float)>
 static void ggml_compute_forward_kq_mask_impl(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src_cells = dst->src[0];
@@ -9177,14 +9193,46 @@ static void ggml_compute_forward_kq_mask_impl(const ggml_compute_params * params
     vp.swa_type = ggml_get_op_params_i32(dst, 2);
     vp.n_swa    = ggml_get_op_params_i32(dst, 3);
 
-    const int64_t n_kv     = dst->ne[0];
-    const int64_t n_tps    = dst->ne[1];
-    const int64_t n_stream = dst->ne[3];
-
     const int32_t * cells = (const int32_t *) src_cells->data;
     const int32_t * toks  = (const int32_t *) src_toks->data;
 
     const T v_drop = conv(-INFINITY);
+
+    // [TAG_QSA_VIS] ggml_kq_mask_ids: dst [W, 1, 1, n_tps*n_stream], element (c, q) = the plane's [ids[c, q], q]
+    if (dst->src[2] != nullptr) {
+        const ggml_tensor * src_ids = dst->src[2];
+        const int64_t W        = dst->ne[0];
+        const int64_t n_kv     = src_cells->ne[0];
+        const int64_t n_tps    = src_toks->ne[1];
+        const int64_t nq       = dst->ne[3];
+        const int32_t * ids    = (const int32_t *) src_ids->data;
+
+        const int64_t dq  = (nq + params->nth - 1)/params->nth;
+        const int64_t iq0 = dq*params->ith;
+        const int64_t iq1 = MIN(iq0 + dq, nq);
+
+        for (int64_t q = iq0; q < iq1; ++q) {
+            const int64_t s = q / n_tps;
+
+            const int32_t * tk = toks  + 4*q;
+            const int32_t * cs = cells + 4*n_kv*s;
+            const int32_t * ir = ids   + W*q;
+
+            T * row = (T *) ((char *) dst->data + q*dst->nb[3]);
+
+            for (int64_t c = 0; c < W; ++c) {
+                const int64_t j = ir[c];
+                float v;
+                // an id outside [0, n_kv) is not read and gives -inf (ggml.h), as the Vulkan IDS shader does
+                row[c] = j >= 0 && j < n_kv && kq_vis_keep(cs, n_kv, j, tk, vp, &v) ? conv(v) : v_drop;
+            }
+        }
+        return;
+    }
+
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_tps    = dst->ne[1];
+    const int64_t n_stream = dst->ne[3];
 
     const int64_t nr  = n_tps*n_stream;
     const int64_t dr  = (nr + params->nth - 1)/params->nth;
@@ -9353,6 +9401,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const fa_vis_src    vis   = fa_get_vis(dst); // [TAG_KQ_VIS]
+    // [TAG_QSA_INDEXED_FA] per-query KV cell list; the loop below walks it instead of [ic_start, ic_end)
+    const ggml_tensor * kv_ids = dst->src[5];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9466,7 +9516,15 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        const int32_t * ids_row = kv_ids ? (const int32_t *) ((const char *) kv_ids->data + iq1*kv_ids->nb[1] + iq3*kv_ids->nb[3]) : nullptr;
+        const int64_t   n_cols  = kv_ids ? kv_ids->ne[0] : ic_end - ic_start;
+
+        for (int64_t ci = 0; ci < n_cols; ++ci) {
+            const int64_t ic = ids_row ? (int64_t) ids_row[ci] : ic_start + ci;
+            if (ids_row && (ic < 0 || ic >= nek1)) {
+                continue; // [TAG_QSA_VIS] a dead column (ggml.h): never read, as the Vulkan shader's sentinel
+            }
+            // [TAG_KQ_VIS] + [TAG_QSA_INDEXED_FA]: with ids the metadata is read at the cell ic, like the plane
             const float mv = mp     ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) :
                              vis_cs ? slope*kq_vis_value_f16_as_f32(vis_cs, vis.n_kv, ic, vis_tk, vis.vp) : 0.0f;
             if (mv == -INFINITY) {
@@ -9992,9 +10050,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
+    const bool indexed = dst->src[5] != nullptr; // [TAG_QSA_INDEXED_FA] ids: the per-row reference loop, no KV split, no Q tiles
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool use_split_kv_path = !indexed && !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -10051,7 +10110,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !indexed && !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&

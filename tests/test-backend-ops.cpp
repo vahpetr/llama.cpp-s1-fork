@@ -8612,17 +8612,20 @@ struct test_flash_attn_ext : public test_case {
 // which would make the FA reference and the backend disagree on 0/0 - every token's own cell.
 // rope2d: tokens of one sequence share a position in runs of 4 (an image row) with distinct (x, y);
 // otherwise x = y = INT32_MAX (no 2-D positions).
-static void init_kq_vis(ggml_tensor * cells, ggml_tensor * toks, bool rope2d, uint32_t seed) {
-    const int64_t n_kv     = cells->ne[0];
-    const int64_t n_tps    = toks->ne[1];
-    const int64_t n_stream = toks->ne[2];
+// [TAG_QSA_VIS] the generator behind init_kq_vis (the same draws, so its cases are unchanged); own (if not NULL) receives
+// each token's own cell index, [s*n_tps + i]
+static void gen_kq_vis(int64_t n_kv, int64_t n_tps, int64_t n_stream, bool rope2d, uint32_t seed,
+                       std::vector<int32_t> & c, std::vector<int32_t> & t, std::vector<int64_t> * own) {
     GGML_ASSERT(n_kv >= n_tps);
 
     std::mt19937 rng(seed);
     auto rnd = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
 
-    std::vector<int32_t> c((size_t) (4*n_kv*n_stream));
-    std::vector<int32_t> t((size_t) (4*n_tps*n_stream));
+    c.assign((size_t) (4*n_kv*n_stream), 0);
+    t.assign((size_t) (4*n_tps*n_stream), 0);
+    if (own) {
+        own->assign((size_t) (n_tps*n_stream), 0);
+    }
 
     for (int64_t s = 0; s < n_stream; ++s) {
         int32_t * c_pos = c.data() + 4*n_kv*s;
@@ -8677,8 +8680,16 @@ static void init_kq_vis(ggml_tensor * cells, ggml_tensor * toks, bool rope2d, ui
             c_seq[j] = (int32_t) (1u << q);
             c_x[j]   = rope2d ? tk[2] : 0;
             c_y[j]   = rope2d ? tk[3] : 0;
+            if (own) {
+                (*own)[s*n_tps + i] = j;
+            }
         }
     }
+}
+
+static void init_kq_vis(ggml_tensor * cells, ggml_tensor * toks, bool rope2d, uint32_t seed) {
+    std::vector<int32_t> c, t;
+    gen_kq_vis(cells->ne[0], toks->ne[1], toks->ne[2], rope2d, seed, c, t, nullptr);
 
     ggml_backend_tensor_set(cells, c.data(), 0, c.size()*sizeof(int32_t));
     ggml_backend_tensor_set(toks,  t.data(), 0, t.size()*sizeof(int32_t));
@@ -8919,6 +8930,416 @@ struct test_mul_mat_reuse_across_scratch : public test_case {
         if (mode == 2) {
             init_kq_vis(ggml_get_tensor(ctx, "cells"), ggml_get_tensor(ctx, "toks"), false, 29591u);
         }
+    }
+};
+
+// [TAG_QSA_INDEXED_FA] mask [n_kv, n_tps, 1, n_stream] f16 + ids [W, n_tps, 1, n_stream] i32; each row W unique ids
+// (a shuffled prefix, ascending if sorted). dead: 0 = 0..30 % (floor) of the row's ids -inf; 1 = row 0 keeps one live id;
+// 2 = causal (query t sees cells < n_kv - n_tps + t + 1) and every list holds cell n_kv - 1; 3 = row 0 all dead.
+static void init_kv_ids_case(ggml_tensor * mask, ggml_tensor * ids, int dead, bool sorted) {
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ids->type == GGML_TYPE_I32);
+    const int64_t n_kv = mask->ne[0], n_tps = mask->ne[1], n_stream = mask->ne[3], W = ids->ne[0];
+    std::mt19937 gen(4242); std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+    std::vector<float> m(n_kv*n_tps*n_stream);
+    std::vector<int32_t> id(W*n_tps*n_stream), perm(n_kv);
+    for (int64_t row = 0; row < n_tps*n_stream; ++row) {
+        const int64_t n_vis = n_kv - n_tps + row % n_tps + 1;
+        float * mr = m.data() + row*n_kv; int32_t * ir = id.data() + row*W;
+        for (int64_t c = 0; c < n_kv; ++c) { mr[c] = (dead == 2 && c >= n_vis) ? -INFINITY : dis(gen); perm[c] = (int32_t) c; }
+        std::shuffle(perm.begin(), perm.end(), gen);
+        if (dead == 2) { std::iter_swap(perm.begin(), std::find(perm.begin(), perm.end(), (int32_t) (n_kv - 1))); }
+        std::copy(perm.begin(), perm.begin() + W, ir);
+        if (sorted) { std::sort(ir, ir + W); }
+        const int64_t n_dead = dead == 0 ? W*(1 + row % 30)/100 : row != 0 ? 0 : dead == 1 ? W - 1 : dead == 3 ? W : 0;
+        for (int64_t c = 0; c < n_dead; ++c) { mr[ir[W - 1 - c]] = -INFINITY; }
+    }
+    std::vector<ggml_fp16_t> m16(m.size()); ggml_fp32_to_fp16_row(m.data(), m16.data(), m.size());
+    ggml_backend_tensor_set(mask, m16.data(), 0, m16.size()*sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(ids, id.data(), 0, id.size()*sizeof(int32_t));
+}
+// the Flash-Next attention shape: head 256, 2 KV heads, GQA 12, K/V as cache views ([D, n_head_kv, n_kv] permuted)
+struct fa_indexed_io { ggml_tensor * q, * k, * v, * m, * ids; };
+static fa_indexed_io fa_indexed_new(ggml_context * ctx, ggml_type type_KV, int64_t n_tps, int64_t n_kv, int64_t W, int64_t n_stream) {
+    fa_indexed_io io;
+    io.q   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, n_tps, 24, n_stream);
+    io.k   = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type_KV, 256, 2, n_kv, n_stream), 0, 2, 1, 3);
+    io.v   = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type_KV, 256, 2, n_kv, n_stream), 0, 2, 1, 3);
+    io.m   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream); ggml_set_name(io.m, "m");
+    io.ids = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, W, n_tps, 1, n_stream);    ggml_set_name(io.ids, "ids");
+    return io;
+}
+static ggml_tensor * fa_indexed_op(ggml_context * ctx, const fa_indexed_io & io, ggml_tensor * mask, ggml_tensor * ids) {
+    ggml_tensor * out = ggml_flash_attn_ext(ctx, io.q, io.k, io.v, mask, 1.0f/16.0f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32); ggml_flash_attn_ext_set_kv_ids(out, ids);
+    return out;
+}
+static void fa_indexed_init(ggml_context * ctx, int dead, bool sorted) {
+    ggml_tensor * m = nullptr, * ids = nullptr;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->op == GGML_OP_NONE) { if (!strcmp(t->name, "m")) { m = t; } else if (!strcmp(t->name, "ids")) { ids = t; } else { init_tensor_uniform(t); } }
+    }
+    GGML_ASSERT(m && ids); // found by name: a rename must not fall through to the uniform fill
+    init_kv_ids_case(m, ids, dead, sorted);
+}
+struct test_flash_attn_ext_indexed : public test_case {
+    const ggml_type type_KV; const int64_t n_tps, n_kv, idx_W, n_stream; const int dead; const bool sorted;
+    std::string vars() override { return VARS_TO_STR7(type_KV, n_tps, n_kv, idx_W, n_stream, dead, sorted); }
+    double max_nmse_err() override { return 5e-4; }
+    test_flash_attn_ext_indexed(ggml_type type_KV, int64_t n_tps, int64_t n_kv, int64_t idx_W, int64_t n_stream = 1, int dead = 0, bool sorted = false)
+        : type_KV(type_KV), n_tps(n_tps), n_kv(n_kv), idx_W(idx_W), n_stream(n_stream), dead(dead), sorted(sorted) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const fa_indexed_io io = fa_indexed_new(ctx, type_KV, n_tps, n_kv, idx_W, n_stream);
+        ggml_tensor * out = fa_indexed_op(ctx, io, io.m, io.ids);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override { fa_indexed_init(ctx, dead, sorted); }
+};
+// spec §3.6: out = concat(indexed(sorted ids) - dense(scan mask), dense) along dim 3; the difference half must be
+// +0.0 on the CPU reference (b). The backend under test (a) is held to a relative bar on its own dense half,
+// sum(diff^2) / sum(dense^2) <= 5e-5, AND to a per-element cap max|diff| <= 5e-3 (the ratio alone would let one
+// element be off by ~0.06 at Q8_0 64/4096/2051). Estimate: uniform q/k/v in [-1, 1] at scale 1/16 give a near-uniform
+// softmax, so |dense| ~ 0.577/sqrt(W) ~ 0.013 RMS at W 2051 (the cap alone is ~1/3 of it); dropping 3 live columns
+// shifts the output by ~sqrt(3)*0.577/2051 ~ 4.9e-4 RMS, a ratio ~1.3e-3 (~25x over the bar), while the two paths
+// differ only in f16 P rounding / summation order (ratio ~1e-6). Tail-tile coverage comes from the UNSORTED indexed
+// cases (NMSE vs CPU), not from this selfcheck: its sorted ids + dead layout make the tail tile all -inf.
+// cases must be q8_0, or f16 with n_tps < GGML_FA_TILE_Q (64): the dense node must stay off the CPU tiled path to be bit-exact
+struct test_flash_attn_ext_indexed_selfcheck : public test_case {
+    const ggml_type type_KV; const int64_t n_tps, n_kv, idx_W; const int dead; const int64_t n_stream;
+    std::string vars() override { return VARS_TO_STR6(type_KV, n_tps, n_kv, idx_W, dead, n_stream) + ",selfcheck"; }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "FLASH_ATTN_EXT"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 0.0; }
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t nd = n/2; // [0, nd) = indexed - dense, [nd, n) = dense
+        double d2 = 0.0, s2 = 0.0, worst = 0.0;
+        for (size_t i = 0; i < nd; ++i) {
+            if (b[i] != 0.0f) { return 1.0; }
+            d2 += (double) a[i]*a[i]; worst = std::max(worst, (double) std::fabs(a[i]));
+        }
+        for (size_t i = nd; i < n; ++i) { s2 += (double) a[i]*a[i]; }
+        if (!(s2 > 0.0)) { return 1.0; }
+        if (worst > 5e-3) { return worst; }
+        return d2/s2 <= 5e-5 ? 0.0 : d2/s2;
+    }
+    test_flash_attn_ext_indexed_selfcheck(ggml_type type_KV, int64_t n_tps, int64_t n_kv, int64_t idx_W, int dead, int64_t n_stream = 1)
+        : type_KV(type_KV), n_tps(n_tps), n_kv(n_kv), idx_W(idx_W), dead(dead), n_stream(n_stream) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const fa_indexed_io io = fa_indexed_new(ctx, type_KV, n_tps, n_kv, idx_W, n_stream);
+        // the scan's mask, as build_qsa_scan builds it (src/models/qwen4exp.cpp:1737-1763)
+        ggml_tensor * all = ggml_fill(ctx, io.m, -INFINITY);
+        all = ggml_view_4d(ctx, all, 1, all->ne[0], all->ne[1], all->ne[3], all->nb[0], all->nb[1], all->nb[2], 0);
+        ggml_tensor * ids3 = ggml_view_4d(ctx, io.ids, io.ids->ne[0], io.ids->ne[1], io.ids->ne[3], 1,
+                                          io.ids->nb[1], io.ids->nb[2], io.ids->ne[3]*io.ids->nb[3], 0);
+        ggml_tensor * zeros = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, ids3->ne[0], ids3->ne[1], ids3->ne[2]), 0.0f);
+        ggml_tensor * sm = ggml_set_rows(ctx, all, zeros, ids3);
+        sm = ggml_view_4d(ctx, sm, sm->ne[1], sm->ne[2], 1, sm->ne[3], sm->nb[2], sm->nb[3], sm->nb[3], 0);
+        sm = ggml_add(ctx, sm, io.m);
+        ggml_tensor * dense = fa_indexed_op(ctx, io, sm, nullptr);
+        ggml_tensor * out = ggml_concat(ctx, ggml_sub(ctx, fa_indexed_op(ctx, io, io.m, io.ids), dense), dense, 3);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override { fa_indexed_init(ctx, dead, true); }
+};
+
+// [TAG_QSA_VIS] (A4 T3/T4) the metadata forms against their plane forms ON THE SAME BACKEND, bit for bit. Each graph
+// computes both and `out` concatenates them (as f32: ids < 2^24 and f16 mask values convert exactly), so err() sees the
+// (plane, vis) pair of the backend under test AND of the CPU reference and requires plane == vis in both (EXACT), then the
+// backend against the CPU. Metadata: gen_kq_vis (holes, seqless used cells, 1-5 sequences with shared-prefix cells, rope2d
+// position ties) + optional extra holes (never a token's own cell). mutate = the negative control: the PLANE side reads cells
+// with one sequence bit of row 0's own cell flipped (and that cell made the row's best), so the halves MUST differ - those
+// cases are registered only with GGML_TEST_A4_NEGATIVE=1, where every case must FAIL.
+struct qsa_vis_meta {
+    std::vector<int32_t> c, cp, t; // cells, the plane side's cells, toks
+    std::vector<int64_t> own;      // each token's own cell
+};
+
+// mutate_tok >= 0: the plane side loses that token's (stream 0) own cell
+static qsa_vis_meta qsa_vis_meta_gen(int64_t n_kv, int64_t n_tps, int64_t n_stream, bool rope2d, uint32_t seed, int holes_pct,
+                                     int64_t mutate_tok) {
+    qsa_vis_meta m;
+    gen_kq_vis(n_kv, n_tps, n_stream, rope2d, seed, m.c, m.t, &m.own);
+    if (holes_pct > 0) {
+        std::mt19937 rng(seed ^ 0x5eedu);
+        std::vector<char> is_own((size_t) (n_kv*n_stream), 0);
+        for (int64_t q = 0; q < n_tps*n_stream; ++q) {
+            is_own[(size_t) ((q / n_tps)*n_kv + m.own[q])] = 1;
+        }
+        for (int64_t s = 0; s < n_stream; ++s) {
+            int32_t * c = m.c.data() + 4*n_kv*s;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (!is_own[(size_t) (s*n_kv + j)] && (int) (rng() % 100) < holes_pct) {
+                    c[j] = -1; c[n_kv + j] = 0; c[2*n_kv + j] = 0; c[3*n_kv + j] = 0;
+                }
+            }
+        }
+    }
+    m.cp = m.c;
+    if (mutate_tok >= 0) {
+        // the token loses its own cell's sequence bit on the plane side only
+        m.cp[(size_t) (n_kv + m.own[mutate_tok])] ^= m.t[4*mutate_tok + 1];
+    }
+    return m;
+}
+
+// two halves of `n` floats (a = plane form, b = metadata form) bitwise equal
+static double qsa_vis_halves_differ(const float * x, size_t n, size_t half_stride, size_t half_len, size_t n_blocks) {
+    double d = 0.0;
+    for (size_t blk = 0; blk < n_blocks; ++blk) {
+        const float * a = x + blk*half_stride;
+        const float * b = a + half_len;
+        for (size_t i = 0; i < half_len; ++i) {
+            d += memcmp(&a[i], &b[i], sizeof(float)) != 0 ? 1.0 : 0.0;
+        }
+    }
+    GGML_UNUSED(n);
+    return d;
+}
+
+struct test_qsa_top_k_vis : public test_case {
+    const int64_t n_kv, n_tps, n_stream;
+    const int     width, n_sel, mode, holes;
+    const bool    rope2d, pad, mutate;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QSA_TOP_K_VIS"; }
+    std::string vars() override {
+        return VARS_TO_STR11(n_kv, n_tps, n_stream, width, n_sel, mode, holes, rope2d, pad, mutate, n_full());
+    }
+    test_qsa_top_k_vis(int64_t n_kv, int64_t n_tps, int64_t n_stream, int width, int n_sel, int mode, int holes = 0,
+                       bool rope2d = false, bool pad = false, bool mutate = false)
+        : n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), n_sel(n_sel), mode(mode), holes(holes),
+          rope2d(rope2d), pad(pad), mutate(mutate) {}
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    int64_t n_blocks() const { return (n_kv + 3)/4; }
+    // pad: the chunk is the ubatch's last np = n_tps rows from t0 = n_full - n_tps + 3, its last 3 rows padding (clamped
+    // to the last query), as build_qsa_chunked builds a [TAG_QSA_CHUNK_PAD] tail chunk
+    int64_t n_full() const { return pad ? n_tps + 8 : n_tps; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * score    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks(), n_tps, n_stream); ggml_set_name(score, "score");
+        ggml_tensor * cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);              ggml_set_name(cell_blk, "cell_blk");
+        ggml_tensor * cells    = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_kv, 4, n_stream);           ggml_set_name(cells, "cells");
+        ggml_tensor * cells_p  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_kv, 4, n_stream);           ggml_set_name(cells_p, "cells_p");
+        ggml_tensor * toks     = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, n_full(), n_stream);       ggml_set_name(toks, "toks");
+        ggml_tensor * plane    = ggml_kq_mask(ctx, cells_p, toks, GGML_TYPE_F16, true, false, 0, 0);
+        ggml_tensor * toks_c   = toks;
+        if (pad) {
+            ggml_tensor * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tps, n_stream); ggml_set_name(rows, "rows");
+            toks_c = ggml_get_rows(ctx, toks, rows);
+            plane  = ggml_get_rows_type(ctx, plane, ggml_reshape_3d(ctx, rows, n_tps, 1, n_stream), GGML_TYPE_F16);
+        }
+        ggml_tensor * a = n_sel > 0 ? ggml_qsa_top_k_blocks(ctx, score, cell_blk, plane, width, n_sel)
+                                    : ggml_qsa_top_k(ctx, score, cell_blk, plane, width);
+        ggml_tensor * b = ggml_qsa_top_k_vis(ctx, score, cell_blk, cells, toks_c, width, n_sel, true);
+        ggml_tensor * out = ggml_concat(ctx, ggml_cast(ctx, a, GGML_TYPE_F32), ggml_cast(ctx, b, GGML_TYPE_F32), 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t t0 = n_full() - n_tps + 3;
+        // the negative control hides row 0's own cell (row 0 = token t0 of a pad chunk) on the plane side
+        const qsa_vis_meta m = qsa_vis_meta_gen(n_kv, n_full(), n_stream, rope2d, 4242u + (uint32_t) (n_kv + n_tps + mode), holes,
+                                                mutate ? (pad ? t0 : 0) : -1);
+        std::mt19937 rng(77u + (uint32_t) mode);
+        std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+        const int64_t nb = n_blocks();
+        std::vector<int32_t> rows((size_t) (n_tps*n_stream));
+        for (int64_t s = 0; s < n_stream; ++s) {
+            for (int64_t i = 0; i < n_tps; ++i) {
+                rows[s*n_tps + i] = (int32_t) (pad ? std::min<int64_t>(t0 + i, n_full() - 1) : i);
+            }
+        }
+        std::vector<float> sc((size_t) (nb*n_tps*n_stream));
+        for (int64_t s = 0; s < n_stream; ++s) {
+            for (int64_t i = 0; i < n_tps; ++i) {
+                float * r = sc.data() + (s*n_tps + i)*nb;
+                for (int64_t b = 0; b < nb; ++b) {
+                    const float x = u01(rng);
+                    r[b] = mode == 0 ? 8.0f*x                                                   // (almost) distinct
+                         : (x < 0.6f ? 0.0f : std::floor(16.0f*u01(rng))/4.0f);                  // ReLU-tied, quantized
+                    if (mode == 2 && u01(rng) < 0.05f) { r[b] = -INFINITY; }                    // dead blocks
+                }
+                if (mode == 2) {
+                    // the census's +1e9 boost on the block of the row's own cell (the tail)
+                    r[m.own[s*n_full() + rows[s*n_tps + i]] / 4] = 1e9f;
+                }
+            }
+        }
+        if (mutate) {
+            // row 0's own cell is its best finite block: selected by the metadata form, hidden on the plane side
+            sc[(size_t) (m.own[rows[0]] / 4)] = 1e6f;
+        }
+        std::vector<int32_t> cb((size_t) (n_kv*n_stream));
+        for (int64_t s = 0; s < n_stream; ++s) {
+            for (int64_t j = 0; j < n_kv; ++j) {
+                cb[s*n_kv + j] = (int32_t) (j / 4);
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) { continue; }
+            if      (!strcmp(t->name, "score"))    { ggml_backend_tensor_set(t, sc.data(),   0, ggml_nbytes(t)); }
+            else if (!strcmp(t->name, "cell_blk")) { ggml_backend_tensor_set(t, cb.data(),   0, ggml_nbytes(t)); }
+            else if (!strcmp(t->name, "cells"))    { ggml_backend_tensor_set(t, m.c.data(),  0, ggml_nbytes(t)); }
+            else if (!strcmp(t->name, "cells_p"))  { ggml_backend_tensor_set(t, m.cp.data(), 0, ggml_nbytes(t)); }
+            else if (!strcmp(t->name, "toks"))     { ggml_backend_tensor_set(t, m.t.data(),  0, ggml_nbytes(t)); }
+            else if (!strcmp(t->name, "rows"))     { ggml_backend_tensor_set(t, rows.data(), 0, ggml_nbytes(t)); }
+        }
+    }
+
+    // out: [width, 2*n_tps, 1, n_stream] - per stream n_tps plane rows, then n_tps metadata rows
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t half = (size_t) (width*n_tps), stride = 2*half;
+        double d = qsa_vis_halves_differ(a, n, stride, half, (size_t) n_stream)  // backend: plane == vis
+                 + qsa_vis_halves_differ(b, n, stride, half, (size_t) n_stream); // CPU:     plane == vis
+        for (int64_t s = 0; s < n_stream; ++s) {                                 // backend vs CPU (the vis half)
+            const float * av = a + s*stride + half;
+            const float * bv = b + s*stride + half;
+            if (n_sel > 0) {
+                for (size_t i = 0; i < half; ++i) { d += av[i] != bv[i] ? 1.0 : 0.0; }
+            } else {
+                d += cmp_ids_per_row(av, bv, half, width, n_kv);
+            }
+        }
+        return d;
+    }
+};
+
+struct test_kq_mask_ids : public test_case {
+    const int64_t n_kv, n_tps, n_stream, W;
+    const bool    rope2d, mutate;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "KQ_MASK_IDS"; }
+    std::string vars() override { return VARS_TO_STR6(n_kv, n_tps, n_stream, W, rope2d, mutate); }
+    test_kq_mask_ids(int64_t n_kv, int64_t n_tps, int64_t n_stream, int64_t W, bool rope2d = false, bool mutate = false)
+        : n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), W(W), rope2d(rope2d), mutate(mutate) {}
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_q = n_tps*n_stream;
+        ggml_tensor * cells   = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_kv, 4, n_stream);     ggml_set_name(cells, "cells");
+        ggml_tensor * cells_p = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_kv, 4, n_stream);     ggml_set_name(cells_p, "cells_p");
+        ggml_tensor * toks    = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, n_tps, n_stream);    ggml_set_name(toks, "toks");
+        ggml_tensor * ids     = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, W, n_tps, 1, n_stream); ggml_set_name(ids, "ids");
+        // the gather's plane form (build_qsa_gather): the f16 plane's rows flattened over (t, s), its cells at the ids
+        ggml_tensor * plane = ggml_kq_mask(ctx, cells_p, toks, GGML_TYPE_F16, true, false, 0, 0);
+        ggml_tensor * cellv = ggml_view_3d(ctx, plane, 1, n_kv, n_q, plane->nb[0], plane->nb[1], 0);
+        ggml_tensor * a = ggml_reshape_4d(ctx, ggml_get_rows_type(ctx, cellv, ggml_reshape_3d(ctx, ids, W, n_q, 1), GGML_TYPE_F16),
+                                          W, 1, 1, n_q);
+        ggml_tensor * b = ggml_kq_mask_ids(ctx, cells, toks, ids, GGML_TYPE_F16, true, false, 0, 0);
+        ggml_tensor * out = ggml_concat(ctx, ggml_cast(ctx, a, GGML_TYPE_F32), ggml_cast(ctx, b, GGML_TYPE_F32), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const qsa_vis_meta m = qsa_vis_meta_gen(n_kv, n_tps, n_stream, rope2d, 99u + (uint32_t) (n_kv + n_tps), 0, mutate ? 0 : -1);
+        std::mt19937 rng(1234u);
+        std::vector<int32_t> id((size_t) (W*n_tps*n_stream)), perm((size_t) n_kv);
+        for (int64_t q = 0; q < n_tps*n_stream; ++q) {
+            for (int64_t j = 0; j < n_kv; ++j) { perm[j] = (int32_t) j; }
+            std::shuffle(perm.begin(), perm.end(), rng);
+            // the row's own cell first (row 0's is the one the negative control flips)
+            std::iter_swap(perm.begin(), std::find(perm.begin(), perm.end(), (int32_t) m.own[q]));
+            std::copy(perm.begin(), perm.begin() + W, id.begin() + q*W);
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) { continue; }
+            if      (!strcmp(t->name, "cells"))   { ggml_backend_tensor_set(t, m.c.data(),  0, ggml_nbytes(t)); }
+            else if (!strcmp(t->name, "cells_p")) { ggml_backend_tensor_set(t, m.cp.data(), 0, ggml_nbytes(t)); }
+            else if (!strcmp(t->name, "toks"))    { ggml_backend_tensor_set(t, m.t.data(),  0, ggml_nbytes(t)); }
+            else if (!strcmp(t->name, "ids"))     { ggml_backend_tensor_set(t, id.data(),   0, ggml_nbytes(t)); }
+        }
+    }
+
+    // out: [2W, 1, 1, n_q] - per row W plane values, then W metadata values; everything bitwise
+    double err(const float * a, const float * b, size_t n) override {
+        double d = qsa_vis_halves_differ(a, n, 2*W, W, (size_t) (n_tps*n_stream))
+                 + qsa_vis_halves_differ(b, n, 2*W, W, (size_t) (n_tps*n_stream));
+        for (size_t i = 0; i < n; ++i) { d += memcmp(&a[i], &b[i], sizeof(float)) != 0 ? 1.0 : 0.0; }
+        return d;
+    }
+};
+
+// indexed flash attention over the metadata vs over the device plane, the Flash-Next shape (head 256, 2 KV heads, GQA 12);
+// dead_tail: the last 3 ids of every row are -1 (dead columns, ggml.h - the [TAG_QSA_WHOLE_BLOCKS] padding guard)
+struct test_flash_attn_ext_indexed_vis : public test_case {
+    const ggml_type type_KV;
+    const int64_t   n_tps, n_kv, W, n_stream;
+    const bool      rope2d, dead_tail, mutate;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "FLASH_ATTN_EXT_INDEXED_VIS"; }
+    std::string vars() override { return VARS_TO_STR8(type_KV, n_tps, n_kv, W, n_stream, rope2d, dead_tail, mutate); }
+    test_flash_attn_ext_indexed_vis(ggml_type type_KV, int64_t n_tps, int64_t n_kv, int64_t W, int64_t n_stream = 1,
+                                    bool rope2d = false, bool dead_tail = false, bool mutate = false)
+        : type_KV(type_KV), n_tps(n_tps), n_kv(n_kv), W(W), n_stream(n_stream), rope2d(rope2d), dead_tail(dead_tail),
+          mutate(mutate) {}
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q       = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, n_tps, 24, n_stream);   ggml_set_name(q, "q");
+        ggml_tensor * k       = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type_KV, 256, 2, n_kv, n_stream), 0, 2, 1, 3);
+        ggml_tensor * v       = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type_KV, 256, 2, n_kv, n_stream), 0, 2, 1, 3);
+        ggml_tensor * cells   = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_kv, 4, n_stream);          ggml_set_name(cells, "cells");
+        ggml_tensor * cells_p = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_kv, 4, n_stream);          ggml_set_name(cells_p, "cells_p");
+        ggml_tensor * toks    = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, n_tps, n_stream);         ggml_set_name(toks, "toks");
+        ggml_tensor * ids     = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, W, n_tps, 1, n_stream);      ggml_set_name(ids, "ids");
+        ggml_tensor * plane   = ggml_kq_mask(ctx, cells_p, toks, GGML_TYPE_F16, true, false, 0, 0);
+        ggml_tensor * a = ggml_flash_attn_ext(ctx, q, k, v, plane, 1.0f/16.0f, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(a, GGML_PREC_F32); ggml_flash_attn_ext_set_kv_ids(a, ids);
+        ggml_tensor * b = ggml_flash_attn_ext_vis(ctx, q, k, v, cells, toks, 1.0f/16.0f, 0.0f, 0.0f, true, false, 0, 0);
+        ggml_flash_attn_ext_set_prec(b, GGML_PREC_F32); ggml_flash_attn_ext_set_kv_ids(b, ids);
+        ggml_tensor * out = ggml_concat(ctx, a, b, 3);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const qsa_vis_meta m = qsa_vis_meta_gen(n_kv, n_tps, n_stream, rope2d, 7u + (uint32_t) (n_kv + n_tps), 0, mutate ? 0 : -1);
+        std::mt19937 rng(4243u);
+        std::vector<int32_t> id((size_t) (W*n_tps*n_stream)), perm((size_t) n_kv);
+        for (int64_t q = 0; q < n_tps*n_stream; ++q) {
+            for (int64_t j = 0; j < n_kv; ++j) { perm[j] = (int32_t) j; }
+            std::shuffle(perm.begin(), perm.end(), rng);
+            // every row attends its own cell (no all-dead row: 0/0 is unspecified), at a random slot
+            std::iter_swap(perm.begin(), std::find(perm.begin(), perm.end(), (int32_t) m.own[q]));
+            std::iter_swap(perm.begin(), perm.begin() + (int64_t) (rng() % (uint32_t) std::max<int64_t>(1, W - (dead_tail ? 3 : 0))));
+            std::copy(perm.begin(), perm.begin() + W, id.begin() + q*W);
+            if (dead_tail && W > 4) {
+                for (int64_t c = W - 3; c < W; ++c) { id[q*W + c] = -1; }
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) { continue; }
+            if      (!strcmp(t->name, "cells"))   { ggml_backend_tensor_set(t, m.c.data(),  0, ggml_nbytes(t)); }
+            else if (!strcmp(t->name, "cells_p")) { ggml_backend_tensor_set(t, m.cp.data(), 0, ggml_nbytes(t)); }
+            else if (!strcmp(t->name, "toks"))    { ggml_backend_tensor_set(t, m.t.data(),  0, ggml_nbytes(t)); }
+            else if (!strcmp(t->name, "ids"))     { ggml_backend_tensor_set(t, id.data(),   0, ggml_nbytes(t)); }
+            else { init_tensor_uniform(t); }
+        }
+    }
+
+    // out: [256, 24, n_tps, 2*n_stream] - streams 0..n_stream-1 the plane form, then the metadata form. Each backend: the
+    // halves bitwise equal (one kernel, the same mask values). Backend vs CPU: the indexed tests' NMSE bar on the vis half.
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t half = n/2;
+        double d = qsa_vis_halves_differ(a, n, n, half, 1) + qsa_vis_halves_differ(b, n, n, half, 1);
+        if (d != 0.0) { return 1.0 + d; }
+        double e2 = 0.0, r2 = 0.0;
+        for (size_t i = half; i < n; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) { return 1e9; }
+            e2 += (double) (a[i] - b[i])*(a[i] - b[i]); r2 += (double) b[i]*b[i];
+        }
+        const double nmse = r2 > 0.0 ? e2/r2 : e2;
+        return nmse <= 5e-4 ? 0.0 : nmse;
     }
 };
 
@@ -12093,6 +12514,68 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 2},  1025,   1, true, true,  8, 30, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    // [TAG_QSA_INDEXED_FA] indexed flash attention (docs/superpowers/specs/2026-09-24-indexed-fa-prefill-design.md §5)
+    for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        for (int64_t n_tps : { 9, 64, 228, 256 }) {                                                        // (a)
+            const int64_t kv_w[4][2] = { { 4096, 64 }, { 4096, 2051 }, { 20000, 64 }, { 20000, 2051 } };   // (n_kv, W)
+            for (const auto & p : kv_w) { test_cases.emplace_back(new test_flash_attn_ext_indexed(type_KV, n_tps, p[0], p[1])); }
+        }
+    }
+    for (int dead : { 1, 2, 3 }) { test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0, 64, 4096, 2051, 1, dead)); } // (b)(c)
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0,  64, 4096, 2051, 1, 0, true));   // (d) sorted
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0,  64, 4096, 2051, 2));            // (e)
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_F16,    9, 4096,   77, 2, 2));         // (e)(f)(c)
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0, 228, 4096,   77));               // (f)
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0,   9, 4096,    1));               // (f) one id
+    for (int64_t n_tps : { 1, 2 }) {  // n_tps <= 8 with ids: the forced plain fold, GQA_TOKENS off
+        test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_Q8_0, n_tps, 4096, 2051));
+    }
+    for (int dead : { 0, 2 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_indexed_selfcheck(GGML_TYPE_Q8_0, 64, 4096, 2051, dead));
+    }
+    for (int dead : { 0, 1, 2, 3 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_indexed_selfcheck(GGML_TYPE_F16,   9, 4096,   77, dead));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_selfcheck(GGML_TYPE_F16, 9, 4096, 77, 2, /*n_stream*/ 2));
+
+    // [TAG_QSA_VIS] (A4 T3/T4) metadata vs plane, bitwise on the backend; GGML_TEST_A4_NEGATIVE=1 registers ONLY the negative
+    // controls instead (one seq bit flipped on the plane side: every one of them must FAIL)
+    {
+        const bool neg = getenv("GGML_TEST_A4_NEGATIVE") != nullptr;
+        auto qv = [&](int64_t n_kv, int64_t n_tps, int64_t ns, int w, int n_sel, int mode, int holes, bool rope2d, bool pad) {
+            test_cases.emplace_back(new test_qsa_top_k_vis(n_kv, n_tps, ns, w, n_sel, mode, holes, rope2d, pad, neg));
+        };
+        for (int n_sel : { 0, 512 }) {
+            for (int mode : { 0, 1, 2 }) {
+                qv(4096,  6,   1, 2051, n_sel, mode, 0,  false, false);  // decode / verify rows
+                qv(4096,  228, 1, 2051, n_sel, mode, 50, false, false);  // a balanced prefill chunk, 50 % extra holes
+                qv(16384, 64,  2, 2051, n_sel, mode, 5,  false, false);  // two streams
+                qv(16384, 256, 1, 2051, n_sel, mode, 0,  false, true);   // a CHUNK_PAD tail chunk (3 padding rows)
+            }
+            qv(4096,   9, 1, 2051, n_sel, 1, 0, true,  false);           // M-RoPE ties at p0 == p1
+            qv(65536,  6, 1, 2051, n_sel, 2, 0, false, false);
+            qv(65536, 64, 1, 2051, n_sel, 1, 0, false, true);
+            qv(262144, 1, 1, 2051, n_sel, 2, 5, false, false);
+        }
+        qv(256, 8, 1, 200, 0, 1, 0, false, false);                       // n_kv < k + visible: -inf fills, T = -inf
+        auto mi = [&](int64_t n_kv, int64_t n_tps, int64_t ns, int64_t w, bool rope2d) {
+            test_cases.emplace_back(new test_kq_mask_ids(n_kv, n_tps, ns, w, rope2d, neg));
+        };
+        mi(4096, 1, 1, 77, false); mi(4096, 6, 1, 2051, false); mi(65536, 64, 1, 2051, false);
+        mi(8192, 6, 2, 2051, false); mi(4096, 8, 1, 77, true); mi(262144, 6, 1, 2051, false);
+        for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+            auto fv = [&](int64_t n_tps, int64_t n_kv, int64_t w, int64_t ns, bool rope2d, bool dead_tail) {
+                test_cases.emplace_back(new test_flash_attn_ext_indexed_vis(type_KV, n_tps, n_kv, w, ns, rope2d, dead_tail, neg));
+            };
+            fv(9,   4096, 77,   1, false, false);
+            fv(228, 4096, 2051, 1, false, false);
+            fv(256, 8192, 2051, 1, false, false);
+            fv(64,  4096, 2051, 2, false, false);   // two streams
+            fv(64,  4096, 2051, 1, true,  false);   // M-RoPE ties
+            fv(64,  4096, 2051, 1, false, true);    // dead (-1) ids
+            fv(9,   4096, 1,    1, false, false);   // one id: the row's own cell
+        }
+    }
 
     // Speculative-decode verify rounds at the Flash-Next attention shape (2 KV heads, GQA 12,
     // HSK = HSV = 256, q8_0 or f16 KV, long KV).  The upstream matrix only ever runs the GQA

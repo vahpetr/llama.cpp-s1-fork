@@ -28,7 +28,17 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 layout (binding = 0) readonly buffer A  {float     data_a[];};   // input values, or QSA block scores (strides in sb_blk/sb_tps)
 layout (binding = 1) writeonly buffer D {int       data_d[];};   // [k, ...]
 layout (binding = 2) readonly buffer CB {int       cell_blk[];}; // QSA: cell->block map [n_kv, n_stream]
+#ifdef QSA_VIS
+// [TAG_QSA_VIS] (A4 T3, ggml_qsa_top_k_vis) the mask computed from the visibility metadata instead of read from a plane:
+// binding 3 holds the cell planes [n_kv, 4, n_stream] (I32), binding 5 the token records [4, n_tps, n_stream] of the
+// rows; qsa_vis_mask() is the f16 plane's element as a float (+0 or -inf, see kq_vis.glsl), so every `a + m` below
+// is the plane form's add on the same value
+layout(constant_id = 2) const uint VIS_CAUSAL = 1;
+layout (binding = 3) readonly buffer VC {int   data_vc[];};
+layout (binding = 5) readonly buffer VT {ivec4 data_vt[];};
+#else
 layout (binding = 3) readonly buffer M  {float16_t mask[];};     // QSA: raw f16 kq_mask [n_kv, n_tps, n_stream]
+#endif
 // workgroupcoherent: written by one invocation, read by others of the same workgroup (see
 // [TAG_QSA_SCRATCH_COHERENT]). Never shared between workgroups - one workgroup owns a row.
 layout (binding = 4) workgroupcoherent buffer S {float scratch[];};  // QSA: [nrows, n_kv] gathered inputs
@@ -49,6 +59,20 @@ layout (push_constant) uniform parameter {
     uint sb_tps;   // QSA only
     uint n_sel;    // QSA == 2 only: the number of whole blocks to select
 } p;
+
+#ifdef QSA_VIS
+int kqv_cell_load(uint idx) {
+    return data_vc[idx];
+}
+
+#include "kq_vis.glsl"
+
+// the mask element of cell i for row t of stream s (the plane's mask[(s * p.n_tps + t) * p.ncols + i])
+float qsa_vis_mask(uint s, uint t, uint i) {
+    return kqv_value(s * 4u * p.ncols, p.ncols, i, data_vt[s * p.n_tps + t],
+                     (VIS_CAUSAL != 0u ? KQV_FLAG_CAUSAL : 0u) | KQV_FLAG_F16, 0);
+}
+#endif
 
 // [TAG_QSA_WHOLE_BLOCKS] GGML_QSA_TAIL_MIN (ggml.h): 5e8 = 15625000 * 2^5, exact in f32
 const float QSA_TAIL_MIN = 5.0e8;
@@ -88,7 +112,11 @@ float gather(uint row, uint i) {
     const uint s = row / p.n_tps;
     const uint block = uint(cell_blk[s * p.ncols + i]);
     const float a = data_a[s * p.n_blocks * p.n_tps + block * p.sb_blk + t * p.sb_tps];
+#ifdef QSA_VIS
+    const float m = qsa_vis_mask(s, t, i);
+#else
     const float m = float(mask[(s * p.n_tps + t) * p.ncols + i]);
+#endif
     return a + m;
 }
 
@@ -259,7 +287,11 @@ bool cell_sel(uint row, uint i) {
     const uint  s = row / p.n_tps;
     const uint  b = uint(cell_blk[s * p.ncols + i]);
     const float a = data_a[s * p.n_blocks * p.n_tps + b * p.sb_blk + t * p.sb_tps];
+#ifdef QSA_VIS
+    const float m = qsa_vis_mask(s, t, i);
+#else
     const float m = float(mask[(s * p.n_tps + t) * p.ncols + i]);
+#endif
     const float v = a + m;
     if (!isinf(v) && !isnan(v) && v >= QSA_TAIL_MIN) {
         return true;

@@ -69,7 +69,18 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout (binding = 0) readonly  buffer A  {float     data_a[];};   // QSA block scores (strides in sb_blk/sb_tps)
 layout (binding = 1) writeonly buffer D  {int       data_d[];};   // [k, nrows] selected cell ids
 layout (binding = 2) readonly  buffer CB {int       cell_blk[];}; // cell->block map [n_kv, n_stream]
+#ifdef QSA_VIS
+// [TAG_QSA_VIS] (A4 T3, ggml_qsa_top_k_vis) the mask computed from the visibility metadata instead of read from a plane:
+// binding 3 holds the cell planes [n_kv, 4, n_stream] (I32), binding 5 the token records [4, n_tps, n_stream] of the
+// rows; qsa_vis_mask() is the f16 plane's element as a float (+0 or -inf, see kq_vis.glsl), so every `a + m` below
+// is the plane form's add on the same value. Read only where the plane form reads the mask (gather in pass 0,
+// cell_sel in the block form's passes 6 and 7).
+layout(constant_id = 4) const uint VIS_CAUSAL = 1;
+layout (binding = 3) readonly  buffer VC {int   data_vc[];};
+layout (binding = 5) readonly  buffer VT {ivec4 data_vt[];};
+#else
 layout (binding = 3) readonly  buffer M  {float16_t mask[];};     // raw f16 kq_mask [n_kv, n_tps, n_stream]
+#endif
 // keys [nrows, ncols] at 0 (FORM 1: the n_blocks block keys) | global histograms [nrows, 4, 256] at hist_off |
 // tile records [nrows, n_tiles, 2] at rec_off | FORM 1: cell-tile records [nrows, n_tiles_c, 2] at rec2_off and
 // the block bitmaps [nrows, 2, nw] (sel, big) at bits_off (uint offsets). Only ever read across a dispatch boundary.
@@ -93,6 +104,20 @@ layout (push_constant) uniform parameter {
     uint bits_off;  // FORM 1: block bitmaps
     uint nw;        // FORM 1: words per bitmap (covers n_tiles * WG * CPT blocks)
 } p;
+
+#ifdef QSA_VIS
+int kqv_cell_load(uint idx) {
+    return data_vc[idx];
+}
+
+#include "kq_vis.glsl"
+
+// the mask element of cell i for row t of stream s (the plane's mask[(s * p.n_tps + t) * p.ncols + i])
+float qsa_vis_mask(uint s, uint t, uint i) {
+    return kqv_value(s * 4u * p.ncols, p.ncols, i, data_vt[s * p.n_tps + t],
+                     (VIS_CAUSAL != 0u ? KQV_FLAG_CAUSAL : 0u) | KQV_FLAG_F16, 0);
+}
+#endif
 
 // [TAG_QSA_WHOLE_BLOCKS] GGML_QSA_TAIL_MIN (ggml.h): 5e8 = 15625000 * 2^5, exact in f32
 const float QSA_TAIL_MIN = 5.0e8;
@@ -127,7 +152,11 @@ float gather(uint row, uint i) {
     const uint s = row / p.n_tps;
     const uint block = uint(cell_blk[s * p.ncols + i]);
     const float a = data_a[s * p.n_blocks * p.n_tps + block * p.sb_blk + t * p.sb_tps];
+#ifdef QSA_VIS
+    const float m = qsa_vis_mask(s, t, i);
+#else
     const float m = float(mask[(s * p.n_tps + t) * p.ncols + i]);
+#endif
     return a + m;
 }
 
@@ -149,7 +178,11 @@ bool cell_sel(uint row, uint i) {
     const uint  t    = row % p.n_tps;
     const uint  s    = row / p.n_tps;
     const uint  b    = uint(cell_blk[s * p.ncols + i]);
+#ifdef QSA_VIS
+    const float m    = qsa_vis_mask(s, t, i);
+#else
     const float m    = float(mask[(s * p.n_tps + t) * p.ncols + i]);
+#endif
     const uint  bits = p.bits_off + row * 2u * p.nw + (b >> 5);
     const uint  bit  = 1u << (b & 31u);
     if ((scratch[bits + p.nw] & bit) != 0u) {

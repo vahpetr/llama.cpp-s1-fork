@@ -683,6 +683,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_set_threadpool") == 0) {
         return (void *)ggml_backend_cpu_set_threadpool;
     }
+    if (strcmp(name, "ggml_backend_fa_kv_ids") == 0) { // [TAG_QSA_INDEXED_FA] FLASH_ATTN_EXT reads src[5]
+        return (void *) ggml_backend_cpu_get_proc_address;
+    }
 
     return NULL;
 

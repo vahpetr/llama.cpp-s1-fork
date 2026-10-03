@@ -1153,6 +1153,11 @@ struct vk_device_struct {
     // [TAG_QSA_TOPK_V2] [TAG_QSA_WHOLE_BLOCKS] the same shader in the block-level form (spec constant 3 = 1): passes
     // 0..4 over the block keys, 5 flag, 6 cell count, 7 cell emit
     vk_pipeline pipeline_topk_v2_qsa_blocks[8];
+    // [TAG_QSA_VIS] (A4 T3) the same selections over the visibility metadata (ggml_qsa_top_k_vis): the QSA_VIS SPIR-V
+    // variants of both kernels, binding 3 = the cell planes, binding 5 = the token records (6 bindings)
+    vk_pipeline pipeline_topk_radix_qsa_vis, pipeline_topk_radix_qsa_blocks_vis;
+    vk_pipeline pipeline_topk_v2_qsa_vis[6];
+    vk_pipeline pipeline_topk_v2_qsa_blocks_vis[8];
     vk_pipeline pipeline_qsa_bias;       // [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
@@ -1208,6 +1213,7 @@ struct vk_device_struct {
     // [TAG_KQ_VIS] the same classification from the visibility metadata, and GGML_OP_KQ_MASK
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_vis_opt;
     vk_pipeline pipeline_kq_mask_f16, pipeline_kq_mask_f32;
+    vk_pipeline pipeline_kq_mask_ids_f16; // [TAG_QSA_VIS] ggml_kq_mask_ids (the QSA gather's window mask)
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     vk_pipeline pipeline_count_experts;        // N_EXPERTS_MAX = BLOCK_SIZE, counting only
@@ -2291,6 +2297,16 @@ struct vk_op_kq_mask_push_constants {
     int32_t  n_swa;
 };
 
+// [TAG_QSA_VIS] kq_mask.comp's IDS variant (ggml_kq_mask_ids): the same constants + the ids per row
+struct vk_op_kq_mask_ids_push_constants {
+    uint32_t n_kv;
+    uint32_t n_tps;
+    uint32_t n_stream;
+    uint32_t flags;
+    int32_t  n_swa;
+    uint32_t n_w;
+};
+
 // Allow pre-recording command buffers
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -2688,7 +2704,7 @@ static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
         const ggml_tensor * q = node->src[0];
         const ggml_tensor * k = node->src[1];
         const ggml_tensor * v = node->src[2];
-        return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * k->ne[1] * q->ne[3];
+        return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * (node->src[5] ? node->src[5]->ne[0] : k->ne[1]) * q->ne[3]; // [TAG_QSA_INDEXED_FA] W ids
     }
     return 0;
 }
@@ -2830,6 +2846,9 @@ class vk_perf_logger {
                 " k(" << k->ne[0] << "," << k->ne[1] << "," << k->ne[2] << "," << k->ne[3] << "), " <<
                 " v(" << v->ne[0] << "," << v->ne[1] << "," << v->ne[2] << "," << v->ne[3] << "), " <<
                 " m(" << (m?m->ne[0]:0) << "," << (m?m->ne[1]:0) << "," << (m?m->ne[2]:0) << "," << (m?m->ne[3]:0) << ")";
+            if (node->src[5]) {
+                name << " ids(" << node->src[5]->ne[0] << ")"; // [TAG_QSA_INDEXED_FA] W: indexed vs dense in the profile
+            }
             return name.str();
         }
         if (node->op == GGML_OP_TOP_K) {
@@ -4327,7 +4346,7 @@ struct vk_fa_tuning_params {
 };
 
 static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type, bool vis = false);
-static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16, ggml_type v_type = GGML_TYPE_F16, bool vis = false);
+static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16, ggml_type v_type = GGML_TYPE_F16, bool vis = false, bool indexed = false);
 
 static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
 
@@ -4509,7 +4528,8 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type,
-                                                  bool gqa_tokens = false, uint32_t vis_flags = 0, uint32_t vis_n_swa = 0) {
+                                                  bool gqa_tokens = false, uint32_t vis_flags = 0, uint32_t vis_n_swa = 0,
+                                                  bool indexed = false) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -4540,6 +4560,7 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
                      // Bit 64 is reserved for prod-v7-fa's CM1_SF_PAD so the two FA series cannot
                      // alias if they are ever merged; see flash_attn_base.glsl.
                      (gqa_tokens        ? 128 : 0) |
+                     (indexed           ? 256 : 0) | // [TAG_QSA_INDEXED_FA] FLASH_ATTN_EXT src[5] kv ids
                      // [TAG_KQ_VIS] 512 VIS, 1024 causal, 2048 alibi, 4096/8192 swa type (flash_attn_vis.glsl)
                      vis_flags;
 
@@ -6345,6 +6366,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     ggml_vk_create_pipeline(device, device->pipeline_kq_mask_f16, "kq_mask_f16", kq_mask_f16_len, kq_mask_f16_data, "main", 3, sizeof(vk_op_kq_mask_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_kq_mask_f32, "kq_mask_f32", kq_mask_f32_len, kq_mask_f32_data, "main", 3, sizeof(vk_op_kq_mask_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_kq_mask_ids_f16, "kq_mask_ids_f16", kq_mask_ids_f16_len, kq_mask_ids_f16_data, "main", 4, sizeof(vk_op_kq_mask_ids_push_constants), {256, 1, 1}, {}, 1); // [TAG_QSA_VIS]
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
@@ -6637,6 +6659,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_blocks, "topk_radix_qsa_blocks", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 2}, 1, true);
+        // [TAG_QSA_VIS] the metadata forms (spec constant 2 = VIS_CAUSAL: causal visibility, the only one the graph builds)
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_vis, "topk_radix_qsa_vis", topk_radix_select_vis_f32_len, topk_radix_select_vis_f32_data, "main", 6, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1, 1}, 1, true);
+        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_blocks_vis, "topk_radix_qsa_blocks_vis", topk_radix_select_vis_f32_len, topk_radix_select_vis_f32_data, "main", 6, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 2, 1}, 1, true);
     }
 
     // [TAG_QSA_TOPK_V2] the distributed QSA radix select: six passes, each its own pipeline (spec constant 0),
@@ -6656,6 +6681,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                      topk_radix_select_v2_f32_len, topk_radix_select_v2_f32_data, "main", 5,
                                      sizeof(vk_op_topk_radix_v2_push_constants), {1, 1, 1},
                                      {pass, 256 / wave, device->qsa_topk_cpt, 1}, 1, true, true, wave);
+        }
+        // [TAG_QSA_VIS] the metadata forms: the QSA_VIS variant, spec constant 4 = VIS_CAUSAL (causal visibility)
+        for (uint32_t pass = 0; pass < 6; ++pass) {
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_v2_qsa_vis[pass], "topk_radix_v2_qsa_vis_p" + std::to_string(pass),
+                                     topk_radix_select_v2_vis_f32_len, topk_radix_select_v2_vis_f32_data, "main", 6,
+                                     sizeof(vk_op_topk_radix_v2_push_constants), {1, 1, 1},
+                                     {pass, 256 / wave, device->qsa_topk_cpt, 0, 1}, 1, true, true, wave);
+        }
+        for (uint32_t pass = 0; pass < 8; ++pass) {
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_v2_qsa_blocks_vis[pass], "topk_radix_v2_qsa_blocks_vis_p" + std::to_string(pass),
+                                     topk_radix_select_v2_vis_f32_len, topk_radix_select_v2_vis_f32_data, "main", 6,
+                                     sizeof(vk_op_topk_radix_v2_push_constants), {1, 1, 1},
+                                     {pass, 256 / wave, device->qsa_topk_cpt, 1, 1}, 1, true, true, wave);
         }
     }
 
@@ -12167,7 +12205,7 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
     return supported;
 }
 
-static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type, bool vis) {
+static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type, bool vis, bool indexed) {
     GGML_UNUSED(v_type);
     // Needs to be kept up to date on shader changes
     const uint32_t Br = params.block_rows;
@@ -12221,7 +12259,11 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     // [TAG_KQ_VIS] flash_attn_vis.glsl staging
     const uint32_t vis_sh = ggml_vk_fa_vis_shmem(Br, Bc, vis);
 
-    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + dead + vis_sh;
+    // [TAG_QSA_INDEXED_FA] idsh[Bc]. The non-indexed cm1 shaders' 4 B idsh[1] is deliberately NOT counted: adding it
+    // could flip a borderline shmem_support verdict on the dense path, which must stay exactly as before.
+    const uint32_t idsh = indexed ? Bc * (uint32_t) sizeof(uint32_t) : 0;
+
+    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + dead + vis_sh + idsh;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
     VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", total_size=" << total_size << ", supported=" << supported);
@@ -12232,7 +12274,10 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride - when this FA
 // node does that. [TAG_QSA_SCRATCH] (M4.2b item 4) one definition for ggml_vk_flash_attn and the prealloc_x presize
 // hint walk (ggml_vk_qsa_scratch_hint), so the two cannot drift; the expression is the one ggml_vk_flash_attn had.
-static bool ggml_vk_fa_use_dequant_kv(const ggml_backend_vk_context * ctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v) {
+static bool ggml_vk_fa_use_dequant_kv(const ggml_backend_vk_context * ctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * ids) {
+    if (ids != nullptr) {
+        return false; // [TAG_QSA_INDEXED_FA] only the ids' rows are read, dequantized in-kernel
+    }
     auto is_dense_kv_cache = [](const ggml_tensor * t) {
         return t->nb[0] == ggml_type_size(t->type) &&
                t->nb[2] == ggml_row_size(t->type, t->ne[0]) &&
@@ -12262,7 +12307,7 @@ static size_t ggml_vk_fa_dequant_staging_bytes(const ggml_tensor * k, const ggml
 
 static bool vk_qsa_scratch_presize_fa_enabled();
 
-static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, const ggml_tensor * ids, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
     std::cerr << "), (" << v << ", name=" << v->name << ", type=" << v->type << ", ne0=" << v->ne[0] << ", ne1=" << v->ne[1] << ", ne2=" << v->ne[2] << ", ne3=" << v->ne[3] << ", nb0=" << v->nb[0] << ", nb1=" << v->nb[1] << ", nb2=" << v->nb[2] << ", nb3=" << v->nb[3];
@@ -12343,7 +12388,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
     // ([TAG_QSA_SCRATCH] M4.2b: the condition lives in ggml_vk_fa_use_dequant_kv so the presize hint walk shares it)
-    const bool use_dequant_kv = ggml_vk_fa_use_dequant_kv(ctx, q, k, v);
+    const bool use_dequant_kv = ggml_vk_fa_use_dequant_kv(ctx, q, k, v, ids);
     const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;
     const ggml_type v_type_eff = use_dequant_kv ? GGML_TYPE_F16 : v->type;
 
@@ -12352,7 +12397,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    if ((N <= 8 || ids != nullptr) && qk_ratio > 1 && qk_ratio <= max_gqa && // [TAG_QSA_INDEXED_FA] ids force the per-token fold
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
@@ -12363,6 +12408,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+    // [TAG_QSA_INDEXED_FA] one workgroup per (token, KV head): only the plain fold gives each token its own rows
+    GGML_ASSERT(ids == nullptr || (gqa_ratio > 1 && tuning_params.path == FA_COOPMAT1 &&
+        ggml_vk_flash_attn_coopmat_shmem_support(ctx->device, tuning_params, HSK, HSV, f32acc, k_type_eff, v_type_eff, vis, true)));
 
     // [TAG_FA_GQA_TOKENS] Fold the query tokens into the row dimension on top of the head fold.
     //
@@ -12399,7 +12447,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     static const bool fa_gqa_tokens = ggml_vk_env_bool("GGML_VK_FA_GQA_TOKENS", true);
     bool gqa_tokens = false;
     const uint32_t unfolded_block_rows = tuning_params.block_rows;
-    if (fa_gqa_tokens && gqa_ratio > 1 && neq1 > 1 && tuning_params.path == FA_COOPMAT1) {
+    if (fa_gqa_tokens && ids == nullptr && gqa_ratio > 1 && neq1 > 1 && tuning_params.path == FA_COOPMAT1) {
         // must match FA_GQA_ROWS in flash_attn_base.glsl
         const uint32_t gqa_rows_padded = ROUNDUP_POW2(gqa_ratio, 16u);
         const uint32_t rows_folded = gqa_rows_padded * (uint32_t)neq1;
@@ -12445,6 +12493,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     bool aligned = (KV % alignment) == 0 &&
                    // the "aligned" shader variant will forcibly align strides, for performance
                    (q_stride & 7) == 0 && (k_stride & 7) == 0 && (v_stride & 7) == 0;
+    if (ids != nullptr) {
+        aligned = false; // [TAG_QSA_INDEXED_FA] KV_bounds_check bounds the last id tile at W and keeps K/V staged
+    }
 
     // Need to use the coopmat2 variant that clamps loads when HSK/HSV aren't sufficiently aligned.
     if (((HSK | HSV) % 16) != 0 && tuning_params.path == FA_COOPMAT2) {
@@ -12464,11 +12515,12 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    bool use_mask_opt = has_mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+    // [TAG_QSA_INDEXED_FA] no mask opt with ids: binding 6 carries the ids
+    bool use_mask_opt = has_mask && ids == nullptr && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    has_mask, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
-                                                                   gqa_tokens, vis_flags, (uint32_t) vis_n_swa);
+                                                                   gqa_tokens, vis_flags, (uint32_t) vis_n_swa, ids != nullptr);
     GGML_ASSERT(!vis || fa_pipeline_state.path != FA_COOPMAT2);
 
     vk_pipeline pipeline = nullptr;
@@ -12504,7 +12556,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t Tr = CEIL_DIV(N, Br);
 
     // Try to use split_k when KV is large enough to be worth the overhead.
-    if (gqa_tokens) {
+    if (ids != nullptr) {
+        // [TAG_QSA_INDEXED_FA] split_k stays 1, pinned ahead of every split_k derivation below (Check-in #9 b):
+        // the shader reads W from p.split_kv and walks [0, W) of the token's ids in one workgroup.
+    } else if (gqa_tokens) {
         // [TAG_FA_GQA_TOKENS] split_k is deliberately NOT re-derived from the folded geometry.
         // It partitions the KV range, and each partition produces its own softmax maximum and
         // sum for the reduce shader to combine, so a different number of partitions gives a
@@ -12535,6 +12590,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         // of "align", so recompute split_k based on that.
         split_kv = ROUNDUP_POW2(std::max(1u, KV / split_k), alignment);
         split_k = CEIL_DIV(KV, split_kv);
+    }
+    if (ids != nullptr) {
+        GGML_ASSERT(split_k == 1);
+        split_kv = (uint32_t) ids->ne[0]; // [TAG_QSA_INDEXED_FA] W, read by the shader as p.split_kv (the push constants are at 128 bytes)
     }
 
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
@@ -12590,7 +12649,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : vis ? ggml_vk_tensor_subbuffer(ctx, vis_cells) : q_buf;
     vk_subbuffer vis_toks_buf = vis ? ggml_vk_tensor_subbuffer(ctx, vis_toks) : q_buf; // binding 7 (scalar/coopmat1 only)
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
-    vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+    vk_subbuffer mask_opt_buf = ids != nullptr ? ggml_vk_tensor_subbuffer(ctx, ids) : // [TAG_QSA_INDEXED_FA] binding 6
+                                use_mask_opt   ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
     if (use_mask_opt) {
         // [TAG_UP29591] the mask-opt / vis-opt bits overwrite a matmul input converted into prealloc_y (upstream #29591)
         ctx->prealloc_y_last_pipeline_used = nullptr;
@@ -15835,7 +15895,8 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
                                       const ggml_tensor * scores, const ggml_tensor * cell_blk,
                                       const ggml_tensor * mask, ggml_tensor * top_k,
                                       uint32_t n_tps, uint32_t n_blocks, uint32_t n_stream,
-                                      uint32_t sb_blk, uint32_t sb_tps, uint32_t n_sel = 0) {
+                                      uint32_t sb_blk, uint32_t sb_tps, uint32_t n_sel = 0,
+                                      const ggml_tensor * vis_toks = nullptr) {
     const uint32_t n_kv  = cell_blk->ne[0];
     const uint32_t width = top_k->ne[0];
     const uint32_t nrows = n_tps * n_stream;
@@ -15844,8 +15905,12 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
     // (it holds one flag per block of the row instead of the gathered cells; n_blocks <= n_kv)
     // [TAG_QSA_TOPK_V2] both forms run v2 when the device enabled it
     const bool v2 = ctx->device->qsa_topk_v2;
-    vk_pipeline pipeline = v2        ? (n_sel > 0 ? ctx->device->pipeline_topk_v2_qsa_blocks[0] : ctx->device->pipeline_topk_v2_qsa[0]) :
-                           n_sel > 0 ? ctx->device->pipeline_topk_radix_qsa_blocks : ctx->device->pipeline_topk_radix_qsa;
+    // [TAG_QSA_VIS] vis_toks != NULL: `mask` is the cell planes and the QSA_VIS pipelines read the metadata (binding 5 = toks)
+    const bool vis = vis_toks != nullptr;
+    vk_pipeline pipeline = v2        ? (n_sel > 0 ? (vis ? ctx->device->pipeline_topk_v2_qsa_blocks_vis[0] : ctx->device->pipeline_topk_v2_qsa_blocks[0])
+                                                  : (vis ? ctx->device->pipeline_topk_v2_qsa_vis[0]        : ctx->device->pipeline_topk_v2_qsa[0])) :
+                           n_sel > 0 ? (vis ? ctx->device->pipeline_topk_radix_qsa_blocks_vis : ctx->device->pipeline_topk_radix_qsa_blocks)
+                                     : (vis ? ctx->device->pipeline_topk_radix_qsa_vis        : ctx->device->pipeline_topk_radix_qsa);
     GGML_ASSERT(pipeline != nullptr);
 
     // scratch holds the gathered+masked input (v2: its keys, then the histograms and tile records),
@@ -15949,10 +16014,17 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
         const uint32_t n_pass = n_sel > 0 ? 8 : 6;
         vk_subbuffer scratch_buf { ctx->prealloc_x, 0, ctx->prealloc_x->size };
         for (uint32_t pass = 0; pass < n_pass; ++pass) {
-            vk_pipeline & pl = n_sel > 0 ? ctx->device->pipeline_topk_v2_qsa_blocks[pass] : ctx->device->pipeline_topk_v2_qsa[pass];
+            vk_pipeline & pl = n_sel > 0 ? (vis ? ctx->device->pipeline_topk_v2_qsa_blocks_vis[pass] : ctx->device->pipeline_topk_v2_qsa_blocks[pass])
+                                         : (vis ? ctx->device->pipeline_topk_v2_qsa_vis[pass]        : ctx->device->pipeline_topk_v2_qsa[pass]);
             // passes 6 and 7 of the block form walk the cells, every other pass the selection domain
             const std::array<uint32_t, 3> elements2 { n_x, pass >= 6 ? n_tiles_c : n_tiles, 1 };
             ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
+            if (vis) {
+                ggml_vk_dispatch_pipeline(ctx, subctx, pl,
+                    { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
+                      ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
+                      scratch_buf, ggml_vk_tensor_subbuffer(ctx, vis_toks) }, pc2, elements2);
+            } else
             ggml_vk_dispatch_pipeline(ctx, subctx, pl,
                 { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
                   ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
@@ -15973,6 +16045,12 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
     };
     vk_subbuffer scratch_buf { ctx->prealloc_x, 0, ctx->prealloc_x->size };
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    if (vis) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
+              ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
+              scratch_buf, ggml_vk_tensor_subbuffer(ctx, vis_toks) }, pc, elements);
+    } else
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
           ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
@@ -16019,14 +16097,46 @@ static void ggml_vk_qsa_top_k(ggml_backend_vk_context * ctx, vk_context& subctx,
     // [TAG_QSA_WHOLE_BLOCKS] op_params[0] == 1: ggml_qsa_top_k_blocks, op_params[1] = n_sel
     const uint32_t n_sel = ggml_get_op_params_i32(node, 0) == 1 ? (uint32_t) ggml_get_op_params_i32(node, 1) : 0u;
 
+    // [TAG_QSA_VIS] op_params[2] == 1 (ggml_qsa_top_k_vis): src[2] is the cell planes, src[3] the token records
+    const ggml_tensor * vis_toks = ggml_get_op_params_i32(node, 2) == 1 ? node->src[3] : nullptr;
+
     ggml_vk_topk_qsa_dispatch(ctx, subctx, scores, cell_blk, mask, node,
-                              n_tps, n_blocks, n_stream, /*sb_blk =*/ 1, /*sb_tps =*/ n_blocks, n_sel);
+                              n_tps, n_blocks, n_stream, /*sb_blk =*/ 1, /*sb_tps =*/ n_blocks, n_sel, vis_toks);
 }
 
 // [TAG_KQ_VIS] GGML_OP_KQ_MASK: the mask plane generated on the device from the metadata
 static void ggml_vk_kq_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * cells = dst->src[0]; // [n_kv, 4, n_stream] I32
     const ggml_tensor * toks  = dst->src[1]; // [4, n_tps, n_stream] I32
+
+    // [TAG_QSA_VIS] ggml_kq_mask_ids: [W, 1, 1, n_tps*n_stream], one (t, s) row per workgroup row, W ids per row
+    if (dst->src[2] != nullptr) {
+        const ggml_tensor * ids = dst->src[2];
+        vk_pipeline pl = ctx->device->pipeline_kq_mask_ids_f16;
+        GGML_ASSERT(dst->type == GGML_TYPE_F16 && pl != nullptr);
+        ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
+
+        const uint32_t n_w    = (uint32_t) dst->ne[0];
+        const uint32_t n_kv_c = (uint32_t) cells->ne[0];
+        const uint32_t n_tps_t = (uint32_t) toks->ne[1];
+        const uint32_t n_str  = (uint32_t) cells->ne[2];
+
+        const uint32_t causal_i   = ggml_get_op_params_i32(dst, 0) != 0;
+        const uint32_t alibi_i    = ggml_get_op_params_i32(dst, 1) != 0;
+        const uint32_t swa_type_i = (uint32_t) ggml_get_op_params_i32(dst, 2) & 3u;
+        const vk_op_kq_mask_ids_push_constants pci = {
+            n_kv_c, n_tps_t, n_str,
+            causal_i | (alibi_i << 1) | (swa_type_i << 2) | 16u, // 16: KQV_FLAG_F16
+            swa_type_i ? ggml_get_op_params_i32(dst, 3) : 0,
+            n_w,
+        };
+        const uint32_t wg_x = std::min(CEIL_DIV(n_w, 256u), 1024u);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pl,
+                                  { ggml_vk_tensor_subbuffer(ctx, cells), ggml_vk_tensor_subbuffer(ctx, toks), ggml_vk_tensor_subbuffer(ctx, dst),
+                                    ggml_vk_tensor_subbuffer(ctx, ids) },
+                                  pci, { wg_x * 256u, n_tps_t, n_str });
+        return;
+    }
 
     vk_pipeline pipeline = dst->type == GGML_TYPE_F16 ? ctx->device->pipeline_kq_mask_f16 : ctx->device->pipeline_kq_mask_f32;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -18177,7 +18287,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_FLASH_ATTN_EXT:
-        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
+        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node->src[5], node);
 
         break;
 
@@ -20680,7 +20790,7 @@ static void ggml_vk_qsa_scratch_hint(ggml_backend_vk_context * ctx, const struct
         if (node->op != GGML_OP_FLASH_ATTN_EXT) {
             continue;
         }
-        if (vk_qsa_scratch_presize_fa && ggml_vk_fa_use_dequant_kv(ctx, node->src[0], node->src[1], node->src[2])) {
+        if (vk_qsa_scratch_presize_fa && ggml_vk_fa_use_dequant_kv(ctx, node->src[0], node->src[1], node->src[2], node->src[5])) {
             ctx->prealloc_size_qsa_hint = std::max(ctx->prealloc_size_qsa_hint,
                                                    ggml_vk_fa_dequant_staging_bytes(node->src[1], node->src[2]));
         }
@@ -21550,6 +21660,33 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if ((op->src[1]->type == GGML_TYPE_BF16) != (op->src[2]->type == GGML_TYPE_BF16)) {
                     return false;
                 }
+                if (op->src[5] != nullptr) { // [TAG_QSA_INDEXED_FA] coopmat1 plain GQA fold only
+                    const ggml_tensor * ids = op->src[5];
+                    const int64_t nh = op->src[0]->ne[2], nh_kv = op->src[1]->ne[2];
+                    if (ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || nh_kv == 0 || nh % nh_kv != 0 ||
+                        op->src[2]->ne[2] != nh_kv ||
+                        nh / nh_kv < 2 || nh / nh_kv > 16 || (op->src[3] && op->src[3]->ne[2] != 1) || op->src[1]->type == GGML_TYPE_BF16) {
+                        return false;
+                    }
+                    const bool f32acc = !device->fp16 || op->op_params[3] == GGML_PREC_F32;
+                    const vk_fa_tuning_params tp = get_fa_tuning_params(device, HSK, HSV, (uint32_t) (nh / nh_kv), (uint32_t) op->src[1]->ne[1],
+                                                                        op->src[1]->type, op->src[2]->type, f32acc);
+                    if (tp.path != FA_COOPMAT1 ||
+                        !ggml_vk_flash_attn_coopmat_shmem_support(device, tp, HSK, HSV, f32acc, op->src[1]->type, op->src[2]->type,
+                                ggml_get_op_params_i32(op, GGML_FA_VIS_PARAM) != 0 && op->src[6] != nullptr, true)) { // [TAG_KQ_VIS] + ids
+                        return false;
+                    }
+                    // ids bind at binding 6 through ggml_vk_tensor_subbuffer, which asserts a
+                    // minStorageBufferOffsetAlignment-aligned offset; the ids row stride is W * 4 B (8204 at W 2051), so a
+                    // row-offset view of a bigger ids tensor would abort there - fall back instead. The ids may be any
+                    // tensor or view whose offset is aligned (e.g. the chunk's own QSA_TOP_K output, or a view at offset 0).
+                    const ggml_tensor * ids_base = ids->view_src ? ids->view_src : ids;
+                    const uint64_t ids_offs = ids->view_offs +
+                        ((ids_base->buffer && ggml_backend_buffer_is_vk(ids_base->buffer)) ? vk_tensor_offset(ids) : 0);
+                    if (ids_offs % device->properties.limits.minStorageBufferOffsetAlignment != 0) {
+                        return false;
+                    }
+                }
                 if (!coopmat2 && !(device->subgroup_shuffle && device->subgroup_vote)) {
                     // scalar/coopmat1 FA uses subgroupShuffle/subgroupAll
                     return false;
@@ -21780,6 +21917,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_KQ_MASK:
             // [TAG_KQ_VIS]
+            if (op->src[2] != nullptr) {
+                // [TAG_QSA_VIS] ggml_kq_mask_ids: the f16 IDS variant only (the gather's window mask is f16)
+                if (op->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_I32 || !ggml_is_contiguous(op->src[2]) ||
+                    device->pipeline_kq_mask_ids_f16 == nullptr) {
+                    return false;
+                }
+            }
             return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op) &&
                    (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
@@ -21796,6 +21940,31 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const ggml_tensor * mask     = op->src[2];
                 if (!scores || !cell_blk || !mask) {
                     return false;
+                }
+                // [TAG_QSA_VIS] ggml_qsa_top_k_vis: src[2] = the cell planes, src[3] = the token records; the QSA_VIS
+                // pipelines are built for causal visibility only
+                if (ggml_get_op_params_i32(op, 2) == 1) {
+                    const ggml_tensor * toks = op->src[3];
+                    if (!toks || mask->type != GGML_TYPE_I32 || toks->type != GGML_TYPE_I32 ||
+                        !ggml_is_contiguous(mask) || !ggml_is_contiguous(toks) ||
+                        ggml_get_op_params_i32(op, 3) != 1 || scores->type != GGML_TYPE_F32 ||
+                        cell_blk->type != GGML_TYPE_I32 || op->type != GGML_TYPE_I32 ||
+                        !ggml_is_contiguous(scores) || !ggml_is_contiguous(cell_blk) || !ggml_is_contiguous(op)) {
+                        return false;
+                    }
+                    const int64_t n_kv = cell_blk->ne[0];
+                    if (mask->ne[0] != n_kv || mask->ne[1] != 4 || mask->ne[2] != scores->ne[2] ||
+                        toks->ne[0] != 4 || toks->ne[1] != scores->ne[1] || toks->ne[2] != scores->ne[2] ||
+                        op->ne[0] <= 0 || op->ne[0] > n_kv) {
+                        return false;
+                    }
+                    if (ggml_get_op_params_i32(op, 0) == 1) {
+                        return scores->ne[0] <= n_kv && ggml_get_op_params_i32(op, 1) > 0 &&
+                               (device->qsa_topk_v2 ? device->pipeline_topk_v2_qsa_blocks_vis[0] != nullptr
+                                                    : device->pipeline_topk_radix_qsa_blocks_vis != nullptr);
+                    }
+                    return device->qsa_topk_v2 ? device->pipeline_topk_v2_qsa_vis[0] != nullptr
+                                               : device->pipeline_topk_radix_qsa_vis != nullptr;
                 }
                 if (scores->type != GGML_TYPE_F32 || cell_blk->type != GGML_TYPE_I32 ||
                     mask->type != GGML_TYPE_F16 || op->type != GGML_TYPE_I32) {
@@ -22316,11 +22485,19 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_fa_kv_ids") == 0) { // [TAG_QSA_INDEXED_FA] FLASH_ATTN_EXT reads src[5]
+        return (void *) ggml_backend_vk_reg_get_proc_address;
+    }
+    return NULL;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
@@ -22682,8 +22859,15 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                         ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 1) != 0, ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 2) != 0,
                         ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 3), ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 4));
             }
+            if (src_clone[5]) {
+                ggml_flash_attn_ext_set_kv_ids(tensor_clone, src_clone[5]); // [TAG_QSA_INDEXED_FA]
+            }
         } else if (tensor->op == GGML_OP_KQ_MASK) { // [TAG_KQ_VIS]
-            tensor_clone = ggml_kq_mask(ggml_ctx, src_clone[0], src_clone[1], tensor->type,
+            tensor_clone = src_clone[2] // [TAG_QSA_VIS] ggml_kq_mask_ids
+                ? ggml_kq_mask_ids(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], tensor->type,
+                    ggml_get_op_params_i32(tensor, 0) != 0, ggml_get_op_params_i32(tensor, 1) != 0,
+                    ggml_get_op_params_i32(tensor, 2), ggml_get_op_params_i32(tensor, 3))
+                : ggml_kq_mask(ggml_ctx, src_clone[0], src_clone[1], tensor->type,
                     ggml_get_op_params_i32(tensor, 0) != 0, ggml_get_op_params_i32(tensor, 1) != 0,
                     ggml_get_op_params_i32(tensor, 2), ggml_get_op_params_i32(tensor, 3));
         } else if (tensor->op == GGML_OP_MUL_MAT) {
@@ -22912,6 +23096,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_argsort(ggml_ctx, src_clone[0], (ggml_sort_order) *(int *)tensor->op_params);
         } else if (tensor->op == GGML_OP_TOP_K) {
             tensor_clone = ggml_top_k(ggml_ctx, src_clone[0], tensor->ne[0]);
+        } else if (tensor->op == GGML_OP_QSA_TOP_K && ggml_get_op_params_i32(tensor, 2) == 1) { // [TAG_QSA_VIS]
+            tensor_clone = ggml_qsa_top_k_vis(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], tensor->ne[0],
+                    ggml_get_op_params_i32(tensor, 0) == 1 ? ggml_get_op_params_i32(tensor, 1) : 0, ggml_get_op_params_i32(tensor, 3) != 0);
         } else if (tensor->op == GGML_OP_QSA_TOP_K) {
             tensor_clone = ggml_get_op_params_i32(tensor, 0) == 1 // [TAG_QSA_WHOLE_BLOCKS]
                 ? ggml_qsa_top_k_blocks(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], tensor->ne[0], ggml_get_op_params_i32(tensor, 1))

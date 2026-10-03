@@ -12,6 +12,8 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <tuple>
+#include <map>
 #include <utility>
 #include <vector>
 
@@ -793,6 +795,157 @@ static int64_t qwen4exp_qsa_gather_max_windows() {
     return max_windows;
 }
 
+// [TAG_QSA_INDEXED_FA] (M6) LLAMA_QSA_PREFILL=scan|indexed: the SCAN branch at n_tps > 8 is the masked scan (default, node
+// for node as before) or FA over each query's own QSA_TOP_K ids (src[5]: no fill/set_rows/add planes, no zeros, no K/V
+// staging). Read once, logged at the first graph build (the reserve); unknown values fall back to scan with a warning.
+// The decision is made once per ubatch from its token count (spec §3.4): every chunk of a chunked ubatch, the
+// [TAG_QSA_CHUNK_PAD] tail included, takes the same attention. It acts only where the scan is taken today: gather
+// ([TAG_QSA_GATHER_MAX_WINDOWS], LLAMA_QSA_PATH=gather) and dense ([TAG_QSA_MIN_KV], exhaustive bypass) are untouched.
+static bool qwen4exp_qsa_prefill_indexed() {
+    static const bool indexed = [] {
+        const char * s = getenv("LLAMA_QSA_PREFILL");
+        if (s == nullptr || *s == '\0') { return false; }
+        const bool on = strcmp(s, "indexed") == 0;
+        if (!on && strcmp(s, "scan") != 0) {
+            LLAMA_LOG_WARN("qwen4exp_qsa_prefill: LLAMA_QSA_PREFILL=%s unknown, using scan\n", s);
+        }
+        LLAMA_LOG_INFO("qwen4exp_qsa_prefill: LLAMA_QSA_PREFILL=%s: the scan branch at n_tps > 8 is %s\n", s,
+                on ? "indexed flash attention (src[5] = QSA_TOP_K ids)" : "the masked scan");
+        return on;
+    }();
+    return indexed;
+}
+
+// [TAG_QSA_INDEXED_SORT] (frozen-M6 isolation, ~/claude-tmp/codex/m6-frozen.sh) LLAMA_QSA_INDEXED_SORT=1 (default 0 = node for
+// node as before): the indexed flash attention reads each row's QSA_TOP_K ids SORTED ASCENDING, i.e. walks the selected
+// cells in KV order as the scan does, so an indexed-vs-scan difference that the order explains disappears with it (the
+// radix select emits winners, then ties, each run ascending). The ids are < 2^24, so cast to F32, argsort ascending,
+// get_rows, cast to I32 is exact and keeps the set. Acts only where the indexed branch is taken (LLAMA_QSA_PREFILL=indexed).
+// Strict: unset / "" / "0" off, "1" on, anything else WARN + off. Read with LLAMA_QSA_PREFILL at the first QSA layer (the
+// reserve); logged once and only when on: `qsa_indexed_sort: on (LLAMA_QSA_INDEXED_SORT=1)`.
+static bool qwen4exp_qsa_indexed_sort() {
+    static const bool on = [] {
+        const char * s = getenv("LLAMA_QSA_INDEXED_SORT");
+        if (s == nullptr || *s == '\0' || strcmp(s, "0") == 0) { return false; }
+        if (strcmp(s, "1") != 0) {
+            LLAMA_LOG_WARN("qwen4exp_qsa_indexed_sort: LLAMA_QSA_INDEXED_SORT=%s is neither 0 nor 1: off\n", s);
+            return false;
+        }
+        LLAMA_LOG_INFO("qsa_indexed_sort: on (LLAMA_QSA_INDEXED_SORT=1): the indexed flash attention reads each row's ids sorted "
+                "ascending%s\n", qwen4exp_qsa_prefill_indexed() ? "" : " - but LLAMA_QSA_PREFILL is not indexed, so no graph uses it");
+        return true;
+    }();
+    return on;
+}
+
+// [TAG_QSA_INDEXED_SORT] each row of ids [W, n, 1, ns] I32 sorted ascending, as a fresh contiguous I32 tensor
+static ggml_tensor * qwen4exp_qsa_sort_ids(ggml_context * ctx, ggml_tensor * ids) {
+    const int64_t W = ids->ne[0];
+    const int64_t R = ids->ne[1]*ids->ne[2]*ids->ne[3];
+
+    ggml_tensor * f    = ggml_reshape_2d(ctx, ggml_cast(ctx, ids, GGML_TYPE_F32), W, R);    // exact: ids < 2^24
+    ggml_tensor * perm = ggml_argsort(ctx, f, GGML_SORT_ORDER_ASC);                          // [W, R] I32
+    ggml_tensor * val  = ggml_get_rows(ctx, ggml_reshape_3d(ctx, f, 1, W, R), perm);         // [1, W, R] F32
+    return ggml_cast(ctx, ggml_reshape_4d(ctx, val, W, ids->ne[1], ids->ne[2], ids->ne[3]), GGML_TYPE_I32);
+}
+
+// [TAG_QSA_VIS] (A4 T3/T4) LLAMA_QSA_VIS=1 (default 0 = node for node as before): in a ubatch of the KQ_VIS metadata class
+// (LLAMA_KQ_VIS=1 and >= LLAMA_KQ_VIS_MIN_TOKENS tokens, where the dense layers already run FA over the metadata) that takes
+// the QSA path, every QSA consumer of the KQ mask reads the 16 B/cell + 16 B/token metadata instead of the [n_kv x n_tps] f16
+// plane: the selection (ggml_qsa_top_k_vis, the fused select), the indexed flash attention (ggml_flash_attn_ext_set_vis on the
+// src[5] node) and the gather's window mask (ggml_kq_mask_ids). The KQ_MASK node then has no consumer and is never computed
+// or allocated (-4 096 B/cell at ub 2048, plus the chunk's [n_kv x C] f16 rows, -512 B/cell at C 256). Every value read is
+// bit-identical to the plane's, so the ids, the attention and the outputs equal knob off (EXACT). The decode class (< 64
+// tokens) keeps its small device plane. Needs LLAMA_QSA_PREFILL=indexed (the scan reads "selected AND visible" from a
+// plane) and GGML_VK_QSA_FUSED_SELECT=1 (the unfused chain adds the cast plane) - else WARN once, off; a graph without the
+// metadata inputs (LLAMA_KQ_VIS=0, n_seq_max > 32) or a backend without the indexed+vis FA keeps the plane. Strict parse:
+// unset / "" / "0" off, "1" on, anything else WARN + off. Read at the first QSA layer (the reserve); proof line (WARN, so it
+// shows at the server's default verbosity) `qsa_vis: on (LLAMA_QSA_VIS=1) ...`.
+static bool qwen4exp_qsa_vis() {
+    static const bool on = [] {
+        const char * s = getenv("LLAMA_QSA_VIS");
+        if (s == nullptr || *s == '\0' || strcmp(s, "0") == 0) { return false; }
+        if (strcmp(s, "1") != 0) {
+            LLAMA_LOG_WARN("qwen4exp_qsa_vis: LLAMA_QSA_VIS=%s is neither 0 nor 1: off\n", s);
+            return false;
+        }
+        if (!qwen4exp_qsa_prefill_indexed()) {
+            LLAMA_LOG_WARN("qwen4exp_qsa_vis: LLAMA_QSA_VIS=1 needs LLAMA_QSA_PREFILL=indexed (the scan reads a plane): off\n");
+            return false;
+        }
+        if (!qwen4exp_qsa_fused_select()) {
+            LLAMA_LOG_WARN("qwen4exp_qsa_vis: LLAMA_QSA_VIS=1 needs GGML_VK_QSA_FUSED_SELECT=1 (the unfused select casts a plane): off\n");
+            return false;
+        }
+        LLAMA_LOG_WARN("qsa_vis: on (LLAMA_QSA_VIS=1): in the KQ_VIS metadata class the QSA selection, the indexed flash "
+                "attention and the gather mask read the cell/token metadata - no [n_kv x n_tps] KQ mask plane\n");
+        return true;
+    }();
+    return on;
+}
+
+// [TAG_QSA_WHOLE_BLOCKS] + [TAG_QSA_INDEXED_FA] the block-level selection pads a row with repeats of its last id
+// (ggml_qsa_top_k_blocks); the indexed flash attention would count such a cell twice (the scan's set_rows writes the same
+// 0 twice, a gathered window masks the repeat itself). So every slot j > 0 whose id equals id[j - 1] becomes -1, a dead
+// column (ggml.h: never read, never counted). Selected ids are distinct, so only padding changes; a cell-form row is
+// returned with the same values. ids < 2^24: the f32 round trip is exact. keep = step(|id[j] - id[j-1]|), slot 0 kept;
+// id' = (id + 1) * keep - 1.
+static ggml_tensor * qwen4exp_qsa_mask_repeats(ggml_context * ctx, ggml_tensor * ids) {
+    const int64_t W = ids->ne[0];
+    const int64_t R = ids->ne[1]*ids->ne[2]*ids->ne[3];
+
+    ggml_tensor * f    = ggml_reshape_2d(ctx, ggml_cast(ctx, ids, GGML_TYPE_F32), W, R);
+    ggml_tensor * cur  = ggml_view_2d(ctx, f, W - 1, R, f->nb[1], f->nb[0]);
+    ggml_tensor * prv  = ggml_view_2d(ctx, f, W - 1, R, f->nb[1], 0);
+    ggml_tensor * keep = ggml_step(ctx, ggml_abs(ctx, ggml_sub(ctx, cur, prv)));                                  // [W - 1, R]
+    ggml_tensor * one  = ggml_scale_bias(ctx, ggml_cont(ctx, ggml_view_2d(ctx, f, 1, R, f->nb[1], 0)), 0.0f, 1.0f); // [1, R]
+    keep = ggml_concat(ctx, one, keep, 0);                                                                         // [W, R]
+    ggml_tensor * out  = ggml_scale_bias(ctx, ggml_mul(ctx, ggml_scale_bias(ctx, f, 1.0f, 1.0f), keep), 1.0f, -1.0f);
+    return ggml_cast(ctx, ggml_reshape_4d(ctx, out, W, ids->ne[1], ids->ne[2], ids->ne[3]), GGML_TYPE_I32);
+}
+
+// the knob refuses rather than let the scheduler put the node on the CPU (spec §6): ask the first backend about a small one.
+// No scheduler (an unknown backend) is a refusal. The answer is cached per (device, K/V types, heads, head dims), so the
+// stand-in node is built once, at the reserve, not per QSA layer per graph.
+// [TAG_QSA_VIS] vis: the same node over the visibility metadata (ggml_flash_attn_ext_vis, causal) instead of an f16 mask.
+static bool qwen4exp_qsa_indexed_supported(ggml_backend_sched_t sched, ggml_type type_k, ggml_type type_v,
+        int64_t d_k, int64_t d_v, int64_t n_head, int64_t n_head_kv, bool vis = false) {
+    if (sched == nullptr) { return false; }
+    ggml_backend_t backend = ggml_backend_sched_get_backend(sched, 0);
+    using key_t = std::tuple<ggml_backend_dev_t, int, int, int64_t, int64_t, int64_t, int64_t, bool>;
+    static std::mutex mtx;
+    static std::map<key_t, bool> answers;
+    const key_t key { ggml_backend_get_device(backend), (int) type_k, (int) type_v, d_k, d_v, n_head, n_head_kv, vis };
+    std::lock_guard<std::mutex> lock(mtx);
+    if (auto it = answers.find(key); it != answers.end()) { return it->second; }
+    ggml_init_params ip = { /*.mem_size =*/ 24*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * q_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_k, 9, n_head, 1);
+    ggml_tensor * k_t = ggml_new_tensor_4d(ctx, type_k, d_k, 256, n_head_kv, 1);
+    ggml_tensor * v_t = ggml_new_tensor_4d(ctx, type_v, d_v, 256, n_head_kv, 1);
+    ggml_tensor * fa = vis
+        ? ggml_flash_attn_ext_vis(ctx, q_t, k_t, v_t, ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 256, 4, 1),
+                ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, 9, 1), 1.0f, 0.0f, 0.0f, true, false, 0, 0)
+        : ggml_flash_attn_ext(ctx, q_t, k_t, v_t, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, 9, 1, 1), 1.0f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+    ggml_flash_attn_ext_set_kv_ids(fa, ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 64, 9, 1, 1));
+    bool ok = ggml_backend_supports_op(backend, fa);
+    if (vis && ok) {
+        // [TAG_QSA_VIS] the other two metadata consumers: the selection (causal, cell form) and the gather's window mask -
+        // a backend that refused either would run it elsewhere instead of keeping the plane
+        ggml_tensor * cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 256, 4, 1);
+        ggml_tensor * toks  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, 9, 1);
+        ggml_tensor * sel   = ggml_qsa_top_k_vis(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 9, 1),
+                ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 256, 1), cells, toks, 11, 0, true);
+        ggml_tensor * msk   = ggml_kq_mask_ids(ctx, cells, toks, ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 11, 9, 1, 1),
+                GGML_TYPE_F16, true, false, 0, 0);
+        ok = ggml_backend_supports_op(backend, sel) && ggml_backend_supports_op(backend, msk);
+    }
+    ggml_free(ctx);
+    answers.emplace(key, ok);
+    return ok;
+}
+
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     // [TAG_PLE_HOIST] before anything else touches gf: the CPU-resident PLE gather has to be the
@@ -1459,7 +1612,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         int *                                   sections,
         int                                     il,
         bool                                    cache_only,
-        qsa_prep *                              prep) {
+        qsa_prep *                              prep,
+        ggml_tensor *                           vis_cells,
+        ggml_tensor *                           vis_toks) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
     const int64_t idx_dim  = hparams.indexer_head_size;
@@ -1702,6 +1857,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         prep->kq_mask  = kq_mask;
         prep->width    = width;
         prep->blk_bias = blk_bias;
+        prep->vis_cells = vis_cells; // [TAG_QSA_VIS]
+        prep->vis_toks  = vis_toks;
         return nullptr;
     }
 
@@ -1713,7 +1870,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_build_forward_expand(gf, bias);
     }
 
-    return build_qsa_select(inp, pooled, q, bias, kq_mask, width, blk_bias, il, pool_store, pool_remap);
+    return build_qsa_select(inp, pooled, q, bias, kq_mask, width, blk_bias, il, pool_store, pool_remap, vis_cells, vis_toks);
 }
 
 // [TAG_QSA_COMPACT_BIAS] the two table inputs that replace the [n_blocks, n_tps, n_stream] f32 plane
@@ -1746,7 +1903,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
         bool                  blk_bias,
         int                   il,
         ggml_tensor *         pool_store,
-        ggml_tensor *         pool_remap) {
+        ggml_tensor *         pool_remap,
+        ggml_tensor *         vis_cells,
+        ggml_tensor *         vis_toks) {
     GGML_ASSERT((pooled != nullptr) != (pool_store != nullptr && pool_remap != nullptr));
 
     const int64_t n_idx_h  = hparams.indexer_n_head;
@@ -1784,10 +1943,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
     // form attends to 2051 (D1), and a block is never split at a tie (D2). The block form needs the per-block bias
     // (a census-shaped score); the per-cell bias path (alibi / non-causal) keeps the cell form. The Vulkan shader
     // binds an f16 mask; an f32 mask (no flash attention) runs the op on the CPU.
+    // [TAG_QSA_VIS] vis_cells/vis_toks: the same selections over the metadata (ggml_qsa_top_k_vis), no mask plane
+    // (without the per-block bias - alibi, non-causal - the selection keeps the plane, and qsa_use_vis' attention side is
+    // independent of it)
+    const bool vis = vis_cells != nullptr && vis_toks != nullptr && blk_bias;
+
     if (blk_bias && llama_qsa_whole_blocks()) {
-        GGML_ASSERT(kq_mask->ne[2] == 1 && hparams.indexer_top_k % inp->ratio == 0);
-        ggml_tensor * top_k = ggml_qsa_top_k_blocks(ctx0, score, inp->cell_blk, kq_mask, (int) width,
-                (int) (hparams.indexer_top_k / inp->ratio));
+        GGML_ASSERT((vis || kq_mask->ne[2] == 1) && hparams.indexer_top_k % inp->ratio == 0);
+        ggml_tensor * top_k = vis
+            ? ggml_qsa_top_k_vis(ctx0, score, inp->cell_blk, vis_cells, vis_toks, (int) width,
+                    (int) (hparams.indexer_top_k / inp->ratio), cparams.causal_attn)
+            : ggml_qsa_top_k_blocks(ctx0, score, inp->cell_blk, kq_mask, (int) width,
+                    (int) (hparams.indexer_top_k / inp->ratio));
         cb(top_k, "indexer_top_k", il);
 
         return top_k;
@@ -1805,7 +1972,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
     // shader's binding 3 is float16_t and the pattern likewise only matches through ggml_cast), so
     // no configuration that fuses today falls off the fused path, and none that does not gets a
     // node the backend would have to run somewhere else.
-    if (blk_bias && kq_mask->type == GGML_TYPE_F16 && kq_mask->ne[2] == 1 && qwen4exp_qsa_fused_select()) {
+    if (blk_bias && (vis || (kq_mask->type == GGML_TYPE_F16 && kq_mask->ne[2] == 1)) && qwen4exp_qsa_fused_select()) {
         // one node, [width, n_tps, 1, n_stream] i32 - already the shape build_attn_qsa wants, so
         // neither the ggml_cont nor the reshape below is needed either.
         // Note for the node-diff probes: this arm has no "indexer_score_tokens-<il>" node, because
@@ -1815,11 +1982,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
         // name|op|type|ne (scripts/bench/probe/fa_rb_nodediff.cpp:281-290) and the op differs -
         // RESHAPE below, QSA_TOP_K here. Cross-arm equality is established by the corpus census and
         // by qsa_fusion_replay's REPLAY_QSA_OP_SELFTEST, not by the node diff.
-        ggml_tensor * top_k = ggml_qsa_top_k(ctx0, score, inp->cell_blk, kq_mask, (int) width);
+        ggml_tensor * top_k = vis
+            ? ggml_qsa_top_k_vis(ctx0, score, inp->cell_blk, vis_cells, vis_toks, (int) width, 0, cparams.causal_attn)
+            : ggml_qsa_top_k(ctx0, score, inp->cell_blk, kq_mask, (int) width);
         cb(top_k, "indexer_top_k", il);
 
         return top_k;
     }
+    GGML_ASSERT(!vis); // qwen4exp_qsa_vis requires the fused select
 
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
     ggml_tensor * expanded = ggml_get_rows(ctx0,
@@ -1854,7 +2024,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor *             top_k,
         float                     kq_scale,
         int                       il,
-        const qsa_prep *          prep) {
+        const qsa_prep *          prep,
+        bool                      vis) {
     // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
     // has already scored with its own query in build_qsa_top_k, so top_k is unaffected.
     if (inp->self_k_rot) {
@@ -1902,9 +2073,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // the two costs meet at 2*n_tps*width == n_kv; the margin keeps the windows small enough
     // for the compute buffer of a decode graph. flash attention is what keeps the values as rows
-    ggml_tensor * cur = qwen4exp_qsa_use_gather(cparams.flash_attn, n_tps, top_k->ne[3], width, n_kv)
-        ? build_qsa_gather(inp, q_cur, top_k, kq_scale, il)
-        : build_qsa_scan  (inp, q_cur, top_k, kq_scale, il);
+    ggml_tensor * cur = nullptr;
+    if (qwen4exp_qsa_use_gather(cparams.flash_attn, n_tps, top_k->ne[3], width, n_kv)) {
+        cur = build_qsa_gather(inp, q_cur, top_k, kq_scale, il, vis);
+    } else if (vis) {
+        // [TAG_QSA_VIS] qsa_use_vis() includes the indexed rule: indexed flash attention over the metadata
+        cur = build_qsa_indexed(inp, q_cur, top_k, kq_scale, il, nullptr, inp->self_kq_vis_toks);
+    } else if (qsa_use_indexed(inp, n_tps, il)) {
+        cur = build_qsa_indexed(inp, q_cur, top_k, kq_scale, il); // [TAG_QSA_INDEXED_FA] the implementation, not the branch
+    } else {
+        cur = build_qsa_scan(inp, q_cur, top_k, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
@@ -1966,6 +2145,62 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_scan(
     return build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
 }
 
+bool llama_model_qwen4exp::graph::qsa_use_indexed(llm_graph_input_attn_kv * inp, int64_t n_tps, int il, bool vis) {
+    if (!qwen4exp_qsa_prefill_indexed() || !cparams.flash_attn || n_tps <= 8) { return false; } // decode/verify: never touched
+    // the cache's types and the layer's shape, no K/V views: the check builds nothing in ctx0
+    const ggml_type type_k = inp->mctx->type_k(), type_v = inp->mctx->type_v();
+    if (qwen4exp_qsa_indexed_supported(sched, type_k, type_v, hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
+                hparams.n_head(il), hparams.n_head_kv(il), vis)) {
+        return true;
+    }
+    if (vis) {
+        static std::atomic<bool> warned_vis{false};
+        if (!warned_vis.exchange(true)) {
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_VIS=1: the first backend does not support indexed flash attention over the metadata"
+                    " for K/V %s/%s - the QSA layers keep the KQ mask plane\n", __func__, ggml_type_name(type_k), ggml_type_name(type_v));
+        }
+        return false;
+    }
+    static std::atomic<bool> warned{false}; // graphs may be built concurrently (several contexts): once, race-free
+    if (!warned.exchange(true)) {
+        LLAMA_LOG_WARN("%s: LLAMA_QSA_PREFILL=indexed: the first backend does not support indexed flash attention for K/V %s/%s"
+                " - using the scan\n", __func__, ggml_type_name(type_k), ggml_type_name(type_v));
+    }
+    return false;
+}
+
+// [TAG_QSA_VIS] see qwen4exp_qsa_vis(): this ubatch's QSA consumers read the metadata (decided once per ubatch, from its
+// token count, like the KQ_VIS class and the indexed rule)
+bool llama_model_qwen4exp::graph::qsa_use_vis(llm_graph_input_attn_kv * inp, int64_t n_tps, int il) {
+    if (!qwen4exp_qsa_vis() || !inp->kq_vis_fa || inp->self_kq_vis_cells == nullptr || inp->self_kq_vis_toks == nullptr) {
+        return false;
+    }
+    return qsa_use_indexed(inp, n_tps, il, /*vis =*/ true);
+}
+
+// [TAG_QSA_INDEXED_FA] build_qsa_scan's attention without the scan: flash attention reads K, V and the mask through
+// the ids, so each query touches only its W cells. Same live cells and logits (spec §2); E1 class.
+ggml_tensor * llama_model_qwen4exp::graph::build_qsa_indexed(llm_graph_input_attn_kv * inp, ggml_tensor * q_cur,
+        ggml_tensor * top_k, float kq_scale, int il, ggml_tensor * kq_mask_chunk, ggml_tensor * vis_toks) {
+    if (llama_qsa_whole_blocks() && top_k->ne[0] > 1) {
+        // [TAG_QSA_WHOLE_BLOCKS] the padding repeats become dead columns (qwen4exp_qsa_mask_repeats)
+        top_k = qwen4exp_qsa_mask_repeats(ctx0, top_k);
+        cb(top_k, "indexer_top_k_dedup", il);
+    }
+    if (qwen4exp_qsa_indexed_sort()) {
+        top_k = qwen4exp_qsa_sort_ids(ctx0, top_k); // [TAG_QSA_INDEXED_SORT]
+        cb(top_k, "indexer_top_k_sorted", il);
+    }
+    if (vis_toks) {
+        // [TAG_QSA_VIS] the mask of column c is the metadata's value at cell ids[c]: no plane, no chunk rows
+        return build_attn_mha(q_cur, inp->mctx->get_k(ctx0, il), inp->mctx->get_v(ctx0, il), nullptr, nullptr, nullptr, nullptr,
+                kq_scale, il, top_k, inp->self_kq_vis_cells, vis_toks);
+    }
+    ggml_tensor * kq_mask = kq_mask_chunk ? kq_mask_chunk : inp->get_kq_mask();
+    return build_attn_mha(q_cur, inp->mctx->get_k(ctx0, il), inp->mctx->get_v(ctx0, il), nullptr, kq_mask, nullptr, nullptr,
+            kq_scale, il, top_k);
+}
+
 // [TAG_QSA_CHUNK] the scan branch, one query chunk at a time. For each chunk, in program order:
 // the indexer score and selection of its queries (build_qsa_select over a view of the indexer q and
 // the chunk's rows of the bias and the mask, gathered on the device), then its scan attention
@@ -1997,9 +2232,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
 
     ggml_tensor * kq_mask = prep.kq_mask;   // [n_kv, n_tps, 1, n_stream]
 
-    // one zero source per layer, sized for the longest chunk; each chunk reads a view of it
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, width, n_max, n_stream);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    // [TAG_QSA_VIS] the ubatch reads the metadata (qsa_use_vis, decided in build_layer_attn): no chunk mask rows, the token
+    // records of the chunk's rows instead; the per-block bias is required (without it the chunk keeps the plane rows)
+    const bool vis = prep.vis_cells != nullptr && prep.vis_toks != nullptr && prep.blk_bias;
+
+    // [TAG_QSA_INDEXED_FA] decided once for the ubatch (n_tps > C >= 64), so a CHUNK_PAD tail of <= 8 queries is indexed too
+    // ([TAG_QSA_VIS] qsa_use_vis includes the indexed rule over the metadata)
+    const bool indexed = vis || qsa_use_indexed(inp, n_tps, il);
+
+    // one zero source per layer, sized for the longest chunk; each chunk reads a view of it (the scan only)
+    ggml_tensor * zeros = nullptr;
+    if (!indexed) {
+        zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, width, n_max, n_stream);
+        zeros = ggml_fill(ctx0, zeros, 0.0f);
+    }
 
     ggml_tensor * out = nullptr;
 
@@ -2045,7 +2291,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
 
         // [n_kv, np, 1, n_stream], back in the mask's own type
         ggml_tensor * mask_c = nullptr;
-        if (kq_mask->type == GGML_TYPE_F16 && qwen4exp_qsa_gather_keeps(kq_mask->type)) {
+        // [TAG_QSA_VIS] [4, np, n_stream] I32: the chunk's token records (the CHUNK_PAD rows repeat the last query's), for
+        // the selection and - cut to the nc real rows - the indexed flash attention
+        ggml_tensor * toks_c = nullptr;
+        if (vis) {
+            toks_c = ggml_get_rows(ctx0, prep.vis_toks, rows);
+            cb(toks_c, "qsa_vis_toks_c", il);
+        } else if (kq_mask->type == GGML_TYPE_F16 && qwen4exp_qsa_gather_keeps(kq_mask->type)) {
             // [TAG_QSA_GATHER_Q8] gathered as f16 rows, no f32 transient and no cast
             mask_c = ggml_get_rows_type(ctx0, kq_mask, ggml_reshape_3d(ctx0, rows, np, 1, n_stream), kq_mask->type);
         } else {
@@ -2056,7 +2308,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
         }
 
         ggml_tensor * top_k = build_qsa_select(prep.inp, prep.pooled, q_idx, bias_c, mask_c, width, prep.blk_bias, il,
-                prep.pool_store, prep.pool_remap);
+                prep.pool_store, prep.pool_remap, vis ? prep.vis_cells : nullptr, toks_c);
 
         if (np > nc) {
             // [TAG_QSA_CHUNK_PAD] THE CUT: from here on only the nc real queries exist - the ids and the mask rows
@@ -2064,7 +2316,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
             // and no output. The padded selection is renamed so LLAMA_QSA_DUMP_IDS hashes the cut ids instead.
             ggml_format_name(top_k, "indexer_top_k_pad-%d", il);
             top_k = ggml_view_4d(ctx0, top_k, width, nc, 1, n_stream, top_k->nb[1], top_k->nb[2], top_k->nb[3], 0);
-            mask_c = ggml_view_4d(ctx0, mask_c, mask_c->ne[0], nc, 1, n_stream, mask_c->nb[1], mask_c->nb[2], mask_c->nb[3], 0);
+            if (vis) {
+                // [TAG_QSA_VIS] the attention's token records: the first nc rows of each stream
+                toks_c = ggml_view_3d(ctx0, toks_c, 4, nc, n_stream, toks_c->nb[1], toks_c->nb[2], 0);
+                if (!ggml_is_contiguous(toks_c)) {
+                    toks_c = ggml_cont(ctx0, toks_c);
+                }
+            } else {
+                mask_c = ggml_view_4d(ctx0, mask_c, mask_c->ne[0], nc, 1, n_stream, mask_c->nb[1], mask_c->nb[2], mask_c->nb[3], 0);
+            }
             if (!ggml_is_contiguous(top_k)) {
                 // more than one stream: the real columns of each stream are apart. The mask cont is an
                 // [n_kv, nc, 1, n_stream] f16 transient next to the padded rows. Measured (M4.3 fix round 1, reserve
@@ -2072,7 +2332,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
                 // stream): the knob costs +379.29 MiB there (2378.59 -> 2757.88), this cont ([196608, 154, 5] f16 =
                 // 288.8 MiB) being most of it. With a unified cache (n_stream = 1, deployed) both are views: +3.09 MiB.
                 top_k  = ggml_cont(ctx0, top_k);
-                mask_c = ggml_cont(ctx0, mask_c);
+                if (mask_c) {
+                    mask_c = ggml_cont(ctx0, mask_c);
+                }
             }
             cb(top_k, "indexer_top_k", il);
         }
@@ -2088,11 +2350,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
             q_att = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q_att), q_cur->ne[0], q_cur->ne[1], nc*n_stream);
         }
 
-        ggml_tensor * zeros_c = ggml_view_4d(ctx0, zeros, 1, width, nc, n_stream,
-                zeros->nb[1], zeros->nb[2], zeros->nb[3], 0);
-
         // [n_embd_head_v*n_head, nc*n_stream], stream-major
-        ggml_tensor * o = build_qsa_scan(inp, q_att, top_k, kq_scale, il, mask_c, zeros_c);
+        ggml_tensor * o = nullptr;
+        if (indexed) {
+            // the ids are this chunk's own QSA_TOP_K output (or the CHUNK_PAD cut: a view at offset 0, or its cont)
+            o = build_qsa_indexed(inp, q_att, top_k, kq_scale, il, mask_c, toks_c); // toks_c: [TAG_QSA_VIS], else NULL
+        } else {
+            ggml_tensor * zeros_c = ggml_view_4d(ctx0, zeros, 1, width, nc, n_stream,
+                    zeros->nb[1], zeros->nb[2], zeros->nb[3], 0);
+            o = build_qsa_scan(inp, q_att, top_k, kq_scale, il, mask_c, zeros_c);
+        }
         o = ggml_reshape_3d(ctx0, o, o->ne[0], nc, n_stream);
 
         out = out ? ggml_concat(ctx0, out, o, 1) : o;
@@ -2113,7 +2380,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
         ggml_tensor *             q_cur,
         ggml_tensor *             top_k,
         float                     kq_scale,
-        int                       il) {
+        int                       il,
+        bool                      vis) {
     const auto * mctx_cur = inp->mctx;
 
     const int64_t width    = top_k->ne[0];
@@ -2155,21 +2423,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
 
     // gathering the attention mask at the selected cells leaves the same values the scan path
     // would put there, so the window carries the reach of its query
-    ggml_tensor * kq_mask = inp->get_kq_mask();
-
-    GGML_ASSERT(kq_mask->nb[3] == kq_mask->nb[1]*n_tps);
-
-    ggml_tensor * mask_cells = ggml_view_3d(ctx0, kq_mask, 1, n_kv, n_q,
-            kq_mask->nb[0], kq_mask->nb[1], 0);
-
     ggml_tensor * idx_query = ggml_reshape_3d(ctx0, top_k, width, n_q, 1);
 
     ggml_tensor * mask = nullptr;
-    if (kq_mask->type == GGML_TYPE_F16 && qwen4exp_qsa_gather_keeps(kq_mask->type)) {
+    ggml_tensor * kq_mask = vis ? nullptr : inp->get_kq_mask();
+    if (vis) {
+        // [TAG_QSA_VIS] the same f16 values straight from the metadata at the ids: [width, 1, 1, n_q], no plane
+        mask = ggml_kq_mask_ids(ctx0, inp->self_kq_vis_cells, inp->self_kq_vis_toks, top_k, GGML_TYPE_F16,
+                cparams.causal_attn, hparams.use_alibi, (int32_t) LLAMA_SWA_TYPE_NONE, 0);
+    } else if (kq_mask->type == GGML_TYPE_F16 && qwen4exp_qsa_gather_keeps(kq_mask->type)) {
+        GGML_ASSERT(kq_mask->nb[3] == kq_mask->nb[1]*n_tps);
+
+        ggml_tensor * mask_cells = ggml_view_3d(ctx0, kq_mask, 1, n_kv, n_q,
+                kq_mask->nb[0], kq_mask->nb[1], 0);
+
         // [TAG_QSA_GATHER_Q8] f16 cells gathered as f16: flash attention's mask type, no cast
         mask = ggml_get_rows_type(ctx0, mask_cells, idx_query, kq_mask->type);
         mask = ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q);
     } else {
+        GGML_ASSERT(kq_mask->nb[3] == kq_mask->nb[1]*n_tps);
+
+        ggml_tensor * mask_cells = ggml_view_3d(ctx0, kq_mask, 1, n_kv, n_q,
+                kq_mask->nb[0], kq_mask->nb[1], 0);
+
         mask = ggml_get_rows(ctx0, mask_cells, idx_query);
         mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q), GGML_TYPE_F16);
     }
@@ -2223,6 +2499,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // Keep the indexer K write (cache_only), run the dense build_attn().
     bool qsa_exhaustive = false;
 
+    if (qsa) {
+        // [TAG_QSA_INDEXED_FA] read and log LLAMA_QSA_PREFILL at the first QSA layer (the reserve), whatever branch it takes
+        qwen4exp_qsa_prefill_indexed();
+        qwen4exp_qsa_indexed_sort(); // [TAG_QSA_INDEXED_SORT] and its sort knob, after it
+        if (qwen4exp_qsa_vis() && inp->self_kq_vis_cells == nullptr) { // [TAG_QSA_VIS] and its knob
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                LLAMA_LOG_WARN("%s: LLAMA_QSA_VIS=1 without the KQ_VIS metadata inputs (LLAMA_KQ_VIS=1, n_seq_max <= 32): "
+                        "the QSA layers keep the KQ mask plane\n", __func__);
+            }
+        }
+    }
+
     if (qsa && (qwen4exp_qsa_bypass_exhaustive() || qwen4exp_qsa_min_kv() > 0)) {
         // same expression as build_qsa_top_k()'s `width`, over the same n_kv
         const int64_t n_kv_idx = mctx_hyb->get_idx()->get_n_kv();
@@ -2260,8 +2549,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         prep.chunk = qwen4exp_qsa_chunk();
     }
 
+    // [TAG_QSA_VIS] (A4) the ubatch's QSA consumers read the metadata, no [n_kv x n_tps] plane (qwen4exp_qsa_vis)
+    const bool qsa_vis = qsa && !qsa_exhaustive && qsa_use_vis(inp, n_tokens/mctx_hyb->get_n_stream(), il);
+
     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, qsa_exhaustive,
-            chunked ? &prep : nullptr) : nullptr;
+            chunked ? &prep : nullptr,
+            qsa_vis ? inp->self_kq_vis_cells : nullptr, qsa_vis ? inp->self_kq_vis_toks : nullptr) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
@@ -2316,7 +2609,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     if (chunked) {
         cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, nullptr, kq_scale, il, &prep);
     } else if (top_k) {
-        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, kq_scale, il);
+        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, kq_scale, il, nullptr, qsa_vis);
     } else {
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
