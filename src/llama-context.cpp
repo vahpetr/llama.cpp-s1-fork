@@ -79,6 +79,9 @@ static const char * sched_prof_ctx_name(llama_context_type ctx_type) {
 // plan_avg = plan_us/n_plan, plan_inc = plans whose every stream took the incremental fast path, cen_inc / cen_full =
 // stream censuses fast / full, fb = the full ones by reason: mark (a mutator's full-census mark or the first plan), shape
 // (> 1 sequence, ranked / dup, oor), shrink (n_kv shrank), region (re-grouped region too large)
+// [TAG_QSA_INPUTS_INC] then (appended) qin_us mir_kib mir_runs mir_full: qin_us = time in the QSA store inputs'
+// set_input (inside inputs_us; either mode), mir_kib / mir_runs / mir_full = KiB and runs written to the device-resident
+// input mirrors and the (array, stream) writes of a whole array (all 0 without LLAMA_QSA_INPUTS_INC=1)
 // per graph: build = process_ubatch() start .. set_inputs (apply, reuse check, build + alloc); inputs = all set_inputs;
 // fill = the KQ mask / metadata fill inside it; compute = graph_compute() host time, which contains the scheduler's
 // user-input uploads (in_wait = the synchronize before each upload, in_copy = the uploads, kq_copy/kq_kib = the
@@ -103,14 +106,16 @@ void llama_context::kqvis_prof_flush(const char * reason) const {
                 " kq_kib=%" PRId64 " compute_us=%" PRId64 " compute_avg=%.1f sync_us=%" PRId64 " sync_avg=%.1f n_sync=%" PRId64
                 " t0_ms=%" PRId64 " t1_ms=%" PRId64
                 " plan_us=%" PRId64 " n_plan=%" PRId64 " plan_avg=%.1f plan_inc=%" PRId64 " cen_inc=%" PRId64
-                " cen_full=%" PRId64 " fb=%" PRId64 "/%" PRId64 "/%" PRId64 "/%" PRId64 "\n",
+                " cen_full=%" PRId64 " fb=%" PRId64 "/%" PRId64 "/%" PRId64 "/%" PRId64
+                " qin_us=%" PRId64 " mir_kib=%" PRId64 " mir_runs=%" PRId64 " mir_full=%" PRId64 "\n",
                 sched_prof_ctx_name(cparams.ctx_type), mode_name[w.mode & 3], w.cls == 1 ? "pp" : "dec", kqvis_n_win, reason,
                 w.graphs, w.reused, w.tokens, w.n_kv_min, w.n_kv_max, w.n_kv_sum/g, w.build_us, w.inputs_us,
                 w.fill_us, w.fill_us/g, w.in_wait_us, w.in_copy_us, w.kq_copy_us,
                 w.kq_bytes/1024, w.compute_us, w.compute_us/g, w.sync_us, w.sync_us/g, w.n_sync,
                 w.t0_ms, w.t1_ms,
                 w.plan_us, w.n_plan, w.n_plan > 0 ? (double) w.plan_us/w.n_plan : 0.0, w.n_plan_inc, w.n_cen_inc,
-                w.n_cen_full, w.n_cen_fb[1], w.n_cen_fb[2], w.n_cen_fb[3], w.n_cen_fb[4]);
+                w.n_cen_full, w.n_cen_fb[1], w.n_cen_fb[2], w.n_cen_fb[3], w.n_cen_fb[4],
+                w.qin_us, w.mir_bytes/1024, w.mir_runs, w.mir_full);
         kqvis_n_win++;
     }
     kqvis_win = kqvis_prof_window();
@@ -1797,6 +1802,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    // [TAG_QSA_INPUTS_INC] the QSA input mirrors are device tensors written in place by set_inputs (a host-visible buffer
+    // is a plain memcpy): the previous graph of this context must be done reading them
+    if (llama_qsa_inputs_inc()) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+
     // [TAG_KQVIS_PROF]
     int64_t kq_t_inputs_us = 0;
     if (kqprof) {
@@ -1880,6 +1891,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             for (int k = 0; k < 5; ++k) {
                 w.n_cen_fb[k] += (int64_t) (p1.n_cen_fb[k] - kq_plan0.n_cen_fb[k]);
             }
+            w.qin_us    += (int64_t) (p1.t_inputs_us - kq_plan0.t_inputs_us);
+            w.mir_bytes += (int64_t) (p1.mir_bytes   - kq_plan0.mir_bytes);
+            w.mir_runs  += (int64_t) (p1.mir_runs    - kq_plan0.mir_runs);
+            w.mir_full  += (int64_t) (p1.mir_full    - kq_plan0.mir_full);
         }
         g_kqvis_last_us.store(t_now_us);
     }

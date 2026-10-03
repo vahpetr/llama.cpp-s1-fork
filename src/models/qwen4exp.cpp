@@ -1678,11 +1678,33 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
             qsa->pooled_cache = true;
 
-            qsa->cell_blk    = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-            if (compact) {
-                build_qsa_compact_inputs(qsa.get(), n_blocks, n_tps, n_stream);
+            // [TAG_QSA_INPUTS_INC] cell_blk, remap and the block table are views of the store's device mirrors, written
+            // in place by set_input (only what changed); a compact graph only, the condition set_input_qsa_store tests
+            const bool mir = store->mir_on && compact;
+
+            if (mir) {
+                using store_t = llama_qsa_pooled_store;
+
+                GGML_ASSERT(n_kv*n_stream <= ggml_nelements(store->mir_t[store_t::MIR_CELL_BLK]) &&
+                            2*n_blocks*n_stream <= ggml_nelements(store->mir_t[store_t::MIR_BTAB]));
+
+                qsa->cell_blk = ggml_view_2d(ctx0, store->mir_t[store_t::MIR_CELL_BLK], n_kv, n_stream,
+                        n_kv*sizeof(int32_t), 0);
+
+                qsa->compact = true;
+                qsa->qsa_blk = ggml_view_3d(ctx0, store->mir_t[store_t::MIR_BTAB], 2, n_blocks, n_stream,
+                        2*sizeof(int32_t), 2*n_blocks*sizeof(int32_t), 0);
+                qsa->qsa_qry = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 2, n_tps, n_stream);
+
+                ggml_set_name (qsa->qsa_qry, "qsa_qry");
+                ggml_set_input(qsa->qsa_qry);
             } else {
-                qsa->bias    = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+                qsa->cell_blk    = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+                if (compact) {
+                    build_qsa_compact_inputs(qsa.get(), n_blocks, n_tps, n_stream);
+                } else {
+                    qsa->bias    = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+                }
             }
             qsa->dirty_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*cap, n_stream);
             qsa->dirty_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*cap*n_stream);
@@ -1694,7 +1716,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_name(qsa->dirty_cells, "qsa_dirty_cells");
             ggml_set_name(qsa->dirty_pos,   "qsa_dirty_pos");
 
-            ggml_set_input(qsa->cell_blk);
+            if (!mir) {
+                ggml_set_input(qsa->cell_blk);
+            }
             if (!compact) {
                 ggml_set_input(qsa->bias);
             }
@@ -1703,12 +1727,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
             if (cap < n_blocks) {
                 qsa->dirty_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, cap*n_stream);
-                qsa->remap     = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks*n_stream);
+                if (mir) {
+                    GGML_ASSERT(n_blocks*n_stream <= ggml_nelements(store->mir_t[llama_qsa_pooled_store::MIR_REMAP]));
+                    qsa->remap = ggml_view_1d(ctx0, store->mir_t[llama_qsa_pooled_store::MIR_REMAP], n_blocks*n_stream, 0);
+                } else {
+                    qsa->remap = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks*n_stream);
+                }
 
                 ggml_set_name (qsa->dirty_dst, "qsa_dirty_dst");
                 ggml_set_name (qsa->remap,     "qsa_remap");
                 ggml_set_input(qsa->dirty_dst);
-                ggml_set_input(qsa->remap);
+                if (!mir) {
+                    ggml_set_input(qsa->remap);
+                }
             } else {
                 // the full pool (a cold rebuild, and every reserve graph): the recompute's leaves exactly
                 qsa->full_s0 = mctx_hyb->qsa_store_s0();

@@ -436,6 +436,7 @@ private:
         // [TAG_QSA_CENSUS_INC] the QSA store plans of the window (deltas of llama_qsa_pooled_store::stats)
         int64_t  plan_us = 0, n_plan = 0, n_plan_inc = 0, n_cen_inc = 0, n_cen_full = 0;
         int64_t  n_cen_fb[5] = {};
+        int64_t  qin_us = 0, mir_bytes = 0, mir_runs = 0, mir_full = 0; // [TAG_QSA_INPUTS_INC]
     };
     mutable kqvis_prof_window kqvis_win;
     mutable int64_t           kqvis_n_win = 0;

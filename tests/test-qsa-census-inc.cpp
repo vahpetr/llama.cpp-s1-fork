@@ -63,6 +63,66 @@ static bool drop_redundant(int d) { return d == DROP_CP; }
 
 static drop_t g_drop = DROP_NONE;
 
+// [TAG_QSA_INPUTS_INC] negative control of the input mirrors: drop the change hints before every mirror update
+static bool g_drop_mir = false;
+
+// [TAG_QSA_INPUTS_INC] the device mirrors as host arrays (poisoned, so a missing write shows)
+struct mirror_sim : llama_qsa_mirror_writer {
+    std::vector<int32_t> a[llama_qsa_pooled_store::MIR_COUNT];
+    uint64_t bytes = 0;
+    void init(uint32_t kv_size, uint32_t n_slots, uint32_t n_stream) {
+        a[llama_qsa_pooled_store::MIR_CELL_BLK].assign((size_t) kv_size*n_stream, 0x5A5A5A5A);
+        a[llama_qsa_pooled_store::MIR_REMAP]   .assign((size_t) n_slots*n_stream, 0x5A5A5A5A);
+        a[llama_qsa_pooled_store::MIR_BTAB]    .assign((size_t) 2*n_slots*n_stream, 0x5A5A5A5A);
+    }
+    void write(int arr, int64_t off, const int32_t * src, int64_t n) override {
+        if (off < 0 || n < 0 || (size_t) (off + n) > a[arr].size()) {
+            fprintf(stderr, "mirror write out of range: arr %d off %lld n %lld size %zu\n", arr, (long long) off,
+                    (long long) n, a[arr].size());
+            abort();
+        }
+        memcpy(a[arr].data() + off, src, (size_t) n*sizeof(int32_t));
+        bytes += (uint64_t) n*sizeof(int32_t);
+    }
+};
+
+// the mirrors after an update vs the full fill of plan `pl` (cell_blk / remap views, the block table from the census);
+// "" when identical
+static std::string mirror_compare(const mirror_sim & m, const llama_qsa_plan & pl,
+                                  const std::vector<const llama_kv_cells *> & cells, bool tail_fix, bool with_remap) {
+    const int64_t n_kv = pl.n_kv, n_blocks = pl.n_blocks;
+    std::vector<int32_t> ref;
+    char buf[256];
+    for (int64_t s = 0; s < pl.n_ns; ++s) {
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (m.a[llama_qsa_pooled_store::MIR_CELL_BLK][s*n_kv + j] != pl.v_cell_blk[s][j]) {
+                snprintf(buf, sizeof(buf), "mirror cell_blk s %lld [%lld]: %d vs full %d", (long long) s, (long long) j,
+                         m.a[llama_qsa_pooled_store::MIR_CELL_BLK][s*n_kv + j], pl.v_cell_blk[s][j]);
+                return buf;
+            }
+        }
+        if (with_remap) {
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                if (m.a[llama_qsa_pooled_store::MIR_REMAP][s*n_blocks + b] != pl.v_remap[s][b]) {
+                    snprintf(buf, sizeof(buf), "mirror remap s %lld [%lld]: %d vs full %d", (long long) s, (long long) b,
+                             m.a[llama_qsa_pooled_store::MIR_REMAP][s*n_blocks + b], pl.v_remap[s][b]);
+                    return buf;
+                }
+            }
+        }
+        ref.assign(2*n_blocks, 0);
+        llama_qsa_fill_blk_tab(*cells[s], *pl.v_cs[s], n_blocks, 0, n_blocks, tail_fix, ref.data());
+        for (int64_t i = 0; i < 2*n_blocks; ++i) {
+            if (m.a[llama_qsa_pooled_store::MIR_BTAB][s*2*n_blocks + i] != ref[i]) {
+                snprintf(buf, sizeof(buf), "mirror qsa_blk s %lld [%lld]: %d vs full %d", (long long) s, (long long) i,
+                         m.a[llama_qsa_pooled_store::MIR_BTAB][s*2*n_blocks + i], ref[i]);
+                return buf;
+            }
+        }
+    }
+    return "";
+}
+
 static void store_init(llama_qsa_pooled_store & st, uint32_t r, uint32_t kv_size, uint32_t n_stream, bool inc) {
     st.ratio    = r;
     st.idx_dim  = 1;
@@ -79,6 +139,7 @@ static void store_init(llama_qsa_pooled_store & st, uint32_t r, uint32_t kv_size
         ss.slot_seen  .assign(st.n_slots,  0);
     }
     st.inc = inc;
+    st.mir_on = inc;   // [TAG_QSA_INPUTS_INC] the inc store also keeps the mirror hints (no device tensors here)
     st.reset_all();
     st.stats = llama_qsa_pooled_store::stats_t();
 }
@@ -146,6 +207,11 @@ struct world {
     uint64_t n_plans = 0, n_cmp_fail = 0, n_fast_partial = 0; // n_fast_partial: fast stream censuses in non-full-pool plans
     std::string first_fail;
 
+    // [TAG_QSA_INPUTS_INC]
+    mirror_sim mir;
+    bool       tail_fix = true;
+    uint64_t   n_mir = 0, n_mir_skip = 0;
+
     world(rng_t & rng_, uint32_t r_, uint32_t kv_, uint32_t ns_, uint32_t pad_, int n_seq_, bool wb) :
         rng(rng_), r(r_), kv_size(kv_), n_stream(ns_), pad(pad_), unified(ns_ == 1), n_seq(n_seq_), whole_blocks(wb) {
         cells.resize(n_stream);
@@ -158,6 +224,8 @@ struct world {
         store_init(st_inc,  r, kv_size, n_stream, true);
         store_init(st_full, r, kv_size, n_stream, false);
         st_ref.init(r, kv_size, n_stream);
+        mir.init(kv_size, st_inc.n_slots, n_stream);
+        tail_fix = rng.p(0.7);
     }
 
     uint32_t strm_of(int seq) const { return unified ? 0 : (uint32_t) seq; }
@@ -475,6 +543,27 @@ struct world {
         for (uint32_t s = s0; s <= s1 && d.empty(); ++s) {
             d = llama_qsa_census_state_check(st_inc, s, cells[s]);
         }
+
+        // [TAG_QSA_INPUTS_INC] the set_input of a compact graph (blk_bias) - or not: a graph rebuilt cache-only, or a
+        // plan replaced before its graph ran, leaves the hints to the next update
+        if (d.empty() && !oor && rng.p(0.85)) {
+            if (g_drop_mir) {
+                for (uint32_t s = s0; s <= s1; ++s) {
+                    auto & C = st_inc.strm[s].cen;
+                    C.mir_cb.clear();
+                    C.mir_rm_lo = INT64_MAX;
+                    C.mir_bt_lo = INT64_MAX;
+                }
+            }
+            llama_qsa_mirror_update(st_inc, pi, cv, tail_fix, !pi.full, true, mir);
+            n_mir++;
+            d = mirror_compare(mir, pi, cv, tail_fix, !pi.full);
+            if (!d.empty()) {
+                d = "[inputs mirror vs full fill] " + d;
+            }
+        } else if (d.empty()) {
+            n_mir_skip++;
+        }
         if (!d.empty()) {
             n_cmp_fail++;
             if (first_fail.empty()) {
@@ -488,6 +577,7 @@ struct world {
 
 struct totals_t {
     uint64_t seqs = 0, plans = 0, fails = 0, ops = 0;
+    uint64_t mir = 0, mir_skip = 0, mir_bytes = 0, mir_full = 0, mir_inc = 0, mir_runs = 0;
     uint64_t cen_inc = 0, cen_full = 0, fb[LLAMA_QSA_CEN_FB_COUNT] = {};
     uint64_t full_pool = 0, fast_partial = 0;
     std::string first_fail;
@@ -601,6 +691,12 @@ static bool run_sequence(rng_t & rng, bool whole_blocks, totals_t & tot) {
     tot.cen_full += w.st_inc.stats.n_cen_full;
     tot.full_pool += w.st_inc.stats.n_full;
     tot.fast_partial += w.n_fast_partial;
+    tot.mir       += w.n_mir;
+    tot.mir_skip  += w.n_mir_skip;
+    tot.mir_bytes += w.st_inc.stats.mir_bytes;
+    tot.mir_full  += w.st_inc.stats.mir_full;
+    tot.mir_inc   += w.st_inc.stats.mir_inc;
+    tot.mir_runs  += w.st_inc.stats.mir_runs;
     for (int k = 0; k < LLAMA_QSA_CEN_FB_COUNT; ++k) {
         tot.fb[k] += w.st_inc.stats.n_cen_fb[k];
     }
@@ -629,6 +725,13 @@ static int run_fuzz(uint64_t n_seq, uint64_t seed, bool quiet) {
                ", whole_blocks=%d\n",
                tot.seqs, n_seq, tot.plans, tot.ops, tot.cen_inc, tot.cen_full, tot.fb[1], tot.fb[2], tot.fb[3], tot.fb[4],
                tot.full_pool, tot.fast_partial, wb ? 1 : 0);
+        printf("inputs: %" PRIu64 " mirror updates compared with the full fill (%" PRIu64 " plans left without one), "
+               "%" PRIu64 " whole-array / %" PRIu64 " incremental (array, stream) writes, %" PRIu64 " runs, %" PRIu64 " KiB\n",
+               tot.mir, tot.mir_skip, tot.mir_full, tot.mir_inc, tot.mir_runs, tot.mir_bytes/1024);
+    }
+    if (tot.mir_inc == 0 || tot.mir_full == 0) {
+        fprintf(stderr, "FAIL: the fuzz did not exercise both mirror write paths\n");
+        return 1;
     }
     if (tot.cen_inc == 0 || tot.cen_full == 0 || tot.fast_partial == 0) {
         fprintf(stderr, "FAIL: the fuzz did not exercise both census paths\n");
@@ -645,13 +748,18 @@ static int run_neg(uint64_t n_seq, uint64_t seed) {
     return 0;
 #else
     int bad = 0;
-    for (int d = DROP_RM; d < DROP_COUNT; ++d) {
+    // d == DROP_COUNT: [TAG_QSA_INPUTS_INC] the input mirrors' change hints
+    for (int d = DROP_RM; d <= DROP_COUNT; ++d) {
         fflush(stdout);
         const pid_t pid = fork();
         if (pid == 0) {
             // silence the child's abort message
             if (freopen("/dev/null", "w", stderr) == nullptr) { _exit(3); }
-            g_drop = (drop_t) d;
+            if (d == DROP_COUNT) {
+                g_drop_mir = true;
+            } else {
+                g_drop = (drop_t) d;
+            }
             _exit(run_fuzz(n_seq, seed, true) == 0 ? 0 : 1);
         }
         int status = 0;
@@ -659,10 +767,10 @@ static int run_neg(uint64_t n_seq, uint64_t seed) {
         const bool exited = WIFEXITED(status);
         const int  code   = exited ? WEXITSTATUS(status) : -1;
         const bool caught = !exited || code != 0;
-        printf("neg: drop the %-11s mark -> %s (%s)%s\n", drop_name[d], caught ? "DETECTED" : "NOT DETECTED",
-               exited ? (code == 0 ? "exit 0" : "mismatch") : "abort",
-               drop_redundant(d) ? " [redundant by design: the one-sequence check / the stream reset cover it]" : "");
-        bad += (caught || drop_redundant(d)) ? 0 : 1;
+        printf("neg: drop the %-11s mark -> %s (%s)%s\n", d == DROP_COUNT ? "inputs-hint" : drop_name[d],
+               caught ? "DETECTED" : "NOT DETECTED", exited ? (code == 0 ? "exit 0" : "mismatch") : "abort",
+               d < DROP_COUNT && drop_redundant(d) ? " [redundant by design: the one-sequence check / the stream reset cover it]" : "");
+        bad += (caught || (d < DROP_COUNT && drop_redundant(d))) ? 0 : 1;
     }
     return bad == 0 ? 0 : 1;
 #endif
@@ -711,6 +819,16 @@ static void run_bench(int64_t n_cells, uint64_t seed) {
         if (mode == 0) { llama_qsa_plan_full(st, in, pl); } else { llama_qsa_plan_inc(st, in, pl); }
         st.pending_armed = true; st.publish(true);
 
+        // [TAG_QSA_INPUTS_INC]
+        std::vector<int32_t> full_cb(n_cells), full_rm(n_cells/r + 1), full_bt(2*(n_cells/r + 1));
+        mirror_sim msim;
+        msim.init((uint32_t) n_cells, st.n_slots, 1);
+        if (mode == 1) {
+            llama_qsa_mirror_update(st, pl, { &cells }, true, !pl.full, true, msim);
+        }
+        double   in_us    = 0;
+        uint64_t in_bytes = 0;
+
         llama_pos pos = (llama_pos) fill;
         uint32_t  head = (uint32_t) fill;
         const int n_round = 200;
@@ -739,6 +857,24 @@ static void run_bench(int64_t n_cells, uint64_t seed) {
             const auto t1 = std::chrono::steady_clock::now();
             t_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
             n_plans++;
+
+            // [TAG_QSA_INPUTS_INC] the host side of the inputs: full = memcpy of cell_blk + remap + the whole block table
+            // (today's set_input_qsa_store), inc = the mirror update (sorted runs, partial table fill) into host arrays
+            {
+                const auto u0 = std::chrono::steady_clock::now();
+                if (mode == 0) {
+                    memcpy(full_cb.data(), pl.v_cell_blk[0], pl.n_kv*sizeof(int32_t));
+                    if (!pl.full) { memcpy(full_rm.data(), pl.v_remap[0], pl.n_blocks*sizeof(int32_t)); }
+                    llama_qsa_fill_blk_tab(cells, *pl.v_cs[0], pl.n_blocks, 0, pl.n_blocks, true, full_bt.data());
+                    in_bytes += (pl.n_kv + (pl.full ? 0 : pl.n_blocks) + 2*pl.n_blocks)*sizeof(int32_t);
+                } else {
+                    const uint64_t b0 = st.stats.mir_bytes;
+                    llama_qsa_mirror_update(st, pl, { &cells }, true, !pl.full, true, msim);
+                    in_bytes += st.stats.mir_bytes - b0;
+                }
+                const auto u1 = std::chrono::steady_clock::now();
+                in_us += std::chrono::duration<double, std::micro>(u1 - u0).count();
+            }
             st.pending_armed = true; st.publish(true);
 
             // rollback: accept a of n
@@ -750,8 +886,10 @@ static void run_bench(int64_t n_cells, uint64_t seed) {
             st.inc_mark_pos(0, pos + a);
             pos += a;
         }
-        printf("bench: n_cells %7" PRId64 " r %u  %-4s  %8.1f us/plan  (%d plans; fast stream censuses %" PRIu64 ")\n",
-               n_cells, r, mode == 0 ? "full" : "inc", t_us/n_plans, n_plans, st.stats.n_cen_inc);
+        printf("bench: n_cells %7" PRId64 " r %u  %-4s  %8.1f us/plan  (%d plans; fast stream censuses %" PRIu64 ")"
+               "  inputs host %8.1f us/graph, %10.1f bytes/graph written\n",
+               n_cells, r, mode == 0 ? "full" : "inc", t_us/n_plans, n_plans, st.stats.n_cen_inc, in_us/n_plans,
+               (double) in_bytes/n_plans);
     }
 }
 

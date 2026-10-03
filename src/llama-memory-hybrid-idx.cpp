@@ -145,6 +145,24 @@ bool llama_qsa_census_check() {
     return llama_qsa_census_inc() && llama_qsa_census_check_env();
 }
 
+// [TAG_QSA_INPUTS_INC] LLAMA_QSA_INPUTS_INC (see the header); the store decides whether its prerequisites hold
+static bool llama_qsa_inputs_inc_env() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_INPUTS_INC");
+        const int    v = llama_qsa_census_inc_parse(s);
+        if (v < 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_INPUTS_INC=%s is neither 0 nor 1: using 0\n", __func__, s);
+        }
+        return v == 1;
+    }();
+
+    return enabled;
+}
+
+bool llama_qsa_inputs_inc() {
+    return llama_qsa_inputs_inc_env();
+}
+
 // [TAG_QSA_COMPACT_BIAS] LLAMA_QSA_COMPACT_BIAS=1: read once per memory, like LLAMA_QSA_POOLED_CACHE, so the replay
 // probe can run both arms in one process
 static bool llama_qsa_compact_bias_env() {
@@ -499,6 +517,68 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     // [TAG_QSA_CENSUS_INC] read (and prove) the census mode at load
     st->inc = llama_qsa_census_inc();
 
+    // [TAG_QSA_INPUTS_INC] the device-resident input mirrors, next to the first QSA layer's store
+    if (llama_qsa_inputs_inc_env()) {
+        if (!st->inc || !qsa_compact) {
+            LLAMA_LOG_WARN("%s: qsa_inputs = full (LLAMA_QSA_INPUTS_INC=1 ignored: needs %s)\n", __func__,
+                    !st->inc ? "LLAMA_QSA_CENSUS_INC=1" : "LLAMA_QSA_COMPACT_BIAS=1 (and n_seq_max <= 32)");
+        } else {
+            ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+            if (offload) {
+                buft = ggml_backend_dev_buffer_type(model.dev_layer(ils[0]));
+            }
+
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(4u*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                throw std::runtime_error("failed to create ggml context for the QSA input mirrors");
+            }
+
+            const int64_t ns = st->n_stream;
+
+            st->mir_t[llama_qsa_pooled_store::MIR_CELL_BLK] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) st->kv_size*ns);
+            st->mir_t[llama_qsa_pooled_store::MIR_REMAP]    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) st->n_slots*ns);
+            st->mir_t[llama_qsa_pooled_store::MIR_BTAB]     = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2*(int64_t) st->n_slots*ns);
+            ggml_set_name(st->mir_t[llama_qsa_pooled_store::MIR_CELL_BLK], "qsa_mir_cell_blk");
+            ggml_set_name(st->mir_t[llama_qsa_pooled_store::MIR_REMAP],    "qsa_mir_remap");
+            ggml_set_name(st->mir_t[llama_qsa_pooled_store::MIR_BTAB],     "qsa_mir_blk");
+
+            ggml_backend_buffer_t buf;
+            if (hparams_idx.no_alloc) {
+                buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    t->buffer = buf;
+                }
+            } else {
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+            }
+            if (!buf) {
+                ggml_free(ctx);
+                throw std::runtime_error("failed to allocate buffer for the QSA input mirrors");
+            }
+
+            // never read before a full write; zero for a deterministic reserve graph
+            ggml_backend_buffer_clear(buf, 0);
+
+            st->mir_on = true;
+            st->mir_ctxs_bufs.emplace_back(ggml_context_ptr(ctx), buf);
+
+            // WARN: the proof line must reach the server log (INFO does not)
+            LLAMA_LOG_WARN("%s: qsa_inputs = incremental (LLAMA_QSA_INPUTS_INC=1): cell_blk / remap / block table are "
+                           "device-resident mirrors (%s, %.2f MiB), set_input writes the changed runs only%s\n", __func__,
+                           ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
+                           llama_qsa_census_check() ? "; LLAMA_QSA_CENSUS_CHECK=1: every set_input downloads and compares them" : "");
+        }
+    } else {
+        LLAMA_LOG_WARN("%s: qsa_inputs = full (LLAMA_QSA_INPUTS_INC unset/0): the QSA layout inputs are filled and uploaded "
+                       "whole per graph\n", __func__);
+    }
+
     qsa_store = std::move(st);
     qsa_store->reset_all();
     qsa_store->stats.n_reset = 0;
@@ -706,6 +786,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
     // [TAG_QSA_POOLED_CACHE] the persistent store counts as memory, like the caches it derives from
     if (qsa_store) {
         for (const auto & [ctx, buf] : qsa_store->ctxs_bufs) {
+            mb[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+        }
+        for (const auto & [ctx, buf] : qsa_store->mir_ctxs_bufs) {
             mb[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
         }
     }
@@ -1510,6 +1593,34 @@ void llama_memory_hybrid_idx_context::qsa_fill_bias(
     }
 }
 
+void llama_qsa_fill_blk_tab(const llama_kv_cells & cells, const llama_qsa_census_stream & cs, int64_t n_blocks, int64_t b0,
+                            int64_t b1, bool tail_fix, int32_t * blk) {
+    const int32_t n_bid = cs.n_bid;
+
+    GGML_ASSERT(n_bid <= n_blocks && 0 <= b0 && b0 <= b1 && b1 <= n_blocks);
+
+    const bool tail_bid_spare = n_bid < n_blocks;
+
+    for (int64_t b = b0; b < std::min<int64_t>(b1, n_bid); ++b) {
+        const auto & set = cells.seq_set((uint32_t) cs.bid_cell[b]);
+
+        uint32_t vis = 0;
+        for (uint32_t k = 0; k < 32; ++k) {
+            vis |= set.test(k) ? 1u << k : 0u;
+        }
+
+        blk[2*b + 0] = cs.bid_idx[b];
+        blk[2*b + 1] = (int32_t) vis;
+    }
+
+    for (int64_t b = std::max<int64_t>(b0, n_bid); b < b1; ++b) {
+        const bool boost = tail_fix && tail_bid_spare && b == n_bid;
+
+        blk[2*b + 0] = INT32_MAX;
+        blk[2*b + 1] = (int32_t) (boost ? 0xFFFFFFFFu : 0u);
+    }
+}
+
 // [TAG_QSA_COMPACT_BIAS] the tables that GGML_OP_QSA_BIAS turns back into qsa_fill_bias's per-block plane.
 // Per block b of stream s (dst_blk [2, n_blocks, n_ns]):
 //   b <  n_bid: key = bid_idx[b], vis = the seq bitmask of bid_cell[b] (the cell the old fill tests)
@@ -1539,27 +1650,9 @@ void llama_memory_hybrid_idx_context::qsa_fill_bias_compact(
 
     GGML_ASSERT(n_bid <= n_blocks);
 
-    const bool tail_bid_spare = n_bid < n_blocks;
-
-    int32_t * blk = dst_blk + 2*s*n_blocks;
-
-    for (int64_t b = 0; b < n_bid; ++b) {
-        const auto & set = cells.seq_set((uint32_t) cs.bid_cell[b]);
-
-        uint32_t vis = 0;
-        for (uint32_t k = 0; k < 32; ++k) {
-            vis |= set.test(k) ? 1u << k : 0u;
-        }
-
-        blk[2*b + 0] = cs.bid_idx[b];
-        blk[2*b + 1] = (int32_t) vis;
-    }
-
-    for (int64_t b = n_bid; b < n_blocks; ++b) {
-        const bool boost = tail_fix && tail_bid_spare && b == n_bid;
-
-        blk[2*b + 0] = INT32_MAX;
-        blk[2*b + 1] = (int32_t) (boost ? 0xFFFFFFFFu : 0u);
+    // [TAG_QSA_INPUTS_INC] dst_blk == nullptr: the block table lives in the device mirror, only the query side is filled
+    if (dst_blk != nullptr) {
+        llama_qsa_fill_blk_tab(cells, cs, n_blocks, 0, n_blocks, tail_fix, dst_blk + 2*s*n_blocks);
     }
 
     for (int64_t ii = 0; ii < n_tps; ++ii) {
@@ -2233,6 +2326,24 @@ static int llama_qsa_census_inc(llama_qsa_pooled_store & st, uint32_t g, const l
         C.empty.resize(n);
     }
 
+    // [TAG_QSA_INPUTS_INC] the cell_blk entries written above (the fragment routing below rewrites only unpooled cells,
+    // which are candidates): the candidates, and the empty list when the dead id moved
+    if (st.mir_on && !C.mir_cb_all) {
+        C.mir_cb.insert(C.mir_cb.end(), cand.begin(), cand.end());
+        if (dead_new != dead_old) {
+            C.mir_cb.insert(C.mir_cb.end(), C.empty.begin(), C.empty.end());
+        }
+        if (C.mir_cb.size() > std::max<size_t>(1024, st.kv_size/8)) {
+            C.mir_cb_all = true;
+            C.mir_cb.clear();
+        }
+    }
+    if (st.mir_on) {
+        // block ids below the region keep bid_idx, bid_cell, remap and their side of n_bid
+        C.mir_rm_lo = std::min<int64_t>(C.mir_rm_lo, region_b0);
+        C.mir_bt_lo = std::min<int64_t>(C.mir_bt_lo, region_b0);
+    }
+
     // [TAG_QSA_WHOLE_BLOCKS] the fragment routing of the full census, over the unpooled cells (all in the region)
     if (llama_qsa_whole_blocks() && n_bid_new < n_blocks) {
         int64_t n_unrouted = 0;
@@ -2401,6 +2512,14 @@ int64_t llama_qsa_plan_inc(llama_qsa_pooled_store & st, const llama_qsa_plan_in 
             C.inc_lo_pos = INT32_MAX;
             C.written.clear();
             C.carry  .clear();
+
+            // [TAG_QSA_INPUTS_INC] every array may have changed
+            if (st.mir_on) {
+                C.mir_cb_all = true;
+                C.mir_cb.clear();
+                C.mir_rm_lo  = 0;
+                C.mir_bt_lo  = 0;
+            }
         }
 
         const int32_t n_bid = C.cs.n_bid;
@@ -2469,6 +2588,12 @@ int64_t llama_qsa_plan_inc(llama_qsa_pooled_store & st, const llama_qsa_plan_in 
         const int32_t row0  = (int32_t) (g*st.n_rows);
 
         C.remap.resize(n_blocks);
+
+        // [TAG_QSA_INPUTS_INC] the full pool renumbers every slot; the fast path changes ids >= region_b0 (recorded by the
+        // census), the full census every id (recorded above)
+        if (full_pool && st.mir_on) {
+            C.mir_rm_lo = 0;
+        }
 
         if (full_pool) {
             for (uint32_t slot = 0; slot < st.n_slots; ++slot) {
@@ -2686,6 +2811,141 @@ int64_t llama_qsa_plan_inc(llama_qsa_pooled_store & st, const llama_qsa_plan_in 
     st.stats.last_n_bid   = n_bid_all;
 
     return cap;
+}
+
+// [TAG_QSA_INPUTS_INC] see the header
+void llama_qsa_mirror_update(llama_qsa_pooled_store & st, const llama_qsa_plan & pl,
+                             const std::vector<const llama_kv_cells *> & cells, bool tail_fix, bool want_remap,
+                             bool want_btab, llama_qsa_mirror_writer & w) {
+    using store_t = llama_qsa_pooled_store;
+
+    GGML_ASSERT(st.mir_on && st.inc && pl.valid && pl.inc && pl.serial == st.serial);
+    GGML_ASSERT((int64_t) cells.size() == pl.n_ns);
+
+    const int64_t n_ns     = pl.n_ns;
+    const int64_t n_kv     = pl.n_kv;
+    const int64_t n_blocks = pl.n_blocks;
+
+    // runs closer than this many elements are written as one
+    const int64_t gap = 32;
+
+    auto write_full = [&](int arr, int64_t off, const int32_t * src, int64_t n) {
+        w.write(arr, off, src, n);
+        st.stats.mir_bytes += (uint64_t) n*sizeof(int32_t);
+        st.stats.mir_runs  += 1;
+        st.stats.mir_full  += 1;
+    };
+
+    auto write_run = [&](int arr, int64_t off, const int32_t * src, int64_t n) {
+        w.write(arr, off, src, n);
+        st.stats.mir_bytes += (uint64_t) n*sizeof(int32_t);
+        st.stats.mir_runs  += 1;
+    };
+
+    auto layout_ok = [&](int arr, int64_t n) {
+        const auto & L = st.mir_layout[arr];
+        return L.valid && L.s0 == pl.s0 && L.n_ns == n_ns && (n_ns == 1 ? n >= L.n : n == L.n);
+    };
+
+    auto set_layout = [&](int arr, int64_t n) {
+        auto & L = st.mir_layout[arr];
+        L.valid = true;
+        L.s0    = pl.s0;
+        L.n_ns  = n_ns;
+        L.n     = n;
+    };
+
+    // cell_blk: every graph reads it
+    {
+        const bool ok = layout_ok(store_t::MIR_CELL_BLK, n_kv);
+
+        for (int64_t s = 0; s < n_ns; ++s) {
+            auto & C = st.strm[pl.s0 + s].cen;
+
+            GGML_ASSERT((int64_t) C.cell_blk.size() >= n_kv);
+
+            if (!ok || C.mir_cb_all) {
+                write_full(store_t::MIR_CELL_BLK, s*n_kv, C.cell_blk.data(), n_kv);
+            } else {
+                st.stats.mir_inc++;
+
+                auto & v = C.mir_cb;
+                std::sort(v.begin(), v.end());
+                v.erase(std::unique(v.begin(), v.end()), v.end());
+
+                size_t i = 0;
+                while (i < v.size() && v[i] < n_kv) {
+                    const int64_t lo = v[i];
+                    int64_t       hi = lo + 1;
+                    for (++i; i < v.size() && v[i] < n_kv && v[i] <= hi + gap; ++i) {
+                        hi = v[i] + 1;
+                    }
+                    write_run(store_t::MIR_CELL_BLK, s*n_kv + lo, C.cell_blk.data() + lo, hi - lo);
+                }
+            }
+
+            C.mir_cb_all = false;
+            C.mir_cb.clear();
+        }
+
+        set_layout(store_t::MIR_CELL_BLK, n_kv);
+    }
+
+    // remap: only a dirty-list graph has one
+    if (want_remap) {
+        GGML_ASSERT(!pl.full);
+
+        const bool ok = layout_ok(store_t::MIR_REMAP, n_blocks);
+
+        for (int64_t s = 0; s < n_ns; ++s) {
+            auto & C = st.strm[pl.s0 + s].cen;
+
+            GGML_ASSERT((int64_t) C.remap.size() >= n_blocks);
+
+            if (!ok || C.mir_rm_lo <= 0) {
+                write_full(store_t::MIR_REMAP, s*n_blocks, C.remap.data(), n_blocks);
+            } else {
+                st.stats.mir_inc++;
+
+                const int64_t lo = std::min<int64_t>(C.mir_rm_lo, n_blocks);
+                if (lo < n_blocks) {
+                    write_run(store_t::MIR_REMAP, s*n_blocks + lo, C.remap.data() + lo, n_blocks - lo);
+                }
+            }
+
+            C.mir_rm_lo = INT64_MAX;
+        }
+
+        set_layout(store_t::MIR_REMAP, n_blocks);
+    }
+
+    // the compact bias block table: refilled from the census from the lowest changed id up, then written
+    if (want_btab) {
+        const bool ok = layout_ok(store_t::MIR_BTAB, 2*n_blocks);
+
+        for (int64_t s = 0; s < n_ns; ++s) {
+            auto & C = st.strm[pl.s0 + s].cen;
+
+            const int64_t lo = std::min<int64_t>(std::max<int64_t>(C.mir_bt_lo, 0), n_blocks);
+
+            C.btab.resize(2*n_blocks);
+            llama_qsa_fill_blk_tab(*cells[s], C.cs, n_blocks, lo, n_blocks, tail_fix, C.btab.data());
+
+            if (!ok || lo == 0) {
+                write_full(store_t::MIR_BTAB, s*2*n_blocks, C.btab.data(), 2*n_blocks);
+            } else {
+                st.stats.mir_inc++;
+
+                if (lo < n_blocks) {
+                    write_run(store_t::MIR_BTAB, s*2*n_blocks + 2*lo, C.btab.data() + 2*lo, 2*(n_blocks - lo));
+                }
+            }
+
+            C.mir_bt_lo = INT64_MAX;
+        }
+
+        set_layout(store_t::MIR_BTAB, 2*n_blocks);
+    }
 }
 
 void llama_qsa_store_save(const llama_qsa_pooled_store & st, llama_qsa_store_snapshot & snap) {
@@ -2992,6 +3252,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa_store(
 
     const int64_t cap = qsa_store_plan(*ubatch, ratio, n_kv, blk_bias);
 
+    // [TAG_QSA_INPUTS_INC] the input time (the plan above is cached: planned in can_reuse / the build)
+    const int64_t t_start_us = ggml_time_us();
+
     const auto & pl = qsa_plan;
 
     GGML_ASSERT(pl.valid);
@@ -3003,7 +3266,6 @@ void llama_memory_hybrid_idx_context::set_input_qsa_store(
     GGML_ASSERT(pl.full == (cap == pl.n_blocks));
     GGML_ASSERT((dirty_dst == nullptr) == pl.full && (remap == nullptr) == pl.full);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(dirty_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(dirty_pos->buffer));
 
@@ -3011,6 +3273,16 @@ void llama_memory_hybrid_idx_context::set_input_qsa_store(
     // census state, which this plan wrote and no later plan has touched yet)
     GGML_ASSERT(!pl.inc || pl.serial == st->serial);
     GGML_ASSERT(ggml_nbytes(cell_blk) == (size_t) (n_kv*pl.n_ns)*sizeof(int32_t));
+
+    // [TAG_QSA_INPUTS_INC] cell_blk / remap / qsa_blk are views of the device mirrors: write what changed (a compact
+    // graph; the graph build makes the same choice, llm_graph_input_qsa)
+    if (st->mir_on && bias == nullptr) {
+        set_input_qsa_mirror(cell_blk, qsa_blk, qsa_qry, dirty_cells, dirty_pos, dirty_dst, remap, ubatch, ratio);
+        st->stats.t_inputs_us += ggml_time_us() - t_start_us;
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
 
     for (int64_t s = 0; s < pl.n_ns; ++s) {
         memcpy((int32_t *) cell_blk->data + s*n_kv, pl.v_cell_blk[s], n_kv*sizeof(int32_t));
@@ -3052,6 +3324,120 @@ void llama_memory_hybrid_idx_context::set_input_qsa_store(
         for (int64_t s = 0; s < pl.n_ns; ++s) {
             qsa_fill_bias(s, ubatch, n_kv, pl.n_ns, pl.n_blocks, ratio, blk_bias,
                     pl.v_cell_blk[s], (float *) bias->data, *pl.v_cs[s]);
+        }
+    }
+
+    // this graph carries the store update: its stamps may be published once it has run
+    st->pending_armed = true;
+
+    st->stats.t_inputs_us += ggml_time_us() - t_start_us;
+}
+
+namespace {
+// [TAG_QSA_INPUTS_INC] the memory's writer: straight into the mirror tensors (memcpy on a host-visible / UMA buffer)
+struct qsa_mirror_writer_dev : llama_qsa_mirror_writer {
+    const llama_qsa_pooled_store & st;
+    explicit qsa_mirror_writer_dev(const llama_qsa_pooled_store & st) : st(st) {}
+    void write(int arr, int64_t off, const int32_t * src, int64_t n) override {
+        ggml_backend_tensor_set(st.mir_t[arr], src, (size_t) off*sizeof(int32_t), (size_t) n*sizeof(int32_t));
+    }
+};
+}
+
+void llama_memory_hybrid_idx_context::set_input_qsa_mirror(
+        ggml_tensor * cell_blk,
+        ggml_tensor * qsa_blk,
+        ggml_tensor * qsa_qry,
+        ggml_tensor * dirty_cells,
+        ggml_tensor * dirty_pos,
+        ggml_tensor * dirty_dst,
+        ggml_tensor * remap,
+        const llama_ubatch * ubatch,
+        uint32_t ratio) const {
+    using store_t = llama_qsa_pooled_store;
+
+    llama_qsa_pooled_store * st = get_qsa_store();
+
+    const auto & pl = qsa_plan;
+
+    const int64_t n_kv     = pl.n_kv;
+    const int64_t n_blocks = pl.n_blocks;
+    const int64_t n_ns     = pl.n_ns;
+
+    GGML_ASSERT(pl.inc && pl.blk_bias && qsa_compact_bias());
+    GGML_ASSERT(qsa_blk != nullptr && qsa_qry != nullptr);
+    GGML_ASSERT(cell_blk->view_src == st->mir_t[store_t::MIR_CELL_BLK] && cell_blk->view_offs == 0 &&
+                ggml_is_contiguous(cell_blk) && cell_blk->ne[0] == n_kv && cell_blk->ne[1] == n_ns);
+    GGML_ASSERT(qsa_blk->view_src == st->mir_t[store_t::MIR_BTAB] && qsa_blk->view_offs == 0 &&
+                ggml_is_contiguous(qsa_blk) && qsa_blk->ne[1] == n_blocks && qsa_blk->ne[2] == n_ns);
+    GGML_ASSERT(remap == nullptr || (remap->view_src == st->mir_t[store_t::MIR_REMAP] && remap->view_offs == 0 &&
+                ggml_nelements(remap) == n_blocks*n_ns));
+    GGML_ASSERT(ggml_backend_buffer_is_host(qsa_qry->buffer));
+    GGML_ASSERT(qsa_qry->ne[1] == ubatch->n_tokens/n_ns);
+
+    // the dirty list: O(cap), ordinary inputs
+    memcpy(dirty_cells->data, pl.dirty_cells.data(), ggml_nbytes(dirty_cells));
+    memcpy(dirty_pos  ->data, pl.dirty_pos  .data(), ggml_nbytes(dirty_pos));
+    if (!pl.full) {
+        GGML_ASSERT(dirty_dst != nullptr && remap != nullptr && ggml_backend_buffer_is_host(dirty_dst->buffer));
+        GGML_ASSERT(dirty_dst->ne[0] == pl.cap*n_ns);
+        memcpy(dirty_dst->data, pl.dirty_dst.data(), ggml_nbytes(dirty_dst));
+    }
+
+    // the query side of the compact bias: O(n_tokens), an ordinary input
+    const int64_t n_tps = ubatch->n_tokens/n_ns;
+
+    std::vector<const llama_kv_cells *> cv(n_ns);
+    for (int64_t s = 0; s < n_ns; ++s) {
+        const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
+
+        cv[s] = &mem->get_mem_idx()->get_cells(seq_of_stream);
+
+        GGML_ASSERT(mem->qsa_stream_of(seq_of_stream) == pl.s0 + s);
+
+        qsa_fill_bias_compact(s, ubatch, n_ns, n_blocks, ratio, nullptr, (int32_t *) qsa_qry->data, *pl.v_cs[s]);
+    }
+
+    // the mirrors: the runs the census changed since each was last written
+    qsa_mirror_writer_dev w(*st);
+    llama_qsa_mirror_update(*st, pl, cv, qsa_tail_fix_enabled(), !pl.full, /*want_btab =*/ true, w);
+
+    // LLAMA_QSA_CENSUS_CHECK=1: what the device holds now == what the full fill uploads
+    if (llama_qsa_census_check()) {
+        std::vector<int32_t> dev;
+        std::vector<int32_t> ref;
+
+        auto cmp = [&](int arr, const char * what, int64_t s, int64_t n, const int32_t * want) {
+            dev.resize(n);
+            ggml_backend_tensor_get(st->mir_t[arr], dev.data(), (size_t) (s*n)*sizeof(int32_t), (size_t) n*sizeof(int32_t));
+            for (int64_t i = 0; i < n; ++i) {
+                if (dev[i] != want[i]) {
+                    GGML_ABORT("[qsa-inputs-check] MISMATCH %s stream %lld [%lld]: device %d, full fill %d (n_kv=%lld "
+                               "n_blocks=%lld n_ns=%lld plan %llu)", what, (long long) s, (long long) i, dev[i], want[i],
+                               (long long) n_kv, (long long) n_blocks, (long long) n_ns,
+                               (unsigned long long) st->stats.n_plan);
+                }
+            }
+        };
+
+        for (int64_t s = 0; s < n_ns; ++s) {
+            cmp(store_t::MIR_CELL_BLK, "cell_blk", s, n_kv, pl.v_cell_blk[s]);
+            if (!pl.full) {
+                cmp(store_t::MIR_REMAP, "remap", s, n_blocks, pl.v_remap[s]);
+            }
+            ref.assign(2*n_blocks, 0);
+            llama_qsa_fill_blk_tab(*cv[s], *pl.v_cs[s], n_blocks, 0, n_blocks, qsa_tail_fix_enabled(), ref.data());
+            cmp(store_t::MIR_BTAB, "qsa_blk", s, 2*n_blocks, ref.data());
+        }
+
+        static std::atomic<uint64_t> n_checked { 0 };
+
+        const uint64_t n = ++n_checked;
+        if (n % 16 == 0 || n <= 4) {
+            LLAMA_LOG_WARN("[qsa-inputs-check] %llu input sets identical (mirror writes: %llu KiB, %llu runs, %llu whole "
+                           "arrays, %llu incremental)\n", (unsigned long long) n,
+                           (unsigned long long) (st->stats.mir_bytes/1024), (unsigned long long) st->stats.mir_runs,
+                           (unsigned long long) st->stats.mir_full, (unsigned long long) st->stats.mir_inc);
         }
     }
 

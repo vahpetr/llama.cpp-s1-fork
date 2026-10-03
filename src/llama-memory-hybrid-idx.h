@@ -52,6 +52,23 @@ int  llama_qsa_census_inc_parse(const char * s);
 bool llama_qsa_census_inc();
 bool llama_qsa_census_check();
 
+//
+// [TAG_QSA_INPUTS_INC] LLAMA_QSA_INPUTS_INC=1 (default 0) - only with LLAMA_QSA_POOLED_CACHE=1, LLAMA_QSA_CENSUS_INC=1 and
+// LLAMA_QSA_COMPACT_BIAS=1 (WARN + off otherwise). The three O(n_kv) QSA graph inputs - cell_blk [n_kv, ns], remap
+// [n_blocks*ns] and the compact bias block table qsa_blk [2, n_blocks, ns] - stop being per-graph host inputs (memcpy /
+// fill of every element + the scheduler's upload of the whole tensor): they are views of persistent device-resident
+// mirrors owned by the pooled store, and set_input writes only the runs the incremental census changed since that
+// mirror was last written (the block table is also FILLED incrementally from a persistent host copy). A full census, a
+// layout change (other streams, n_kv change with > 1 stream) or a hint overflow writes the whole array. qsa_qry and the
+// dirty list stay ordinary inputs (O(n_tokens) / O(cap)). The mirrors are written in place, so the context synchronizes
+// its scheduler before set_inputs (the previous graph must be done reading them). EXACT: the mirrors hold the bytes
+// the full fill would upload; LLAMA_QSA_CENSUS_CHECK=1 also downloads them after every set_input and aborts on the
+// first differing element. Off is today's code path.
+//
+// the knob, read once per process; the first call logs the proof line `qsa_inputs = incremental (LLAMA_QSA_INPUTS_INC=1)`
+// / `qsa_inputs = full (...)` at WARN (the memory calls it when it creates the pooled-key cache)
+bool llama_qsa_inputs_inc();
+
 // what the per-token bias fill needs from the block census of one stream
 struct llama_qsa_census_stream {
     int32_t n_bid  = 0;
@@ -156,6 +173,15 @@ struct llama_qsa_pooled_store {
             // scratch: per-cell dedup epoch
             std::vector<uint32_t> seen;
             uint32_t              seen_epoch = 0;
+
+            // [TAG_QSA_INPUTS_INC] what changed since each device mirror last received this stream (store.mir_on only):
+            // cell_blk: every listed cell (all = the whole array); remap / block table: every block id >= lo (0 = all,
+            // INT64_MAX = none). btab = the persistent host block table [2*n_blocks] the mirror is written from
+            bool                 mir_cb_all = true;
+            std::vector<int32_t> mir_cb;
+            int64_t              mir_rm_lo  = 0;
+            int64_t              mir_bt_lo  = 0;
+            std::vector<int32_t> btab;
         } cen;
     };
 
@@ -191,7 +217,25 @@ struct llama_qsa_pooled_store {
         uint32_t last_dirty    = 0;  // of the last plan, all streams
         uint32_t last_cap      = 0;
         uint32_t last_n_bid    = 0;
+        uint64_t t_inputs_us   = 0;  // [TAG_QSA_INPUTS_INC] time in set_input_qsa_store (both modes)
+        uint64_t mir_bytes     = 0;  // [TAG_QSA_INPUTS_INC] bytes written to the device mirrors
+        uint64_t mir_runs      = 0;  //   runs written (one tensor_set each)
+        uint64_t mir_full      = 0;  //   (array, stream) writes of the whole array
+        uint64_t mir_inc       = 0;  //   (array, stream) incremental writes (possibly empty)
     } stats;
+
+    // [TAG_QSA_INPUTS_INC] the device-resident input mirrors (mir_on only): I32, per array the layout it was last written
+    // with - ubatch stream s of the array at offset s*n (n = n_kv / n_blocks / 2*n_blocks), streams s0 .. s0+n_ns-1
+    enum { MIR_CELL_BLK = 0, MIR_REMAP = 1, MIR_BTAB = 2, MIR_COUNT = 3 };
+    bool mir_on = false;
+    ggml_tensor * mir_t[MIR_COUNT] = { nullptr, nullptr, nullptr };   // [kv_size*n_stream], [n_slots*n_stream], [2*n_slots*n_stream]
+    struct mir_layout_t {
+        bool     valid = false;
+        uint32_t s0    = 0;
+        int64_t  n_ns  = 0;
+        int64_t  n     = 0;
+    } mir_layout[MIR_COUNT];
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> mir_ctxs_bufs;
 
     void reset_stream(uint32_t s);      // invalidate stream s: free every slot, no stamp valid
     void reset_all();
@@ -286,6 +330,25 @@ std::string llama_qsa_plan_compare(const llama_qsa_plan & ref, const std::vector
                                    const llama_qsa_pooled_store & st_ref, const llama_qsa_plan & inc,
                                    const llama_qsa_pooled_store & st_inc, uint32_t r,
                                    const std::vector<std::vector<uint64_t>> * inc_stamps = nullptr); // for a full-path `inc`
+
+// [TAG_QSA_COMPACT_BIAS] the per-block half of the compact bias tables of one stream: entries [b0, b1) of dst_blk
+// ([2, n_blocks]), from the census (qsa_fill_bias_compact's block loop; tail_fix = [TAG_QSA_TAIL_FIX])
+void llama_qsa_fill_blk_tab(const llama_kv_cells & cells, const llama_qsa_census_stream & cs, int64_t n_blocks, int64_t b0,
+                            int64_t b1, bool tail_fix, int32_t * dst_blk);
+
+// [TAG_QSA_INPUTS_INC] where the mirror writes go (the device in the memory, host arrays in the tests)
+struct llama_qsa_mirror_writer {
+    virtual ~llama_qsa_mirror_writer() = default;
+    // write n I32 elements of src at element offset off of mirror array `arr` (llama_qsa_pooled_store::MIR_*)
+    virtual void write(int arr, int64_t off, const int32_t * src, int64_t n) = 0;
+};
+
+// [TAG_QSA_INPUTS_INC] bring the mirrors up to the plan `pl` (made by llama_qsa_plan_inc on `st`): per ubatch stream the
+// changed runs of cell_blk, of remap (want_remap: a dirty-list graph) and of the block table (want_btab, refilled from
+// cells[s] incrementally), or the whole array on a full census / a layout change / an overflow; consumes the hints
+void llama_qsa_mirror_update(llama_qsa_pooled_store & st, const llama_qsa_plan & pl,
+                             const std::vector<const llama_kv_cells *> & cells, bool tail_fix, bool want_remap,
+                             bool want_btab, llama_qsa_mirror_writer & w);
 
 //
 // llama_memory_hybrid_idx
@@ -477,6 +540,12 @@ public:
     void set_input_qsa_store(ggml_tensor * cell_blk, ggml_tensor * bias, ggml_tensor * qsa_blk, ggml_tensor * qsa_qry,
                              ggml_tensor * dirty_cells, ggml_tensor * dirty_pos, ggml_tensor * dirty_dst,
                              ggml_tensor * remap, const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
+
+    // [TAG_QSA_INPUTS_INC] set_input_qsa_store with the device mirrors (store mir_on): cell_blk / qsa_blk / remap are
+    // views of llama_qsa_pooled_store::mir_t, written in place; qsa_qry and the dirty list are ordinary inputs
+    void set_input_qsa_mirror(ggml_tensor * cell_blk, ggml_tensor * qsa_blk, ggml_tensor * qsa_qry,
+                              ggml_tensor * dirty_cells, ggml_tensor * dirty_pos, ggml_tensor * dirty_dst,
+                              ggml_tensor * remap, const llama_ubatch * ubatch, uint32_t ratio) const;
 
     // the cache stream of the planned ubatch's first stream (the full pool's store view starts there)
     uint32_t qsa_store_s0() const;
