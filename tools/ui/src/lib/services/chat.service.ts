@@ -140,24 +140,32 @@ export class ChatService {
 	): Promise<ApiChatMessageData> {
 		// Handle tool result messages (role: 'tool')
 		if (message.role === MessageRole.TOOL && message.toolCallId) {
-			// images a tool returned go back exactly as the agentic loop sent them (text
-			// first, raw data URLs), else the next turn's prompt diverges from the cache
-			const images: DatabaseMessageExtraImageFile[] = (message.extra ?? []).filter(
-				(extra: DatabaseMessageExtra): extra is DatabaseMessageExtraImageFile =>
-					extra.type === AttachmentType.IMAGE
-			);
+			// images and audio a tool returned go back exactly as the agentic loop sent them
+			// (text first, then the attachments in order, raw data), else the next turn's prompt
+			// diverges from the cache; audio for a model without audio input is dropped in
+			// sendMessage, as the loop never sent it
 			const parts: ApiChatMessageContentPart[] = [
-				{ text: message.content, type: ContentPartType.TEXT },
-				...images.map(
-					(image: DatabaseMessageExtraImageFile): ApiChatMessageContentPart => ({
-						image_url: { url: image.base64Url },
-						type: ContentPartType.IMAGE_URL
-					})
-				)
+				{ text: message.content, type: ContentPartType.TEXT }
 			];
 
+			for (const extra of message.extra ?? []) {
+				if (extra.type === AttachmentType.IMAGE) {
+					parts.push({
+						image_url: { url: (extra as DatabaseMessageExtraImageFile).base64Url },
+						type: ContentPartType.IMAGE_URL
+					});
+				} else if (extra.type === AttachmentType.AUDIO) {
+					const audio = extra as DatabaseMessageExtraAudioFile;
+
+					parts.push({
+						input_audio: { data: audio.base64Data, format: getAudioInputFormat(audio.mimeType) },
+						type: ContentPartType.INPUT_AUDIO
+					});
+				}
+			}
+
 			return {
-				content: images.length > 0 ? parts : message.content,
+				content: parts.length > 1 ? parts : message.content,
 				role: MessageRole.TOOL,
 				tool_call_id: message.toolCallId
 			};
@@ -1089,6 +1097,25 @@ export class ChatService {
 		} = options;
 		const normalizedMessages: ApiChatMessageData[] =
 			await ChatService.normalizeMessagesForApi(messages);
+
+		// Tool results carry audio only for models with audio input, as in the agentic loop
+		if (options.model && !modelsStore.props.modelSupportsAudio(options.model)) {
+			normalizedMessages.forEach((msg) => {
+				if (msg.role === MessageRole.TOOL && Array.isArray(msg.content)) {
+					msg.content = msg.content.filter(
+						(part: ApiChatMessageContentPart) => part.type !== ContentPartType.INPUT_AUDIO
+					);
+
+					if (
+						msg.content.length === 1 &&
+						msg.content[0].type === ContentPartType.TEXT &&
+						typeof msg.content[0].text === 'string'
+					) {
+						msg.content = msg.content[0].text;
+					}
+				}
+			});
+		}
 
 		// Filter out image attachments if the model doesn't support vision
 		if (options.model && !modelsStore.props.modelSupportsVision(options.model)) {
