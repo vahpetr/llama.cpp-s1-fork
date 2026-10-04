@@ -1718,6 +1718,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk"}, "PATH",
+        "directory for the disk tier of the prompt cache: a slot state that another conversation evicts is written "
+        "there and loaded back when its conversation returns (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-gib"}, "N",
+        string_format("disk prompt cache quota in GiB (default: %d)", params.cache_disk_gib),
+        [](common_params & params, int value) {
+            params.cache_disk_gib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_GIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-min-tokens"}, "N",
+        string_format("only prompts with at least N tokens go to the disk prompt cache (default: %d)", params.cache_disk_min_tokens),
+        [](common_params & params, int value) {
+            params.cache_disk_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-ttl-days"}, "N",
+        string_format("delete disk prompt cache entries unused for N days (default: %d, 0 = never)", params.cache_disk_ttl_days),
+        [](common_params & params, int value) {
+            params.cache_disk_ttl_days = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_TTL_DAYS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

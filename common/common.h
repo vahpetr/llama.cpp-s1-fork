@@ -651,6 +651,13 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    // disk tier of the prompt cache: slot states evicted by another conversation are written here and loaded back
+    // when that conversation returns (empty path = disabled)
+    std::string cache_disk_path       = "";    // NOLINT
+    int32_t     cache_disk_gib        = 200;   // quota for all entries, GiB
+    int32_t     cache_disk_min_tokens = 8192;  // shorter prompts are cheaper to re-process than to keep
+    int32_t     cache_disk_ttl_days   = 14;    // entries unused this long are deleted
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

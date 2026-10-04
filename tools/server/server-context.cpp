@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
+#include "server-disk-cache.h"
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
@@ -412,6 +413,21 @@ struct server_slot {
         }
 
         return true;
+    }
+
+    // [TAG_DISK_PROMPT_CACHE] keep this slot's prompt on disk before it is overwritten
+    bool disk_save(server_disk_cache & disk_cache) const {
+        if (prompt.tokens.size() == 0) {
+            return false;
+        }
+
+        return disk_cache.save(ctx_tgt, ctx_dft, spec, id, prompt);
+    }
+
+    bool disk_load(server_disk_cache & disk_cache, int idx) {
+        prompt_clear(); // both models' memory of this sequence, through the slot's own memory wrapper
+
+        return disk_cache.load(idx, ctx_tgt, ctx_dft, spec, id, prompt);
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -1325,6 +1341,8 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    std::unique_ptr<server_disk_cache> disk_cache; // [TAG_DISK_PROMPT_CACHE]
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1779,6 +1797,14 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        if (!params_base.cache_disk_path.empty() && params_base.cache_disk_gib > 0) {
+            disk_cache = std::make_unique<server_disk_cache>(
+                params_base.cache_disk_path, (uint64_t) params_base.cache_disk_gib << 30,
+                std::max(1, params_base.cache_disk_min_tokens), params_base.cache_disk_ttl_days,
+                server_disk_cache_fingerprint(params_base, n_ctx), mctx != nullptr);
+            disk_cache->init();
+        }
+
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
@@ -2064,6 +2090,32 @@ private:
             }
         }
 
+        // [TAG_DISK_PROMPT_CACHE] a stored conversation that shares clearly more with the new prompt than this slot
+        //   is loaded instead of re-processed; whatever the slot is about to lose (all of it on a load, or most of it
+        //   when the new prompt diverges early) is written to disk first
+        if (ret && disk_cache && !ret->is_processing() && task.type == SERVER_TASK_TYPE_COMPLETION) {
+            const size_t n_slot   = ret->prompt.tokens.size();
+            const size_t lcp_slot = ret->prompt.tokens.get_common_prefix(task.tokens);
+            const size_t margin   = 1024; // below this a load does not pay for itself
+
+            const bool will_load = disk_cache->find(task.tokens, lcp_slot + margin, ret->n_ctx, nullptr) >= 0;
+
+            if (n_slot > 0 && (will_load || 2*lcp_slot < n_slot)) {
+                ret->disk_save(*disk_cache);
+            }
+
+            if (will_load) {
+                size_t lcp_disk = 0;
+                const int idx = disk_cache->find(task.tokens, lcp_slot + margin, ret->n_ctx, &lcp_disk);
+                if (idx >= 0) {
+                    SLT_INF(*ret, "disk cache: loading a stored prompt, common prefix %zu vs %zu in the slot\n", lcp_disk, lcp_slot);
+                    if (!ret->disk_load(*disk_cache, idx)) {
+                        ret->prompt_clear();
+                    }
+                }
+            }
+        }
+
         return ret;
     }
 
@@ -2104,6 +2156,10 @@ private:
             if (prompt_cache && victim->prompt_save(*prompt_cache)) {
                 SRV_DBG("__TEST_TAG_PURGE_SAVED_%d__\n", victim->id);
                 prompt_cache->update();
+            }
+
+            if (disk_cache) {
+                victim->disk_save(*disk_cache); // [TAG_DISK_PROMPT_CACHE]
             }
 
             victim->prompt_clear();
@@ -3292,6 +3348,10 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    if (disk_cache) {
+                        slot->disk_save(*disk_cache); // [TAG_DISK_PROMPT_CACHE] the restore overwrites the slot
+                    }
+
                     size_t nread = 0;
                     try {
                         size_t n_packed = 0;
@@ -3351,6 +3411,9 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+
+                    // no disk save here: an erase is the client discarding the slot (pi after a failed restore,
+                    // a released hand), unlike a restore that overwrites someone else's conversation
 
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
