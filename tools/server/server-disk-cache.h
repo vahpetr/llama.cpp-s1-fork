@@ -41,6 +41,7 @@ struct server_disk_cache_entry {
     std::vector<server_deep_ref> deep;
 
     std::vector<std::string> blobs; // [TAG_DISK_DELTA] content blocks the .tgt / .dft maps reference
+    std::vector<std::string> ckpt_keys; // its in-RAM checkpoints, kept in the checkpoint store
 
     uint64_t bytes   = 0; // logical size (what a full copy would take)
     uint64_t own_bytes = 0; // its own files (.tok, .aux, maps); the blocks are shared
@@ -125,6 +126,7 @@ struct server_disk_cache {
     std::map<std::string, uint64_t> blobs;
     uint64_t blob_bytes = 0;
 
+    bool ckpt_store(const std::string & key, const common_prompt_checkpoint & c, bool * written);
     std::string blob_path(const std::string & key) const;
     bool save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
                      std::vector<std::string> & keys, uint64_t & n_logical, uint64_t & n_written);

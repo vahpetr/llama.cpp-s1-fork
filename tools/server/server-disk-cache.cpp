@@ -21,7 +21,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr uint32_t DISK_CACHE_VERSION = 3; // 2: deep checkpoint refs in .aux, 3: block-deduplicated state streams
+static constexpr uint32_t DISK_CACHE_VERSION = 4; // 2: deep checkpoint refs in .aux, 3: block-deduplicated state streams, 4: .aux checkpoints by key
 static constexpr uint32_t AUX_MAGIC          = 0x58554144; // "DAUX"
 static constexpr uint32_t CKPT_MAGIC         = 0x324b4344; // "DCK2"
 static constexpr uint32_t MAP_MAGIC          = 0x3150414d; // "MAP1"
@@ -123,7 +123,8 @@ static bool get_str(std::ifstream & f, std::string & v) {
 // .aux layout: magic, n_ckpt, n_ckpt x {n_tokens, pos_min, pos_max, flags_tgt, flags_dft, tgt, dft, spec},
 // spec_state, n_deep, n_deep x {n_tokens, kind, key}. with_data = false seeks over the state blobs.
 static bool read_aux(const std::string & path, bool with_data, std::list<common_prompt_checkpoint> * checkpoints,
-                     std::vector<uint8_t> * spec_state, std::vector<server_deep_ref> & deep) {
+                     std::vector<uint8_t> * spec_state, std::vector<server_deep_ref> & deep,
+                     std::vector<std::string> & ckpt_keys) {
     std::ifstream f(path, std::ios::binary);
     uint32_t magic = 0, n_ckpt = 0;
     bool ok = get(f, magic) && magic == AUX_MAGIC && get(f, n_ckpt) && n_ckpt < 4096;
@@ -132,11 +133,10 @@ static bool read_aux(const std::string & path, bool with_data, std::list<common_
         int64_t  n_tokens = 0;
         int32_t  pos_min = 0, pos_max = 0;
         uint32_t ft = 0, fd = 0;
-        ok = get(f, n_tokens) && get(f, pos_min) && get(f, pos_max) && get(f, ft) && get(f, fd);
-        if (with_data) {
-            ok = ok && get_vec(f, c.data_tgt) && get_vec(f, c.data_dft) && get_vec(f, c.data_spec);
-        } else {
-            ok = ok && skip_vec(f) && skip_vec(f) && skip_vec(f);
+        std::string key;
+        ok = get(f, n_tokens) && get(f, pos_min) && get(f, pos_max) && get(f, ft) && get(f, fd) && get_str(f, key);
+        if (ok) {
+            ckpt_keys.push_back(key);
         }
         c.n_tokens  = n_tokens;
         c.pos_min   = pos_min;
@@ -332,7 +332,7 @@ void server_disk_cache::init() {
                         ok = e.tokens.size() == j.at("n_tokens").get<size_t>() &&
                              file_size_or_0(path(id, ".tgt")) > 0 &&
                              (!e.has_dft || file_size_or_0(path(id, ".dft")) > 0) &&
-                             read_aux(path(id, ".aux"), false, nullptr, nullptr, e.deep) &&
+                             read_aux(path(id, ".aux"), false, nullptr, nullptr, e.deep, e.ckpt_keys) &&
                              read_map_keys(path(id, ".tgt"), e.blobs) &&
                              (!e.has_dft || read_map_keys(path(id, ".dft"), e.blobs));
                         for (const char * ext : { ".tok", ".aux", ".tgt", ".dft" }) {
@@ -502,6 +502,8 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     e.id      = random_id();
     e.has_dft = ctx_dft != nullptr;
 
+    uint64_t n_ckpt_written = 0;
+
     bool ok = true;
     try {
         // tokens
@@ -514,17 +516,33 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
         // checkpoints + speculative state
         if (ok) {
             std::ofstream f(path(e.id, ".aux"), std::ios::binary | std::ios::trunc);
+            // the in-RAM checkpoints go to the content-addressed store (a later save of the same conversation, a
+            // branch or a copy writes them once), the .aux keeps their keys
+            std::vector<size_t> ns;
+            for (const auto & c : prompt.checkpoints) {
+                ns.push_back((size_t) c.n_tokens);
+            }
+            std::vector<size_t> ns_sorted = ns;
+            std::sort(ns_sorted.begin(), ns_sorted.end());
+            ns_sorted.erase(std::unique(ns_sorted.begin(), ns_sorted.end()), ns_sorted.end());
+            const std::vector<std::string> keys_sorted = prompt.tokens.prefix_keys(ns_sorted);
             put<uint32_t>(f, AUX_MAGIC);
             put<uint32_t>(f, (uint32_t) prompt.checkpoints.size());
             for (const auto & c : prompt.checkpoints) {
+                const auto at = std::lower_bound(ns_sorted.begin(), ns_sorted.end(), (size_t) c.n_tokens) - ns_sorted.begin();
+                const std::string & key = keys_sorted[at];
+                bool written = false;
+                if (!ckpt_store(key, c, &written)) {
+                    throw std::runtime_error("cannot store a checkpoint");
+                }
+                n_ckpt_written += written ? file_size_or_0(ckpt_path(key)) : 0;
+                e.ckpt_keys.push_back(key);
                 put<int64_t>(f, c.n_tokens);
                 put<int32_t>(f, c.pos_min);
                 put<int32_t>(f, c.pos_max);
                 put<uint32_t>(f, c.flags_tgt);
                 put<uint32_t>(f, c.flags_dft);
-                put_vec(f, c.data_tgt);
-                put_vec(f, c.data_dft);
-                put_vec(f, c.data_spec);
+                put_str(f, key);
             }
             std::vector<uint8_t> spec_state;
             if (spec) {
@@ -557,6 +575,9 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
         e.deep    = prompt.deep;
         e.t_saved = e.t_used = now_s();
         e.bytes   = n_logical + file_size_or_0(path(e.id, ".tok")) + file_size_or_0(path(e.id, ".aux"));
+        for (const auto & c : prompt.checkpoints) {
+            e.bytes += c.size();
+        }
         for (const char * ext : { ".tok", ".aux", ".tgt", ".dft" }) {
             e.own_bytes += file_size_or_0(path(e.id, ext));
         }
@@ -581,8 +602,8 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     const double ms = (ggml_time_us() - t_start) / 1000.0;
     DSK_INF("saved %s: %zu tokens, %zu checkpoints + %zu deep, %.1f MiB state, %.1f MiB written (%.1f %%) in %.0f ms\n",
             e.id.c_str(), n, prompt.checkpoints.size(), prompt.deep.size(), n_logical / (1024.0 * 1024.0),
-            (n_written + file_size_or_0(path(e.id, ".aux"))) / (1024.0 * 1024.0),
-            100.0 * (n_written + file_size_or_0(path(e.id, ".aux"))) / std::max<double>(1.0, e.bytes), ms);
+            (n_written + n_ckpt_written + file_size_or_0(path(e.id, ".aux"))) / (1024.0 * 1024.0),
+            100.0 * (n_written + n_ckpt_written + file_size_or_0(path(e.id, ".aux"))) / std::max<double>(1.0, e.bytes), ms);
 
     const std::string id = e.id;
     entries.push_back(std::move(e));
@@ -622,8 +643,17 @@ bool server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * c
     std::vector<uint8_t> spec_state;
     std::vector<server_deep_ref> deep;
     try {
-        if (!read_aux(path(e.id, ".aux"), true, &checkpoints, &spec_state, deep)) {
+        std::vector<std::string> keys;
+        if (!read_aux(path(e.id, ".aux"), true, &checkpoints, &spec_state, deep, keys) || keys.size() != checkpoints.size()) {
             throw std::runtime_error("truncated or corrupt");
+        }
+        size_t i = 0;
+        for (auto & c : checkpoints) {
+            common_prompt_checkpoint full;
+            if (!deep_get(keys[i++], full) || full.n_tokens != c.n_tokens) {
+                throw std::runtime_error("a checkpoint is missing");
+            }
+            c = std::move(full);
         }
     } catch (const std::exception & err) {
         DSK_WRN("entry %s: unreadable .aux (%s), dropping it\n", e.id.c_str(), err.what());
@@ -718,6 +748,59 @@ void server_disk_cache::thin(std::vector<server_deep_ref> & refs, int64_t n_end)
     refs = std::move(kept);
 }
 
+// write c under key unless a file with that key exists (content-addressed: the same prefix gives the same state)
+bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_checkpoint & c, bool * written) {
+    if (written) {
+        *written = false;
+    }
+    const int64_t t_now = now_s();
+    auto it = ckpts.find(key);
+    if (it != ckpts.end()) {
+        it->second.t_used = t_now;
+        return true;
+    }
+    const std::string fin = ckpt_path(key);
+    const std::string tmp = fin + ".tmp";
+    bool ok = false;
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        put<uint32_t>(f, CKPT_MAGIC);
+        put_str(f, fingerprint.substr(0, 16));
+        put_str(f, key);
+        put<int64_t>(f, c.n_tokens);
+        put<int32_t>(f, c.pos_min);
+        put<int32_t>(f, c.pos_max);
+        put<uint32_t>(f, c.flags_tgt);
+        put<uint32_t>(f, c.flags_dft);
+        put_vec(f, c.data_tgt);
+        put_vec(f, c.data_dft);
+        put_vec(f, c.data_spec);
+        ok = (bool) f;
+    }
+    std::error_code ec;
+    if (ok) {
+        fs::rename(tmp, fin, ec);
+        ok = !ec;
+    }
+    if (!ok) {
+        fs::remove(tmp, ec);
+        DSK_WRN("cannot write checkpoint at %" PRId64 "\n", c.n_tokens);
+        return false;
+    }
+    server_deep_ckpt_meta m;
+    m.key      = key;
+    m.n_tokens = c.n_tokens;
+    m.pos_min  = c.pos_min;
+    m.pos_max  = c.pos_max;
+    m.bytes    = file_size_or_0(fin);
+    m.t_used   = t_now;
+    ckpts.emplace(key, m);
+    if (written) {
+        *written = true;
+    }
+    return true;
+}
+
 void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_checkpoint & c, uint8_t kind) {
     // below min-step a re-process is cheaper than 113 MiB of disk (a short system prompt, a tiny chat)
     if (quota == 0 || c.data_tgt.empty() || c.n_tokens < ckpt_min_step || c.n_tokens > (int64_t) prompt.tokens.size() ||
@@ -750,52 +833,14 @@ void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_che
         }
     }
 
-    const int64_t t_now = now_s();
-    auto it = ckpts.find(key);
-    if (it == ckpts.end()) {
-        const int64_t t_start = ggml_time_us();
-        const std::string fin = ckpt_path(key);
-        const std::string tmp = fin + ".tmp";
-        bool ok = false;
-        {
-            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-            put<uint32_t>(f, CKPT_MAGIC);
-            put_str(f, fingerprint.substr(0, 16));
-            put_str(f, key);
-            put<int64_t>(f, c.n_tokens);
-            put<int32_t>(f, c.pos_min);
-            put<int32_t>(f, c.pos_max);
-            put<uint32_t>(f, c.flags_tgt);
-            put<uint32_t>(f, c.flags_dft);
-            put_vec(f, c.data_tgt);
-            put_vec(f, c.data_dft);
-            put_vec(f, c.data_spec);
-            ok = (bool) f;
-        }
-        std::error_code ec;
-        if (ok) {
-            fs::rename(tmp, fin, ec);
-            ok = !ec;
-        }
-        if (!ok) {
-            fs::remove(tmp, ec);
-            DSK_WRN("cannot write deep checkpoint at %" PRId64 "\n", c.n_tokens);
-            return;
-        }
-        server_deep_ckpt_meta m;
-        m.key      = key;
-        m.n_tokens = c.n_tokens;
-        m.pos_min  = c.pos_min;
-        m.pos_max  = c.pos_max;
-        m.bytes    = file_size_or_0(fin);
-        m.t_used   = t_now;
-        it = ckpts.emplace(key, m).first;
-        need_enforce = true;
-        DSK_INF("deep checkpoint at %" PRId64 " (%s) stored, %.1f MiB in %.0f ms\n", c.n_tokens,
-                kind == server_deep_ref::DEEP_KIND_BRANCH ? "branch" : kind == server_deep_ref::DEEP_KIND_ANCHOR ? "anchor" : "depth",
-                m.bytes / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
-    } else {
-        it->second.t_used = t_now;
+    bool written = false;
+    if (!ckpt_store(key, c, &written)) {
+        return;
+    }
+    need_enforce = written;
+    if (written) {
+        DSK_INF("deep checkpoint at %" PRId64 " (%s) stored\n", c.n_tokens,
+                kind == server_deep_ref::DEEP_KIND_BRANCH ? "branch" : kind == server_deep_ref::DEEP_KIND_ANCHOR ? "anchor" : "depth");
     }
 
     bool found = false;
@@ -911,6 +956,7 @@ void server_disk_cache::deep_gc() {
         for (const auto & r : e.deep) {
             referenced.insert(r.key);
         }
+        referenced.insert(e.ckpt_keys.begin(), e.ckpt_keys.end());
     }
     for (auto it = ckpts.begin(); it != ckpts.end();) {
         if (!referenced.count(it->first)) {
