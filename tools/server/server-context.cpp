@@ -4054,6 +4054,33 @@ private:
 
                             slot.b0_prefix_match = n_past;
 
+                            // [TAG_PREFIX_DIVERGE] the client changed already-cached history: one line with the text
+                            //   around the first differing token, so a re-prefill can be traced to its cause (a reordered
+                            //   tool list, a dropped message, a re-rendered answer) without LLAMA_SERVER_SLOTS_DEBUG
+                            if (slot.task->params.cache_prompt && slot.task->params.n_cache_reuse == 0 &&
+                                n_past < (int) slot.prompt.tokens.size() && n_past < slot.task->n_tokens()) {
+                                const auto around = [&](const server_tokens & toks) {
+                                    const int i0 = std::max(0, n_past - 16);
+                                    const int i1 = std::min<int>(n_past + 32, toks.size());
+                                    std::string s;
+                                    for (int i = i0; i < i1; i++) {
+                                        if (i == n_past) {
+                                            s += "<<|>>";
+                                        }
+                                        const llama_token t = toks[i];
+                                        s += t != LLAMA_TOKEN_NULL ? common_token_to_piece(ctx_tgt, t) : "[mtmd]";
+                                    }
+                                    std::string out;
+                                    for (const char c : s) {
+                                        out += c == '\n' ? std::string("\\n") : std::string(1, c);
+                                    }
+                                    return out;
+                                };
+                                SLT_INF(slot, "prompt diverges from the cache at token %d (cached %d, prompt %d): old '%s' new '%s'\n",
+                                        n_past, (int) slot.prompt.tokens.size(), slot.task->n_tokens(),
+                                        around(slot.prompt.tokens).c_str(), around(slot.task->tokens).c_str());
+                            }
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110

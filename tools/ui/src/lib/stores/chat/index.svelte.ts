@@ -945,7 +945,10 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 						toolCwd,
 						type: MessageType.TEXT
 					},
-					currentMessageId
+					// chain parallel tool results (assistant -> tool 1 -> tool 2): parenting
+					// each on the assistant made them siblings, so the path rebuilt on the
+					// next turn kept only the last one
+					lastCreatedInFlow
 				);
 
 				// mirror into the active store and move the node pointer only when this

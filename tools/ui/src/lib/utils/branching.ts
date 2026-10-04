@@ -83,16 +83,76 @@ export function filterByLeafNodeId(
 		currentNode = nodeMap.get(currentNode.parent);
 	}
 
-	// Sort: system messages first, then by timestamp
-	result.sort((a, b) => {
+	// Root-to-leaf tree order; timestamps can tie for messages written in the same ms
+	result.reverse();
+
+	const ordered = withSiblingToolResults(result, messages);
+
+	// System messages first (stable sort keeps the tree order of the rest)
+	ordered.sort((a, b) => {
 		if (a.role === MessageRole.SYSTEM && b.role !== MessageRole.SYSTEM) return -1;
 
 		if (a.role !== MessageRole.SYSTEM && b.role === MessageRole.SYSTEM) return 1;
 
-		return a.timestamp - b.timestamp;
+		return 0;
 	});
 
-	return result;
+	return ordered;
+}
+
+/**
+ * Older builds parented every result of a parallel tool call on the assistant, so the
+ * results are siblings and a root-to-leaf path holds only one of them. Put the results
+ * of each path assistant's tool calls back right after it, in tool-call order, which is
+ * the order the agentic loop sent them in.
+ */
+function withSiblingToolResults(
+	path: DatabaseMessage[],
+	messages: readonly DatabaseMessage[]
+): DatabaseMessage[] {
+	const callOrder = (msg: DatabaseMessage): string[] => {
+		if (msg.role !== MessageRole.ASSISTANT || !msg.toolCalls) return [];
+
+		try {
+			const calls = JSON.parse(msg.toolCalls) as { id?: string }[];
+
+			return Array.isArray(calls) ? calls.map((c) => c.id ?? '') : [];
+		} catch {
+			return [];
+		}
+	};
+	const out: DatabaseMessage[] = [];
+	const placed = new Set<string>();
+
+	for (const msg of path) {
+		if (placed.has(msg.id)) continue;
+
+		out.push(msg);
+		placed.add(msg.id);
+
+		const ids = callOrder(msg);
+
+		if (ids.length < 2) continue;
+
+		const results = messages.filter(
+			(m) =>
+				m.parent === msg.id &&
+				m.role === MessageRole.TOOL &&
+				!!m.toolCallId &&
+				ids.includes(m.toolCallId)
+		);
+
+		if (results.length < 2) continue;
+
+		results.sort((a, b) => ids.indexOf(a.toolCallId!) - ids.indexOf(b.toolCallId!));
+
+		for (const r of results) {
+			out.push(r);
+			placed.add(r.id);
+		}
+	}
+
+	return out;
 }
 
 /**

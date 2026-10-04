@@ -568,7 +568,16 @@ class ToolsStore {
 		const connections = mcpStore.getConnections();
 
 		if (connections.size > 0) {
-			for (const [serverId, connection] of connections) {
+			// iterate in settings order, not Map insertion order: a reconnect re-inserts its
+			// server at the end, which would reorder the tools block and invalidate the
+			// server's prompt cache from the system prompt on
+			const rank = new Map(mcpStore.getServers().map((s, i) => [s.id?.trim(), i]));
+			const ordered = [...connections].sort(
+				([a], [b]) =>
+					(rank.get(a) ?? Number.MAX_SAFE_INTEGER) - (rank.get(b) ?? Number.MAX_SAFE_INTEGER)
+			);
+
+			for (const [serverId, connection] of ordered) {
 				const serverName = mcpStore.getServerDisplayName(serverId);
 
 				for (const tool of connection.tools) {

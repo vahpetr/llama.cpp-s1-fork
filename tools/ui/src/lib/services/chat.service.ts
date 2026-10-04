@@ -140,8 +140,24 @@ export class ChatService {
 	): Promise<ApiChatMessageData> {
 		// Handle tool result messages (role: 'tool')
 		if (message.role === MessageRole.TOOL && message.toolCallId) {
+			// images a tool returned go back exactly as the agentic loop sent them (text
+			// first, raw data URLs), else the next turn's prompt diverges from the cache
+			const images: DatabaseMessageExtraImageFile[] = (message.extra ?? []).filter(
+				(extra: DatabaseMessageExtra): extra is DatabaseMessageExtraImageFile =>
+					extra.type === AttachmentType.IMAGE
+			);
+			const parts: ApiChatMessageContentPart[] = [
+				{ text: message.content, type: ContentPartType.TEXT },
+				...images.map(
+					(image: DatabaseMessageExtraImageFile): ApiChatMessageContentPart => ({
+						image_url: { url: image.base64Url },
+						type: ContentPartType.IMAGE_URL
+					})
+				)
+			];
+
 			return {
-				content: message.content,
+				content: images.length > 0 ? parts : message.content,
 				role: MessageRole.TOOL,
 				tool_call_id: message.toolCallId
 			};
