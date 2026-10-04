@@ -2,6 +2,9 @@
 
 #include "log.h"
 
+#include "ggml-backend.h"
+#include "../../src/llama-ext.h" // llama_state_seq_write_cb / read_cb [TAG_DISK_DELTA]
+
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
@@ -18,12 +21,38 @@
 
 namespace fs = std::filesystem;
 
-static constexpr uint32_t DISK_CACHE_VERSION = 2; // 2: deep checkpoint refs in .aux
+static constexpr uint32_t DISK_CACHE_VERSION = 3; // 2: deep checkpoint refs in .aux, 3: block-deduplicated state streams
 static constexpr uint32_t AUX_MAGIC          = 0x58554144; // "DAUX"
 static constexpr uint32_t CKPT_MAGIC         = 0x324b4344; // "DCK2"
+static constexpr uint32_t MAP_MAGIC          = 0x3150414d; // "MAP1"
+static constexpr size_t   BLOB_BYTES         = 4ull << 20; // block size of the state streams (aligned within each tensor)
 
 static int64_t now_s() {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// 2 x 64-bit hash, 4 lanes for throughput (memory-bound on s1); content keys of the state blocks [TAG_DISK_DELTA]
+static std::string hash_key(const uint8_t * p, size_t n) {
+    uint64_t a = 0x9E3779B97F4A7C15ull, b = 0xC2B2AE3D27D4EB4Full, c = 0x165667B19E3779F9ull, d = 0x27D4EB2F165667C5ull;
+    const auto mix = [](uint64_t h, uint64_t w, uint64_t k) {
+        h = (h ^ w) * k;
+        return h ^ (h >> 31);
+    };
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        uint64_t w[4];
+        memcpy(w, p + i, 32);
+        a = mix(a, w[0], 0x9FB21C651E98DF25ull);
+        b = mix(b, w[1], 0xD6E8FEB86659FD93ull);
+        c = mix(c, w[2], 0xFF51AFD7ED558CCDull);
+        d = mix(d, w[3], 0xC4CEB9FE1A85EC53ull);
+    }
+    for (; i < n; i++) {
+        a = mix(a, p[i], 0x9FB21C651E98DF25ull);
+    }
+    uint64_t h1 = mix(mix(a, c, 0xFF51AFD7ED558CCDull), n, 0x9FB21C651E98DF25ull);
+    uint64_t h2 = mix(mix(b, d, 0xC4CEB9FE1A85EC53ull), a ^ n, 0xD6E8FEB86659FD93ull);
+    return string_format("%016llx%016llx-%zu", (unsigned long long) h1, (unsigned long long) h2, n);
 }
 
 static std::string random_id() {
@@ -214,7 +243,7 @@ std::string server_disk_cache::path(const std::string & id, const char * ext) co
 
 void server_disk_cache::remove_files(const std::string & id) const {
     std::error_code ec;
-    for (const char * ext : { ".meta", ".tok", ".tgt", ".dft", ".aux", ".meta.tmp", ".tok.tmp", ".aux.tmp" }) {
+    for (const char * ext : { ".meta", ".tok", ".tgt", ".dft", ".aux", ".meta.tmp", ".tok.tmp", ".aux.tmp", ".tgt.tmp", ".dft.tmp" }) {
         fs::remove(path(id, ext), ec);
     }
 }
@@ -244,9 +273,9 @@ bool server_disk_cache::write_meta(const server_disk_cache_entry & e) const {
 }
 
 uint64_t server_disk_cache::total_bytes() const {
-    uint64_t res = 0;
+    uint64_t res = blob_bytes;
     for (const auto & e : entries) {
-        res += e.bytes;
+        res += e.own_bytes; // .tok, .aux and the maps (which hold the small fields inline)
     }
     for (const auto & it : ckpts) {
         res += it.second.bytes;
@@ -303,7 +332,12 @@ void server_disk_cache::init() {
                         ok = e.tokens.size() == j.at("n_tokens").get<size_t>() &&
                              file_size_or_0(path(id, ".tgt")) > 0 &&
                              (!e.has_dft || file_size_or_0(path(id, ".dft")) > 0) &&
-                             read_aux(path(id, ".aux"), false, nullptr, nullptr, e.deep);
+                             read_aux(path(id, ".aux"), false, nullptr, nullptr, e.deep) &&
+                             read_map_keys(path(id, ".tgt"), e.blobs) &&
+                             (!e.has_dft || read_map_keys(path(id, ".dft"), e.blobs));
+                        for (const char * ext : { ".tok", ".aux", ".tgt", ".dft" }) {
+                            e.own_bytes += file_size_or_0(path(id, ext));
+                        }
                     }
                 }
             }
@@ -315,6 +349,44 @@ void server_disk_cache::init() {
             entries.push_back(std::move(e));
         } else {
             remove_files(id);
+            n_dropped++;
+        }
+    }
+
+    // block store: every complete block file (a crash leaves only .tmp files); unreferenced ones go in enforce()
+    fs::create_directories(fs::path(dir) / "blk", ec);
+    for (const auto & de : fs::directory_iterator(fs::path(dir) / "blk", ec)) {
+        const std::string name = de.path().filename().string();
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, ".blk") == 0) {
+            const uint64_t n = file_size_or_0(de.path().string());
+            blobs[name.substr(0, name.size() - 4)] = n;
+            blob_bytes += n;
+        } else {
+            fs::remove(de.path(), ec);
+        }
+    }
+    {
+        // a block whose size does not match its key is a torn write
+        for (auto it = blobs.begin(); it != blobs.end();) {
+            const auto dash = it->first.rfind('-');
+            if (dash == std::string::npos || std::to_string(it->second) != it->first.substr(dash + 1)) {
+                fs::remove(blob_path(it->first), ec);
+                blob_bytes -= it->second;
+                it = blobs.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // entries whose blocks are gone (a crash between writes, a manual cleanup) cannot be loaded
+    for (size_t i = 0; i < entries.size();) {
+        const bool complete = std::all_of(entries[i].blobs.begin(), entries[i].blobs.end(),
+                [&](const std::string & k) { return blobs.count(k) > 0; });
+        if (complete) {
+            i++;
+        } else {
+            erase(i);
             n_dropped++;
         }
     }
@@ -373,6 +445,7 @@ void server_disk_cache::enforce(const std::string & protect) {
     }
 
     deep_gc();
+    blob_gc();
 
     while (total_bytes() > quota && !entries.empty()) {
         size_t victim = SIZE_MAX;
@@ -394,7 +467,8 @@ void server_disk_cache::enforce(const std::string & protect) {
                 entries[victim].tokens.size(), entries[victim].bytes / (1024.0 * 1024.0 * 1024.0), v_min);
         erase(victim);
         n_evict++;
-        deep_gc(); // the evicted entry's deep checkpoints may now be unreferenced
+        deep_gc(); // the evicted entry's deep checkpoints and blocks may now be unreferenced
+        blob_gc();
     }
 }
 
@@ -470,18 +544,21 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
         ok = false;
     }
 
-    // the KV / recurrent state streams to the file without a host-sized buffer
-    ok = ok && llama_state_seq_save_file(ctx_tgt, path(e.id, ".tgt").c_str(), id_slot, nullptr, 0) > 0;
+    // [TAG_DISK_DELTA] the KV / recurrent state streams through 4 MiB content blocks: a block already on disk (the
+    //   unchanged part of a conversation saved before, a branch, a copy) is referenced, only new ones are written
+    uint64_t n_logical = 0, n_written = 0;
+    ok = ok && save_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), e.blobs, n_logical, n_written);
     if (ok && ctx_dft) {
-        ok = llama_state_seq_save_file(ctx_dft, path(e.id, ".dft").c_str(), id_slot, nullptr, 0) > 0;
+        ok = save_stream(ctx_dft, id_slot, path(e.id, ".dft"), e.blobs, n_logical, n_written);
     }
 
     if (ok) {
         e.tokens  = prompt.tokens.clone();
         e.deep    = prompt.deep;
         e.t_saved = e.t_used = now_s();
-        for (const char * ext : { ".tok", ".tgt", ".dft", ".aux" }) {
-            e.bytes += file_size_or_0(path(e.id, ext));
+        e.bytes   = n_logical + file_size_or_0(path(e.id, ".tok")) + file_size_or_0(path(e.id, ".aux"));
+        for (const char * ext : { ".tok", ".aux", ".tgt", ".dft" }) {
+            e.own_bytes += file_size_or_0(path(e.id, ext));
         }
         ok = write_meta(e);
     }
@@ -502,8 +579,10 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     }
 
     const double ms = (ggml_time_us() - t_start) / 1000.0;
-    DSK_INF("saved %s: %zu tokens, %zu checkpoints + %zu deep, %.1f MiB in %.0f ms (%.2f GB/s)\n", e.id.c_str(), n,
-            prompt.checkpoints.size(), prompt.deep.size(), e.bytes / (1024.0 * 1024.0), ms, e.bytes / std::max(1e-3, ms) / 1e6);
+    DSK_INF("saved %s: %zu tokens, %zu checkpoints + %zu deep, %.1f MiB state, %.1f MiB written (%.1f %%) in %.0f ms\n",
+            e.id.c_str(), n, prompt.checkpoints.size(), prompt.deep.size(), n_logical / (1024.0 * 1024.0),
+            (n_written + file_size_or_0(path(e.id, ".aux"))) / (1024.0 * 1024.0),
+            100.0 * (n_written + file_size_or_0(path(e.id, ".aux"))) / std::max<double>(1.0, e.bytes), ms);
 
     const std::string id = e.id;
     entries.push_back(std::move(e));
@@ -552,14 +631,11 @@ bool server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * c
         return false;
     }
 
-    // a non-null token buffer: with tokens_out == nullptr llama_state_seq_load_file only probes the token count
-    llama_token no_tokens = 0;
-    size_t      n_tok     = 0;
     llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
-    bool ok = llama_state_seq_load_file(ctx_tgt, path(e.id, ".tgt").c_str(), id_slot, &no_tokens, 0, &n_tok) > 0;
+    bool ok = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"));
     if (ok && ctx_dft) {
         llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
-        ok = e.has_dft && llama_state_seq_load_file(ctx_dft, path(e.id, ".dft").c_str(), id_slot, &no_tokens, 0, &n_tok) > 0;
+        ok = e.has_dft && load_stream(ctx_dft, id_slot, path(e.id, ".dft"));
     }
     if (!ok) {
         DSK_WRN("entry %s: state load failed, dropping it\n", e.id.c_str());
@@ -841,6 +917,245 @@ void server_disk_cache::deep_gc() {
             std::error_code ec;
             fs::remove(ckpt_path(it->first), ec);
             it = ckpts.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+//
+// block-deduplicated state streams [TAG_DISK_DELTA]
+//
+// <id>.tgt / <id>.dft = MAP1 magic, then segments: u8 kind (0 = inline bytes: u64 n + bytes; 1 = block: key) until
+// kind 255. The concatenation is exactly the llama_state_seq_write stream, so loading is format-agnostic; only the
+// cutting of tensor ranges into blocks aligned to BLOB_BYTES within each tensor makes the unchanged part of a growing
+// conversation produce the same blocks again.
+
+std::string server_disk_cache::blob_path(const std::string & key) const {
+    return (fs::path(dir) / "blk" / (key + ".blk")).string();
+}
+
+bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
+                                    std::vector<std::string> & keys, uint64_t & n_logical, uint64_t & n_written) {
+    const std::string tmp = map_path + ".tmp";
+    std::ofstream fm(tmp, std::ios::binary | std::ios::trunc);
+    put<uint32_t>(fm, MAP_MAGIC);
+
+    std::vector<uint8_t> inl;
+    std::vector<uint8_t> buf;
+    bool ok = true;
+
+    const auto flush_inline = [&]() {
+        if (inl.empty()) {
+            return;
+        }
+        put<uint8_t>(fm, 0);
+        put<uint64_t>(fm, inl.size());
+        fm.write(reinterpret_cast<const char *>(inl.data()), inl.size());
+        n_written += inl.size();
+        inl.clear();
+    };
+
+    llama_state_seq_writer w;
+    w.write = [&](const void * src, size_t size) {
+        const auto * p = static_cast<const uint8_t *>(src);
+        inl.insert(inl.end(), p, p + size);
+        n_logical += size;
+    };
+    w.write_tensor = [&](ggml_tensor * tensor, size_t offset, size_t size) {
+        if (size < (64u << 10)) {
+            // small ranges (e.g. the per-row ranges of a transposed V cache) stay inline: no file per few KiB
+            const size_t at = inl.size();
+            inl.resize(at + size);
+            ggml_backend_tensor_get(tensor, inl.data() + at, offset, size);
+            n_logical += size;
+            return;
+        }
+        flush_inline();
+        n_logical += size;
+        size_t pos = offset;
+        const size_t end = offset + size;
+        while (ok && pos < end) {
+            // block boundaries are fixed offsets of the tensor, so the same rows give the same blocks every save
+            const size_t blk_end = std::min(end, (pos / BLOB_BYTES + 1) * BLOB_BYTES);
+            const size_t n = blk_end - pos;
+            buf.resize(n);
+            ggml_backend_tensor_get(tensor, buf.data(), pos, n);
+            const std::string key = hash_key(buf.data(), n);
+            if (blobs.count(key) == 0) {
+                const std::string fin = blob_path(key);
+                const std::string ftmp = fin + ".tmp";
+                {
+                    std::ofstream fb(ftmp, std::ios::binary | std::ios::trunc);
+                    fb.write(reinterpret_cast<const char *>(buf.data()), n);
+                    ok = (bool) fb;
+                }
+                std::error_code ec;
+                if (ok) {
+                    fs::rename(ftmp, fin, ec);
+                    ok = !ec;
+                }
+                if (!ok) {
+                    fs::remove(ftmp, ec);
+                    break;
+                }
+                blobs[key] = n;
+                blob_bytes += n;
+                n_written += n;
+            }
+            put<uint8_t>(fm, 1);
+            put_str(fm, key);
+            keys.push_back(key);
+            pos = blk_end;
+        }
+    };
+
+    ok = llama_state_seq_write_cb(ctx, id_slot, 0, w) > 0 && ok;
+    flush_inline();
+    put<uint8_t>(fm, 255);
+    fm.close();
+    ok = ok && (bool) fm;
+
+    std::error_code ec;
+    if (ok) {
+        fs::rename(tmp, map_path, ec);
+        ok = !ec;
+    }
+    if (!ok) {
+        fs::remove(tmp, ec);
+    }
+    return ok;
+}
+
+bool server_disk_cache::read_map_keys(const std::string & map_path, std::vector<std::string> & keys) {
+    std::ifstream fm(map_path, std::ios::binary);
+    uint32_t magic = 0;
+    if (!get(fm, magic) || magic != MAP_MAGIC) {
+        return false;
+    }
+    for (;;) {
+        uint8_t kind = 0;
+        if (!get(fm, kind)) {
+            return false;
+        }
+        if (kind == 255) {
+            return true;
+        }
+        if (kind == 0) {
+            uint64_t n = 0;
+            if (!get(fm, n)) {
+                return false;
+            }
+            fm.seekg((std::streamoff) n, std::ios::cur);
+        } else if (kind == 1) {
+            std::string key;
+            if (!get_str(fm, key)) {
+                return false;
+            }
+            keys.push_back(std::move(key));
+        } else {
+            return false;
+        }
+    }
+}
+
+bool server_disk_cache::load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path) {
+    std::ifstream fm(map_path, std::ios::binary);
+    uint32_t magic = 0;
+    if (!get(fm, magic) || magic != MAP_MAGIC) {
+        return false;
+    }
+
+    // the current segment: inline bytes come from the map itself, a block from its (verified) buffer
+    uint64_t seg_left = 0;
+    bool     seg_inline = false;
+    std::vector<uint8_t> blk;
+    size_t   blk_pos = 0;
+    bool done = false;
+    bool corrupt = false;
+
+    const auto next_segment = [&]() -> bool {
+        uint8_t kind = 0;
+        if (!get(fm, kind)) {
+            return false;
+        }
+        if (kind == 255) {
+            done = true;
+            return false;
+        }
+        if (kind == 0) {
+            seg_inline = true;
+            return (bool) get(fm, seg_left);
+        }
+        std::string key;
+        if (kind != 1 || !get_str(fm, key)) {
+            return false;
+        }
+        const auto it = blobs.find(key);
+        if (it == blobs.end()) {
+            DSK_WRN("block %s is missing\n", key.c_str());
+            return false;
+        }
+        // a block is shared by every entry with this prefix: check it against its key, a torn write after a host
+        // hang must fail the load (and go), not restore wrong state
+        blk.resize(it->second);
+        {
+            std::ifstream fb(blob_path(key), std::ios::binary);
+            if (!fb.read(reinterpret_cast<char *>(blk.data()), blk.size()) || hash_key(blk.data(), blk.size()) != key) {
+                DSK_WRN("block %s is corrupt, dropping it\n", key.c_str());
+                std::error_code ec;
+                fs::remove(blob_path(key), ec);
+                blob_bytes -= it->second;
+                blobs.erase(it);
+                corrupt = true;
+                return false;
+            }
+        }
+        seg_inline = false;
+        seg_left   = blk.size();
+        blk_pos    = 0;
+        return true;
+    };
+
+    llama_state_seq_reader r;
+    r.read = [&](void * dst, size_t size) -> bool {
+        auto * out = static_cast<char *>(dst);
+        while (size > 0) {
+            if (seg_left == 0 && !next_segment()) {
+                return false;
+            }
+            const size_t n = (size_t) std::min<uint64_t>(seg_left, size);
+            if (seg_inline) {
+                if (!fm.read(out, n)) {
+                    return false;
+                }
+            } else {
+                memcpy(out, blk.data() + blk_pos, n);
+                blk_pos += n;
+            }
+            out      += n;
+            size     -= n;
+            seg_left -= n;
+        }
+        return true;
+    };
+
+    const bool ok = llama_state_seq_read_cb(ctx, id_slot, 0, r) > 0 && !corrupt;
+    GGML_UNUSED(done);
+    return ok;
+}
+
+void server_disk_cache::blob_gc() {
+    std::set<std::string> referenced;
+    for (const auto & e : entries) {
+        referenced.insert(e.blobs.begin(), e.blobs.end());
+    }
+    for (auto it = blobs.begin(); it != blobs.end();) {
+        if (!referenced.count(it->first)) {
+            std::error_code ec;
+            fs::remove(blob_path(it->first), ec);
+            blob_bytes -= it->second;
+            it = blobs.erase(it);
         } else {
             ++it;
         }

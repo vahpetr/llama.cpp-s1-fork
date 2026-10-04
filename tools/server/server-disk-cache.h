@@ -40,7 +40,10 @@ struct server_disk_cache_entry {
 
     std::vector<server_deep_ref> deep;
 
-    uint64_t bytes   = 0;
+    std::vector<std::string> blobs; // [TAG_DISK_DELTA] content blocks the .tgt / .dft maps reference
+
+    uint64_t bytes   = 0; // logical size (what a full copy would take)
+    uint64_t own_bytes = 0; // its own files (.tok, .aux, maps); the blocks are shared
     int64_t  t_saved = 0; // unix seconds
     int64_t  t_used  = 0; // unix seconds, last save or load
     int32_t  hits    = 0; // loads
@@ -117,6 +120,17 @@ struct server_disk_cache {
     std::vector<server_disk_cache_entry> entries;
 
     std::map<std::string, server_deep_ckpt_meta> ckpts;
+
+    // [TAG_DISK_DELTA] content-addressed blocks of the state streams: key -> bytes on disk
+    std::map<std::string, uint64_t> blobs;
+    uint64_t blob_bytes = 0;
+
+    std::string blob_path(const std::string & key) const;
+    bool save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
+                     std::vector<std::string> & keys, uint64_t & n_logical, uint64_t & n_written);
+    bool load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path);
+    static bool read_map_keys(const std::string & map_path, std::vector<std::string> & keys);
+    void blob_gc();
 
     std::string path(const std::string & id, const char * ext) const;
     std::string ckpt_path(const std::string & key) const;

@@ -7,6 +7,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
@@ -132,3 +133,26 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+//
+// streamed sequence state [TAG_DISK_DELTA] (fork): the same bytes as llama_state_seq_save_file / load_file after
+// their header, through callbacks, so a caller can store large tensor ranges by content and rebuild the stream
+//
+
+struct llama_state_seq_writer {
+    // small fields (counts, cell metadata, types)
+    std::function<void(const void * src, size_t size)> write;
+    // a range of a state tensor (KV rows, recurrent state); the callee reads it with ggml_backend_tensor_get
+    std::function<void(struct ggml_tensor * tensor, size_t offset, size_t size)> write_tensor;
+};
+
+struct llama_state_seq_reader {
+    // fill dst with the next size bytes of the stream; return false on failure
+    std::function<bool(void * dst, size_t size)> read;
+};
+
+// returns the number of bytes in the stream, 0 on failure
+LLAMA_API size_t llama_state_seq_write_cb(struct llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags,
+                                          const llama_state_seq_writer & writer);
+LLAMA_API size_t llama_state_seq_read_cb (struct llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags,
+                                          const llama_state_seq_reader & reader);

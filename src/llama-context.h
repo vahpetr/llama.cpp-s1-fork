@@ -182,6 +182,10 @@ struct llama_context {
      const llama_token * tokens,
                 size_t   n_token_count);
 
+    // [TAG_DISK_DELTA] the stream of state_seq_save_file / load_file without the file
+    size_t state_seq_write_io(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+    size_t state_seq_read_io (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+
     //
     // perf
     //
