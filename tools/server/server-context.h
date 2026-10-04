@@ -97,6 +97,9 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // after start_loop returned: write the slots to the disk prompt cache (no-op without --cache-disk)
+    void save_on_exit();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;
@@ -130,6 +133,7 @@ struct server_routes {
     // they won't be called until ctx_http.is_ready is set to true
     server_http_context::handler_t get_health;
     server_http_context::handler_t get_metrics;
+    server_http_context::handler_t get_disk_cache;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
     server_http_context::handler_t get_props;

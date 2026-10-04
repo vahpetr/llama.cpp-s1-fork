@@ -1235,11 +1235,45 @@ public:
         res.n_sampling_fast     = common_sampler_perf_n_fast();
         res.n_sampling_fast_pen = common_sampler_perf_n_fast_pen();
 
+        if (disk_cache) {
+            res.disk.n_saves        = disk_cache->n_saves;
+            res.disk.n_loads        = disk_cache->n_loads;
+            res.disk.n_evict        = disk_cache->n_evict;
+            res.disk.n_deep_rewinds = disk_cache->n_deep_rewinds;
+            res.disk.n_load_failed  = disk_cache->n_load_failed;
+            res.disk.bytes_written  = disk_cache->bytes_written;
+            res.disk.bytes_loaded   = disk_cache->bytes_loaded;
+            res.disk.save_us        = disk_cache->save_us;
+            res.disk.load_us        = disk_cache->load_us;
+            res.disk.n_entries      = disk_cache->n_entries();
+            res.disk.n_deep_ckpts   = disk_cache->n_deep_ckpts();
+            res.disk.n_blocks       = disk_cache->n_blocks();
+            res.disk.bytes_on_disk  = disk_cache->total_bytes();
+        }
+
         return res;
     }
 
     void reset_metrics_bucket() {
         metrics.reset_bucket();
+    }
+
+    json disk_cache_status() const {
+        return disk_cache ? disk_cache->status() : json{ { "enabled", false } };
+    }
+
+    // [TAG_DISK_PROMPT_CACHE] the server is stopping (the loop has returned): keep every slot's conversation, so a
+    //   restart or a deploy loses nothing; runs on the main thread before the contexts are freed
+    void save_on_exit() {
+        if (!disk_cache || sleeping || ctx_tgt == nullptr) {
+            return;
+        }
+        for (auto & slot : slots) {
+            if (slot.prompt.n_tokens() > 0) {
+                SLT_INF(slot, "saving %d tokens to the disk cache before exit\n", slot.prompt.n_tokens());
+                slot.disk_save(*disk_cache);
+            }
+        }
     }
 
 private:
@@ -4296,6 +4330,7 @@ private:
                                                     [&](const auto & c) { return c.n_tokens > n_ck; });
                                             slot.prompt.checkpoints.insert(pos_it, std::move(ck));
                                             disk_cache->deep_adopt(slot.prompt, m);
+                                            disk_cache->n_deep_rewinds++;
                                             SLT_INF(slot, "deep checkpoint at n_tokens = %" PRId64 " for a divergence at %d (replay %" PRId64 " tokens instead of %d)\n",
                                                     n_ck, n_div, (int64_t) n_div - n_ck, n_div);
 
@@ -5302,6 +5337,10 @@ void server_context::terminate() {
     impl->queue_tasks.terminate();
 }
 
+void server_context::save_on_exit() {
+    impl->save_on_exit();
+}
+
 llama_context * server_context::get_llama_context() const {
     return impl->ctx_tgt;
 }
@@ -5782,6 +5821,13 @@ json server_routes::get_model_info() const {
 void server_routes::init_routes() {
     // IMPORTANT: all lambda functions must start with create_response()
     // this is to ensure that the server_res_generator can handle sleeping case correctly
+
+    // [TAG_DISK_PROMPT_CACHE] stored conversations + totals (a snapshot, safe from the HTTP threads)
+    this->get_disk_cache = [this](const server_http_req &) {
+        auto res = create_response(true);
+        res->ok(ctx_server.disk_cache_status());
+        return res;
+    };
 
     this->get_health = [this](const server_http_req &) {
         // error and loading states are handled by middleware

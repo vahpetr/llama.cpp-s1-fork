@@ -426,6 +426,8 @@ void server_disk_cache::init() {
             dir.c_str(), entries.size(), ckpts.size(), total_bytes() / (1024.0 * 1024.0 * 1024.0),
             quota / (1024.0 * 1024.0 * 1024.0), n_min_tokens, ttl_days, ckpt_ratio, ckpt_min_step, ckpt_max,
             n_dropped, n_ck_dropped);
+
+    refresh_status();
 }
 
 void server_disk_cache::enforce(const std::string & protect) {
@@ -470,6 +472,8 @@ void server_disk_cache::enforce(const std::string & protect) {
         deep_gc(); // the evicted entry's deep checkpoints and blocks may now be unreferenced
         blob_gc();
     }
+
+    refresh_status();
 }
 
 bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot,
@@ -606,6 +610,8 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
             100.0 * (n_written + n_ckpt_written + file_size_or_0(path(e.id, ".aux"))) / std::max<double>(1.0, e.bytes), ms);
 
     const std::string id = e.id;
+    bytes_written += n_written + n_ckpt_written + file_size_or_0(path(e.id, ".aux")) + file_size_or_0(path(e.id, ".tok"));
+    save_us       += (uint64_t) (ggml_time_us() - t_start);
     entries.push_back(std::move(e));
     n_saves++;
 
@@ -658,6 +664,8 @@ bool server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * c
     } catch (const std::exception & err) {
         DSK_WRN("entry %s: unreadable .aux (%s), dropping it\n", e.id.c_str(), err.what());
         erase(idx);
+        n_load_failed++;
+        refresh_status();
         return false;
     }
 
@@ -670,6 +678,8 @@ bool server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * c
     if (!ok) {
         DSK_WRN("entry %s: state load failed, dropping it\n", e.id.c_str());
         erase(idx);
+        n_load_failed++;
+        refresh_status();
         return false;
     }
 
@@ -690,6 +700,9 @@ bool server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * c
     e.hits++;
     write_meta(e);
     n_loads++;
+    bytes_loaded += e.bytes;
+    load_us      += (uint64_t) (ggml_time_us() - t_start);
+    refresh_status();
 
     const double ms = (ggml_time_us() - t_start) / 1000.0;
     DSK_INF("loaded %s: %zu tokens, %zu checkpoints, %.1f MiB in %.0f ms (%.2f GB/s, hit %d)\n", e.id.c_str(),
@@ -795,6 +808,7 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
     m.bytes    = file_size_or_0(fin);
     m.t_used   = t_now;
     ckpts.emplace(key, m);
+    bytes_written += m.bytes;
     if (written) {
         *written = true;
     }
@@ -1206,4 +1220,52 @@ void server_disk_cache::blob_gc() {
             ++it;
         }
     }
+}
+
+void server_disk_cache::refresh_status() {
+    json list = json::array();
+    for (const auto & e : entries) {
+        list.push_back({
+            { "id",          e.id                 },
+            { "n_tokens",    e.tokens.size()      },
+            { "state_bytes", e.bytes              },
+            { "own_bytes",   e.own_bytes          },
+            { "n_deep",      e.deep.size()        },
+            { "t_saved",     e.t_saved            },
+            { "t_used",      e.t_used             },
+            { "hits",        e.hits               },
+            { "value",       entry_value(e, now_s()) },
+        });
+    }
+    json j = {
+        { "enabled",        quota > 0           },
+        { "dir",            dir                 },
+        { "quota_bytes",    quota               },
+        { "bytes_on_disk",  total_bytes()       },
+        { "min_tokens",     n_min_tokens        },
+        { "ttl_days",       ttl_days            },
+        { "ckpt_ratio",     ckpt_ratio          },
+        { "ckpt_max",       ckpt_max            },
+        { "n_entries",      entries.size()      },
+        { "n_deep_ckpts",   ckpts.size()        },
+        { "n_blocks",       blobs.size()        },
+        { "block_bytes",    blob_bytes          },
+        { "saves",          n_saves             },
+        { "loads",          n_loads             },
+        { "load_failures",  n_load_failed       },
+        { "deep_rewinds",   n_deep_rewinds      },
+        { "evictions",      n_evict             },
+        { "bytes_written",  bytes_written       },
+        { "bytes_loaded",   bytes_loaded        },
+        { "save_seconds",   save_us / 1e6       },
+        { "load_seconds",   load_us / 1e6       },
+        { "entries",        list                },
+    };
+    std::lock_guard<std::mutex> lock(status_mtx);
+    status_snap = std::move(j);
+}
+
+json server_disk_cache::status() const {
+    std::lock_guard<std::mutex> lock(status_mtx);
+    return status_snap;
 }

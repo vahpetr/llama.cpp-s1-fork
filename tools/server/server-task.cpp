@@ -1619,6 +1619,24 @@ std::string server_task_result_metrics::to_metrics() {
             "admission_rejected_total",
             "GTT headroom admission: prompts rejected (503) after waiting longer than LLAMA_GTT_ADMISSION_MAX_WAIT_S",
             (double) metrics.admission_rejected_total
+        }, {
+            "disk_cache_saves_total", "Disk prompt cache: conversations written", (double) metrics.disk.n_saves
+        }, {
+            "disk_cache_loads_total", "Disk prompt cache: conversations loaded instead of re-processed", (double) metrics.disk.n_loads
+        }, {
+            "disk_cache_load_failures_total", "Disk prompt cache: loads that failed (entry dropped, normal prefill)", (double) metrics.disk.n_load_failed
+        }, {
+            "disk_cache_deep_rewinds_total", "Disk prompt cache: rewinds to a stored recurrent checkpoint", (double) metrics.disk.n_deep_rewinds
+        }, {
+            "disk_cache_evictions_total", "Disk prompt cache: entries removed by quota or TTL", (double) metrics.disk.n_evict
+        }, {
+            "disk_cache_bytes_written_total", "Disk prompt cache: bytes written (new blocks, maps, checkpoints)", (double) metrics.disk.bytes_written
+        }, {
+            "disk_cache_bytes_loaded_total", "Disk prompt cache: state bytes loaded", (double) metrics.disk.bytes_loaded
+        }, {
+            "disk_cache_save_seconds_total", "Disk prompt cache: time spent saving (blocks the server loop)", metrics.disk.save_us / 1.e6
+        }, {
+            "disk_cache_load_seconds_total", "Disk prompt cache: time spent loading", metrics.disk.load_us / 1.e6
         },
     };
 
@@ -1683,6 +1701,14 @@ std::string server_task_result_metrics::to_metrics() {
             "admission_last_deferred",
             "GTT headroom admission: 1 when the last check deferred a prompt ubatch",
             (double) metrics.admission_last_deferred
+        }, {
+            "disk_cache_entries", "Disk prompt cache: stored conversations", (double) metrics.disk.n_entries
+        }, {
+            "disk_cache_deep_checkpoints", "Disk prompt cache: stored recurrent checkpoints", (double) metrics.disk.n_deep_ckpts
+        }, {
+            "disk_cache_blocks", "Disk prompt cache: stored 4 MiB state blocks", (double) metrics.disk.n_blocks
+        }, {
+            "disk_cache_bytes", "Disk prompt cache: bytes on disk", (double) metrics.disk.bytes_on_disk
         },
     };
 

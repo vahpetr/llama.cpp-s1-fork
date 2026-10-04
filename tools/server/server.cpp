@@ -209,6 +209,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // proxy handlers
         // note: routes.get_health stays the same
         routes.get_metrics                 = models_routes->proxy_get;
+        routes.get_disk_cache              = models_routes->proxy_get;
         routes.post_props                  = models_routes->proxy_post;
         routes.post_completions            = models_routes->proxy_post;
         routes.post_completions_oai        = models_routes->proxy_post;
@@ -246,6 +247,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
+    ctx_http.get ("/disk-cache",               ex_wrapper(routes.get_disk_cache));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models));
@@ -543,6 +545,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
+
+        ctx_server.save_on_exit();
 
         clean_up();
         if (ctx_http.thread.joinable()) {

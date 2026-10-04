@@ -483,6 +483,14 @@ struct server_metrics {
     // tokens reused from the cache need no decode, so they only have a count
     uint64_t n_prompt_cached = 0;
 
+    // [TAG_DISK_PROMPT_CACHE] disk tier of the prompt cache (cumulative counters + current gauges)
+    struct {
+        uint64_t n_saves = 0, n_loads = 0, n_evict = 0, n_deep_rewinds = 0, n_load_failed = 0;
+        uint64_t bytes_written = 0, bytes_loaded = 0;
+        uint64_t save_us = 0, load_us = 0;
+        uint64_t n_entries = 0, n_deep_ckpts = 0, n_blocks = 0, bytes_on_disk = 0;
+    } disk;
+
     // [TAG_B0_RESTORE_LOG] (v33 B0) prompt-checkpoint restores and the common-prefix tokens they re-process
     uint64_t n_prompt_restores        = 0;
     uint64_t n_prompt_replayed_tokens = 0;

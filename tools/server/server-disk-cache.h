@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -102,10 +103,24 @@ struct server_disk_cache {
 
     uint64_t total_bytes() const;
 
-    // counters for the logs
+    // counters for the logs and /metrics
     uint64_t n_saves = 0;
     uint64_t n_loads = 0;
     uint64_t n_evict = 0;
+    uint64_t n_deep_rewinds = 0;
+    uint64_t n_load_failed  = 0;
+    uint64_t bytes_written  = 0;
+    uint64_t bytes_loaded   = 0;
+    uint64_t save_us        = 0;
+    uint64_t load_us        = 0;
+
+    size_t n_entries()    const { return entries.size(); }
+    size_t n_deep_ckpts() const { return ckpts.size(); }
+    size_t n_blocks()     const { return blobs.size(); }
+
+    // the stored conversations and totals for GET /disk-cache; thread-safe (a snapshot the server loop refreshes)
+    json status() const;
+    void refresh_status();
 
   private:
     std::string dir;
@@ -121,6 +136,9 @@ struct server_disk_cache {
     std::vector<server_disk_cache_entry> entries;
 
     std::map<std::string, server_deep_ckpt_meta> ckpts;
+
+    mutable std::mutex status_mtx;
+    json               status_snap;
 
     // [TAG_DISK_DELTA] content-addressed blocks of the state streams: key -> bytes on disk
     std::map<std::string, uint64_t> blobs;
