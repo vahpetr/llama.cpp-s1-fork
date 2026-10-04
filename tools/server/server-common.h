@@ -234,6 +234,11 @@ public:
     // split the tokens into message spans, skipping over media chunks
     common_chat_msg_spans find_message_spans(const common_chat_msg_delimiters & delims) const;
 
+    // content keys of the prefixes [0, n) for each n in ns (ascending): two 64-bit hashes over the text tokens and the
+    // media chunk ids, plus n. Equal keys = the same prefix, so a recurrent-state checkpoint taken at n in one
+    // conversation is valid for any other prompt that starts the same way [TAG_DEEP_CKPT]
+    std::vector<std::string> prefix_keys(const std::vector<size_t> & ns) const;
+
     // check text token IDs and the mapping between media chunks and token ranges
     bool validate(const struct llama_context * ctx) const;
 

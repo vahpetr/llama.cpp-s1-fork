@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -17,8 +18,9 @@
 
 namespace fs = std::filesystem;
 
-static constexpr uint32_t DISK_CACHE_VERSION = 1;
+static constexpr uint32_t DISK_CACHE_VERSION = 2; // 2: deep checkpoint refs in .aux
 static constexpr uint32_t AUX_MAGIC          = 0x58554144; // "DAUX"
+static constexpr uint32_t CKPT_MAGIC         = 0x324b4344; // "DCK2"
 
 static int64_t now_s() {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -67,6 +69,72 @@ static void put_vec(std::ofstream & f, const std::vector<uint8_t> & v) {
 template <typename T> static bool get(std::ifstream & f, T & v) {
     return (bool) f.read(reinterpret_cast<char *>(&v), sizeof(T));
 }
+static bool get_vec(std::ifstream & f, std::vector<uint8_t> & v);
+static bool skip_vec(std::ifstream & f) {
+    uint64_t n = 0;
+    if (!get(f, n) || n > (1ull << 33)) {
+        return false;
+    }
+    f.seekg((std::streamoff) n, std::ios::cur);
+    return (bool) f;
+}
+static void put_str(std::ofstream & f, const std::string & v) {
+    put<uint32_t>(f, (uint32_t) v.size());
+    f.write(v.data(), v.size());
+}
+static bool get_str(std::ifstream & f, std::string & v) {
+    uint32_t n = 0;
+    if (!get(f, n) || n > 4096) {
+        return false;
+    }
+    v.resize(n);
+    return n == 0 || (bool) f.read(v.data(), n);
+}
+
+// .aux layout: magic, n_ckpt, n_ckpt x {n_tokens, pos_min, pos_max, flags_tgt, flags_dft, tgt, dft, spec},
+// spec_state, n_deep, n_deep x {n_tokens, kind, key}. with_data = false seeks over the state blobs.
+static bool read_aux(const std::string & path, bool with_data, std::list<common_prompt_checkpoint> * checkpoints,
+                     std::vector<uint8_t> * spec_state, std::vector<server_deep_ref> & deep) {
+    std::ifstream f(path, std::ios::binary);
+    uint32_t magic = 0, n_ckpt = 0;
+    bool ok = get(f, magic) && magic == AUX_MAGIC && get(f, n_ckpt) && n_ckpt < 4096;
+    for (uint32_t i = 0; ok && i < n_ckpt; i++) {
+        common_prompt_checkpoint c;
+        int64_t  n_tokens = 0;
+        int32_t  pos_min = 0, pos_max = 0;
+        uint32_t ft = 0, fd = 0;
+        ok = get(f, n_tokens) && get(f, pos_min) && get(f, pos_max) && get(f, ft) && get(f, fd);
+        if (with_data) {
+            ok = ok && get_vec(f, c.data_tgt) && get_vec(f, c.data_dft) && get_vec(f, c.data_spec);
+        } else {
+            ok = ok && skip_vec(f) && skip_vec(f) && skip_vec(f);
+        }
+        c.n_tokens  = n_tokens;
+        c.pos_min   = pos_min;
+        c.pos_max   = pos_max;
+        c.flags_tgt = ft;
+        c.flags_dft = fd;
+        if (ok && checkpoints) {
+            checkpoints->push_back(std::move(c));
+        }
+    }
+    if (with_data && spec_state) {
+        ok = ok && get_vec(f, *spec_state);
+    } else {
+        ok = ok && skip_vec(f);
+    }
+    uint32_t n_deep = 0;
+    ok = ok && get(f, n_deep) && n_deep < 65536;
+    for (uint32_t i = 0; ok && i < n_deep; i++) {
+        server_deep_ref r;
+        ok = get(f, r.n_tokens) && get(f, r.kind) && get_str(f, r.key);
+        if (ok) {
+            deep.push_back(std::move(r));
+        }
+    }
+    return ok;
+}
+
 static bool get_vec(std::ifstream & f, std::vector<uint8_t> & v) {
     uint64_t n = 0;
     if (!get(f, n) || n > (1ull << 33)) { // 8 GiB: far above one recurrent state, below a corrupt length
@@ -130,9 +198,15 @@ std::string server_disk_cache_fingerprint(const common_params & params, int32_t 
 }
 
 server_disk_cache::server_disk_cache(std::string dir, uint64_t quota_bytes, int32_t min_tokens, int32_t ttl_days,
-                                     std::string fingerprint, bool has_mtmd)
+                                     std::string fingerprint, bool has_mtmd, float ckpt_ratio, int32_t ckpt_min_step,
+                                     int32_t ckpt_max)
     : dir(std::move(dir)), quota(quota_bytes), n_min_tokens(min_tokens), ttl_days(ttl_days),
-      fingerprint(std::move(fingerprint)), has_mtmd(has_mtmd) {}
+      fingerprint(std::move(fingerprint)), has_mtmd(has_mtmd), ckpt_ratio(ckpt_ratio),
+      ckpt_min_step(std::max(1, ckpt_min_step)), ckpt_max(std::max(2, ckpt_max)) {}
+
+std::string server_disk_cache::ckpt_path(const std::string & key) const {
+    return (fs::path(dir) / "ckpt" / (key + ".ck")).string();
+}
 
 std::string server_disk_cache::path(const std::string & id, const char * ext) const {
     return (fs::path(dir) / (id + ext)).string();
@@ -173,6 +247,9 @@ uint64_t server_disk_cache::total_bytes() const {
     uint64_t res = 0;
     for (const auto & e : entries) {
         res += e.bytes;
+    }
+    for (const auto & it : ckpts) {
+        res += it.second.bytes;
     }
     return res;
 }
@@ -225,7 +302,8 @@ void server_disk_cache::init() {
                         e.tokens = server_tokens::deserialize(packed, has_mtmd);
                         ok = e.tokens.size() == j.at("n_tokens").get<size_t>() &&
                              file_size_or_0(path(id, ".tgt")) > 0 &&
-                             (!e.has_dft || file_size_or_0(path(id, ".dft")) > 0);
+                             (!e.has_dft || file_size_or_0(path(id, ".dft")) > 0) &&
+                             read_aux(path(id, ".aux"), false, nullptr, nullptr, e.deep);
                     }
                 }
             }
@@ -241,11 +319,41 @@ void server_disk_cache::init() {
         }
     }
 
+    // deep checkpoint store: keep the files with this fingerprint
+    fs::create_directories(fs::path(dir) / "ckpt", ec);
+    size_t n_ck_dropped = 0;
+    const std::string fp_short = fingerprint.substr(0, 16);
+    for (const auto & de : fs::directory_iterator(fs::path(dir) / "ckpt", ec)) {
+        const std::string name = de.path().filename().string();
+        bool ok = false;
+        server_deep_ckpt_meta m;
+        if (name.size() > 3 && name.compare(name.size() - 3, 3, ".ck") == 0) {
+            std::ifstream f(de.path(), std::ios::binary);
+            uint32_t magic = 0;
+            std::string fp;
+            ok = get(f, magic) && magic == CKPT_MAGIC && get_str(f, fp) && fp == fp_short && get_str(f, m.key) &&
+                 get(f, m.n_tokens) && get(f, m.pos_min) && get(f, m.pos_max) && m.key + ".ck" == name;
+        }
+        if (ok) {
+            m.bytes  = file_size_or_0(de.path().string());
+            std::error_code ec_t;
+            const auto mt = fs::last_write_time(de.path(), ec_t);
+            m.t_used = ec_t ? now_s() : std::chrono::duration_cast<std::chrono::seconds>(
+                           (mt - fs::file_time_type::clock::now()) + std::chrono::system_clock::now().time_since_epoch()).count();
+            ckpts[m.key] = m;
+        } else {
+            fs::remove(de.path(), ec);
+            n_ck_dropped++;
+        }
+    }
+
     enforce("");
 
-    DSK_INF("dir %s: %zu entries, %.2f GiB (quota %.0f GiB, min %d tokens, ttl %d days), %zu stale/foreign dropped\n",
-            dir.c_str(), entries.size(), total_bytes() / (1024.0 * 1024.0 * 1024.0), quota / (1024.0 * 1024.0 * 1024.0),
-            n_min_tokens, ttl_days, n_dropped);
+    DSK_INF("dir %s: %zu entries + %zu deep checkpoints, %.2f GiB (quota %.0f GiB, min %d tokens, ttl %d days, "
+            "deep ratio %.2f min step %d max %d), %zu + %zu stale/foreign dropped\n",
+            dir.c_str(), entries.size(), ckpts.size(), total_bytes() / (1024.0 * 1024.0 * 1024.0),
+            quota / (1024.0 * 1024.0 * 1024.0), n_min_tokens, ttl_days, ckpt_ratio, ckpt_min_step, ckpt_max,
+            n_dropped, n_ck_dropped);
 }
 
 void server_disk_cache::enforce(const std::string & protect) {
@@ -263,6 +371,8 @@ void server_disk_cache::enforce(const std::string & protect) {
             }
         }
     }
+
+    deep_gc();
 
     while (total_bytes() > quota && !entries.empty()) {
         size_t victim = SIZE_MAX;
@@ -284,6 +394,7 @@ void server_disk_cache::enforce(const std::string & protect) {
                 entries[victim].tokens.size(), entries[victim].bytes / (1024.0 * 1024.0 * 1024.0), v_min);
         erase(victim);
         n_evict++;
+        deep_gc(); // the evicted entry's deep checkpoints may now be unreferenced
     }
 }
 
@@ -346,6 +457,12 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
                 common_speculative_get_state(spec, id_slot, spec_state);
             }
             put_vec(f, spec_state);
+            put<uint32_t>(f, (uint32_t) prompt.deep.size());
+            for (const auto & r : prompt.deep) {
+                put<int64_t>(f, r.n_tokens);
+                put<uint8_t>(f, r.kind);
+                put_str(f, r.key);
+            }
             ok = ok && (bool) f;
         }
     } catch (const std::exception & err) {
@@ -361,6 +478,7 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
 
     if (ok) {
         e.tokens  = prompt.tokens.clone();
+        e.deep    = prompt.deep;
         e.t_saved = e.t_used = now_s();
         for (const char * ext : { ".tok", ".tgt", ".dft", ".aux" }) {
             e.bytes += file_size_or_0(path(e.id, ext));
@@ -384,8 +502,8 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     }
 
     const double ms = (ggml_time_us() - t_start) / 1000.0;
-    DSK_INF("saved %s: %zu tokens, %zu checkpoints, %.1f MiB in %.0f ms (%.2f GB/s)\n", e.id.c_str(), n,
-            prompt.checkpoints.size(), e.bytes / (1024.0 * 1024.0), ms, e.bytes / std::max(1e-3, ms) / 1e6);
+    DSK_INF("saved %s: %zu tokens, %zu checkpoints + %zu deep, %.1f MiB in %.0f ms (%.2f GB/s)\n", e.id.c_str(), n,
+            prompt.checkpoints.size(), prompt.deep.size(), e.bytes / (1024.0 * 1024.0), ms, e.bytes / std::max(1e-3, ms) / 1e6);
 
     const std::string id = e.id;
     entries.push_back(std::move(e));
@@ -423,26 +541,9 @@ bool server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * c
 
     std::list<common_prompt_checkpoint> checkpoints;
     std::vector<uint8_t> spec_state;
+    std::vector<server_deep_ref> deep;
     try {
-        std::ifstream f(path(e.id, ".aux"), std::ios::binary);
-        uint32_t magic = 0, n_ckpt = 0;
-        bool ok = get(f, magic) && magic == AUX_MAGIC && get(f, n_ckpt);
-        for (uint32_t i = 0; ok && i < n_ckpt; i++) {
-            common_prompt_checkpoint c;
-            int64_t  n_tokens = 0;
-            int32_t  pos_min = 0, pos_max = 0;
-            uint32_t ft = 0, fd = 0;
-            ok = get(f, n_tokens) && get(f, pos_min) && get(f, pos_max) && get(f, ft) && get(f, fd) &&
-                 get_vec(f, c.data_tgt) && get_vec(f, c.data_dft) && get_vec(f, c.data_spec);
-            c.n_tokens  = n_tokens;
-            c.pos_min   = pos_min;
-            c.pos_max   = pos_max;
-            c.flags_tgt = ft;
-            c.flags_dft = fd;
-            checkpoints.push_back(std::move(c));
-        }
-        ok = ok && get_vec(f, spec_state);
-        if (!ok) {
+        if (!read_aux(path(e.id, ".aux"), true, &checkpoints, &spec_state, deep)) {
             throw std::runtime_error("truncated or corrupt");
         }
     } catch (const std::exception & err) {
@@ -472,6 +573,12 @@ bool server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * c
 
     prompt.tokens      = e.tokens.clone();
     prompt.checkpoints = std::move(checkpoints);
+    prompt.deep.clear();
+    for (auto & r : deep) {
+        if (ckpts.count(r.key)) { // a collected checkpoint is just a gap in the schedule
+            prompt.deep.push_back(std::move(r));
+        }
+    }
 
     e.t_used = now_s();
     e.hits++;
@@ -484,4 +591,258 @@ bool server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * c
             e.bytes / std::max(1e-3, ms) / 1e6, e.hits);
 
     return true;
+}
+
+//
+// deep checkpoints [TAG_DEEP_CKPT]
+//
+
+// depth schedule: walking from the end of the conversation backwards, a checkpoint is kept when it lies at least
+// max(min_step, ratio x its distance to the end) below the previous kept one; the anchor (the shallowest one) and
+// branch points are always kept; above ckpt_max the oldest depth / branch ones go first. Dense where edits and
+// regenerations happen, logarithmic in the depth overall (ratio 0.25: ~25 for 1M tokens).
+void server_disk_cache::thin(std::vector<server_deep_ref> & refs, int64_t n_end) const {
+    std::sort(refs.begin(), refs.end(), [](const auto & a, const auto & b) { return a.n_tokens < b.n_tokens; });
+    // one ref per position, the most important kind wins
+    for (size_t i = 1; i < refs.size();) {
+        if (refs[i].n_tokens == refs[i - 1].n_tokens) {
+            if (refs[i].kind > refs[i - 1].kind) {
+                refs[i - 1] = refs[i];
+            }
+            refs.erase(refs.begin() + i);
+        } else {
+            i++;
+        }
+    }
+    if (refs.empty()) {
+        return;
+    }
+
+    std::vector<server_deep_ref> kept;
+    int64_t last = n_end;
+    for (auto it = refs.rbegin(); it != refs.rend(); ++it) {
+        const int64_t gap_min = std::max<int64_t>(ckpt_min_step, (int64_t) (ckpt_ratio * (double) (n_end - it->n_tokens)));
+        const bool is_front = std::next(it) == refs.rend(); // the shallowest one is the conversation's anchor
+        if (is_front || it->kind != server_deep_ref::DEEP_KIND_DEPTH || last - it->n_tokens >= gap_min) {
+            kept.push_back(*it);
+            last = it->n_tokens;
+        }
+    }
+    std::reverse(kept.begin(), kept.end());
+
+    for (uint8_t kind : { server_deep_ref::DEEP_KIND_DEPTH, server_deep_ref::DEEP_KIND_BRANCH }) {
+        for (size_t i = 1; (int32_t) kept.size() > ckpt_max && i < kept.size();) {
+            if (kept[i].kind == kind) {
+                kept.erase(kept.begin() + i);
+            } else {
+                i++;
+            }
+        }
+    }
+
+    refs = std::move(kept);
+}
+
+void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_checkpoint & c, uint8_t kind) {
+    if (quota == 0 || c.data_tgt.empty() || c.n_tokens <= 0 || c.n_tokens > (int64_t) prompt.tokens.size() ||
+        ((c.flags_tgt | c.flags_dft) & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+        return;
+    }
+
+    // refs whose file was collected (e.g. carried by a RAM prompt-cache state) are gaps, not schedule members
+    prompt.deep.erase(std::remove_if(prompt.deep.begin(), prompt.deep.end(),
+                [&](const auto & r) { return ckpts.count(r.key) == 0; }), prompt.deep.end());
+
+    std::string key;
+    try {
+        key = prompt.tokens.prefix_keys({ (size_t) c.n_tokens })[0];
+    } catch (const std::exception & err) {
+        DSK_WRN("deep checkpoint key: %s\n", err.what());
+        return;
+    }
+
+    bool need_enforce = false;
+
+    // would the schedule keep it? then it is worth the write (~113 MiB on the prod model)
+    {
+        std::vector<server_deep_ref> trial = prompt.deep;
+        trial.push_back({ c.n_tokens, key, kind });
+        thin(trial, (int64_t) prompt.tokens.size());
+        const bool kept = std::any_of(trial.begin(), trial.end(), [&](const auto & r) { return r.key == key; });
+        if (!kept) {
+            return;
+        }
+    }
+
+    const int64_t t_now = now_s();
+    auto it = ckpts.find(key);
+    if (it == ckpts.end()) {
+        const int64_t t_start = ggml_time_us();
+        const std::string fin = ckpt_path(key);
+        const std::string tmp = fin + ".tmp";
+        bool ok = false;
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            put<uint32_t>(f, CKPT_MAGIC);
+            put_str(f, fingerprint.substr(0, 16));
+            put_str(f, key);
+            put<int64_t>(f, c.n_tokens);
+            put<int32_t>(f, c.pos_min);
+            put<int32_t>(f, c.pos_max);
+            put<uint32_t>(f, c.flags_tgt);
+            put<uint32_t>(f, c.flags_dft);
+            put_vec(f, c.data_tgt);
+            put_vec(f, c.data_dft);
+            put_vec(f, c.data_spec);
+            ok = (bool) f;
+        }
+        std::error_code ec;
+        if (ok) {
+            fs::rename(tmp, fin, ec);
+            ok = !ec;
+        }
+        if (!ok) {
+            fs::remove(tmp, ec);
+            DSK_WRN("cannot write deep checkpoint at %" PRId64 "\n", c.n_tokens);
+            return;
+        }
+        server_deep_ckpt_meta m;
+        m.key      = key;
+        m.n_tokens = c.n_tokens;
+        m.pos_min  = c.pos_min;
+        m.pos_max  = c.pos_max;
+        m.bytes    = file_size_or_0(fin);
+        m.t_used   = t_now;
+        it = ckpts.emplace(key, m).first;
+        need_enforce = true;
+        DSK_INF("deep checkpoint at %" PRId64 " (%s) stored, %.1f MiB in %.0f ms\n", c.n_tokens,
+                kind == server_deep_ref::DEEP_KIND_BRANCH ? "branch" : kind == server_deep_ref::DEEP_KIND_ANCHOR ? "anchor" : "depth",
+                m.bytes / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
+    } else {
+        it->second.t_used = t_now;
+    }
+
+    bool found = false;
+    for (auto & r : prompt.deep) {
+        if (r.n_tokens == c.n_tokens) {
+            r.key  = key;
+            r.kind = std::max(r.kind, kind);
+            found  = true;
+        }
+    }
+    if (!found) {
+        prompt.deep.push_back({ c.n_tokens, key, kind });
+    }
+
+    const size_t n_before = prompt.deep.size();
+    thin(prompt.deep, (int64_t) prompt.tokens.size());
+    if (prompt.deep.size() != n_before) {
+        DSK_INF("deep schedule: %zu -> %zu checkpoints for %zu tokens\n", n_before, prompt.deep.size(), prompt.tokens.size());
+    }
+
+    if (need_enforce && total_bytes() > quota) {
+        enforce("");
+    }
+}
+
+void server_disk_cache::deep_adopt(server_prompt & prompt, const server_deep_ckpt_meta & m) {
+    for (const auto & r : prompt.deep) {
+        if (r.key == m.key) {
+            return;
+        }
+    }
+    prompt.deep.push_back({ m.n_tokens, m.key, server_deep_ref::DEEP_KIND_DEPTH });
+    thin(prompt.deep, (int64_t) prompt.tokens.size());
+}
+
+std::vector<server_deep_ckpt_meta> server_disk_cache::deep_candidates(const server_tokens & tokens, int64_t n_max) const {
+    std::vector<server_deep_ckpt_meta> cand;
+    for (const auto & it : ckpts) {
+        if (it.second.n_tokens <= n_max && it.second.n_tokens <= (int64_t) tokens.size()) {
+            cand.push_back(it.second);
+        }
+    }
+    if (cand.empty()) {
+        return cand;
+    }
+    std::sort(cand.begin(), cand.end(), [](const auto & a, const auto & b) { return a.n_tokens < b.n_tokens; });
+    std::vector<size_t> ns;
+    for (const auto & c : cand) {
+        if (ns.empty() || ns.back() != (size_t) c.n_tokens) {
+            ns.push_back((size_t) c.n_tokens);
+        }
+    }
+    std::vector<std::string> keys;
+    try {
+        keys = tokens.prefix_keys(ns);
+    } catch (const std::exception &) {
+        return {};
+    }
+    const std::set<std::string> want(keys.begin(), keys.end());
+    std::vector<server_deep_ckpt_meta> res;
+    for (auto it = cand.rbegin(); it != cand.rend(); ++it) {
+        if (want.count(it->key)) {
+            res.push_back(*it);
+        }
+    }
+    return res;
+}
+
+bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoint & out) {
+    auto it = ckpts.find(key);
+    if (it == ckpts.end()) {
+        return false;
+    }
+    try {
+        std::ifstream f(ckpt_path(key), std::ios::binary);
+        uint32_t magic = 0;
+        std::string fp, k;
+        int64_t  n_tokens = 0;
+        int32_t  pos_min = 0, pos_max = 0;
+        uint32_t ft = 0, fd = 0;
+        const bool ok = get(f, magic) && magic == CKPT_MAGIC && get_str(f, fp) && get_str(f, k) && k == key &&
+                        get(f, n_tokens) && get(f, pos_min) && get(f, pos_max) && get(f, ft) && get(f, fd) &&
+                        get_vec(f, out.data_tgt) && get_vec(f, out.data_dft) && get_vec(f, out.data_spec);
+        if (!ok) {
+            throw std::runtime_error("truncated or corrupt");
+        }
+        out.n_tokens  = n_tokens;
+        out.pos_min   = pos_min;
+        out.pos_max   = pos_max;
+        out.flags_tgt = ft;
+        out.flags_dft = fd;
+        out.id_task   = -1;
+    } catch (const std::exception & err) {
+        DSK_WRN("deep checkpoint %s unreadable (%s), dropping it\n", key.c_str(), err.what());
+        std::error_code ec;
+        fs::remove(ckpt_path(key), ec);
+        ckpts.erase(it);
+        return false;
+    }
+    it->second.t_used = now_s();
+    it->second.hits++;
+    std::error_code ec;
+    fs::last_write_time(ckpt_path(key), fs::file_time_type::clock::now(), ec); // t_used survives a restart
+    return true;
+}
+
+void server_disk_cache::deep_gc() {
+    std::set<std::string> referenced;
+    if (live_refs) {
+        referenced = live_refs();
+    }
+    for (const auto & e : entries) {
+        for (const auto & r : e.deep) {
+            referenced.insert(r.key);
+        }
+    }
+    for (auto it = ckpts.begin(); it != ckpts.end();) {
+        if (!referenced.count(it->first)) {
+            std::error_code ec;
+            fs::remove(ckpt_path(it->first), ec);
+            it = ckpts.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }

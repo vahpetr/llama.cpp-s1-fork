@@ -563,14 +563,29 @@ struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
 };
 
+// [TAG_DEEP_CKPT] a recurrent-state checkpoint that left the in-RAM list and lives in the disk cache's
+// content-addressed checkpoint store (server_disk_cache), referenced by the conversation that owns it
+struct server_deep_ref {
+    int64_t     n_tokens = 0;
+    std::string key;            // server_tokens::prefix_keys of [0, n_tokens)
+    uint8_t     kind     = 0;   // DEEP_KIND_*
+
+    static constexpr uint8_t DEEP_KIND_DEPTH  = 0; // kept by the depth schedule
+    static constexpr uint8_t DEEP_KIND_ANCHOR = 1; // first checkpoint of the conversation (system prompt + tools)
+    static constexpr uint8_t DEEP_KIND_BRANCH = 2; // a point a branch was taken from
+};
+
 struct server_prompt {
     server_tokens tokens;
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    std::vector<server_deep_ref> deep; // ascending n_tokens, all <= tokens.size()
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        deep.clear();
     }
 
     int n_tokens() const {
@@ -581,6 +596,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            deep,
         };
     }
 };

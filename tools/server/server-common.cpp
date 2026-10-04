@@ -735,6 +735,44 @@ common_chat_msg_spans server_tokens::find_message_spans(const common_chat_msg_de
     return delims.split(tokens, skips);
 }
 
+std::vector<std::string> server_tokens::prefix_keys(const std::vector<size_t> & ns) const {
+    uint64_t h1 = 1469598103934665603ull;
+    uint64_t h2 = 0x9e3779b97f4a7c15ull;
+    const auto mix = [&](const void * data, size_t len) {
+        const auto * p = static_cast<const uint8_t *>(data);
+        for (size_t k = 0; k < len; k++) {
+            h1 = (h1 ^ p[k]) * 1099511628211ull;
+            h2 = (h2 ^ p[k]) * 0xff51afd7ed558ccdull;
+            h2 ^= h2 >> 29;
+        }
+    };
+
+    std::vector<std::string> out;
+    out.reserve(ns.size());
+
+    size_t i = 0;
+    for (const size_t n : ns) {
+        GGML_ASSERT(n <= tokens.size() && n >= i);
+        for (; i < n; i++) {
+            const llama_token t = tokens[i];
+            if (t != LLAMA_TOKEN_NULL) {
+                mix(&t, sizeof(t));
+                continue;
+            }
+            const auto it = map_idx_to_media.find(i);
+            if (it != map_idx_to_media.end()) {
+                const char * id = mtmd_input_chunk_get_id(it->second.get());
+                const std::string sid = id ? id : "";
+                mix("\x01media:", 7);
+                mix(sid.data(), sid.size());
+            }
+        }
+        out.push_back(string_format("%016llx%016llx-%zu", (unsigned long long) h1, (unsigned long long) h2, n));
+    }
+
+    return out;
+}
+
 bool server_tokens::validate(const struct llama_context * ctx) const {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);

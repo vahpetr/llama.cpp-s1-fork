@@ -349,6 +349,10 @@ struct server_slot {
     // [TAG_CKPT_PIN_RESTORED] (v33 fix round 2) n_tokens of the checkpoint this task restored (and kept), -1 = none;
     //   the capacity eviction in create_checkpoint() skips it for the rest of the task
     int64_t ckpt_pinned_n_tokens = -1;
+
+    // [TAG_DEEP_CKPT] a user-message start this task branched at after a deep-checkpoint rewind: the replay takes a
+    //   checkpoint there and stores it, so the next branch from the same point is a rewind, not a replay; -1 = none
+    int64_t ckpt_branch_pos = -1;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -1343,6 +1347,38 @@ private:
 
     std::unique_ptr<server_disk_cache> disk_cache; // [TAG_DISK_PROMPT_CACHE]
 
+    // [TAG_DEEP_CKPT] a checkpoint leaving the slot's in-RAM list goes to the deep store (if the schedule keeps it)
+    void deep_spill(server_slot & slot, const common_prompt_checkpoint & ckpt, uint8_t kind) {
+        if (disk_cache) {
+            disk_cache->deep_put(slot.prompt, ckpt, kind);
+        }
+    }
+
+    // collect deep checkpoints nothing references (see live_deep_refs)
+    void deep_gc() {
+        if (disk_cache) {
+            disk_cache->deep_gc();
+        }
+    }
+
+    // the deep refs of every live prompt: the slots and the RAM prompt cache's states
+    std::set<std::string> live_deep_refs() const {
+        std::set<std::string> keys;
+        for (const auto & slot : slots) {
+            for (const auto & r : slot.prompt.deep) {
+                keys.insert(r.key);
+            }
+        }
+        if (prompt_cache) {
+            for (const auto & st : prompt_cache->states) {
+                for (const auto & r : st.prompt.deep) {
+                    keys.insert(r.key);
+                }
+            }
+        }
+        return keys;
+    }
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1801,7 +1837,9 @@ private:
             disk_cache = std::make_unique<server_disk_cache>(
                 params_base.cache_disk_path, (uint64_t) params_base.cache_disk_gib << 30,
                 std::max(1, params_base.cache_disk_min_tokens), params_base.cache_disk_ttl_days,
-                server_disk_cache_fingerprint(params_base, n_ctx), mctx != nullptr);
+                server_disk_cache_fingerprint(params_base, n_ctx), mctx != nullptr,
+                params_base.cache_disk_ckpt_ratio, params_base.checkpoint_min_step, params_base.cache_disk_ckpt_max);
+            disk_cache->live_refs = [this]() { return live_deep_refs(); };
             disk_cache->init();
         }
 
@@ -3052,6 +3090,8 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                deep_spill(slot, *it, server_deep_ref::DEEP_KIND_DEPTH);
+
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -3079,6 +3119,8 @@ private:
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
                     victim == slot.prompt.checkpoints.begin() ? "" : "; skipped the pinned restored checkpoint");
 
+            deep_spill(slot, *victim, server_deep_ref::DEEP_KIND_DEPTH);
+
             slot.prompt.checkpoints.erase(victim);
         }
 
@@ -3104,6 +3146,18 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
                 (float) cur.data_tgt.size() / 1024 / 1024, (float) cur.data_dft.size() / 1024 / 1024,
                 (float) cur.data_spec.size() / 1024 / 1024);
+
+        // [TAG_DEEP_CKPT] the first checkpoint of a conversation (system prompt + tools, shared by every chat and agent
+        //   with the same setup) and a branch point are stored at once, the rest when they leave the in-RAM list
+        if (disk_cache) {
+            if (cur.n_tokens == slot.ckpt_branch_pos) {
+                deep_spill(slot, cur, server_deep_ref::DEEP_KIND_BRANCH);
+                slot.ckpt_branch_pos = -1;
+            } else if (slot.prompt.deep.empty() && slot.prompt.checkpoints.size() == 1) {
+                deep_spill(slot, cur, server_deep_ref::DEEP_KIND_ANCHOR);
+            }
+            deep_gc();
+        }
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -3989,6 +4043,7 @@ private:
                         slot.b0_full_reset    = false;
                         slot.b0_prefix_match  = 0;
                         slot.ckpt_pinned_n_tokens = -1;
+                        slot.ckpt_branch_pos      = -1;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -4203,22 +4258,58 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
-                                    // search for a context checkpoint
-                                    const auto it = std::find_if(
-                                        slot.prompt.checkpoints.rbegin(),
-                                        slot.prompt.checkpoints.rend(),
-                                        [&](const auto & cur) {
-                                            // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
-                                                return false;
-                                            }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                    const auto usable = [&](const auto & cur) {
+                                        // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
+                                        SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                        // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
+                                        if (cur.pos_max > pos_next) {
+                                            return false;
                                         }
-                                    );
+                                        return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                    };
+
+                                    // search for a context checkpoint
+                                    auto it = std::find_if(slot.prompt.checkpoints.rbegin(), slot.prompt.checkpoints.rend(), usable);
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+
+                                    // [TAG_DEEP_CKPT] none of the in-RAM checkpoints (all near the old end) reaches back to the
+                                    //   divergence: rewind to the deepest stored checkpoint of this prefix instead of re-processing
+                                    //   everything, and take a checkpoint at the branch point on the way back up
+                                    //   (also when the usable in-RAM one lies far below the divergence: an old pinned branch point)
+                                    const int64_t n_ram = do_reset ? -1 : it->n_tokens;
+                                    if (disk_cache && n_past - n_ram > params_base.checkpoint_min_step) {
+                                        const int n_div = n_past;
+                                        for (const auto & m : disk_cache->deep_candidates(slot.task->tokens, n_past)) {
+                                            if (m.n_tokens <= n_ram) {
+                                                break; // deepest first: nothing better than the in-RAM one is left
+                                            }
+                                            if (m.pos_max > pos_next || !(m.pos_min < pos_min_thold || m.pos_min == 0)) {
+                                                continue;
+                                            }
+                                            common_prompt_checkpoint ck;
+                                            if (!disk_cache->deep_get(m.key, ck)) {
+                                                continue;
+                                            }
+                                            const int64_t n_ck = ck.n_tokens;
+                                            auto pos_it = std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                                                    [&](const auto & c) { return c.n_tokens > n_ck; });
+                                            slot.prompt.checkpoints.insert(pos_it, std::move(ck));
+                                            disk_cache->deep_adopt(slot.prompt, m);
+                                            SLT_INF(slot, "deep checkpoint at n_tokens = %" PRId64 " for a divergence at %d (replay %" PRId64 " tokens instead of %d)\n",
+                                                    n_ck, n_div, (int64_t) n_div - n_ck, n_div);
+
+                                            for (const auto & sp : slot.task->params.message_spans.spans) {
+                                                if (sp.role == COMMON_CHAT_ROLE_USER && (int64_t) sp.pos > n_ck + params_base.checkpoint_min_step / 4 &&
+                                                    (int64_t) sp.pos <= n_div) {
+                                                    slot.ckpt_branch_pos = (int64_t) sp.pos;
+                                                }
+                                            }
+                                            break;
+                                        }
+                                        it = std::find_if(slot.prompt.checkpoints.rbegin(), slot.prompt.checkpoints.rend(), usable);
+                                        do_reset = it == slot.prompt.checkpoints.rend();
+                                    }
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
@@ -4285,6 +4376,10 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // [TAG_DEEP_CKPT] stored checkpoints past the kept prefix belong to the old continuation
+                        slot.prompt.deep.erase(std::remove_if(slot.prompt.deep.begin(), slot.prompt.deep.end(),
+                                    [&](const auto & r) { return r.n_tokens > n_past; }), slot.prompt.deep.end());
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -4340,6 +4435,7 @@ private:
 
                         slot.prompt.tokens.keep_first(0);
                         slot.prompt.checkpoints.clear();
+                        slot.prompt.deep.clear(); // [TAG_DEEP_CKPT]
 
                         slot.stats.n_prompt_cached = 0;
 
@@ -4477,7 +4573,8 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step ||
+                                pos == slot.ckpt_branch_pos) {
                                 break;
                             }
                         }
@@ -4555,6 +4652,7 @@ private:
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
+                            n_tokens_start == slot.ckpt_branch_pos ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 

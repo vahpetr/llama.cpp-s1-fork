@@ -657,6 +657,8 @@ struct common_params {
     int32_t     cache_disk_gib        = 200;   // quota for all entries, GiB
     int32_t     cache_disk_min_tokens = 8192;  // shorter prompts are cheaper to re-process than to keep
     int32_t     cache_disk_ttl_days   = 14;    // entries unused this long are deleted
+    float       cache_disk_ckpt_ratio = 0.25f; // deep checkpoints: gap >= ratio x distance to the conversation's end
+    int32_t     cache_disk_ckpt_max   = 32;    // deep checkpoints kept per conversation
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
