@@ -122,6 +122,9 @@ struct server_disk_cache {
     json status() const;
     void refresh_status();
 
+    // after a model reload (wake-up from idle sleep): a changed fingerprint drops every stored state
+    void revalidate(const std::string & fingerprint);
+
   private:
     std::string dir;
     uint64_t    quota;

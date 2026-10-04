@@ -1867,7 +1867,12 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
-        if (!params_base.cache_disk_path.empty() && params_base.cache_disk_gib > 0) {
+        // created once: a wake-up from idle sleep reloads the model but keeps this object, so GET /disk-cache (HTTP
+        // threads) never sees it replaced; entries are matched by tokens only, so LoRA adapters disable it
+        if (!params_base.lora_adapters.empty() && !params_base.cache_disk_path.empty()) {
+            SRV_WRN("%s", "--cache-disk is disabled while LoRA adapters are loaded (stored states are keyed by tokens only)\n");
+        }
+        if (!disk_cache && params_base.lora_adapters.empty() && !params_base.cache_disk_path.empty() && params_base.cache_disk_gib > 0) {
             disk_cache = std::make_unique<server_disk_cache>(
                 params_base.cache_disk_path, (uint64_t) params_base.cache_disk_gib << 30,
                 std::max(1, params_base.cache_disk_min_tokens), params_base.cache_disk_ttl_days,
@@ -1875,6 +1880,8 @@ private:
                 params_base.cache_disk_ckpt_ratio, params_base.checkpoint_min_step, params_base.cache_disk_ckpt_max);
             disk_cache->live_refs = [this]() { return live_deep_refs(); };
             disk_cache->init();
+        } else if (disk_cache) {
+            disk_cache->revalidate(server_disk_cache_fingerprint(params_base, n_ctx));
         }
 
         if (params_base.n_ctx_checkpoints > 0) {

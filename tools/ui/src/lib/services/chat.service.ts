@@ -1097,9 +1097,12 @@ export class ChatService {
 		} = options;
 		const normalizedMessages: ApiChatMessageData[] =
 			await ChatService.normalizeMessagesForApi(messages);
+		// the model the capability filters check: in single-model mode the request names none, and
+		// the agentic loop falls back to the first model, so the history must be filtered the same way
+		const capModel = options.model || modelsStore.models[0]?.model || '';
 
 		// Tool results carry audio only for models with audio input, as in the agentic loop
-		if (options.model && !modelsStore.props.modelSupportsAudio(options.model)) {
+		if (capModel && !modelsStore.props.modelSupportsAudio(capModel)) {
 			normalizedMessages.forEach((msg) => {
 				if (msg.role === MessageRole.TOOL && Array.isArray(msg.content)) {
 					msg.content = msg.content.filter(
@@ -1118,13 +1121,13 @@ export class ChatService {
 		}
 
 		// Filter out image attachments if the model doesn't support vision
-		if (options.model && !modelsStore.props.modelSupportsVision(options.model)) {
+		if (capModel && !modelsStore.props.modelSupportsVision(capModel)) {
 			normalizedMessages.forEach((msg) => {
 				if (Array.isArray(msg.content)) {
 					msg.content = msg.content.filter((part: ApiChatMessageContentPart) => {
 						if (part.type === ContentPartType.IMAGE_URL) {
 							console.info(
-								`[ChatService] Skipping image attachment in message history (model "${options.model}" does not support vision)`
+								`[ChatService] Skipping image attachment in message history (model "${capModel}" does not support vision)`
 							);
 
 							return false;

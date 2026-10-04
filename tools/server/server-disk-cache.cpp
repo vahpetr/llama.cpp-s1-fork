@@ -14,6 +14,7 @@
 #include <fstream>
 #include <random>
 #include <set>
+#include <sstream>
 #include <unistd.h> // environ
 
 #define DSK_INF(fmt, ...) LOG_INF("srv  %12.*s: " fmt, 12, "disk_cache", __VA_ARGS__)
@@ -21,10 +22,11 @@
 
 namespace fs = std::filesystem;
 
-static constexpr uint32_t DISK_CACHE_VERSION = 4; // 2: deep checkpoint refs in .aux, 3: block-deduplicated state streams, 4: .aux checkpoints by key
+static constexpr uint32_t DISK_CACHE_VERSION = 5; // 5: sealed (checksummed) .tok / .aux / .ck and map segments // 2: deep checkpoint refs in .aux, 3: block-deduplicated state streams, 4: .aux checkpoints by key
 static constexpr uint32_t AUX_MAGIC          = 0x58554144; // "DAUX"
-static constexpr uint32_t CKPT_MAGIC         = 0x324b4344; // "DCK2"
-static constexpr uint32_t MAP_MAGIC          = 0x3150414d; // "MAP1"
+static constexpr uint32_t CKPT_MAGIC         = 0x334b4344; // "DCK3"
+static constexpr uint32_t MAP_MAGIC          = 0x3250414d; // "MAP2"
+static constexpr uint32_t SEAL_MAGIC         = 0x4c414553; // "SEAL"
 static constexpr size_t   BLOB_BYTES         = 4ull << 20; // block size of the state streams (aligned within each tensor)
 
 static int64_t now_s() {
@@ -86,20 +88,20 @@ static double entry_value(const server_disk_cache_entry & e, int64_t t_now) {
 }
 
 // little-endian POD stream helpers for the .aux file
-template <typename T> static void put(std::ofstream & f, const T & v) {
+template <typename T> static void put(std::ostream & f, const T & v) {
     f.write(reinterpret_cast<const char *>(&v), sizeof(T));
 }
-static void put_vec(std::ofstream & f, const std::vector<uint8_t> & v) {
+static void put_vec(std::ostream & f, const std::vector<uint8_t> & v) {
     put<uint64_t>(f, v.size());
     if (!v.empty()) {
         f.write(reinterpret_cast<const char *>(v.data()), v.size());
     }
 }
-template <typename T> static bool get(std::ifstream & f, T & v) {
+template <typename T> static bool get(std::istream & f, T & v) {
     return (bool) f.read(reinterpret_cast<char *>(&v), sizeof(T));
 }
-static bool get_vec(std::ifstream & f, std::vector<uint8_t> & v);
-static bool skip_vec(std::ifstream & f) {
+static bool get_vec(std::istream & f, std::vector<uint8_t> & v);
+static bool skip_vec(std::istream & f) {
     uint64_t n = 0;
     if (!get(f, n) || n > (1ull << 33)) {
         return false;
@@ -107,11 +109,11 @@ static bool skip_vec(std::ifstream & f) {
     f.seekg((std::streamoff) n, std::ios::cur);
     return (bool) f;
 }
-static void put_str(std::ofstream & f, const std::string & v) {
+static void put_str(std::ostream & f, const std::string & v) {
     put<uint32_t>(f, (uint32_t) v.size());
     f.write(v.data(), v.size());
 }
-static bool get_str(std::ifstream & f, std::string & v) {
+static bool get_str(std::istream & f, std::string & v) {
     uint32_t n = 0;
     if (!get(f, n) || n > 4096) {
         return false;
@@ -120,12 +122,50 @@ static bool get_str(std::ifstream & f, std::string & v) {
     return n == 0 || (bool) f.read(v.data(), n);
 }
 
+// sealed file = body | hash_key(body) | u32 key length | SEAL: a torn or corrupted file never parses as valid
+// (the content keys of the blocks only name their bytes; these files carry their own check)
+static bool write_sealed(const std::string & path, const std::string & body) {
+    const std::string key = hash_key(reinterpret_cast<const uint8_t *>(body.data()), body.size());
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(body.data(), body.size());
+    f.write(key.data(), key.size());
+    put<uint32_t>(f, (uint32_t) key.size());
+    put<uint32_t>(f, SEAL_MAGIC);
+    return (bool) f;
+}
+
+static bool read_sealed(const std::string & path, std::string & body) {
+    std::ifstream f(path, std::ios::binary);
+    std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (all.size() < 8) {
+        return false;
+    }
+    uint32_t klen = 0, magic = 0;
+    memcpy(&klen,  all.data() + all.size() - 8, 4);
+    memcpy(&magic, all.data() + all.size() - 4, 4);
+    if (magic != SEAL_MAGIC || klen == 0 || klen > 256 || all.size() < 8 + (size_t) klen) {
+        return false;
+    }
+    const size_t n_body = all.size() - 8 - klen;
+    const std::string key = all.substr(n_body, klen);
+    if (hash_key(reinterpret_cast<const uint8_t *>(all.data()), n_body) != key) {
+        return false;
+    }
+    all.resize(n_body);
+    body = std::move(all);
+    return true;
+}
+
 // .aux layout: magic, n_ckpt, n_ckpt x {n_tokens, pos_min, pos_max, flags_tgt, flags_dft, tgt, dft, spec},
 // spec_state, n_deep, n_deep x {n_tokens, kind, key}. with_data = false seeks over the state blobs.
 static bool read_aux(const std::string & path, bool with_data, std::list<common_prompt_checkpoint> * checkpoints,
                      std::vector<uint8_t> * spec_state, std::vector<server_deep_ref> & deep,
                      std::vector<std::string> & ckpt_keys) {
-    std::ifstream f(path, std::ios::binary);
+    std::string body;
+    if (!read_sealed(path, body)) {
+        return false;
+    }
+    std::istringstream f(body);
     uint32_t magic = 0, n_ckpt = 0;
     bool ok = get(f, magic) && magic == AUX_MAGIC && get(f, n_ckpt) && n_ckpt < 4096;
     for (uint32_t i = 0; ok && i < n_ckpt; i++) {
@@ -164,7 +204,7 @@ static bool read_aux(const std::string & path, bool with_data, std::list<common_
     return ok;
 }
 
-static bool get_vec(std::ifstream & f, std::vector<uint8_t> & v) {
+static bool get_vec(std::istream & f, std::vector<uint8_t> & v) {
     uint64_t n = 0;
     if (!get(f, n) || n > (1ull << 33)) { // 8 GiB: far above one recurrent state, below a corrupt length
         return false;
@@ -189,11 +229,12 @@ std::string server_disk_cache_fingerprint(const common_params & params, int32_t 
     for (char ** ep = environ; ep && *ep; ep++) {
         const std::string kv = *ep;
         if (kv.rfind("LLAMA_", 0) == 0 || kv.rfind("GGML_", 0) == 0) {
-            if (kv.rfind("LLAMA_ARG_", 0) != 0) {
+            if (kv.rfind("LLAMA_ARG_CACHE_DISK", 0) != 0) { // only the disk cache's own options are neutral
                 knobs.push_back(kv);
             }
         }
     }
+    std::sort(knobs.begin(), knobs.end()); // environment order is arbitrary; the argv below keeps its order
     // the command line (rope scaling, QSA ratio, ... change the stored K/V) minus the disk cache's own options
     {
         std::ifstream fc("/proc/self/cmdline", std::ios::binary);
@@ -211,18 +252,37 @@ std::string server_disk_cache_fingerprint(const common_params & params, int32_t 
             knobs.push_back("argv:" + arg);
         }
     }
-    std::sort(knobs.begin(), knobs.end());
     std::string env_id;
     for (const auto & kv : knobs) {
         env_id += kv + ";";
     }
-    const std::string s = string_format("v%u|%s|%llu|%s|%llu|ctx%d|k%d|v%d|dk%d|dv%d|%s|%s|%s",
+    // a file's identity: size + mtime (a re-converted model at the same path and size has a new mtime)
+    const auto file_id = [](const std::string & p) {
+        std::error_code ec_f;
+        const auto mt = fs::last_write_time(p, ec_f);
+        return string_format("%llu@%lld", (unsigned long long) file_size_or_0(p),
+                             ec_f ? 0ll : (long long) mt.time_since_epoch().count());
+    };
+    // every shard of a split GGUF (<name>-00001-of-0000N.gguf)
+    const auto model_id = [&](const std::string & p) {
+        std::string id = file_id(p);
+        const auto at = p.rfind("-00001-of-");
+        if (at != std::string::npos && p.size() >= at + 15) {
+            const int n = atoi(p.substr(at + 10, 5).c_str());
+            for (int i = 2; i <= n && i < 100000; i++) {
+                const std::string shard = p.substr(0, at) + string_format("-%05d-of-", i) + p.substr(at + 10);
+                id += "|" + file_id(shard);
+            }
+        }
+        return id;
+    };
+    const std::string s = string_format("v%u|%s|%s|%s|%s|ctx%d|k%d|v%d|dk%d|dv%d|%s|%s|%s|%s",
         DISK_CACHE_VERSION,
-        params.model.path.c_str(), (unsigned long long) file_size_or_0(params.model.path),
-        params.speculative.draft.mparams.path.c_str(), (unsigned long long) file_size_or_0(params.speculative.draft.mparams.path),
+        params.model.path.c_str(), model_id(params.model.path).c_str(),
+        params.speculative.draft.mparams.path.c_str(), model_id(params.speculative.draft.mparams.path).c_str(),
         n_ctx, (int) params.cache_type_k, (int) params.cache_type_v,
         (int) params.speculative.draft.cache_type_k, (int) params.speculative.draft.cache_type_v,
-        params.mmproj.path.c_str(), exe_id.c_str(), env_id.c_str());
+        params.mmproj.path.c_str(), file_id(params.mmproj.path).c_str(), exe_id.c_str(), env_id.c_str());
     return string_format("%016llx", (unsigned long long) std::hash<std::string>{}(s)) + " " + s;
 }
 
@@ -323,9 +383,8 @@ void server_disk_cache::init() {
                     e.hits    = j.at("hits").get<int32_t>();
                     e.has_dft = j.at("has_dft").get<bool>();
 
-                    std::ifstream ft(path(id, ".tok"), std::ios::binary);
-                    std::vector<char> raw((std::istreambuf_iterator<char>(ft)), std::istreambuf_iterator<char>());
-                    if (!raw.empty() && raw.size() % sizeof(llama_token) == 0) {
+                    std::string raw;
+                    if (read_sealed(path(id, ".tok"), raw) && !raw.empty() && raw.size() % sizeof(llama_token) == 0) {
                         llama_tokens packed(raw.size() / sizeof(llama_token));
                         memcpy(packed.data(), raw.data(), raw.size());
                         e.tokens = server_tokens::deserialize(packed, has_mtmd);
@@ -405,6 +464,11 @@ void server_disk_cache::init() {
             std::string fp;
             ok = get(f, magic) && magic == CKPT_MAGIC && get_str(f, fp) && fp == fp_short && get_str(f, m.key) &&
                  get(f, m.n_tokens) && get(f, m.pos_min) && get(f, m.pos_max) && m.key + ".ck" == name;
+            // the header is indexed without reading the 113 MiB body (its seal is checked on use): bound it, and the
+            // key carries the token count, so a corrupt n_tokens cannot reach prefix_keys
+            const auto dash = m.key.rfind('-');
+            ok = ok && m.n_tokens > 0 && m.n_tokens < (1ll << 31) && m.pos_min >= 0 && m.pos_max >= m.pos_min &&
+                 dash != std::string::npos && m.key.substr(dash + 1) == std::to_string(m.n_tokens);
         }
         if (ok) {
             m.bytes  = file_size_or_0(de.path().string());
@@ -513,13 +577,11 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
         // tokens
         {
             const std::vector<char> packed = prompt.tokens.serialize();
-            std::ofstream f(path(e.id, ".tok"), std::ios::binary | std::ios::trunc);
-            f.write(packed.data(), packed.size());
-            ok = ok && (bool) f;
+            ok = ok && write_sealed(path(e.id, ".tok"), std::string(packed.begin(), packed.end()));
         }
         // checkpoints + speculative state
         if (ok) {
-            std::ofstream f(path(e.id, ".aux"), std::ios::binary | std::ios::trunc);
+            std::ostringstream f;
             // the in-RAM checkpoints go to the content-addressed store (a later save of the same conversation, a
             // branch or a copy writes them once), the .aux keeps their keys
             std::vector<size_t> ns;
@@ -559,7 +621,7 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
                 put<uint8_t>(f, r.kind);
                 put_str(f, r.key);
             }
-            ok = ok && (bool) f;
+            ok = ok && (bool) f && write_sealed(path(e.id, ".aux"), f.str());
         }
     } catch (const std::exception & err) {
         DSK_WRN("cannot serialize the prompt: %s\n", err.what());
@@ -776,7 +838,7 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
     const std::string tmp = fin + ".tmp";
     bool ok = false;
     {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        std::ostringstream f;
         put<uint32_t>(f, CKPT_MAGIC);
         put_str(f, fingerprint.substr(0, 16));
         put_str(f, key);
@@ -788,7 +850,7 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
         put_vec(f, c.data_tgt);
         put_vec(f, c.data_dft);
         put_vec(f, c.data_spec);
-        ok = (bool) f;
+        ok = (bool) f && write_sealed(tmp, f.str());
     }
     std::error_code ec;
     if (ok) {
@@ -929,7 +991,11 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         return false;
     }
     try {
-        std::ifstream f(ckpt_path(key), std::ios::binary);
+        std::string body;
+        if (!read_sealed(ckpt_path(key), body)) {
+            throw std::runtime_error("checksum mismatch or truncated");
+        }
+        std::istringstream f(body);
         uint32_t magic = 0;
         std::string fp, k;
         int64_t  n_tokens = 0;
@@ -1012,6 +1078,7 @@ bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const 
         put<uint8_t>(fm, 0);
         put<uint64_t>(fm, inl.size());
         fm.write(reinterpret_cast<const char *>(inl.data()), inl.size());
+        put_str(fm, hash_key(inl.data(), inl.size())); // cell metadata, types: checked on load like the blocks
         n_written += inl.size();
         inl.clear();
     };
@@ -1103,10 +1170,14 @@ bool server_disk_cache::read_map_keys(const std::string & map_path, std::vector<
         }
         if (kind == 0) {
             uint64_t n = 0;
+            std::string h;
             if (!get(fm, n)) {
                 return false;
             }
             fm.seekg((std::streamoff) n, std::ios::cur);
+            if (!get_str(fm, h)) {
+                return false;
+            }
         } else if (kind == 1) {
             std::string key;
             if (!get_str(fm, key)) {
@@ -1144,8 +1215,22 @@ bool server_disk_cache::load_stream(llama_context * ctx, int32_t id_slot, const 
             return false;
         }
         if (kind == 0) {
-            seg_inline = true;
-            return (bool) get(fm, seg_left);
+            // an inline segment is read whole and checked against the hash that follows it
+            uint64_t n = 0;
+            std::string h;
+            if (!get(fm, n) || n > (1ull << 32)) {
+                return false;
+            }
+            blk.resize(n);
+            if (!fm.read(reinterpret_cast<char *>(blk.data()), n) || !get_str(fm, h) || hash_key(blk.data(), n) != h) {
+                DSK_WRN("%s: inline segment corrupt\n", map_path.c_str());
+                corrupt = true;
+                return false;
+            }
+            seg_inline = false; // served from blk like a block
+            seg_left   = n;
+            blk_pos    = 0;
+            return true;
         }
         std::string key;
         if (kind != 1 || !get_str(fm, key)) {
@@ -1220,6 +1305,24 @@ void server_disk_cache::blob_gc() {
             ++it;
         }
     }
+}
+
+void server_disk_cache::revalidate(const std::string & fp) {
+    if (fp == fingerprint) {
+        return;
+    }
+    DSK_WRN("%s", "the model / context / flags changed since the cache was opened: dropping every stored state\n");
+    fingerprint = fp;
+    while (!entries.empty()) {
+        erase(entries.size() - 1);
+    }
+    for (const auto & it : ckpts) {
+        std::error_code ec;
+        fs::remove(ckpt_path(it.first), ec);
+    }
+    ckpts.clear();
+    blob_gc();
+    refresh_status();
 }
 
 void server_disk_cache::refresh_status() {
