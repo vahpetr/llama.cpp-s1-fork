@@ -597,10 +597,12 @@ bool server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * c
 // deep checkpoints [TAG_DEEP_CKPT]
 //
 
-// depth schedule: walking from the end of the conversation backwards, a checkpoint is kept when it lies at least
-// max(min_step, ratio x its distance to the end) below the previous kept one; the anchor (the shallowest one) and
-// branch points are always kept; above ckpt_max the oldest depth / branch ones go first. Dense where edits and
-// regenerations happen, logarithmic in the depth overall (ratio 0.25: ~25 for 1M tokens).
+// depth schedule: walking up from the anchor, a checkpoint is kept when it lies at least
+// max(min_step, ratio x its distance to the end) above the previous kept one; the anchor (the shallowest one) and
+// branch points are always kept; above ckpt_max the oldest depth / branch ones go first. Walking up (not down from
+// the end) keeps the decision for old checkpoints stable while the conversation grows: they are thinned only as
+// their distance to the end grows, so the gaps stay ~ratio x distance (ratio 0.125: a branch replays <= ~0.2 x its
+// distance to the end; ~20-24 checkpoints for 1M tokens).
 void server_disk_cache::thin(std::vector<server_deep_ref> & refs, int64_t n_end) const {
     std::sort(refs.begin(), refs.end(), [](const auto & a, const auto & b) { return a.n_tokens < b.n_tokens; });
     // one ref per position, the most important kind wins
@@ -619,16 +621,13 @@ void server_disk_cache::thin(std::vector<server_deep_ref> & refs, int64_t n_end)
     }
 
     std::vector<server_deep_ref> kept;
-    int64_t last = n_end;
-    for (auto it = refs.rbegin(); it != refs.rend(); ++it) {
-        const int64_t gap_min = std::max<int64_t>(ckpt_min_step, (int64_t) (ckpt_ratio * (double) (n_end - it->n_tokens)));
-        const bool is_front = std::next(it) == refs.rend(); // the shallowest one is the conversation's anchor
-        if (is_front || it->kind != server_deep_ref::DEEP_KIND_DEPTH || last - it->n_tokens >= gap_min) {
-            kept.push_back(*it);
-            last = it->n_tokens;
+    for (size_t i = 0; i < refs.size(); i++) {
+        const auto & r = refs[i];
+        const int64_t gap_min = std::max<int64_t>(ckpt_min_step, (int64_t) (ckpt_ratio * (double) (n_end - r.n_tokens)));
+        if (i == 0 || r.kind != server_deep_ref::DEEP_KIND_DEPTH || r.n_tokens - kept.back().n_tokens >= gap_min) {
+            kept.push_back(r);
         }
     }
-    std::reverse(kept.begin(), kept.end());
 
     for (uint8_t kind : { server_deep_ref::DEEP_KIND_DEPTH, server_deep_ref::DEEP_KIND_BRANCH }) {
         for (size_t i = 1; (int32_t) kept.size() > ckpt_max && i < kept.size();) {
@@ -644,7 +643,8 @@ void server_disk_cache::thin(std::vector<server_deep_ref> & refs, int64_t n_end)
 }
 
 void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_checkpoint & c, uint8_t kind) {
-    if (quota == 0 || c.data_tgt.empty() || c.n_tokens <= 0 || c.n_tokens > (int64_t) prompt.tokens.size() ||
+    // below min-step a re-process is cheaper than 113 MiB of disk (a short system prompt, a tiny chat)
+    if (quota == 0 || c.data_tgt.empty() || c.n_tokens < ckpt_min_step || c.n_tokens > (int64_t) prompt.tokens.size() ||
         ((c.flags_tgt | c.flags_dft) & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
         return;
     }
