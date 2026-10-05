@@ -1,5 +1,7 @@
 <script lang="ts">
+	import { AlertTriangle } from '@lucide/svelte';
 	import { goto } from '$app/navigation';
+	import { DialogConfirmation } from '$lib/components/app';
 	import {
 		ChatMessageAssistant,
 		ChatMessageMcpPrompt,
@@ -17,7 +19,12 @@
 		ChatMessageDeletionInfo,
 		DatabaseMessageExtraMcpPrompt
 	} from '$lib/types';
-	import { deriveAgenticSections } from '$lib/utils';
+	import {
+		deriveAgenticSections,
+		estimateReprocessCost,
+		formatReprocessCost,
+		REPROCESS_WARN_TOKENS
+	} from '$lib/utils';
 	import { parseFilesToMessageExtras } from '$lib/utils/browser-only';
 
 	interface Props {
@@ -105,6 +112,11 @@
 	let editedUploadedFiles = $state<ChatUploadedFile[]>([]);
 	let isEditing = $state(false);
 	let showDeleteDialog = $state(false);
+
+	// changing the system message makes the server re-process the whole conversation: confirm first
+	let showSystemCostDialog = $state(false);
+	let systemCostText = $state('');
+	let systemChangeConfirmed = false;
 	let shouldBranchAfterEdit = $state(false);
 	let textareaElement: HTMLTextAreaElement | undefined = $state();
 
@@ -309,10 +321,37 @@
 		document.querySelector<HTMLTextAreaElement>('.chat-screen-form-wrapper textarea')?.focus();
 	}
 
+	function confirmSystemChange() {
+		showSystemCostDialog = false;
+		systemChangeConfirmed = true;
+		void handleSaveEdit();
+	}
+
 	async function handleSaveEdit() {
 		if (message.role === MessageRole.SYSTEM) {
 			// System messages: update in place without branching
 			const newContent = editedContent.trim();
+			const oldContent = (
+				message.content === SYSTEM_MESSAGE_PLACEHOLDER ? '' : message.content
+			).trim();
+
+			if (newContent !== oldContent && !systemChangeConfirmed) {
+				const cost = estimateReprocessCost(
+					conversationsStore.activeMessages.filter((m) => m.id !== message.id)
+				);
+
+				if (cost && cost.tokens >= REPROCESS_WARN_TOKENS) {
+					systemCostText =
+						`The system message is the start of every request, so the model has to re-read ` +
+						`the whole conversation (${formatReprocessCost(cost)}). To keep this conversation ` +
+						`as it is, start a new chat instead.`;
+					showSystemCostDialog = true;
+
+					return;
+				}
+			}
+
+			systemChangeConfirmed = false;
 
 			// If content is empty, remove without deleting children
 			if (!newContent) {
@@ -380,6 +419,20 @@
 		showDeleteDialog = show;
 	}
 </script>
+
+{#if message.role === MessageRole.SYSTEM}
+	<DialogConfirmation
+		bind:open={showSystemCostDialog}
+		cancelText="Keep editing"
+		confirmText="Change it"
+		description={systemCostText}
+		icon={AlertTriangle}
+		onCancel={() => (showSystemCostDialog = false)}
+		onConfirm={confirmSystemChange}
+		title="Re-read the whole conversation?"
+		variant="destructive"
+	/>
+{/if}
 
 <div class:chat-message--synthetic={isSynthetic} class="chat-message">
 	{#if message.role === MessageRole.SYSTEM}

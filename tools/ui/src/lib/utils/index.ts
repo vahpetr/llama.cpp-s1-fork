@@ -350,3 +350,9 @@ export { remToPx } from './css';
 
 // Audio format helper (used by agentic store and chat service)
 export { getAudioInputFormat } from './audio-format';
+export {
+	estimateReprocessCost,
+	formatReprocessCost,
+	REPROCESS_WARN_TOKENS,
+	type ReprocessCost
+} from './system-prompt-cost';

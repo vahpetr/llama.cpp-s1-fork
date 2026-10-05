@@ -104,6 +104,7 @@
 				}
 
 				chatStore.syncLoadingStateForChat(chatId);
+				await chatStore.removeStalePlaceholder();
 				// server probe (with localStorage fallback) and attach
 				await chatStore.discoverActiveStream(chatId);
 

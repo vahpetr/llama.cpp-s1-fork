@@ -560,6 +560,22 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		return this.flows.regenerateMessageWithBranching(messageId, modelOverride);
 	}
 
+	/**
+	 * Opening the system message editor stores the message with the placeholder text; closing the
+	 * editor other than with Cancel (switching chats, reloading) leaves it behind. Remove such a
+	 * leftover when its conversation is opened again, unless it is the one being edited.
+	 */
+	async removeStalePlaceholder(): Promise<void> {
+		const stale = conversationsStore.activeMessages.find(
+			(m) =>
+				m.role === MessageRole.SYSTEM &&
+				m.content === SYSTEM_MESSAGE_PLACEHOLDER &&
+				m.id !== this.pendingEditMessageId
+		);
+
+		if (stale) await this.removeSystemPromptPlaceholder(stale.id);
+	}
+
 	async removeSystemPromptPlaceholder(messageId: string): Promise<boolean> {
 		const activeConv = conversationsStore.activeConversation;
 
