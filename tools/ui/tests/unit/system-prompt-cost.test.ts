@@ -40,6 +40,29 @@ describe('estimateReprocessCost', () => {
 		expect(formatReprocessCost(cost!)).toBe('~10k tokens, ~33 s');
 	});
 
+	it('adds what came after the latest measured reply (a failed reply, an unanswered message)', () => {
+		const cost = estimateReprocessCost([
+			msg(MessageRole.USER, { content: 'hi' }),
+			msg(MessageRole.ASSISTANT, {
+				timings: { cache_n: 0, predicted_n: 50, prompt_ms: 100, prompt_n: 100 }
+			}),
+			msg(MessageRole.USER, { content: 'y'.repeat(50000) })
+		]);
+
+		expect(cost?.tokens).toBe(150 + 12500);
+	});
+
+	it('does not trust an old measurement after an earlier message grew without re-sending', () => {
+		const cost = estimateReprocessCost([
+			msg(MessageRole.USER, { content: 'z'.repeat(50000) }),
+			msg(MessageRole.ASSISTANT, {
+				timings: { cache_n: 0, predicted_n: 50, prompt_ms: 100, prompt_n: 100 }
+			})
+		]);
+
+		expect(cost?.tokens).toBe(12500);
+	});
+
 	it('is null without user messages', () => {
 		expect(estimateReprocessCost([msg(MessageRole.SYSTEM, { content: 'rules' })])).toBeNull();
 	});

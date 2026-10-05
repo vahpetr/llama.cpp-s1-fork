@@ -24,28 +24,36 @@ export const REPROCESS_WARN_TOKENS = 4000;
 export function estimateReprocessCost(messages: readonly DatabaseMessage[]): ReprocessCost | null {
 	if (!messages.some((m) => m.role === MessageRole.USER)) return null;
 
-	let tokens = 0;
+	let measured = 0;
+	let measuredAt = -1;
 	let rate = 0;
 	let rateTokens = 0;
 
-	for (const m of messages) {
+	messages.forEach((m, i) => {
 		const t = m.timings;
 
-		if (!t) continue;
+		if (!t) return;
 
-		tokens = Math.max(tokens, (t.prompt_n ?? 0) + (t.cache_n ?? 0) + (t.predicted_n ?? 0));
+		const ctx = (t.prompt_n ?? 0) + (t.cache_n ?? 0) + (t.predicted_n ?? 0);
+
+		if (ctx > 0) {
+			measured = ctx;
+			measuredAt = i;
+		}
 
 		if ((t.prompt_n ?? 0) >= 2000 && (t.prompt_ms ?? 0) > 0 && (t.prompt_n ?? 0) > rateTokens) {
 			rateTokens = t.prompt_n ?? 0;
 			rate = (t.prompt_n ?? 0) / ((t.prompt_ms ?? 1) / 1000);
 		}
-	}
+	});
 
-	if (tokens === 0) {
-		const chars = messages.reduce((n, m) => n + (m.content?.length ?? 0), 0);
-
-		tokens = Math.round(chars / 4);
-	}
+	// the latest measured context, plus ~4 characters per token for what came after it (messages
+	// without timings: a failed or stopped reply, a message not answered yet)
+	const after = messages.slice(measuredAt + 1).reduce((n, m) => n + (m.content?.length ?? 0), 0);
+	// and never below the whole history's text: an earlier message edited without re-sending has no
+	// new measurement
+	const all = messages.reduce((n, m) => n + (m.content?.length ?? 0), 0);
+	const tokens = Math.max(measured + Math.round(after / 4), Math.round(all / 4));
 
 	return { seconds: tokens / (rate > 0 ? rate : FALLBACK_TOKENS_PER_SECOND), tokens };
 }

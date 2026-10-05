@@ -9,7 +9,7 @@
 
 import { browser } from '$app/environment';
 import { goto } from '$app/navigation';
-import { ROUTES } from '$lib/constants';
+import { ROUTES, SYSTEM_MESSAGE_PLACEHOLDER } from '$lib/constants';
 import { MessageRole } from '$lib/enums';
 import { ConversationTransferService } from '$lib/services/conversation-transfer.service';
 import { DatabaseService } from '$lib/services/database.service';
@@ -492,12 +492,10 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		return this.initPromise;
 	}
 
-	/**
-	 * Loads a specific conversation and its messages
-	 * @param convId - The conversation ID to load
-	 * @returns True if conversation was loaded successfully
-	 */
-	async loadConversation(convId: string): Promise<boolean> {
+	async loadConversation(
+		convId: string,
+		keepPlaceholderId: string | null = null
+	): Promise<boolean> {
 		try {
 			const conversation = await DatabaseService.getConversation(convId);
 
@@ -509,7 +507,9 @@ class ConversationsStore implements ConversationsPreferencesHost {
 			// it doesn't belong to this conversation.
 			this.preferences.pendingCwd = null;
 
-			this.activeConversation = conversation;
+			await this.dropStalePlaceholder(convId, keepPlaceholderId);
+
+			this.activeConversation = (await DatabaseService.getConversation(convId)) ?? conversation;
 
 			if (conversation.currNode) {
 				const allMessages = await DatabaseService.getConversationMessages(convId);
@@ -732,6 +732,46 @@ class ConversationsStore implements ConversationsPreferencesHost {
 			if (target[key] !== value) {
 				target[key] = value;
 			}
+		}
+	}
+
+	/**
+	 * Loads a specific conversation and its messages
+	 * @param convId - The conversation ID to load
+	 * @returns True if conversation was loaded successfully
+	 */
+	/**
+	 * Opening the system message editor stores the message with the placeholder text; closing the
+	 * editor other than with Cancel (switching chats, reloading) leaves it behind, and it must not
+	 * become the system prompt. It is removed here, before the conversation's messages reach the
+	 * UI, so no editor can be open on it - except keepId, a placeholder just created for editing.
+	 */
+	private async dropStalePlaceholder(convId: string, keepId: string | null): Promise<void> {
+		const all = await DatabaseService.getConversationMessages(convId);
+		const root = all.find((m) => m.type === 'root' && m.parent === null);
+		const stale = all.find(
+			(m) =>
+				m.role === MessageRole.SYSTEM &&
+				m.type !== 'root' &&
+				m.content === SYSTEM_MESSAGE_PLACEHOLDER &&
+				m.id !== keepId &&
+				m.parent === root?.id
+		);
+
+		if (!stale || !root) return;
+
+		for (const childId of stale.children) {
+			await DatabaseService.updateMessage(childId, { parent: root.id });
+		}
+		await DatabaseService.updateMessage(root.id, {
+			children: [...root.children.filter((id: string) => id !== stale.id), ...stale.children]
+		});
+		await DatabaseService.deleteMessage(stale.id);
+
+		const conversation = await DatabaseService.getConversation(convId);
+
+		if (conversation?.currNode === stale.id) {
+			await DatabaseService.updateCurrentNode(convId, stale.children[0] ?? root.id);
 		}
 	}
 

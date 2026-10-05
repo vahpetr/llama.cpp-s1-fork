@@ -95,7 +95,10 @@
 			}
 
 			(async () => {
-				const success = await conversationsStore.loadConversation(chatId);
+				const success = await conversationsStore.loadConversation(
+					chatId,
+					chatStore.pendingEditMessageId
+				);
 
 				if (!success) {
 					await goto(ROUTES.START);
@@ -104,7 +107,6 @@
 				}
 
 				chatStore.syncLoadingStateForChat(chatId);
-				await chatStore.removeStalePlaceholder();
 				// server probe (with localStorage fallback) and attach
 				await chatStore.discoverActiveStream(chatId);
 

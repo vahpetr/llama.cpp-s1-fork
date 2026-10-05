@@ -117,6 +117,16 @@
 	let showSystemCostDialog = $state(false);
 	let systemCostText = $state('');
 	let systemChangeConfirmed = false;
+	let systemDeletePending = false;
+
+	// the cost of re-reading the conversation without this system message, null below the warn level
+	function systemChangeCost(): string | null {
+		const cost = estimateReprocessCost(
+			conversationsStore.activeMessages.filter((m) => m.id !== message.id)
+		);
+
+		return cost && cost.tokens >= REPROCESS_WARN_TOKENS ? formatReprocessCost(cost) : null;
+	}
 	let shouldBranchAfterEdit = $state(false);
 	let textareaElement: HTMLTextAreaElement | undefined = $state();
 
@@ -267,6 +277,21 @@
 	}
 
 	async function handleDelete() {
+		// removing a real system prompt changes the start of every request: show its cost instead
+		if (message.role === MessageRole.SYSTEM && message.content !== SYSTEM_MESSAGE_PLACEHOLDER) {
+			const cost = systemChangeCost();
+
+			if (cost) {
+				systemCostText =
+					`Without the system message the model has to re-read the whole conversation ` +
+					`(${cost}). To keep this conversation as it is, start a new chat instead.`;
+				systemDeletePending = true;
+				showSystemCostDialog = true;
+
+				return;
+			}
+		}
+
 		deletionInfo = await chatStore.getDeletionInfo(message.id);
 		showDeleteDialog = true;
 	}
@@ -323,8 +348,21 @@
 
 	function confirmSystemChange() {
 		showSystemCostDialog = false;
+
+		if (systemDeletePending) {
+			systemDeletePending = false;
+			void handleConfirmDelete();
+
+			return;
+		}
+
 		systemChangeConfirmed = true;
 		void handleSaveEdit();
+	}
+
+	function cancelSystemChange() {
+		showSystemCostDialog = false;
+		systemDeletePending = false;
 	}
 
 	async function handleSaveEdit() {
@@ -336,15 +374,13 @@
 			).trim();
 
 			if (newContent !== oldContent && !systemChangeConfirmed) {
-				const cost = estimateReprocessCost(
-					conversationsStore.activeMessages.filter((m) => m.id !== message.id)
-				);
+				const cost = systemChangeCost();
 
-				if (cost && cost.tokens >= REPROCESS_WARN_TOKENS) {
+				if (cost) {
 					systemCostText =
 						`The system message is the start of every request, so the model has to re-read ` +
-						`the whole conversation (${formatReprocessCost(cost)}). To keep this conversation ` +
-						`as it is, start a new chat instead.`;
+						`the whole conversation (${cost}). To keep this conversation as it is, start a new ` +
+						`chat instead.`;
 					showSystemCostDialog = true;
 
 					return;
@@ -427,7 +463,7 @@
 		confirmText="Change it"
 		description={systemCostText}
 		icon={AlertTriangle}
-		onCancel={() => (showSystemCostDialog = false)}
+		onCancel={cancelSystemChange}
 		onConfirm={confirmSystemChange}
 		title="Re-read the whole conversation?"
 		variant="destructive"

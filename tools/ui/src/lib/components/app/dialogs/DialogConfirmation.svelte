@@ -32,7 +32,10 @@
 	}: Props = $props();
 
 	function handleKeydown(event: KeyboardEvent) {
-		if (event.key === KeyboardKey.ENTER) {
+		// Enter confirms, unless a focused button (e.g. Cancel) handles it itself
+		const onButton = event.target instanceof HTMLElement && event.target.closest('button') !== null;
+
+		if (event.key === KeyboardKey.ENTER && !event.defaultPrevented && !onButton) {
 			event.preventDefault();
 
 			onConfirm();
