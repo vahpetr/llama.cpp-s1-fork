@@ -16,6 +16,7 @@
 #include <set>
 #include <sstream>
 #include <unistd.h> // environ
+#include <sys/stat.h>
 
 #define DSK_INF(fmt, ...) LOG_INF("srv  %12.*s: " fmt, 12, "disk_cache", __VA_ARGS__)
 #define DSK_WRN(fmt, ...) LOG_WRN("srv  %12.*s: " fmt, 12, "disk_cache", __VA_ARGS__)
@@ -215,15 +216,67 @@ static bool get_vec(std::istream & f, std::vector<uint8_t> & v) {
 
 std::string server_disk_cache_fingerprint(const common_params & params, int32_t n_ctx) {
     std::error_code ec;
+    // the code that computes and lays out the state: the content of the loaded llama / ggml / mtmd
+    // libraries (builds are deterministic, so a rebuild with unchanged sources keeps the cache). The
+    // server library (HTTP, webui) is left out - a webui or server-side change does not change the
+    // state; the disk cache's own format is DISK_CACHE_VERSION. Static builds fall back to the binary.
     std::string exe_id;
     {
-        const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-        if (!ec) {
-            const auto sz = fs::file_size(exe, ec);
-            const auto mt = fs::last_write_time(exe, ec).time_since_epoch().count();
-            exe_id = std::to_string(sz) + ":" + std::to_string(mt);
+        // path -> inode from /proc/self/maps ("addr perms offset dev inode path")
+        std::map<std::string, unsigned long long> libs;
+        bool ok = true;
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        while (std::getline(maps, line)) {
+            const auto at = line.find('/');
+            if (at == std::string::npos) {
+                continue;
+            }
+            std::string p = line.substr(at);
+            const std::string base = fs::path(p).filename().string();
+            const bool ours = base.rfind("libllama", 0) == 0 || base.rfind("libggml", 0) == 0 || base.rfind("libmtmd", 0) == 0;
+            if (!ours || base.rfind("libllama-server", 0) == 0) {
+                continue;
+            }
+            if (p.size() > 10 && p.compare(p.size() - 10, 10, " (deleted)") == 0) {
+                ok = false; // the loaded file was replaced on disk: its bytes cannot be hashed
+                continue;
+            }
+            std::istringstream fields(line.substr(0, at));
+            std::string addr, perms, offset, dev;
+            unsigned long long inode = 0;
+            fields >> addr >> perms >> offset >> dev >> inode;
+            libs[p] = inode;
+        }
+        for (const auto & it : libs) {
+            struct stat st {};
+            std::ifstream f(it.first, std::ios::binary);
+            const std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            if (!f.good() && !f.eof()) {
+                ok = false;
+            }
+            if (stat(it.first.c_str(), &st) != 0 || (unsigned long long) st.st_ino != it.second || bytes.empty()) {
+                ok = false; // not the file that is mapped
+            }
+            exe_id += fs::path(it.first).filename().string() + "=" +
+                      hash_key(reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size()) + ";";
+        }
+        if (libs.empty()) {
+            const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+            if (!ec) {
+                const auto sz = fs::file_size(exe, ec);
+                const auto mt = fs::last_write_time(exe, ec).time_since_epoch().count();
+                exe_id = std::to_string(sz) + ":" + std::to_string(mt);
+            }
+        }
+        if (!ok) {
+            exe_id = "unverifiable:" + random_id(); // matches nothing: the cache is not reused
         }
     }
+#ifdef SERVER_STATE_SRC_HASH
+    // the server's own state-handling sources (checkpoints, restore, serialization), hashed at build time
+    exe_id += std::string("|server-src=") + SERVER_STATE_SRC_HASH;
+#endif
     // LLAMA_* / GGML_* environment knobs (QSA, KQ_VIS, int8, ...) select graph and state variants under one binary
     std::vector<std::string> knobs;
     for (char ** ep = environ; ep && *ep; ep++) {

@@ -31,6 +31,18 @@ if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
+# [TAG_DISK_PROMPT_CACHE] the disk prompt cache's fingerprint covers the server's state-handling C++ sources
+# (checkpoint creation / restore, token serialization, the cache itself), not the webui: a webui-only rebuild
+# keeps the stored conversations, any change here drops them
+set(SERVER_STATE_SRC_HASH "")
+foreach(SRC server-context.cpp server-common.cpp server-common.h server-task.cpp server-task.h server-disk-cache.cpp server-disk-cache.h)
+    file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/${SRC} H)
+    string(APPEND SERVER_STATE_SRC_HASH ${H})
+endforeach()
+string(SHA256 SERVER_STATE_SRC_HASH "${SERVER_STATE_SRC_HASH}")
+string(SUBSTRING "${SERVER_STATE_SRC_HASH}" 0 16 SERVER_STATE_SRC_HASH)
+set_source_files_properties(server-disk-cache.cpp PROPERTIES COMPILE_DEFINITIONS "SERVER_STATE_SRC_HASH=\"${SERVER_STATE_SRC_HASH}\"")
+
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
