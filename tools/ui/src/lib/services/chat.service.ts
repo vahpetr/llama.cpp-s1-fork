@@ -22,8 +22,8 @@ import {
 	SSE_LINE_SEPARATOR,
 	STREAM_QUERY_PARAMS,
 	STREAM_RESUME_LOCALSTORAGE_KEY_PREFIX,
-	STREAM_VISIBILITY_KICK_MS
-} from '$lib/constants';
+	STREAM_VISIBILITY_KICK_MS,
+	SYSTEM_MESSAGE_PLACEHOLDER} from '$lib/constants';
 import {
 	AttachmentLabel,
 	AttachmentType,
@@ -845,11 +845,14 @@ export class ChatService {
 				})
 			)
 		).filter((msg: { role: ChatRole; content: string | ApiChatMessageContentPart[] }) => {
-			// Filter out empty system messages
+			// Filter out empty system messages, and the placeholder a system message is created with
+			// when its editor opens: closing the editor other than with Cancel (switching chats,
+			// reloading) leaves it in the database, and sending it would change the system prompt
+			// of the whole conversation (a full re-prefill on the server)
 			if (msg.role === MessageRole.SYSTEM) {
-				const content = typeof msg.content === 'string' ? msg.content : '';
+				const content = typeof msg.content === 'string' ? msg.content.trim() : '';
 
-				return content.trim().length > 0;
+				return content.length > 0 && content !== SYSTEM_MESSAGE_PLACEHOLDER;
 			}
 
 			return true;
