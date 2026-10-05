@@ -23,7 +23,8 @@ import {
 	STREAM_QUERY_PARAMS,
 	STREAM_RESUME_LOCALSTORAGE_KEY_PREFIX,
 	STREAM_VISIBILITY_KICK_MS,
-	SYSTEM_MESSAGE_PLACEHOLDER} from '$lib/constants';
+	SYSTEM_MESSAGE_PLACEHOLDER
+} from '$lib/constants';
 import {
 	AttachmentLabel,
 	AttachmentType,
@@ -34,7 +35,11 @@ import {
 } from '$lib/enums';
 import { modelsStore } from '$lib/stores/models/index.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
-import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
+import type {
+	DatabaseMessageExtraMcpPrompt,
+	DatabaseMessageExtraMcpResource,
+	OpenAIToolDefinition
+} from '$lib/types';
 import type {
 	ApiChatCompletionToolCall,
 	ApiChatMessageContentPart,
@@ -868,7 +873,8 @@ export class ChatService {
 		messages: ApiChatMessageData[] | (DatabaseMessage & { extra?: DatabaseMessageExtra[] })[],
 		model?: string | null,
 		excludeReasoning?: boolean,
-		signal?: AbortSignal
+		signal?: AbortSignal,
+		tools?: OpenAIToolDefinition[]
 	): Promise<void> {
 		const normalizedMessages: ApiChatMessageData[] =
 			await ChatService.normalizeMessagesForApi(messages);
@@ -888,7 +894,9 @@ export class ChatService {
 				return mapped;
 			}),
 			n_predict: 0,
-			stream: false
+			stream: false,
+			// the same prompt start as the conversation's requests (its frozen tool list)
+			...(tools && tools.length > 0 ? { tools } : {})
 		};
 
 		if (model) {

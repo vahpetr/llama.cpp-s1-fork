@@ -45,7 +45,8 @@ import {
 	formatCwdMessage,
 	getConversationModel,
 	isAbortError,
-	normalizeModelName
+	normalizeModelName,
+	parseToolsSnapshot
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
 
@@ -1450,8 +1451,17 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				...allMessages,
 				{ ...assistantMessage, content: assistantContent }
 			];
+			const frozenTools = parseToolsSnapshot(
+				(await DatabaseService.getConversation(assistantMessage.convId))?.toolsSnapshot
+			);
 
-			await ChatService.preEncode(messagesWithAssistant, model, excludeReasoning, signal);
+			await ChatService.preEncode(
+				messagesWithAssistant,
+				model,
+				excludeReasoning,
+				signal,
+				frozenTools ?? undefined
+			);
 		} catch (err) {
 			if (!isAbortError(err)) {
 				console.warn('[ChatStore] Pre-encode failed:', err);

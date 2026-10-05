@@ -32,7 +32,8 @@ import {
 	findDescendantMessages,
 	findLeafNode,
 	findMessageById,
-	isAbortError
+	isAbortError,
+	parseToolsSnapshot
 } from '$lib/utils';
 
 /**
@@ -132,11 +133,16 @@ export class ChatMessageFlows {
 				});
 			};
 			const abortController = this.host.getOrCreateAbortController(msg.convId);
+			// the conversation's frozen tool list belongs to the prompt's start (see the agentic flow)
+			const frozenTools = parseToolsSnapshot(
+				(await DatabaseService.getConversation(msg.convId))?.toolsSnapshot
+			);
 
 			await ChatService.sendMessage(
 				contextWithContinue,
 				{
 					...this.host.getApiOptions(),
+					...(frozenTools && frozenTools.length > 0 ? { tools: frozenTools } : {}),
 					continueFinalMessage: true,
 					onChunk: (chunk: string) => {
 						appendedContent += chunk;

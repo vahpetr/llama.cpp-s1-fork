@@ -421,6 +421,9 @@ export class DatabaseService {
 				const newConv: DatabaseConversation = {
 					currNode: lastClonedMessage.id,
 					cwd: sourceConv.cwd,
+					// the inherited history keeps its prompt start: same tool list and tool choices
+					disabledToolCategories: sourceConv.disabledToolCategories,
+					disabledTools: sourceConv.disabledTools,
 					forkedFromConversationId: sourceConvId,
 					id: newConvId,
 					lastModified: Date.now(),
@@ -430,7 +433,9 @@ export class DatabaseService {
 								serverId: o.serverId
 							}))
 						: undefined,
-					name: options.name
+					name: options.name,
+					toolsDeclinedKey: sourceConv.toolsDeclinedKey,
+					toolsSnapshot: sourceConv.toolsSnapshot
 				};
 
 				await db[IDXDB_TABLES.conversations].add(newConv);
@@ -554,6 +559,32 @@ export class DatabaseService {
 	}
 
 	/**
+	 * Updates a conversation. `lastModified` is never stamped implicitly;
+	 * pass it in `updates` to bump the conversation in recency ordering.
+	 *
+	 * @param id - Conversation ID
+	 * @param updates - Partial updates to apply
+	 * @returns Promise that resolves when the conversation is updated
+	 */
+	/**
+	 * Store a conversation's tool list snapshot unless it already has one, atomically, and return the
+	 * snapshot that is in effect (two tabs racing on the first request agree on one list).
+	 */
+	static async initToolsSnapshot(id: string, snapshot: string): Promise<string | undefined> {
+		return await db.transaction('rw', db[IDXDB_TABLES.conversations], async () => {
+			const conv = await db[IDXDB_TABLES.conversations].get(id);
+
+			if (!conv) return undefined;
+
+			if (conv.toolsSnapshot !== undefined) return conv.toolsSnapshot;
+
+			await db[IDXDB_TABLES.conversations].update(id, { toolsSnapshot: snapshot });
+
+			return snapshot;
+		});
+	}
+
+	/**
 	 * Toggles the pinned status of a conversation.
 	 *
 	 * @param id - Conversation ID
@@ -573,19 +604,28 @@ export class DatabaseService {
 		return newPinnedState;
 	}
 
-	/**
-	 * Updates a conversation. `lastModified` is never stamped implicitly;
-	 * pass it in `updates` to bump the conversation in recency ordering.
-	 *
-	 * @param id - Conversation ID
-	 * @param updates - Partial updates to apply
-	 * @returns Promise that resolves when the conversation is updated
-	 */
 	static async updateConversation(
 		id: string,
 		updates: Partial<Omit<DatabaseConversation, 'id'>>
 	): Promise<void> {
 		await db[IDXDB_TABLES.conversations].update(id, updates);
+	}
+
+	/** Update a conversation only if `check` holds for its stored row, atomically; false if it did not. */
+	static async updateConversationIf(
+		id: string,
+		check: (conv: DatabaseConversation) => boolean,
+		updates: Partial<Omit<DatabaseConversation, 'id'>>
+	): Promise<boolean> {
+		return await db.transaction('rw', db[IDXDB_TABLES.conversations], async () => {
+			const conv = await db[IDXDB_TABLES.conversations].get(id);
+
+			if (!conv || !check(conv)) return false;
+
+			await db[IDXDB_TABLES.conversations].update(id, updates);
+
+			return true;
+		});
 	}
 
 	/**

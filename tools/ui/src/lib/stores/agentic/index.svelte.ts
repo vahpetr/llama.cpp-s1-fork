@@ -29,6 +29,7 @@ import {
 	ToolCallType
 } from '$lib/enums';
 import { ChatService } from '$lib/services';
+import { DatabaseService } from '$lib/services/database.service';
 import { ReadMediaService } from '$lib/services/read-media.service';
 import { SandboxService } from '$lib/services/sandbox.service';
 import { ToolsService } from '$lib/services/tools.service';
@@ -77,7 +78,8 @@ import {
 	executeBrowserInfoTool,
 	executeGetDatetimeTool,
 	getAudioInputFormat,
-	isAbortError
+	isAbortError,
+	parseToolsSnapshot
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
 
@@ -342,7 +344,33 @@ class AgenticStore {
 			}
 		}
 
-		const tools = toolsStore.getEnabledToolsForLLM(disabledTools, disabledToolCategories);
+		const current = toolsStore.getEnabledToolsForLLM(disabledTools, disabledToolCategories);
+		// the tool list is part of the prompt's start: a conversation keeps sending the list it began
+		// with (applying a change is the user's choice, at send time), so a tool that went away (an
+		// MCP server down) or a reconnect never re-processes the conversation; a call to an
+		// unavailable tool returns an error to the model
+		const conversation = await DatabaseService.getConversation(conversationId);
+
+		let snapshot = parseToolsSnapshot(conversation?.toolsSnapshot);
+
+		if (snapshot === null) {
+			// the first request fixes the list (also an empty one: enabling tools later is a change)
+			const stored = await DatabaseService.initToolsSnapshot(
+				conversationId,
+				JSON.stringify(current)
+			);
+
+			snapshot = parseToolsSnapshot(stored) ?? current;
+
+			if (conversationsStore.activeConversation?.id === conversationId) {
+				conversationsStore.activeConversation = {
+					...conversationsStore.activeConversation,
+					toolsSnapshot: stored
+				};
+			}
+		}
+
+		const tools = snapshot;
 
 		if (tools.length === 0) {
 			return { handled: false };
@@ -745,13 +773,13 @@ class AgenticStore {
 
 				const toolName = toolCall.function.name;
 				const serverLabel = toolsStore.getToolServerLabel(toolName);
+				// a tool of the conversation's frozen list that is not available now (its MCP server is
+				// down): answer with an error at once, no permission prompt for a call that cannot run
+				const unavailable = toolsStore.getToolSource(toolName) === null;
 				// Ask for permission before executing the tool
-				const permission = await this.gates.requestPermission(
-					conversationId,
-					toolName,
-					serverLabel,
-					signal
-				);
+				const permission = unavailable
+					? ToolPermissionDecision.DENY
+					: await this.gates.requestPermission(conversationId, toolName, serverLabel, signal);
 
 				// Yield to allow Svelte to flush the UI update (hide permission dialog)
 				await new Promise((r) => setTimeout(r, 0));
@@ -774,7 +802,10 @@ class AgenticStore {
 				// Cleared unconditionally below.
 				this.updateSession(conversationId, { executingToolCallId: toolCall.id });
 
-				if (permission === ToolPermissionDecision.DENY) {
+				if (unavailable) {
+					result = `Error: the tool "${toolName}" is not available right now (its server is not connected).`;
+					toolSuccess = false;
+				} else if (permission === ToolPermissionDecision.DENY) {
 					result = 'Tool execution was denied by the user.';
 					toolSuccess = false;
 				} else {

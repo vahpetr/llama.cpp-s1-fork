@@ -26,6 +26,10 @@ export interface DatabaseConversation {
 	/** Tool categories disabled for this conversation */
 	disabledToolCategories?: ToolSource[];
 	forkedFromConversationId?: string;
+	/** JSON of the tool definitions this conversation sends (its first agentic request's list) */
+	toolsSnapshot?: string;
+	/** a tool change the user chose not to apply (ToolsChange.key) */
+	toolsDeclinedKey?: string;
 	pinned?: boolean;
 }
 

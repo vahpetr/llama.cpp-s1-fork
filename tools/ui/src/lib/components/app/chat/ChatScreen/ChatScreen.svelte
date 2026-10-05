@@ -2,6 +2,7 @@
 	import ChatScreenActionScrollDown from './ChatScreenActionScrollDown.svelte';
 	import ChatScreenDialogsAndAlerts from './ChatScreenDialogsAndAlerts.svelte';
 	import ChatScreenGreeting from './ChatScreenGreeting.svelte';
+	import { AlertTriangle } from '@lucide/svelte';
 	import { page } from '$app/state';
 	import {
 		ChatMessages,
@@ -9,6 +10,7 @@
 		ChatScreenForm,
 		ChatScreenServerError,
 		ChatScreenStreamResumeStatus,
+		DialogConfirmation,
 		ServerLoadingSplash
 	} from '$lib/components/app';
 	import { LANDING_SETTLE_MAX_MS, LANDING_STABLE_FRAMES, ROUTES } from '$lib/constants';
@@ -18,13 +20,24 @@
 	import { useChatScreenFileUpload } from '$lib/hooks/use-chat-screen-file-upload.svelte';
 	import { useChatScreenScroll } from '$lib/hooks/use-chat-screen-scroll.svelte';
 	import { useKeyboardShortcuts } from '$lib/hooks/use-keyboard-shortcuts.svelte';
+	import { DatabaseService } from '$lib/services/database.service';
 	import {
 		chatStore,
 		conversationsStore,
 		deviceStore,
+		draftMessagesStore,
 		serverStore,
-		settingsStore
+		settingsStore,
+		toolsStore
 	} from '$lib/stores';
+	import {
+		applyToolsChange,
+		diffToolsSnapshot,
+		estimateReprocessCost,
+		formatReprocessCost,
+		parseToolsSnapshot,
+		REPROCESS_WARN_TOKENS
+	} from '$lib/utils';
 	import { parseFilesToMessageExtras } from '$lib/utils/browser-only';
 	import { onDestroy, onMount, tick } from 'svelte';
 
@@ -102,7 +115,86 @@
 		showDeleteDialog = false;
 	}
 
+	// a conversation sends the tool list it started with (see the agentic flow); a change the user made
+	// (tools enabled / disabled for it) is applied only after a confirmation that shows its cost
+	let showToolsDialog = $state(false);
+	let toolsDialogText = $state('');
+	let resolveToolsDialog: ((apply: boolean) => void) | null = null;
+
+	/** Settle a tool change of the active conversation before a send. */
+	async function settleToolsChange(): Promise<void> {
+		const convId = conversationsStore.activeConversation?.id;
+
+		if (!convId) return;
+
+		// another tab may have changed the snapshot: decide on the persisted one, and replace it only
+		// if it is still the one the decision was made on (compare-and-swap), else decide again
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const conv = await DatabaseService.getConversation(convId);
+			const snapshot = parseToolsSnapshot(conv?.toolsSnapshot);
+
+			if (!conv || snapshot === null) return;
+
+			const current = toolsStore.getEnabledToolsForLLM(
+				new Set(conversationsStore.preferences.getDisabledTools()),
+				new Set(conversationsStore.preferences.getDisabledToolCategories())
+			);
+			const available = new Set(toolsStore.allTools.map((e) => e.definition.function.name));
+			const change = diffToolsSnapshot(snapshot, current, available);
+
+			if (!change || change.key === conv.toolsDeclinedKey) return;
+
+			const cost = estimateReprocessCost(conversationsStore.activeMessages);
+
+			let apply = true;
+
+			if (cost && cost.tokens >= REPROCESS_WARN_TOKENS) {
+				const parts = [
+					change.added.length ? `added: ${change.added.join(', ')}` : '',
+					change.removed.length ? `removed: ${change.removed.join(', ')}` : ''
+				].filter(Boolean);
+
+				toolsDialogText =
+					`The tools of this conversation changed (${parts.join('; ')}). The tool list is the ` +
+					`start of every request, so applying it makes the model re-read the whole ` +
+					`conversation (${formatReprocessCost(cost)}). Keeping the previous tools costs nothing.`;
+				showToolsDialog = true;
+				apply = await new Promise<boolean>((resolve) => (resolveToolsDialog = resolve));
+			}
+
+			const updates = apply
+				? {
+						toolsDeclinedKey: undefined,
+						toolsSnapshot: JSON.stringify(applyToolsChange(snapshot, current, change))
+					}
+				: { toolsDeclinedKey: change.key };
+			const done = await DatabaseService.updateConversationIf(
+				convId,
+				(c) => c.toolsSnapshot === conv.toolsSnapshot,
+				updates
+			);
+
+			if (!done) continue;
+
+			if (conversationsStore.activeConversation?.id === convId) {
+				conversationsStore.activeConversation = {
+					...conversationsStore.activeConversation,
+					...updates
+				};
+			}
+
+			return;
+		}
+	}
+
+	function closeToolsDialog(apply: boolean) {
+		showToolsDialog = false;
+		resolveToolsDialog?.(apply);
+		resolveToolsDialog = null;
+	}
+
 	async function handleSendMessage(message: string, files?: ChatUploadedFile[]): Promise<boolean> {
+		const originId = conversationsStore.activeConversation?.id;
 		const plainFiles = files ? $state.snapshot(files) : undefined;
 		const result = plainFiles
 			? await parseFilesToMessageExtras(plainFiles, activeModel.activeModelId ?? undefined)
@@ -121,6 +213,16 @@
 			}
 
 			return false;
+		}
+
+		await settleToolsChange();
+
+		// the user switched conversations while the tool confirmation was open: the message belongs to
+		// the conversation it was written in - keep it as that one's draft, send nothing here
+		if (conversationsStore.activeConversation?.id !== originId) {
+			draftMessagesStore.saveDraftMessage(originId, message, files ?? []);
+
+			return true;
 		}
 
 		handleSendLikeScroll();
@@ -361,6 +463,18 @@
 		</div>
 	</div>
 {/if}
+
+<DialogConfirmation
+	bind:open={showToolsDialog}
+	cancelText="Keep previous tools"
+	confirmText="Apply the new tools"
+	description={toolsDialogText}
+	icon={AlertTriangle}
+	onCancel={() => closeToolsDialog(false)}
+	onConfirm={() => closeToolsDialog(true)}
+	title="Apply the changed tools?"
+	variant="destructive"
+/>
 
 <ChatScreenDialogsAndAlerts
 	{activeErrorDialog}
