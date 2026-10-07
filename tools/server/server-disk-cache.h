@@ -429,7 +429,12 @@ bool server_disk_cache_same_identity(const std::string & a, const std::string & 
 //   size + mtime + inode; ours are content-hashed in the cheap identity) and the driver environment (RADV_ / MESA_ /
 //   AMD_ / VK_ / ...) - a driver change forces a re-measurement. Gap: ggml's device description carries no Vulkan
 //   driverVersion / apiVersion; a driver update that replaces no mapped file (e.g. firmware) is not seen
+//   A mapped library whose device + inode in /proc/self/maps differ from stat() of its path, or that is unlinked /
+//   unreadable, makes the identity SERVER_CACHE_RUNTIME_UNVERIFIED: its memo key is "" (no memo read or written)
+static constexpr const char * SERVER_CACHE_RUNTIME_UNVERIFIED = "unverified";
 std::string server_cache_runtime_identity();
+// one /proc/self/maps line: 0 = not a tracked library, 1 = verified (entry = path:size:mtime:inode), -1 = unverifiable
+int server_cache_maps_lib(const std::string & line, std::string & entry);
 // placement_id = server_cache_placement_identity (the effective placement + NUMA strategy of this load)
 std::string server_cache_memo_key(const std::string & cheap, const std::string & runtime_id,
                                   const std::string & placement_id = "-");

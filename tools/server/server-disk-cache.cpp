@@ -21,6 +21,7 @@
 #include <type_traits>
 #include <unistd.h> // environ
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/file.h> // flock
 #include <fcntl.h>
 
@@ -848,6 +849,45 @@ bool server_disk_cache_same_identity(const std::string & a, const std::string & 
     return a.size() >= 16 && b.size() >= 16 && a.compare(0, 16, b, 0, 16) == 0 && ba == bb;
 }
 
+// [TAG_CACHE_COMPAT2] one /proc/self/maps line (astra compat2 r2 mapped-library identity): the mapping's device +
+//   inode must be those of the path as stat() sees it now - a file replaced or unlinked after it was mapped would
+//   otherwise lend the new file's identity to the old loaded code
+int server_cache_maps_lib(const std::string & line, std::string & entry) {
+    const auto at = line.find('/');
+    if (at == std::string::npos) {
+        return 0;
+    }
+    std::string p = line.substr(at);
+    const std::string del = " (deleted)";
+    const bool deleted = p.size() > del.size() && p.compare(p.size() - del.size(), del.size(), del) == 0;
+    if (deleted) {
+        p.resize(p.size() - del.size());
+    }
+    const std::string base = fs::path(p).filename().string();
+    if (base.find(".so") == std::string::npos || base.rfind("libllama", 0) == 0 || base.rfind("libggml", 0) == 0 ||
+        base.rfind("libmtmd", 0) == 0) {
+        return 0;
+    }
+    if (deleted) {
+        return -1;
+    }
+    // "addr perms offset MM:mm inode   path": device major:minor (hex) and inode (decimal) of the mapped file
+    unsigned int maj = 0, mnr = 0;
+    unsigned long long ino = 0;
+    char addr[128], perms[16], off[32];
+    if (sscanf(line.c_str(), "%127s %15s %31s %x:%x %llu", addr, perms, off, &maj, &mnr, &ino) != 6) {
+        return -1;
+    }
+    struct stat st {};
+    if (stat(p.c_str(), &st) != 0 || (unsigned long long) st.st_ino != ino || major(st.st_dev) != maj ||
+        minor(st.st_dev) != mnr) {
+        return -1;
+    }
+    entry = string_format("%s:%lld:%lld.%09ld:%llu", p.c_str(), (long long) st.st_size, (long long) st.st_mtim.tv_sec,
+                          (long) st.st_mtim.tv_nsec, (unsigned long long) st.st_ino);
+    return 1;
+}
+
 std::string server_cache_runtime_identity() {
     // GPU devices: name, description, PCI id (ggml's device description carries no driver version - the Vulkan
     //   backend's description is the device name only; the driver is covered by its mapped libraries below)
@@ -878,25 +918,23 @@ std::string server_cache_runtime_identity() {
     //   libstdc++, ...) by path + size + mtime + inode - an upgrade or a swap changes it. libllama / libggml* /
     //   libmtmd are content-hashed in the cheap identity already
     std::set<std::string> libs;
+    bool verified = true;
     {
         std::ifstream maps("/proc/self/maps");
+        verified = maps.good();
         std::string line;
         while (std::getline(maps, line)) {
-            const auto at = line.find('/');
-            if (at == std::string::npos) {
-                continue;
+            std::string entry;
+            const int r = server_cache_maps_lib(line, entry);
+            if (r < 0) {
+                verified = false;
+            } else if (r > 0) {
+                libs.insert(entry);
             }
-            const std::string p = line.substr(at);
-            const std::string base = fs::path(p).filename().string();
-            if (base.find(".so") == std::string::npos || base.rfind("libllama", 0) == 0 ||
-                base.rfind("libggml", 0) == 0 || base.rfind("libmtmd", 0) == 0) {
-                continue;
-            }
-            struct stat st {};
-            libs.insert(stat(p.c_str(), &st) == 0 ?
-                string_format("%s:%lld:%lld.%09ld:%llu", p.c_str(), (long long) st.st_size, (long long) st.st_mtim.tv_sec,
-                              (long) st.st_mtim.tv_nsec, (unsigned long long) st.st_ino) : p + ":?");
         }
+    }
+    if (!verified) {
+        return SERVER_CACHE_RUNTIME_UNVERIFIED;
     }
     std::string lib;
     for (const auto & l : libs) {
@@ -928,6 +966,9 @@ std::string server_cache_runtime_identity() {
 
 std::string server_cache_memo_key(const std::string & cheap, const std::string & runtime_id,
                                   const std::string & placement_id) {
+    if (runtime_id == SERVER_CACHE_RUNTIME_UNVERIFIED) {
+        return ""; // fail-closed: no memo is read or published for an unverifiable runtime
+    }
     return h16_of(string_format("cheap=%s|probe=%u|runtime=%s|place=%s", cheap.c_str(), DISK_CACHE_PROBE_REVISION,
                                 runtime_id.c_str(), placement_id.c_str()));
 }

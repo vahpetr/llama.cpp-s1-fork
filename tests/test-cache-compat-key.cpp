@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 namespace fs = std::filesystem;
@@ -287,6 +289,46 @@ int main() {
             }
             CHECK(n_tmp == 0);
         }
+        fs::remove_all(dir);
+    }
+    // [TAG_CACHE_COMPAT2] mapped-library identity (astra r2): the device + inode of a maps line must match stat() of
+    //   the path; a replaced / unlinked / missing file is unverifiable, and an unverifiable runtime has no memo key
+    {
+        const fs::path dir = fs::temp_directory_path() / ("cache-compat-maps-" + std::to_string(getpid()));
+        fs::create_directories(dir);
+        const fs::path so = dir / "libfoo.so.1";
+        { std::ofstream o(so); o << "x"; }
+        struct stat st {};
+        CHECK(stat(so.c_str(), &st) == 0);
+        const auto line = [&](unsigned long long ino, unsigned maj, unsigned mnr, const std::string & path) {
+            char b[64];
+            snprintf(b, sizeof(b), "%02x:%02x %llu", maj, mnr, ino);
+            return "7f0000000000-7f0000001000 r-xp 00000000 " + std::string(b) + "    " + path;
+        };
+        const unsigned maj = major(st.st_dev), mnr = minor(st.st_dev);
+        std::string e;
+        CHECK(server_cache_maps_lib(line(st.st_ino, maj, mnr, so.string()), e) == 1 && e.find(so.string()) == 0);
+        CHECK(server_cache_maps_lib(line(st.st_ino + 1, maj, mnr, so.string()), e) == -1); // replaced: other inode
+        CHECK(server_cache_maps_lib(line(st.st_ino, maj, mnr + 1, so.string()), e) == -1); // other device
+        CHECK(server_cache_maps_lib(line(st.st_ino, maj, mnr, so.string() + " (deleted)"), e) == -1);
+        CHECK(server_cache_maps_lib(line(st.st_ino, maj, mnr, (dir / "libgone.so").string()), e) == -1);
+        CHECK(server_cache_maps_lib("7f0000000000-7f0000001000 r-xp 00000000 garbage " + so.string(), e) == -1);
+        // untracked: no path, not a shared object, our own libraries (content-hashed in the cheap identity)
+        CHECK(server_cache_maps_lib("7f0000000000-7f0000001000 rw-p 00000000 00:00 0    [heap]", e) == 0);
+        CHECK(server_cache_maps_lib(line(1, 0, 0, "/x/model.gguf"), e) == 0);
+        CHECK(server_cache_maps_lib(line(1, 0, 0, "/x/libggml-base.so (deleted)"), e) == 0);
+        // replace the file under the same path: the old mapping's inode no longer verifies
+        fs::remove(so);
+        { std::ofstream o(so); o << "y"; }
+        struct stat st2 {};
+        CHECK(stat(so.c_str(), &st2) == 0);
+        if (st2.st_ino != st.st_ino) {
+            CHECK(server_cache_maps_lib(line(st.st_ino, maj, mnr, so.string()), e) == -1);
+        }
+        CHECK(server_cache_memo_key(cheap_a, SERVER_CACHE_RUNTIME_UNVERIFIED, "-").empty());
+        CHECK(!server_cache_memo_key(cheap_a, "cpu", "-").empty());
+        // this process's own mappings verify
+        CHECK(server_cache_runtime_identity() != SERVER_CACHE_RUNTIME_UNVERIFIED);
         fs::remove_all(dir);
     }
     // [TAG_CACHE_COMPAT2] runtime identity of the memo: stable within a process, carries the CPU feature list and the

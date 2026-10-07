@@ -1539,7 +1539,9 @@ private:
         const std::string cheap = server_disk_cache_fingerprint(params_base, n_ctx);
         const std::string memo = server_cache_memo_key(cheap, server_cache_runtime_identity(),
                                                        server_cache_placement_identity(params_base, ctx_tgt, ctx_dft));
-        if (server_cache_memo_get(params_base.cache_disk_path, memo, cache_meas)) {
+        if (memo.empty()) {
+            SRV_WRN("%s", "cache-compat: runtime libraries unverifiable (mapping != file) - no measurement memo\n");
+        } else if (server_cache_memo_get(params_base.cache_disk_path, memo, cache_meas)) {
             cache_meas_how = "memo hit";
             return;
         }
