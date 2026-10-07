@@ -547,6 +547,7 @@ struct server_slot {
     int                  spec_tput_n_kept = 0;  // tokens it drafted before the n_min rule
     int                  spec_tput_n_draft_rounds = 0; // drafting rounds of this task (the first one is cold)
     bool                 spec_tput_ranked = false; // this round's bucket had rank (else `off`: no cooldown observation)
+    bool                 spec_tput_probe  = false; // this round is a cooldown probe (its draft is kept below n_min)
     // the last decision's state for /slots (also at n = 0): the rule's n*, the cost model of the slot's depth bucket
     bool                  spec_tput_active   = false;
     bool                  spec_tput_measured = false;
@@ -686,6 +687,7 @@ struct server_slot {
         spec_tput_n_kept   = 0;
         spec_tput_n_draft_rounds = 0;
         spec_tput_ranked   = false;
+        spec_tput_probe    = false;
         spec_tput_active   = false;
         spec_tput_measured = false;
         spec_tput_rule     = 0;
@@ -4225,6 +4227,7 @@ private:
         const bool ranked = f.ranked();
         slot.spec_tput_ranked = ranked;
         int n = 0;
+        slot.spec_tput_probe = false;
         if (!ranked) {
             slot.spec_cd = common_spec_cooldown();
             n_rule = common_spec_tput_explore_n(f, std::min(n_lo, n_max_cfg), n_max_cfg);
@@ -4234,10 +4237,11 @@ private:
             n = std::min(slot.spec_cd.decide(n_rule), n_max_cfg);
             if (was_cooling && n > 0) {
                 // the probe: the shortest length the drafter keeps (none fits the remaining space: no probe this round)
-                n = n_lo <= n_max_cfg ? n_lo : 0;
+                n = common_spec_tput_probe_n(dp.n_min, n_max_cfg);
             }
             if (was_cooling && n > 0) {
                 slot.stats.n_spec_probe_rounds++;
+                slot.spec_tput_probe = true; // v51 r2 (Hermes): the n_min rule must not clear the probe
             }
         }
         if (trace > 0 && n != slot.spec_n_max_last) {
@@ -4732,6 +4736,8 @@ private:
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
                         };
+                        // [TAG_SPEC_DRAFT_POLICY] a tput cooldown probe is kept as drafted (false on every other path)
+                        common_speculative_get_draft_params(spec.get(), slot.id).keep_short = n_tput > 0 && slot.spec_tput_probe;
 
                         drafting.push_back(&slot);
                     }
@@ -4772,16 +4778,19 @@ private:
             if (draft.empty()) {
                 slot.stats.n_spec_empty_drafts += 1;
                 if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
-                    // [TAG_SPEC_DRAFT_POLICY] an empty draft: a stop at position 0 is a failure there; a draft the
-                    //   n_min rule cleared stopped at n_kept (positions before it were never verified: unobserved)
+                    // [TAG_SPEC_DRAFT_POLICY] an empty draft: a stop at position 0 is a failure there (and a failed
+                    //   round for the cooldown); a draft the n_min rule cleared stopped at n_kept > 0 (positions before
+                    //   it were never verified: unobserved; only the stop at n_kept is) and is no cooldown observation
+                    //   (v51 r2, Hermes: counted as a failure it could keep a cooldown alive when n_min > 1)
                     const int n_max_cfg = common_speculative_n_max(spec.get());
-                    if (slot.spec_tput_n_kept == 0) {
+                    const auto kind = common_spec_tput_empty_draft(slot.spec_tput_n_att, slot.spec_tput_n_kept);
+                    if (kind == COMMON_SPEC_TPUT_EMPTY_FAIL0) {
                         slot.spec_acc_update(1, 0, n_max_cfg);
-                    } else if (slot.spec_tput_n_att > slot.spec_tput_n_kept) {
+                        if (slot.spec_tput_ranked) {
+                            slot.spec_cd.observe(0, 0);
+                        }
+                    } else if (kind == COMMON_SPEC_TPUT_EMPTY_STOP_K) {
                         slot.spec_acc_observe_stop((size_t) slot.spec_tput_n_kept, n_max_cfg);
-                    }
-                    if (slot.spec_tput_ranked) {
-                        slot.spec_cd.observe(0, 0);
                     }
                 }
             }

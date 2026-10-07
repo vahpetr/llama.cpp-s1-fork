@@ -795,10 +795,13 @@ static void draft_policy_e2e(gguf_context * meta) {
 // stop included) and the tokens it drafted before the n_min rule (n_kept): the server prices the draft call by the
 // attempted length and observes a stop at its real position
 static void draft_attempt_report(gguf_context * meta) {
-    struct tc { float p_min; int n_min; int n_max; int att; int kept; size_t out; const char * what; };
-    for (const tc & t : { tc{ 0.0f,  0, 4, 4, 4, 4, "full draft: attempted 4, kept 4" },
-                          tc{ 1.01f, 0, 4, 1, 0, 0, "p_min stop at position 0: attempted 1, kept 0" },
-                          tc{ 0.0f,  3, 2, 2, 2, 0, "n_min 3 clears a 2-token draft: kept 2 reported" } }) {
+    // keep: v51 r2 (Hermes) a tput cooldown probe (keep_short) is never cleared by the n_min rule
+    struct tc { float p_min; int n_min; int n_max; bool keep; int att; int kept; size_t out; const char * what; };
+    for (const tc & t : { tc{ 0.0f,  0, 4, false, 4, 4, 4, "full draft: attempted 4, kept 4" },
+                          tc{ 1.01f, 0, 4, false, 1, 0, 0, "p_min stop at position 0: attempted 1, kept 0" },
+                          tc{ 0.0f,  3, 2, false, 2, 2, 0, "n_min 3 clears a 2-token draft: kept 2 reported" },
+                          tc{ 0.0f,  3, 2, true,  2, 2, 2, "keep_short probe: n_min 3 keeps the 2-token draft" },
+                          tc{ 0.0f,  3, 3, true,  3, 3, 3, "keep_short probe at n_min: 3 drafted, 3 kept" } }) {
         mtp_env e;
         env_cfg cfg = { "", GGML_TYPE_F16, 512, false };
         cfg.p_min = t.p_min;
@@ -820,6 +823,7 @@ static void draft_attempt_report(gguf_context * meta) {
         dp.id_last  = id_last;
         dp.prompt   = nullptr;
         dp.result   = &out;
+        dp.keep_short = t.keep;
         common_speculative_draft(e.spec);
         check(dp.n_attempted == t.att && dp.n_kept == t.kept && out.size() == t.out,
               std::string(t.what) + " (got attempted " + std::to_string(dp.n_attempted) + ", kept " +

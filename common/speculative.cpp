@@ -397,7 +397,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 continue;
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
+            if (!dp.keep_short && dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
         }
@@ -859,7 +859,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 continue;
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
+            if (!dp.keep_short && dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
         }
@@ -1339,7 +1339,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     result.push_back((llama_token) row[predecessor]);
                 }
 
-                if (result.size() < (size_t) params.n_min) {
+                if (!dp.keep_short && result.size() < (size_t) params.n_min) {
                     result.clear();
                 }
                 continue;
@@ -1398,7 +1398,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
 
-            if (result.size() < (size_t) params.n_min) {
+            if (!dp.keep_short && result.size() < (size_t) params.n_min) {
                 result.clear();
             }
         }
@@ -1878,7 +1878,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             dp.n_kept = (int32_t) dp.result->size();
-            if (dp.result->size() < (size_t) params.n_min) {
+            if (!dp.keep_short && dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
         }
@@ -2169,7 +2169,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         for (int i = 0; i < params.n_max; ++i) {
             const llama_token token = mod.get(result.data() + i);
             if (token == common_ngram_mod::EMPTY) {
-                if (i < params.n_min) {
+                if (i < params.n_min && !dparams.keep_short) {
                     result.clear();
                     return;
                 }
@@ -3456,4 +3456,16 @@ void common_spec_cooldown::observe(int n_proposed, int n_accepted) {
         c      = c_min;
         wait   = c;
     }
+}
+
+int common_spec_tput_probe_n(int n_min, int n_max) {
+    const int n_lo = std::max(1, n_min);
+    return n_lo <= n_max ? n_lo : 0;
+}
+
+common_spec_tput_empty_kind common_spec_tput_empty_draft(int n_attempted, int n_kept) {
+    if (n_kept <= 0) {
+        return COMMON_SPEC_TPUT_EMPTY_FAIL0;
+    }
+    return n_attempted > n_kept ? COMMON_SPEC_TPUT_EMPTY_STOP_K : COMMON_SPEC_TPUT_EMPTY_NONE;
 }

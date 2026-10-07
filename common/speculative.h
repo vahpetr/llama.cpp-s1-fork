@@ -75,6 +75,11 @@ struct common_speculative_draft_params {
     //   drafted before the n_min rule (a draft shorter than n_min is cleared from result, not from n_kept)
     int32_t n_attempted = -1;
     int32_t n_kept      = -1;
+
+    // [TAG_SPEC_DRAFT_POLICY] (v51 r2, Hermes) input: true = the n_min rule does not clear this draft (a tput cooldown
+    //   probe of max(n_min, 1) tokens that stopped early is kept as drafted - a cleared probe would count as a failed
+    //   probe and could keep a cooldown alive by itself). false (the default, every other caller): unchanged.
+    bool keep_short = false;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -260,7 +265,7 @@ struct common_spec_tput_model {
 
 // the cooldown around true-zero decisions: without a draft the acceptance estimate never moves, so after a zero
 //   decision (or K consecutive rounds that proposed nothing / had nothing accepted) the slot plays n = 0 for C rounds and
-//   then probes n = 1; a failed probe doubles C (c_min .. c_max), a success (a non-zero acceptance) halves C (spec §3;
+//   then probes (the server drafts max(n_min, 1) tokens for it, kept even below n_min); a failed probe doubles C (c_min .. c_max), a success (a non-zero acceptance) halves C (spec §3;
 //   below c_min the cooldown ends).
 struct common_spec_cooldown {
     int k_fail = 3;  // consecutive failed rounds that start a cooldown
@@ -278,3 +283,16 @@ struct common_spec_cooldown {
     void observe(int n_proposed, int n_accepted);
     bool cooling() const { return c > 0; }
 };
+
+// v51 r2 (Hermes): the cooldown probe's length: max(n_min, 1) - the shortest draft the n_min rule keeps - or 0 when it
+//   does not fit n_max (no probe this round). The probe is drafted with keep_short (never cleared by the n_min rule).
+int common_spec_tput_probe_n(int n_min, int n_max);
+
+// v51 r2 (Hermes): what an EMPTY draft of a tput round observes, from the drafter's n_attempted / n_kept
+enum common_spec_tput_empty_kind {
+    COMMON_SPEC_TPUT_EMPTY_FAIL0 = 0, // nothing drafted (a stop at position 0): a failure at 0, a failed round
+    COMMON_SPEC_TPUT_EMPTY_STOP_K,    // the n_min rule cleared n_kept > 0 tokens and the drafter stopped at n_kept: only
+                                      //   that stop is observed (positions < n_kept unverified); no cooldown observation
+    COMMON_SPEC_TPUT_EMPTY_NONE,      // cleared without a stop (n_kept = n_attempted): no observation at all
+};
+common_spec_tput_empty_kind common_spec_tput_empty_draft(int n_attempted, int n_kept);

@@ -3,6 +3,7 @@
 
 #include "speculative.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -448,6 +449,49 @@ static void test_replay_fallback() {
     check(c.r1 > 1.9 && c.r1 < 2.1, "warm rb: the fit's slope (r1 ~ 2)");
 }
 
+// v51 r2 (Hermes): with n_min > 1 a probe shorter than n_min used to be cleared by the n_min rule and counted as a
+//   failed probe - a cooldown that could sustain itself. The probe is max(n_min, 1) tokens, kept as drafted; a draft
+//   the n_min rule cleared (outside a probe) is no cooldown observation and never a failure at position 0.
+static void test_probe_n_min() {
+    check(common_spec_tput_probe_n(0, 8) == 1 && common_spec_tput_probe_n(1, 8) == 1, "probe = 1 for n_min <= 1");
+    check(common_spec_tput_probe_n(3, 8) == 3, "probe = n_min = 3");
+    check(common_spec_tput_probe_n(3, 2) == 0, "probe does not fit n_max: no probe");
+
+    check(common_spec_tput_empty_draft(1, 0) == COMMON_SPEC_TPUT_EMPTY_FAIL0, "stop at 0: a failure at 0");
+    check(common_spec_tput_empty_draft(0, 0) == COMMON_SPEC_TPUT_EMPTY_FAIL0, "nothing attempted, nothing kept: failure");
+    check(common_spec_tput_empty_draft(3, 2) == COMMON_SPEC_TPUT_EMPTY_STOP_K, "cleared 2 kept, stop at 2: the stop only");
+    check(common_spec_tput_empty_draft(2, 2) == COMMON_SPEC_TPUT_EMPTY_NONE, "cleared without a stop: no observation");
+
+    // the Hermes scenario, n_min = 3: the probe (3 tokens) stops at position 2 (p_min) every time, 1 of the 2 accepted.
+    //   Old: cleared -> observe(0, 0) -> C doubles to c_max and stays there. New: kept -> observe(2, 1) -> C halves.
+    const int n_min = 3;
+    common_spec_cooldown old_cd, new_cd;
+    old_cd.decide(0);
+    new_cd.decide(0);
+    for (int r = 0; r < 200; ++r) {
+        if (old_cd.decide(5) > 0) {
+            old_cd.observe(0, 0); // cleared probe = failed probe
+        }
+        if (new_cd.cooling() && new_cd.decide(5) > 0) {
+            const int n_probe = common_spec_tput_probe_n(n_min, 8);
+            const int n_kept  = std::min(n_probe, 2); // keep_short: the 2 drafted tokens are verified
+            new_cd.observe(n_kept, 1);
+        }
+    }
+    check(old_cd.cooling() && old_cd.c == old_cd.c_max, "old: cleared probes keep the cooldown at c_max (self-sustaining)");
+    check(!new_cd.cooling(), "new: a kept short probe that is accepted ends the cooldown");
+
+    // non-probe rounds whose drafts the n_min rule clears do not start a cooldown (no observation): 10 such rounds
+    common_spec_cooldown k;
+    for (int r = 0; r < 10; ++r) {
+        k.decide(4);
+        if (common_spec_tput_empty_draft(4, 2) == COMMON_SPEC_TPUT_EMPTY_FAIL0) {
+            k.observe(0, 0);
+        }
+    }
+    check(!k.cooling() && k.n_fail == 0, "cleared drafts never start a cooldown");
+}
+
 static void test_cooldown() {
     common_spec_cooldown cd;
 
@@ -525,6 +569,7 @@ int main() {
     test_rank();
     test_margin();
     test_replay_fallback();
+    test_probe_n_min();
     if (n_fail) {
         printf("test-spec-draft-policy: %d failures (%d checks ok)\n", n_fail, n_ok);
         return 1;
