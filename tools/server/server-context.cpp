@@ -1415,7 +1415,8 @@ private:
 
     // [TAG_DEEP_CKPT] a checkpoint leaving the slot's in-RAM list goes to the deep store (if the schedule keeps it)
     void deep_spill(server_slot & slot, const common_prompt_checkpoint & ckpt, uint8_t kind) {
-        if (disk_cache) {
+        // (Codex gate r3 Major 2) not persisted with more than one stateful speculative implementation (one carry)
+        if (disk_cache && common_speculative_n_stateful(spec.get()) <= 1) {
             disk_cache->deep_put(slot.prompt, ckpt, kind);
         }
     }

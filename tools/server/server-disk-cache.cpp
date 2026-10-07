@@ -1084,6 +1084,17 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
         DSK_INF("not saving %zu tokens: a partial prompt (legacy /slots restore, draft side incomplete)\n", n);
         return false;
     }
+    if (spec && common_speculative_n_stateful(spec) > 1) {
+        // (Codex gate r3 Major 2) the carry container holds one implementation's state: with several stateful ones
+        //   a save would persist an incomplete state - refused until a multi-state container exists
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            DSK_WRN("not saving: %d stateful speculative implementations (one carry per entry is supported), the disk "
+                    "cache does not persist this run\n", common_speculative_n_stateful(spec));
+        }
+        return false;
+    }
 
     // already stored: exactly this prompt (a longer entry does not count: its recurrent state is at its own end,
     // so this prefix could only come back through a checkpoint)
@@ -1574,9 +1585,10 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
         return res;
     }
 
-    if (spec && !spec_state.empty() && !common_speculative_set_state(spec, id_slot, spec_state)) {
+    if (spec && !common_speculative_set_state(spec, id_slot, spec_state)) {
         // (Codex gate r2 Major 1) a half-restored state (streams in, carry not) is worse than a miss: the entry is
-        //   invalid (an adopt source's files stay), the caller clears the slot
+        //   invalid (an adopt source's files stay), the caller clears the slot. (Codex gate r3 Major 2) an EMPTY carry
+        //   is restorable only for stateless implementations: MTP / eagle3 require theirs
         common_speculative_reset_state(spec, id_slot);
         DSK_WRN("entry %s: speculative carry not restorable, dropping it%s\n", e.id.c_str(),
                 e.src.empty() ? "" : " from the adopt sources (its files stay)");

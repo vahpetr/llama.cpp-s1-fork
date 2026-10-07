@@ -181,6 +181,10 @@ struct common_speculative_impl {
     // the carry schema this implementation writes with get_state ("" = it has no per-seq state): goes into the disk
     //   cache's state descriptor, so a change of schema or width is a descriptor mismatch, not a silent misload
     virtual std::string state_schema() const { return ""; }
+    // (Codex gate r3 Major 2) true: get_state() always yields this implementation's carry (MTP's pending_h, eagle3's
+    //   boundary when it stashes one), so a restore without one (an empty blob) is a missing state, not a legitimate
+    //   absence; false: stateless (draft-simple, dflash, ngram) - nothing to restore
+    virtual bool state_required() const { return false; }
 
     static constexpr int SET_STATE_NOT_MINE = 0;
     static constexpr int SET_STATE_OK       = 1;
@@ -894,12 +898,15 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (!need_boundary_stash()) {
             return false;
         }
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos_last[seq_id] < 0) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return false;
         }
 
-        const llama_pos          pos = pending_pos_last[seq_id];
-        const std::vector<float> & g = pending_g_last[seq_id];
+        // (Codex gate r3 Major 2) no deferred boundary is stored explicitly (pos -1, a zero row of the full width):
+        //   an empty carry is then always a missing state, never "no boundary"
+        const llama_pos          pos = pending_pos_last[seq_id] < 0 ? -1 : pending_pos_last[seq_id];
+        const std::vector<float>   zero(pos < 0 ? (size_t) n_embd_dec : 0, 0.0f);
+        const std::vector<float> & g = pos < 0 ? zero : pending_g_last[seq_id];
         const uint32_t       width = (uint32_t) g.size();
 
         const size_t hdr = 2 * sizeof(uint32_t) + sizeof(llama_pos);
@@ -913,6 +920,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
     std::string state_schema() const override {
         return need_boundary_stash() ? string_format("eagle3-boundary:%08x-f32x%d", BOUNDARY_G_MAGIC, n_embd_dec) : "";
+    }
+
+    bool state_required() const override {
+        return need_boundary_stash();
     }
 
     int set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
@@ -1905,6 +1916,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::string state_schema() const override {
         return string_format("mtp-pending-h:%08x-f32x%d", PENDING_H_MAGIC, n_embd);
+    }
+
+    bool state_required() const override {
+        return true;
     }
 
     int set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
@@ -3109,23 +3124,46 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
     return false;
 }
 
+int common_speculative_n_stateful(const common_speculative * spec) {
+    int n = 0;
+    if (spec != nullptr) {
+        for (const auto & impl : spec->impls) {
+            n += impl->state_required() ? 1 : 0;
+        }
+    }
+    return n;
+}
+
+const char * common_speculative_carry_verdict(int n_required, size_t n_bytes, int n_ok, int n_failed) {
+    if (n_bytes == 0) {
+        // (Codex gate r3 Major 2) an empty carry: a legitimate absence only when no implementation has a state
+        return n_required > 0 ? "empty, but a stateful implementation requires its carry" : nullptr;
+    }
+    // (Codex gate r2 Major 1) one implementation must claim and restore the blob; a claimed-but-rejected blob or one
+    //   nobody claims (a legacy untagged eagle3 boundary, another schema) is a failed restoration
+    if (n_failed > 0) {
+        return "rejected";
+    }
+    return n_ok > 0 ? nullptr : "no implementation claims it";
+}
+
 bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
-    if (spec == nullptr || data.empty()) {
+    if (spec == nullptr) {
         return true; // nothing to restore
     }
 
-    // (Codex gate r2 Major 1) one implementation must claim and restore the blob; a claimed-but-rejected blob or one
-    //   nobody claims (a legacy untagged eagle3 boundary, another schema) is a failed restoration
-    bool ok = false;
-    bool failed = false;
-    for (auto & impl : spec->impls) {
-        const int r = impl->set_state(seq_id, data);
-        ok     = ok     || r == common_speculative_impl::SET_STATE_OK;
-        failed = failed || r == common_speculative_impl::SET_STATE_FAILED;
+    int n_ok = 0;
+    int n_failed = 0;
+    if (!data.empty()) {
+        for (auto & impl : spec->impls) {
+            const int r = impl->set_state(seq_id, data);
+            n_ok     += r == common_speculative_impl::SET_STATE_OK     ? 1 : 0;
+            n_failed += r == common_speculative_impl::SET_STATE_FAILED ? 1 : 0;
+        }
     }
-    if (!ok || failed) {
-        LOG_WRN("%s: speculative state of seq %d not restored (%zu bytes, %s)\n", __func__, seq_id, data.size(),
-                failed ? "rejected" : "no implementation claims it");
+    const char * why = common_speculative_carry_verdict(common_speculative_n_stateful(spec), data.size(), n_ok, n_failed);
+    if (why != nullptr) {
+        LOG_WRN("%s: speculative state of seq %d not restored (%zu bytes, %s)\n", __func__, seq_id, data.size(), why);
         return false;
     }
     return true;

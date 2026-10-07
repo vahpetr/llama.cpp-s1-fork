@@ -88,8 +88,18 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 // false: the blob was not restored (no implementation claims it, or the claiming one rejects its width / size);
-//   an empty blob restores nothing and is true
+//   an empty blob is true only when no implementation is stateful (Codex gate r3 Major 2: MTP / eagle3 with a
+//   boundary stash require their carry - an empty one is a missing state)
 bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+
+// the number of active implementations whose per-seq carry is required (MTP, eagle3 with a boundary stash);
+//   get_state() serializes one carry, so persisting with more than one is refused by the callers
+int common_speculative_n_stateful(const common_speculative * spec);
+
+// the restore verdict of common_speculative_set_state (exposed for an offline unit check): nullptr = restored /
+//   legitimately nothing to restore, else the reason. n_required: stateful implementations, n_bytes: the carry's
+//   size, n_ok / n_failed: implementations that restored / rejected it
+const char * common_speculative_carry_verdict(int n_required, size_t n_bytes, int n_ok, int n_failed);
 
 // the per-seq carry schemas of the stateful implementations (schema id, tag and row width), "," joined; "" = none
 std::string common_speculative_state_schema(const common_speculative * spec);
