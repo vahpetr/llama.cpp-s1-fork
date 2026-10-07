@@ -178,8 +178,17 @@ static void init_env(mtp_env & env, gguf_context * meta, const env_cfg & cfg) {
     llama_model_params mp = llama_model_default_params();
     mp.progress_callback = silent_progress;
     mp.load_mtp          = true;
-    ggml_backend_dev_t devs[2] = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
+    // TEST_MTP_GPU=1: the first GPU (else integrated GPU) device with every layer offloaded (a Vulkan / GPU build check), default the CPU
+    static const bool use_gpu = getenv("TEST_MTP_GPU") != nullptr && atoi(getenv("TEST_MTP_GPU")) != 0;
+    ggml_backend_dev_t devs[2] = { ggml_backend_dev_by_type(use_gpu ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
+    if (use_gpu && devs[0] == nullptr) {
+        devs[0] = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU); // an integrated GPU (e.g. the 780M)
+    }
+    GGML_ASSERT(devs[0] != nullptr && "TEST_MTP_GPU=1 but no GPU device");
     mp.devices = devs;
+    if (use_gpu) {
+        mp.n_gpu_layers = 999;
+    }
 
     size_t seed = 31;
     env.model.reset(llama_model_init_from_user(meta, set_tensor_data, &seed, mp));
@@ -519,11 +528,12 @@ static void timing(gguf_context * meta) {
 struct loop_result {
     std::vector<llama_token> committed;
     std::vector<float>       logits;   // N_VOCAB per committed token
+    std::vector<int>         width;    // the target batch width each committed token's logits row came from
     std::vector<uint8_t>     tgt_state; // the target's full state stream at the end
     std::vector<std::vector<llama_token>> drafts; // the proposals, per round with a draft call
     std::vector<std::vector<float>>       dlogits; // the last draft step's logits, per round with a draft call
     int n_rounds = 0, n_drafted = 0, n_accepted = 0, n_zero = 0;
-    std::map<int, int> n_hist; // chosen draft length -> rounds
+    std::map<int, int> hist; // chosen draft length -> rounds
 };
 
 // returns the draft length for the next round (0 = no draft call); observe() gets the round's outcome
@@ -542,17 +552,19 @@ static loop_result run_loop(mtp_env & env, loop_policy & pol, size_t n_commit) {
     llama_token id_last = argmax(lp.data() + (prompt.size() - 1) * N_VOCAB);
     res.committed.push_back(id_last);
     res.logits.insert(res.logits.end(), lp.end() - N_VOCAB, lp.end());
+    res.width.push_back((int) prompt.size());
 
     const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
     while (res.committed.size() < n_commit) {
         const int n_req = pol.decide();
-        res.n_hist[n_req]++;
+        res.hist[n_req]++;
         res.n_rounds++;
         if (n_req == 0) {
             const auto v = feed(env, { id_last }, pos);
             id_last = argmax(v.data());
             res.committed.push_back(id_last);
             res.logits.insert(res.logits.end(), v.begin(), v.end());
+            res.width.push_back(1);
             pos += 1;
             res.n_zero++;
             continue;
@@ -580,6 +592,7 @@ static loop_result run_loop(mtp_env & env, loop_policy & pol, size_t n_commit) {
             id_last = argmax(v.data());
             res.committed.push_back(id_last);
             res.logits.insert(res.logits.end(), v.begin(), v.end());
+            res.width.push_back(1);
             pos += 1;
             continue;
         }
@@ -599,6 +612,7 @@ static loop_result run_loop(mtp_env & env, loop_policy & pol, size_t n_commit) {
         for (size_t i = 0; i <= n_acc && res.committed.size() < n_commit + 8; ++i) {
             res.committed.push_back(argmax(v.data() + i * N_VOCAB));
             res.logits.insert(res.logits.end(), v.begin() + i * N_VOCAB, v.begin() + (i + 1) * N_VOCAB);
+            res.width.push_back((int) verify.size());
         }
         res.n_accepted += (int) n_acc;
         pol.observe(n_req, (int) d.toks.size(), (int) n_acc);
@@ -618,16 +632,19 @@ static loop_result run_loop(mtp_env & env, loop_policy & pol, size_t n_commit) {
     // compare the first n_commit tokens only (a round may overshoot)
     res.committed.resize(n_commit);
     res.logits.resize(n_commit * N_VOCAB);
+    res.width.resize(n_commit);
     res.tgt_state.resize(llama_state_seq_get_size_ext(env.ctx_tgt.get(), 0, 0));
     GGML_ASSERT(llama_state_seq_get_data_ext(env.ctx_tgt.get(), res.tgt_state.data(), res.tgt_state.size(), 0, 0) == res.tgt_state.size());
     return res;
 }
 
 // first index where two committed streams differ (token or logits row), or -1
-static int first_diff(const loop_result & a, const loop_result & b) {
+// same_class: compare the logits rows only where both came from the same width class (1 = a plain decode, or >= 2)
+static int first_diff(const loop_result & a, const loop_result & b, bool same_class = false) {
     for (size_t i = 0; i < std::min(a.committed.size(), b.committed.size()); ++i) {
-        if (a.committed[i] != b.committed[i] ||
-                memcmp(a.logits.data() + i * N_VOCAB, b.logits.data() + i * N_VOCAB, N_VOCAB * sizeof(float)) != 0) {
+        const bool cmp_row = !same_class || (a.width[i] == 1) == (b.width[i] == 1);
+        if (a.committed[i] != b.committed[i] || (cmp_row &&
+                memcmp(a.logits.data() + i * N_VOCAB, b.logits.data() + i * N_VOCAB, N_VOCAB * sizeof(float)) != 0)) {
             return (int) i;
         }
     }
@@ -669,6 +686,106 @@ static void draft_kv_type_pair(gguf_context * meta) {
            ra.n_accepted, ra.n_drafted, rb.n_accepted, rb.n_drafted, same, total, (double) dmax);
 }
 
+// [TAG_SPEC_DRAFT_POLICY] the server's tput policy on a fixed cost model: the per-position acceptance EMA (alpha 1/32,
+// optimistic start, an empty draft or a short draft = a failure at the stop position) -> common_spec_tput_best_n ->
+// common_spec_cooldown, exactly as server_context_impl::spec_tput_n / spec_acc_update use them
+struct tput_policy : loop_policy {
+    common_spec_tput_cost c;
+    common_spec_cooldown  cd;
+    std::vector<float>    ema;
+    int n_max = 4;
+    tput_policy() {
+        c.d0 = 1.0; c.d1 = 2.2; c.v0 = 25.0; c.v1 = 1.5; c.c0 = 0.8; c.c1 = 0.2; c.host = 1.2;
+    }
+    int decide() override {
+        return std::min(cd.decide(common_spec_tput_best_n(ema, n_max, c)), n_max);
+    }
+    void observe(int n_req, int n_proposed, int n_acc) override {
+        if (ema.empty()) {
+            ema.assign(n_max, 1.0f);
+        }
+        const int n_obs = n_proposed < n_req ? n_proposed + 1 : n_proposed;
+        for (int i = 0; i < n_obs && i <= n_acc && i < (int) ema.size(); ++i) {
+            ema[i] += (1.0f/32.0f) * ((i < n_acc ? 1.0f : 0.0f) - ema[i]);
+        }
+        cd.observe(n_proposed, n_acc);
+    }
+};
+
+static std::string hist_str(const std::map<int, int> & h) {
+    std::string s;
+    for (const auto & kv : h) {
+        s += (s.empty() ? "" : " ") + std::to_string(kv.first) + ":" + std::to_string(kv.second);
+    }
+    return s;
+}
+
+// [TAG_SPEC_DRAFT_POLICY] policy off (n = 4 every round) vs tput (true-zero rounds, probes, other widths): the same
+// committed tokens with the same target logits rows, compared per committed token (the round structure and so the
+// verify widths differ: a composition class); then tput with a q8_0 draft KV
+static void draft_policy_e2e(gguf_context * meta) {
+    const size_t n_commit = 96;
+    mtp_env A, B, C;
+    init_env(A, meta, { "", GGML_TYPE_F16,  512, false });
+    init_env(B, meta, { "", GGML_TYPE_F16,  512, false });
+    init_env(C, meta, { "", GGML_TYPE_Q8_0, 512, false });
+    loop_policy off;
+    tput_policy tb, tc;
+    const auto ra = run_loop(A, off, n_commit);
+    const auto rb = run_loop(B, tb,  n_commit);
+    const auto rc = run_loop(C, tc,  n_commit);
+    // a plain one-token decode is its own class on the CPU (the n = 1 output matmul path; measured below): the rows are
+    // compared bitwise within a class, the committed tokens and the target state everywhere
+    const int fb = first_diff(ra, rb, true);
+    const int fc = first_diff(ra, rc, true);
+    check(fb < 0, "policy off vs tput: committed tokens + target logits identical (first diff at " + std::to_string(fb) + ")");
+    check(eq(ra.tgt_state, rb.tgt_state), "policy off vs tput: target state stream identical");
+    check(first_diff(rb, rc) < 0, "tput f16 vs tput q8_0 draft KV: committed tokens + target logits identical (same widths)");
+    check(fc < 0, "policy off vs tput + q8_0 draft KV: committed tokens + target logits identical (first diff at " + std::to_string(fc) + ")");
+    check(eq(ra.tgt_state, rc.tgt_state), "policy off vs tput + q8_0 draft KV: target state stream identical");
+    check(rb.n_zero > 0 && rb.hist.count(1) > 0, "tput: true-zero rounds and probes happened");
+    // the width class on this backend: fixed n = 0..3 vs n = 4 (verify widths 1..4 vs 5): token mismatches, max |dlogit|
+    const auto dist = [](const loop_result & x, const loop_result & y, int & n_tok) {
+        float m = 0.0f;
+        n_tok = 0;
+        for (size_t i = 0; i < x.committed.size(); ++i) {
+            n_tok += x.committed[i] != y.committed[i];
+            for (size_t j = 0; j < N_VOCAB; ++j) {
+                m = std::max(m, std::fabs(x.logits[i*N_VOCAB + j] - y.logits[i*N_VOCAB + j]));
+            }
+        }
+        return m;
+    };
+    {
+        int n_tok = 0;
+        const float m = dist(ra, rb, n_tok);
+        printf("  off vs tput f16: %d committed tokens differ, max |dlogit| %.3g\n", n_tok, (double) m);
+    }
+    struct fixed_n : loop_policy { int n; int decide() override { return n; } };
+    for (int n = 0; n < 4; ++n) {
+        mtp_env E;
+        init_env(E, meta, { "", GGML_TYPE_F16, 512, false });
+        fixed_n f; f.n = n;
+        const auto rf = run_loop(E, f, n_commit);
+        int n_tok = 0;
+        const float m = dist(ra, rf, n_tok);
+        check(n_tok == 0 && eq(ra.tgt_state, rf.tgt_state) && first_diff(ra, rf, true) < 0,
+              "verify width " + std::to_string(n + 1) + " vs 5: tokens, target state and same-class rows identical");
+        printf("  width class: verify width %d vs 5: first diff at %d, %d tokens differ, max |dlogit| %.3g, target state %s\n",
+               n + 1, first_diff(ra, rf), n_tok, (double) m, eq(ra.tgt_state, rf.tgt_state) ? "identical" : "differs");
+    }
+    const auto line = [](const char * name, const loop_result & r) {
+        printf("  %-14s rounds %3d (zero %3d), drafted %3d, accepted %3d, n* distribution %s\n", name, r.n_rounds, r.n_zero,
+               r.n_drafted, r.n_accepted, hist_str(r.hist).c_str());
+    };
+    printf("%sdraft policy e2e, %zu committed tokens: target identical off vs tput %s, off vs tput+q8_0 %s\n",
+           mtp_qsa_mode() ? "[sparse MTP] " : "", n_commit, fb < 0 && eq(ra.tgt_state, rb.tgt_state) ? "yes" : "NO",
+           fc < 0 && eq(ra.tgt_state, rc.tgt_state) ? "yes" : "NO");
+    line("off (n=4)", ra);
+    line("tput f16", rb);
+    line("tput q8_0", rc);
+}
+
 int main() {
     llama_log_set(quiet_log, nullptr);
     common_log_set_verbosity_thold(-1);
@@ -676,7 +793,8 @@ int main() {
 
     gguf_context_ptr meta = make_meta(4096);
 
-    printf("mode: %s\n", mtp_qsa_mode() ? "sparse MTP draft (LLAMA_MTP_QSA=1)" : "dense MTP draft");
+    printf("mode: %s%s\n", mtp_qsa_mode() ? "sparse MTP draft (LLAMA_MTP_QSA=1)" : "dense MTP draft",
+           getenv("TEST_MTP_GPU") && atoi(getenv("TEST_MTP_GPU")) ? ", GPU device (TEST_MTP_GPU=1)" : "");
 
     for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
         run_pair(meta.get(), t, false);
@@ -685,6 +803,7 @@ int main() {
     run_pair(meta.get(), GGML_TYPE_F16, true); // backend draft sampling: the samplers see no zero-output graph now
 
     draft_kv_type_pair(meta.get());
+    draft_policy_e2e(meta.get());
 
     timing(meta.get());
 
