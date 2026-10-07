@@ -17,6 +17,14 @@
 // equivalent length at row j: the leading draft tokens with top-10 confidence >= --spec-draft-p-min (the draft's p_min stop)
 // equal to the target argmax of rows j, j+1, ...; censored (left out of acc / acclen) when a teacher-forced token is not the
 // previous accepted draft token (that target row is off the draft's path).
+// GATE INSTRUMENT (v49, Codex astra r2 Major 1): --compare is bytewise as well - state files: carrier_bytes_equal (the whole
+// blob incl. its tag), logits_bytes_equal, tgt_bytes_equal / dft_bytes_equal (memcmp of the full blobs), nan_mismatch,
+// bytes_equal = all of them + same prompt / n_past / last token; logit dumps: bytes_equal_rows / bytes_equal; two snapshot
+// files: first differing line. last_maxdiff / maxdiff are NaN-safe (a NaN on one side only -> null = not equal).
+// --snapshot-every-ubatch F: a JSON line after every draft catch-up (prefill -b chunk = ubatch at -b == -ub; replay before /
+// after the draft side), after every restore, every draft chain (all D steps' logits + nextn embeddings hashed) with the
+// draft-KV rollback after it, the server-path draft at row 0 and every --gen decode: the draft seq state hash, the carrier
+// blob hash, the target logits hash of the rows (full vocabulary, bytewise). Equal files = equal draft state at every step.
 #include "arg.h"
 #include "chat.h"
 #include "common.h"
@@ -49,6 +57,13 @@ static uint64_t fnv(const void * p, size_t n) { // FNV-1a 64
     for (size_t i = 0; i < n; ++i) { h = (h ^ ((const uint8_t *) p)[i]) * 1099511628211ull; }
     return h;
 }
+static uint64_t hash64(const void * p, size_t n) { // FNV-style over 64-bit words (snapshots of multi-GiB blobs); deterministic
+    const uint8_t * b = (const uint8_t *) p; uint64_t h = 1469598103934665603ull; size_t i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, b + i, 8); h = (h ^ w) * 1099511628211ull; h ^= h >> 31; }
+    for (; i < n; ++i) { h = (h ^ b[i]) * 1099511628211ull; }
+    return h ^ (uint64_t) n;
+}
+static uint64_t hmix(uint64_t h, uint64_t x) { return (h ^ x) * 1099511628211ull ^ ((h ^ x) >> 29); }
 
 struct state_t {
     int32_t n_vocab = 0, n_embd = 0, n_past = 0, last_tok = -1;
@@ -157,7 +172,34 @@ template <class T> static std::string jarr(const std::vector<T> & v) {
 struct env_t {
     llama_context * tgt = nullptr, * dft = nullptr; common_speculative * spec = nullptr;
     int n_vocab = 0, n_embd = 0, D = 0; float p_min = 0; llama_batch b1 {}; std::string mode;
+    FILE * snap = nullptr; std::vector<uint8_t> sbuf; // --snapshot-every-ubatch
 };
+
+static uint64_t seq_hash(llama_context * ctx, std::vector<uint8_t> & buf) {
+    buf.resize(llama_state_seq_get_size(ctx, 0));
+    if (llama_state_seq_get_data(ctx, buf.data(), buf.size(), 0) != buf.size()) { fail("snapshot: state capture failed"); }
+    return hash64(buf.data(), buf.size());
+}
+static uint64_t logits_hash(llama_context * ctx, int i0, int m, int V) { // rows i0 .. i0+m-1 of the last decode, full vocabulary
+    uint64_t h = 0;
+    for (int i = i0; i < i0 + m; ++i) { h = hmix(h, hash64(llama_get_logits_ith(ctx, i), (size_t) V * sizeof(float))); }
+    return h;
+}
+// one snapshot line: where, position, rows, the draft seq state hash (+ size), the carrier blob hash, an extra hash (target
+// logits / draft chain / draft tokens), optionally the target seq state hash
+static void snap(env_t & E, const char * at, const std::string & ctx_tag, int pos, int m, uint64_t extra, bool tgt = false) {
+    if (!E.snap) { return; }
+    std::vector<uint8_t> c;
+    const uint64_t hc = common_speculative_get_state(E.spec, 0, c) ? hash64(c.data(), c.size()) : 0;
+    const uint64_t hd = seq_hash(E.dft, E.sbuf); const size_t nd = E.sbuf.size();
+    std::string ht = "null";
+    if (tgt) { char b[24]; snprintf(b, sizeof(b), "\"%016llx\"", (unsigned long long) seq_hash(E.tgt, E.sbuf)); ht = b; }
+    E.sbuf.clear(); E.sbuf.shrink_to_fit();
+    fprintf(E.snap, "{\"t\":\"snap\",\"at\":\"%s\",\"ctx\":\"%s\",\"pos\":%d,\"m\":%d,\"dft_size\":%zu,\"dft\":\"%016llx\",\"carrier_size\":%zu,"
+            "\"carrier\":\"%016llx\",\"extra\":\"%016llx\",\"tgt\":%s}\n", at, ctx_tag.c_str(), pos, m, nd, (unsigned long long) hd,
+            c.size(), (unsigned long long) hc, (unsigned long long) extra, ht.c_str());
+    fflush(E.snap);
+}
 
 static void restore(env_t & E, const state_t & s) {
     llama_memory_clear(llama_get_memory(E.tgt), true);
@@ -171,7 +213,7 @@ static void restore(env_t & E, const state_t & s) {
 // from (id_last = tok at pos, carrier h0) -> tokens, top-10 softmax confidence per step (what p_min gates), step-0 logits;
 // then drops its draft-KV cells (the server's rollback of a draft)
 static void draft_chain(env_t & E, llama_token tok, llama_pos pos, const float * h0, std::vector<int> & d, std::vector<float> & p10,
-                        std::vector<float> & lg0) {
+                        std::vector<float> & lg0, uint64_t * chain = nullptr) {
     std::vector<float> h(h0, h0 + E.n_embd); std::vector<int> ids;
     d.clear(); p10.clear();
     for (int k = 0; k < E.D; ++k) {
@@ -186,6 +228,7 @@ static void draft_chain(env_t & E, llama_token tok, llama_pos pos, const float *
         if (k == 0) { lg0.assign(l, l + E.n_vocab); }
         const float * hn = llama_get_embeddings_nextn_ith(E.dft, 0);
         h.assign(hn, hn + E.n_embd);
+        if (chain) { *chain = hmix(hmix(*chain, hash64(l, (size_t) E.n_vocab * sizeof(float))), hash64(hn, (size_t) E.n_embd * sizeof(float))); }
     }
     llama_memory_seq_rm(llama_get_memory(E.dft), 0, pos, -1);
 }
@@ -198,6 +241,8 @@ struct ref_t { std::vector<float> logits, margin; std::vector<int> top1; int n =
 static void replay(env_t & E, const state_t & S, const tokens & C, const std::string & ctag, int n, ref_t & ref, FILE * out,
                    const std::string & dump_dir, int dump_rows, const std::vector<double> * gen_sums) {
     restore(E, S);
+    const std::string sctx = S.tag + "/" + ctag + "/n" + std::to_string(n);
+    snap(E, "restore", sctx, (int) S.n_past, 0, 0, true);
     const int L = (int) C.size(), V = E.n_vocab, n_dump = dump_rows > 0 ? std::min(dump_rows, L) : L;
     const llama_pos N = S.n_past;
     const bool is_ref = ref.logits.empty();
@@ -221,6 +266,7 @@ static void replay(env_t & E, const state_t & S, const tokens & C, const std::st
         if (!common_speculative_get_state(E.spec, 0, carrier)) { fail("no draft-mtp carrier"); }
         if (llama_decode(E.tgt, b) != 0) { fail("target decode failed at row " + std::to_string(b0)); }
         if (!common_speculative_process(E.spec, b)) { fail("draft-mtp catch-up failed"); }
+        snap(E, "catchup", sctx, (int) (N + b0), m, E.snap ? logits_hash(E.tgt, 0, m, V) : 0);
         for (int i = 0; i < m; ++i) { // target side, forward
             const int j = b0 + i;
             const float * lt = llama_get_logits_ith(E.tgt, i);
@@ -241,7 +287,10 @@ static void replay(env_t & E, const state_t & S, const tokens & C, const std::st
             const int j = b0 + i;
             row_t & r = rows[j];
             llama_memory_seq_rm(mem_dft, 0, N + j, -1);
-            draft_chain(E, C[j], N + j, i == 0 ? (const float *) (carrier.data() + 4) : llama_get_embeddings_nextn_ith(E.tgt, i - 1), r.d, r.p10, lg0);
+            uint64_t chain = 0;
+            draft_chain(E, C[j], N + j, i == 0 ? (const float *) (carrier.data() + 4) : llama_get_embeddings_nextn_ith(E.tgt, i - 1), r.d, r.p10, lg0,
+                        E.snap ? &chain : nullptr);
+            snap(E, "draft+rollback", sctx, (int) (N + j), E.D, chain);
             if (j == 0) { // the same draft through common_speculative_draft (the server's path; p_min 0, n_max D)
                 static const tokens no_prompt;
                 tokens res;
@@ -251,6 +300,7 @@ static void replay(env_t & E, const state_t & S, const tokens & C, const std::st
                 common_speculative_draft(E.spec);
                 llama_memory_seq_rm(mem_dft, 0, N, -1);
                 draft_check = std::vector<int>(res.begin(), res.end()) == r.d ? 0 : 1;
+                snap(E, "server-draft+rollback", sctx, (int) N, (int) res.size(), hash64(res.data(), res.size() * sizeof(llama_token)));
             }
             const float * lt = llama_get_logits_ith(E.tgt, i);
             r.kl_dt = (float) kl(lg0.data(), lt, V);
@@ -258,6 +308,7 @@ static void replay(env_t & E, const state_t & S, const tokens & C, const std::st
         }
         common_speculative_set_state(E.spec, 0, carrier); // rebuild this batch's draft-KV cells; the carrier -> its last row
         if (!common_speculative_process(E.spec, b)) { fail("draft-mtp catch-up failed"); }
+        snap(E, "re-catchup", sctx, (int) (N + b0), m, 0);
     }
     llama_batch_free(b);
     if (dump) { fclose(dump); }
@@ -309,22 +360,46 @@ static int compare(const std::string & a, const std::string & b) {
     std::vector<int> ia, ib;
     if (FILE * fs = open_magic(a, STATE_MAGIC)) {
         fclose(fs);
-        const state_t A = load_state(a, false), B = load_state(b, false);
+        const state_t A = load_state(a, true), B = load_state(b, true); // the full blobs: bytewise
         if (A.n_vocab != B.n_vocab || A.n_embd != B.n_embd) { fail("incompatible states"); }
-        double l2 = 0, n2 = 0, mxd = 0;
+        double l2 = 0, n2 = 0, mxd = 0; int nan_mm = 0;
         for (int i = 0; i < A.n_embd; ++i) { const double d = A.h()[i] - B.h()[i]; l2 += d * d; n2 += (double) A.h()[i] * A.h()[i]; }
-        for (int i = 0; i < A.n_vocab; ++i) { mxd = std::max(mxd, (double) std::fabs(A.logits[i] - B.logits[i])); }
+        for (int i = 0; i < A.n_vocab; ++i) { // NaN-safe: a NaN on one side only = not equal (maxdiff -> inf -> null)
+            const float x = A.logits[i], y = B.logits[i];
+            if (std::isnan(x) != std::isnan(y)) { nan_mm++; mxd = INFINITY; } else if (!std::isnan(x)) { mxd = std::max(mxd, (double) std::fabs(x - y)); }
+        }
+        auto beq = [](const std::vector<uint8_t> & x, const std::vector<uint8_t> & y) { return x.size() == y.size() && (x.empty() || memcmp(x.data(), y.data(), x.size()) == 0); };
+        const bool c_eq = beq(A.carrier, B.carrier), t_eq = beq(A.tgt, B.tgt), d_eq = beq(A.dft, B.dft);
+        const bool l_eq = A.logits.size() == B.logits.size() && memcmp(A.logits.data(), B.logits.data(), A.logits.size() * sizeof(float)) == 0;
+        const bool all_eq = c_eq && t_eq && d_eq && l_eq && A.prompt_hash == B.prompt_hash && A.n_past == B.n_past && A.last_tok == B.last_tok;
         topk(A.logits.data(), A.n_vocab, 2, ia); topk(B.logits.data(), B.n_vocab, 2, ib);
         printf("{\"t\":\"compare_state\",\"a\":\"%s\",\"b\":\"%s\",\"Pa\":\"%s\",\"Pb\":\"%s\",\"same_prompt\":%d,\"n_past\":%d,"
                "\"carrier_l2\":%s,\"carrier_rel\":%s,\"last_kl\":%s,\"last_top1_eq\":%d,\"last_dmargin\":%s,\"last_maxdiff\":%s,"
-               "\"tgt_equal\":%d,\"dft_equal\":%d}\n", A.tag.c_str(), B.tag.c_str(), A.mode.c_str(), B.mode.c_str(),
+               "\"tgt_equal\":%d,\"dft_equal\":%d,\"carrier_bytes_equal\":%d,\"logits_bytes_equal\":%d,\"tgt_bytes_equal\":%d,"
+               "\"dft_bytes_equal\":%d,\"nan_mismatch\":%d,\"tgt_size\":%zu,\"dft_size\":%zu,\"bytes_equal\":%d}\n", A.tag.c_str(), B.tag.c_str(), A.mode.c_str(), B.mode.c_str(),
                (int) (A.prompt_hash == B.prompt_hash && A.n_past == B.n_past), A.n_past, jnum(std::sqrt(l2)).c_str(),
                jnum(std::sqrt(l2 / std::max(n2, 1e-30))).c_str(), jnum(kl(A.logits.data(), B.logits.data(), A.n_vocab)).c_str(),
                (int) (ia[0] == ib[0]), jnum(std::fabs(margin(A.logits.data(), ia) - margin(B.logits.data(), ib))).c_str(),
-               jnum(mxd).c_str(), (int) (A.tgt_hash == B.tgt_hash), (int) (A.dft_hash == B.dft_hash));
+               jnum(mxd).c_str(), (int) (A.tgt_hash == B.tgt_hash), (int) (A.dft_hash == B.dft_hash), (int) c_eq, (int) l_eq, (int) t_eq,
+               (int) d_eq, nan_mm, A.tgt.size(), A.dft.size(), (int) all_eq);
         return 0;
     }
     FILE * f[2] = { open_magic(a, DUMP_MAGIC), open_magic(b, DUMP_MAGIC) };
+    if (!f[0] && !f[1]) { // two snapshot files (--snapshot-every-ubatch): line by line, bytewise
+        std::ifstream x(a, std::ios::binary), y(b, std::ios::binary);
+        if (!x || !y) { fail("cannot read " + a + " / " + b); }
+        std::string lx, ly; int n = 0, first = -1, na = 0, nb = 0;
+        while (true) {
+            const bool gx = (bool) std::getline(x, lx), gy = (bool) std::getline(y, ly);
+            na += gx; nb += gy; if (!gx && !gy) { break; }
+            if (first < 0 && (gx != gy || lx != ly)) { first = n; }
+            n++;
+        }
+        if (na > 0 && read_file(a).rfind("{\"t\":\"snap\"", 0) != 0) { fail("not a state file, a logit dump or a snapshot file: " + a); }
+        printf("{\"t\":\"compare_snap\",\"a\":\"%s\",\"b\":\"%s\",\"lines_a\":%d,\"lines_b\":%d,\"first_diff\":%d,\"bytes_equal\":%d}\n",
+               base_tag(a).c_str(), base_tag(b).c_str(), na, nb, first, (int) (first < 0 && na > 0 && read_file(a) == read_file(b)));
+        return 0;
+    }
     int32_t h[2][2]; std::string meta[2];
     for (int k = 0; k < 2; ++k) {
         if (!f[k]) { fail("not a state file or a logit dump: " + (k ? b : a)); }
@@ -332,25 +407,30 @@ static int compare(const std::string & a, const std::string & b) {
     }
     if (h[0][1] != h[1][1]) { fail("vocab sizes differ"); }
     const int R = std::min(h[0][0], h[1][0]), V = h[0][1];
-    std::vector<float> x((size_t) V), y((size_t) V); double s_kl = 0, mx_kl = 0, s_dm = 0, mxd = 0; int n_eq = 0;
+    std::vector<float> x((size_t) V), y((size_t) V); double s_kl = 0, mx_kl = 0, s_dm = 0, mxd = 0; int n_eq = 0, n_beq = 0, nan_mm = 0;
     for (int r = 0; r < R; ++r) {
         rd(f[0], x.data(), (size_t) V * 4); rd(f[1], y.data(), (size_t) V * 4);
         const double k = kl(x.data(), y.data(), V); s_kl += k; mx_kl = std::max(mx_kl, k);
         topk(x.data(), V, 2, ia); topk(y.data(), V, 2, ib);
         n_eq += ia[0] == ib[0]; s_dm += std::fabs(margin(x.data(), ia) - margin(y.data(), ib));
-        for (int i = 0; i < V; ++i) { mxd = std::max(mxd, (double) std::fabs(x[i] - y[i])); }
+        for (int i = 0; i < V; ++i) {
+            if (std::isnan(x[i]) != std::isnan(y[i])) { nan_mm++; mxd = INFINITY; } else if (!std::isnan(x[i])) { mxd = std::max(mxd, (double) std::fabs(x[i] - y[i])); }
+        }
+        n_beq += memcmp(x.data(), y.data(), (size_t) V * 4) == 0;
     }
     fclose(f[0]); fclose(f[1]);
     printf("{\"t\":\"compare_dump\",\"a\":\"%s\",\"b\":\"%s\",\"rows\":%d,\"kl_mean\":%s,\"kl_max\":%s,\"top1_agree\":%s,\"dmargin_mean\":%s,"
-           "\"maxdiff\":%s}\n", meta[0].c_str(), meta[1].c_str(), R, jnum(R ? s_kl / R : NAN).c_str(), jnum(mx_kl).c_str(),
-           jnum(R ? (double) n_eq / R : NAN).c_str(), jnum(R ? s_dm / R : NAN).c_str(), jnum(mxd).c_str());
+           "\"maxdiff\":%s,\"rows_a\":%d,\"rows_b\":%d,\"bytes_equal_rows\":%d,\"nan_mismatch\":%d,\"bytes_equal\":%d}\n", meta[0].c_str(),
+           meta[1].c_str(), R, jnum(R ? s_kl / R : NAN).c_str(), jnum(mx_kl).c_str(), jnum(R ? (double) n_eq / R : NAN).c_str(),
+           jnum(R ? s_dm / R : NAN).c_str(), jnum(mxd).c_str(), h[0][0], h[1][0], n_beq, nan_mm,
+           (int) (R > 0 && h[0][0] == h[1][0] && n_beq == R));
     return 0;
 }
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     bool chat = false; int gen = 0, max_rows = 0, dump_rows = 0;
-    std::string prompt_text, prompt_ids, state_out, gen_out, out_path, dump_dir;
+    std::string prompt_text, prompt_ids, state_out, gen_out, out_path, dump_dir, snap_path;
     std::vector<std::string> states_in, cmp;
     std::vector<std::pair<bool, std::string>> cont_files; // (ids?, path)
     std::vector<int> n_list = { 1, 6, 30 };
@@ -372,6 +452,7 @@ int main(int argc, char ** argv) {
         else if (a == "--dump-rows")   { dump_rows = std::stoi(val()); }
         else if (a == "--max-rows")    { max_rows = std::stoi(val()); }
         else if (a == "--compare")     { cmp.push_back(val()); cmp.push_back(val()); }
+        else if (a == "--snapshot-every-ubatch") { snap_path = val(); }
         else                           { rest.push_back(argv[i]); }
     }
     if (!cmp.empty()) { return compare(cmp[0], cmp[1]); }
@@ -401,6 +482,7 @@ int main(int argc, char ** argv) {
     params.speculative.draft.p_min = 0.0f; params.speculative.draft.n_min = 0; params.speculative.draft.backend_sampling = false;
     params.speculative.draft.ctx_tgt = E.tgt; params.speculative.draft.ctx_dft = E.dft;
     if (!(E.spec = common_speculative_init(params.speculative, 1))) { fail("draft-mtp init failed"); }
+    if (!snap_path.empty() && !(E.snap = fopen(snap_path.c_str(), "w"))) { fail("cannot write " + snap_path); }
     E.b1 = llama_batch_init(1, E.n_embd, 1);
     E.b1.token = (llama_token *) malloc(sizeof(llama_token)); // the MTP batch carries token + embd (as the impl)
     LOG_INF("mtp-replay: mode %s, n_vocab %d, n_embd %d, D %d, p_min %.2f, n_ctx %u, n_batch %d\n", E.mode.c_str(), E.n_vocab, E.n_embd,
@@ -433,6 +515,7 @@ int main(int argc, char ** argv) {
             for (size_t i = 0; i < m; ++i) { common_batch_add(b, prompt[i0 + i], (llama_pos) (i0 + i), { 0 }, i0 + i + 1 == prompt.size()); }
             if (llama_decode(E.tgt, b) != 0) { fail("prefill decode failed at " + std::to_string(i0)); }
             if (!common_speculative_process(E.spec, b)) { fail("prefill draft-mtp catch-up failed at " + std::to_string(i0)); }
+            snap(E, "prefill-catchup", "prefill", (int) i0, (int) m, i0 + m == prompt.size() && E.snap ? logits_hash(E.tgt, -1, 1, E.n_vocab) : 0);
             if ((i0 / params.n_batch) % 16 == 15) { LOG_INF("prefill %zu / %zu tokens, %.1f s\n", i0 + m, prompt.size(), (ggml_time_ms() - t0) / 1e3); }
         }
         llama_batch_free(b);
@@ -445,6 +528,13 @@ int main(int argc, char ** argv) {
         if (llama_state_seq_get_data(E.tgt, S.tgt.data(), S.tgt.size(), 0) != S.tgt.size() ||
             llama_state_seq_get_data(E.dft, S.dft.data(), S.dft.size(), 0) != S.dft.size()) { fail("state capture failed"); }
         S.tgt_hash = fnv(S.tgt.data(), S.tgt.size()); S.dft_hash = fnv(S.dft.data(), S.dft.size());
+        if (E.snap) {
+            fprintf(E.snap, "{\"t\":\"snap\",\"at\":\"prefill-end\",\"n_past\":%d,\"tgt_size\":%zu,\"tgt\":\"%016llx\",\"dft_size\":%zu,"
+                    "\"dft\":\"%016llx\",\"carrier\":\"%016llx\",\"logits\":\"%016llx\"}\n", S.n_past, S.tgt.size(),
+                    (unsigned long long) hash64(S.tgt.data(), S.tgt.size()), S.dft.size(), (unsigned long long) hash64(S.dft.data(), S.dft.size()),
+                    (unsigned long long) hash64(S.carrier.data(), S.carrier.size()), (unsigned long long) hash64(S.logits.data(), S.logits.size() * sizeof(float)));
+            fflush(E.snap);
+        }
         save_state(state_out, S);
         std::vector<int> ids; double h2 = 0;
         topk(S.logits.data(), E.n_vocab, 2, ids);
@@ -462,6 +552,7 @@ int main(int argc, char ** argv) {
                 if (llama_decode(E.tgt, b1) != 0) { fail("gen decode failed"); }
                 const float * l = llama_get_logits_ith(E.tgt, 0);
                 gen_sums.push_back(sum_d(l, E.n_vocab));
+                snap(E, "gen", "gen", S.n_past + k, 1, E.snap ? hash64(l, (size_t) E.n_vocab * sizeof(float)) : 0);
                 if (k + 1 < gen) { topk(l, E.n_vocab, 1, ids); g.push_back(ids[0]); }
             }
             llama_batch_free(b1);
@@ -495,6 +586,7 @@ int main(int argc, char ** argv) {
         }
         if (out) { fclose(out); }
     }
+    if (E.snap) { fclose(E.snap); }
     llama_batch_free(E.b1); common_speculative_free(E.spec); llama_backend_free();
     return 0;
 }
