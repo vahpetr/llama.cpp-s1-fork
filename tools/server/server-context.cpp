@@ -1289,6 +1289,15 @@ private:
 
     server_batch batch;
 
+    // [TAG_SLOT_INVALIDATE] slots released on a failure path in this update_slots() pass: their sequence may hold part
+    //   of a batch, and a batch built before the failure may still write it, so they are cleared again after decoding
+    std::vector<int32_t> slots_invalidated;
+
+    // debug-only fault injection for the failure-path tests, read once at load (absent in every deployment):
+    //   LLAMA_SERVER_DEBUG_FAULT=slot   - a per-slot exception in post_decode() once a slot has generated 2 tokens
+    //   LLAMA_SERVER_DEBUG_FAULT=decode - an exception after a successful decode (as a failed speculative batch)
+    int32_t dbg_fault = 0;
+
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
@@ -1506,6 +1515,11 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
+        if (const char * f = getenv("LLAMA_SERVER_DEBUG_FAULT")) {
+            dbg_fault = std::string(f) == "slot" ? 1 : std::string(f) == "decode" ? 2 : 0;
+            SRV_WRN("debug fault injection armed: %s\n", f);
+        }
+
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
@@ -3573,6 +3587,7 @@ private:
                 SLT_ERR(slot, "got exception: %s\n", e.what());
                 send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                 slot.release();
+                invalidate_slot(slot);
             }
         }
     }
@@ -3585,15 +3600,35 @@ private:
                 SLT_ERR(*slot, "got exception: %s\n", e.what());
                 send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                 slot->release();
+                invalidate_slot(*slot);
             }
         }
     }
 
+    // [TAG_SLOT_INVALIDATE] a slot released on a failure path: its sequence (target + draft) may hold part of a batch,
+    //   so it is cleared now and once more after this pass's decode, which may still write it (same end state as the
+    //   decode-error branch in decode())
+    void invalidate_slot(server_slot & slot) {
+        slot.prompt_clear();
+        slots_invalidated.push_back(slot.id);
+    }
+
     void abort_all_slots(const std::string & reason) {
         for (auto & slot : slots) {
+            // a slot with tokens in the batch was selected as processing in this pass, even if it was released since
+            bool in_batch = false;
+            for (const auto & t : batch.tokens) {
+                if (t.id_slot == slot.id) {
+                    in_batch = true;
+                    break;
+                }
+            }
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
+                invalidate_slot(slot);
+            } else if (in_batch) {
+                invalidate_slot(slot);
             }
         }
     }
@@ -3629,6 +3664,8 @@ private:
 #endif
 
     void update_slots() {
+        slots_invalidated.clear();
+
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3719,6 +3756,10 @@ private:
 
                 batch_view = batch.get_view(off, n_tokens);
                 bool ok = decode(n_batch, off, batch_view);
+                if (ok && dbg_fault == 2 && batch_view.n_tokens == 1) { // the first generation step
+                    dbg_fault = 0;
+                    throw std::runtime_error("debug fault: decode");
+                }
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -3746,6 +3787,14 @@ private:
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
+            }
+        }
+
+        // [TAG_SLOT_INVALIDATE] what the batch wrote for a slot invalidated in this pass goes too
+        for (const int32_t id : slots_invalidated) {
+            server_slot & slot = slots[id];
+            if (!slot.is_processing()) {
+                slot.prompt_clear();
             }
         }
     }
@@ -4564,6 +4613,7 @@ private:
                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
                             send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
                             slot.release();
+                            invalidate_slot(slot); // [TAG_SLOT_INVALIDATE] part of the chunk may be in the sequence
                             return; // the slot is done, skip it entirely
                         }
 
@@ -4877,6 +4927,10 @@ private:
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
         iterate(slots, [&](server_slot & slot) {
+            if (dbg_fault == 1 && slot.is_processing() && slot.stats.n_gen >= 2) {
+                dbg_fault = 0;
+                throw std::runtime_error("debug fault: slot");
+            }
             for (auto & i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
