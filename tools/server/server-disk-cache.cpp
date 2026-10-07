@@ -1116,6 +1116,7 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     e.has_dft = ctx_dft != nullptr;
 
     uint64_t n_ckpt_written = 0;
+    std::vector<server_deep_ref> deep; // (Codex gate r3 Major 5) the committed deep refs: the .aux and e.deep hold the same set
 
     bool ok = true;
     try {
@@ -1162,17 +1163,27 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
             put_vec(f, spec_state);
             // [TAG_DISK_ADOPT] (Codex gate r2 Major 7) a deep checkpoint still indexed from an adopt source is copied
             //   into the own namespace before the entry is published, so the branch history survives without the
-            //   adopt key; one that cannot be copied now is left out of the refs (a gap in the schedule)
-            std::vector<server_deep_ref> deep;
+            //   adopt key. (Codex gate r3 Major 5) a copy that fails inconclusively (a read error, a failed write)
+            //   aborts the publication - the slot is not saved now, a later eviction retries; only a source verified
+            //   missing / damaged (deep_get dropped it from the index) is left out: an explicitly reported gap
             for (const auto & r : prompt.deep) {
                 const auto ck = ckpts.find(r.key);
                 if (ck != ckpts.end() && !ck->second.src_dir.empty()) {
                     common_prompt_checkpoint c;
                     bool written = false;
-                    if (!deep_get(r.key, c) || !ckpt_store(r.key, c, &written)) {
-                        DSK_WRN("deep checkpoint %s: cannot copy it from its adopt source, left out of the entry\n",
-                                r.key.c_str());
+                    bool io      = false;
+                    if (!deep_get(r.key, c, &io)) {
+                        if (io || ckpts.count(r.key)) {
+                            throw std::runtime_error("deep checkpoint " + r.key + ": its adopt source is not readable "
+                                                     "now, not publishing the entry (retried at the next eviction)");
+                        }
+                        DSK_WRN("deep checkpoint %s: its adopt source is missing or damaged, left out of the entry "
+                                "(a gap in the checkpoint schedule)\n", r.key.c_str());
                         continue;
+                    }
+                    if (!ckpt_store(r.key, c, &written)) {
+                        throw std::runtime_error("deep checkpoint " + r.key + ": cannot copy it into the own "
+                                                 "namespace, not publishing the entry (retried at the next eviction)");
                     }
                     n_ckpt_written += written ? file_size_or_0(ckpt_path(r.key)) : 0;
                     n_deep_copied++;
@@ -1257,7 +1268,7 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
 
     if (ok) {
         e.tokens  = prompt.tokens.clone();
-        e.deep    = prompt.deep;
+        e.deep    = deep; // (Codex gate r3 Major 5) the refs the .aux holds
         e.t_saved = e.t_used = now_s();
         e.bytes   = n_logical + file_size_or_0(path(e.id, ".tok")) + file_size_or_0(path(e.id, ".aux"));
         for (const auto & c : prompt.checkpoints) {
@@ -1293,7 +1304,7 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
 
     const double ms = (ggml_time_us() - t_start) / 1000.0;
     DSK_INF("saved %s: %zu tokens, %zu checkpoints + %zu deep, %.1f MiB state, %.1f MiB written (%.1f %%) in %.0f ms\n",
-            e.id.c_str(), n, prompt.checkpoints.size(), prompt.deep.size(), n_logical / (1024.0 * 1024.0),
+            e.id.c_str(), n, prompt.checkpoints.size(), e.deep.size(), n_logical / (1024.0 * 1024.0),
             (n_written + n_ckpt_written + file_size_or_0(path(e.id, ".aux"))) / (1024.0 * 1024.0),
             100.0 * (n_written + n_ckpt_written + file_size_or_0(path(e.id, ".aux"))) / std::max<double>(1.0, e.bytes), ms);
 
@@ -1667,10 +1678,10 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
         it->second.t_used = t_now;
         return true;
     }
-    if (it != ckpts.end()) {
-        ckpts.erase(it); // [TAG_DISK_ADOPT] the source's file stays; the own namespace gets its own copy
-    }
-    const std::string fin = ckpt_path(key);
+    // [TAG_DISK_ADOPT] an adopt source's checkpoint: the source's file stays, the own namespace gets its own copy;
+    //   (Codex gate r3 Major 5) the source's index record stays until the copy commits - a failed write leaves the
+    //   intact source checkpoint indexed
+    const std::string fin = (fs::path(dir) / "ckpt" / (key + ".ck")).string();
     const std::string tmp = fin + ".tmp";
     bool ok = false;
     {
@@ -1707,7 +1718,7 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
     m.pos_max  = c.pos_max;
     m.bytes    = file_size_or_0(fin);
     m.t_used   = t_now;
-    ckpts.emplace(key, m);
+    ckpts[key] = m; // replaces an adopt source's record (src_dir) only now that the own copy is committed
     bytes_written += m.bytes;
     if (written) {
         *written = true;
