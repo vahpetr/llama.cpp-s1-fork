@@ -37,10 +37,12 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-ext.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -509,6 +511,164 @@ static void timing(gguf_context * meta) {
            "old %.3f ms, new %.3f ms (%.1f %% less)\n", ms[0] / n_ub, ms[1] / n_ub, 100.0 * (1.0 - ms[1] / ms[0]));
 }
 
+// [TAG_MTP_DRAFT_KV_TYPE] (v51) a greedy speculative generation loop in the server's call order: prefill, then rounds
+// of draft (n tokens) -> per-round checkpoint -> verify [id_last, draft] -> accept the target's argmax prefix -> on a
+// rejection restore + roll back + replay the committed rows; n = 0 is a plain one-token decode (the true-zero round of
+// --spec-draft-policy tput: no draft call, process() still runs). Every committed token is recorded with the target
+// logits row it was taken from, so two runs compare per committed token whatever their round structure.
+struct loop_result {
+    std::vector<llama_token> committed;
+    std::vector<float>       logits;   // N_VOCAB per committed token
+    std::vector<uint8_t>     tgt_state; // the target's full state stream at the end
+    std::vector<std::vector<llama_token>> drafts; // the proposals, per round with a draft call
+    std::vector<std::vector<float>>       dlogits; // the last draft step's logits, per round with a draft call
+    int n_rounds = 0, n_drafted = 0, n_accepted = 0, n_zero = 0;
+    std::map<int, int> n_hist; // chosen draft length -> rounds
+};
+
+// returns the draft length for the next round (0 = no draft call); observe() gets the round's outcome
+struct loop_policy {
+    virtual ~loop_policy() = default;
+    virtual int  decide() { return 4; }
+    virtual void observe(int /*n_req*/, int /*n_proposed*/, int /*n_acc*/) {}
+};
+
+static loop_result run_loop(mtp_env & env, loop_policy & pol, size_t n_commit) {
+    loop_result res;
+    common_speculative_begin(env.spec, 0, {});
+    const auto prompt = tokens(40, 4242);
+    const auto lp = feed(env, prompt, 0);
+    llama_pos   pos     = (llama_pos) prompt.size();
+    llama_token id_last = argmax(lp.data() + (prompt.size() - 1) * N_VOCAB);
+    res.committed.push_back(id_last);
+    res.logits.insert(res.logits.end(), lp.end() - N_VOCAB, lp.end());
+
+    const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+    while (res.committed.size() < n_commit) {
+        const int n_req = pol.decide();
+        res.n_hist[n_req]++;
+        res.n_rounds++;
+        if (n_req == 0) {
+            const auto v = feed(env, { id_last }, pos);
+            id_last = argmax(v.data());
+            res.committed.push_back(id_last);
+            res.logits.insert(res.logits.end(), v.begin(), v.end());
+            pos += 1;
+            res.n_zero++;
+            continue;
+        }
+        draft_out d;
+        {
+            auto & dp = common_speculative_get_draft_params(env.spec, 0);
+            dp.drafting = true;
+            dp.n_max    = n_req;
+            dp.n_past   = pos;
+            dp.id_last  = id_last;
+            dp.prompt   = nullptr;
+            dp.result   = &d.toks;
+            common_speculative_draft(env.spec);
+            dp.drafting = false;
+            const float * l = llama_get_logits_ith(env.ctx_dft.get(), -1);
+            res.dlogits.emplace_back(l, l + N_VOCAB);
+            llama_memory_seq_rm(llama_get_memory(env.ctx_dft.get()), 0, pos, -1);
+        }
+        res.drafts.push_back(d.toks);
+        res.n_drafted += (int) d.toks.size();
+        if (d.toks.empty()) {
+            pol.observe(n_req, 0, 0);
+            const auto v = feed(env, { id_last }, pos);
+            id_last = argmax(v.data());
+            res.committed.push_back(id_last);
+            res.logits.insert(res.logits.end(), v.begin(), v.end());
+            pos += 1;
+            continue;
+        }
+        common_prompt_checkpoint ck;
+        auto * mem = llama_get_memory(env.ctx_tgt.get());
+        ck.update_pos(pos, llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0));
+        ck.update_tgt(env.ctx_tgt.get(), 0, flags);
+        GGML_ASSERT(common_speculative_get_state(env.spec, 0, ck.data_spec));
+
+        std::vector<llama_token> verify = { id_last };
+        verify.insert(verify.end(), d.toks.begin(), d.toks.end());
+        const auto v = feed(env, verify, pos);
+        size_t n_acc = 0;
+        while (n_acc < d.toks.size() && argmax(v.data() + n_acc * N_VOCAB) == d.toks[n_acc]) {
+            n_acc++;
+        }
+        for (size_t i = 0; i <= n_acc && res.committed.size() < n_commit + 8; ++i) {
+            res.committed.push_back(argmax(v.data() + i * N_VOCAB));
+            res.logits.insert(res.logits.end(), v.begin() + i * N_VOCAB, v.begin() + (i + 1) * N_VOCAB);
+        }
+        res.n_accepted += (int) n_acc;
+        pol.observe(n_req, (int) d.toks.size(), (int) n_acc);
+        if (n_acc < d.toks.size()) {
+            const std::vector<llama_token> committed(verify.begin(), verify.begin() + n_acc + 1);
+            ck.load_tgt(env.ctx_tgt.get(), 0, flags);
+            common_memory cm;
+            cm.init(env.ctx_tgt.get(), env.ctx_dft.get());
+            cm.seq_rm(0, ck.pos_max + 1, -1);
+            common_speculative_set_state(env.spec, 0, ck.data_spec);
+            feed(env, committed, pos);
+        }
+        common_speculative_accept(env.spec, 0, (uint16_t) n_acc);
+        pos    += (llama_pos) n_acc + 1;
+        id_last = res.committed.back();
+    }
+    // compare the first n_commit tokens only (a round may overshoot)
+    res.committed.resize(n_commit);
+    res.logits.resize(n_commit * N_VOCAB);
+    res.tgt_state.resize(llama_state_seq_get_size_ext(env.ctx_tgt.get(), 0, 0));
+    GGML_ASSERT(llama_state_seq_get_data_ext(env.ctx_tgt.get(), res.tgt_state.data(), res.tgt_state.size(), 0, 0) == res.tgt_state.size());
+    return res;
+}
+
+// first index where two committed streams differ (token or logits row), or -1
+static int first_diff(const loop_result & a, const loop_result & b) {
+    for (size_t i = 0; i < std::min(a.committed.size(), b.committed.size()); ++i) {
+        if (a.committed[i] != b.committed[i] ||
+                memcmp(a.logits.data() + i * N_VOCAB, b.logits.data() + i * N_VOCAB, N_VOCAB * sizeof(float)) != 0) {
+            return (int) i;
+        }
+    }
+    return a.committed.size() == b.committed.size() ? -1 : (int) std::min(a.committed.size(), b.committed.size());
+}
+
+// [TAG_MTP_DRAFT_KV_TYPE] draft KV f16 vs q8_0 (--spec-draft-type-k/-v): the target side is exact (committed tokens, their
+// logits rows, the target state stream), the draft state layout (descriptor) differs, the proposals may differ
+static void draft_kv_type_pair(gguf_context * meta) {
+    mtp_env A, B;
+    init_env(A, meta, { "", GGML_TYPE_F16,  512, false });
+    init_env(B, meta, { "", GGML_TYPE_Q8_0, 512, false });
+    check(llama_state_seq_descriptor(A.ctx_tgt.get()) == llama_state_seq_descriptor(B.ctx_tgt.get()),
+          "draft KV type: the target descriptor is unchanged");
+    check(llama_state_seq_descriptor(A.ctx_dft.get()) != llama_state_seq_descriptor(B.ctx_dft.get()),
+          "draft KV type: the draft descriptor (state layout, disk-cache compat key) differs f16 vs q8_0");
+    loop_policy fixed;
+    const auto ra = run_loop(A, fixed, 64);
+    const auto rb = run_loop(B, fixed, 64);
+    const int fd = first_diff(ra, rb);
+    check(fd < 0, "draft KV f16 vs q8_0: committed tokens + their target logits identical (first diff at " + std::to_string(fd) + ")");
+    check(eq(ra.tgt_state, rb.tgt_state), "draft KV f16 vs q8_0: target state stream identical");
+    int same = 0, total = 0;
+    float dmax = 0.0f;
+    for (size_t r = 0; r < std::min(ra.dlogits.size(), rb.dlogits.size()); ++r) {
+        for (size_t i = 0; i < N_VOCAB; ++i) {
+            dmax = std::max(dmax, std::fabs(ra.dlogits[r][i] - rb.dlogits[r][i]));
+        }
+    }
+    for (size_t r = 0; r < std::min(ra.drafts.size(), rb.drafts.size()); ++r) {
+        for (size_t i = 0; i < std::min(ra.drafts[r].size(), rb.drafts[r].size()); ++i) {
+            same += ra.drafts[r][i] == rb.drafts[r][i];
+            total++;
+        }
+    }
+    printf("%sdraft KV f16 vs q8_0, greedy loop n=4, 64 committed tokens: target identical %s; acceptance f16 %d/%d, q8_0 %d/%d; "
+           "proposal agreement %d/%d, last-step draft logits max |diff| %.3g\n", mtp_qsa_mode() ? "[sparse MTP] " : "",
+           fd < 0 && eq(ra.tgt_state, rb.tgt_state) ? "yes" : "NO",
+           ra.n_accepted, ra.n_drafted, rb.n_accepted, rb.n_drafted, same, total, (double) dmax);
+}
+
 int main() {
     llama_log_set(quiet_log, nullptr);
     common_log_set_verbosity_thold(-1);
@@ -523,6 +683,8 @@ int main() {
         op_table(meta.get(), t);
     }
     run_pair(meta.get(), GGML_TYPE_F16, true); // backend draft sampling: the samplers see no zero-output graph now
+
+    draft_kv_type_pair(meta.get());
 
     timing(meta.get());
 

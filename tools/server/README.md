@@ -337,6 +337,15 @@ services:
       LLAMA_ARG_PORT: 8080
 ```
 
+### MTP draft KV cache type
+
+With `--spec-type draft-mtp` the MTP draft context's K/V cache follows `--spec-draft-type-k` / `--spec-draft-type-v`
+(env `LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K` / `_V`, default `f16`). `-ctkd q8_0 -ctvd q8_0` halves the draft KV (needs flash
+attention for the quantized V). The target side is exact: the target logits and state do not depend on the draft KV type,
+only the draft proposals (and so the acceptance) may move. The draft KV type is part of the draft state layout, so it
+enters the state descriptor and the `--cache-disk` compat key: entries saved with another draft KV type are not loaded.
+(`tests/test-mtp-catchup.cpp`, `[TAG_MTP_DRAFT_KV_TYPE]`)
+
 ### Multimodal support
 
 Multimodal support was added in [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) and is currently an experimental feature.
