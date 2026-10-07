@@ -58,6 +58,7 @@ struct server_disk_cache_entry {
     //   with draft_cover < the token count marks the prompt draft-partial ([TAG_DRAFT_PARTIAL]). A .meta without it: the token count (its writer
     //   kept C1), except an own entry with adopted_from (v50rc4 published adopted target-only states): 0
     int64_t     draft_cover = 0;
+    std::string desc_full;    // [TAG_CACHE_COMPAT2] the writer's full-coverage descriptor hash (format >= 8; "" before)
 };
 
 // [TAG_DISK_LOAD_RESULT] why a load failed decides what happens to the entry: only an invalid entry (seal / hash /
@@ -259,6 +260,19 @@ struct server_disk_cache {
 
     std::string desc_h;     // hash16 of the combined descriptor (target + draft): .meta, .ck, /disk-cache
     std::string desc_key;   // [TAG_CACHE_COMPAT2] full-coverage hash16 of the combined descriptor (key v2)
+    std::string desc_tgt_full; // [TAG_CACHE_COMPAT2] envelope v2: full-coverage hash16 of the target descriptor
+    std::string desc_dft_full; // envelope v2: full-coverage hash16 of the draft descriptor
+    // which state envelopes a stream may carry (Codex compat2 D): v2 with the full-coverage hash; v1 (weak hash)
+    //   only for an adopted format-7 entry; none only for an adopted format 5 / 6 entry
+    struct stream_rule {
+        std::string h2;               // required v2 hash ("": nothing passes)
+        std::string h1;               // v1 hash, when v1_ok
+        bool        v1_ok     = false;
+        bool        legacy_ok = false;
+    };
+    // tgt_only: [TAG_ADOPT_TARGET_ONLY] an adopt source's entry judged per stream (its descriptor_full names its own
+    //   draft, which differs by design): the stream's own full-coverage hash binds it
+    stream_rule rule_for(const server_disk_cache_entry & e, bool tgt, bool tgt_only = false) const;
     std::string desc_tgt_h; // envelope hash of the .tgt streams
     std::string desc_dft_h; // envelope hash of the .dft streams
     float       ckpt_ratio;
@@ -299,9 +313,9 @@ struct server_disk_cache {
                      std::vector<std::string> & keys, uint64_t & n_logical, uint64_t & n_written);
     // env_h: the envelope hash the stream must carry; legacy_ok: a stream without an envelope (format 5 / 6) is accepted
     server_disk_load_result load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
-                                        const std::string & env_h, bool legacy_ok);
+                                        const stream_rule & rule);
     static bool read_map_keys(const std::string & map_path, std::vector<std::string> & keys, sealed_status * st = nullptr);
-    server_disk_load_result verify_stream(const std::string & map_path, const std::string & env_h, bool legacy_ok);
+    server_disk_load_result verify_stream(const std::string & map_path, const stream_rule & rule);
     // [TAG_ADOPT_TARGET_ONLY] an adopt source's entry whose .tgt envelope names this target descriptor while its .dft
     //   envelope names another draft descriptor (or envelope version): its target stream alone is loadable
     bool target_only(const server_disk_cache_entry & e) const;

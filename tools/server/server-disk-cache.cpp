@@ -30,13 +30,13 @@
 
 namespace fs = std::filesystem;
 
-static constexpr uint32_t DISK_CACHE_VERSION = 7; // 7: envelope (magic, version, descriptor hash, length) at the head of .tgt / .dft maps and .ck // 6: user-message starts at the end of .aux (optional: a 5 entry loads with them unknown) // 5: sealed (checksummed) .tok / .aux / .ck and map segments // 2: deep checkpoint refs in .aux, 3: block-deduplicated state streams, 4: .aux checkpoints by key
+static constexpr uint32_t DISK_CACHE_VERSION = 8; // 8: envelope v2 - full-coverage descriptor hashes in .tgt / .dft / .ck envelopes, descriptor_full in .meta // 7: envelope (magic, version, descriptor hash, length) at the head of .tgt / .dft maps and .ck // 6: user-message starts at the end of .aux (optional: a 5 entry loads with them unknown) // 5: sealed (checksummed) .tok / .aux / .ck and map segments // 2: deep checkpoint refs in .aux, 3: block-deduplicated state streams, 4: .aux checkpoints by key
 static constexpr uint32_t AUX_MAGIC          = 0x58554144; // "DAUX"
 static constexpr uint32_t CKPT_MAGIC         = 0x334b4344; // "DCK3" (format 5 / 6: no envelope)
 static constexpr uint32_t CKPT_ENV_MAGIC     = 0x344b4344; // "DCK4": fingerprint, envelope version, descriptor hash
 static constexpr uint32_t MAP_MAGIC          = 0x3250414d; // "MAP2" (format 5 / 6: no envelope)
 static constexpr uint32_t MAP_ENV_MAGIC      = 0x3350414d; // "MAP3": envelope version, descriptor hash, stream length
-static constexpr uint32_t ENVELOPE_VERSION   = 1;
+static constexpr uint32_t ENVELOPE_VERSION   = 2; // 2: full-coverage descriptor hashes (1: weak, format 7)
 // [TAG_STATE_DESCRIPTOR] bump on any change of what a restored checkpoint means (its flags, the draft-prefix retention,
 //   the replay rules after a deep rewind) that keeps the bytes the same
 static constexpr uint32_t SERVER_CKPT_SEMANTICS_REV = 1;
@@ -528,6 +528,13 @@ static bool legacy_payload_ok(const server_disk_cache_entry & e) {
     return !e.src.empty() && legacy_format(e.version);
 }
 
+// [TAG_CACHE_COMPAT2] (Codex compat2 D) an envelope is accepted at v2 with the full-coverage hash, or at v1 with the
+//   weak hash only where the rule allows it (an adopted format-7 entry)
+template <typename R>
+static bool envelope_ok(const R & rule, uint32_t ver, const std::string & h) {
+    return (ver == 2 && !rule.h2.empty() && h == rule.h2) || (ver == 1 && rule.v1_ok && h == rule.h1);
+}
+
 // the payload format a fingerprint was written with: its "v<N>" field (0 when it does not parse)
 static uint32_t fingerprint_format(const std::string & fp) {
     const auto sp = fp.find(' ');
@@ -996,6 +1003,22 @@ std::string server_cache_measure_hash(const std::string & bytes) {
     return h16_of(bytes);
 }
 
+server_disk_cache::stream_rule server_disk_cache::rule_for(const server_disk_cache_entry & e, bool tgt, bool tgt_only) const {
+    stream_rule r;
+    // the writer's full descriptor, when its metadata carries one (format >= 8), must be ours: else nothing passes
+    //   (an adopt source's target-only entry: its draft differs by design, each stream's own hash decides)
+    if (!(tgt_only && !e.src.empty()) && !e.desc_full.empty() && e.desc_full != desc_key) {
+        DSK_WRN("entry %s: written under descriptor %s, this context is %s\n", e.id.c_str(), e.desc_full.c_str(),
+                desc_key.c_str());
+        return r;
+    }
+    r.h2        = tgt ? desc_tgt_full : desc_dft_full;
+    r.h1        = tgt ? desc_tgt_h : desc_dft_h;
+    r.v1_ok     = !e.src.empty() && e.version == 7;
+    r.legacy_ok = legacy_payload_ok(e);
+    return r;
+}
+
 void server_disk_cache::set_fingerprint(const std::string & fp) {
     fingerprint = fp;
     dir = (fs::path(root) / ("ns-" + fp.substr(0, 16))).string();
@@ -1100,6 +1123,9 @@ bool server_disk_cache::write_meta(const server_disk_cache_entry & e) const {
     };
     if (!e.src.empty()) {
         return false; // [TAG_DISK_ADOPT] an adopt source is never written
+    }
+    if (e.src.empty() || !e.desc_full.empty()) {
+        j["descriptor_full"] = e.src.empty() ? desc_key : e.desc_full; // [TAG_CACHE_COMPAT2]
     }
     if (!e.adopted_from.empty()) {
         j["adopted_from"] = e.adopted_from;
@@ -1252,6 +1278,7 @@ sealed_status server_disk_cache::read_entry(const std::string & id, const std::s
         }
         e.version = ver;
         e.adopted_from = j.value("adopted_from", std::string());
+        e.desc_full    = j.value("descriptor_full", std::string());
         e.bytes   = j.at("bytes").get<uint64_t>();
         e.t_saved = j.at("t_saved").get<int64_t>();
         e.t_used  = j.at("t_used").get<int64_t>();
@@ -1504,7 +1531,7 @@ void server_disk_cache::init() {
             uint32_t env_ver = 0;
             std::string dh;
             ok = get_le(f, magic) && magic == CKPT_ENV_MAGIC && get_str_le(f, fp) && fp == fp_short && get_le(f, env_ver) &&
-                 get_str_le(f, dh) && dh == desc_h && get_str(f, m.key) &&
+                 get_str_le(f, dh) && env_ver == ENVELOPE_VERSION && dh == desc_key && get_str(f, m.key) &&
                  get(f, m.n_tokens) && get(f, m.pos_min) && get(f, m.pos_max) && m.key + ".ck" == name;
             if (!ok && f.bad()) {
                 io_keys.insert(name.substr(0, name.size() - 3));
@@ -1801,9 +1828,9 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     // [TAG_DISK_DELTA] the KV / recurrent state streams through 4 MiB content blocks: a block already on disk (the
     //   unchanged part of a conversation saved before, a branch, a copy) is referenced, only new ones are written
     uint64_t n_logical = 0, n_written = 0;
-    ok = ok && save_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), desc_tgt_h, e.blobs, n_logical, n_written);
+    ok = ok && save_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), desc_tgt_full, e.blobs, n_logical, n_written);
     if (ok && ctx_dft) {
-        ok = save_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_h, e.blobs, n_logical, n_written);
+        ok = save_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_full, e.blobs, n_logical, n_written);
     }
 
     // [TAG_DISK_BLK_NS] (Codex gate r3 Major 1) an own entry depends on no other store: every block it references
@@ -1968,19 +1995,22 @@ bool server_disk_cache::target_only(const server_disk_cache_entry & e) const {
     if (e.src.empty() || !e.has_dft) {
         return false; // own namespace: both streams must match (strict)
     }
+    // [TAG_CACHE_COMPAT2] each stream envelope is judged by its own rule (v2 full-coverage hash; v1 only for an adopted
+    //   format-7 entry); the writer's combined descriptor_full names its draft too, so it is not compared here: the
+    //   target stream's own full-coverage hash binds the target
     uint32_t tv = 0, dv = 0;
     std::string th, dh;
-    if (!read_stream_env(path(e.id, ".tgt"), tv, th) || tv != ENVELOPE_VERSION || th != desc_tgt_h) {
+    if (!read_stream_env(path(e.id, ".tgt"), tv, th) || !envelope_ok(rule_for(e, true, true), tv, th)) {
         return false;
     }
     if (!read_stream_env(path(e.id, ".dft"), dv, dh)) {
         return false;
     }
-    return dv != ENVELOPE_VERSION || dh != desc_dft_h;
+    return !envelope_ok(rule_for(e, false, true), dv, dh);
 }
 
-server_disk_load_result server_disk_cache::verify_stream(const std::string & map_path, const std::string & env_h,
-                                                         bool legacy_ok) {
+server_disk_load_result server_disk_cache::verify_stream(const std::string & map_path, const stream_rule & rule) {
+    const bool legacy_ok = rule.legacy_ok;
     std::ifstream fm;
     const sealed_status st_open = open_for_read(map_path, fm);
     if (st_open != SEALED_OK) {
@@ -1994,7 +2024,7 @@ server_disk_load_result server_disk_cache::verify_stream(const std::string & map
     if (magic == MAP_ENV_MAGIC) {
         uint32_t ver = 0;
         std::string h;
-        if (!get_le(fm, ver) || ver != ENVELOPE_VERSION || !get_str_le(fm, h) || h != env_h || !get_le(fm, n_total) || n_total == 0) {
+        if (!get_le(fm, ver) || !get_str_le(fm, h) || !envelope_ok(rule, ver, h) || !get_le(fm, n_total) || n_total == 0) {
             return fm.bad() ? SERVER_DISK_LOAD_OTHER : SERVER_DISK_LOAD_INVALID;
         }
     }
@@ -2101,10 +2131,10 @@ server_disk_load_result server_disk_cache::verify(int idx) {
         }
     }
     if (res == SERVER_DISK_LOAD_OK) {
-        res = verify_stream(path(id, ".tgt"), desc_tgt_h, legacy_payload_ok(e));
+        res = verify_stream(path(id, ".tgt"), rule_for(e, true, tgt_only));
     }
     if (res == SERVER_DISK_LOAD_OK && e.has_dft && !tgt_only) {
-        res = verify_stream(path(id, ".dft"), desc_dft_h, legacy_payload_ok(e));
+        res = verify_stream(path(id, ".dft"), rule_for(e, false));
     }
 
     if (res == SERVER_DISK_LOAD_INVALID) {
@@ -2198,10 +2228,10 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
     }
 
     llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
-    server_disk_load_result res = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), desc_tgt_h, legacy_payload_ok(e));
+    server_disk_load_result res = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), rule_for(e, true, tgt_only));
     if (res == SERVER_DISK_LOAD_OK && ctx_dft) {
         llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
-        res = tgt_only ? SERVER_DISK_LOAD_OK : e.has_dft ? load_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_h, legacy_payload_ok(e)) : SERVER_DISK_LOAD_INVALID;
+        res = tgt_only ? SERVER_DISK_LOAD_OK : e.has_dft ? load_stream(ctx_dft, id_slot, path(e.id, ".dft"), rule_for(e, false)) : SERVER_DISK_LOAD_INVALID;
     }
     if (res != SERVER_DISK_LOAD_OK) {
         // [TAG_DISK_LOAD_RESULT] the caller clears the slot; only an invalid entry goes
@@ -2366,7 +2396,7 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
         put_le<uint32_t>(f, CKPT_ENV_MAGIC);
         put_str_le(f, fingerprint.substr(0, 16));
         put_le<uint32_t>(f, ENVELOPE_VERSION);
-        put_str_le(f, desc_h);
+        put_str_le(f, desc_key);
         put_str(f, key);
         put<int64_t>(f, c.n_tokens);
         put<int32_t>(f, c.pos_min);
@@ -2555,26 +2585,32 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         if (ok && magic == CKPT_ENV_MAGIC) {
             ok = get_le(f, env_ver) && get_str_le(f, dh);
         } else {
-            env_ver = ENVELOPE_VERSION;
-            dh      = desc_h;
+            env_ver = ENVELOPE_VERSION; // an eligible format 5 / 6 checkpoint (legacy_ok): no envelope to compare
+            dh      = desc_key;
         }
         // [TAG_STATE_DESCRIPTOR] checked before anything reaches the contexts: a checkpoint of another state layout
         //   is a miss (it would otherwise abort in common_prompt_checkpoint::load_tgt on a size mismatch)
+        // [TAG_CACHE_COMPAT2] v2 full hash; a v1 (weak) envelope only from an adopted format-7 source
+        const bool v1_src = from_src && it->second.src_version == 7;
+        const bool env_ok = (env_ver == ENVELOPE_VERSION && dh == desc_key) || (env_ver == 1 && v1_src && dh == desc_h);
         // [TAG_ADOPT_TARGET_ONLY] except an adopt source's checkpoint that carries the source's learned target-
         //   compatible descriptor (or teaches it: `learn`, a target-only load of an entry whose target stream matched,
-        //   written in the same save): its target state loads, its draft data is dropped below
+        //   written in the same save): its target state loads, its draft data is dropped below. The learned value
+        //   names the envelope version (a v2 hash, or a v1 one of a format-7 source)
         bool tgt_only = false;
-        if (ok && env_ver == ENVELOPE_VERSION && dh != desc_h && from_src && magic == CKPT_ENV_MAGIC) {
+        if (ok && !env_ok && from_src && magic == CKPT_ENV_MAGIC && (env_ver == ENVELOPE_VERSION || (env_ver == 1 && v1_src))) {
+            const std::string vdh = "v" + std::to_string(env_ver) + ":" + dh;
             auto lt = tgt_compat_dh.find(it->second.src_dir);
             if (lt == tgt_compat_dh.end() && learn) {
-                lt = tgt_compat_dh.emplace(it->second.src_dir, dh).first;
+                lt = tgt_compat_dh.emplace(it->second.src_dir, vdh).first;
                 DSK_INF("adopt source %s: combined descriptor %s is target-compatible (learned from a target-only load)\n",
-                        it->second.src_dir.c_str(), dh.c_str());
+                        it->second.src_dir.c_str(), vdh.c_str());
             }
-            tgt_only = lt != tgt_compat_dh.end() && lt->second == dh;
+            tgt_only = lt != tgt_compat_dh.end() && lt->second == vdh;
         }
-        if (ok && (env_ver != ENVELOPE_VERSION || dh != desc_h) && !tgt_only) {
-            throw std::runtime_error("state descriptor mismatch (" + dh + ", expected " + desc_h + ")");
+        if (ok && !env_ok && !tgt_only) {
+            throw std::runtime_error("state descriptor mismatch (v" + std::to_string(env_ver) + " " + dh + ", expected v" +
+                                     std::to_string(ENVELOPE_VERSION) + " " + desc_key + ")");
         }
         ok = ok && get_str(f, k) && k == key &&
              get(f, n_tokens) && get(f, pos_min) && get(f, pos_max) && get(f, ft) && get(f, fd) &&
@@ -2879,7 +2915,8 @@ bool server_disk_cache::read_map_keys(const std::string & map_path, std::vector<
 }
 
 server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
-                                                       const std::string & env_h, bool legacy_ok) {
+                                                       const stream_rule & rule) {
+    const bool legacy_ok = rule.legacy_ok;
     std::ifstream fm;
     if (open_for_read(map_path, fm) == SEALED_IO) {
         // [TAG_DISK_READ_STATUS] the map exists but cannot be opened: inconclusive, the entry stays
@@ -2901,12 +2938,13 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
     if (magic == MAP_ENV_MAGIC) {
         uint32_t ver = 0;
         std::string h;
-        if (!get_le(fm, ver) || ver != ENVELOPE_VERSION || !get_str_le(fm, h) || h != env_h || !get_le(fm, n_total) || n_total == 0) {
+        if (!get_le(fm, ver) || !get_str_le(fm, h) || !envelope_ok(rule, ver, h) || !get_le(fm, n_total) || n_total == 0) {
             if (fm.bad()) {
                 DSK_WRN("%s: read error at the state envelope, keeping it\n", map_path.c_str());
                 return SERVER_DISK_LOAD_OTHER;
             }
-            DSK_WRN("%s: state envelope mismatch (descriptor %s, expected %s)\n", map_path.c_str(), h.c_str(), env_h.c_str());
+            DSK_WRN("%s: state envelope mismatch (v%u descriptor %s, expected v%u %s%s)\n", map_path.c_str(), ver, h.c_str(),
+                    ENVELOPE_VERSION, rule.h2.c_str(), rule.v1_ok ? " or an adopted v1" : "");
             return SERVER_DISK_LOAD_INVALID;
         }
     }
@@ -3244,6 +3282,7 @@ void server_disk_cache::refresh_status() {
         { "adopt",          al                  },
         { "key",            fingerprint.substr(0, 16) },
         { "descriptor",     desc_h              },
+        { "descriptor_full", desc_key           }, // [TAG_CACHE_COMPAT2] envelope v2
         { "foreign",        fl                  },
         { "dir",            dir                 },
         { "quota_bytes",    quota               },
@@ -3304,7 +3343,9 @@ void server_disk_cache::set_descriptor(llama_context * ctx_tgt, llama_context * 
     desc_tgt_h = h16(tgt);
     desc_dft_h = h16(dft);
     desc_h     = h16(tgt + "\n" + dft);
-    desc_key   = h16_of(tgt + "\n" + dft); // [TAG_CACHE_COMPAT2] every byte counts (desc_h stays: the envelopes)
+    desc_key   = h16_of(tgt + "\n" + dft); // [TAG_CACHE_COMPAT2] every byte counts: key v2 + envelope v2
+    desc_tgt_full = h16_of(tgt);
+    desc_dft_full = h16_of(dft);
     DSK_INF("state descriptor %s (target %s, draft %s)\n", desc_h.c_str(), desc_tgt_h.c_str(), desc_dft_h.c_str());
     DSK_DBG("target descriptor: %s\n", tgt.c_str());
     DSK_DBG("draft descriptor: %s\n", dft.c_str());
