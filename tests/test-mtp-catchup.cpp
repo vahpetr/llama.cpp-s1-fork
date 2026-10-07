@@ -189,9 +189,9 @@ static void init_env(mtp_env & env, gguf_context * meta, const env_cfg & cfg) {
         cd.cb_eval           = census_cb;
         cd.cb_eval_user_data = &env.census;
     }
-    setenv("LLAMA_MTP_CATCHUP_ATTN", cfg.catchup_attn, 1);
+    common_set_env("LLAMA_MTP_CATCHUP_ATTN", cfg.catchup_attn);   // portable (_putenv_s on _WIN32; sol r1)
     env.ctx_dft.reset(llama_init_from_model(env.model.get(), cd));
-    unsetenv("LLAMA_MTP_CATCHUP_ATTN");
+    common_set_env("LLAMA_MTP_CATCHUP_ATTN", "");                 // empty = unset
     GGML_ASSERT(env.ctx_dft && "MTP context failed");
 
     env.params.types                  = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
