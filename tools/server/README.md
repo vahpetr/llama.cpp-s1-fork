@@ -346,6 +346,21 @@ only the draft proposals (and so the acceptance) may move. The draft KV type is 
 enters the state descriptor and the `--cache-disk` compat key: entries saved with another draft KV type are not loaded.
 (`tests/test-mtp-catchup.cpp`, `[TAG_MTP_DRAFT_KV_TYPE]`)
 
+### Draft length policy (`--spec-draft-policy`)
+
+`--spec-draft-policy tput` (env `LLAMA_ARG_SPEC_DRAFT_POLICY`; default `off` = `--spec-draft-n-max` /
+`--spec-draft-n-max-adaptive` as before, byte-identical) picks the draft length per round as the n in [0, n-max] that
+maximises the committed tokens per ms, `(1 + sum_{i<=n} P_i) / (T_draft(n) + T_verify(n+1) + T_catchup(n+1) + T_host)`:
+P_i from the per-position acceptance EMA (an empty or short draft counts as a failure at the stop position), the costs
+from exponentially weighted fits of the server's own single-slot round times (draft call vs n, target decode and MTP
+catch-up vs batch rows, host rest). Until the fits have 8 rounds it drafts n-max. n = 0 is a true zero: no draft call,
+no per-round checkpoint, a plain one-token decode (the draft KV still catches up). A cooldown keeps zero from being
+final: after a zero decision or 3 consecutive rounds with nothing accepted the slot plays 0 for C rounds (C = 4,
+doubling to 64 on a failed probe) and then probes n = 1; any accepted token leaves the cooldown. It replaces
+`--spec-draft-n-max-adaptive` while on. Verify widths change, so the target output is the same only up to the backend's
+batch-width class (on the CPU a 1-row decode differs from wider batches by ~1e-8 in the logits). The slot's end-of-task
+log shows the zero rounds and probes; `LLAMA_TRACE=1` logs each length change with the fitted costs.
+
 ### Multimodal support
 
 Multimodal support was added in [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) and is currently an experimental feature.

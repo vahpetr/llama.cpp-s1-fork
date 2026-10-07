@@ -4284,6 +4284,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_ADAPTIVE_MEASURE"));
     add_opt(common_arg(
+        {"--spec-draft-policy"}, "{off,tput}",
+        "draft length policy: off = --spec-draft-n-max / --spec-draft-n-max-adaptive as before; tput = per round the "
+        "length that maximises committed tokens per ms from the measured draft / verify / catch-up / host times and the "
+        "running acceptance, 0 included (a plain decode, no draft call), with a cooldown + probe around zero rounds "
+        "(default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.speculative.draft.policy = COMMON_SPEC_DRAFT_POLICY_OFF;
+            } else if (value == "tput") {
+                params.speculative.draft.policy = COMMON_SPEC_DRAFT_POLICY_TPUT;
+            } else {
+                throw std::invalid_argument("expected off or tput");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_POLICY"));
+    add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {

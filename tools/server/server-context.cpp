@@ -539,6 +539,10 @@ struct server_slot {
     int   spec_cost_n_kv     = 0;
     bool  spec_cost_measured = false;
 
+    // [TAG_SPEC_DRAFT_POLICY] --spec-draft-policy tput: the cooldown state and the length requested this round
+    common_spec_cooldown spec_cd;
+    int                  spec_tput_n_req = 0;
+
     static constexpr float SPEC_ACC_EMA_ALPHA = 1.0f/32.0f;
 
     // Update the per-position conditional acceptance from one verification round.
@@ -643,6 +647,8 @@ struct server_slot {
         spec_cost_t_dec    = 0.0f;
         spec_cost_n_kv     = 0;
         spec_cost_measured = false;
+        spec_cd            = common_spec_cooldown();
+        spec_tput_n_req    = 0;
 
         n_predict_max = -1;
 
@@ -947,6 +953,11 @@ struct server_slot {
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
 
+        if (stats.n_spec_zero_rounds + stats.n_spec_probe_rounds > 0) { // [TAG_SPEC_DRAFT_POLICY]
+            SLT_INF(*this, "draft policy tput: %" PRIu64 " zero rounds (no draft call), %" PRIu64 " probes, cooldown %d\n",
+                    stats.n_spec_zero_rounds, stats.n_spec_probe_rounds, spec_cd.c);
+        }
+
         if (stats.n_spec_timed_rounds > 0) { // [TAG_SPEC_ROUND_TIMING]
             const double nr = (double) stats.n_spec_timed_rounds;
             SLT_INF(*this, "round time: %" PRIu64 " rounds, per round draft %.3f ms, catch-up %.3f ms, verify %.3f ms, host %.3f ms\n",
@@ -1230,6 +1241,43 @@ struct server_spec_cost_fit {
         t_tok = (float) (f_tok*((double) t_tok0 + (double) k_tok*(double) n_kv));
         t_dec = (float) (f_dec*((double) t_dec0 + (double) k_dec*(double) n_kv));
 
+        return true;
+    }
+};
+
+// [TAG_SPEC_DRAFT_POLICY] exponentially weighted least squares t = a + b*n of one round component (ms), for
+//   --spec-draft-policy tput; fed from single-slot pure-generation rounds only (spec_round_finish)
+struct server_spec_ew_line {
+    static constexpr double ALPHA   = 1.0/64.0;
+    static constexpr double W_MIN   = 8.0;
+    static constexpr double VAR_MIN = 0.25;
+
+    double w = 0.0, s_n = 0.0, s_t = 0.0, s_nn = 0.0, s_nt = 0.0;
+
+    void add(double n, double t_ms) {
+        const double d = 1.0 - ALPHA;
+        w    = d*w    + 1.0;
+        s_n  = d*s_n  + n;
+        s_t  = d*s_t  + t_ms;
+        s_nn = d*s_nn + n*n;
+        s_nt = d*s_nt + n*t_ms;
+    }
+
+    // false before W_MIN samples; a slope that the samples do not identify (one row count only, or a negative fit)
+    // falls back to b_prior, capped so that the intercept through the mean keeps at least half of the mean time (a
+    // prior from another machine must not turn the measured fixed cost into a per-row one)
+    bool get(double & a, double & b, double b_prior) const {
+        if (w < W_MIN) {
+            return false;
+        }
+        const double mean_n = s_n / w;
+        const double mean_t = s_t / w;
+        const double var_n  = s_nn / w - mean_n*mean_n;
+        b = var_n >= VAR_MIN ? (s_nt / w - mean_n*mean_t) / var_n : -1.0;
+        if (!(b >= 0.0)) {
+            b = std::min(b_prior, 0.5*mean_t / std::max(mean_n, 1.0));
+        }
+        a = std::max(0.0, mean_t - b*mean_n);
         return true;
     }
 };
@@ -1670,6 +1718,10 @@ private:
 
     // measured cost model for --spec-draft-n-max-adaptive (see server_spec_cost_fit)
     server_spec_cost_fit spec_cost;
+
+    // [TAG_SPEC_DRAFT_POLICY] --spec-draft-policy tput: per-round cost fits (draft wall vs drafted n, verify and
+    // catch-up wall vs batch rows, host wall)
+    server_spec_ew_line spec_fit_draft, spec_fit_verify, spec_fit_catchup, spec_fit_host;
 
     json json_ui_settings = json::object();
 
@@ -4047,10 +4099,77 @@ private:
         int64_t catchup_us = 0; // the common_speculative_process yield blocks of the pass's batch views
         int64_t verify_us  = 0; // the llama_decode (+ sync) yield blocks of the pass's batch views
         std::vector<int> slot_ids; // slots that drafted in this pass (empty: not a round)
+        // [TAG_SPEC_DRAFT_POLICY] tput: slots that took a true-zero round, the drafted n requested, the target rows
+        //   decoded and the rows a pure round of the single drafting / zero slot has (1 + its draft)
+        std::vector<int> zero_ids;
+        int n_draft_req   = 0;
+        int n_rows        = 0;
+        int n_rows_expect = 0;
     } spec_rt;
+
+    // [TAG_SPEC_DRAFT_POLICY] one single-slot pure round -> the cost fits
+    void spec_tput_feed() {
+        const size_t n_slots = spec_rt.slot_ids.size() + spec_rt.zero_ids.size();
+        if (n_slots != 1 || spec_rt.n_rows <= 0 || spec_rt.n_rows != spec_rt.n_rows_expect) {
+            return;
+        }
+        const int64_t t_round = ggml_time_us() - spec_rt.t0_us;
+        const int64_t t_host  = std::max<int64_t>(0, t_round - spec_rt.draft_us - spec_rt.catchup_us - spec_rt.verify_us);
+        if (!spec_rt.slot_ids.empty()) {
+            spec_fit_draft.add(spec_rt.n_draft_req, spec_rt.draft_us / 1e3);
+        }
+        spec_fit_verify .add(spec_rt.n_rows, spec_rt.verify_us  / 1e3);
+        spec_fit_catchup.add(spec_rt.n_rows, spec_rt.catchup_us / 1e3);
+        spec_fit_host   .add(0.0,            t_host             / 1e3);
+    }
+
+    // [TAG_SPEC_DRAFT_POLICY] the draft length of this round for a slot that may draft up to n_draft_max (0 = true zero)
+    int spec_tput_n(server_slot & slot, int n_draft_max) {
+        const auto & dp = params_base.speculative.draft;
+        const int n_max_cfg = std::min(n_draft_max, common_speculative_n_max(spec.get()));
+        // slope priors while one row count dominates the samples: the depth-aware model's cost of one drafted token,
+        // half on the draft call and half on the verify decode
+        const int    n_kv  = spec_n_kv_depth(slot);
+        const double t_tok = (double) dp.n_max_adaptive_t_tok + (double) dp.n_max_adaptive_k_tok*(double) n_kv;
+        common_spec_tput_cost c;
+        double h_b = 0.0;
+        const bool ok = spec_fit_draft  .get(c.d0, c.d1, 0.5*t_tok) &&
+                        spec_fit_verify .get(c.v0, c.v1, 0.5*t_tok) &&
+                        spec_fit_catchup.get(c.c0, c.c1, 0.0) &&
+                        spec_fit_host   .get(c.host, h_b, 0.0);
+        double rate = 0.0;
+        // before the fits are usable: today's length (n_max), the cooldown still applies
+        int n_rule = ok ? common_spec_tput_best_n(slot.spec_acc_ema, n_max_cfg, c, &rate) : n_max_cfg;
+        const bool was_cooling = slot.spec_cd.cooling();
+        int n = std::min(slot.spec_cd.decide(n_rule), n_max_cfg);
+        if (n > 0) {
+            // --spec-draft-n-min: the drafter throws away a shorter draft, so a probe of 1 would always come back empty
+            n = std::max(n, std::min(dp.n_min, n_max_cfg));
+        }
+        if (was_cooling && n > 0) {
+            slot.stats.n_spec_probe_rounds++;
+        }
+        if (trace > 0 && n != slot.spec_n_max_last) {
+            SLT_INF(slot, "draft policy tput: %d -> %d (rule %d, %s, cooldown %d, n_kv %d, draft %.2f+%.2fn, verify %.2f+%.2fm, "
+                    "catch-up %.2f+%.2fm, host %.2f ms, %.4f tok/ms)\n", slot.spec_n_max_last, n, n_rule,
+                    ok ? "measured" : "warm-up", slot.spec_cd.c, n_kv, c.d0, c.d1, c.v0, c.v1, c.c0, c.c1, c.host, rate);
+        }
+        slot.spec_n_max_last = n;
+        slot.spec_tput_n_req = n;
+        metrics.spec_adaptive_n_max = (uint64_t) n;
+        return n;
+    }
 
     // end of a pass: a round -> the slots' stats, the /metrics counters and the main context's kqvis-prof window
     void spec_round_finish() {
+        if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
+            spec_tput_feed();
+            if (spec_rt.slot_ids.empty() && !spec_rt.zero_ids.empty()) { // a true-zero round: not a prefill pass
+                spec_rt.catchup_us = 0;
+                spec_rt.zero_ids.clear();
+                return;
+            }
+        }
         if (spec_rt.slot_ids.empty()) {
             if (spec_rt.catchup_us > 0) { // a pass without a drafting slot (prompt processing): its catch-up, separately
                 metrics.n_spec_catchup_pf_passes += 1;
@@ -4148,6 +4267,10 @@ private:
             spec_rt.catchup_us = 0;
             spec_rt.verify_us  = 0;
             spec_rt.slot_ids.clear();
+            spec_rt.zero_ids.clear();
+            spec_rt.n_draft_req   = 0;
+            spec_rt.n_rows        = 0;
+            spec_rt.n_rows_expect = 0;
         }
 
         try {
@@ -4369,6 +4492,19 @@ private:
                     } else {
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
+                        // [TAG_SPEC_DRAFT_POLICY] tput: the length first; a true zero is a plain decode (no draft
+                        //   call, no per-round checkpoint, process() keeps the draft KV), like n_draft_max == 0
+                        int n_tput = -1;
+                        if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
+                            n_tput = spec_tput_n(slot, n_draft_max);
+                            if (n_tput == 0) {
+                                slot.stats.n_spec_zero_rounds++;
+                                spec_rt.zero_ids.push_back(slot.id);
+                                spec_rt.n_rows_expect = 1;
+                                return;
+                            }
+                        }
+
                         slot.spec_ckpt.update_pos(
                                 slot.prompt.n_tokens(),
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
@@ -4382,7 +4518,9 @@ private:
 
                         int n_draft_req = n_draft_max;
 
-                        if (params_base.speculative.draft.n_max_adaptive) {
+                        if (n_tput > 0) {
+                            n_draft_req = std::min(n_draft_req, n_tput);
+                        } else if (params_base.speculative.draft.n_max_adaptive) {
                             const auto & dparams = params_base.speculative.draft;
 
                             // [TAG_SPEC_ADAPTIVE_DEPTH] the cost of a drafted token and of the decode it
@@ -4473,6 +4611,15 @@ private:
 
             if (draft.empty()) {
                 slot.stats.n_spec_empty_drafts += 1;
+                if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
+                    // [TAG_SPEC_DRAFT_POLICY] an empty draft is a failure at position 0
+                    slot.spec_acc_update(1, 0, common_speculative_n_max(spec.get()));
+                    slot.spec_cd.observe(0, 0);
+                }
+            }
+            if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
+                spec_rt.n_draft_req   = slot.spec_tput_n_req;
+                spec_rt.n_rows_expect = 1 + (int) draft.size();
             }
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
@@ -5404,6 +5551,7 @@ private:
             }
         });
         spec_rt.verify_us += ggml_time_us() - t_verify0;
+        spec_rt.n_rows    += batch_view.n_tokens; // [TAG_SPEC_DRAFT_POLICY]
 
         if (ret != 0) {
             {
@@ -5675,7 +5823,8 @@ private:
                 // success and no failure, and the EMA converged to 1.0 - i.e. always draft n-max -
                 // no matter how badly the draft model was doing.  A fold round's fresh tail was
                 // dropped for the same reason.
-                if (params_base.speculative.draft.n_max_adaptive) {
+                if (params_base.speculative.draft.n_max_adaptive ||
+                        params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
                     const size_t n_committed_in = std::min(slot.spec_n_committed, n_draft);
                     const size_t n_fresh_draft  = n_draft - n_committed_in;
                     const size_t n_matched      = accepted.size() - 1;
@@ -5683,7 +5832,17 @@ private:
                                                 ? std::min(n_matched - n_committed_in, n_fresh_draft)
                                                 : 0;
 
+                    if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
+                        // [TAG_SPEC_DRAFT_POLICY] a drafter that stopped short (p_min exit) failed at the next position
+                        const bool short_draft = n_committed_in == 0 && n_fresh_draft > 0 &&
+                                                 (int) n_fresh_draft < slot.spec_tput_n_req;
+                        slot.spec_acc_update(n_fresh_draft + (short_draft ? 1 : 0), n_fresh_acc, common_speculative_n_max(spec.get()));
+                        if (n_fresh_draft > 0) {
+                            slot.spec_cd.observe((int) n_fresh_draft, (int) n_fresh_acc);
+                        }
+                    } else {
                     slot.spec_acc_update(n_fresh_draft, n_fresh_acc, common_speculative_n_max(spec.get()));
+                    }
                 }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();

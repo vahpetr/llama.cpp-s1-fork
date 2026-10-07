@@ -131,3 +131,39 @@ private:
 using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+
+// [TAG_SPEC_DRAFT_POLICY] (v51) --spec-draft-policy tput: the throughput-max draft length (server only).
+//   One round with n drafted tokens commits 1 + sum_{i<=n} P_i tokens on average (P_i = prod_{j<=i} p_j, p_j the
+//   per-position conditional acceptance) and costs T_draft(n) + T_verify(n+1) + T_catchup(n+1) + T_host; n = 0 is a
+//   plain one-token decode (no draft call: T_draft(0) = 0). All costs in ms, affine in the row count.
+struct common_spec_tput_cost {
+    double d0 = 0.0, d1 = 0.0; // the draft call for n >= 1 tokens: d0 + d1*n
+    double v0 = 0.0, v1 = 0.0; // the target decode of m = n+1 rows: v0 + v1*m
+    double c0 = 0.0, c1 = 0.0; // the MTP process() catch-up of m rows: c0 + c1*m
+    double host = 0.0;         // per-round host time
+};
+
+// n* = argmax over n in [0, n_max] of the committed tokens per ms; p[i] = p_{i+1} (missing entries count as 1);
+// ties go to the shorter draft. rate_out (optional): the expected tokens per ms at n*.
+int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const common_spec_tput_cost & c,
+                            double * rate_out = nullptr);
+
+// the cooldown around true-zero decisions: without a draft the acceptance estimate never moves, so after a zero
+//   decision (or K consecutive rounds that proposed nothing / had nothing accepted) the slot plays n = 0 for C rounds and
+//   then probes n = 1; a failed probe doubles C (c_min .. c_max), a non-zero acceptance leaves the cooldown (C resets).
+struct common_spec_cooldown {
+    int k_fail = 3;  // consecutive failed rounds that start a cooldown
+    int c_min  = 4;
+    int c_max  = 64;
+
+    int n_fail = 0;  // consecutive failed rounds (outside a cooldown)
+    int c      = 0;  // the current cooldown length, 0 = not cooling
+    int wait   = 0;  // zero rounds left before the next probe
+
+    // the draft length for this round from the rule's n_rule: n_rule outside a cooldown (a zero starts one),
+    // inside it 0 or the probe (1)
+    int  decide(int n_rule);
+    // the outcome of a round that called the drafter: n_proposed tokens drafted (0 = empty), n_accepted of them taken
+    void observe(int n_proposed, int n_accepted);
+    bool cooling() const { return c > 0; }
+};

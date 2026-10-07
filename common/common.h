@@ -321,6 +321,11 @@ struct common_params_model {
     }
 };
 
+enum common_spec_draft_policy {
+    COMMON_SPEC_DRAFT_POLICY_OFF  = 0,
+    COMMON_SPEC_DRAFT_POLICY_TPUT = 1,
+};
+
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
@@ -343,6 +348,10 @@ struct common_params_speculative_draft {
     // prefer the server's own measured round times (an exponentially-weighted least-squares fit of the
     // decode wall time against the batch token count) over the affine model above, when the fit is usable
     bool  n_max_adaptive_measure = true;
+
+    // [TAG_SPEC_DRAFT_POLICY] --spec-draft-policy: COMMON_SPEC_DRAFT_POLICY_OFF = the rules above (today),
+    //   _TPUT = the throughput-max draft length with cooldown and true-zero rounds (server only, common_spec_tput_best_n)
+    int32_t policy = 0;
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)

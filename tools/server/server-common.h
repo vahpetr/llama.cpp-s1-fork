@@ -376,6 +376,8 @@ struct server_slot_stats {
     uint64_t n_spec_plain_rounds  = 0; // no draft tokens in the batch (empty draft, or no draft attempted)
     uint64_t n_spec_empty_drafts  = 0; // drafter was asked and returned nothing (subset of plain)
     uint64_t n_spec_fold_rejected = 0; // replays that follow a rejection inside a folded round
+    uint64_t n_spec_zero_rounds   = 0; // [TAG_SPEC_DRAFT_POLICY] tput chose n = 0: no draft call (subset of plain)
+    uint64_t n_spec_probe_rounds  = 0; // [TAG_SPEC_DRAFT_POLICY] tput cooldown probes (n = 1)
 
     // [TAG_SPEC_ROUND_TIMING] (R80.1 v49) host wall time of the speculative rounds this slot drafted in (one round = one
     // update_slots pass that ran the drafter; a pass shared by several drafting slots is counted in full for each)

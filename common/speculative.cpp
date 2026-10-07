@@ -3238,3 +3238,63 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 str_perf.c_str());
     }
 }
+
+// [TAG_SPEC_DRAFT_POLICY]
+int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const common_spec_tput_cost & c, double * rate_out) {
+    int    best_n    = 0;
+    double best_rate = -1.0;
+    double p_cum     = 1.0;
+    double gain      = 1.0; // 1 + sum_{i<=n} P_i
+    for (int n = 0; n <= std::max(0, n_max); ++n) {
+        if (n > 0) {
+            p_cum *= (n - 1 < (int) p.size()) ? std::min(std::max((double) p[n - 1], 0.0), 1.0) : 1.0;
+            gain  += p_cum;
+        }
+        const double m    = (double) (n + 1);
+        const double cost = (n > 0 ? c.d0 + c.d1*(double) n : 0.0) + c.v0 + c.v1*m + c.c0 + c.c1*m + c.host;
+        const double rate = cost > 0.0 ? gain / cost : gain * 1e30;
+        if (rate > best_rate) {
+            best_rate = rate;
+            best_n    = n;
+        }
+    }
+    if (rate_out) {
+        *rate_out = best_rate;
+    }
+    return best_n;
+}
+
+int common_spec_cooldown::decide(int n_rule) {
+    if (c > 0) {
+        if (wait > 0) {
+            wait--;
+            return 0;
+        }
+        return 1; // the probe
+    }
+    if (n_rule <= 0) {
+        c    = c_min;
+        wait = c - 1; // this round is the first of the C zero rounds
+        return 0;
+    }
+    return n_rule;
+}
+
+void common_spec_cooldown::observe(int n_proposed, int n_accepted) {
+    if (n_proposed > 0 && n_accepted > 0) {
+        n_fail = 0;
+        c      = 0;
+        wait   = 0;
+        return;
+    }
+    if (c > 0) { // a failed probe
+        c    = std::min(2*c, c_max);
+        wait = c;
+        return;
+    }
+    if (++n_fail >= k_fail) {
+        n_fail = 0;
+        c      = c_min;
+        wait   = c;
+    }
+}
