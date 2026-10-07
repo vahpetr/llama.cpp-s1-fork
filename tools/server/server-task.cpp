@@ -1615,6 +1615,14 @@ std::string server_task_result_metrics::to_metrics() {
             "Speculative: wall time of the draft catch-up (common_speculative_process) per round",
             metrics.t_spec_catchup_us / 1e6
         }, {
+            "spec_catchup_prefill_seconds_total",
+            "Speculative: wall time of the draft catch-up in passes without a drafting slot (prompt processing)",
+            metrics.t_spec_catchup_pf_us / 1e6
+        }, {
+            "spec_catchup_prefill_passes_total",
+            "Speculative: passes without a drafting slot that ran the draft catch-up (prompt processing)",
+            (double) metrics.n_spec_catchup_pf_passes
+        }, {
             "spec_verify_seconds_total",
             "Speculative: wall time of the verify decode (llama_decode + sync) per round",
             metrics.t_spec_verify_us / 1e6

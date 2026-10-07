@@ -537,6 +537,10 @@ struct server_metrics {
     int64_t  t_spec_catchup_us   = 0;
     int64_t  t_spec_verify_us    = 0;
     int64_t  t_spec_host_us      = 0;
+    // [TAG_SPEC_ROUND_TIMING] the draft catch-up of passes in which no slot drafted (prompt processing / fill): not a round,
+    // counted separately so the fill's catch-up share is measurable
+    uint64_t n_spec_catchup_pf_passes = 0;
+    int64_t  t_spec_catchup_pf_us     = 0;
 
     // adaptive draft length (--spec-draft-n-max-adaptive) - gauges, last decision taken by any slot
     uint64_t spec_adaptive_n_max    = 0;  // effective draft length asked of the drafter

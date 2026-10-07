@@ -3815,6 +3815,12 @@ private:
     // end of a pass: a round -> the slots' stats, the /metrics counters and the main context's kqvis-prof window
     void spec_round_finish() {
         if (spec_rt.slot_ids.empty()) {
+            if (spec_rt.catchup_us > 0) { // a pass without a drafting slot (prompt processing): its catch-up, separately
+                metrics.n_spec_catchup_pf_passes += 1;
+                metrics.t_spec_catchup_pf_us     += spec_rt.catchup_us;
+                llama_kqvis_prof_add_catchup_pf(ctx_tgt, spec_rt.catchup_us);
+                spec_rt.catchup_us = 0;
+            }
             return;
         }
         const int64_t t_round  = ggml_time_us() - spec_rt.t0_us;

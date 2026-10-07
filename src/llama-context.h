@@ -261,6 +261,7 @@ public:
 
     // [TAG_SPEC_ROUND_TIMING] adds one speculative round to the open kqvis-prof window (llama_kqvis_prof_add_spec_round)
     void kqvis_prof_add_spec_round(int64_t t_draft_us, int64_t t_catchup_us, int64_t t_verify_us, int64_t t_host_us) const;
+    void kqvis_prof_add_catchup_pf(int64_t t_catchup_us) const;
 
 private:
     llm_graph_params graph_params(
@@ -442,6 +443,7 @@ private:
         int64_t  qin_us = 0, mir_bytes = 0, mir_runs = 0, mir_full = 0; // [TAG_QSA_INPUTS_INC]
         // [TAG_SPEC_ROUND_TIMING] speculative rounds reported by the server (llama_kqvis_prof_add_spec_round)
         int64_t  n_round = 0, t_draft_us = 0, t_catchup_us = 0, t_verify_us = 0, t_host_us = 0;
+        int64_t  t_catchup_pf_us = 0; // the catch-up of passes without a drafting slot (prompt processing)
     };
     mutable kqvis_prof_window kqvis_win;
     mutable int64_t           kqvis_n_win = 0;

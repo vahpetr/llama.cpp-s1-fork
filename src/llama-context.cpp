@@ -111,6 +111,10 @@ void llama_context::kqvis_prof_add_spec_round(int64_t t_draft_us, int64_t t_catc
     w.t_host_us    += t_host_us;
 }
 
+void llama_context::kqvis_prof_add_catchup_pf(int64_t t_catchup_us) const {
+    kqvis_win.t_catchup_pf_us += t_catchup_us; // [TAG_SPEC_ROUND_TIMING]
+}
+
 void llama_context::kqvis_prof_flush(const char * reason) const {
     const auto & w = kqvis_win;
     if (w.graphs > 0) {
@@ -124,7 +128,7 @@ void llama_context::kqvis_prof_flush(const char * reason) const {
                 " plan_us=%" PRId64 " n_plan=%" PRId64 " plan_avg=%.1f plan_inc=%" PRId64 " cen_inc=%" PRId64
                 " cen_full=%" PRId64 " fb=%" PRId64 "/%" PRId64 "/%" PRId64 "/%" PRId64
                 " qin_us=%" PRId64 " mir_kib=%" PRId64 " mir_runs=%" PRId64 " mir_full=%" PRId64
-                " n_round=%" PRId64 " t_draft_ms=%.3f t_catchup_ms=%.3f t_verify_ms=%.3f t_host_ms=%.3f\n",
+                " n_round=%" PRId64 " t_draft_ms=%.3f t_catchup_ms=%.3f t_verify_ms=%.3f t_host_ms=%.3f t_catchup_pf_ms=%.3f\n",
                 sched_prof_ctx_name(cparams.ctx_type), mode_name[w.mode & 3], w.cls == 1 ? "pp" : "dec", kqvis_n_win, reason,
                 w.graphs, w.reused, w.tokens, w.n_kv_min, w.n_kv_max, w.n_kv_sum/g, w.build_us, w.inputs_us,
                 w.fill_us, w.fill_us/g, w.in_wait_us, w.in_copy_us, w.kq_copy_us,
@@ -133,7 +137,8 @@ void llama_context::kqvis_prof_flush(const char * reason) const {
                 w.plan_us, w.n_plan, w.n_plan > 0 ? (double) w.plan_us/w.n_plan : 0.0, w.n_plan_inc, w.n_cen_inc,
                 w.n_cen_full, w.n_cen_fb[1], w.n_cen_fb[2], w.n_cen_fb[3], w.n_cen_fb[4],
                 w.qin_us, w.mir_bytes/1024, w.mir_runs, w.mir_full,
-                w.n_round, w.t_draft_us/1000.0, w.t_catchup_us/1000.0, w.t_verify_us/1000.0, w.t_host_us/1000.0);
+                w.n_round, w.t_draft_us/1000.0, w.t_catchup_us/1000.0, w.t_verify_us/1000.0, w.t_host_us/1000.0,
+                w.t_catchup_pf_us/1000.0);
         kqvis_n_win++;
     }
     kqvis_win = kqvis_prof_window();
@@ -4875,6 +4880,12 @@ void llama_kqvis_prof_add_spec_round(struct llama_context * ctx, int64_t t_draft
         int64_t t_verify_us, int64_t t_host_us) {
     if (ctx != nullptr && llama_kqvis_prof_enabled()) {
         ctx->kqvis_prof_add_spec_round(t_draft_us, t_catchup_us, t_verify_us, t_host_us);
+    }
+}
+
+void llama_kqvis_prof_add_catchup_pf(struct llama_context * ctx, int64_t t_catchup_us) {
+    if (ctx != nullptr && llama_kqvis_prof_enabled()) {
+        ctx->kqvis_prof_add_catchup_pf(t_catchup_us);
     }
 }
 

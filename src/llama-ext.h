@@ -124,6 +124,10 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API void llama_kqvis_prof_add_spec_round(struct llama_context * ctx, int64_t t_draft_us, int64_t t_catchup_us,
         int64_t t_verify_us, int64_t t_host_us);
 
+// [TAG_SPEC_ROUND_TIMING] the draft catch-up wall time (us) of a server pass in which no slot drafted (prompt processing)
+// -> t_catchup_pf_ms of the open kqvis-prof window (LLAMA_KQ_VIS_PROF=1; a no-op otherwise). Pure telemetry.
+LLAMA_API void llama_kqvis_prof_add_catchup_pf(struct llama_context * ctx, int64_t t_catchup_us);
+
 //
 // model/context data extraction
 //
