@@ -369,7 +369,8 @@ std::string server_disk_cache_model_identity(const common_params & params);
 
 // [TAG_CACHE_COMPAT2] the parsed-param digest (Codex compat2 A): a normalized digest of the semantic parsed
 //   configuration of BOTH contexts. In: requested + effective n_batch / n_ubatch, n_parallel / n_seq_max, threads
-//   (generation + batch, target + draft, requested + effective), devices, n_gpu_layers, main GPU, split mode,
+//   (generation + batch, target + draft, requested + effective), NUMA strategy, devices, n_gpu_layers, main GPU,
+//   split mode, the effective placement of both loaded models (after fit-params),
 //   tensor split, tensor-buffer overrides, KV / op offload, extra buffer types (repack), host buffers, flash
 //   attention, KV types, SWA-full, unified KV, the QSA ratio, --override-kv (model metadata overrides), the loaded
 //   indexer / QSA metadata (selection budget + policy per layer), and the speculative configuration (types, synthetic
@@ -378,8 +379,9 @@ std::string server_disk_cache_model_identity(const common_params & params);
 //   Exact-qualified exclusions (do not change the state bytes a token sequence produces):
 //   - model / draft / mmproj paths, HF / URL sources: the content identity (model_id) is keyed instead
 //   - n_ctx, RoPE / YaRN, n_ctx_seq: the effective values are in the state descriptor (desc)
-//   - mmap / mlock / direct-io / check-tensors / fit-params*: loading method; fit's effects land in the effective
-//     values above (ngl, tensor split, n_ctx)
+//   - mmap / mlock / direct-io / check-tensors / fit-params*: loading method; fit's effects (GPU layers, tensor
+//     split, buffer overrides) are keyed through the effective placement of the loaded model
+//     (server_cache_model_placement, in the ctx canon), its n_ctx through the descriptor
 //   - cpu masks / priority / poll / strict placement: scheduling of the same per-row work, thread counts are in
 //   - sampling defaults, grammar, chat template / jinja / reasoning, stop words: they choose tokens; a stored state
 //     is keyed by its tokens
@@ -390,6 +392,12 @@ std::string server_disk_cache_model_identity(const common_params & params);
 //   - LoRA adapters: the disk cache is disabled with LoRA
 //   - ngram lookup cache paths: draft proposals only, verified against the target like any draft (n-gram params in)
 std::string server_cache_param_canon(const common_params & params);
+// [TAG_CACHE_COMPAT2] effective placement (astra r2): hash16 of llama_model_placement_desc - GPU-layer count, split
+//   mode, devices, tensor split, per-layer device and per-weight buffer type AS LOADED (after fit-params); "none"
+//   without a model. It enters the ctx canon (hence the key digest) and, with the NUMA strategy, the memo identity
+std::string server_cache_model_placement(const llama_model * m);
+std::string server_cache_placement_identity(const common_params & params, const llama_context * ctx_tgt,
+                                            const llama_context * ctx_dft);
 std::string server_cache_ctx_canon(const llama_context * ctx);
 std::string server_cache_param_digest(const common_params & params, const llama_context * ctx_tgt,
                                       const llama_context * ctx_dft);
@@ -420,7 +428,9 @@ bool server_disk_cache_same_identity(const std::string & a, const std::string & 
 //   AMD_ / VK_ / ...) - a driver change forces a re-measurement. Gap: ggml's device description carries no Vulkan
 //   driverVersion / apiVersion; a driver update that replaces no mapped file (e.g. firmware) is not seen
 std::string server_cache_runtime_identity();
-std::string server_cache_memo_key(const std::string & cheap, const std::string & runtime_id);
+// placement_id = server_cache_placement_identity (the effective placement + NUMA strategy of this load)
+std::string server_cache_memo_key(const std::string & cheap, const std::string & runtime_id,
+                                  const std::string & placement_id = "-");
 bool server_cache_memo_get(const std::string & root, const std::string & memo_key, std::string & measure_h);
 bool server_cache_memo_put(const std::string & root, const std::string & memo_key, const std::string & measure_h);
 

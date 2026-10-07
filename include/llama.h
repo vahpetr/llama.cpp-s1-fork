@@ -657,6 +657,11 @@ extern "C" {
     // Get metadata value as a string by index
     LLAMA_API int32_t llama_model_meta_val_str_by_index(const struct llama_model * model, int32_t i, char * buf, size_t buf_size);
 
+    // [TAG_CACHE_COMPAT2] the effective weight placement as loaded (after fit-params): GPU-layer count, split mode,
+    //   device list, tensor split, the device of the input / every layer / the output, and the buffer type of every
+    //   weight tensor. snprintf semantics: returns the full length (call again with a larger buffer if needed)
+    LLAMA_API int32_t llama_model_placement_desc(const struct llama_model * model, char * buf, size_t buf_size);
+
     // Get a string describing the model type
     LLAMA_API int32_t llama_model_desc(const struct llama_model * model, char * buf, size_t buf_size);
 

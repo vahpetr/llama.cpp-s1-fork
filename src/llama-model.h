@@ -740,6 +740,8 @@ struct llama_model {
 
     void print_info() const;
 
+    std::string placement_desc() const; // [TAG_CACHE_COMPAT2]
+
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
 

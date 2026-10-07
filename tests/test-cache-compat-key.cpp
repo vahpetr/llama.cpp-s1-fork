@@ -101,7 +101,8 @@ int main() {
         CHECK(a1 != base);
         for (auto args : std::vector<std::vector<const char *>>{
                  { "-b", "64" }, { "-ub", "32" }, { "-t", "3" }, { "-tb", "3" }, { "-nkvo" }, { "-fa", "off" },
-                 { "--spec-draft-n-max", "5" }, { "--override-kv", "qwen4exp.indexer_top_k=int:512" }, { "--no-op-offload" } }) {
+                 { "--spec-draft-n-max", "5" }, { "--override-kv", "qwen4exp.indexer_top_k=int:512" }, { "--no-op-offload" },
+                 { "--numa", "distribute" } }) {
             args.insert(args.begin(), { "-m", "x.gguf" });
             const std::string c = canon(args, {});
             if (c == base || c == "parse-failed") {
@@ -193,6 +194,21 @@ int main() {
         const std::string mk = server_cache_memo_key(cheap_a, "cpu");
         CHECK(mk != server_cache_memo_key(cheap_b, "cpu"));
         CHECK(mk != server_cache_memo_key(cheap_a, "Vulkan0/AMD Radeon 780M/0000:c4:00.0;"));
+        // [TAG_CACHE_COMPAT2] the effective placement (astra r2): another placement / NUMA strategy is another memo
+        {
+            CHECK(mk == server_cache_memo_key(cheap_a, "cpu", "-"));
+            CHECK(mk != server_cache_memo_key(cheap_a, "cpu", "1111111111111111"));
+            CHECK(server_cache_memo_key(cheap_a, "cpu", "1111111111111111") !=
+                  server_cache_memo_key(cheap_a, "cpu", "2222222222222222"));
+            CHECK(server_cache_model_placement(nullptr) == "none");
+            common_params pn;
+            const std::string p0 = server_cache_placement_identity(pn, nullptr, nullptr);
+            CHECK(p0 == server_cache_placement_identity(pn, nullptr, nullptr));
+            pn.numa = GGML_NUMA_STRATEGY_DISTRIBUTE;
+            CHECK(p0 != server_cache_placement_identity(pn, nullptr, nullptr));
+            CHECK(server_cache_memo_key(cheap_a, "cpu", p0) !=
+                  server_cache_memo_key(cheap_a, "cpu", server_cache_placement_identity(pn, nullptr, nullptr)));
+        }
         std::string m;
         CHECK(!server_cache_memo_get(dir.string(), mk, m));
         CHECK(server_cache_memo_put(dir.string(), mk, "0123456789abcdef"));

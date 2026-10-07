@@ -2106,6 +2106,32 @@ void llama_model::print_info() const {
     vocab.print_info();
 }
 
+// [TAG_CACHE_COMPAT2] the effective placement (see llama_model_placement_desc)
+std::string llama_model::placement_desc() const {
+    const auto dn = [](ggml_backend_dev_t d) { return d ? std::string(ggml_backend_dev_name(d)) : std::string("-"); };
+    std::string r = "ngl=" + std::to_string(n_gpu_layers()) + ";split=" + std::to_string((int) split_mode()) + ";dev=[";
+    for (const auto & d : devices) {
+        r += dn(d.dev) + (d.is_meta ? "*" : "") + ",";
+    }
+    r += "];ts=[";
+    const float * ts = tensor_split();
+    for (size_t i = 0; ts && i < llama_max_devices(); i++) {
+        char b[48];
+        snprintf(b, sizeof(b), "%a,", ts[i]);
+        r += b;
+    }
+    r += "];in=" + dn(pimpl->dev_input.dev) + ";L=[";
+    for (const auto & ld : pimpl->dev_layer) {
+        r += dn(ld.dev) + ",";
+    }
+    r += "];out=" + dn(pimpl->dev_output.dev) + ";T=[";
+    for (const auto & [name, t] : tensors_by_name) {
+        const char * bn = t && t->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)) : "-";
+        r += std::to_string(name.size()) + ":" + name + "=" + bn + ";";
+    }
+    return r + "]";
+}
+
 ggml_backend_dev_t llama_model::dev_layer(int il) const {
     return pimpl->dev_layer.at(il).dev;
 }
@@ -3084,6 +3110,11 @@ int32_t llama_model_meta_key_by_index(const llama_model * model, int i, char * b
     auto it = model->gguf_kv.begin();
     std::advance(it, i);
     return snprintf(buf, buf_size, "%s", it->first.c_str());
+}
+
+int32_t llama_model_placement_desc(const llama_model * model, char * buf, size_t buf_size) {
+    const std::string r = model->placement_desc();
+    return snprintf(buf, buf_size, "%s", r.c_str());
 }
 
 int32_t llama_model_meta_val_str_by_index(const llama_model * model, int32_t i, char * buf, size_t buf_size) {

@@ -584,8 +584,8 @@ static std::string canon_buft(const std::vector<llama_model_tensor_buft_override
 }
 
 std::string server_cache_param_canon(const common_params & p) {
-    std::string r = string_format("nb=%d;ub=%d;npar=%d;%s;b%s;dev=%s;ngl=%d;main=%d;split=%d;ts=[",
-                                  p.n_batch, p.n_ubatch, p.n_parallel, canon_cpu(p.cpuparams).c_str(),
+    std::string r = string_format("nb=%d;ub=%d;npar=%d;numa=%d;%s;b%s;dev=%s;ngl=%d;main=%d;split=%d;ts=[",
+                                  p.n_batch, p.n_ubatch, p.n_parallel, (int) p.numa, canon_cpu(p.cpuparams).c_str(),
                                   canon_cpu(p.cpuparams_batch).c_str(), canon_devices(p.devices).c_str(), p.n_gpu_layers,
                                   p.main_gpu, (int) p.split_mode);
     for (size_t i = 0; i < llama_max_devices() && i < 128; i++) {
@@ -633,13 +633,38 @@ std::string server_cache_param_canon(const common_params & p) {
     return r;
 }
 
+// [TAG_CACHE_COMPAT2] the effective placement of a loaded model (Codex compat2 astra r2): fit-params rewrites the
+//   GPU-layer count, tensor split and buffer overrides after parsing, so the requested values do not identify it -
+//   the loaded model reports what was applied (llama_model_placement_desc)
+std::string server_cache_model_placement(const llama_model * m) {
+    if (m == nullptr) {
+        return "none";
+    }
+    const int32_t n = llama_model_placement_desc(m, nullptr, 0);
+    if (n < 0) {
+        return "unknown";
+    }
+    std::string s((size_t) n + 1, '\0');
+    llama_model_placement_desc(m, s.data(), s.size());
+    s.resize((size_t) n);
+    return h16_of(s);
+}
+
+std::string server_cache_placement_identity(const common_params & p, const llama_context * ctx_tgt,
+                                            const llama_context * ctx_dft) {
+    return h16_of(string_format("numa=%d|t=%s|d=%s", (int) p.numa,
+                                server_cache_model_placement(ctx_tgt ? llama_get_model(ctx_tgt) : nullptr).c_str(),
+                                server_cache_model_placement(ctx_dft ? llama_get_model(ctx_dft) : nullptr).c_str()));
+}
+
 std::string server_cache_ctx_canon(const llama_context * ctx) {
     if (ctx == nullptr) {
         return "none";
     }
     llama_context * c = const_cast<llama_context *>(ctx);
-    std::string r = string_format("nb=%u;ub=%u;seq=%u;thr=%d/%d;qsa_meta=[", llama_n_batch(ctx), llama_n_ubatch(ctx),
-                                  llama_n_seq_max(ctx), llama_n_threads(c), llama_n_threads_batch(c));
+    std::string r = string_format("nb=%u;ub=%u;seq=%u;thr=%d/%d;place=%s;qsa_meta=[", llama_n_batch(ctx),
+                                  llama_n_ubatch(ctx), llama_n_seq_max(ctx), llama_n_threads(c),
+                                  llama_n_threads_batch(c), server_cache_model_placement(llama_get_model(ctx)).c_str());
     // QSA selection budget / policy as loaded (GGUF metadata; --override-kv is in the parsed part): indexer_* keys
     const llama_model * m = llama_get_model(ctx);
     char kb[256], vb[1024];
@@ -898,9 +923,10 @@ std::string server_cache_runtime_identity() {
            "|denv=" + h16_of(env);
 }
 
-std::string server_cache_memo_key(const std::string & cheap, const std::string & runtime_id) {
-    return h16_of(string_format("cheap=%s|probe=%u|runtime=%s", cheap.c_str(), DISK_CACHE_PROBE_REVISION,
-                                runtime_id.c_str()));
+std::string server_cache_memo_key(const std::string & cheap, const std::string & runtime_id,
+                                  const std::string & placement_id) {
+    return h16_of(string_format("cheap=%s|probe=%u|runtime=%s|place=%s", cheap.c_str(), DISK_CACHE_PROBE_REVISION,
+                                runtime_id.c_str(), placement_id.c_str()));
 }
 
 static fs::path memo_path(const std::string & root, const std::string & memo_key) {

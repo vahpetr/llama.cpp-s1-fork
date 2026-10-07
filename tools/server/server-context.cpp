@@ -1537,7 +1537,8 @@ private:
         cache_meas_how.clear();
         cache_memo_key_pending.clear();
         const std::string cheap = server_disk_cache_fingerprint(params_base, n_ctx);
-        const std::string memo = server_cache_memo_key(cheap, server_cache_runtime_identity());
+        const std::string memo = server_cache_memo_key(cheap, server_cache_runtime_identity(),
+                                                       server_cache_placement_identity(params_base, ctx_tgt, ctx_dft));
         if (server_cache_memo_get(params_base.cache_disk_path, memo, cache_meas)) {
             cache_meas_how = "memo hit";
             return;
@@ -1573,9 +1574,10 @@ private:
         p.env_digest = server_cache_env_digest(server_cache_environ());
         p.param_digest = server_cache_param_digest(params_base, ctx_tgt, ctx_dft);
         const std::string fp = server_disk_cache_fingerprint_v2(cheap, p);
-        SRV_INF("cache-compat: key %s = model %s | desc %s | meas %s | depth %u | env %s | param %s (cheap %s)\n",
-                fp.substr(0, 16).c_str(), p.model_id.c_str(), p.desc_h.c_str(), meas.c_str(), p.depth_version,
-                p.env_digest.c_str(), p.param_digest.c_str(), cheap.substr(0, 16).c_str());
+        SRV_INF("cache-compat: key %s = model %s | desc %s | meas %s | depth %u | env %s | param %s (cheap %s, "
+                "place %s)\n", fp.substr(0, 16).c_str(), p.model_id.c_str(), p.desc_h.c_str(), meas.c_str(),
+                p.depth_version, p.env_digest.c_str(), p.param_digest.c_str(), cheap.substr(0, 16).c_str(),
+                server_cache_placement_identity(params_base, ctx_tgt, ctx_dft).c_str());
         return fp;
     }
 
