@@ -66,6 +66,10 @@ enum server_disk_load_result {
     SERVER_DISK_LOAD_OTHER,
 };
 
+// [TAG_DISK_READ_STATUS] (Codex gate r1 A3 Major 1) a read that could not be done (open / read / allocation error)
+//   is inconclusive and keeps the files; only verified damage (missing file, truncation, format, checksum) is BAD
+enum sealed_status { SEALED_OK, SEALED_IO, SEALED_BAD };
+
 struct server_deep_ckpt_meta {
     std::string key;
     int64_t     n_tokens = 0;
@@ -173,6 +177,7 @@ struct server_disk_cache {
         std::string key;      // hash16 of its fingerprint
         std::string path;     // its directory (the root for the legacy namespace)
         bool        legacy  = false;
+        bool        incomplete = false; // its listing failed: never removed this scan
         size_t      n_entries = 0;
         uint64_t    bytes   = 0; // its own files (entries + checkpoints), not the shared blocks
         int64_t     t_newest = 0; // mtime of its newest file
@@ -193,8 +198,8 @@ struct server_disk_cache {
     std::map<std::string, std::string> src_dir_of; // adopt entry id -> its directory
     std::map<int32_t, std::string> slot_adopted;    // slot -> adopt source of the state it loaded
     void open_adopt_sources();
-    bool read_entry(const std::string & id, const std::string & fp, server_disk_cache_entry & e) const;
-    void scan_foreign();
+    sealed_status read_entry(const std::string & id, const std::string & fp, server_disk_cache_entry & e) const;
+    bool scan_foreign(); // false: a listing failed, the foreign block sets are incomplete
     void remove_foreign(const foreign_ns & ns);
     bool foreign_protected(const foreign_ns & ns) const;
 
@@ -223,6 +228,9 @@ struct server_disk_cache {
     // [TAG_DISK_DELTA] content-addressed blocks of the state streams: key -> bytes on disk
     std::map<std::string, uint64_t> blobs;
     uint64_t blob_bytes = 0;
+    // [TAG_DISK_READ_STATUS] (Hermes gate Major 1) an own entry / block / checkpoint skipped at start on an I/O error:
+    //   what it references is unknown, so no block or checkpoint is collected for the rest of this run
+    bool gc_hold = false;
 
     bool ckpt_store(const std::string & key, const common_prompt_checkpoint & c, bool * written);
     std::string blob_path(const std::string & key) const;
@@ -231,7 +239,7 @@ struct server_disk_cache {
     // env_h: the envelope hash the stream must carry; legacy_ok: a stream without an envelope (format 5 / 6) is accepted
     server_disk_load_result load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
                                         const std::string & env_h, bool legacy_ok);
-    static bool read_map_keys(const std::string & map_path, std::vector<std::string> & keys);
+    static bool read_map_keys(const std::string & map_path, std::vector<std::string> & keys, sealed_status * st = nullptr);
     server_disk_load_result verify_stream(const std::string & map_path, const std::string & env_h, bool legacy_ok);
     void drop_invalid(int idx); // erase an invalid entry, count it, collect what it alone referenced
     void blob_gc();

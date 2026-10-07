@@ -143,10 +143,6 @@ static bool write_sealed(const std::string & path, const std::string & body) {
     return (bool) f;
 }
 
-// [TAG_DISK_READ_STATUS] (Codex gate r1 A3 Major 1) a read that could not be done (open / read / allocation error)
-//   is inconclusive and keeps the files; only verified damage (missing file, truncation, format, checksum) is BAD
-enum sealed_status { SEALED_OK, SEALED_IO, SEALED_BAD };
-
 // opens path for reading: SEALED_BAD if it does not exist, SEALED_IO if it exists but cannot be opened
 static sealed_status open_for_read(const std::string & path, std::ifstream & f) {
     f.open(path, std::ios::binary);
@@ -155,6 +151,35 @@ static sealed_status open_for_read(const std::string & path, std::ifstream & f) 
     }
     std::error_code ec;
     return !fs::exists(path, ec) && !ec ? SEALED_BAD : SEALED_IO;
+}
+
+// a file that must be non-empty: SEALED_BAD if it is missing or empty, SEALED_IO if it cannot be inspected now
+static sealed_status nonempty_file(const std::string & path) {
+    std::error_code ec;
+    const auto n = fs::file_size(path, ec);
+    if (!ec) {
+        return n > 0 ? SEALED_OK : SEALED_BAD;
+    }
+    std::error_code ec_e;
+    return !fs::exists(path, ec_e) && !ec_e ? SEALED_BAD : SEALED_IO;
+}
+
+// [TAG_DISK_READ_STATUS] (Hermes gate Major 1) a directory listing that failed (opening it or mid-way) is not an
+//   empty directory: false, and the caller must not act on the partial view. missing_ok: a missing directory is empty
+static bool list_dir(const fs::path & p, std::vector<fs::directory_entry> & out, bool missing_ok, std::string * err = nullptr) {
+    out.clear();
+    std::error_code ec;
+    fs::directory_iterator it(p, ec);
+    for (const fs::directory_iterator end; !ec && it != end; it.increment(ec)) {
+        out.push_back(*it);
+    }
+    if (ec && missing_ok && ec == std::errc::no_such_file_or_directory && out.empty()) {
+        return true;
+    }
+    if (ec && err) {
+        *err = p.string() + ": " + ec.message();
+    }
+    return !ec;
 }
 
 static sealed_status read_sealed(const std::string & path, std::string & body) {
@@ -499,8 +524,19 @@ uint64_t server_disk_cache::total_bytes() const {
         const auto it = blobs.find(k);
         res += it != blobs.end() ? it->second : 0;
     }
+    std::set<std::string> ck_refs;
+    if (gc_hold) {
+        // [TAG_DISK_READ_STATUS] held for the entries skipped at start: an unreferenced checkpoint is not collected
+        //   this run, so it must not push the quota into evicting entries that can be read
+        for (const auto & e : entries) {
+            ck_refs.insert(e.ckpt_keys.begin(), e.ckpt_keys.end());
+            for (const auto & r : e.deep) {
+                ck_refs.insert(r.key);
+            }
+        }
+    }
     for (const auto & it : ckpts) {
-        res += it.second.bytes;
+        res += !gc_hold || ck_refs.count(it.first) ? it.second.bytes : 0;
     }
     return res;
 }
@@ -516,46 +552,76 @@ void server_disk_cache::erase(size_t idx) {
     entries.erase(entries.begin() + idx);
 }
 
-bool server_disk_cache::read_entry(const std::string & id, const std::string & fp, server_disk_cache_entry & e) const {
+// [TAG_DISK_READ_STATUS] (Hermes gate Major 1) SEALED_IO: a file of the entry cannot be read now (open / read /
+//   allocation error) - inconclusive, its files stay; SEALED_BAD: verified incomplete, damaged or another fingerprint
+sealed_status server_disk_cache::read_entry(const std::string & id, const std::string & fp, server_disk_cache_entry & e) const {
     e.id = id;
-    bool ok = false;
     try {
-        std::ifstream fm(path(id, ".meta"));
-        if (fm) {
-            const std::string text((std::istreambuf_iterator<char>(fm)), std::istreambuf_iterator<char>());
-            const json j = json::parse(text);
-            const uint32_t ver = j.value("version", 0u);
-            if (ver >= 5 && ver <= DISK_CACHE_VERSION && j.value("fingerprint", std::string()) == fp) {
-                e.version = ver;
-                e.adopted_from = j.value("adopted_from", std::string());
-                e.bytes   = j.at("bytes").get<uint64_t>();
-                e.t_saved = j.at("t_saved").get<int64_t>();
-                e.t_used  = j.at("t_used").get<int64_t>();
-                e.hits    = j.at("hits").get<int32_t>();
-                e.has_dft = j.at("has_dft").get<bool>();
+        std::ifstream fm;
+        if (const auto st = open_for_read(path(id, ".meta"), fm); st != SEALED_OK) {
+            return st;
+        }
+        const std::string text((std::istreambuf_iterator<char>(fm)), std::istreambuf_iterator<char>());
+        if (fm.bad()) {
+            return SEALED_IO;
+        }
+        const json j = json::parse(text);
+        const uint32_t ver = j.value("version", 0u);
+        if (ver < 5 || ver > DISK_CACHE_VERSION || j.value("fingerprint", std::string()) != fp) {
+            return SEALED_BAD;
+        }
+        e.version = ver;
+        e.adopted_from = j.value("adopted_from", std::string());
+        e.bytes   = j.at("bytes").get<uint64_t>();
+        e.t_saved = j.at("t_saved").get<int64_t>();
+        e.t_used  = j.at("t_used").get<int64_t>();
+        e.hits    = j.at("hits").get<int32_t>();
+        e.has_dft = j.at("has_dft").get<bool>();
 
-                std::string raw;
-                if (read_sealed(path(id, ".tok"), raw) == SEALED_OK && !raw.empty() && raw.size() % sizeof(llama_token) == 0) {
-                    llama_tokens packed(raw.size() / sizeof(llama_token));
-                    memcpy(packed.data(), raw.data(), raw.size());
-                    e.tokens = server_tokens::deserialize(packed, has_mtmd);
-                    ok = e.tokens.size() == j.at("n_tokens").get<size_t>() &&
-                         file_size_or_0(path(id, ".tgt")) > 0 &&
-                         (!e.has_dft || file_size_or_0(path(id, ".dft")) > 0) &&
-                         read_aux(path(id, ".aux"), false, nullptr, nullptr, e.deep, e.ckpt_keys) == SEALED_OK &&
-                         read_map_keys(path(id, ".tgt"), e.blobs) &&
-                         (!e.has_dft || read_map_keys(path(id, ".dft"), e.blobs));
-                    for (const char * ext : { ".tok", ".aux", ".tgt", ".dft" }) {
-                        e.own_bytes += file_size_or_0(path(id, ext));
-                    }
-                }
+        std::string raw;
+        if (const auto st = read_sealed(path(id, ".tok"), raw); st != SEALED_OK) {
+            return st;
+        }
+        if (raw.empty() || raw.size() % sizeof(llama_token) != 0) {
+            return SEALED_BAD;
+        }
+        llama_tokens packed(raw.size() / sizeof(llama_token));
+        memcpy(packed.data(), raw.data(), raw.size());
+        e.tokens = server_tokens::deserialize(packed, has_mtmd);
+        if (e.tokens.size() != j.at("n_tokens").get<size_t>()) {
+            return SEALED_BAD;
+        }
+        for (const char * ext : { ".tgt", ".dft" }) {
+            if (ext[1] == 'd' && !e.has_dft) {
+                continue;
+            }
+            if (const auto st = nonempty_file(path(id, ext)); st != SEALED_OK) {
+                return st;
             }
         }
+        if (const auto st = read_aux(path(id, ".aux"), false, nullptr, nullptr, e.deep, e.ckpt_keys); st != SEALED_OK) {
+            return st;
+        }
+        for (const char * ext : { ".tgt", ".dft" }) {
+            if (ext[1] == 'd' && !e.has_dft) {
+                continue;
+            }
+            sealed_status st = SEALED_BAD;
+            if (!read_map_keys(path(id, ext), e.blobs, &st)) {
+                return st;
+            }
+        }
+        for (const char * ext : { ".tok", ".aux", ".tgt", ".dft" }) {
+            e.own_bytes += file_size_or_0(path(id, ext));
+        }
+        return SEALED_OK;
+    } catch (const std::bad_alloc & err) {
+        DSK_WRN("entry %s not readable now: %s\n", id.c_str(), err.what());
+        return SEALED_IO;
     } catch (const std::exception & err) {
         DSK_WRN("entry %s unreadable: %s\n", id.c_str(), err.what());
-        ok = false;
+        return SEALED_BAD;
     }
-    return ok;
 }
 
 void server_disk_cache::init() {
@@ -567,15 +633,19 @@ void server_disk_cache::init() {
         return;
     }
     const std::string key = fingerprint.substr(0, 16);
+    gc_hold = false;
 
     // [TAG_DISK_NAMESPACE] flat entries / checkpoints of this very fingerprint move into the own namespace (rename,
     //   atomic per file; the .meta last, so an interrupted move leaves an incomplete flat entry that is skipped);
     //   flat files of another fingerprint stay where they are (legacy namespace: a rollback still finds them)
     {
+        std::vector<fs::directory_entry> ls;
         std::set<std::string> flat;
-        for (const auto & de : fs::directory_iterator(root, ec)) {
+        list_dir(root, ls, true); // a failed listing only postpones the move
+        for (const auto & de : ls) {
+            std::error_code ec_t;
             const std::string name = de.path().filename().string();
-            if (de.is_regular_file() && name.find('.') == 16) {
+            if (de.is_regular_file(ec_t) && name.find('.') == 16) {
                 flat.insert(name.substr(0, 16));
             }
         }
@@ -590,7 +660,8 @@ void server_disk_cache::init() {
                 DSK_INF("moved flat entry %s into namespace %s\n", id.c_str(), key.c_str());
             }
         }
-        for (const auto & de : fs::directory_iterator(fs::path(root) / "ckpt", ec)) {
+        list_dir(fs::path(root) / "ckpt", ls, true);
+        for (const auto & de : ls) {
             if (ckpt_fingerprint(de.path()) == key) {
                 std::error_code ec_m;
                 fs::rename(de.path(), fs::path(dir) / "ckpt" / de.path().filename(), ec_m);
@@ -599,8 +670,35 @@ void server_disk_cache::init() {
         ec.clear();
     }
 
+    // [TAG_DISK_READ_STATUS] (Hermes gate Major 1) every listing the start acts on is taken before anything is removed;
+    //   a failed one disables the cache for this run with all files untouched - an empty view of blk/ would otherwise
+    //   drop every entry as "blocks gone", an empty ckpt/ every checkpoint-bearing entry at its first load
+    std::vector<fs::directory_entry> ls_own, ls_blk, ls_ck;
+    {
+        std::string err;
+        std::error_code ec_b;
+        fs::create_directories(fs::path(root) / "blk", ec_b);
+        if (ec_b) {
+            err = (fs::path(root) / "blk").string() + ": " + ec_b.message();
+        }
+        if (ec_b || !list_dir(dir, ls_own, false, &err) || !list_dir(fs::path(root) / "blk", ls_blk, false, &err) ||
+                !list_dir(fs::path(dir) / "ckpt", ls_ck, false, &err)) {
+            DSK_WRN("cannot list %s: disk cache disabled for this run, no file touched\n", err.c_str());
+            quota = 0;
+            entries.clear();
+            ckpts.clear();
+            blobs.clear();
+            blob_bytes = 0;
+            foreign.clear();
+            adopted.clear();
+            src_dir_of.clear();
+            refresh_status();
+            return;
+        }
+    }
+
     std::set<std::string> ids;
-    for (const auto & de : fs::directory_iterator(dir, ec)) {
+    for (const auto & de : ls_own) {
         const std::string name = de.path().filename().string();
         const auto dot = name.find('.');
         if (dot == 16) {
@@ -609,11 +707,15 @@ void server_disk_cache::init() {
     }
 
     size_t n_dropped = 0;
+    size_t n_skipped = 0;
     for (const auto & id : ids) {
         server_disk_cache_entry e;
-        const bool ok = read_entry(id, fingerprint, e);
-        if (ok) {
+        const sealed_status st = read_entry(id, fingerprint, e);
+        if (st == SEALED_OK) {
             entries.push_back(std::move(e));
+        } else if (st == SEALED_IO) {
+            DSK_WRN("entry %s not readable now (I/O error): kept on disk, skipped for this run\n", id.c_str());
+            n_skipped++;
         } else {
             remove_files(id);
             n_dropped++;
@@ -621,11 +723,16 @@ void server_disk_cache::init() {
     }
 
     // block store: every complete block file (a crash leaves only .tmp files); unreferenced ones go in enforce()
-    fs::create_directories(fs::path(root) / "blk", ec);
-    for (const auto & de : fs::directory_iterator(fs::path(root) / "blk", ec)) {
+    std::set<std::string> io_keys; // blocks / checkpoints present but not inspectable now: kept, not indexed
+    for (const auto & de : ls_blk) {
         const std::string name = de.path().filename().string();
         if (name.size() > 4 && name.compare(name.size() - 4, 4, ".blk") == 0) {
-            const uint64_t n = file_size_or_0(de.path().string());
+            std::error_code ec_s;
+            const uint64_t n = fs::file_size(de.path(), ec_s);
+            if (ec_s) {
+                io_keys.insert(name.substr(0, name.size() - 4));
+                continue;
+            }
             blobs[name.substr(0, name.size() - 4)] = n;
             blob_bytes += n;
         } else {
@@ -646,28 +753,19 @@ void server_disk_cache::init() {
         }
     }
 
-    // entries whose blocks are gone (a crash between writes, a manual cleanup) cannot be loaded
-    for (size_t i = 0; i < entries.size();) {
-        const bool complete = std::all_of(entries[i].blobs.begin(), entries[i].blobs.end(),
-                [&](const std::string & k) { return blobs.count(k) > 0; });
-        if (complete) {
-            i++;
-        } else {
-            erase(i);
-            n_dropped++;
-        }
-    }
-
     // deep checkpoint store: keep the files with this fingerprint
-    fs::create_directories(fs::path(dir) / "ckpt", ec);
     size_t n_ck_dropped = 0;
     const std::string fp_short = fingerprint.substr(0, 16);
-    for (const auto & de : fs::directory_iterator(fs::path(dir) / "ckpt", ec)) {
+    for (const auto & de : ls_ck) {
         const std::string name = de.path().filename().string();
         bool ok = false;
         server_deep_ckpt_meta m;
         if (name.size() > 3 && name.compare(name.size() - 3, 3, ".ck") == 0) {
-            std::ifstream f(de.path(), std::ios::binary);
+            std::ifstream f;
+            if (open_for_read(de.path().string(), f) == SEALED_IO) {
+                io_keys.insert(name.substr(0, name.size() - 3));
+                continue;
+            }
             uint32_t magic = 0;
             std::string fp;
             uint32_t env_ver = 0;
@@ -675,6 +773,10 @@ void server_disk_cache::init() {
             ok = get(f, magic) && magic == CKPT_ENV_MAGIC && get_str(f, fp) && fp == fp_short && get(f, env_ver) &&
                  get_str(f, dh) && dh == desc_h && get_str(f, m.key) &&
                  get(f, m.n_tokens) && get(f, m.pos_min) && get(f, m.pos_max) && m.key + ".ck" == name;
+            if (!ok && f.bad()) {
+                io_keys.insert(name.substr(0, name.size() - 3));
+                continue;
+            }
             // the header is indexed without reading the 113 MiB body (its seal is checked on use): bound it, and the
             // key carries the token count, so a corrupt n_tokens cannot reach prefix_keys
             const auto dash = m.key.rfind('-');
@@ -692,6 +794,34 @@ void server_disk_cache::init() {
             fs::remove(de.path(), ec);
             n_ck_dropped++;
         }
+    }
+
+    // entries whose blocks are gone (a crash between writes, a manual cleanup) cannot be loaded; one that references
+    //   a block or checkpoint not inspectable now is skipped for this run with its files kept
+    for (size_t i = 0; i < entries.size();) {
+        const auto & e = entries[i];
+        const auto io_ref = [&](const std::string & k) { return io_keys.count(k) > 0; };
+        const bool io = std::any_of(e.blobs.begin(), e.blobs.end(), io_ref) ||
+                        std::any_of(e.ckpt_keys.begin(), e.ckpt_keys.end(), io_ref) ||
+                        std::any_of(e.deep.begin(), e.deep.end(), [&](const server_deep_ref & r) { return io_ref(r.key); });
+        const bool complete = std::all_of(e.blobs.begin(), e.blobs.end(),
+                [&](const std::string & k) { return blobs.count(k) > 0; });
+        if (io) {
+            DSK_WRN("entry %s references a file not readable now (I/O error): kept on disk, skipped for this run\n",
+                    e.id.c_str());
+            entries.erase(entries.begin() + i);
+            n_skipped++;
+        } else if (complete) {
+            i++;
+        } else {
+            erase(i);
+            n_dropped++;
+        }
+    }
+    if (n_skipped > 0 || !io_keys.empty()) {
+        gc_hold = true;
+        DSK_WRN("%zu entries and %zu blocks / checkpoints skipped on I/O errors: no block or checkpoint is collected "
+                "this run\n", n_skipped, io_keys.size());
     }
 
     open_adopt_sources();
@@ -1523,6 +1653,9 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
 }
 
 void server_disk_cache::deep_gc() {
+    if (gc_hold) {
+        return; // [TAG_DISK_READ_STATUS] an entry skipped at start may reference any of them
+    }
     std::set<std::string> referenced;
     if (live_refs) {
         referenced = live_refs();
@@ -1659,46 +1792,61 @@ bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const 
     return ok;
 }
 
-bool server_disk_cache::read_map_keys(const std::string & map_path, std::vector<std::string> & keys) {
-    std::ifstream fm(map_path, std::ios::binary);
+bool server_disk_cache::read_map_keys(const std::string & map_path, std::vector<std::string> & keys, sealed_status * st) {
+    // st: SEALED_IO when the map could not be read now (open / read error), SEALED_BAD when it is missing or malformed
+    std::ifstream fm;
+    const sealed_status st_open = open_for_read(map_path, fm);
+    const auto fail = [&](sealed_status res) {
+        if (st) {
+            *st = res;
+        }
+        return false;
+    };
+    if (st_open != SEALED_OK) {
+        return fail(st_open);
+    }
+    const auto bad = [&]() { return fail(fm.bad() ? SEALED_IO : SEALED_BAD); };
     uint32_t magic = 0;
     if (!get(fm, magic) || (magic != MAP_MAGIC && magic != MAP_ENV_MAGIC)) {
-        return false;
+        return bad();
     }
     if (magic == MAP_ENV_MAGIC) {
         uint32_t ver = 0;
         std::string h;
         uint64_t n = 0;
         if (!get(fm, ver) || !get_str(fm, h) || !get(fm, n)) {
-            return false;
+            return bad();
         }
     }
     for (;;) {
         uint8_t kind = 0;
         if (!get(fm, kind)) {
-            return false;
+            return bad();
         }
         if (kind == 255) {
+            if (st) {
+                *st = SEALED_OK;
+            }
             return true;
         }
         if (kind == 0) {
             uint64_t n = 0;
             std::string h;
             if (!get(fm, n)) {
-                return false;
+                return bad();
             }
             fm.seekg((std::streamoff) n, std::ios::cur);
             if (!get_str(fm, h)) {
-                return false;
+                return bad();
             }
         } else if (kind == 1) {
             std::string key;
             if (!get_str(fm, key)) {
-                return false;
+                return bad();
             }
             keys.push_back(std::move(key));
         } else {
-            return false;
+            return bad();
         }
     }
 }
@@ -1861,14 +2009,19 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
 }
 
 void server_disk_cache::blob_gc() {
+    if (gc_hold) {
+        return; // [TAG_DISK_READ_STATUS] an entry skipped at start may reference any of them
+    }
     std::set<std::string> referenced;
     for (const auto & e : entries) {
         referenced.insert(e.blobs.begin(), e.blobs.end());
     }
     // [TAG_DISK_NAMESPACE] blocks of every other namespace on disk (incl. other live processes) stay: rescan them
-    //   only when something would be deleted
+    //   only when something would be deleted; a failed rescan deletes nothing
     if (std::any_of(blobs.begin(), blobs.end(), [&](const auto & b) { return !referenced.count(b.first); })) {
-        scan_foreign();
+        if (!scan_foreign()) {
+            return;
+        }
         for (const auto & ns : foreign) {
             referenced.insert(ns.blocks.begin(), ns.blocks.end());
         }
@@ -1996,29 +2149,45 @@ void server_disk_cache::set_descriptor(llama_context * ctx_tgt, llama_context * 
 // [TAG_DISK_NAMESPACE] every other namespace: ns-<key>/ directories and the flat legacy top level (grouped by the
 //   fingerprint in its .meta files); TTL (newest file older than ttl_days) and cap (all together <= quota / 2, oldest
 //   first) remove whole namespaces; the blocks they reference are kept by blob_gc
-void server_disk_cache::scan_foreign() {
+bool server_disk_cache::scan_foreign() {
     const std::string own = fingerprint.substr(0, 16);
     std::map<std::string, foreign_ns> found;
-    std::error_code ec;
-    const auto add_maps = [](foreign_ns & ns, const fs::path & base, const std::string & id) {
+    bool complete = true;
+    const auto add_maps = [&complete](foreign_ns & ns, const fs::path & base, const std::string & id) {
         std::vector<std::string> keys;
         for (const char * ext : { ".tgt", ".dft" }) {
             keys.clear();
-            if (read_map_keys((base / (id + ext)).string(), keys)) {
+            sealed_status st = SEALED_BAD;
+            if (read_map_keys((base / (id + ext)).string(), keys, &st)) {
                 ns.blocks.insert(keys.begin(), keys.end());
+            } else if (st == SEALED_IO) {
+                ns.incomplete = true; // its blocks are not known
+                complete = false;
             }
         }
     };
-    for (const auto & de : fs::directory_iterator(root, ec)) {
+    // [TAG_DISK_READ_STATUS] (Hermes gate Major 1) a failed listing keeps the previous view and removes nothing;
+    //   a namespace whose own listing failed is incomplete: never removed, and its blocks are not known
+    std::vector<fs::directory_entry> ls;
+    std::string err;
+    if (!list_dir(root, ls, false, &err)) {
+        DSK_WRN("cannot list %s: foreign namespaces not rescanned, nothing removed\n", err.c_str());
+        return false;
+    }
+    for (const auto & de : ls) {
+        std::error_code ec_t;
         const std::string name = de.path().filename().string();
-        if (de.is_directory() && name.rfind("ns-", 0) == 0 && name.size() == 19 && name.substr(3) != own) {
+        if (de.is_directory(ec_t) && name.rfind("ns-", 0) == 0 && name.size() == 19 && name.substr(3) != own) {
             foreign_ns & ns = found["ns:" + name.substr(3)];
             ns.key  = name.substr(3);
             ns.path = de.path().string();
             ns.t_newest = mtime_s(de.path()); // a namespace just created by another process is not idle
             std::error_code ec_r;
-            for (const auto & f : fs::recursive_directory_iterator(de.path(), ec_r)) {
-                if (!f.is_regular_file()) {
+            fs::recursive_directory_iterator it(de.path(), ec_r);
+            for (const fs::recursive_directory_iterator end; !ec_r && it != end; it.increment(ec_r)) {
+                const auto & f = *it;
+                std::error_code ec_f;
+                if (!f.is_regular_file(ec_f)) {
                     continue;
                 }
                 const std::string fn = f.path().filename().string();
@@ -2029,7 +2198,12 @@ void server_disk_cache::scan_foreign() {
                     add_maps(ns, de.path(), fn.substr(0, 16));
                 }
             }
-        } else if (de.is_regular_file() && name.size() == 21 && name.compare(16, 5, ".meta") == 0) {
+            if (ec_r) {
+                DSK_WRN("cannot list %s: %s (namespace kept)\n", ns.path.c_str(), ec_r.message().c_str());
+                ns.incomplete = true;
+                complete = false;
+            }
+        } else if (de.is_regular_file(ec_t) && name.size() == 21 && name.compare(16, 5, ".meta") == 0) {
             const std::string fp = meta_fingerprint(de.path().string());
             const std::string k  = fp.size() >= 16 ? fp.substr(0, 16) : std::string("unknown");
             foreign_ns & ns = found["legacy:" + k];
@@ -2047,7 +2221,14 @@ void server_disk_cache::scan_foreign() {
             add_maps(ns, fs::path(root), id);
         }
     }
-    for (const auto & de : fs::directory_iterator(fs::path(root) / "ckpt", ec)) {
+    if (!list_dir(fs::path(root) / "ckpt", ls, true, &err)) {
+        DSK_WRN("cannot list %s: legacy namespaces kept\n", err.c_str());
+        for (auto & it : found) {
+            it.second.incomplete = it.second.incomplete || it.second.legacy;
+        }
+        ls.clear();
+    }
+    for (const auto & de : ls) {
         const std::string k = ckpt_fingerprint(de.path());
         auto it = found.find("legacy:" + k);
         if (it != found.end()) {
@@ -2071,7 +2252,7 @@ void server_disk_cache::scan_foreign() {
         const foreign_ns & ns = foreign[i];
         const bool expired = ttl_days > 0 && t_now - ns.t_newest > (int64_t) ttl_days * 86400;
         const bool over    = total > quota / 2; // oldest first (sorted)
-        if ((expired || over) && !foreign_protected(ns)) {
+        if ((expired || over) && !foreign_protected(ns) && !ns.incomplete) {
             DSK_INF("removing foreign namespace %s%s (%zu entries, %.2f GiB, idle %.1f days): %s\n", ns.key.c_str(),
                     ns.legacy ? " (legacy)" : "", ns.n_entries, ns.bytes / (1024.0 * 1024.0 * 1024.0),
                     (t_now - ns.t_newest) / 86400.0, expired ? "ttl" : "cap");
@@ -2082,6 +2263,7 @@ void server_disk_cache::scan_foreign() {
             i++;
         }
     }
+    return complete;
 }
 
 bool server_disk_cache::foreign_protected(const foreign_ns & ns) const {
@@ -2120,9 +2302,19 @@ void server_disk_cache::open_adopt_sources() {
             ckdir  = fs::path(root) / "ckpt";
             a.legacy = true;
         }
-        for (const auto & de : fs::directory_iterator(base, ec)) {
+        // [TAG_DISK_READ_STATUS] (Hermes gate Major 1) both listings first: a source that cannot be listed now is
+        //   not opened this run (its files are never written either way)
+        std::vector<fs::directory_entry> ls_base, ls_ck;
+        std::string err;
+        if (!list_dir(base, ls_base, false, &err) || !list_dir(ckdir, ls_ck, true, &err)) {
+            DSK_WRN("adopt %s: cannot list %s, not opened this run\n", key.c_str(), err.c_str());
+            adopted.push_back(a); // still protected from the foreign TTL / cap
+            continue;
+        }
+        for (const auto & de : ls_base) {
+            std::error_code ec_t;
             const std::string name = de.path().filename().string();
-            if (de.is_regular_file() && name.size() == 21 && name.compare(16, 5, ".meta") == 0) {
+            if (de.is_regular_file(ec_t) && name.size() == 21 && name.compare(16, 5, ".meta") == 0) {
                 const std::string fp = meta_fingerprint(de.path().string());
                 if (fp.rfind(key, 0) == 0) {
                     a.fingerprint = fp;
@@ -2145,7 +2337,7 @@ void server_disk_cache::open_adopt_sources() {
             }
             src_dir_of[id] = base.string();
             server_disk_cache_entry e;
-            const bool ok = read_entry(id, a.fingerprint, e) &&
+            const bool ok = read_entry(id, a.fingerprint, e) == SEALED_OK &&
                 std::all_of(e.blobs.begin(), e.blobs.end(), [&](const std::string & k) { return blobs.count(k) > 0; });
             if (ok) {
                 e.src = key;
@@ -2156,7 +2348,7 @@ void server_disk_cache::open_adopt_sources() {
             }
         }
         size_t n_ck = 0;
-        for (const auto & de : fs::directory_iterator(ckdir, ec)) {
+        for (const auto & de : ls_ck) {
             std::ifstream f(de.path(), std::ios::binary);
             uint32_t magic = 0, env_ver = 0;
             std::string fp, dh;
@@ -2192,7 +2384,9 @@ void server_disk_cache::remove_foreign(const foreign_ns & ns) {
             fs::remove(fs::path(root) / (id + ext), ec);
         }
     }
-    for (const auto & de : fs::directory_iterator(fs::path(root) / "ckpt", ec)) {
+    std::vector<fs::directory_entry> ls;
+    list_dir(fs::path(root) / "ckpt", ls, true); // a failed listing leaves the checkpoints (TTL / cap retries)
+    for (const auto & de : ls) {
         if (ckpt_fingerprint(de.path()) == ns.key) {
             std::error_code ec_r;
             fs::remove(de.path(), ec_r);
