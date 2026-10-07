@@ -2975,6 +2975,34 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+// [TAG_MTP_CATCHUP_NOATTN] keep in step with the rotation + store block of build_attn above: the same rotation
+// nodes, the same expand order (v, k, then cpy_k, cpy_v - k last so a rope + set_rows fusion still sees them
+// adjacent), the same cpy_k/cpy_v calls; only q (not stored) and the attention are absent
+void llm_graph_context::build_attn_store_kv(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+                int   il) const {
+    if (inp->self_k_rot) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    }
+
+    if (inp->self_v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+
+    const auto & k_idxs = inp->get_k_idxs();
+    const auto & v_idxs = inp->get_v_idxs();
+
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+}
+
 static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,

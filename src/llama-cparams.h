@@ -37,6 +37,7 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
+    bool mtp_catchup_attn;        // [TAG_MTP_CATCHUP_NOATTN] false: a zero-output MTP ubatch stores K/V only (LLAMA_MTP_CATCHUP_ATTN=0)
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

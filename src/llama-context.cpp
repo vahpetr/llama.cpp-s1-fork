@@ -406,6 +406,25 @@ llama_context::llama_context(
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
 
+    // [TAG_MTP_CATCHUP_NOATTN] LLAMA_MTP_CATCHUP_ATTN (MTP contexts only, read once per context): 1 / unset = today's
+    // full draft graph for every ubatch; 0 = a ubatch with zero outputs and no unmasked hidden export (the speculative
+    // catch-up of prefill and verification rows) builds only the draft block's K/V projections and the cache writes -
+    // no attention, head or FFN (R80.4, item 7). Exact: the written K/V bytes do not depend on the attention output.
+    // Strict parse as LLAMA_MTP_CARRIER_ZERO: only a plain 0 or 1; anything else keeps the default with a WARN.
+    cparams.mtp_catchup_attn = true;
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        const char * s = getenv("LLAMA_MTP_CATCHUP_ATTN");
+        if (s != nullptr && !(strcmp(s, "0") == 0 || strcmp(s, "1") == 0)) {
+            LLAMA_LOG_WARN("%s: invalid LLAMA_MTP_CATCHUP_ATTN='%s' (0 or 1) - the full catch-up graph stays\n", __func__, s);
+        } else if (s != nullptr) {
+            cparams.mtp_catchup_attn = s[0] == '1';
+        }
+        LLAMA_LOG_INFO("%s: LLAMA_MTP_CATCHUP_ATTN=%d%s: %s\n", __func__, cparams.mtp_catchup_attn ? 1 : 0,
+                s == nullptr ? " (default)" : "",
+                cparams.mtp_catchup_attn ? "zero-output MTP catch-up ubatches build the full draft graph"
+                                         : "zero-output MTP catch-up ubatches store K/V only (attention-free)");
+    }
+
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
