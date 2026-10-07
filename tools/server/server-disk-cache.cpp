@@ -2344,22 +2344,98 @@ bool server_disk_cache::foreign_protected(const foreign_ns & ns) const {
     return std::any_of(adopted.begin(), adopted.end(), [&](const adopt_src & a) { return a.key == ns.key; });
 }
 
-// the structural part of a fingerprint: model / draft / mmproj paths + size@mtime of every file, n_ctx, KV types
-//   (the fields after the format version, before the binary / environment / argv)
-static std::string fingerprint_structure(const std::string & fp) {
+// [TAG_DISK_ADOPT] (Codex gate r2 Major 3) the structural part of a fingerprint (model / draft / mmproj paths with the
+//   size@mtime of every file - each shard of a split GGUF -, n_ctx, KV types), parsed into named fields and
+//   re-encoded length-delimited with arrays of shard identities: "name=<len>:<value>;" / "name=[<n>]<len>:<v>...;".
+//   The v6 / v7 fingerprint text is positional ("v|model|id[|shard id...]|draft|id[|shard id...]|ctxN|kN|vN|dkN|dvN|
+//   mmproj|id|binary|env"): the number of shard identities after a path follows from its "-00001-of-NNNNN" suffix,
+//   as server_disk_cache_fingerprint writes them. Anything that does not parse unambiguously (a '|' in a path, a
+//   shard count that does not match, a malformed identity or field) returns "" with the reason: adoption is refused.
+std::string server_disk_cache_fingerprint_structure(const std::string & fp, std::string * why) {
+    const auto fail = [&](const std::string & w) {
+        if (why) {
+            *why = w;
+        }
+        return std::string();
+    };
     const auto sp = fp.find(' ');
     const std::vector<std::string> f = string_split<std::string>(sp == std::string::npos ? fp : fp.substr(sp + 1), '|');
+    size_t i = 1;
+    const auto is_file_id = [](const std::string & v) { // "<size>@<mtime>"
+        const auto at = v.find('@');
+        if (at == std::string::npos || at == 0 || at + 1 >= v.size()) {
+            return false;
+        }
+        for (size_t k = 0; k < v.size(); k++) {
+            const char c = v[k];
+            if (k != at && !(c >= '0' && c <= '9') && !(c == '-' && k == at + 1)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto field = [](const std::string & name, const std::string & v) {
+        return name + "=" + std::to_string(v.size()) + ":" + v + ";";
+    };
     std::string res;
-    for (size_t i = 1; i < f.size() && i <= 11; i++) {
-        res += f[i] + "|";
+    // a path and the identities of its files: 1 + (N - 1) shards for "<name>-00001-of-0000N.gguf"
+    const auto path_files = [&](const char * name) -> bool {
+        if (i + 1 >= f.size()) {
+            return false;
+        }
+        const std::string & p = f[i++];
+        size_t n = 1;
+        const auto at = p.rfind("-00001-of-");
+        if (at != std::string::npos && p.size() >= at + 15) {
+            const int ns = atoi(p.substr(at + 10, 5).c_str());
+            n = (size_t) std::max(1, std::min(ns, 99999));
+        }
+        if (i + n > f.size()) {
+            return false;
+        }
+        std::string arr = std::string(name) + "_files=[" + std::to_string(n) + "]";
+        for (size_t k = 0; k < n; k++) {
+            const std::string & id = f[i++];
+            if (!is_file_id(id)) {
+                return false;
+            }
+            arr += std::to_string(id.size()) + ":" + id;
+        }
+        res += field(name, p) + arr + ";";
+        return true;
+    };
+    if (f.size() < 2 || f[0].empty() || f[0][0] != 'v') {
+        return fail("no version field");
     }
-    return f.size() > 11 ? res : std::string();
+    if (!path_files("model")) {
+        return fail("model path / shard identities do not parse (a '|' in the path or a shard count mismatch)");
+    }
+    if (!path_files("draft")) {
+        return fail("draft path / shard identities do not parse (a '|' in the path or a shard count mismatch)");
+    }
+    for (const char * name : { "ctx", "k", "v", "dk", "dv" }) {
+        const std::string pre = name;
+        if (i >= f.size() || f[i].rfind(pre, 0) != 0 || f[i].size() == pre.size() ||
+            f[i].find_first_not_of("-0123456789", pre.size()) != std::string::npos) {
+            return fail("field " + pre + " does not parse");
+        }
+        res += field(name, f[i++].substr(pre.size()));
+    }
+    if (i + 1 >= f.size() || !is_file_id(f[i + 1])) {
+        return fail("mmproj path / identity does not parse");
+    }
+    res += field("mmproj", f[i]) + field("mmproj_file", f[i + 1]);
+    return res;
 }
 
 void server_disk_cache::open_adopt_sources() {
     adopted.clear();
     src_dir_of.clear();
-    const std::string own_struct = fingerprint_structure(fingerprint);
+    std::string own_why;
+    const std::string own_struct = server_disk_cache_fingerprint_structure(fingerprint, &own_why);
+    if (own_struct.empty() && !adopt_keys.empty()) {
+        DSK_WRN("adopt: this server's own fingerprint does not parse (%s), no source is adopted\n", own_why.c_str());
+    }
     for (const auto & key : adopt_keys) {
         if (key.empty() || key == fingerprint.substr(0, 16)) {
             continue;
@@ -2399,11 +2475,19 @@ void server_disk_cache::open_adopt_sources() {
             DSK_WRN("adopt %s: no entries of that key in %s\n", key.c_str(), root.c_str());
             continue;
         }
-        if (fingerprint_structure(a.fingerprint).empty() || fingerprint_structure(a.fingerprint) != own_struct) {
-            DSK_WRN("adopt %s refused: its structural part (model / draft / mmproj files, n_ctx, KV types) differs: %s\n",
-                    key.c_str(), fingerprint_structure(a.fingerprint).c_str());
+        std::string why;
+        const std::string src_struct = server_disk_cache_fingerprint_structure(a.fingerprint, &why);
+        if (src_struct.empty() || own_struct.empty()) {
+            DSK_WRN("adopt %s refused: ambiguous structural identity (%s)\n", key.c_str(),
+                    src_struct.empty() ? why.c_str() : "own fingerprint");
             continue;
         }
+        if (src_struct != own_struct) {
+            DSK_WRN("adopt %s refused: its structural part (model / draft / mmproj files, n_ctx, KV types) differs: %s\n",
+                    key.c_str(), src_struct.c_str());
+            continue;
+        }
+        DSK_INF("adopt %s: structure %s\n", key.c_str(), src_struct.c_str());
         for (const auto & id : ids) {
             if (src_dir_of.count(id) || std::any_of(entries.begin(), entries.end(), [&](const auto & o) { return o.id == id; })) {
                 continue;

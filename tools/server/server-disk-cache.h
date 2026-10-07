@@ -81,6 +81,10 @@ struct server_deep_ckpt_meta {
     std::string src_dir; // [TAG_DISK_ADOPT] the adopt source's ckpt/ (read-only); empty: the own namespace
 };
 
+// the structural identity of a disk-cache fingerprint (named, length-delimited fields; shard identity arrays) for
+//   adoption eligibility; "" with *why set when it does not parse unambiguously
+std::string server_disk_cache_fingerprint_structure(const std::string & fp, std::string * why = nullptr);
+
 struct server_disk_cache {
     server_disk_cache(std::string dir, uint64_t quota_bytes, int32_t min_tokens, int32_t ttl_days,
                       std::string fingerprint, bool has_mtmd, float ckpt_ratio, int32_t ckpt_min_step, int32_t ckpt_max);
