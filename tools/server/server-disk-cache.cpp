@@ -600,6 +600,10 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     if (quota == 0 || n < (size_t) n_min_tokens) {
         return false;
     }
+    if (prompt.noncanonical) { // [TAG_NONCANONICAL]
+        DSK_INF("not saving %zu tokens: the state was shifted (not the state of this prefix)\n", n);
+        return false;
+    }
 
     // already stored: exactly this prompt (a longer entry does not count: its recurrent state is at its own end,
     // so this prefix could only come back through a checkpoint)
@@ -956,6 +960,9 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
 }
 
 void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_checkpoint & c, uint8_t kind) {
+    if (prompt.noncanonical) { // [TAG_NONCANONICAL]
+        return;
+    }
     // below min-step a re-process is cheaper than 113 MiB of disk (a short system prompt, a tiny chat)
     if (quota == 0 || c.data_tgt.empty() || c.n_tokens < ckpt_min_step || c.n_tokens > (int64_t) prompt.tokens.size() ||
         ((c.flags_tgt | c.flags_dft) & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {

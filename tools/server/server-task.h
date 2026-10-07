@@ -582,10 +582,15 @@ struct server_prompt {
 
     std::vector<server_deep_ref> deep; // ascending n_tokens, all <= tokens.size()
 
+    // [TAG_NONCANONICAL] the retained KV was computed with tokens that are no longer in `tokens` (context shift,
+    //   n_cache_reuse shift): it is not the state of this token prefix, so it is never published (disk save, deep_put)
+    bool noncanonical = false;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
         deep.clear();
+        noncanonical = false;
     }
 
     int n_tokens() const {
@@ -597,6 +602,7 @@ struct server_prompt {
             tokens.clone(),
             checkpoints,
             deep,
+            noncanonical,
         };
     }
 };

@@ -3890,6 +3890,11 @@ private:
 
                     slot.prompt.clear();
                     slot.prompt.tokens.insert(new_tokens);
+
+                    // [TAG_NONCANONICAL] the KV past n_keep was computed with the discarded tokens before it
+                    slot.prompt.noncanonical  = true;
+                    slot.ckpt_pinned_n_tokens = -1;
+                    slot.ckpt_branch_pos      = -1;
                 }
 
                 slot.truncated = true;
@@ -4256,6 +4261,8 @@ private:
 
                                     SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
 
+                                    int64_t first_edit = -1; // [TAG_NONCANONICAL] first position whose KV was shifted
+
                                     while (head_c < slot.prompt.tokens.size() &&
                                            head_p < input_tokens.size()) {
 
@@ -4274,6 +4281,10 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
+                                            if (first_edit < 0) {
+                                                first_edit = (int64_t) head_p;
+                                            }
+
                                             slot.mem.seq_rm (slot.id, head_p, head_c);
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
 
@@ -4286,6 +4297,22 @@ private:
                                             head_p += n_match;
                                         } else {
                                             head_c += 1;
+                                        }
+                                    }
+
+                                    // [TAG_NONCANONICAL] the shifted chunks were computed in another context: the prompt
+                                    //   is noncanonical, and checkpoints / deep refs / pin / branch marker past the first
+                                    //   edited position describe a sequence that no longer exists
+                                    if (first_edit >= 0) {
+                                        slot.prompt.noncanonical = true;
+                                        slot.prompt.checkpoints.remove_if([&](const auto & c) { return c.n_tokens > first_edit; });
+                                        slot.prompt.deep.erase(std::remove_if(slot.prompt.deep.begin(), slot.prompt.deep.end(),
+                                                    [&](const auto & r) { return r.n_tokens > first_edit; }), slot.prompt.deep.end());
+                                        if (slot.ckpt_pinned_n_tokens > first_edit) {
+                                            slot.ckpt_pinned_n_tokens = -1;
+                                        }
+                                        if (slot.ckpt_branch_pos > first_edit) {
+                                            slot.ckpt_branch_pos = -1;
                                         }
                                     }
 
@@ -4502,6 +4529,9 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+                        if (n_past == 0) {
+                            slot.prompt.noncanonical = false; // [TAG_NONCANONICAL] a full recompute
+                        }
 
                         // [TAG_DEEP_CKPT] stored checkpoints past the kept prefix belong to the old continuation
                         slot.prompt.deep.erase(std::remove_if(slot.prompt.deep.begin(), slot.prompt.deep.end(),
@@ -4563,6 +4593,7 @@ private:
                         slot.prompt.tokens.keep_first(0);
                         slot.prompt.checkpoints.clear();
                         slot.prompt.deep.clear(); // [TAG_DEEP_CKPT]
+                        slot.prompt.noncanonical = false; // [TAG_NONCANONICAL]
 
                         slot.stats.n_prompt_cached = 0;
 
