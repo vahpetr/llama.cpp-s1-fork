@@ -2081,6 +2081,12 @@ private:
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+
+                // a busy pinned slot is returned as is: the caller defers the task and selection re-runs later, so
+                // nothing here (similarity bookkeeping, the RAM tier, the disk hook) may touch its running state
+                if (ret->is_processing()) {
+                    return ret;
+                }
             }
         }
 
