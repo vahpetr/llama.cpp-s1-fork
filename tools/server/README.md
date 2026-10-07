@@ -353,7 +353,11 @@ enters the state descriptor and the `--cache-disk` compat key: entries saved wit
 maximises the committed tokens per ms, `(1 + sum_{i<=n} P_i) / (T_draft(n) + T_verify(n+1) + T_catchup(n+1) + T_host)`:
 P_i from the per-position acceptance EMA (an empty or short draft counts as a failure at the stop position), the costs
 from exponentially weighted fits of the server's own single-slot round times (draft call vs n, target decode and MTP
-catch-up vs batch rows, host rest). Until the fits have 8 rounds it drafts n-max. n = 0 is a true zero: no draft call,
+catch-up vs batch rows, host rest), kept per KV-depth bucket (log2: [0, 8k), [8k, 16k), ... 107k -> 4, 524k -> 7, 1M -> 8),
+so a deep slot is priced only from rounds at its own depth. The prior path: until the slot's bucket has 8 rounds of its
+own the slot drafts n-max (the cooldown still applies); other buckets are never borrowed. A FULL / deep-RS rejection's
+restore + replay pass is priced too (its own fit, charged to the round with the replay's extra token; prior until warm:
+a plain round of the replay's rows). n = 0 is a true zero: no draft call,
 no per-round checkpoint, a plain one-token decode (the draft KV still catches up). A cooldown keeps zero from being
 final: after a zero decision or 3 consecutive rounds with nothing accepted the slot plays 0 for C rounds (C = 4,
 doubling to 64 on a failed probe) and then probes n = 1; any accepted token leaves the cooldown. It replaces

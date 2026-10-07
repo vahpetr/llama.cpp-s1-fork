@@ -160,6 +160,42 @@ void common_spec_tput_eval(const std::vector<float> & p, int n, const common_spe
 int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const common_spec_tput_cost & c,
                             double * rate_out = nullptr);
 
+// exponentially weighted least squares t = a + b*n of one round component (ms), for --spec-draft-policy tput
+struct common_spec_ew_line {
+    static constexpr double ALPHA   = 1.0/64.0;
+    static constexpr double W_MIN   = 8.0;
+    static constexpr double VAR_MIN = 0.25;
+
+    double w = 0.0, s_n = 0.0, s_t = 0.0, s_nn = 0.0, s_nt = 0.0;
+
+    void add(double n, double t_ms);
+    // false before W_MIN samples; a slope that the samples do not identify (one row count only, or a negative fit)
+    // falls back to b_prior, capped so that the intercept through the mean keeps at least half of the mean time (a
+    // prior from another machine must not turn the measured fixed cost into a per-row one)
+    bool get(double & a, double & b, double b_prior) const;
+};
+
+// the fits are kept per KV-depth bucket (v51 r1, Codex D Major): every component's cost grows with the depth the
+//   round attends over, so a deep slot is priced only from rounds at its own depth. log2 buckets: [0, 8k) -> 0,
+//   [2^(12+b), 2^(13+b)) -> b (107k -> 4, 524k -> 7, 1M -> 8), >= 2M -> 9.
+#define COMMON_SPEC_TPUT_N_BUCKETS 10
+int common_spec_tput_bucket(int n_kv);
+
+struct common_spec_tput_fits {
+    common_spec_ew_line draft;   // draft wall vs drafted n
+    common_spec_ew_line verify;  // target decode wall vs batch rows
+    common_spec_ew_line catchup; // MTP process() wall vs batch rows
+    common_spec_ew_line host;    // the rest of the pass
+    common_spec_ew_line rb;      // the rollback cycle (restore + replay pass) vs the replay rows
+};
+
+struct common_spec_tput_model {
+    common_spec_tput_fits bucket[COMMON_SPEC_TPUT_N_BUCKETS];
+
+    common_spec_tput_fits       & at(int n_kv)       { return bucket[common_spec_tput_bucket(n_kv)]; }
+    const common_spec_tput_fits & at(int n_kv) const { return bucket[common_spec_tput_bucket(n_kv)]; }
+};
+
 // the cooldown around true-zero decisions: without a draft the acceptance estimate never moves, so after a zero
 //   decision (or K consecutive rounds that proposed nothing / had nothing accepted) the slot plays n = 0 for C rounds and
 //   then probes n = 1; a failed probe doubles C (c_min .. c_max), a non-zero acceptance leaves the cooldown (C resets).

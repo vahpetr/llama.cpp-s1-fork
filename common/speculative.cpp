@@ -3279,6 +3279,38 @@ int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const commo
     return best_n;
 }
 
+void common_spec_ew_line::add(double n, double t_ms) {
+    const double d = 1.0 - ALPHA;
+    w    = d*w    + 1.0;
+    s_n  = d*s_n  + n;
+    s_t  = d*s_t  + t_ms;
+    s_nn = d*s_nn + n*n;
+    s_nt = d*s_nt + n*t_ms;
+}
+
+bool common_spec_ew_line::get(double & a, double & b, double b_prior) const {
+    if (w < W_MIN) {
+        return false;
+    }
+    const double mean_n = s_n / w;
+    const double mean_t = s_t / w;
+    const double var_n  = s_nn / w - mean_n*mean_n;
+    b = var_n >= VAR_MIN ? (s_nt / w - mean_n*mean_t) / var_n : -1.0;
+    if (!(b >= 0.0)) {
+        b = std::min(b_prior, 0.5*mean_t / std::max(mean_n, 1.0));
+    }
+    a = std::max(0.0, mean_t - b*mean_n);
+    return true;
+}
+
+int common_spec_tput_bucket(int n_kv) {
+    int b = 0;
+    while (b + 1 < COMMON_SPEC_TPUT_N_BUCKETS && (int64_t) n_kv >= ((int64_t) 1 << (13 + b))) {
+        b++;
+    }
+    return b;
+}
+
 int common_spec_cooldown::decide(int n_rule) {
     if (c > 0) {
         if (wait > 0) {

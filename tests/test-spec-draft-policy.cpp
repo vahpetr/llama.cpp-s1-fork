@@ -145,6 +145,35 @@ static void test_rollback_cycle() {
     }
 }
 
+// (v51 r1, D Major) the fits are per KV-depth bucket: shallow rounds never price a deep slot
+static void test_depth_buckets() {
+    check(common_spec_tput_bucket(0) == 0 && common_spec_tput_bucket(8191) == 0, "bucket 0 below 8k");
+    check(common_spec_tput_bucket(8192) == 1 && common_spec_tput_bucket(16383) == 1, "bucket 1 = [8k, 16k)");
+    check(common_spec_tput_bucket(107000) == 4, "107k -> bucket 4");
+    check(common_spec_tput_bucket(524288) == 7 && common_spec_tput_bucket(524287) == 6, "524k -> bucket 7");
+    check(common_spec_tput_bucket(1048576) == 8, "1M -> bucket 8");
+    check(common_spec_tput_bucket(1 << 30) == COMMON_SPEC_TPUT_N_BUCKETS - 1, "deeper -> the last bucket");
+
+    common_spec_tput_model m;
+    // 200 shallow rounds (2k): verify 10 + 1/row
+    for (int r = 0; r < 200; ++r) {
+        m.at(2048).verify.add(1 + r % 5, 10.0 + 1.0*(1 + r % 5));
+    }
+    double a = 0.0, b = 0.0;
+    check(!m.at(524288).verify.get(a, b, 0.0), "a deep bucket without its own samples is not warm (prior path)");
+    // 20 deep rounds (520k): verify 40 + 3/row; 200 more shallow rounds afterwards do not move it
+    for (int r = 0; r < 20; ++r) {
+        m.at(520000).verify.add(1 + r % 5, 40.0 + 3.0*(1 + r % 5));
+    }
+    for (int r = 0; r < 200; ++r) {
+        m.at(4096).verify.add(1 + r % 5, 10.0 + 1.0*(1 + r % 5));
+    }
+    check(m.at(524000).verify.get(a, b, 0.0) && std::fabs(a - 40.0) < 1e-6 && std::fabs(b - 3.0) < 1e-6,
+          "the deep bucket's fit is its own rounds only (a " + std::to_string(a) + ", b " + std::to_string(b) + ")");
+    check(m.at(100).verify.get(a, b, 0.0) && std::fabs(a - 10.0) < 1e-6 && std::fabs(b - 1.0) < 1e-6,
+          "the shallow bucket's fit is untouched by deep rounds");
+}
+
 static void test_cooldown() {
     common_spec_cooldown cd;
 
@@ -206,6 +235,7 @@ static void test_cooldown() {
 int main() {
     test_rule();
     test_rollback_cycle();
+    test_depth_buckets();
     test_cooldown();
     if (n_fail) {
         printf("test-spec-draft-policy: %d failures (%d checks ok)\n", n_fail, n_ok);

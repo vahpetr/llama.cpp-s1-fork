@@ -1247,43 +1247,6 @@ struct server_spec_cost_fit {
     }
 };
 
-// [TAG_SPEC_DRAFT_POLICY] exponentially weighted least squares t = a + b*n of one round component (ms), for
-//   --spec-draft-policy tput; fed from single-slot pure-generation rounds only (spec_round_finish)
-struct server_spec_ew_line {
-    static constexpr double ALPHA   = 1.0/64.0;
-    static constexpr double W_MIN   = 8.0;
-    static constexpr double VAR_MIN = 0.25;
-
-    double w = 0.0, s_n = 0.0, s_t = 0.0, s_nn = 0.0, s_nt = 0.0;
-
-    void add(double n, double t_ms) {
-        const double d = 1.0 - ALPHA;
-        w    = d*w    + 1.0;
-        s_n  = d*s_n  + n;
-        s_t  = d*s_t  + t_ms;
-        s_nn = d*s_nn + n*n;
-        s_nt = d*s_nt + n*t_ms;
-    }
-
-    // false before W_MIN samples; a slope that the samples do not identify (one row count only, or a negative fit)
-    // falls back to b_prior, capped so that the intercept through the mean keeps at least half of the mean time (a
-    // prior from another machine must not turn the measured fixed cost into a per-row one)
-    bool get(double & a, double & b, double b_prior) const {
-        if (w < W_MIN) {
-            return false;
-        }
-        const double mean_n = s_n / w;
-        const double mean_t = s_t / w;
-        const double var_n  = s_nn / w - mean_n*mean_n;
-        b = var_n >= VAR_MIN ? (s_nt / w - mean_n*mean_t) / var_n : -1.0;
-        if (!(b >= 0.0)) {
-            b = std::min(b_prior, 0.5*mean_t / std::max(mean_n, 1.0));
-        }
-        a = std::max(0.0, mean_t - b*mean_n);
-        return true;
-    }
-};
-
 //
 // server_context_impl (private implementation)
 //
@@ -1722,10 +1685,8 @@ private:
     server_spec_cost_fit spec_cost;
 
     // [TAG_SPEC_DRAFT_POLICY] --spec-draft-policy tput: per-round cost fits (draft wall vs drafted n, verify and
-    // catch-up wall vs batch rows, host wall)
-    server_spec_ew_line spec_fit_draft, spec_fit_verify, spec_fit_catchup, spec_fit_host;
-    // the rollback cycle: checkpoint restore + the replay pass, vs the replay rows (a + 2)
-    server_spec_ew_line spec_fit_rb;
+    // catch-up wall vs batch rows, host wall, the rollback cycle vs the replay rows), one set per KV-depth bucket
+    common_spec_tput_model spec_tput_fits;
 
     json json_ui_settings = json::object();
 
@@ -4109,6 +4070,7 @@ private:
         int n_draft_req   = 0;
         int n_rows        = 0;
         int n_rows_expect = 0;
+        int n_kv          = 0; // the depth of the round's slot: its fits bucket
         // tput: slots whose pass is the replay after a checkpoint restore, that restore's wall, and the restores
         //   done in this pass (not host time of this pass: charged to the replay that follows)
         std::vector<int> replay_ids;
@@ -4125,17 +4087,18 @@ private:
         const int64_t t_round = ggml_time_us() - spec_rt.t0_us;
         if (!spec_rt.replay_ids.empty()) {
             // the complete rollback cycle: the restore (in the rejecting pass) + this whole replay pass
-            spec_fit_rb.add(spec_rt.n_rows, (spec_rt.replay_restore_us + t_round) / 1e3);
+            spec_tput_fits.at(spec_rt.n_kv).rb.add(spec_rt.n_rows, (spec_rt.replay_restore_us + t_round) / 1e3);
             return;
         }
         const int64_t t_host  = std::max<int64_t>(0, t_round - spec_rt.draft_us - spec_rt.catchup_us - spec_rt.verify_us -
                                                      spec_rt.restore_us);
+        auto & f = spec_tput_fits.at(spec_rt.n_kv);
         if (!spec_rt.slot_ids.empty()) {
-            spec_fit_draft.add(spec_rt.n_draft_req, spec_rt.draft_us / 1e3);
+            f.draft.add(spec_rt.n_draft_req, spec_rt.draft_us / 1e3);
         }
-        spec_fit_verify .add(spec_rt.n_rows, spec_rt.verify_us  / 1e3);
-        spec_fit_catchup.add(spec_rt.n_rows, spec_rt.catchup_us / 1e3);
-        spec_fit_host   .add(0.0,            t_host             / 1e3);
+        f.verify .add(spec_rt.n_rows, spec_rt.verify_us  / 1e3);
+        f.catchup.add(spec_rt.n_rows, spec_rt.catchup_us / 1e3);
+        f.host   .add(0.0,            t_host             / 1e3);
     }
 
     // [TAG_SPEC_DRAFT_POLICY] the draft length of this round for a slot that may draft up to n_draft_max (0 = true zero)
@@ -4148,14 +4111,17 @@ private:
         const double t_tok = (double) dp.n_max_adaptive_t_tok + (double) dp.n_max_adaptive_k_tok*(double) n_kv;
         common_spec_tput_cost c;
         double h_b = 0.0;
-        const bool ok = spec_fit_draft  .get(c.d0, c.d1, 0.5*t_tok) &&
-                        spec_fit_verify .get(c.v0, c.v1, 0.5*t_tok) &&
-                        spec_fit_catchup.get(c.c0, c.c1, 0.0) &&
-                        spec_fit_host   .get(c.host, h_b, 0.0);
+        // the fits of this slot's depth bucket only (samples from other depths never price this one); a bucket
+        //   that is not warm yet takes the prior path below (the configured length, cooldown still on)
+        const auto & f = spec_tput_fits.at(n_kv);
+        const bool ok = f.draft  .get(c.d0, c.d1, 0.5*t_tok) &&
+                        f.verify .get(c.v0, c.v1, 0.5*t_tok) &&
+                        f.catchup.get(c.c0, c.c1, 0.0) &&
+                        f.host   .get(c.host, h_b, 0.0);
         // the rollback cycle (restore + replay pass of r rows); before its fit is usable: a replay pass priced as a
         //   plain round of r rows (no restore)
         double r_b = 0.0;
-        if (!spec_fit_rb.get(c.r0, r_b, c.v1 + c.c1)) {
+        if (!f.rb.get(c.r0, r_b, c.v1 + c.c1)) {
             c.r0 = c.v0 + c.c0 + c.host;
             r_b  = c.v1 + c.c1;
         }
@@ -4176,13 +4142,14 @@ private:
             slot.stats.n_spec_probe_rounds++;
         }
         if (trace > 0 && n != slot.spec_n_max_last) {
-            SLT_INF(slot, "draft policy tput: %d -> %d (rule %d, %s, cooldown %d, n_kv %d, draft %.2f+%.2fn, verify %.2f+%.2fm, "
+            SLT_INF(slot, "draft policy tput: %d -> %d (rule %d, %s, cooldown %d, n_kv %d bucket %d, draft %.2f+%.2fn, verify %.2f+%.2fm, "
                     "catch-up %.2f+%.2fm, host %.2f ms, rollback %.2f+%.2fr free %d, %.4f tok/ms)\n", slot.spec_n_max_last, n, n_rule,
-                    ok ? "measured" : "warm-up", slot.spec_cd.c, n_kv, c.d0, c.d1, c.v0, c.v1, c.c0, c.c1, c.host,
+                    ok ? "measured" : "warm-up", slot.spec_cd.c, n_kv, common_spec_tput_bucket(n_kv), c.d0, c.d1, c.v0, c.v1, c.c0, c.c1, c.host,
                     c.r0, c.r1, c.n_rb_free, rate);
         }
         slot.spec_n_max_last = n;
         slot.spec_tput_n_req = n;
+        spec_rt.n_kv         = n_kv;
         metrics.spec_adaptive_n_max = (uint64_t) n;
         return n;
     }
@@ -4298,6 +4265,7 @@ private:
             spec_rt.n_draft_req   = 0;
             spec_rt.n_rows        = 0;
             spec_rt.n_rows_expect = 0;
+            spec_rt.n_kv          = 0;
             spec_rt.replay_ids.clear();
             spec_rt.replay_restore_us = 0;
             spec_rt.restore_us        = 0;
@@ -4524,6 +4492,7 @@ private:
                                 slot.spec_is_replay && slot.spec_n_committed == slot.spec_draft.size()) {
                             spec_rt.replay_ids.push_back(slot.id);
                             spec_rt.replay_restore_us = slot.spec_rb_restore_us;
+                            spec_rt.n_kv              = spec_n_kv_depth(slot);
                             spec_rt.n_rows_expect     = 1 + (int) slot.spec_draft.size();
                             slot.spec_rb_restore_us   = 0;
                         }
