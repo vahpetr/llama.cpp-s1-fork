@@ -434,14 +434,30 @@ static int64_t mtime_s(const fs::path & p) {
 }
 
 // the fingerprint recorded in an entry's .meta, empty if unreadable
-static std::string meta_fingerprint(const std::string & path) {
+// io_error (Codex gate r2 Major 2): the file exists but could not be read - its identity is unknown, not damaged
+static std::string meta_fingerprint(const std::string & path, bool * io_error = nullptr) {
     try {
         std::ifstream fm(path);
         if (!fm) {
+            std::error_code ec;
+            if (io_error && (fs::exists(path, ec) || ec)) {
+                *io_error = true;
+            }
             return "";
         }
         const std::string text((std::istreambuf_iterator<char>(fm)), std::istreambuf_iterator<char>());
+        if (fm.bad()) {
+            if (io_error) {
+                *io_error = true;
+            }
+            return "";
+        }
         return json::parse(text).value("fingerprint", std::string());
+    } catch (const std::bad_alloc &) {
+        if (io_error) {
+            *io_error = true;
+        }
+        return "";
     } catch (const std::exception &) {
         return "";
     }
@@ -1886,6 +1902,11 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
     }
     uint32_t magic = 0;
     if (!get(fm, magic) || (magic != MAP_ENV_MAGIC && !(legacy_ok && magic == MAP_MAGIC))) {
+        // [TAG_DISK_READ_STATUS] (Codex gate r2 Major 2) a read error is inconclusive, only a read that worked is damage
+        if (fm.bad()) {
+            DSK_WRN("%s: read error at the state envelope, keeping it\n", map_path.c_str());
+            return SERVER_DISK_LOAD_OTHER;
+        }
         DSK_WRN("%s: no state envelope\n", map_path.c_str());
         return SERVER_DISK_LOAD_INVALID;
     }
@@ -1895,6 +1916,10 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
         uint32_t ver = 0;
         std::string h;
         if (!get(fm, ver) || ver != ENVELOPE_VERSION || !get_str(fm, h) || h != env_h || !get(fm, n_total) || n_total == 0) {
+            if (fm.bad()) {
+                DSK_WRN("%s: read error at the state envelope, keeping it\n", map_path.c_str());
+                return SERVER_DISK_LOAD_OTHER;
+            }
             DSK_WRN("%s: state envelope mismatch (descriptor %s, expected %s)\n", map_path.c_str(), h.c_str(), env_h.c_str());
             return SERVER_DISK_LOAD_INVALID;
         }
@@ -2103,6 +2128,7 @@ void server_disk_cache::refresh_status() {
         fl.push_back({
             { "key",       ns.key       },
             { "legacy",    ns.legacy    },
+            { "incomplete", ns.incomplete }, // never collected this scan (listing / identity unknown)
             { "n_entries", ns.n_entries },
             { "bytes",     ns.bytes     },
             { "age_s",     now_s() - ns.t_newest },
@@ -2180,6 +2206,7 @@ bool server_disk_cache::scan_foreign() {
     const std::string own = fingerprint.substr(0, 16);
     std::map<std::string, foreign_ns> found;
     bool complete = true;
+    bool any_unidentified = false;
     const auto add_maps = [&complete](foreign_ns & ns, const fs::path & base, const std::string & id) {
         std::vector<std::string> keys;
         for (const char * ext : { ".tgt", ".dft" }) {
@@ -2231,12 +2258,26 @@ bool server_disk_cache::scan_foreign() {
                 complete = false;
             }
         } else if (de.is_regular_file(ec_t) && name.size() == 21 && name.compare(16, 5, ".meta") == 0) {
-            const std::string fp = meta_fingerprint(de.path().string());
-            const std::string k  = fp.size() >= 16 ? fp.substr(0, 16) : std::string("unknown");
+            bool unreadable = false;
+            const std::string fp = meta_fingerprint(de.path().string(), &unreadable);
+            const std::string k  = unreadable ? std::string("unidentified") :
+                                   fp.size() >= 16 ? fp.substr(0, 16) : std::string("unknown");
             foreign_ns & ns = found["legacy:" + k];
             ns.key    = k;
             ns.path   = root;
             ns.legacy = true;
+            if (unreadable) {
+                // [TAG_DISK_READ_STATUS] (Codex gate r2 Major 2) a legacy entry whose .meta cannot be read now has an
+                //   unknown identity: it may belong to any legacy fingerprint (an adopt source among them), so no legacy
+                //   namespace is collected while it stays unidentified (marked below), and it is never collected itself
+                ns.incomplete = true;
+                any_unidentified = true;
+                if (!warned_unidentified) {
+                    warned_unidentified = true;
+                    DSK_WRN("legacy entry %s: .meta not readable, identity unknown - legacy files are kept while it is "
+                            "unidentified (logged once)\n", name.substr(0, 16).c_str());
+                }
+            }
             ns.n_entries++;
             const std::string id = name.substr(0, 16);
             ns.ids.push_back(id);
@@ -2246,6 +2287,11 @@ bool server_disk_cache::scan_foreign() {
                 ns.t_newest = std::max(ns.t_newest, mtime_s(p));
             }
             add_maps(ns, fs::path(root), id);
+        }
+    }
+    if (any_unidentified) {
+        for (auto & it : found) {
+            it.second.incomplete = it.second.incomplete || it.second.legacy;
         }
     }
     if (!list_dir(fs::path(root) / "ckpt", ls, true, &err)) {

@@ -235,6 +235,7 @@ struct server_disk_cache {
     // [TAG_DISK_READ_STATUS] (Hermes gate Major 1) an own entry / block / checkpoint skipped at start on an I/O error:
     //   what it references is unknown, so no block or checkpoint is collected for the rest of this run
     bool gc_hold = false;
+    bool warned_unidentified = false; // an unreadable legacy .meta was reported (once per run)
 
     bool ckpt_store(const std::string & key, const common_prompt_checkpoint & c, bool * written);
     std::string blob_path(const std::string & key) const;
