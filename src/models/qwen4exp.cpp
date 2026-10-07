@@ -631,10 +631,36 @@ static int64_t qwen4exp_qsa_chunk() {
         if (v > 0 && v < 64) {
             LLAMA_LOG_WARN("%s: LLAMA_QSA_CHUNK=%lld raised to 64\n", __func__, v);
         }
-        return (int64_t) (v <= 0 ? 0 : std::max<long long>(v, 64));
+        const int64_t c = (int64_t) (v <= 0 ? 0 : std::max<long long>(v, 64));
+        // [TAG_QSA_RELU_INPLACE] (R80.1 v49, B5) the proof line, printed once at the first QSA graph (the reserve at load)
+        if (c > 0) {
+            LLAMA_LOG_WARN("%s: qsa_chunk: on (C=%lld, LLAMA_QSA_CHUNK=%s): scan ubatches with more than C queries run the "
+                           "query-dependent half of each QSA layer chunk by chunk\n", __func__, (long long) c, s);
+        } else {
+            LLAMA_LOG_WARN("%s: qsa_chunk: off (LLAMA_QSA_CHUNK %s)\n", __func__, s ? s : "unset");
+        }
+        return c;
     }();
 
     return chunk;
+}
+
+// [TAG_QSA_RELU_INPLACE] (R80.1 v49, QSA depth plan B5 step 2) LLAMA_QSA_RELU_INPLACE=1 (default 0): the indexer
+// score's ReLU (build_qsa_select) runs in place on the score GEMM's output (ggml_relu_inplace) instead of into a new
+// [n_blocks, n_idx_h, n_tps, n_stream] f32 plane. Exact: the same unary kernel computes max(x, 0) element by element
+// from the same input, only into the input's own memory; nothing else reads the pre-ReLU score (the head sums read
+// the ReLU output). What it saves is the allocator's second plane where it does not already reuse the GEMM output.
+// Off = today's graph node for node.
+static bool qwen4exp_qsa_relu_inplace() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_RELU_INPLACE");
+        const bool on = s != nullptr && atoi(s) != 0;
+        LLAMA_LOG_WARN("%s: qsa_relu_inplace: %s (LLAMA_QSA_RELU_INPLACE %s)\n", __func__, on ? "on" : "off",
+                       s ? s : "unset");
+        return on;
+    }();
+
+    return enabled;
 }
 
 // [TAG_QSA_CHUNK_PAD] (M4.3) LLAMA_QSA_CHUNK_PAD=1: [TAG_QSA_CHUNK] cuts the ubatch into full chunks of C queries
@@ -1949,7 +1975,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
     // [TAG_QSA_POOL_REMAP] the same product read straight from the store: [n_blocks, n_idx_h*n_tps, n_stream] either way
     ggml_tensor * score = pooled ? ggml_mul_mat(ctx0, pooled, q) : ggml_mul_mat_rows(ctx0, pool_store, pool_remap, q);
     score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-    score = ggml_relu(ctx0, score);
+    score = qwen4exp_qsa_relu_inplace() ? ggml_relu_inplace(ctx0, score) : ggml_relu(ctx0, score); // [TAG_QSA_RELU_INPLACE]
 
     // the heads sit side by side on ne[1] and there are few of them, so summing slices beats a
     // transpose that would carry the whole block by token surface twice over
