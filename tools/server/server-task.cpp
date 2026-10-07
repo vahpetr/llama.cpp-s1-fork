@@ -1954,7 +1954,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
-                               const std::string & desc) {
+                               const std::string & desc, std::vector<uint8_t> * swapped_spec, bool * swapped) {
+    if (swapped) {
+        *swapped = false;
+    }
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -2030,6 +2033,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         prompt = std::move(it_best->prompt);
+        if (swapped_spec) {
+            *swapped_spec = std::move(it_best->data.spec);
+        }
+        if (swapped) {
+            *swapped = true;
+        }
 
         states.erase(it_best);
     }

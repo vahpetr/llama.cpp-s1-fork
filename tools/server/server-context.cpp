@@ -415,6 +415,11 @@ struct server_slot {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+        // [TAG_CACHE_COMPAT2] the speculative carry belongs to this prompt: it travels with the entry (one carry is
+        //   serializable; with more stateful implementations it stays empty and the swap-in resets the draft side)
+        if (spec && common_speculative_n_stateful(spec) <= 1) {
+            common_speculative_get_state(spec, id, cur->data.spec);
+        }
 
         return true;
     }
@@ -440,9 +445,29 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, state_desc());
+        std::vector<uint8_t> carry;
+        bool swapped = false;
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, state_desc(), &carry, &swapped);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+            if (spec) {
+                common_speculative_reset_state(spec, id); // [TAG_SPEC_RESET] the caller clears the sequence
+            }
+        } else if (swapped && spec && !common_speculative_set_state(spec, id, carry)) {
+            // [TAG_CACHE_COMPAT2] (astra compat2 r2) a RAM swap-in replaced the target + draft states: the drafter's
+            //   carry must be the swapped-in prompt's. Not restorable (none saved, several stateful implementations,
+            //   schema mismatch): as the legacy /slots restore - drop the draft sequence and the carry, the prompt
+            //   is partial (not published to the disk cache until fully recomputed)
+            common_speculative_reset_state(spec, id);
+            if (ctx_dft) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), id, -1, -1);
+            }
+            prompt.partial = prompt.partial || ctx_dft != nullptr;
+            SLT_INF(*this, "RAM swap-in of %zu tokens: speculative carry not restorable (%zu bytes) - draft sequence "
+                    "and carry reset%s\n", prompt.tokens.size(), carry.size(), prompt.partial ? ", the prompt is partial" : "");
+        } else if (swapped && spec) {
+            SLT_DBG(*this, "RAM swap-in of %zu tokens: speculative carry restored (%zu bytes)\n", prompt.tokens.size(),
+                    carry.size());
         }
 
         return res;

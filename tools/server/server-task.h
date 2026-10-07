@@ -664,9 +664,10 @@ struct server_prompt {
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
+    std::vector<uint8_t> spec; // [TAG_CACHE_COMPAT2] the speculative carry (common_speculative_get_state) at save
 
     size_t size() const {
-        return main.size() + drft.size();
+        return main.size() + drft.size() + spec.size();
     }
 };
 
@@ -709,8 +710,10 @@ struct server_prompt_cache {
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft,
                                       const std::string & desc = "");
 
+    // swapped_spec: when a cached state was swapped in, set to its saved speculative carry and *swapped = true (the
+    //   caller restores the carry or resets the draft side)
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
-              const std::string & desc = "");
+              const std::string & desc = "", std::vector<uint8_t> * swapped_spec = nullptr, bool * swapped = nullptr);
 
     void update();
 };
