@@ -3,7 +3,10 @@
 #include "server-disk-cache.h"
 #include "arg.h"
 
+#include <atomic>
 #include <cstdio>
+#include <iterator>
+#include <thread>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -178,6 +181,77 @@ int main() {
         CHECK(!server_cache_memo_get(dir.string(), mk, m));
         CHECK(server_cache_memo_put(dir.string(), mk, "0123456789abcdef"));
         CHECK(server_cache_memo_get(dir.string(), mk, m) && m == "0123456789abcdef");
+        // [TAG_CACHE_COMPAT2] malformed / truncated / foreign records are rejected; a failed value is never published
+        const fs::path mp = dir / "compat-memo" / (mk + ".txt");
+        std::string rec;
+        {
+            std::ifstream f(mp, std::ios::binary);
+            rec.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        const auto put_raw = [&](const std::string & text) {
+            std::ofstream f(mp, std::ios::binary | std::ios::trunc);
+            f << text;
+        };
+        for (size_t n = 0; n < rec.size(); n++) {
+            put_raw(rec.substr(0, n)); // every truncation
+            if (server_cache_memo_get(dir.string(), mk, m)) {
+                fprintf(stderr, "FAIL truncated memo (%zu of %zu bytes) accepted\n", n, rec.size());
+                n_fail++;
+            }
+        }
+        for (size_t i = 0; i < rec.size(); i++) {
+            std::string bad = rec;
+            bad[i] = bad[i] == 'a' ? 'b' : 'a'; // every single-byte corruption
+            put_raw(bad);
+            if (server_cache_memo_get(dir.string(), mk, m)) {
+                fprintf(stderr, "FAIL corrupted memo (byte %zu) accepted\n", i);
+                n_fail++;
+            }
+        }
+        put_raw(rec + "x");
+        CHECK(!server_cache_memo_get(dir.string(), mk, m));
+        put_raw("0123456789abcdef\n"); // the step-2 r0 format
+        CHECK(!server_cache_memo_get(dir.string(), mk, m));
+        const std::string mk2 = server_cache_memo_key(cheap_b, "cpu");
+        CHECK(server_cache_memo_put(dir.string(), mk2, "1111111111111111"));
+        fs::copy_file(dir / "compat-memo" / (mk2 + ".txt"), mp, fs::copy_options::overwrite_existing);
+        CHECK(!server_cache_memo_get(dir.string(), mk, m)); // another key's record under this name
+        CHECK(!server_cache_memo_put(dir.string(), mk, "unmeasured-0123"));
+        // concurrent publishers + a reader: never a torn or invalid record, no temporary left behind
+        {
+            std::atomic<int> bad_reads{0};
+            std::atomic<bool> stop{false};
+            std::vector<std::thread> th;
+            for (int t = 0; t < 6; t++) {
+                th.emplace_back([&, t]() {
+                    for (int k = 0; k < 40; k++) {
+                        if (!server_cache_memo_put(dir.string(), mk, t % 2 ? "aaaaaaaaaaaaaaaa" : "bbbbbbbbbbbbbbbb")) {
+                            bad_reads++;
+                        }
+                    }
+                });
+            }
+            std::thread rd([&]() {
+                while (!stop) {
+                    std::string v;
+                    if (server_cache_memo_get(dir.string(), mk, v) && v != "aaaaaaaaaaaaaaaa" && v != "bbbbbbbbbbbbbbbb") {
+                        bad_reads++;
+                    }
+                }
+            });
+            for (auto & x : th) {
+                x.join();
+            }
+            stop = true;
+            rd.join();
+            CHECK(bad_reads == 0);
+            CHECK(server_cache_memo_get(dir.string(), mk, m));
+            size_t n_tmp = 0;
+            for (const auto & de : fs::directory_iterator(dir / "compat-memo")) {
+                n_tmp += de.path().filename().string().find(".tmp") != std::string::npos;
+            }
+            CHECK(n_tmp == 0);
+        }
         fs::remove_all(dir);
     }
     // [TAG_CACHE_COMPAT2] runtime identity of the memo: stable within a process, carries the CPU feature list and the

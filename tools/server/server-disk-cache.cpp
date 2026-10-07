@@ -14,7 +14,9 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <atomic>
 #include <set>
+#include <thread>
 #include <sstream>
 #include <type_traits>
 #include <unistd.h> // environ
@@ -898,30 +900,90 @@ static fs::path memo_path(const std::string & root, const std::string & memo_key
     return fs::path(root) / "compat-memo" / (memo_key + ".txt");
 }
 
+// [TAG_CACHE_COMPAT2] (Codex compat2 C memo race) one record per file, validated whole on read:
+//   "compat-memo/1 key=<memo key> meas=<hash16> sum=<hash16 of the text before ' sum='>\n" and nothing else
+static std::string memo_record(const std::string & memo_key, const std::string & measure_h) {
+    const std::string head = "compat-memo/1 key=" + memo_key + " meas=" + measure_h;
+    return head + " sum=" + h16_of(head) + "\n";
+}
+
+static bool is_hash16(const std::string & v) {
+    return v.size() == 16 && v.find_first_not_of("0123456789abcdef") == std::string::npos;
+}
+
 bool server_cache_memo_get(const std::string & root, const std::string & memo_key, std::string & measure_h) {
-    std::ifstream f(memo_path(root, memo_key));
-    std::string v;
-    if (!f.is_open() || !std::getline(f, v) || v.size() != 16 || v.find_first_not_of("0123456789abcdef") != std::string::npos) {
+    std::ifstream f(memo_path(root, memo_key), std::ios::binary);
+    if (!f.is_open()) {
         return false;
+    }
+    std::string text;
+    char buf[512];
+    while (f.read(buf, sizeof(buf)) || f.gcount() > 0) {
+        text.append(buf, (size_t) f.gcount());
+        if (text.size() > 4096) {
+            return false;
+        }
+    }
+    if (f.bad()) {
+        return false;
+    }
+    const std::string pre = "compat-memo/1 key=" + memo_key + " meas=";
+    if (text.rfind(pre, 0) != 0 || text.size() < pre.size() + 16) {
+        return false;
+    }
+    const std::string v = text.substr(pre.size(), 16);
+    if (!is_hash16(v) || text != memo_record(memo_key, v)) {
+        return false; // truncated, torn, foreign key or a corrupt checksum
     }
     measure_h = v;
     return true;
 }
 
 bool server_cache_memo_put(const std::string & root, const std::string & memo_key, const std::string & measure_h) {
+    if (!is_hash16(measure_h)) {
+        return false; // only a real measurement is ever published
+    }
     std::error_code ec;
     const fs::path p = memo_path(root, memo_key);
     fs::create_directories(p.parent_path(), ec);
-    const fs::path tmp = p.string() + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::trunc);
-        f << measure_h << "\n";
-        if (!f.good()) {
-            return false;
-        }
+    if (ec) {
+        return false;
     }
-    fs::rename(tmp, p, ec);
-    return !ec;
+    // a unique temporary per writer: two publishers never share an inode; rename is the last step
+    static std::atomic<uint64_t> n_put{0};
+    const fs::path tmp = p.string() + ".tmp." + std::to_string((long long) getpid()) + "." +
+                         std::to_string(n_put.fetch_add(1)) + "." +
+                         std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    const std::string rec = memo_record(memo_key, measure_h);
+    const int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = true;
+    for (size_t off = 0; ok && off < rec.size();) {
+        const ssize_t n = write(fd, rec.data() + off, rec.size() - off);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        ok = n > 0;
+        off += ok ? (size_t) n : 0;
+    }
+    ok = ok && fsync(fd) == 0;
+    ok = (close(fd) == 0) && ok;
+    if (ok) {
+        fs::rename(tmp, p, ec);
+        ok = !ec;
+    }
+    if (!ok) {
+        fs::remove(tmp, ec);
+        return false;
+    }
+    const int dfd = open(p.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd >= 0) {
+        fsync(dfd); // the rename's durability; best effort (a lost rename is a re-measurement, never a wrong key)
+        close(dfd);
+    }
+    return true;
 }
 
 std::string server_cache_measure_component(const std::string & measure_h) {

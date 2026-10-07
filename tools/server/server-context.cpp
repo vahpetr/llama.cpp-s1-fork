@@ -1565,11 +1565,6 @@ private:
                     "for a later start)\n", cache_meas_how.empty() ? "not prepared" : cache_meas_how.c_str(), meas.c_str());
         } else {
             SRV_INF("cache-compat: measurement %s (%s)\n", meas.c_str(), cache_meas_how.c_str());
-            if (!cache_memo_key_pending.empty() &&
-                !server_cache_memo_put(disk_cache->root_dir(), cache_memo_key_pending, meas)) {
-                SRV_WRN("%s", "cache-compat: the measurement memo could not be written\n");
-            }
-            cache_memo_key_pending.clear();
         }
         server_cache_key_parts p;
         p.model_id   = server_disk_cache_model_identity(params_base);
@@ -1582,6 +1577,17 @@ private:
                 fp.substr(0, 16).c_str(), p.model_id.c_str(), p.desc_h.c_str(), meas.c_str(), p.depth_version,
                 p.env_digest.c_str(), p.param_digest.c_str(), cheap.substr(0, 16).c_str());
         return fp;
+    }
+
+    // [TAG_CACHE_COMPAT2] publish a fresh measurement to the memo - only while this process holds the cache root's
+    //   lock (after init()), never for a failed measurement
+    void cache_compat_publish() {
+        if (!cache_memo_key_pending.empty() && disk_cache && disk_cache->owns_root() && !cache_meas.empty()) {
+            if (!server_cache_memo_put(disk_cache->root_dir(), cache_memo_key_pending, cache_meas)) {
+                SRV_WRN("%s", "cache-compat: the measurement memo could not be written\n");
+            }
+        }
+        cache_memo_key_pending.clear();
     }
 
     // [TAG_DEEP_CKPT] a checkpoint leaving the slot's in-RAM list goes to the deep store (if the schedule keeps it)
@@ -2123,10 +2129,12 @@ private:
                                       "/" + common_speculative_state_schema(spec.get()));
             disk_cache->set_fingerprint(cache_compat_key(server_disk_cache_fingerprint(params_base, n_ctx)));
             disk_cache->init();
+            cache_compat_publish();
         } else if (disk_cache) {
             disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types) +
                                       "/" + common_speculative_state_schema(spec.get()));
             disk_cache->revalidate(cache_compat_key(server_disk_cache_fingerprint(params_base, n_ctx)));
+            cache_compat_publish();
         }
 
         if (params_base.n_ctx_checkpoints > 0) {

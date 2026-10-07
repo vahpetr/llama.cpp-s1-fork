@@ -203,6 +203,7 @@ struct server_disk_cache {
     //   after set_descriptor() and the measurement
     void set_fingerprint(const std::string & fp);
     const std::string & root_dir() const { return root; }
+    bool owns_root() const { return lock_fd >= 0; } // [TAG_DISK_LOCK] this process holds the cache root's lock
 
   private:
     // [TAG_DISK_NAMESPACE] <root>/ns-<key>/ holds this fingerprint's entries, ckpt/ and blk/ (its new blocks,
