@@ -1624,7 +1624,11 @@ std::string server_task_result_metrics::to_metrics() {
         }, {
             "disk_cache_loads_total", "Disk prompt cache: conversations loaded instead of re-processed", (double) metrics.disk.n_loads
         }, {
-            "disk_cache_load_failures_total", "Disk prompt cache: loads that failed (entry dropped, normal prefill)", (double) metrics.disk.n_load_failed
+            "disk_cache_load_failures_total", "Disk prompt cache: loads that failed on an invalid entry (entry dropped, normal prefill)", (double) metrics.disk.n_load_failed
+        }, {
+            "disk_cache_load_capacity_failures_total", "Disk prompt cache: loads that found no room in the KV cache (entry kept)", (double) metrics.disk.n_load_capacity
+        }, {
+            "disk_cache_load_other_failures_total", "Disk prompt cache: loads that failed inconclusively (entry kept, normal prefill)", (double) metrics.disk.n_load_other
         }, {
             "disk_cache_deep_rewinds_total", "Disk prompt cache: rewinds to a stored recurrent checkpoint", (double) metrics.disk.n_deep_rewinds
         }, {

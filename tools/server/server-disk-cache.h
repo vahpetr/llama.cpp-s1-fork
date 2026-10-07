@@ -52,6 +52,16 @@ struct server_disk_cache_entry {
     bool     has_dft = false;
 };
 
+// [TAG_DISK_LOAD_RESULT] why a load failed decides what happens to the entry: only an invalid entry (seal / hash /
+//   format of any of its files) is erased; a capacity failure (the verified state does not fit the free cells) and an
+//   inconclusive one keep it
+enum server_disk_load_result {
+    SERVER_DISK_LOAD_OK,
+    SERVER_DISK_LOAD_INVALID,
+    SERVER_DISK_LOAD_CAPACITY,
+    SERVER_DISK_LOAD_OTHER,
+};
+
 struct server_deep_ckpt_meta {
     std::string key;
     int64_t     n_tokens = 0;
@@ -77,9 +87,9 @@ struct server_disk_cache {
     // index of the entry with the longest common prefix with tokens, if longer than lcp_min and it fits n_ctx_slot
     int find(const server_tokens & tokens, size_t lcp_min, size_t n_ctx_slot, size_t * lcp_out) const;
 
-    // load entry idx into seq id_slot and prompt; on false the slot's memory is undefined (caller clears it)
-    bool load(int idx, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot,
-              server_prompt & prompt);
+    // load entry idx into seq id_slot and prompt; unless OK the slot's memory is undefined (caller clears it)
+    server_disk_load_result load(int idx, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec,
+                                 int32_t id_slot, server_prompt & prompt);
 
     // [TAG_DEEP_CKPT] store a checkpoint of prompt (taken at c.n_tokens) and reference it from prompt.deep, then
     // re-apply the depth schedule to prompt.deep
@@ -108,7 +118,15 @@ struct server_disk_cache {
     uint64_t n_loads = 0;
     uint64_t n_evict = 0;
     uint64_t n_deep_rewinds = 0;
-    uint64_t n_load_failed  = 0;
+    uint64_t n_load_failed  = 0; // invalid: the entry was dropped
+    uint64_t n_load_capacity = 0; // the state did not fit the free cells: the entry was kept
+    uint64_t n_load_other   = 0; // inconclusive: the entry was kept
+
+    // the entry with this id is never evicted (a load retried across purges) - empty: none
+    std::string protect_id;
+
+    int find_id(const std::string & id) const;
+    const std::string & entry_id(int idx) const { return entries[idx].id; }
     uint64_t bytes_written  = 0;
     uint64_t bytes_loaded   = 0;
     uint64_t save_us        = 0;
@@ -151,7 +169,7 @@ struct server_disk_cache {
     std::string blob_path(const std::string & key) const;
     bool save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
                      std::vector<std::string> & keys, uint64_t & n_logical, uint64_t & n_written);
-    bool load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path);
+    server_disk_load_result load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path);
     static bool read_map_keys(const std::string & map_path, std::vector<std::string> & keys);
     void blob_gc();
 

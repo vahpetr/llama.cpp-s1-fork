@@ -428,7 +428,7 @@ struct server_slot {
         return disk_cache.save(ctx_tgt, ctx_dft, spec, id, prompt);
     }
 
-    bool disk_load(server_disk_cache & disk_cache, int idx) {
+    server_disk_load_result disk_load(server_disk_cache & disk_cache, int idx) {
         prompt_clear(); // both models' memory of this sequence, through the slot's own memory wrapper
 
         return disk_cache.load(idx, ctx_tgt, ctx_dft, spec, id, prompt);
@@ -1241,6 +1241,8 @@ public:
             res.disk.n_evict        = disk_cache->n_evict;
             res.disk.n_deep_rewinds = disk_cache->n_deep_rewinds;
             res.disk.n_load_failed  = disk_cache->n_load_failed;
+            res.disk.n_load_capacity = disk_cache->n_load_capacity;
+            res.disk.n_load_other   = disk_cache->n_load_other;
             res.disk.bytes_written  = disk_cache->bytes_written;
             res.disk.bytes_loaded   = disk_cache->bytes_loaded;
             res.disk.save_us        = disk_cache->save_us;
@@ -2208,7 +2210,29 @@ private:
                 const int idx = disk_cache->find(task.tokens, lcp_slot + margin, ret->n_ctx, &lcp_disk);
                 if (idx >= 0) {
                     SLT_INF(*ret, "disk cache: loading a stored prompt, common prefix %zu vs %zu in the slot\n", lcp_disk, lcp_slot);
-                    if (!ret->disk_load(*disk_cache, idx)) {
+                    server_disk_load_result res = ret->disk_load(*disk_cache, idx);
+
+                    // [TAG_DISK_LOAD_RESULT] no room in a unified pool: purge idle slots (they are saved first) and
+                    //   retry until the entry loads or nothing is left to purge; the entry is addressed by its id and
+                    //   kept from eviction meanwhile (a victim's save can evict entries and move the others)
+                    if (res == SERVER_DISK_LOAD_CAPACITY) {
+                        disk_cache->protect_id = disk_cache->entry_id(idx);
+                        while (res == SERVER_DISK_LOAD_CAPACITY) {
+                            ret->prompt_clear();
+                            if (!try_clear_idle_slots()) {
+                                break;
+                            }
+                            const int idx_retry = disk_cache->find_id(disk_cache->protect_id);
+                            if (idx_retry < 0) {
+                                break;
+                            }
+                            SLT_INF(*ret, "disk cache: retrying the load after a purge (%s)\n", disk_cache->protect_id.c_str());
+                            res = ret->disk_load(*disk_cache, idx_retry);
+                        }
+                        disk_cache->protect_id.clear();
+                    }
+
+                    if (res != SERVER_DISK_LOAD_OK) {
                         ret->prompt_clear();
                     }
                 }

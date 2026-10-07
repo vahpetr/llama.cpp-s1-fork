@@ -10,6 +10,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -552,7 +553,7 @@ void server_disk_cache::enforce(const std::string & protect) {
 
     if (ttl_days > 0) {
         for (size_t i = 0; i < entries.size();) {
-            if (entries[i].id != protect && t_now - entries[i].t_used > (int64_t) ttl_days * 86400) {
+            if (entries[i].id != protect && entries[i].id != protect_id && t_now - entries[i].t_used > (int64_t) ttl_days * 86400) {
                 DSK_INF("expired %s (%zu tokens, idle %.1f days)\n", entries[i].id.c_str(), entries[i].tokens.size(),
                         (t_now - entries[i].t_used) / 86400.0);
                 erase(i);
@@ -570,7 +571,7 @@ void server_disk_cache::enforce(const std::string & protect) {
         size_t victim = SIZE_MAX;
         double v_min  = 0.0;
         for (size_t i = 0; i < entries.size(); i++) {
-            if (entries[i].id == protect) {
+            if (entries[i].id == protect || entries[i].id == protect_id) {
                 continue;
             }
             const double v = entry_value(entries[i], t_now);
@@ -711,7 +712,8 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
 
     // older saves of the same conversation that this one extends are obsolete
     for (size_t i = 0; i < entries.size();) {
-        if (entries[i].tokens.size() < n && prompt.tokens.get_common_prefix(entries[i].tokens) == entries[i].tokens.size()) {
+        if (entries[i].tokens.size() < n && entries[i].id != protect_id &&
+            prompt.tokens.get_common_prefix(entries[i].tokens) == entries[i].tokens.size()) {
             erase(i);
         } else {
             i++;
@@ -754,8 +756,17 @@ int server_disk_cache::find(const server_tokens & tokens, size_t lcp_min, size_t
     return best;
 }
 
-bool server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec,
-                             int32_t id_slot, server_prompt & prompt) {
+int server_disk_cache::find_id(const std::string & id) const {
+    for (size_t i = 0; i < entries.size(); i++) {
+        if (entries[i].id == id) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * ctx_dft,
+                                                common_speculative * spec, int32_t id_slot, server_prompt & prompt) {
     auto & e = entries[idx];
 
     const int64_t t_start = ggml_time_us();
@@ -781,21 +792,30 @@ bool server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * c
         erase(idx);
         n_load_failed++;
         refresh_status();
-        return false;
+        return SERVER_DISK_LOAD_INVALID;
     }
 
     llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
-    bool ok = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"));
-    if (ok && ctx_dft) {
+    server_disk_load_result res = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"));
+    if (res == SERVER_DISK_LOAD_OK && ctx_dft) {
         llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
-        ok = e.has_dft && load_stream(ctx_dft, id_slot, path(e.id, ".dft"));
+        res = e.has_dft ? load_stream(ctx_dft, id_slot, path(e.id, ".dft")) : SERVER_DISK_LOAD_INVALID;
     }
-    if (!ok) {
-        DSK_WRN("entry %s: state load failed, dropping it\n", e.id.c_str());
-        erase(idx);
-        n_load_failed++;
+    if (res != SERVER_DISK_LOAD_OK) {
+        // [TAG_DISK_LOAD_RESULT] the caller clears the slot; only an invalid entry goes
+        if (res == SERVER_DISK_LOAD_INVALID) {
+            DSK_WRN("entry %s: state load failed (invalid), dropping it\n", e.id.c_str());
+            erase(idx);
+            n_load_failed++;
+        } else if (res == SERVER_DISK_LOAD_CAPACITY) {
+            DSK_WRN("entry %s: state load failed (no room in the KV cache), keeping it\n", e.id.c_str());
+            n_load_capacity++;
+        } else {
+            DSK_WRN("entry %s: state load failed (inconclusive), keeping it\n", e.id.c_str());
+            n_load_other++;
+        }
         refresh_status();
-        return false;
+        return res;
     }
 
     if (spec && !spec_state.empty()) {
@@ -824,7 +844,7 @@ bool server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * c
             prompt.tokens.size(), prompt.checkpoints.size(), e.bytes / (1024.0 * 1024.0), ms,
             e.bytes / std::max(1e-3, ms) / 1e6, e.hits);
 
-    return true;
+    return SERVER_DISK_LOAD_OK;
 }
 
 //
@@ -1243,11 +1263,11 @@ bool server_disk_cache::read_map_keys(const std::string & map_path, std::vector<
     }
 }
 
-bool server_disk_cache::load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path) {
+server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path) {
     std::ifstream fm(map_path, std::ios::binary);
     uint32_t magic = 0;
     if (!get(fm, magic) || magic != MAP_MAGIC) {
-        return false;
+        return SERVER_DISK_LOAD_INVALID;
     }
 
     // the current segment: inline bytes come from the map itself, a block from its (verified) buffer
@@ -1315,16 +1335,20 @@ bool server_disk_cache::load_stream(llama_context * ctx, int32_t id_slot, const 
         return true;
     };
 
+    bool read_failed = false; // the stream itself (map, inline segment, block) could not supply the bytes
+
     llama_state_seq_reader r;
     r.read = [&](void * dst, size_t size) -> bool {
         auto * out = static_cast<char *>(dst);
         while (size > 0) {
             if (seg_left == 0 && !next_segment()) {
+                read_failed = true;
                 return false;
             }
             const size_t n = (size_t) std::min<uint64_t>(seg_left, size);
             if (seg_inline) {
                 if (!fm.read(out, n)) {
+                    read_failed = true;
                     return false;
                 }
             } else {
@@ -1338,9 +1362,35 @@ bool server_disk_cache::load_stream(llama_context * ctx, int32_t id_slot, const 
         return true;
     };
 
-    const bool ok = llama_state_seq_read_cb(ctx, id_slot, 0, r) > 0 && !corrupt;
+    // [TAG_DISK_LOAD_RESULT] the library reports "no room" only through its log ("failed to find ... available cells
+    //   in kv cache", KV and recurrent memory alike), so the read runs under a log hook that forwards everything and
+    //   notes that line (the same wrapping as common/fit.cpp)
+    struct cap_hook {
+        ggml_log_callback cb = nullptr;
+        void *            ud = nullptr;
+        bool              no_room = false;
+    } hook;
+    llama_log_get(&hook.cb, &hook.ud);
+    llama_log_set([](ggml_log_level level, const char * text, void * ud) {
+        auto * h = static_cast<cap_hook *>(ud);
+        if (text && strstr(text, "available cells in kv cache")) {
+            h->no_room = true;
+        }
+        if (h->cb) {
+            h->cb(level, text, h->ud);
+        }
+    }, &hook);
+    const bool ok = llama_state_seq_read_cb(ctx, id_slot, 0, r) > 0;
+    llama_log_set(hook.cb, hook.ud);
     GGML_UNUSED(done);
-    return ok;
+
+    if (ok && !corrupt) {
+        return SERVER_DISK_LOAD_OK;
+    }
+    if (corrupt || read_failed) {
+        return SERVER_DISK_LOAD_INVALID;
+    }
+    return hook.no_room ? SERVER_DISK_LOAD_CAPACITY : SERVER_DISK_LOAD_OTHER;
 }
 
 void server_disk_cache::blob_gc() {
@@ -1409,6 +1459,8 @@ void server_disk_cache::refresh_status() {
         { "saves",          n_saves             },
         { "loads",          n_loads             },
         { "load_failures",  n_load_failed       },
+        { "load_failures_capacity", n_load_capacity },
+        { "load_failures_other",    n_load_other    },
         { "deep_rewinds",   n_deep_rewinds      },
         { "evictions",      n_evict             },
         { "bytes_written",  bytes_written       },
