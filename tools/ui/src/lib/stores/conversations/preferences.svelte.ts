@@ -109,19 +109,21 @@ export class ConversationPreferences {
 	}
 
 	/**
-	 * Gets the effective reasoning effort for the active conversation.
+	 * Gets the effective reasoning effort for a conversation (default: the active one).
 	 * Returns the conversation override if set, otherwise the global default.
 	 * DEFAULT means no override is sent and the server decides.
 	 */
-	getReasoningEffort(): ReasoningEffort {
-		if (this.host.activeConversation) {
-			if (this.host.activeConversation.reasoningEffort !== undefined) {
-				return this.host.activeConversation.reasoningEffort;
+	getReasoningEffort(
+		conv: DatabaseConversation | null = this.host.activeConversation
+	): ReasoningEffort {
+		if (conv) {
+			if (conv.reasoningEffort !== undefined) {
+				return conv.reasoningEffort;
 			}
 
 			// conversations created before the tri-state store an explicit
 			// opt-out only as thinkingEnabled = false
-			if (this.host.activeConversation.thinkingEnabled === false) {
+			if (conv.thinkingEnabled === false) {
 				return ReasoningEffort.OFF;
 			}
 		}

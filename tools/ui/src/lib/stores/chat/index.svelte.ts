@@ -41,6 +41,7 @@ import type {
 	ChatMessagePromptProgress,
 	ChatMessageTimings,
 	ChatStreamCallbacks,
+	DatabaseConversation,
 	DatabaseMessage,
 	DatabaseMessageExtra,
 	ErrorDialogState
@@ -380,7 +381,11 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		return this.activity.loadingConvs;
 	}
 
-	getApiOptions(): Record<string, unknown> {
+	/**
+	 * Request options of a real turn. Conversation-specific options (reasoning effort) come
+	 * from `conversation` when given, else from the active conversation.
+	 */
+	getApiOptions(conversation?: DatabaseConversation | null): Record<string, unknown> {
 		const currentConfig = settingsStore.config;
 		const hasValue = (value: unknown): boolean =>
 			value !== undefined && value !== null && value !== '';
@@ -399,7 +404,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		if (currentConfig.excludeReasoningFromContext) apiOptions.excludeReasoningFromContext = true;
 
 		// an explicit reasoning choice overrides the server default, DEFAULT sends nothing
-		const effort = conversationsStore.preferences.getReasoningEffort();
+		// (undefined = the active conversation)
+		const effort = conversationsStore.preferences.getReasoningEffort(conversation);
 
 		if (effort !== ReasoningEffort.DEFAULT) {
 			apiOptions.enableThinking = effort !== ReasoningEffort.OFF;
@@ -1431,7 +1437,9 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			if (!allIdle || signal.aborted) return;
 
 			// the path the next request rebuilds from the database (tool calls, tool results,
-			// reasoning), with the request options of a real turn and the frozen tool list
+			// reasoning), with the request options of a real turn and the frozen tool list;
+			// conversation-specific options come from this conversation's own record, never
+			// from the active one (the user may have switched conversations meanwhile)
 			const conversation = await DatabaseService.getConversation(convId);
 
 			if (!conversation) return;
@@ -1446,7 +1454,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			await ChatService.preEncode(
 				path,
 				{
-					...this.getApiOptions(),
+					...this.getApiOptions(conversation),
 					...(model ? { model } : {}),
 					tools: frozenTools ?? undefined
 				},
