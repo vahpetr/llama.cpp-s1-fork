@@ -16,6 +16,7 @@
 #include <random>
 #include <set>
 #include <sstream>
+#include <type_traits>
 #include <unistd.h> // environ
 #include <sys/stat.h>
 #include <sys/file.h> // flock
@@ -120,6 +121,55 @@ static bool skip_vec(std::istream & f) {
     f.seekg((std::streamoff) n, std::ios::cur);
     return (bool) f;
 }
+// [TAG_STATE_DESCRIPTOR] (Codex gate r2 Minor 2 / D1) the envelope (magic, version, descriptor hash, stream length)
+//   and the .ck header are written field by field in fixed little-endian order, whatever the host; on a
+//   little-endian host the bytes equal the earlier native writes (format unchanged)
+template <typename T> static void put_le(std::ostream & f, T v) {
+    static_assert(std::is_unsigned<T>::value, "unsigned fields only");
+    uint8_t b[sizeof(T)];
+    for (size_t i = 0; i < sizeof(T); i++) {
+        b[i] = (uint8_t) (v >> (8 * i));
+    }
+    f.write(reinterpret_cast<const char *>(b), sizeof(T));
+}
+template <typename T> static bool get_le(std::istream & f, T & v) {
+    static_assert(std::is_unsigned<T>::value, "unsigned fields only");
+    uint8_t b[sizeof(T)];
+    if (!f.read(reinterpret_cast<char *>(b), sizeof(T))) {
+        return false;
+    }
+    v = 0;
+    for (size_t i = 0; i < sizeof(T); i++) {
+        v |= (T) b[i] << (8 * i);
+    }
+    return true;
+}
+static void put_str_le(std::ostream & f, const std::string & v) {
+    put_le<uint32_t>(f, (uint32_t) v.size());
+    f.write(v.data(), v.size());
+}
+static bool get_str_le(std::istream & f, std::string & v) {
+    uint32_t n = 0;
+    if (!get_le(f, n) || n > 4096) {
+        return false;
+    }
+    v.resize(n);
+    return n == 0 || (bool) f.read(v.data(), n);
+}
+
+// (Codex gate r2 Minor 2) after a container's terminator / trailer: SEALED_OK at end of file, SEALED_BAD when bytes
+//   follow, SEALED_IO when the stream failed (a read error is not damage)
+static sealed_status at_eof(std::istream & f) {
+    if (f.bad()) {
+        return SEALED_IO;
+    }
+    const auto c = f.peek();
+    if (f.bad()) {
+        return SEALED_IO;
+    }
+    return c == std::char_traits<char>::eof() ? SEALED_OK : SEALED_BAD;
+}
+
 static void put_str(std::ostream & f, const std::string & v) {
     put<uint32_t>(f, (uint32_t) v.size());
     f.write(v.data(), v.size());
@@ -282,7 +332,8 @@ static sealed_status read_aux(const std::string & path, bool with_data, std::lis
             }
         }
     }
-    return ok ? SEALED_OK : SEALED_BAD;
+    // (Codex gate r2 Minor 2) nothing may follow the trailer (the body is in memory: no read error here)
+    return ok && at_eof(f) == SEALED_OK ? SEALED_OK : SEALED_BAD;
 }
 
 static bool get_vec(std::istream & f, std::vector<uint8_t> & v) {
@@ -470,7 +521,7 @@ static std::string ckpt_fingerprint(const fs::path & p) {
     std::ifstream f(p, std::ios::binary);
     uint32_t magic = 0;
     std::string fp;
-    if (get(f, magic) && (magic == CKPT_MAGIC || magic == CKPT_ENV_MAGIC) && get_str(f, fp)) {
+    if (get_le(f, magic) && (magic == CKPT_MAGIC || magic == CKPT_ENV_MAGIC) && get_str_le(f, fp)) {
         return fp;
     }
     return "";
@@ -894,8 +945,8 @@ void server_disk_cache::init() {
             std::string fp;
             uint32_t env_ver = 0;
             std::string dh;
-            ok = get(f, magic) && magic == CKPT_ENV_MAGIC && get_str(f, fp) && fp == fp_short && get(f, env_ver) &&
-                 get_str(f, dh) && dh == desc_h && get_str(f, m.key) &&
+            ok = get_le(f, magic) && magic == CKPT_ENV_MAGIC && get_str_le(f, fp) && fp == fp_short && get_le(f, env_ver) &&
+                 get_str_le(f, dh) && dh == desc_h && get_str(f, m.key) &&
                  get(f, m.n_tokens) && get(f, m.pos_min) && get(f, m.pos_max) && m.key + ".ck" == name;
             if (!ok && f.bad()) {
                 io_keys.insert(name.substr(0, name.size() - 3));
@@ -1258,13 +1309,13 @@ server_disk_load_result server_disk_cache::verify_stream(const std::string & map
     }
     uint32_t magic = 0;
     uint64_t n_total = 0;
-    if (!get(fm, magic) || (magic != MAP_ENV_MAGIC && !(legacy_ok && magic == MAP_MAGIC))) {
+    if (!get_le(fm, magic) || (magic != MAP_ENV_MAGIC && !(legacy_ok && magic == MAP_MAGIC))) {
         return fm.bad() ? SERVER_DISK_LOAD_OTHER : SERVER_DISK_LOAD_INVALID;
     }
     if (magic == MAP_ENV_MAGIC) {
         uint32_t ver = 0;
         std::string h;
-        if (!get(fm, ver) || ver != ENVELOPE_VERSION || !get_str(fm, h) || h != env_h || !get(fm, n_total) || n_total == 0) {
+        if (!get_le(fm, ver) || ver != ENVELOPE_VERSION || !get_str_le(fm, h) || h != env_h || !get_le(fm, n_total) || n_total == 0) {
             return fm.bad() ? SERVER_DISK_LOAD_OTHER : SERVER_DISK_LOAD_INVALID;
         }
     }
@@ -1277,7 +1328,11 @@ server_disk_load_result server_disk_cache::verify_stream(const std::string & map
                 break;
             }
             if (kind == 255) {
-                return n_total == 0 || n_seen == n_total ? SERVER_DISK_LOAD_OK : SERVER_DISK_LOAD_INVALID;
+                const sealed_status e = at_eof(fm);
+                if (e == SEALED_IO) {
+                    return SERVER_DISK_LOAD_OTHER;
+                }
+                return e == SEALED_OK && (n_total == 0 || n_seen == n_total) ? SERVER_DISK_LOAD_OK : SERVER_DISK_LOAD_INVALID;
             }
             if (kind == 0) {
                 uint64_t n = 0;
@@ -1572,10 +1627,10 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
     bool ok = false;
     {
         std::ostringstream f;
-        put<uint32_t>(f, CKPT_ENV_MAGIC);
-        put_str(f, fingerprint.substr(0, 16));
-        put<uint32_t>(f, ENVELOPE_VERSION);
-        put_str(f, desc_h);
+        put_le<uint32_t>(f, CKPT_ENV_MAGIC);
+        put_str_le(f, fingerprint.substr(0, 16));
+        put_le<uint32_t>(f, ENVELOPE_VERSION);
+        put_str_le(f, desc_h);
         put_str(f, key);
         put<int64_t>(f, c.n_tokens);
         put<int32_t>(f, c.pos_min);
@@ -1752,9 +1807,9 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         std::string dh;
         // [TAG_DISK_ADOPT] an adopt source's format 5 / 6 checkpoint has no envelope: accepted on the operator's word
         const bool from_src = !it->second.src_dir.empty();
-        bool ok = get(f, magic) && (magic == CKPT_ENV_MAGIC || (from_src && magic == CKPT_MAGIC)) && get_str(f, fp);
+        bool ok = get_le(f, magic) && (magic == CKPT_ENV_MAGIC || (from_src && magic == CKPT_MAGIC)) && get_str_le(f, fp);
         if (ok && magic == CKPT_ENV_MAGIC) {
-            ok = get(f, env_ver) && get_str(f, dh);
+            ok = get_le(f, env_ver) && get_str_le(f, dh);
         } else {
             env_ver = ENVELOPE_VERSION;
             dh      = desc_h;
@@ -1875,11 +1930,11 @@ bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const 
     const std::string tmp = map_path + ".tmp";
     std::ofstream fm(tmp, std::ios::binary | std::ios::trunc);
     // [TAG_STATE_DESCRIPTOR] envelope: magic, version, descriptor hash, stream length (patched at the end)
-    put<uint32_t>(fm, MAP_ENV_MAGIC);
-    put<uint32_t>(fm, ENVELOPE_VERSION);
-    put_str(fm, env_h);
+    put_le<uint32_t>(fm, MAP_ENV_MAGIC);
+    put_le<uint32_t>(fm, ENVELOPE_VERSION);
+    put_str_le(fm, env_h);
     const auto len_at = fm.tellp();
-    put<uint64_t>(fm, 0);
+    put_le<uint64_t>(fm, 0);
     const uint64_t n_logical0 = n_logical;
 
     std::vector<uint8_t> inl;
@@ -1958,7 +2013,7 @@ bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const 
     flush_inline();
     put<uint8_t>(fm, 255);
     fm.seekp(len_at);
-    put<uint64_t>(fm, (uint64_t) n_stream);
+    put_le<uint64_t>(fm, (uint64_t) n_stream);
     fm.close();
     ok = ok && (bool) fm;
 
@@ -1988,14 +2043,14 @@ bool server_disk_cache::read_map_keys(const std::string & map_path, std::vector<
     }
     const auto bad = [&]() { return fail(fm.bad() ? SEALED_IO : SEALED_BAD); };
     uint32_t magic = 0;
-    if (!get(fm, magic) || (magic != MAP_MAGIC && magic != MAP_ENV_MAGIC)) {
+    if (!get_le(fm, magic) || (magic != MAP_MAGIC && magic != MAP_ENV_MAGIC)) {
         return bad();
     }
     if (magic == MAP_ENV_MAGIC) {
         uint32_t ver = 0;
         std::string h;
         uint64_t n = 0;
-        if (!get(fm, ver) || !get_str(fm, h) || !get(fm, n)) {
+        if (!get_le(fm, ver) || !get_str_le(fm, h) || !get_le(fm, n)) {
             return bad();
         }
     }
@@ -2005,6 +2060,10 @@ bool server_disk_cache::read_map_keys(const std::string & map_path, std::vector<
             return bad();
         }
         if (kind == 255) {
+            const sealed_status e = at_eof(fm);
+            if (e != SEALED_OK) {
+                return fail(e);
+            }
             if (st) {
                 *st = SEALED_OK;
             }
@@ -2041,7 +2100,7 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
         return SERVER_DISK_LOAD_OTHER;
     }
     uint32_t magic = 0;
-    if (!get(fm, magic) || (magic != MAP_ENV_MAGIC && !(legacy_ok && magic == MAP_MAGIC))) {
+    if (!get_le(fm, magic) || (magic != MAP_ENV_MAGIC && !(legacy_ok && magic == MAP_MAGIC))) {
         // [TAG_DISK_READ_STATUS] (Codex gate r2 Major 2) a read error is inconclusive, only a read that worked is damage
         if (fm.bad()) {
             DSK_WRN("%s: read error at the state envelope, keeping it\n", map_path.c_str());
@@ -2055,7 +2114,7 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
     if (magic == MAP_ENV_MAGIC) {
         uint32_t ver = 0;
         std::string h;
-        if (!get(fm, ver) || ver != ENVELOPE_VERSION || !get_str(fm, h) || h != env_h || !get(fm, n_total) || n_total == 0) {
+        if (!get_le(fm, ver) || ver != ENVELOPE_VERSION || !get_str_le(fm, h) || h != env_h || !get_le(fm, n_total) || n_total == 0) {
             if (fm.bad()) {
                 DSK_WRN("%s: read error at the state envelope, keeping it\n", map_path.c_str());
                 return SERVER_DISK_LOAD_OTHER;
@@ -2081,6 +2140,13 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
             return false;
         }
         if (kind == 255) {
+            const sealed_status e = at_eof(fm);
+            if (e == SEALED_IO) {
+                io_error = true;
+            } else if (e == SEALED_BAD) {
+                DSK_WRN("%s: bytes after the map terminator\n", map_path.c_str());
+                corrupt = true;
+            }
             done = true;
             return false;
         }
@@ -2180,7 +2246,7 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
 
     if (ok && !corrupt) {
         // full consumption: nothing of the stream is left unread (an unread suffix is state this context dropped)
-        const bool rest_empty = seg_left == 0 && !next_segment() && done && !corrupt;
+        const bool rest_empty = seg_left == 0 && !next_segment() && done && !corrupt && !io_error;
         if (!rest_empty && (io_error || fm.bad())) {
             return SERVER_DISK_LOAD_OTHER; // [TAG_DISK_READ_STATUS]
         }
@@ -2691,13 +2757,19 @@ void server_disk_cache::open_adopt_sources() {
             }
             src_dir_of[id] = base.string();
             server_disk_cache_entry e;
-            const bool ok = read_entry(id, a.fingerprint, e) == SEALED_OK &&
+            const sealed_status st = read_entry(id, a.fingerprint, e);
+            const bool complete = st == SEALED_OK &&
                 std::all_of(e.blobs.begin(), e.blobs.end(), [&](const std::string & k) { return blobs.count(k) > 0; });
-            if (ok) {
+            if (complete) {
                 e.src = key;
                 entries.push_back(std::move(e));
                 a.n_entries++;
             } else {
+                // (Codex gate r2 Minor 1) an entry-specific warning and the dropped counter; its files stay either way
+                DSK_WRN("adopt %s: entry %s not adopted (%s)\n", key.c_str(), id.c_str(),
+                        st == SEALED_IO ? "temporarily unreadable" : st == SEALED_OK ? "incomplete: a block is missing" :
+                        "damaged");
+                a.dropped++;
                 src_dir_of.erase(id);
             }
         }
@@ -2707,9 +2779,9 @@ void server_disk_cache::open_adopt_sources() {
             uint32_t magic = 0, env_ver = 0;
             std::string fp, dh;
             server_deep_ckpt_meta m;
-            bool ok = get(f, magic) && (magic == CKPT_MAGIC || magic == CKPT_ENV_MAGIC) && get_str(f, fp) && fp == key;
+            bool ok = get_le(f, magic) && (magic == CKPT_MAGIC || magic == CKPT_ENV_MAGIC) && get_str_le(f, fp) && fp == key;
             if (ok && magic == CKPT_ENV_MAGIC) {
-                ok = get(f, env_ver) && get_str(f, dh);
+                ok = get_le(f, env_ver) && get_str_le(f, dh);
             }
             ok = ok && get_str(f, m.key) && get(f, m.n_tokens) && get(f, m.pos_min) && get(f, m.pos_max) &&
                  m.key + ".ck" == de.path().filename().string() && m.n_tokens > 0 && !ckpts.count(m.key);
