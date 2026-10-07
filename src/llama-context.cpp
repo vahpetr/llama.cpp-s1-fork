@@ -853,9 +853,9 @@ llama_context::~llama_context() {
         // [TAG_GRAPH_CACHE] totals of this context
         const auto & t = graph_cache_tot;
         LLAMA_LOG_INFO("graph-cache: ctx=%s K=%d hit=%" PRId64 " miss=%" PRId64 " check=%" PRId64 " inval=%" PRId64
-                " evict=%" PRId64 " clear=%" PRId64 " check2=%" PRId64 " check_sched=%" PRId64 " park_fail=%" PRId64 " bypass=%" PRId64 "\n",
+                " evict=%" PRId64 " clear=%" PRId64 " check2=%" PRId64 " check_sched=%" PRId64 " park_fail=%" PRId64 " bypass=%" PRId64 " check2_state_only=%" PRId64 "\n",
                 sched_prof_ctx_name(cparams.ctx_type), graph_cache_k, t.hit, t.miss, t.check, t.inval, t.evict, t.clear,
-                t.check2, t.check_sched, t.park_fail, t.bypass);
+                t.check2, t.check_sched, t.park_fail, t.bypass, t.check2_state_only);
         graph_cache.clear(); // before the scheduler (the snapshots reference its tensors only by pointer)
     }
 
@@ -2167,10 +2167,13 @@ void llama_context::graph_cache_check_exec_pre(llm_graph_result * res, const lla
 
 void llama_context::graph_cache_check_exec_post(llm_graph_result * res) {
     GGML_UNUSED(res);
-    if (graph_cache_exec.outputs.empty() || graph_cache_exec.state.empty()) {
-        // every decode graph produces outputs and writes the memory state: an empty set means the check saw nothing
-        GGML_ABORT("graph-cache check=2: nothing to compare (%zu outputs, %zu state tensors)",
-                graph_cache_exec.outputs.size(), graph_cache_exec.state.size());
+    if (graph_cache_exec.outputs.empty() && graph_cache_exec.state.empty()) {
+        // every decode graph produces outputs or writes the memory state: an empty set means the check saw nothing
+        GGML_ABORT("graph-cache check=2: nothing to compare (no outputs, no state tensors)");
+    }
+    if (graph_cache_exec.outputs.empty()) {
+        // a state-only graph (the KV-only MTP catch-up: the cache writes are its only roots): the state bytes decide
+        graph_cache_tot.check2_state_only++;
     }
     ggml_backend_sched_synchronize(sched.get());
     std::vector<uint8_t> got;

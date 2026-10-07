@@ -224,7 +224,7 @@ struct run_out {
     std::vector<llama_token> drafts;
     std::vector<std::string> qsa_ids; // [qsa-ids] lines without the graph counter
     int64_t hit[2] = {0, 0}, miss[2] = {0, 0}, check[2] = {0, 0}, inval[2] = {0, 0}; // [0] main, [1] mtp
-    int64_t evict[2] = {0, 0}, clear[2] = {0, 0}, check2[2] = {0, 0}, check_sched[2] = {0, 0}, park_fail[2] = {0, 0}, bypass[2] = {0, 0};
+    int64_t evict[2] = {0, 0}, clear[2] = {0, 0}, check2[2] = {0, 0}, check_sched[2] = {0, 0}, park_fail[2] = {0, 0}, bypass[2] = {0, 0}, check2_state_only[2] = {0, 0};
 };
 
 static run_out run(gguf_context * meta, const char * k, const char * check, const std::string & stderr_path, int fail_take = -1,
@@ -365,6 +365,9 @@ static run_out run(gguf_context * meta, const char * k, const char * check, cons
             const int i = strcmp(ctx, "mtp") == 0 ? 1 : 0;
             out.hit[i] += h; out.miss[i] += m; out.check[i] += c; out.inval[i] += inv;
             out.evict[i] += ev; out.clear[i] += cl; out.check2[i] += c2; out.check_sched[i] += cs; out.park_fail[i] += pf; out.bypass[i] += bp;
+            if (const char * so = strstr(line.c_str(), " check2_state_only=")) {
+                out.check2_state_only[i] += atoll(so + strlen(" check2_state_only="));
+            }
         }
     }
     return out;
@@ -573,6 +576,22 @@ int main(int argc, char ** argv) {
         }
         run(meta.get(), "8", argv[4], argv[3]);
         return 0; // not aborted: the check missed the corruption
+    }
+    if (argc == 3 && strcmp(argv[1], "--kvonly") == 0) {
+        // [TAG_GRAPH_CACHE] state-only graphs: LLAMA_MTP_CATCHUP_ATTN=0 makes the zero-output MTP catch-up ubatches
+        // KV-only (the cache writes are the graph's only roots); CHECK=2 compares their state bytes
+        const std::string kdir = argv[2];
+        common_set_env("LLAMA_MTP_CATCHUP_ATTN", "0");
+        const run_out k_off = run(meta.get(), "0", "0", kdir + "/test-graph-cache-kvonly-off.stderr");
+        const run_out k_ch2 = run(meta.get(), "8", "2", kdir + "/test-graph-cache-kvonly-check2.stderr");
+        printf("kvonly: %zu logits; CHECK=2 main hit=%" PRId64 " check2=%" PRId64 "; mtp hit=%" PRId64 " check2=%" PRId64 " state-only=%" PRId64 "\n",
+               k_off.logits.size(), k_ch2.hit[0], k_ch2.check2[0], k_ch2.hit[1], k_ch2.check2[1], k_ch2.check2_state_only[1]);
+        expect(!k_off.logits.empty() && same(k_off.logits, k_ch2.logits) && same(k_off.drafts, k_ch2.drafts) && k_off.qsa_ids == k_ch2.qsa_ids,
+               "kvonly: K=8 + CHECK=2 identical to cache off");
+        expect(k_ch2.check2[0] == k_ch2.hit[0] && k_ch2.check2[1] == k_ch2.hit[1] && k_ch2.check2_state_only[1] > 0,
+               "kvonly: CHECK=2 on every hit, KV-only catch-up hits compared by their state (state-only > 0)");
+        printf("test-graph-cache --kvonly: %s\n", n_fail == 0 ? "OK" : "FAILED");
+        return n_fail == 0 ? 0 : 1;
     }
     if (argc == 3 && strcmp(argv[1], "--split") == 0) {
         // [TAG_GRAPH_CACHE] split-only inputs: the layers on FAKE, the inputs on the CPU (see namespace fake)
