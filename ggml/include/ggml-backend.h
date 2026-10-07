@@ -358,6 +358,21 @@ extern "C" {
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
+    // [TAG_GRAPH_CACHE] graph snapshots: keep several allocated graphs on one scheduler and switch between them
+    // without re-splitting or re-allocating. All snapshot graphs share the scheduler's compute buffers, so they must
+    // run strictly in sequence and every input must be fully rewritten before each compute.
+    //  take:    moves the allocated per-graph state (split graph, splits, tensor assignments and copies) into a new
+    //           snapshot; the scheduler is left reset (as after ggml_backend_sched_reset)
+    //  restore: swaps the snapshot's state with the scheduler's (the snapshot then holds the previous state); returns
+    //           false (and resets the scheduler) if the snapshot is stale, i.e. the buffer generation changed
+    //  buffer_gen: bumped whenever a compute buffer is freed or (re)allocated and on every ggml_backend_sched_reserve
+    typedef struct ggml_backend_sched_snapshot * ggml_backend_sched_snapshot_t;
+    GGML_API ggml_backend_sched_snapshot_t ggml_backend_sched_take(ggml_backend_sched_t sched);
+    GGML_API bool                 ggml_backend_sched_restore(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap);
+    GGML_API bool                 ggml_backend_sched_snapshot_valid(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap);
+    GGML_API void                 ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snap);
+    GGML_API uint64_t             ggml_backend_sched_buffer_gen(ggml_backend_sched_t sched);
+
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 

@@ -495,7 +495,19 @@ struct ggml_gallocr {
     int n_leafs;
 
     int grow_slack; // [TAG_ALLOC_GROW_SLACK] percent, see ggml_gallocr_set_grow_slack; 0 = exact fit
+
+    // [TAG_GRAPH_CACHE] bumped whenever a buffer is freed or (re)allocated (ggml_gallocr_buffer_gen): a tensor
+    // allocated before the bump may point into freed memory. A re-plan that keeps every buffer does not bump.
+    uint64_t buffer_gen;
 };
+
+uint64_t ggml_gallocr_buffer_gen(ggml_gallocr_t galloc) {
+    return galloc->buffer_gen;
+}
+
+void ggml_gallocr_bump_buffer_gen(ggml_gallocr_t galloc) {
+    galloc->buffer_gen++;
+}
 
 void ggml_gallocr_set_grow_slack(ggml_gallocr_t galloc, int percent) {
     galloc->grow_slack = percent > 0 ? percent : 0;
@@ -989,6 +1001,7 @@ static bool ggml_gallocr_reserve_n_impl(
             // buffers, and frees the dead one a second time. Drop every alias of the buffer we are
             // about to free before freeing it, so no stale pointer can outlive it on any path.
             struct vbuffer * old_buffer = galloc->buffers[i];
+            galloc->buffer_gen++; // [TAG_GRAPH_CACHE]
             if (old_buffer != NULL) {
                 for (int j = 0; j < galloc->n_buffers; j++) {
                     if (galloc->buffers[j] == old_buffer) {

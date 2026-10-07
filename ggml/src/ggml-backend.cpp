@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <utility>
 #include <string.h>
 #include <algorithm>
 #include <vector>
@@ -2013,6 +2014,129 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     sched->is_alloc = false;
 }
 
+// [TAG_GRAPH_CACHE] the post-alloc per-graph state of a scheduler: everything ggml_backend_sched_split_graph +
+// ggml_backend_sched_alloc_splits build and ggml_backend_sched_compute_splits / get_tensor_backend read. The
+// node/leaf backend id arrays (and their prev_* twins) stay with the scheduler: they describe the allocator's last
+// plan and are only read by the next ggml_backend_sched_alloc_splits, exactly as without snapshots.
+struct ggml_backend_sched_snapshot {
+    bool is_reset;
+    bool is_alloc;
+
+    struct ggml_hash_set  hash_set;
+    int                 * hv_tensor_backend_ids;
+    struct ggml_tensor ** hv_tensor_copies;
+
+    struct ggml_cgraph graph;
+
+    struct ggml_backend_sched_split * splits;
+    int n_splits;
+    int splits_capacity;
+
+    int cur_copy;
+
+    struct ggml_tensor ** graph_inputs;
+    int n_graph_inputs;
+    int graph_inputs_capacity;
+
+    struct ggml_context * ctx;
+    char * context_buffer;
+
+    uint64_t buffer_gen; // the scheduler's buffer generation when the state was allocated
+};
+
+static void ggml_backend_sched_swap_state(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap) {
+    std::swap(sched->is_reset,              snap->is_reset);
+    std::swap(sched->is_alloc,              snap->is_alloc);
+    std::swap(sched->hash_set,              snap->hash_set);
+    std::swap(sched->hv_tensor_backend_ids, snap->hv_tensor_backend_ids);
+    std::swap(sched->hv_tensor_copies,      snap->hv_tensor_copies);
+    std::swap(sched->graph,                 snap->graph);
+    std::swap(sched->splits,                snap->splits);
+    std::swap(sched->n_splits,              snap->n_splits);
+    std::swap(sched->splits_capacity,       snap->splits_capacity);
+    std::swap(sched->cur_copy,              snap->cur_copy);
+    std::swap(sched->graph_inputs,          snap->graph_inputs);
+    std::swap(sched->n_graph_inputs,        snap->n_graph_inputs);
+    std::swap(sched->graph_inputs_capacity, snap->graph_inputs_capacity);
+    std::swap(sched->ctx,                   snap->ctx);
+    std::swap(sched->context_buffer,        snap->context_buffer);
+}
+
+uint64_t ggml_backend_sched_buffer_gen(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return ggml_gallocr_buffer_gen(sched->galloc);
+}
+
+ggml_backend_sched_snapshot_t ggml_backend_sched_take(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(sched->is_alloc);
+
+    // an empty state of the same sizes as ggml_backend_sched_new allocates
+    auto * snap = (ggml_backend_sched_snapshot *) calloc(1, sizeof(struct ggml_backend_sched_snapshot));
+    snap->hash_set              = ggml_hash_set_new(sched->hash_set.size);
+    GGML_ASSERT(snap->hash_set.size == sched->hash_set.size);
+    snap->hv_tensor_backend_ids = (int *) malloc(snap->hash_set.size * sizeof(snap->hv_tensor_backend_ids[0]));
+    snap->hv_tensor_copies      = (ggml_tensor **) malloc(snap->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    snap->splits_capacity       = 16;
+    snap->splits                = (ggml_backend_sched_split *) calloc(snap->splits_capacity, sizeof(snap->splits[0]));
+    snap->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
+    snap->graph_inputs          = (struct ggml_tensor **) calloc(snap->graph_inputs_capacity, sizeof(struct ggml_tensor *));
+    snap->context_buffer        = (char *) malloc(sched->context_buffer_size);
+    snap->is_reset              = false; // forces the full clear in ggml_backend_sched_reset below
+    snap->is_alloc              = false;
+
+    ggml_backend_sched_swap_state(sched, snap);
+    snap->buffer_gen = ggml_backend_sched_buffer_gen(sched);
+
+    // the scheduler now holds the empty state: clear it as a reset does
+    ggml_backend_sched_reset(sched);
+
+    return snap;
+}
+
+bool ggml_backend_sched_restore(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(snap);
+
+    const uint64_t gen   = ggml_backend_sched_buffer_gen(sched);
+    const bool     valid = snap->is_alloc && snap->buffer_gen == gen;
+
+    // the scheduler's current state moves into the snapshot (so it can be kept by the caller); a scheduler state
+    // that is allocated is current by construction
+    ggml_backend_sched_swap_state(sched, snap);
+    snap->buffer_gen = gen;
+
+    if (!valid) {
+        // stale (the buffers were reallocated since) or never allocated: the restored state must not be used
+        ggml_backend_sched_reset(sched);
+    }
+    return valid;
+}
+
+bool ggml_backend_sched_snapshot_valid(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap) {
+    GGML_ASSERT(sched);
+    return snap != NULL && snap->is_alloc && snap->buffer_gen == ggml_backend_sched_buffer_gen(sched);
+}
+
+void ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snap) {
+    if (snap == NULL) {
+        return;
+    }
+    ggml_free(snap->ctx);
+    ggml_hash_set_free(&snap->hash_set);
+    for (int i = 0; i < snap->splits_capacity; i++) {
+        free(snap->splits[i].inputs);
+    }
+    free(snap->splits);
+    free(snap->graph_inputs);
+    free(snap->hv_tensor_backend_ids);
+    free(snap->hv_tensor_copies);
+    free(snap->context_buffer);
+    free(snap->graph.nodes);
+    free(snap->graph.leafs);
+    free(snap);
+}
+
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
@@ -2034,6 +2158,9 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
+
+    // [TAG_GRAPH_CACHE] an explicit reserve invalidates every snapshot, even when no buffer had to grow
+    ggml_gallocr_bump_buffer_gen(sched->galloc);
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;

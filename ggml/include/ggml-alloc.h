@@ -78,6 +78,10 @@ GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_i
 // current size, instead of the exact fit. 0 (the default) = exact fit. The first allocation is never affected.
 GGML_API void ggml_gallocr_set_grow_slack(ggml_gallocr_t galloc, int percent);
 
+// [TAG_GRAPH_CACHE] generation of the allocator's buffers: bumped whenever a buffer is freed or (re)allocated
+GGML_API uint64_t ggml_gallocr_buffer_gen(ggml_gallocr_t galloc);
+GGML_API void     ggml_gallocr_bump_buffer_gen(ggml_gallocr_t galloc);
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 // ggml_backend_alloc_ctx_tensors_from_buft_size returns the size of the buffer that would be allocated by ggml_backend_alloc_ctx_tensors_from_buft
