@@ -330,6 +330,20 @@ static constexpr uint32_t DISK_CACHE_DEPTH_VERSION = 1;
 // the measurement's probe (tokens, positions, outputs, ubatch schedule, hashed sections); a change re-measures
 static constexpr uint32_t DISK_CACHE_PROBE_REVISION = 1;
 
+enum server_cache_env_class {
+    SERVER_CACHE_ENV_EXACT,    // speed / diagnostics / control by contract: not in the key
+    SERVER_CACHE_ENV_SEMANTIC, // results / representation, unclear or unregistered: digested into the key
+};
+
+// the env registry (spec appendix "Registry seed"); unregistered LLAMA_* / GGML_* names are semantic
+server_cache_env_class server_cache_env_classify(const std::string & name);
+
+// digest (hash16) of the semantic knobs among "NAME=value" entries; order-independent; "-" when there are none
+std::string server_cache_env_digest(const std::vector<std::string> & env);
+
+// the process's LLAMA_* / GGML_* environment entries ("NAME=value")
+std::vector<std::string> server_cache_environ();
+
 // sampled content hash of a file (size + fixed-offset samples, a few MiB): "<hash16>"; "absent" when it cannot be read
 std::string server_cache_file_identity(const std::string & path);
 

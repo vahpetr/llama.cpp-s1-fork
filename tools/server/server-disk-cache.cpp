@@ -524,6 +524,80 @@ static std::string h16_of(const std::string & s) {
     return string_format("%016llx", h1 ^ (h2 * 0x9E3779B97F4A7C15ull));
 }
 
+// the env registry, seeded from spec series D "Appendix: Registry seed" (Codex 2026-10-07). Only the exact class is
+//   listed name by name: everything else - the registered semantic / unclear names AND every unregistered LLAMA_* /
+//   GGML_* name - is semantic (unknown => strict). The inventory comes from the readers (helpers such as the Vulkan
+//   backend's env lookups and the LLAMA_ARG_* aliases of common/arg.cpp), not from a literal grep of getenv
+static const char * const CACHE_ENV_EXACT[] = {
+    // speed / diagnostics / control by contract
+    "LLAMA_TRACE", "LLAMA_BATCH_DEBUG", "LLAMA_GRAPH_INPUT_DEBUG", "LLAMA_GRAPH_RESULT_DEBUG", "LLAMA_KV_CACHE_DEBUG",
+    "LLAMA_GRAPH_REUSE_DISABLE", "LLAMA_RESERVE_RUNTIME_SHAPE", "LLAMA_SAMPLER_FASTPATH", "LLAMA_DSV4_COMPRESS_DEBUG",
+    "LLAMA_KQ_VIS_PROF", "LLAMA_QSA_DUMP_IDS", "LLAMA_QSA_CENSUS_CHECK", "LLAMA_QSA_COMPACT_BIAS_CHECK",
+    "LLAMA_QSA_TAIL_ASSERT", "LLAMA_PLE_DUMP", "LLAMA_PLE_HOIST", "LLAMA_PLE_PREFETCH", "LLAMA_PLE_GATHER_SORT",
+    "LLAMA_SERVER_SLOTS_DEBUG", "LLAMA_SERVER_SLOTS_N_DIFF", "LLAMA_SERVER_DEBUG_FAKE_TIMING", "LLAMA_SERVER_CHILD_MODE",
+    "LLAMA_SERVER_ROUTER_PORT", "LLAMA_APP_CMD", "LLAMA_CACHE",
+    "LLAMA_GTT_ADMISSION_MIB", "LLAMA_GTT_ADMISSION_MAX_WAIT_S", "LLAMA_GTT_SLOPE_B_PER_CELL",
+    "LLAMA_GTT_STAGING_B_PER_CELL", "LLAMA_GTT_STAGING_STEP_MIB", "LLAMA_GTT_SLACK_PCT", "LLAMA_GTT_ONCE_MIB",
+    "LLAMA_GTT_HOLES_FULL_CHUNK", "LLAMA_GTT_USED_PATH",
+    // LLAMA_ARG_* aliases (common/arg.cpp): classified one by one by their parsed meaning - only the control plane
+    "LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_API_KEY",
+    // Vulkan speed / diagnostics only by contract
+    "GGML_VK_PREFER_HOST_MEMORY", "GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM", "GGML_VK_ALLOW_SYSMEM_FALLBACK",
+    "GGML_VK_ENABLE_MEMORY_PRIORITY", "GGML_VK_FORCE_MAX_ALLOCATION_SIZE", "GGML_VK_FORCE_MAX_BUFFER_SIZE",
+    "GGML_VK_SUBALLOCATION_BLOCK_SIZE", "GGML_VK_MAX_NODES_PER_SUBMIT", "GGML_VK_DISABLE_ASYNC",
+    "GGML_VK_ALLOW_GRAPHICS_QUEUE", "GGML_VK_ASYNC_USE_TRANSFER_QUEUE", "GGML_VK_SERIALIZE_SUBMISSIONS",
+    "GGML_VK_DISABLE_DESCRIPTOR_REUSE", "GGML_VK_FREE_WAIT_IDLE", "GGML_VK_ASYNC_READ_COPYBUF", "GGML_VK_ASYNC_READ_UMA",
+    "GGML_VK_QSA_SCRATCH_PRESIZE", "GGML_VK_QSA_SCRATCH_PRESIZE_FA", "GGML_VK_DEBUG_MARKERS", "GGML_VK_PERF_LOGGER",
+    "GGML_VK_PERF_LOGGER_CONCURRENT", "GGML_VK_PERF_LOGGER_FREQUENCY", "GGML_VK_SYNC_LOGGER", "GGML_VK_MEMORY_LOGGER",
+    "GGML_VK_PIPELINE_STATS", "GGML_VK_OPT_WINDOW", "GGML_VK_FLOPS_SEED_LEGACY", "GGML_VK_SUBMIT_LOG",
+    "GGML_VK_FUSION_DIAG", "GGML_VK_FUSION_COUNT", "GGML_VK_FUSION_LIST", "GGML_VULKAN_SKIP_CHECKS",
+    "GGML_VULKAN_OUTPUT_TENSOR", "GGML_ALLOC_GROW_SLACK", "GGML_SCHED_PROFILE", "GGML_SCHED_DEBUG",
+    "GGML_SCHED_DEBUG_REALLOC", "GGML_META_DEBUG", "GGML_NO_BACKTRACE", "GGML_BACKTRACE_LLDB", "GGML_GET_ROWS_SORTED",
+    "GGML_GET_ROWS_STATS", "GGML_GET_ROWS_THREADS",
+};
+
+server_cache_env_class server_cache_env_classify(const std::string & name) {
+    if (name.rfind("LLAMA_ARG_CACHE_DISK", 0) == 0) {
+        return SERVER_CACHE_ENV_EXACT; // the disk cache's own options (neutral since v1)
+    }
+    for (const char * e : CACHE_ENV_EXACT) {
+        if (name == e) {
+            return SERVER_CACHE_ENV_EXACT;
+        }
+    }
+    return SERVER_CACHE_ENV_SEMANTIC;
+}
+
+std::string server_cache_env_digest(const std::vector<std::string> & env) {
+    std::vector<std::string> sem;
+    for (const auto & kv : env) {
+        const auto eq = kv.find('=');
+        if (server_cache_env_classify(kv.substr(0, eq)) == SERVER_CACHE_ENV_SEMANTIC) {
+            sem.push_back(kv);
+        }
+    }
+    if (sem.empty()) {
+        return "-";
+    }
+    std::sort(sem.begin(), sem.end());
+    std::string s;
+    for (const auto & kv : sem) {
+        s += std::to_string(kv.size()) + ":" + kv + ";";
+    }
+    return h16_of(s);
+}
+
+std::vector<std::string> server_cache_environ() {
+    std::vector<std::string> out;
+    for (char ** ep = environ; ep && *ep; ep++) {
+        const std::string kv = *ep;
+        if (kv.rfind("LLAMA_", 0) == 0 || kv.rfind("GGML_", 0) == 0) {
+            out.push_back(kv);
+        }
+    }
+    return out;
+}
+
 std::string server_cache_file_identity(const std::string & p) {
     if (p.empty()) {
         return "none";
