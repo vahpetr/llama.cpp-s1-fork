@@ -768,21 +768,33 @@ void server_disk_cache::init() {
     // [TAG_DISK_READ_STATUS] (Hermes gate Major 1) every listing the start acts on is taken before anything is removed;
     //   a failed one disables the cache for this run with all files untouched - an empty view of blk/ would otherwise
     //   drop every entry as "blocks gone", an empty ckpt/ every checkpoint-bearing entry at its first load
-    std::vector<fs::directory_entry> ls_own, ls_blk, ls_ck;
+    std::vector<fs::directory_entry> ls_own, ls_blk, ls_oblk, ls_ck;
     {
         std::string err;
         std::error_code ec_b;
-        fs::create_directories(fs::path(root) / "blk", ec_b);
+        // [TAG_DISK_BLK_NS] (Codex gate r2 Major 6) new blocks go to the own namespace's store <ns>/blk; the shared
+        //   <root>/blk is the legacy store (format <= 6 entries): indexed and referenced, never written
+        fs::create_directories(fs::path(dir) / "blk", ec_b);
         if (ec_b) {
-            err = (fs::path(root) / "blk").string() + ": " + ec_b.message();
+            err = (fs::path(dir) / "blk").string() + ": " + ec_b.message();
         }
-        if (ec_b || !list_dir(dir, ls_own, false, &err) || !list_dir(fs::path(root) / "blk", ls_blk, false, &err) ||
+        std::error_code ec_l;
+        const bool has_legacy_blk = fs::is_directory(fs::path(root) / "blk", ec_l);
+        if (ec_l == std::errc::no_such_file_or_directory) {
+            ec_l.clear(); // no legacy store
+        } else if (ec_l) {
+            err = (fs::path(root) / "blk").string() + ": " + ec_l.message();
+        }
+        if (ec_b || ec_l || !list_dir(dir, ls_own, false, &err) ||
+                (has_legacy_blk && !list_dir(fs::path(root) / "blk", ls_blk, false, &err)) ||
+                !list_dir(fs::path(dir) / "blk", ls_oblk, false, &err) ||
                 !list_dir(fs::path(dir) / "ckpt", ls_ck, false, &err)) {
             DSK_WRN("cannot list %s: disk cache disabled for this run, no file touched\n", err.c_str());
             quota = 0;
             entries.clear();
             ckpts.clear();
             blobs.clear();
+            blob_dir_of.clear();
             blob_bytes = 0;
             foreign.clear();
             adopted.clear();
@@ -819,19 +831,33 @@ void server_disk_cache::init() {
 
     // block store: every complete block file (a crash leaves only .tmp files); unreferenced ones go in enforce()
     std::set<std::string> io_keys; // blocks / checkpoints present but not inspectable now: kept, not indexed
-    for (const auto & de : ls_blk) {
-        const std::string name = de.path().filename().string();
-        if (name.size() > 4 && name.compare(name.size() - 4, 4, ".blk") == 0) {
-            std::error_code ec_s;
-            const uint64_t n = fs::file_size(de.path(), ec_s);
-            if (ec_s) {
-                io_keys.insert(name.substr(0, name.size() - 4));
-                continue;
+    blob_dir_of.clear();
+    const std::string legacy_blk = (fs::path(root) / "blk").string();
+    // the legacy store first, the own store second: a block present in both is served from the own store
+    for (const auto * ls : { &ls_blk, &ls_oblk }) {
+        const bool legacy = ls == &ls_blk;
+        for (const auto & de : *ls) {
+            const std::string name = de.path().filename().string();
+            if (name.size() > 4 && name.compare(name.size() - 4, 4, ".blk") == 0) {
+                std::error_code ec_s;
+                const uint64_t n = fs::file_size(de.path(), ec_s);
+                const std::string key = name.substr(0, name.size() - 4);
+                if (ec_s) {
+                    io_keys.insert(key);
+                    continue;
+                }
+                if (!blobs.count(key)) {
+                    blob_bytes += n;
+                }
+                blobs[key] = n;
+                if (legacy) {
+                    blob_dir_of[key] = legacy_blk;
+                } else {
+                    blob_dir_of.erase(key);
+                }
+            } else if (!legacy) {
+                fs::remove(de.path(), ec); // an own .tmp left by a crash; the legacy store is not written
             }
-            blobs[name.substr(0, name.size() - 4)] = n;
-            blob_bytes += n;
-        } else {
-            fs::remove(de.path(), ec);
         }
     }
     {
@@ -839,7 +865,10 @@ void server_disk_cache::init() {
         for (auto it = blobs.begin(); it != blobs.end();) {
             const auto dash = it->first.rfind('-');
             if (dash == std::string::npos || std::to_string(it->second) != it->first.substr(dash + 1)) {
-                fs::remove(blob_path(it->first), ec);
+                if (blob_writable(it->first)) {
+                    fs::remove(blob_path(it->first), ec);
+                }
+                blob_dir_of.erase(it->first);
                 blob_bytes -= it->second;
                 it = blobs.erase(it);
             } else {
@@ -1268,7 +1297,10 @@ server_disk_load_result server_disk_cache::verify_stream(const std::string & map
             if (!got || hash_key(buf.data(), buf.size()) != key) {
                 DSK_WRN("block %s is corrupt, dropping it\n", key.c_str());
                 std::error_code ec;
-                fs::remove(blob_path(key), ec);
+                if (blob_writable(key)) {
+                    fs::remove(blob_path(key), ec);
+                }
+                blob_dir_of.erase(key);
                 blob_bytes -= it->second;
                 blobs.erase(it);
                 return SERVER_DISK_LOAD_INVALID;
@@ -1803,8 +1835,19 @@ void server_disk_cache::deep_gc() {
 // cutting of tensor ranges into blocks aligned to BLOB_BYTES within each tensor makes the unchanged part of a growing
 // conversation produce the same blocks again.
 
+// the own store or the legacy store (whose blocks an unreferenced / damaged state may remove); never an adopt
+//   source's store
+bool server_disk_cache::blob_writable(const std::string & key) const {
+    const auto it = blob_dir_of.find(key);
+    return it == blob_dir_of.end() || it->second == (fs::path(root) / "blk").string();
+}
+
 std::string server_disk_cache::blob_path(const std::string & key) const {
-    return (fs::path(root) / "blk" / (key + ".blk")).string();
+    const auto it = blob_dir_of.find(key);
+    if (it != blob_dir_of.end()) {
+        return (fs::path(it->second) / (key + ".blk")).string(); // legacy store / an adopt source's store
+    }
+    return (fs::path(dir) / "blk" / (key + ".blk")).string();
 }
 
 bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
@@ -1880,6 +1923,7 @@ bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const 
                     break;
                 }
                 blobs[key] = n;
+                blob_dir_of.erase(key); // written to the own store
                 blob_bytes += n;
                 n_written += n;
             }
@@ -2065,7 +2109,10 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
             if (!got || hash_key(blk.data(), blk.size()) != key) {
                 DSK_WRN("block %s is corrupt, dropping it\n", key.c_str());
                 std::error_code ec;
-                fs::remove(blob_path(key), ec);
+                if (blob_writable(key)) {
+                    fs::remove(blob_path(key), ec);
+                }
+                blob_dir_of.erase(key);
                 blob_bytes -= it->second;
                 blobs.erase(it);
                 corrupt = true;
@@ -2155,8 +2202,14 @@ void server_disk_cache::blob_gc() {
     }
     for (auto it = blobs.begin(); it != blobs.end();) {
         if (!referenced.count(it->first)) {
+            const auto bd = blob_dir_of.find(it->first);
             std::error_code ec;
-            fs::remove(blob_path(it->first), ec);
+            if (bd == blob_dir_of.end() || bd->second == (fs::path(root) / "blk").string()) {
+                fs::remove(blob_path(it->first), ec); // own store, or a legacy block nothing on disk references
+            }
+            if (bd != blob_dir_of.end()) {
+                blob_dir_of.erase(bd);
+            }
             blob_bytes -= it->second;
             it = blobs.erase(it);
         } else {
@@ -2408,7 +2461,10 @@ bool server_disk_cache::scan_foreign() {
     for (const auto & ns : foreign) {
         total += ns.bytes;
         for (const auto & b : ns.blocks) {
-            if (!own_refs.count(b) && foreign_only[b]++ == 0) {
+            // a block in the shared legacy store (one in a namespace's own blk/ is part of its ns.bytes)
+            const auto bd = blob_dir_of.find(b);
+            if (!own_refs.count(b) && bd != blob_dir_of.end() && bd->second == (fs::path(root) / "blk").string() &&
+                    foreign_only[b]++ == 0) {
                 const auto bt = blobs.find(b);
                 total += bt != blobs.end() ? bt->second : 0;
             }
@@ -2559,6 +2615,27 @@ void server_disk_cache::open_adopt_sources() {
             DSK_WRN("adopt %s: cannot list %s, not opened this run\n", key.c_str(), err.c_str());
             adopted.push_back(a); // still protected from the foreign TTL / cap
             continue;
+        }
+        // [TAG_DISK_BLK_NS] a namespaced source keeps its blocks in <ns>/blk: indexed read-only (own / legacy first)
+        if (!a.legacy) {
+            std::vector<fs::directory_entry> ls_sb;
+            std::error_code ec_d;
+            if (fs::is_directory(base / "blk", ec_d) && list_dir(base / "blk", ls_sb, false, &err)) {
+                for (const auto & de : ls_sb) {
+                    const std::string name = de.path().filename().string();
+                    std::error_code ec_s;
+                    const uint64_t n = fs::file_size(de.path(), ec_s);
+                    if (ec_s || name.size() <= 4 || name.compare(name.size() - 4, 4, ".blk") != 0) {
+                        continue;
+                    }
+                    const std::string k = name.substr(0, name.size() - 4);
+                    if (!blobs.count(k)) {
+                        blobs[k] = n;
+                        blob_dir_of[k] = (base / "blk").string();
+                        blob_bytes += n;
+                    }
+                }
+            }
         }
         for (const auto & de : ls_base) {
             std::error_code ec_t;

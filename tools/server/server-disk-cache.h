@@ -181,7 +181,11 @@ struct server_disk_cache {
     const std::string & descriptor_hash() const { return desc_h; }
 
   private:
-    // [TAG_DISK_NAMESPACE] <root>/ns-<key>/ holds this fingerprint's entries and ckpt/; <root>/blk/ the shared blocks;
+    // [TAG_DISK_NAMESPACE] <root>/ns-<key>/ holds this fingerprint's entries, ckpt/ and blk/ (its new blocks,
+    //   [TAG_DISK_BLK_NS]); <root>/blk/ is the legacy (format <= 6) block store, read-only for new blocks. Rollback-
+    //   forward: a v47 rollback never touches ns-<key>/ (own entries + exclusive blocks survive it); a legacy block a
+    //   v48 entry references (dedup) can be collected by v47 when v47 evicts its flat owner - that v48 entry is then
+    //   dropped as incomplete at the next v48 start (a miss, never a wrong load);
     //   the flat top level (entries + ckpt/ of a format <= 6 build) is a legacy namespace, kept in place for a rollback
     struct foreign_ns {
         std::string key;      // hash16 of its fingerprint
@@ -236,6 +240,7 @@ struct server_disk_cache {
 
     // [TAG_DISK_DELTA] content-addressed blocks of the state streams: key -> bytes on disk
     std::map<std::string, uint64_t> blobs;
+    std::map<std::string, std::string> blob_dir_of; // [TAG_DISK_BLK_NS] a block outside the own store: its directory
     uint64_t blob_bytes = 0;
     // [TAG_DISK_READ_STATUS] (Hermes gate Major 1) an own entry / block / checkpoint skipped at start on an I/O error:
     //   what it references is unknown, so no block or checkpoint is collected for the rest of this run
@@ -245,6 +250,7 @@ struct server_disk_cache {
 
     bool ckpt_store(const std::string & key, const common_prompt_checkpoint & c, bool * written);
     std::string blob_path(const std::string & key) const;
+    bool        blob_writable(const std::string & key) const;
     bool save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path, const std::string & env_h,
                      std::vector<std::string> & keys, uint64_t & n_logical, uint64_t & n_written);
     // env_h: the envelope hash the stream must carry; legacy_ok: a stream without an envelope (format 5 / 6) is accepted
