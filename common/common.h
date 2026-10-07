@@ -1238,12 +1238,13 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void load_tgt(
+    // false: the state's consumed length differs from the stored one (the destination may be partially restored)
+    bool load_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
-    void load_dft(
+    bool load_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;

@@ -4178,7 +4178,9 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                    if (!ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+                        GGML_ABORT("speculative draft checkpoint size mismatch\n"); // this run's own state: a bug
+                    }
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
@@ -4560,6 +4562,8 @@ private:
                                     //   everything, and take a checkpoint at the branch point on the way back up
                                     //   (also when the usable in-RAM one lies far below the divergence: an old pinned branch point)
                                     const int64_t n_ram = do_reset ? -1 : it->n_tokens;
+                                    const common_prompt_checkpoint * disk_ck = nullptr; // the deep checkpoint taken from disk
+                                    std::string disk_ck_key;
                                     if (disk_cache && n_past - n_ram > params_base.checkpoint_min_step) {
                                         const int n_div = n_past;
                                         for (const auto & m : disk_cache->deep_candidates(slot.task->tokens, n_past)) {
@@ -4576,7 +4580,8 @@ private:
                                             const int64_t n_ck = ck.n_tokens;
                                             auto pos_it = std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
                                                     [&](const auto & c) { return c.n_tokens > n_ck; });
-                                            slot.prompt.checkpoints.insert(pos_it, std::move(ck));
+                                            disk_ck_key = m.key;
+                                            disk_ck = &*slot.prompt.checkpoints.insert(pos_it, std::move(ck));
                                             disk_cache->deep_adopt(slot.prompt, m);
                                             disk_cache->n_deep_rewinds++;
                                             SLT_INF(slot, "deep checkpoint at n_tokens = %" PRId64 " for a divergence at %d (replay %" PRId64 " tokens instead of %d)\n",
@@ -4594,9 +4599,12 @@ private:
                                         do_reset = it == slot.prompt.checkpoints.rend();
                                     }
 
+                                    bool restored = false;
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                        restored = it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                    }
+                                    if (!do_reset && restored) {
                                         if (ctx_dft && ckpt_skip_dft && it->data_dft.empty()) {
                                             // [TAG_CKPT_NO_DFT] every surviving checkpoint is a prefix of the live tokens (the
                                             //   pos_max > pos_next ones are erased below), so the live draft KV already holds
@@ -4608,8 +4616,39 @@ private:
                                                 llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
                                             }
                                         } else {
-                                            it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                            restored = it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
                                         }
+                                    }
+                                    if (!do_reset && !restored) {
+                                        // [TAG_CKPT_LOAD_CHECKED] (Codex gate r2 Blocker 1) the stored state's length differs from
+                                        //   what the context consumed: a cache miss, not an abort - clear the partially restored
+                                        //   destination in both contexts, drop that checkpoint (from disk too when it came from
+                                        //   there) and re-process the prompt
+                                        const bool from_disk = disk_ck != nullptr && &*it == disk_ck;
+                                        if (disk_cache && !from_disk) {
+                                            // an in-RAM checkpoint that came with a loaded entry lives in the checkpoint
+                                            //   store under its prefix key: drop it there too
+                                            try {
+                                                disk_ck_key = slot.prompt.tokens.prefix_keys({ (size_t) it->n_tokens }).at(0);
+                                            } catch (const std::exception &) {
+                                                disk_ck_key.clear();
+                                            }
+                                        }
+                                        SLT_WRN(slot, "context checkpoint (n_tokens = %" PRId64 ", key %s) does not restore - dropping it, full prompt re-processing\n",
+                                                it->n_tokens, disk_ck_key.empty() ? "-" : disk_ck_key.c_str());
+                                        if (disk_cache && !disk_ck_key.empty()) {
+                                            disk_cache->deep_drop(disk_ck_key, "state length mismatch on restore");
+                                            auto & dr = slot.prompt.deep;
+                                            dr.erase(std::remove_if(dr.begin(), dr.end(), [&](const auto & r) { return r.key == disk_ck_key; }), dr.end());
+                                        }
+                                        slot.prompt.checkpoints.erase(std::next(it).base());
+                                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                                        if (ctx_dft) {
+                                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+                                        }
+                                        do_reset = true;
+                                    }
+                                    if (!do_reset) {
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
@@ -5352,10 +5391,15 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                        // this run's own speculative checkpoint: a size mismatch is a bug, not a cache miss
+                        if (!ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+                            GGML_ABORT("speculative checkpoint size mismatch\n");
+                        }
 
                         if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                            if (!ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+                                GGML_ABORT("speculative draft checkpoint size mismatch\n");
+                            }
                         }
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);

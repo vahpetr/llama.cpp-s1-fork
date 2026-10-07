@@ -240,7 +240,9 @@ static sealed_status read_aux(const std::string & path, bool with_data, std::lis
         int32_t  pos_min = 0, pos_max = 0;
         uint32_t ft = 0, fd = 0;
         std::string key;
-        ok = get(f, n_tokens) && get(f, pos_min) && get(f, pos_max) && get(f, ft) && get(f, fd) && get_str(f, key);
+        ok = get(f, n_tokens) && get(f, pos_min) && get(f, pos_max) && get(f, ft) && get(f, fd) && get_str(f, key) &&
+             // (Codex gate r2 Blocker 1) a stored checkpoint is host data: it must never select the on-device path
+             !((ft | fd) & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
         if (ok) {
             ckpt_keys.push_back(key);
         }
@@ -1618,6 +1620,10 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         if (!ok) {
             throw std::runtime_error("truncated or corrupt");
         }
+        if ((ft | fd) & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            // (Codex gate r2 Blocker 1) a stored checkpoint is host data: it must never select the on-device path
+            throw std::runtime_error("on-device state flags");
+        }
         out.n_tokens  = n_tokens;
         out.pos_min   = pos_min;
         out.pos_max   = pos_max;
@@ -1647,6 +1653,21 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         fs::last_write_time(ckpt_path(key), fs::file_time_type::clock::now(), ec); // t_used survives a restart
     }
     return true;
+}
+
+void server_disk_cache::deep_drop(const std::string & key, const char * why) {
+    auto it = ckpts.find(key);
+    if (it == ckpts.end()) {
+        return;
+    }
+    DSK_WRN("deep checkpoint %s: %s, dropping it\n", key.c_str(), why);
+    if (it->second.src_dir.empty()) {
+        std::error_code ec;
+        fs::remove(ckpt_path(key), ec);
+    }
+    ckpts.erase(it);
+    n_ckpt_dropped++;
+    refresh_status();
 }
 
 void server_disk_cache::deep_gc() {
@@ -2108,6 +2129,7 @@ void server_disk_cache::refresh_status() {
         { "load_failures_capacity", n_load_capacity },
         { "load_failures_other",    n_load_other    },
         { "deep_rewinds",   n_deep_rewinds      },
+        { "ckpt_dropped",   n_ckpt_dropped      },
         { "evictions",      n_evict             },
         { "bytes_written",  bytes_written       },
         { "bytes_loaded",   bytes_loaded        },

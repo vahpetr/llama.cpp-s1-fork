@@ -113,6 +113,10 @@ struct server_disk_cache {
     // reference a stored checkpoint a deep rewind used from prompt.deep (it then survives the collection)
     void deep_adopt(server_prompt & prompt, const server_deep_ckpt_meta & m);
 
+    // [TAG_CKPT_LOAD_CHECKED] a checkpoint that passed deep_get but did not restore (state length mismatch): forget
+    //   it and remove its file (an adopt source's file stays, read-only)
+    void deep_drop(const std::string & key, const char * why);
+
     // delete checkpoint files that no entry and no live prompt (live_refs) references
     void deep_gc();
 
@@ -128,6 +132,7 @@ struct server_disk_cache {
     uint64_t n_loads = 0;
     uint64_t n_evict = 0;
     uint64_t n_deep_rewinds = 0;
+    uint64_t n_ckpt_dropped = 0; // deep checkpoints that did not restore
     uint64_t n_load_failed  = 0; // invalid: the entry was dropped
     uint64_t n_load_capacity = 0; // the state did not fit the free cells: the entry was kept
     uint64_t n_load_other   = 0; // inconclusive: the entry was kept
