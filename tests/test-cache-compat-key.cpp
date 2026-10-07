@@ -192,6 +192,17 @@ int main() {
         CHECK(r1 != r0);
         CHECK(server_cache_memo_key(cheap_a, r0) != server_cache_memo_key(cheap_a, r1));
     }
+    // [TAG_CACHE_COMPAT2] fail-closed: a failed measurement gives a non-reusable namespace (two failures never share)
+    {
+        const std::string u1 = server_cache_measure_component("");
+        const std::string u2 = server_cache_measure_component("");
+        CHECK(u1.rfind("unmeasured-", 0) == 0 && u1 != u2);
+        CHECK(server_cache_measure_component("bbbbbbbbbbbbbbbb") == "bbbbbbbbbbbbbbbb");
+        auto p1 = parts(); p1.measure_h = u1;
+        auto p2 = parts(); p2.measure_h = u2;
+        CHECK(server_disk_cache_fingerprint_v2(cheap_a, p1).substr(0, 16) != server_disk_cache_fingerprint_v2(cheap_a, p2).substr(0, 16));
+        CHECK(server_disk_cache_fingerprint_v2(cheap_a, p1).substr(0, 16) != fa.substr(0, 16));
+    }
     CHECK(server_cache_measure_hash("abc") == server_cache_measure_hash("abc"));
     CHECK(server_cache_measure_hash("abc") != server_cache_measure_hash("abd"));
 

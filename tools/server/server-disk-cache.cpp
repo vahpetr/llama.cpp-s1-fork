@@ -900,6 +900,12 @@ bool server_cache_memo_put(const std::string & root, const std::string & memo_ke
     return !ec;
 }
 
+std::string server_cache_measure_component(const std::string & measure_h) {
+    // fail-closed: a failed measurement gets a namespace no other start can reach (random), so nothing written under
+    //   it is ever reused and no compatibility claim is made
+    return measure_h.empty() ? "unmeasured-" + random_id() : measure_h;
+}
+
 std::string server_cache_measure_hash(const std::string & bytes) {
     return h16_of(bytes);
 }

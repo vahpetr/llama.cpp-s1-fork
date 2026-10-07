@@ -1558,11 +1558,11 @@ private:
     //   only hold entries of another cheap identity, or none (this server is then the first writer and seeds its own
     //   measurement before its first save)
     std::string cache_compat_key(const std::string & cheap) {
-        std::string meas = cache_meas;
-        if (meas.empty()) {
-            meas = "unmeasured-" + cheap.substr(0, 16); // matches no other cheap identity: a miss, never a mixup
-            SRV_WRN("cache-compat: measurement %s, key bound to the cheap identity\n",
-                    cache_meas_how.empty() ? "not prepared" : cache_meas_how.c_str());
+        const std::string meas = server_cache_measure_component(cache_meas);
+        if (cache_meas.empty()) {
+            cache_memo_key_pending.clear(); // fail-closed: nothing published
+            SRV_WRN("cache-compat: measurement %s - non-reusable namespace %s (no stored state is reused or kept "
+                    "for a later start)\n", cache_meas_how.empty() ? "not prepared" : cache_meas_how.c_str(), meas.c_str());
         } else {
             SRV_INF("cache-compat: measurement %s (%s)\n", meas.c_str(), cache_meas_how.c_str());
             if (!cache_memo_key_pending.empty() &&

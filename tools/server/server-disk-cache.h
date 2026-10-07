@@ -407,5 +407,9 @@ std::string server_cache_memo_key(const std::string & cheap, const std::string &
 bool server_cache_memo_get(const std::string & root, const std::string & memo_key, std::string & measure_h);
 bool server_cache_memo_put(const std::string & root, const std::string & memo_key, const std::string & measure_h);
 
+// [TAG_CACHE_COMPAT2] the key's measurement component: the hash, or "unmeasured-<random>" for a failed measurement
+//   (a non-reusable namespace; the caller publishes no memo)
+std::string server_cache_measure_component(const std::string & measure_h);
+
 // the hash16 of measurement bytes (target, draft, carry sections as given)
 std::string server_cache_measure_hash(const std::string & bytes);
