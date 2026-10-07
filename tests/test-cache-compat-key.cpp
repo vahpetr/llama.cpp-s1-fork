@@ -171,6 +171,22 @@ int main() {
             o.put('y');
         }
         CHECK(server_cache_file_identity(f) != i0);
+        // KNOWN LIMITATION (design R80.2: sampled, not complete, content identity): an equal-size edit outside the
+        //   four 1 MiB samples keeps the identity - here byte 1.5 MiB of an 8 MiB file (samples at 0, 2.33, 4.67, 7 MiB)
+        {
+            const std::string g = (dir / "big.gguf").string();
+            {
+                std::ofstream o(g, std::ios::binary);
+                o << std::string(8u << 20, 'x');
+            }
+            const std::string g0 = server_cache_file_identity(g);
+            {
+                std::fstream o(g, std::ios::in | std::ios::out | std::ios::binary);
+                o.seekp((3u << 20) / 2);
+                o.put('y');
+            }
+            CHECK(server_cache_file_identity(g) == g0); // documents the limitation; a sampled edit changes it (above)
+        }
         CHECK(server_cache_file_identity((dir / "missing").string()) == "absent");
         CHECK(server_cache_file_identity("") == "none");
 
@@ -276,6 +292,24 @@ int main() {
         auto p2 = parts(); p2.measure_h = u2;
         CHECK(server_disk_cache_fingerprint_v2(cheap_a, p1).substr(0, 16) != server_disk_cache_fingerprint_v2(cheap_a, p2).substr(0, 16));
         CHECK(server_disk_cache_fingerprint_v2(cheap_a, p1).substr(0, 16) != fa.substr(0, 16));
+    }
+    // [TAG_CACHE_COMPAT2] full coverage: a change at EVERY byte position of a descriptor-sized string changes the
+    //   hash16 used for the descriptor key / envelope v2 / measurement (the weak v1 hash16 saw lanes a / c only)
+    {
+        std::string d;
+        for (int i = 0; d.size() < 3000; i++) {
+            d += "layer" + std::to_string(i) + "{k=q8_0,v=q8_0,dims=128x8,rot=64};";
+        }
+        const std::string h0 = server_cache_measure_hash(d);
+        size_t n_same = 0;
+        for (size_t i = 0; i < d.size(); i++) {
+            std::string m = d;
+            m[i] ^= 0x01;
+            n_same += server_cache_measure_hash(m) == h0;
+        }
+        CHECK(n_same == 0);
+        CHECK(server_cache_measure_hash(d + "x") != h0);
+        CHECK(server_cache_measure_hash(d.substr(0, d.size() - 1)) != h0);
     }
     CHECK(server_cache_measure_hash("abc") == server_cache_measure_hash("abc"));
     CHECK(server_cache_measure_hash("abc") != server_cache_measure_hash("abd"));
