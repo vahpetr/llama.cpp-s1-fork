@@ -2195,11 +2195,14 @@ private:
         //   is loaded instead of re-processed; whatever the slot is about to lose (all of it on a load, or most of it
         //   when the new prompt diverges early) is written to disk first
         if (ret && disk_cache && !ret->is_processing() && task.type == SERVER_TASK_TYPE_COMPLETION) {
+            // [TAG_NO_CACHE_PROMPT] cache_prompt:false re-processes the whole prompt: no lookup / load, and the slot
+            //   keeps nothing of its prompt (the retained prefix counts as 0 for the outgoing save)
+            const bool   reuse    = task.params.cache_prompt;
             const size_t n_slot   = ret->prompt.tokens.size();
-            const size_t lcp_slot = ret->prompt.tokens.get_common_prefix(task.tokens);
+            const size_t lcp_slot = reuse ? ret->prompt.tokens.get_common_prefix(task.tokens) : 0;
             const size_t margin   = 1024; // below this a load does not pay for itself
 
-            const bool will_load = disk_cache->find(task.tokens, lcp_slot + margin, ret->n_ctx, nullptr) >= 0;
+            const bool will_load = reuse && disk_cache->find(task.tokens, lcp_slot + margin, ret->n_ctx, nullptr) >= 0;
 
             // [TAG_TURN_BOUNDARY] a late branch: a whole later user turn of the resident prompt is cut off and the
             //   lost tail is worth a load. Best-effort: needs the user-message starts (message_spans of a chat
