@@ -119,6 +119,8 @@ export interface SettingsChatServiceOptions {
 	// Custom JSON parameters
 	customJson?: string;
 	timings_per_token?: boolean;
+	// Generation length; 0 = prompt processing only (pre-encode)
+	n_predict?: number;
 	// Continuation control (vLLM compat), opt in to the explicit continue final message flag
 	continueFinalMessage?: boolean;
 	// Callbacks

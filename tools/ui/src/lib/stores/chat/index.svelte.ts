@@ -41,6 +41,7 @@ import type {
 	ErrorDialogState
 } from '$lib/types';
 import {
+	filterByLeafNodeId,
 	findMessageById,
 	formatCwdMessage,
 	getConversationModel,
@@ -1074,13 +1075,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 				// Pre-encode conversation in KV cache for faster next turn
 				if (settingsStore.config.preEncodeConversation) {
-					this.triggerPreEncode(
-						allMessages,
-						assistantMessage,
-						streamedContent,
-						effectiveModel,
-						!!settingsStore.config.excludeReasoningFromContext
-					);
+					this.triggerPreEncode(convId, effectiveModel);
 				}
 			},
 			onModel: (modelName: string) => recordModel(modelName),
@@ -1417,13 +1412,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		}
 	}
 
-	private async triggerPreEncode(
-		allMessages: DatabaseMessage[],
-		assistantMessage: DatabaseMessage,
-		assistantContent: string,
-		model?: string | null,
-		excludeReasoning?: boolean
-	): Promise<void> {
+	private async triggerPreEncode(convId: string, model?: string | null): Promise<void> {
 		this.cancelPreEncode();
 		this.preEncodeAbortController = new AbortController();
 
@@ -1434,20 +1423,27 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 			if (!allIdle || signal.aborted) return;
 
-			const messagesWithAssistant: DatabaseMessage[] = [
-				...allMessages,
-				{ ...assistantMessage, content: assistantContent }
-			];
-			const frozenTools = parseToolsSnapshot(
-				(await DatabaseService.getConversation(assistantMessage.convId))?.toolsSnapshot
-			);
+			// the path the next request rebuilds from the database (tool calls, tool results,
+			// reasoning), with the request options of a real turn and the frozen tool list
+			const conversation = await DatabaseService.getConversation(convId);
+
+			if (!conversation) return;
+
+			const path = filterByLeafNodeId(
+				await DatabaseService.getConversationMessages(convId),
+				conversation.currNode,
+				false
+			) as DatabaseMessage[];
+			const frozenTools = parseToolsSnapshot(conversation.toolsSnapshot);
 
 			await ChatService.preEncode(
-				messagesWithAssistant,
-				model,
-				excludeReasoning,
-				signal,
-				frozenTools ?? undefined
+				path,
+				{
+					...this.getApiOptions(),
+					...(model ? { model } : {}),
+					tools: frozenTools ?? undefined
+				},
+				signal
 			);
 		} catch (err) {
 			if (!isAbortError(err)) {
