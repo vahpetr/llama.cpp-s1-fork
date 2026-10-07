@@ -1308,7 +1308,14 @@ private:
     // debug-only fault injection for the failure-path tests, read once at load (absent in every deployment):
     //   LLAMA_SERVER_DEBUG_FAULT=slot   - a per-slot exception in post_decode() once a slot has generated 2 tokens
     //   LLAMA_SERVER_DEBUG_FAULT=decode - an exception after a successful decode (as a failed speculative batch)
+    //   LLAMA_SERVER_DEBUG_FAULT=ckpt   - an exception in the first create_checkpoint() (a pre-decode batch-building
+    //                                     failure after the slot's prompt rows were appended)
     int32_t dbg_fault = 0;
+
+    // [TAG_PREDECODE_ABORT] (Codex gate r1 A1) true while pre_decode() builds the batch: a per-slot exception there
+    //   cannot be confined to the slot (its rows are already in the batch, slot_batched may be unset or point at it),
+    //   so iterate() rethrows it to the outer abort-and-return path in update_slots(), which discards the batch
+    bool iterate_rethrow = false;
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
@@ -1531,7 +1538,7 @@ private:
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
         if (const char * f = getenv("LLAMA_SERVER_DEBUG_FAULT")) {
-            dbg_fault = std::string(f) == "slot" ? 1 : std::string(f) == "decode" ? 2 : 0;
+            dbg_fault = std::string(f) == "slot" ? 1 : std::string(f) == "decode" ? 2 : std::string(f) == "ckpt" ? 3 : 0;
             SRV_WRN("debug fault injection armed: %s\n", f);
         }
 
@@ -3174,6 +3181,11 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        if (dbg_fault == 3) {
+            dbg_fault = 0;
+            throw std::runtime_error("debug fault: ckpt");
+        }
+
         const int id_task = slot.task->id;
 
         // [TAG_CKPT_KEEP_SAME_POS] (v33 fix round 1) a checkpoint that already exists at this position is the one just
@@ -3701,6 +3713,9 @@ private:
             try {
                 callback(slot);
             } catch (const std::exception & e) {
+                if (iterate_rethrow) {
+                    throw;
+                }
                 SLT_ERR(slot, "got exception: %s\n", e.what());
                 send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                 slot.release();
@@ -3714,6 +3729,9 @@ private:
             try {
                 callback(*slot);
             } catch (const std::exception & e) {
+                if (iterate_rethrow) {
+                    throw;
+                }
                 SLT_ERR(*slot, "got exception: %s\n", e.what());
                 send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                 slot->release();
@@ -3831,7 +3849,9 @@ private:
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
 
-            // the batch is half-built and not rendered, skip now to avoid UB
+            // [TAG_PREDECODE_ABORT] the batch is half-built and not rendered: discard it (rows of the aborted slots,
+            //   slot_batched) so nothing of it is decoded, and skip now to avoid UB
+            batch.clear();
             return;
         }
 
@@ -3990,6 +4010,13 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+
+        // [TAG_PREDECODE_ABORT] from here on a per-slot failure aborts the whole pass (see update_slots())
+        iterate_rethrow = true;
+        struct rethrow_reset {
+            bool & f;
+            ~rethrow_reset() { f = false; }
+        } rethrow_guard { iterate_rethrow };
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
