@@ -407,6 +407,7 @@ private:
         std::vector<graph_cache_alloc_rec> manifest; // CHECK only
     };
     int32_t graph_cache_k     = 0;
+    std::string graph_cache_inject; // test seam LLAMA_GRAPH_CACHE_CHECK_INJECT=ptr|view|route (first CHECK only)
     int32_t graph_cache_check = 0; // 1 = rebuild + compare plan and manifest, 2 = also execute the fresh plan and compare
     bool    graph_cache_active = false; // the live scheduler state belongs to the cache, not to gf_res_prev
     size_t  graph_cache_max_nodes = 0;
@@ -416,7 +417,7 @@ private:
     ggml_backend_sched_t   graph_cache_check_owner = nullptr; // the main scheduler the scratch one was made for
     size_t                 graph_cache_check_nodes = 0;       // and its node budget
     struct graph_cache_stats {
-        int64_t hit = 0, miss = 0, check = 0, inval = 0, evict = 0, clear = 0, check2 = 0, check_sched = 0, park_fail = 0;
+        int64_t hit = 0, miss = 0, check = 0, inval = 0, evict = 0, clear = 0, check2 = 0, check_sched = 0, park_fail = 0, bypass = 0;
     };
     graph_cache_stats graph_cache_tot;
 

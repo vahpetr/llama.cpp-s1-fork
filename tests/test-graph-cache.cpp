@@ -20,6 +20,9 @@
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -130,10 +133,11 @@ struct run_out {
     std::vector<llama_token> drafts;
     std::vector<std::string> qsa_ids; // [qsa-ids] lines without the graph counter
     int64_t hit[2] = {0, 0}, miss[2] = {0, 0}, check[2] = {0, 0}, inval[2] = {0, 0}; // [0] main, [1] mtp
-    int64_t evict[2] = {0, 0}, clear[2] = {0, 0}, check2[2] = {0, 0}, check_sched[2] = {0, 0}, park_fail[2] = {0, 0};
+    int64_t evict[2] = {0, 0}, clear[2] = {0, 0}, check2[2] = {0, 0}, check_sched[2] = {0, 0}, park_fail[2] = {0, 0}, bypass[2] = {0, 0};
 };
 
-static run_out run(gguf_context * meta, const char * k, const char * check, const std::string & stderr_path, int fail_take = -1) {
+static run_out run(gguf_context * meta, const char * k, const char * check, const std::string & stderr_path, int fail_take = -1,
+                   bool backend_sampling = false) {
     run_out out;
     ggml_backend_sched_snapshot_fail_inject(fail_take); // -1 = off; n = the take after n successful ones fails
     common_set_env("LLAMA_GRAPH_CACHE",       k);
@@ -177,7 +181,7 @@ static run_out run(gguf_context * meta, const char * k, const char * check, cons
         params.draft.n_max            = 4;
         params.draft.n_min            = 0;
         params.draft.p_min            = 0.0f;
-        params.draft.backend_sampling = false; // backend samplers bypass the graph cache (AUDIT-graph-cache-inputs.md)
+        params.draft.backend_sampling = backend_sampling; // prod default true: the draft context then bypasses the graph cache
         params.draft.ctx_tgt          = ctx_tgt.get();
         params.draft.ctx_dft          = ctx_dft.get();
         common_speculative * spec = common_speculative_init(params, 1);
@@ -261,12 +265,12 @@ static run_out run(gguf_context * meta, const char * k, const char * check, cons
     while (std::getline(ls, line)) {
         char ctx[16] = {0};
         int kk = 0;
-        long long h = 0, m = 0, c = 0, inv = 0, ev = 0, cl = 0, c2 = 0, cs = 0, pf = 0;
-        if (sscanf(line.c_str(), "graph-cache: ctx=%15s K=%d hit=%lld miss=%lld check=%lld inval=%lld evict=%lld clear=%lld check2=%lld check_sched=%lld park_fail=%lld",
-                   ctx, &kk, &h, &m, &c, &inv, &ev, &cl, &c2, &cs, &pf) == 11) {
+        long long h = 0, m = 0, c = 0, inv = 0, ev = 0, cl = 0, c2 = 0, cs = 0, pf = 0, bp = 0;
+        if (sscanf(line.c_str(), "graph-cache: ctx=%15s K=%d hit=%lld miss=%lld check=%lld inval=%lld evict=%lld clear=%lld check2=%lld check_sched=%lld park_fail=%lld bypass=%lld",
+                   ctx, &kk, &h, &m, &c, &inv, &ev, &cl, &c2, &cs, &pf, &bp) == 12) {
             const int i = strcmp(ctx, "mtp") == 0 ? 1 : 0;
             out.hit[i] += h; out.miss[i] += m; out.check[i] += c; out.inval[i] += inv;
-            out.evict[i] += ev; out.clear[i] += cl; out.check2[i] += c2; out.check_sched[i] += cs; out.park_fail[i] += pf;
+            out.evict[i] += ev; out.clear[i] += cl; out.check2[i] += c2; out.check_sched[i] += cs; out.park_fail[i] += pf; out.bypass[i] += bp;
         }
     }
     return out;
@@ -284,11 +288,38 @@ static bool same(const std::vector<T> & a, const std::vector<T> & b) {
     return a.size() == b.size() && (a.empty() || memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0);
 }
 
+// a CHECK=1 run with one induced corruption of a cached entry (LLAMA_GRAPH_CACHE_CHECK_INJECT) in a child process:
+// it must abort with the matching graph-cache check message
+static bool aborts_with(gguf_context * meta, const char * inject, const std::string & path, const char * msg) {
+    fflush(stdout);
+    GGML_UNUSED(meta);
+    // fork + exec (a plain fork of this multi-threaded process can deadlock): the child is this binary in inject mode
+    const pid_t pid = fork();
+    if (pid == 0) {
+        execl("/proc/self/exe", "test-graph-cache", "--inject", inject, path.c_str(), (char *) nullptr);
+        _exit(127);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    std::ifstream f(path);
+    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const bool found = text.find(msg) != std::string::npos;
+    printf("inject %s: %s, message %s\n", inject, WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT ? "SIGABRT" : "no abort",
+           found ? "found" : "missing");
+    return WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT && found;
+}
+
 int main(int argc, char ** argv) {
     llama_log_set(capture_log, nullptr);
     common_set_env("GGML_ALLOC_GROW_SLACK", "0");
-    const std::string dir = argc > 1 ? argv[1] : ".";
+    const std::string dir = argc == 2 ? argv[1] : ".";
     gguf_context_ptr meta = make_meta(4096);
+    if (argc == 4 && strcmp(argv[1], "--inject") == 0) {
+        common_set_env("LLAMA_GRAPH_CACHE_CHECK_INJECT", argv[2]);
+        common_set_env("GGML_NO_BACKTRACE", "1");
+        run(meta.get(), "8", "1", argv[3]);
+        return 0; // not aborted: the check missed the corruption
+    }
 
     const run_out off = run(meta.get(), "0", "0", dir + "/test-graph-cache-off.stderr");
     const run_out on  = run(meta.get(), "8", "0", dir + "/test-graph-cache-on.stderr");
@@ -308,7 +339,10 @@ int main(int argc, char ** argv) {
     }
 
     const run_out pfl = run(meta.get(), "8", "1", dir + "/test-graph-cache-parkfail.stderr", 10);
-    for (const run_out * r : { &off, &on, &chk, &ch2, &pfl }) {
+    // the production draft configuration: backend sampling ON in the draft (MTP) context
+    const run_out obs = run(meta.get(), "0", "0", dir + "/test-graph-cache-bs-off.stderr", -1, true);
+    const run_out cbs = run(meta.get(), "8", "1", dir + "/test-graph-cache-bs-check.stderr", -1, true);
+    for (const run_out * r : { &off, &on, &chk, &ch2, &pfl, &obs, &cbs }) {
         printf("run: %zu logits, %zu draft tokens, %zu [qsa-ids] lines; main hit=%" PRId64 " miss=%" PRId64 " check=%" PRId64
                " inval=%" PRId64 "; mtp hit=%" PRId64 " miss=%" PRId64 " check=%" PRId64 " inval=%" PRId64 "\n",
                r->logits.size(), r->drafts.size(), r->qsa_ids.size(), r->hit[0], r->miss[0], r->check[0], r->inval[0],
@@ -333,6 +367,24 @@ int main(int argc, char ** argv) {
     expect(ch2.check2[0] == ch2.hit[0] && ch2.check2[1] == ch2.hit[1] && ch2.check[0] == ch2.hit[0] && ch2.hit[0] > 0,
            "CHECK=2: every hit also executed fresh from the same state, outputs + state bytes equal");
     expect(on.inval[0] + on.inval[1] > 0, "regrow past kv_graph_span invalidated snapshots (inval > 0)");
+
+    printf("backend sampling: mtp bypass=%" PRId64 " clear=%" PRId64 "; main hit=%" PRId64 " check=%" PRId64 "\n",
+           cbs.bypass[1], cbs.clear[1], cbs.hit[0], cbs.check[0]);
+    expect(same(obs.logits, cbs.logits) && same(obs.drafts, cbs.drafts) && obs.qsa_ids == cbs.qsa_ids,
+           "draft backend sampling ON (prod): K=8 + CHECK identical to cache off");
+    expect(cbs.hit[1] == 0 && cbs.miss[1] == 0 && cbs.bypass[1] > 0,
+           "draft backend sampling ON: the MTP context bypasses the cache (no hit/miss, bypass > 0)");
+    expect(cbs.hit[0] > cbs.miss[0] && cbs.check[0] == cbs.hit[0] && cbs.bypass[0] == 0,
+           "draft backend sampling ON: the target context still hits, CHECK on every hit, no bypass");
+
+    expect(aborts_with(meta.get(), "ptr",   dir + "/test-graph-cache-inject-ptr.stderr",   "allocation differs from the manifest"),
+           "CHECK aborts on an induced compute-pointer corruption");
+    expect(aborts_with(meta.get(), "view",  dir + "/test-graph-cache-inject-view.stderr",  "view inconsistent"),
+           "CHECK aborts on an induced view corruption");
+    // the CPU-only plan has one split without inputs: the seam routes a phantom copy into split 0 (n_inputs
+    // differs); with split inputs (Vulkan + CPU) it feeds input 0's copy from another source ("copy routing differs")
+    expect(aborts_with(meta.get(), "route", dir + "/test-graph-cache-inject-route.stderr", "the cached split plan differs from a fresh build"),
+           "CHECK aborts on an induced copy-routing mismatch");
 
     printf("test-graph-cache: %s\n", n_fail == 0 ? "OK" : "FAILED");
     return n_fail == 0 ? 0 : 1;

@@ -996,6 +996,7 @@ struct llm_graph_topology_cmp {
     std::unordered_map<const ggml_tensor *, int> ida, idb;
     int n_other = 0;
     std::string why;
+    bool inject_route = false; // test seam (LLAMA_GRAPH_CACHE_CHECK_INJECT=route): perturb the cached split routing
 
     bool ref_eq(const ggml_tensor * a, const ggml_tensor * b);
     bool tensor_eq(const ggml_tensor * a, const ggml_tensor * b, const char * kind, int i);

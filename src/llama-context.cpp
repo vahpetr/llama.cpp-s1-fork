@@ -620,6 +620,10 @@ llama_context::llama_context(
         const char * LLAMA_GRAPH_CACHE_CHECK = getenv("LLAMA_GRAPH_CACHE_CHECK");
         graph_cache_k     = LLAMA_GRAPH_CACHE ? std::max(0, atoi(LLAMA_GRAPH_CACHE)) : 0;
         graph_cache_check = graph_cache_k > 0 && LLAMA_GRAPH_CACHE_CHECK ? std::max(0, atoi(LLAMA_GRAPH_CACHE_CHECK)) : 0;
+        if (graph_cache_check > 0) {
+            const char * inj = getenv("LLAMA_GRAPH_CACHE_CHECK_INJECT");
+            graph_cache_inject = inj ? inj : "";
+        }
         if (graph_cache_k > 0) {
             LLAMA_LOG_INFO("%s: graph cache: K = %d, check = %d\n", __func__, graph_cache_k, graph_cache_check);
         }
@@ -848,9 +852,9 @@ llama_context::~llama_context() {
         // [TAG_GRAPH_CACHE] totals of this context
         const auto & t = graph_cache_tot;
         LLAMA_LOG_INFO("graph-cache: ctx=%s K=%d hit=%" PRId64 " miss=%" PRId64 " check=%" PRId64 " inval=%" PRId64
-                " evict=%" PRId64 " clear=%" PRId64 " check2=%" PRId64 " check_sched=%" PRId64 " park_fail=%" PRId64 "\n",
+                " evict=%" PRId64 " clear=%" PRId64 " check2=%" PRId64 " check_sched=%" PRId64 " park_fail=%" PRId64 " bypass=%" PRId64 "\n",
                 sched_prof_ctx_name(cparams.ctx_type), graph_cache_k, t.hit, t.miss, t.check, t.inval, t.evict, t.clear,
-                t.check2, t.check_sched, t.park_fail);
+                t.check2, t.check_sched, t.park_fail, t.bypass);
         graph_cache.clear(); // before the scheduler (the snapshots reference its tensors only by pointer)
     }
 
@@ -1860,13 +1864,29 @@ llm_graph_result * llama_context::graph_cache_get(const llama_ubatch & ubatch, l
                 ggml_backend_sched_split_graph(graph_cache_check_sched.get(), gf_check);
             }
             llm_graph_topology_cmp cmp;
+            if (!graph_cache_inject.empty()) {
+                // test seam: corrupt the cached entry once; the checks below must abort
+                for (const auto & r : e.manifest) {
+                    auto * t = const_cast<ggml_tensor *>(r.t);
+                    if (graph_cache_inject == "ptr" && t->view_src == nullptr && r.size > 0) {
+                        t->data = (char *) t->data + 64;
+                        break;
+                    }
+                    if (graph_cache_inject == "view" && t->view_src != nullptr) {
+                        t->view_offs += 16;
+                        break;
+                    }
+                }
+                cmp.inject_route = graph_cache_inject == "route";
+                graph_cache_inject.clear();
+            }
+            graph_cache_manifest_check(e);
             if (gf_check == nullptr || !cmp.graph_eq(e.res->get_gf(), gf_check)) {
                 GGML_ABORT("graph-cache check: the cached graph differs from a fresh build: %s", gf_check ? cmp.why.c_str() : "rebuild failed");
             }
             if (!cmp.sched_eq(s, e.res->get_gf(), graph_cache_check_sched.get(), gf_check)) {
                 GGML_ABORT("graph-cache check: the cached split plan differs from a fresh build: %s", cmp.why.c_str());
             }
-            graph_cache_manifest_check(e);
             graph_cache_tot.check++;
             graph_cache_check_res->reset();
         }
@@ -2134,6 +2154,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // last built graph, AUDIT-graph-cache-inputs.md), and pipeline parallelism rotates the input copies: neither
     // can switch between cached graphs, both keep the single previous graph
     const bool use_graph_cache = graph_cache_k > 0 && !graph_reuse_disable && !cparams.pipeline_parallel && sampling.samplers.empty();
+    if (graph_cache_k > 0 && !use_graph_cache) {
+        graph_cache_tot.bypass++;
+    }
     if (!use_graph_cache && graph_cache_active) {
         graph_cache_clear();
     }

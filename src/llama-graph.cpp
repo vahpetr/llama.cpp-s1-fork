@@ -4116,8 +4116,12 @@ bool llm_graph_topology_cmp::sched_eq(ggml_backend_sched_t sa, ggml_cgraph * cac
     }
     for (int i = 0; i < ns; ++i) {
         int ba, sta, ea, bb, stb, eb;
-        const int nia = ggml_backend_sched_get_split(sa, i, &ba, &sta, &ea);
+        int       nia = ggml_backend_sched_get_split(sa, i, &ba, &sta, &ea);
         const int nib = ggml_backend_sched_get_split(sb, i, &bb, &stb, &eb);
+        const bool perturb = inject_route && i == 0;
+        if (perturb && nia == 0) {
+            nia = 1; // a phantom copy routed into split 0 (a plan without split inputs, e.g. CPU only)
+        }
         if (nia != nib || ba != bb || sta != stb || ea != eb) {
             why = format("split %d: backend/range/n_inputs differs (%d %d-%d %d vs %d %d-%d %d)", i, ba, sta, ea, nia, bb, stb, eb, nib);
             return false;
@@ -4126,6 +4130,9 @@ bool llm_graph_topology_cmp::sched_eq(ggml_backend_sched_t sa, ggml_cgraph * cac
             ggml_tensor * ia, * ca, * ib, * cb;
             ggml_backend_sched_get_split_input(sa, i, j, &ia, &ca);
             ggml_backend_sched_get_split_input(sb, i, j, &ib, &cb);
+            if (perturb && j == 0) {
+                ia = ggml_graph_node(cached, 0); // the copy fed from another source tensor
+            }
             if (!ref_eq(ia, ib) || !ref_eq(ca, cb)) {
                 if (why.empty() || why.rfind("split", 0) != 0) {
                     why = format("split %d input %d (%s -> %s): copy routing differs%s%s", i, j, ia ? ia->name : "-", ca ? ca->name : "-",
