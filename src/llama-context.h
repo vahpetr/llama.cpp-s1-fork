@@ -434,6 +434,7 @@ private:
         std::vector<std::pair<const ggml_tensor *, std::vector<uint8_t>>> state;   // persistent tensors written
     };
     graph_cache_exec_rec graph_cache_exec;
+    uint32_t graph_cache_exec_n_tokens = 0;
     void graph_cache_check_exec_pre(llm_graph_result * res, const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx);
     void graph_cache_check_exec_post(llm_graph_result * res);
     // the cache path of process_ubatch: a reused or newly built and allocated graph, nullptr on failure

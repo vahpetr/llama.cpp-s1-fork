@@ -288,6 +288,98 @@ static bool same(const std::vector<T> & a, const std::vector<T> & b) {
     return a.size() == b.size() && (a.empty() || memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0);
 }
 
+// [TAG_GRAPH_CACHE] memory transitions on the target context (QSA env of ctest, recurrent rollback depth per verify
+// batch): rollback (seq_rm of the last batch's tail), state save -> more rounds -> state load, shrink (clear + 20
+// tokens) -> regrow (a 100-token batch), clear. A unified-cache purge / hole refill is not reachable through the API
+// for this hybrid M-RoPE model (position overwrite rejected, recurrent seq_rm only at the tail). Every row's logits are recorded; cached graphs must be reused
+// across the transitions only where they stay valid.
+static run_out run_transitions(gguf_context * meta, const char * k, const char * check, const std::string & stderr_path) {
+    run_out out;
+    common_set_env("LLAMA_GRAPH_CACHE",       k);
+    common_set_env("LLAMA_GRAPH_CACHE_CHECK", check);
+    g_log.clear();
+    fflush(stderr);
+    { std::ofstream truncate(stderr_path); }
+    GGML_ASSERT(freopen(stderr_path.c_str(), "a", stderr) != nullptr);
+    setvbuf(stderr, nullptr, _IOLBF, 0);
+    {
+        llama_model_params mp = llama_model_default_params();
+        mp.progress_callback = silent_progress;
+        mp.load_mtp          = true;
+        ggml_backend_dev_t devs[2] = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
+        mp.devices = devs;
+        size_t seed = 31;
+        llama_model_ptr model(llama_model_init_from_user(meta, set_tensor_data, &seed, mp));
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = 1024; cp.n_batch = 128; cp.n_ubatch = 64; cp.n_seq_max = 1; cp.n_threads = 4; cp.n_threads_batch = 4;
+        cp.kv_graph_span = 256;
+        cp.n_rs_seq      = 4; // recurrent rollback (a verify batch of up to 4 tokens)
+        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+        GGML_ASSERT(ctx);
+        llama_memory_t mem = llama_get_memory(ctx.get());
+        llama_pos n_past = 0;
+        uint32_t tag = 0;
+        auto feed = [&](const std::vector<llama_token> & toks, llama_pos pos0) {
+            llama_batch b = llama_batch_init((int32_t) toks.size(), 0, 1);
+            for (size_t i = 0; i < toks.size(); ++i) {
+                common_batch_add(b, toks[i], pos0 + (llama_pos) i, { 0 }, true);
+            }
+            llama_set_rs_rollback_depth(ctx.get(), toks.size() <= 4 ? (uint32_t) toks.size() : 0);
+            GGML_ASSERT(llama_decode(ctx.get(), b) == 0);
+            for (size_t i = 0; i < toks.size(); ++i) {
+                const float * l = llama_get_logits_ith(ctx.get(), (int32_t) i);
+                out.logits.insert(out.logits.end(), l, l + N_VOCAB);
+            }
+            llama_batch_free(b);
+        };
+        auto rounds = [&](int n) {
+            for (int r = 0; r < n; ++r) {
+                const int w = 1 + r % 4;
+                feed(tokens((size_t) w, 2000 + tag++), n_past);
+                n_past += w;
+            }
+        };
+        feed(tokens(120, 77), 0); n_past = 120;
+        rounds(12);
+        // rollback: drop 3 of the last verify batch's 4 tokens (recurrent state rolled back), then continue
+        GGML_ASSERT(llama_memory_seq_rm(mem, 0, n_past - 3, -1)); n_past -= 3;
+        rounds(8);
+        // state save -> diverge -> state load
+        std::vector<uint8_t> state(llama_state_get_size(ctx.get()));
+        GGML_ASSERT(llama_state_get_data(ctx.get(), state.data(), state.size()) == state.size());
+        const llama_pos n_saved = n_past;
+        rounds(8);
+        GGML_ASSERT(llama_state_set_data(ctx.get(), state.data(), state.size()) == state.size());
+        n_past = n_saved;
+        rounds(8);
+        // shrink -> regrow (a hybrid recurrent sequence cannot be cut in the middle: clear, 20 tokens, then a
+        // 100-token batch that grows n_kv again)
+        llama_memory_clear(mem, true);
+        feed(tokens(20, 3500), 0); n_past = 20;
+        rounds(8);
+        feed(tokens(100, 4000), n_past); n_past += 100;
+        rounds(8);
+        // clear
+        llama_memory_clear(mem, true); n_past = 0;
+        feed(tokens(90, 5000), 0); n_past = 90;
+        rounds(12);
+    }
+    fflush(stderr);
+    GGML_ASSERT(freopen("/dev/tty", "w", stderr) != nullptr || freopen("/dev/null", "w", stderr) != nullptr);
+    std::istringstream ls(g_log);
+    std::string line;
+    while (std::getline(ls, line)) {
+        char cx[16] = {0};
+        int kk = 0;
+        long long h = 0, m = 0, c = 0, inv = 0, ev = 0, cl = 0, c2 = 0;
+        if (sscanf(line.c_str(), "graph-cache: ctx=%15s K=%d hit=%lld miss=%lld check=%lld inval=%lld evict=%lld clear=%lld check2=%lld",
+                   cx, &kk, &h, &m, &c, &inv, &ev, &cl, &c2) == 9) {
+            out.hit[0] += h; out.miss[0] += m; out.check[0] += c; out.check2[0] += c2;
+        }
+    }
+    return out;
+}
+
 // [TAG_GRAPH_CACHE] memory of the cache at the brain's node budget: n_ubatch 2048 gives this qwen4exp context
 // graph_max_nodes = max(2048*40, 32*n_tensors) = 81920, as the prod brain (n_ubatch 2048, 1224 tensors). Decode
 // widths 1..9 (each a new graph: a miss) and report VmSize / VmRSS after each; with K=8 every miss from the second
@@ -430,6 +522,18 @@ int main(int argc, char ** argv) {
     expect(ch2.check2[0] == ch2.hit[0] && ch2.check2[1] == ch2.hit[1] && ch2.check[0] == ch2.hit[0] && ch2.hit[0] > 0,
            "CHECK=2: every hit also executed fresh from the same state, outputs + state bytes equal");
     expect(on.inval[0] + on.inval[1] > 0, "regrow past kv_graph_span invalidated snapshots (inval > 0)");
+
+    const run_out t_off = run_transitions(meta.get(), "0", "0", dir + "/test-graph-cache-trans-off.stderr");
+    const run_out t_chk = run_transitions(meta.get(), "8", "1", dir + "/test-graph-cache-trans-check.stderr");
+    printf("transitions: cache off == K=8 + CHECK=1: %s (%" PRId64 " hits)\n", same(t_off.logits, t_chk.logits) ? "yes" : "NO", t_chk.hit[0]);
+    fflush(stdout);
+    const run_out t_ch2 = run_transitions(meta.get(), "8", "2", dir + "/test-graph-cache-trans-check2.stderr");
+    printf("transitions: %zu logits; K=8+CHECK hit=%" PRId64 " miss=%" PRId64 " check=%" PRId64 "; CHECK=2 hit=%" PRId64 " check2=%" PRId64 "\n",
+           t_off.logits.size(), t_chk.hit[0], t_chk.miss[0], t_chk.check[0], t_ch2.hit[0], t_ch2.check2[0]);
+    expect(same(t_off.logits, t_chk.logits) && same(t_off.logits, t_ch2.logits),
+           "transitions (rollback, state load, shrink -> regrow, clear): logits cache off == K=8 + CHECK=1 == CHECK=2");
+    expect(t_chk.hit[0] > 0 && t_chk.check[0] == t_chk.hit[0] && t_ch2.check2[0] == t_ch2.hit[0] && t_ch2.hit[0] > 0,
+           "transitions: the cache hits and CHECK (1 and 2) is green on every hit");
 
     printf("backend sampling: mtp bypass=%" PRId64 " clear=%" PRId64 "; main hit=%" PRId64 " check=%" PRId64 "\n",
            cbs.bypass[1], cbs.clear[1], cbs.hit[0], cbs.check[0]);

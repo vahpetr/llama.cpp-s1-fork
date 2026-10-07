@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -2056,12 +2057,19 @@ void llama_context::graph_cache_check_exec_pre(llm_graph_result * res, const lla
     ggml_cgraph * gf_c = res->get_gf();
     const int n = ggml_graph_n_nodes(gf_c);
 
-    // the persistent tensors the graph produces in place (KV/recurrent/QSA writes): their bytes before
+    // every persistent non-weight tensor the graph reaches (KV / recurrent / rollback / QSA state, also when an op
+    // writes it as a side effect of a source): its bytes before. Weights are never written and are skipped.
     std::vector<std::pair<const ggml_tensor *, std::vector<uint8_t>>> before;
-    for (int i = 0; i < n; ++i) {
-        const ggml_tensor * t = ggml_graph_node(gf_c, i);
-        if (t->buffer != nullptr && !graph_cache_is_compute(t) && t->op != GGML_OP_NONE && t->op != GGML_OP_VIEW &&
-            t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
+    {
+        std::vector<const ggml_tensor *> ts;
+        graph_cache_collect(gf_c, ts);
+        std::set<std::pair<const void *, size_t>> seen;
+        for (const ggml_tensor * t : ts) {
+            if (t->buffer == nullptr || t->data == nullptr || graph_cache_is_compute(t) ||
+                ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                !seen.insert({ t->data, ggml_nbytes(t) }).second) {
+                continue;
+            }
             before.emplace_back(t, std::vector<uint8_t>());
             graph_cache_read(t, before.back().second);
         }
@@ -2077,7 +2085,25 @@ void llama_context::graph_cache_check_exec_pre(llm_graph_result * res, const lla
     if (gf_f == nullptr || ggml_graph_n_nodes(gf_f) != n || !ggml_backend_sched_alloc_graph(cs, gf_f)) {
         GGML_ABORT("graph-cache check=2: the fresh plan could not be built/allocated");
     }
-    graph_cache_check_res->set_inputs(&ubatch);
+    graph_cache_exec_n_tokens = ubatch.n_tokens;
+    {
+        // the inputs exactly as the cached graph got them: set_inputs is not repeated (some inputs are one-shot,
+        // e.g. a pending recurrent rollback is consumed by the first call). Equal topologies are collected in the
+        // same order, so the i-th tensors correspond.
+        std::vector<const ggml_tensor *> tc, tf;
+        graph_cache_collect(gf_c, tc);
+        graph_cache_collect(gf_f, tf);
+        GGML_ASSERT(tc.size() == tf.size());
+        std::vector<uint8_t> buf;
+        for (size_t i = 0; i < tc.size(); ++i) {
+            if (!(tc[i]->flags & GGML_TENSOR_FLAG_INPUT) || tc[i]->data == nullptr || tc[i]->data == tf[i]->data) {
+                continue;
+            }
+            GGML_ASSERT((tf[i]->flags & GGML_TENSOR_FLAG_INPUT) && ggml_nbytes(tc[i]) == ggml_nbytes(tf[i]));
+            graph_cache_read(tc[i], buf);
+            ggml_backend_tensor_set(const_cast<ggml_tensor *>(tf[i]), buf.data(), 0, buf.size());
+        }
+    }
     if (graph_compute(gf_f, ubatch.n_tokens > 1, cs) != GGML_STATUS_SUCCESS) {
         GGML_ABORT("graph-cache check=2: the fresh plan failed to compute");
     }
@@ -2113,8 +2139,10 @@ void llama_context::graph_cache_check_exec_post(llm_graph_result * res) {
         for (const auto & [t, want] : *set) {
             graph_cache_read(t, got);
             if (got != want) {
-                GGML_ABORT("graph-cache check=2: %s %s differs between the cached and a fresh plan",
-                        set == &graph_cache_exec.outputs ? "output" : "state", t->name);
+                size_t i0 = 0;
+                while (i0 < got.size() && got[i0] == want[i0]) { ++i0; }
+                GGML_ABORT("graph-cache check=2: %s %s differs between the cached and a fresh plan (hit %" PRId64 ", n_tokens %u, byte %zu of %zu)",
+                        set == &graph_cache_exec.outputs ? "output" : "state", t->name, graph_cache_tot.hit, graph_cache_exec_n_tokens, i0, got.size());
             }
         }
     }
