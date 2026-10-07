@@ -383,6 +383,35 @@ private:
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
+    // [TAG_GRAPH_CACHE] env LLAMA_GRAPH_CACHE=<K> (default 0 = only gf_res_prev, as before): an LRU of K built and
+    // allocated graphs, each with the scheduler state of its allocation (ggml_backend_sched_take/_restore). The
+    // scheduler's live state belongs to the one resident entry (snap == nullptr). LLAMA_GRAPH_CACHE_CHECK=1 rebuilds
+    // every hit into a scratch result and aborts if its topology differs from the cached graph.
+    struct sched_snapshot_deleter {
+        void operator()(ggml_backend_sched_snapshot_t s) const { ggml_backend_sched_snapshot_free(s); }
+    };
+    struct graph_cache_entry {
+        llm_graph_result_ptr res;
+        std::unique_ptr<ggml_backend_sched_snapshot, sched_snapshot_deleter> snap; // nullptr while resident
+        bool resident = false;
+    };
+    int32_t graph_cache_k     = 0;
+    bool    graph_cache_check = false;
+    bool    graph_cache_active = false; // the live scheduler state belongs to the cache, not to gf_res_prev
+    size_t  graph_cache_max_nodes = 0;
+    std::vector<graph_cache_entry> graph_cache; // most recently used first
+    llm_graph_result_ptr  graph_cache_check_res;
+    ggml_backend_sched_ptr graph_cache_check_sched;
+    struct graph_cache_stats {
+        int64_t hit = 0, miss = 0, check = 0, inval = 0, evict = 0, clear = 0;
+    };
+    graph_cache_stats graph_cache_tot;
+
+    // drop every cached graph (the scheduler is about to be reset, reserved or replaced)
+    void graph_cache_clear();
+    // the cache path of process_ubatch: a reused or newly built and allocated graph, nullptr on failure
+    llm_graph_result * graph_cache_get(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool & reused);
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
@@ -429,6 +458,7 @@ private:
     struct kqvis_prof_window {
         int32_t  graphs = 0;
         int32_t  reused = 0;
+        int32_t  gc_hit = 0, gc_miss = 0, gc_check = 0, gc_inval = 0; // [TAG_GRAPH_CACHE]
         int32_t  cls    = -1; // 0 = dec, 1 = pp
         int32_t  mode   = -1; // bit 0 = mask fill, bit 1 = metadata fill (0 = none)
         uint64_t epoch  = 0;  // the global idle epoch at the first graph

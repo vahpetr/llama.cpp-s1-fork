@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstring>
 #include <numeric>
+#include <unordered_map>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -4019,4 +4020,82 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
     relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
 
     return relative_bucket;
+}
+
+// [TAG_GRAPH_CACHE]
+bool llm_graph_topology_equal(ggml_cgraph * cached, ggml_cgraph * fresh, std::string & why) {
+    const int na = ggml_graph_n_nodes(cached);
+    const int nb = ggml_graph_n_nodes(fresh);
+    if (na != nb) {
+        why = format("n_nodes %d vs %d", na, nb);
+        return false;
+    }
+
+    // tensor -> position: node i -> i; any other tensor (leafs, views of weights / KV) -> -(k + 1) in the order of
+    // first reference, so equal topologies number them identically
+    std::unordered_map<const ggml_tensor *, int> ida, idb;
+    for (int i = 0; i < na; ++i) {
+        ida[ggml_graph_node(cached, i)] = i;
+        idb[ggml_graph_node(fresh,  i)] = i;
+    }
+    int n_other = 0;
+
+    std::function<bool(const ggml_tensor *, const ggml_tensor *, const char *, int)> tensor_eq;
+    auto ref_eq = [&](const ggml_tensor * a, const ggml_tensor * b) -> bool {
+        if (a == nullptr || b == nullptr) {
+            return a == b;
+        }
+        const auto ia = ida.find(a);
+        const auto ib = idb.find(b);
+        if (ia != ida.end() || ib != idb.end()) {
+            return ia != ida.end() && ib != idb.end() && ia->second == ib->second;
+        }
+        // first reference of a tensor outside the node list: number it and compare it
+        const int id = -(++n_other);
+        ida[a] = id;
+        idb[b] = id;
+        return tensor_eq(a, b, "leaf", n_other - 1);
+    };
+    tensor_eq = [&](const ggml_tensor * a, const ggml_tensor * b, const char * kind, int i) -> bool {
+        const char * what = nullptr;
+        if (a->op != b->op) {
+            what = "op";
+        } else if (a->type != b->type) {
+            what = "type";
+        } else if (memcmp(a->ne, b->ne, sizeof(a->ne)) != 0) {
+            what = "ne";
+        } else if (memcmp(a->nb, b->nb, sizeof(a->nb)) != 0) {
+            what = "nb";
+        } else if (memcmp(a->op_params, b->op_params, sizeof(a->op_params)) != 0) {
+            what = "op_params";
+        } else if (a->flags != b->flags) {
+            what = "flags";
+        } else if (a->view_offs != b->view_offs || !ref_eq(a->view_src, b->view_src)) {
+            what = "view";
+        } else if (b->data != nullptr && a->data != b->data) {
+            what = "data"; // a tensor that exists outside the compute buffer (weights, KV-cache views)
+        } else if (a->data == nullptr) {
+            what = "unallocated";
+        } else {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (!ref_eq(a->src[s], b->src[s])) {
+                    what = "src";
+                    break;
+                }
+            }
+        }
+        if (what) {
+            if (why.empty()) {
+                why = format("%s %d (%s / %s): %s differs", kind, i, a->name, b->name, what);
+            }
+            return false;
+        }
+        return true;
+    };
+    for (int i = 0; i < na; ++i) {
+        if (!tensor_eq(ggml_graph_node(cached, i), ggml_graph_node(fresh, i), "node", i)) {
+            return false;
+        }
+    }
+    return true;
 }

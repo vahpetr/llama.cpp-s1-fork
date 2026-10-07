@@ -984,6 +984,13 @@ private:
 
 using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 
+// [TAG_GRAPH_CACHE] LLAMA_GRAPH_CACHE_CHECK: true if `cached` (an allocated graph) has the topology of `fresh` (the
+// same graph rebuilt, not allocated): node order, ops, types, shapes, strides, op_params, flags, sources,
+// views and view offsets, and the data address of every tensor that `fresh` already has (weights, KV-cache views).
+// Compute-buffer offsets are not compared: they come from the allocator's plan at allocation time. `why` names the
+// first difference.
+bool llm_graph_topology_equal(ggml_cgraph * cached, ggml_cgraph * fresh, std::string & why);
+
 //
 // llm_graph_context
 //
