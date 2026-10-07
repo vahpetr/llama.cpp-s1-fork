@@ -657,6 +657,7 @@ struct common_params {
     int32_t     cache_disk_gib        = 200;   // quota for all entries, GiB
     int32_t     cache_disk_min_tokens = 8192;  // shorter prompts are cheaper to re-process than to keep
     int32_t     cache_disk_ttl_days   = 14;    // entries unused this long are deleted
+    std::string cache_disk_adopt;              // [TAG_DISK_ADOPT] comma-separated foreign namespace keys read as extra sources
     float       cache_disk_ckpt_ratio = 0.125f; // deep checkpoints: gap >= ratio x distance to the conversation's end
     int32_t     cache_disk_ckpt_max   = 32;    // deep checkpoints kept per conversation
 

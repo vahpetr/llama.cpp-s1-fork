@@ -403,11 +403,16 @@ static std::string ckpt_fingerprint(const fs::path & p) {
 static const char * const ENTRY_EXTS[] = { ".meta", ".tok", ".tgt", ".dft", ".aux" };
 
 std::string server_disk_cache::ckpt_path(const std::string & key) const {
+    const auto it = ckpts.find(key);
+    if (it != ckpts.end() && !it->second.src_dir.empty()) {
+        return (fs::path(it->second.src_dir) / (key + ".ck")).string(); // [TAG_DISK_ADOPT] read-only source
+    }
     return (fs::path(dir) / "ckpt" / (key + ".ck")).string();
 }
 
 std::string server_disk_cache::path(const std::string & id, const char * ext) const {
-    return (fs::path(dir) / (id + ext)).string();
+    const auto it = src_dir_of.find(id);
+    return (fs::path(it != src_dir_of.end() ? it->second : dir) / (id + ext)).string();
 }
 
 void server_disk_cache::remove_files(const std::string & id) const {
@@ -418,8 +423,8 @@ void server_disk_cache::remove_files(const std::string & id) const {
 }
 
 bool server_disk_cache::write_meta(const server_disk_cache_entry & e) const {
-    const json j = {
-        { "version",     DISK_CACHE_VERSION },
+    json j = {
+        { "version",     e.version ? e.version : DISK_CACHE_VERSION },
         { "fingerprint", fingerprint        },
         { "descriptor",  desc_h             },
         { "n_tokens",    e.tokens.size()    },
@@ -429,6 +434,12 @@ bool server_disk_cache::write_meta(const server_disk_cache_entry & e) const {
         { "hits",        e.hits             },
         { "has_dft",     e.has_dft          },
     };
+    if (!e.src.empty()) {
+        return false; // [TAG_DISK_ADOPT] an adopt source is never written
+    }
+    if (!e.adopted_from.empty()) {
+        j["adopted_from"] = e.adopted_from;
+    }
     const std::string tmp = path(e.id, ".meta.tmp");
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -447,6 +458,9 @@ uint64_t server_disk_cache::total_bytes() const {
     uint64_t res = 0;
     std::set<std::string> refs;
     for (const auto & e : entries) {
+        if (!e.src.empty()) {
+            continue;
+        }
         res += e.own_bytes; // .tok, .aux and the maps (which hold the small fields inline)
         refs.insert(e.blobs.begin(), e.blobs.end());
     }
@@ -461,8 +475,56 @@ uint64_t server_disk_cache::total_bytes() const {
 }
 
 void server_disk_cache::erase(size_t idx) {
+    if (!entries[idx].src.empty()) {
+        // [TAG_DISK_ADOPT] an adopt source's entry only loses its eligibility; its files stay
+        src_dir_of.erase(entries[idx].id);
+        entries.erase(entries.begin() + idx);
+        return;
+    }
     remove_files(entries[idx].id);
     entries.erase(entries.begin() + idx);
+}
+
+bool server_disk_cache::read_entry(const std::string & id, const std::string & fp, server_disk_cache_entry & e) const {
+    e.id = id;
+    bool ok = false;
+    try {
+        std::ifstream fm(path(id, ".meta"));
+        if (fm) {
+            const std::string text((std::istreambuf_iterator<char>(fm)), std::istreambuf_iterator<char>());
+            const json j = json::parse(text);
+            const uint32_t ver = j.value("version", 0u);
+            if (ver >= 5 && ver <= DISK_CACHE_VERSION && j.value("fingerprint", std::string()) == fp) {
+                e.version = ver;
+                e.adopted_from = j.value("adopted_from", std::string());
+                e.bytes   = j.at("bytes").get<uint64_t>();
+                e.t_saved = j.at("t_saved").get<int64_t>();
+                e.t_used  = j.at("t_used").get<int64_t>();
+                e.hits    = j.at("hits").get<int32_t>();
+                e.has_dft = j.at("has_dft").get<bool>();
+
+                std::string raw;
+                if (read_sealed(path(id, ".tok"), raw) && !raw.empty() && raw.size() % sizeof(llama_token) == 0) {
+                    llama_tokens packed(raw.size() / sizeof(llama_token));
+                    memcpy(packed.data(), raw.data(), raw.size());
+                    e.tokens = server_tokens::deserialize(packed, has_mtmd);
+                    ok = e.tokens.size() == j.at("n_tokens").get<size_t>() &&
+                         file_size_or_0(path(id, ".tgt")) > 0 &&
+                         (!e.has_dft || file_size_or_0(path(id, ".dft")) > 0) &&
+                         read_aux(path(id, ".aux"), false, nullptr, nullptr, e.deep, e.ckpt_keys) &&
+                         read_map_keys(path(id, ".tgt"), e.blobs) &&
+                         (!e.has_dft || read_map_keys(path(id, ".dft"), e.blobs));
+                    for (const char * ext : { ".tok", ".aux", ".tgt", ".dft" }) {
+                        e.own_bytes += file_size_or_0(path(id, ext));
+                    }
+                }
+            }
+        }
+    } catch (const std::exception & err) {
+        DSK_WRN("entry %s unreadable: %s\n", id.c_str(), err.what());
+        ok = false;
+    }
+    return ok;
 }
 
 void server_disk_cache::init() {
@@ -518,42 +580,7 @@ void server_disk_cache::init() {
     size_t n_dropped = 0;
     for (const auto & id : ids) {
         server_disk_cache_entry e;
-        e.id = id;
-        bool ok = false;
-        try {
-            std::ifstream fm(path(id, ".meta"));
-            if (fm) {
-                const std::string text((std::istreambuf_iterator<char>(fm)), std::istreambuf_iterator<char>());
-                const json j = json::parse(text);
-                const uint32_t ver = j.value("version", 0u);
-                if ((ver == DISK_CACHE_VERSION || ver == 5) && j.value("fingerprint", std::string()) == fingerprint) {
-                    e.bytes   = j.at("bytes").get<uint64_t>();
-                    e.t_saved = j.at("t_saved").get<int64_t>();
-                    e.t_used  = j.at("t_used").get<int64_t>();
-                    e.hits    = j.at("hits").get<int32_t>();
-                    e.has_dft = j.at("has_dft").get<bool>();
-
-                    std::string raw;
-                    if (read_sealed(path(id, ".tok"), raw) && !raw.empty() && raw.size() % sizeof(llama_token) == 0) {
-                        llama_tokens packed(raw.size() / sizeof(llama_token));
-                        memcpy(packed.data(), raw.data(), raw.size());
-                        e.tokens = server_tokens::deserialize(packed, has_mtmd);
-                        ok = e.tokens.size() == j.at("n_tokens").get<size_t>() &&
-                             file_size_or_0(path(id, ".tgt")) > 0 &&
-                             (!e.has_dft || file_size_or_0(path(id, ".dft")) > 0) &&
-                             read_aux(path(id, ".aux"), false, nullptr, nullptr, e.deep, e.ckpt_keys) &&
-                             read_map_keys(path(id, ".tgt"), e.blobs) &&
-                             (!e.has_dft || read_map_keys(path(id, ".dft"), e.blobs));
-                        for (const char * ext : { ".tok", ".aux", ".tgt", ".dft" }) {
-                            e.own_bytes += file_size_or_0(path(id, ext));
-                        }
-                    }
-                }
-            }
-        } catch (const std::exception & err) {
-            DSK_WRN("entry %s unreadable: %s\n", id.c_str(), err.what());
-            ok = false;
-        }
+        const bool ok = read_entry(id, fingerprint, e);
         if (ok) {
             entries.push_back(std::move(e));
         } else {
@@ -636,11 +663,18 @@ void server_disk_cache::init() {
         }
     }
 
+    open_adopt_sources();
     scan_foreign();
 
     enforce("");
 
     DSK_INF("own key %s (descriptor %s), %zu foreign namespaces\n", key.c_str(), desc_h.c_str(), foreign.size());
+    for (const auto & ns : foreign) {
+        // [TAG_DISK_ADOPT] what an operator passes to --cache-disk-adopt
+        DSK_INF("foreign namespace %s%s: %zu entries, %.2f GiB, idle %.1f days\n", ns.key.c_str(),
+                ns.legacy ? " (legacy)" : "", ns.n_entries, ns.bytes / (1024.0 * 1024.0 * 1024.0),
+                (now_s() - ns.t_newest) / 86400.0);
+    }
     DSK_INF("dir %s: %zu entries + %zu deep checkpoints, %.2f GiB (quota %.0f GiB, min %d tokens, ttl %d days, "
             "deep ratio %.2f min step %d max %d), %zu + %zu stale/foreign dropped\n",
             dir.c_str(), entries.size(), ckpts.size(), total_bytes() / (1024.0 * 1024.0 * 1024.0),
@@ -655,7 +689,7 @@ void server_disk_cache::enforce(const std::string & protect) {
 
     if (ttl_days > 0) {
         for (size_t i = 0; i < entries.size();) {
-            if (entries[i].id != protect && entries[i].id != protect_id && t_now - entries[i].t_used > (int64_t) ttl_days * 86400) {
+            if (entries[i].src.empty() && entries[i].id != protect && entries[i].id != protect_id && t_now - entries[i].t_used > (int64_t) ttl_days * 86400) {
                 DSK_INF("expired %s (%zu tokens, idle %.1f days)\n", entries[i].id.c_str(), entries[i].tokens.size(),
                         (t_now - entries[i].t_used) / 86400.0);
                 erase(i);
@@ -673,7 +707,7 @@ void server_disk_cache::enforce(const std::string & protect) {
         size_t victim = SIZE_MAX;
         double v_min  = 0.0;
         for (size_t i = 0; i < entries.size(); i++) {
-            if (entries[i].id == protect || entries[i].id == protect_id) {
+            if (entries[i].id == protect || entries[i].id == protect_id || !entries[i].src.empty()) {
                 continue;
             }
             const double v = entry_value(entries[i], t_now);
@@ -714,7 +748,7 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     // already stored: exactly this prompt (a longer entry does not count: its recurrent state is at its own end,
     // so this prefix could only come back through a checkpoint)
     for (auto & e : entries) {
-        if (e.tokens.size() == n && e.tokens.get_common_prefix(prompt.tokens) == n) {
+        if (e.src.empty() && e.tokens.size() == n && e.tokens.get_common_prefix(prompt.tokens) == n) {
             e.t_used = now_s();
             write_meta(e);
             return true;
@@ -737,6 +771,10 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
 
     server_disk_cache_entry e;
     e.id      = random_id();
+    e.version = DISK_CACHE_VERSION;
+    if (slot_adopted.count(id_slot)) {
+        e.adopted_from = slot_adopted[id_slot]; // [TAG_DISK_ADOPT] provenance of a resave after an adopted load
+    }
     e.has_dft = ctx_dft != nullptr;
 
     uint64_t n_ckpt_written = 0;
@@ -877,7 +915,8 @@ int server_disk_cache::find(const server_tokens & tokens, size_t lcp_min, size_t
             continue;
         }
         const size_t lcp = entries[i].tokens.get_common_prefix(tokens);
-        if (lcp > lcp_best) {
+        // [TAG_DISK_ADOPT] the own namespace wins a tie with an adopt source
+        if (lcp > lcp_best || (lcp == lcp_best && best >= 0 && entries[i].src.empty() && !entries[best].src.empty())) {
             lcp_best = lcp;
             best     = (int) i;
         }
@@ -931,15 +970,19 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
     }
 
     llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
-    server_disk_load_result res = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), desc_tgt_h, false);
+    server_disk_load_result res = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), desc_tgt_h, !e.src.empty());
     if (res == SERVER_DISK_LOAD_OK && ctx_dft) {
         llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
-        res = e.has_dft ? load_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_h, false) : SERVER_DISK_LOAD_INVALID;
+        res = e.has_dft ? load_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_h, !e.src.empty()) : SERVER_DISK_LOAD_INVALID;
     }
     if (res != SERVER_DISK_LOAD_OK) {
         // [TAG_DISK_LOAD_RESULT] the caller clears the slot; only an invalid entry goes
         if (res == SERVER_DISK_LOAD_INVALID) {
-            DSK_WRN("entry %s: state load failed (invalid), dropping it\n", e.id.c_str());
+            DSK_WRN("entry %s: state load failed (invalid), dropping it%s\n", e.id.c_str(),
+                    e.src.empty() ? "" : " from the adopt sources (its files stay)");
+            for (auto & a : adopted) {
+                a.dropped += a.key == e.src;
+            }
             erase(idx);
             n_load_failed++;
             deep_gc(); // [TAG_DISK_GC] the dropped entry's checkpoints and blocks may now be unreferenced
@@ -971,8 +1014,16 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
 
     e.t_used = now_s();
     e.hits++;
-    write_meta(e);
+    write_meta(e); // a no-op for an adopt source
     n_loads++;
+    slot_adopted.erase(id_slot);
+    if (!e.src.empty()) {
+        slot_adopted[id_slot] = e.src;
+        for (auto & a : adopted) {
+            a.hits += a.key == e.src;
+        }
+        DSK_INF("adopted load: entry %s from source %s (format %u)\n", e.id.c_str(), e.src.c_str(), e.version);
+    }
     bytes_loaded += e.bytes;
     load_us      += (uint64_t) (ggml_time_us() - t_start);
     refresh_status();
@@ -1041,9 +1092,12 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
     }
     const int64_t t_now = now_s();
     auto it = ckpts.find(key);
-    if (it != ckpts.end()) {
+    if (it != ckpts.end() && it->second.src_dir.empty()) {
         it->second.t_used = t_now;
         return true;
+    }
+    if (it != ckpts.end()) {
+        ckpts.erase(it); // [TAG_DISK_ADOPT] the source's file stays; the own namespace gets its own copy
     }
     const std::string fin = ckpt_path(key);
     const std::string tmp = fin + ".tmp";
@@ -1219,7 +1273,15 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         uint32_t ft = 0, fd = 0;
         uint32_t env_ver = 0;
         std::string dh;
-        bool ok = get(f, magic) && magic == CKPT_ENV_MAGIC && get_str(f, fp) && get(f, env_ver) && get_str(f, dh);
+        // [TAG_DISK_ADOPT] an adopt source's format 5 / 6 checkpoint has no envelope: accepted on the operator's word
+        const bool from_src = !it->second.src_dir.empty();
+        bool ok = get(f, magic) && (magic == CKPT_ENV_MAGIC || (from_src && magic == CKPT_MAGIC)) && get_str(f, fp);
+        if (ok && magic == CKPT_ENV_MAGIC) {
+            ok = get(f, env_ver) && get_str(f, dh);
+        } else {
+            env_ver = ENVELOPE_VERSION;
+            dh      = desc_h;
+        }
         // [TAG_STATE_DESCRIPTOR] checked before anything reaches the contexts: a checkpoint of another state layout
         //   is a miss (it would otherwise abort in common_prompt_checkpoint::load_tgt on a size mismatch)
         if (ok && (env_ver != ENVELOPE_VERSION || dh != desc_h)) {
@@ -1241,14 +1303,18 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
     } catch (const std::exception & err) {
         DSK_WRN("deep checkpoint %s unreadable (%s), dropping it\n", key.c_str(), err.what());
         std::error_code ec;
-        fs::remove(ckpt_path(key), ec);
+        if (it->second.src_dir.empty()) {
+            fs::remove(ckpt_path(key), ec);
+        }
         ckpts.erase(it);
         return false;
     }
     it->second.t_used = now_s();
     it->second.hits++;
     std::error_code ec;
-    fs::last_write_time(ckpt_path(key), fs::file_time_type::clock::now(), ec); // t_used survives a restart
+    if (it->second.src_dir.empty()) {
+        fs::last_write_time(ckpt_path(key), fs::file_time_type::clock::now(), ec); // t_used survives a restart
+    }
     return true;
 }
 
@@ -1264,7 +1330,7 @@ void server_disk_cache::deep_gc() {
         referenced.insert(e.ckpt_keys.begin(), e.ckpt_keys.end());
     }
     for (auto it = ckpts.begin(); it != ckpts.end();) {
-        if (!referenced.count(it->first)) {
+        if (!referenced.count(it->first) && it->second.src_dir.empty()) {
             std::error_code ec;
             fs::remove(ckpt_path(it->first), ec);
             it = ckpts.erase(it);
@@ -1636,6 +1702,9 @@ void server_disk_cache::refresh_status() {
             { "t_saved",     e.t_saved            },
             { "t_used",      e.t_used             },
             { "hits",        e.hits               },
+            { "version",     e.version            },
+            { "source",      e.src                },
+            { "adopted_from", e.adopted_from      },
             { "value",       entry_value(e, now_s()) },
         });
     }
@@ -1649,8 +1718,14 @@ void server_disk_cache::refresh_status() {
             { "age_s",     now_s() - ns.t_newest },
         });
     }
+    json al = json::array();
+    for (const auto & a : adopted) {
+        al.push_back({ { "key", a.key }, { "legacy", a.legacy }, { "n_entries", a.n_entries }, { "hits", a.hits },
+                       { "dropped", a.dropped } });
+    }
     json j = {
         { "enabled",        quota > 0           },
+        { "adopt",          al                  },
         { "key",            fingerprint.substr(0, 16) },
         { "descriptor",     desc_h              },
         { "foreign",        fl                  },
@@ -1798,8 +1873,100 @@ void server_disk_cache::scan_foreign() {
 }
 
 bool server_disk_cache::foreign_protected(const foreign_ns & ns) const {
-    GGML_UNUSED(ns);
-    return false;
+    // [TAG_DISK_ADOPT] an eligible adopt source and its checkpoints survive TTL / cap
+    return std::any_of(adopted.begin(), adopted.end(), [&](const adopt_src & a) { return a.key == ns.key; });
+}
+
+// the structural part of a fingerprint: model / draft / mmproj paths + size@mtime of every file, n_ctx, KV types
+//   (the fields after the format version, before the binary / environment / argv)
+static std::string fingerprint_structure(const std::string & fp) {
+    const auto sp = fp.find(' ');
+    const std::vector<std::string> f = string_split<std::string>(sp == std::string::npos ? fp : fp.substr(sp + 1), '|');
+    std::string res;
+    for (size_t i = 1; i < f.size() && i <= 11; i++) {
+        res += f[i] + "|";
+    }
+    return f.size() > 11 ? res : std::string();
+}
+
+void server_disk_cache::open_adopt_sources() {
+    adopted.clear();
+    src_dir_of.clear();
+    const std::string own_struct = fingerprint_structure(fingerprint);
+    for (const auto & key : adopt_keys) {
+        if (key.empty() || key == fingerprint.substr(0, 16)) {
+            continue;
+        }
+        adopt_src a;
+        a.key = key;
+        std::error_code ec;
+        fs::path base = fs::path(root) / ("ns-" + key);
+        fs::path ckdir = base / "ckpt";
+        std::vector<std::string> ids;
+        if (!fs::is_directory(base, ec)) {
+            base   = root; // the legacy (flat) namespace of a format <= 6 build
+            ckdir  = fs::path(root) / "ckpt";
+            a.legacy = true;
+        }
+        for (const auto & de : fs::directory_iterator(base, ec)) {
+            const std::string name = de.path().filename().string();
+            if (de.is_regular_file() && name.size() == 21 && name.compare(16, 5, ".meta") == 0) {
+                const std::string fp = meta_fingerprint(de.path().string());
+                if (fp.rfind(key, 0) == 0) {
+                    a.fingerprint = fp;
+                    ids.push_back(name.substr(0, 16));
+                }
+            }
+        }
+        if (ids.empty()) {
+            DSK_WRN("adopt %s: no entries of that key in %s\n", key.c_str(), root.c_str());
+            continue;
+        }
+        if (fingerprint_structure(a.fingerprint).empty() || fingerprint_structure(a.fingerprint) != own_struct) {
+            DSK_WRN("adopt %s refused: its structural part (model / draft / mmproj files, n_ctx, KV types) differs: %s\n",
+                    key.c_str(), fingerprint_structure(a.fingerprint).c_str());
+            continue;
+        }
+        for (const auto & id : ids) {
+            if (src_dir_of.count(id) || std::any_of(entries.begin(), entries.end(), [&](const auto & o) { return o.id == id; })) {
+                continue;
+            }
+            src_dir_of[id] = base.string();
+            server_disk_cache_entry e;
+            const bool ok = read_entry(id, a.fingerprint, e) &&
+                std::all_of(e.blobs.begin(), e.blobs.end(), [&](const std::string & k) { return blobs.count(k) > 0; });
+            if (ok) {
+                e.src = key;
+                entries.push_back(std::move(e));
+                a.n_entries++;
+            } else {
+                src_dir_of.erase(id);
+            }
+        }
+        size_t n_ck = 0;
+        for (const auto & de : fs::directory_iterator(ckdir, ec)) {
+            std::ifstream f(de.path(), std::ios::binary);
+            uint32_t magic = 0, env_ver = 0;
+            std::string fp, dh;
+            server_deep_ckpt_meta m;
+            bool ok = get(f, magic) && (magic == CKPT_MAGIC || magic == CKPT_ENV_MAGIC) && get_str(f, fp) && fp == key;
+            if (ok && magic == CKPT_ENV_MAGIC) {
+                ok = get(f, env_ver) && get_str(f, dh);
+            }
+            ok = ok && get_str(f, m.key) && get(f, m.n_tokens) && get(f, m.pos_min) && get(f, m.pos_max) &&
+                 m.key + ".ck" == de.path().filename().string() && m.n_tokens > 0 && !ckpts.count(m.key);
+            if (ok) {
+                m.bytes   = file_size_or_0(de.path().string());
+                m.t_used  = mtime_s(de.path());
+                m.src_dir = ckdir.string();
+                ckpts[m.key] = m;
+                n_ck++;
+            }
+        }
+        DSK_INF("adopt source %s%s: %zu entries + %zu deep checkpoints (read-only, fingerprint %s)\n", key.c_str(),
+                a.legacy ? " (legacy)" : "", a.n_entries, n_ck, a.fingerprint.substr(0, 16).c_str());
+        adopted.push_back(a);
+    }
 }
 
 void server_disk_cache::remove_foreign(const foreign_ns & ns) {

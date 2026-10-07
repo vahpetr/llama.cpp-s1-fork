@@ -50,6 +50,10 @@ struct server_disk_cache_entry {
     int64_t  t_used  = 0; // unix seconds, last save or load
     int32_t  hits    = 0; // loads
     bool     has_dft = false;
+
+    uint32_t    version = 0;  // payload format as written (a 5 / 6 entry of an adopt source stays 5 / 6)
+    std::string src;          // [TAG_DISK_ADOPT] the adopt source's key; empty: the own namespace
+    std::string adopted_from; // own entry saved after a load from an adopt source: that source's key
 };
 
 // [TAG_DISK_LOAD_RESULT] why a load failed decides what happens to the entry: only an invalid entry (seal / hash /
@@ -70,6 +74,7 @@ struct server_deep_ckpt_meta {
     uint64_t    bytes    = 0;
     int64_t     t_used   = 0;
     int32_t     hits     = 0;
+    std::string src_dir; // [TAG_DISK_ADOPT] the adopt source's ckpt/ (read-only); empty: the own namespace
 };
 
 struct server_disk_cache {
@@ -122,6 +127,10 @@ struct server_disk_cache {
     uint64_t n_load_capacity = 0; // the state did not fit the free cells: the entry was kept
     uint64_t n_load_other   = 0; // inconclusive: the entry was kept
 
+    // [TAG_DISK_ADOPT] --cache-disk-adopt: foreign namespace keys opened read-only as extra load sources (set before
+    //   init()); eligibility (structural fingerprint part) at init, usability at load
+    std::vector<std::string> adopt_keys;
+
     // the entry with this id is never evicted (a load retried across purges) - empty: none
     std::string protect_id;
 
@@ -165,6 +174,20 @@ struct server_disk_cache {
         std::set<std::string> blocks; // blocks its maps reference (kept by the block collection)
     };
     std::vector<foreign_ns> foreign;
+
+    struct adopt_src {
+        std::string key;
+        std::string fingerprint;
+        bool        legacy = false;
+        size_t      n_entries = 0;
+        uint64_t    hits = 0;
+        uint64_t    dropped = 0; // entries whose load failed invalid: no longer eligible (files kept)
+    };
+    std::vector<adopt_src> adopted;
+    std::map<std::string, std::string> src_dir_of; // adopt entry id -> its directory
+    std::map<int32_t, std::string> slot_adopted;    // slot -> adopt source of the state it loaded
+    void open_adopt_sources();
+    bool read_entry(const std::string & id, const std::string & fp, server_disk_cache_entry & e) const;
     void scan_foreign();
     void remove_foreign(const foreign_ns & ns);
     bool foreign_protected(const foreign_ns & ns) const;

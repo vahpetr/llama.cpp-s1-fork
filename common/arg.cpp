@@ -1747,6 +1747,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_TTL_DAYS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-adopt"}, "KEY[,KEY...]",
+        "[TAG_DISK_ADOPT] open these foreign --cache-disk namespaces (the hash16 \"key\" another build shows in GET "
+        "/disk-cache and logs as \"own key\") read-only as extra load sources, e.g. the previous image's after an exact "
+        "deploy. A source is eligible only if its model / draft / mmproj files, context size and KV types match; its "
+        "entries are verified at load (state envelope where present, full consumption) and the next save goes to the "
+        "own namespace; the source is never written. A format 5 / 6 entry has no descriptor and is accepted on the "
+        "operator's word: approve the adoption with a gate record naming the exact source and destination images and "
+        "effective configurations (not a standing allowlist). Not part of the cache fingerprint.",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_adopt = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_DISK_ADOPT"));
+    add_opt(common_arg(
         {"--cache-disk-ckpt-ratio"}, "F",
         string_format("disk prompt cache: keep a stored recurrent checkpoint when its gap to the next one is at least F x its "
                       "distance to the conversation's end - dense near the end, logarithmic in the depth (default: %.2f)",
