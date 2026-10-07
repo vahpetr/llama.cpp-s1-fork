@@ -369,7 +369,8 @@ std::string server_disk_cache_model_identity(const common_params & params);
 
 // [TAG_CACHE_COMPAT2] the parsed-param digest (Codex compat2 A): a normalized digest of the semantic parsed
 //   configuration of BOTH contexts. In: requested + effective n_batch / n_ubatch, n_parallel / n_seq_max, threads
-//   (generation + batch, target + draft, requested + effective), NUMA strategy, devices, n_gpu_layers, main GPU,
+//   (generation + batch, target + draft, requested + effective), ctx-checkpoints + checkpoint-min-step (they
+//   place the prefill ubatch boundaries before a checkpoint), NUMA strategy, devices, n_gpu_layers, main GPU,
 //   split mode, the effective placement of both loaded models (after fit-params),
 //   tensor split, tensor-buffer overrides, KV / op offload, extra buffer types (repack), host buffers, flash
 //   attention, KV types, SWA-full, unified KV, the QSA ratio, --override-kv (model metadata overrides), the loaded
@@ -386,9 +387,10 @@ std::string server_disk_cache_model_identity(const common_params & params);
 //   - sampling defaults, grammar, chat template / jinja / reasoning, stop words: they choose tokens; a stored state
 //     is keyed by its tokens
 //   - host / port / API key / timeouts / slots / metrics / webui / log options: control plane
-//   - cache-ram, cache-disk-*, ctx-checkpoints, checkpoint-min-step, cache-reuse: where / which states are kept,
-//     not their bytes
-//   - context shift, n_keep, n_predict: generation policy after a restore, not stored bytes
+//   - cache-ram, cache-disk-*: where / which states are kept, not their bytes
+//   - cache-reuse: changes the bytes, but a reused (shifted) prompt is marked non-canonical and never saved
+//   - context shift, n_keep: change the bytes, but a shifted prompt is non-canonical and never saved; n_predict:
+//     generation policy after a restore
 //   - LoRA adapters: the disk cache is disabled with LoRA
 //   - ngram lookup cache paths: draft proposals only, verified against the target like any draft (n-gram params in)
 std::string server_cache_param_canon(const common_params & params);

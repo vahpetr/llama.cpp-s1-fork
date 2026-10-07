@@ -584,8 +584,11 @@ static std::string canon_buft(const std::vector<llama_model_tensor_buft_override
 }
 
 std::string server_cache_param_canon(const common_params & p) {
-    std::string r = string_format("nb=%d;ub=%d;npar=%d;numa=%d;%s;b%s;dev=%s;ngl=%d;main=%d;split=%d;ts=[",
-                                  p.n_batch, p.n_ubatch, p.n_parallel, (int) p.numa, canon_cpu(p.cpuparams).c_str(),
+    // ctx-checkpoints / checkpoint-min-step set the prefill ubatch boundaries (the 4 + n_ubatch / 4 splits before a
+    //   checkpoint), not only which states are kept (astra compat2 r2)
+    std::string r = string_format("nb=%d;ub=%d;npar=%d;ctxcp=%d;cms=%d;numa=%d;%s;b%s;dev=%s;ngl=%d;main=%d;split=%d;ts=[",
+                                  p.n_batch, p.n_ubatch, p.n_parallel, p.n_ctx_checkpoints, p.checkpoint_min_step,
+                                  (int) p.numa, canon_cpu(p.cpuparams).c_str(),
                                   canon_cpu(p.cpuparams_batch).c_str(), canon_devices(p.devices).c_str(), p.n_gpu_layers,
                                   p.main_gpu, (int) p.split_mode);
     for (size_t i = 0; i < llama_max_devices() && i < 128; i++) {

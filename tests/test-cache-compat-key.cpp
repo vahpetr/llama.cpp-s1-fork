@@ -102,7 +102,7 @@ int main() {
         for (auto args : std::vector<std::vector<const char *>>{
                  { "-b", "64" }, { "-ub", "32" }, { "-t", "3" }, { "-tb", "3" }, { "-nkvo" }, { "-fa", "off" },
                  { "--spec-draft-n-max", "5" }, { "--override-kv", "qwen4exp.indexer_top_k=int:512" }, { "--no-op-offload" },
-                 { "--numa", "distribute" } }) {
+                 { "--numa", "distribute" }, { "--ctx-checkpoints", "4" }, { "--checkpoint-min-step", "64" } }) {
             args.insert(args.begin(), { "-m", "x.gguf" });
             const std::string c = canon(args, {});
             if (c == base || c == "parse-failed") {
@@ -115,6 +115,9 @@ int main() {
         // a control-plane option (exact-qualified) leaves it
         CHECK(canon({ "-m", "x.gguf", "--port", "18999" }, {}) == base);
         CHECK(server_cache_env_digest({ "LLAMA_ARG_BATCH=64" }) == "-");
+        // the checkpoint schedule: argv and env give one digest
+        CHECK(canon({ "-m", "x.gguf", "--ctx-checkpoints", "4" }, {}) ==
+              canon({ "-m", "x.gguf" }, { { "LLAMA_ARG_CTX_CHECKPOINTS", "4" } }));
     }
     // v1 fingerprints keep exact comparison; v1 vs v2 never match
     CHECK(server_disk_cache_same_identity(cheap_a, cheap_a));
