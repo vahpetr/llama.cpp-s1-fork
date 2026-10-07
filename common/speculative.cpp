@@ -3298,6 +3298,7 @@ void common_spec_ew_line::add(double n, double t_ms) {
         return;
     }
     n_samples++;
+    n_at[std::min(std::max((int) std::lround(n), 0), N_X - 1)]++;
     const double d = 1.0 - ALPHA;
     w    = d*w    + 1.0;
     s_n  = d*s_n  + n;
@@ -3319,6 +3320,26 @@ bool common_spec_ew_line::get(double & a, double & b, double b_prior) const {
     }
     a = std::max(0.0, mean_t - b*mean_n);
     return std::isfinite(a) && std::isfinite(b);
+}
+
+int common_spec_ew_line::n_distinct(int min_count) const {
+    int k = 0;
+    for (int i = 0; i < N_X; ++i) {
+        k += n_at[i] >= min_count ? 1 : 0;
+    }
+    return k;
+}
+
+bool common_spec_tput_fits::ranked() const {
+    return draft.n_distinct(COMMON_SPEC_TPUT_RANK_MIN) >= 2 && verify.n_distinct(COMMON_SPEC_TPUT_RANK_MIN) >= 2;
+}
+
+int common_spec_tput_explore_n(common_spec_tput_fits & f, int n_lo, int n_max) {
+    const int n_x = std::max(n_lo, n_max - 2);
+    if (n_x >= n_max) {
+        return n_max;
+    }
+    return ++f.n_unranked_rounds % COMMON_SPEC_TPUT_EXPLORE_EVERY == 0 ? n_x : n_max;
 }
 
 int common_spec_tput_bucket(int n_kv) {

@@ -183,9 +183,16 @@ struct common_spec_ew_line {
     static constexpr double W_MIN   = 8.0;
     static constexpr double VAR_MIN = 0.25;
 
+    static constexpr int N_X = 64; // the per-x sample counts (x rounded, clamped to [0, N_X-1]) of the rank condition
+
     double w = 0.0, s_n = 0.0, s_t = 0.0, s_nn = 0.0, s_nt = 0.0;
     int    n_samples  = 0; // accepted samples (the warm-up counts these: W_MIN of them, not the decayed weight)
     int    n_rejected = 0; // non-finite or negative samples dropped
+    int    n_at[N_X]  = { 0 }; // accepted samples per distinct x (not decayed)
+
+    // the distinct x values with at least min_count accepted samples each (v51 r2, Codex sol §4: the slope is
+    //   identified only by samples at >= 2 distinct x; 8 samples at one x are a warm-up, not a rank)
+    int n_distinct(int min_count) const;
 
     // a non-finite n or t, or t < 0, is rejected (counted, not fitted)
     void add(double n, double t_ms);
@@ -209,7 +216,24 @@ struct common_spec_tput_fits {
     common_spec_ew_line host;    // the rest of a zero round (the host intercept)
     common_spec_ew_line host_d;  // the rest of a drafting round (checkpoint excluded) vs rows: fallback for host
     common_spec_ew_line rb;      // the rollback cycle (restore + replay pass) vs the replay rows
+
+    uint32_t n_unranked_rounds = 0; // drafting decisions taken in this bucket while it had no rank (exploration cadence)
+
+    // v51 r2 (Codex sol §4 Major): the fits may decide a zero or a shorter draft only once both slopes they
+    //   extrapolate are identified - the draft fit's samples span >= 2 distinct attempted lengths and the verify fit's
+    //   >= 2 distinct row counts, each with >= COMMON_SPEC_TPUT_RANK_MIN samples. Until then the policy is `off`.
+    bool ranked() const;
 };
+
+#define COMMON_SPEC_TPUT_RANK_MIN     4
+#define COMMON_SPEC_TPUT_EXPLORE_EVERY 16
+
+// the draft length of a drafting round in a bucket WITHOUT rank: n_max (as `off`), except every
+//   COMMON_SPEC_TPUT_EXPLORE_EVERY-th such round, which drafts max(n_lo, n_max - 2) (an exploration round: fitted like
+//   any other round, never a cooldown failure). Cost: <= 1/16 of the unranked rounds lose the expected acceptance of
+//   the last two positions (P_{n_max-1} + P_{n_max} tokens) and save two draft steps + two verify rows; it ends once
+//   the bucket has rank. n_max - 2 <= n_lo - 1 (no shorter keepable length): always n_max (the bucket stays `off`).
+int common_spec_tput_explore_n(common_spec_tput_fits & f, int n_lo, int n_max);
 
 struct common_spec_tput_model {
     common_spec_tput_fits bucket[COMMON_SPEC_TPUT_N_BUCKETS];

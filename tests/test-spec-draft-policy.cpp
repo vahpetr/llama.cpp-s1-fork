@@ -281,6 +281,64 @@ static void test_rule_hygiene() {
     check(n_cons < n_opt, "the conservative tail prior shortens the draft");
 }
 
+// v51 r2 (Codex sol §4 Major): identifiability. Fits whose samples sit at one attempted length / row count have no rank
+//   (8 samples are a warm-up, not a rank): the policy is `off` there, with an exploration round every 16th drafting
+//   round at max(n_lo, n_max - 2) until both the draft and the verify fit span >= 2 lengths with >= 4 samples each.
+static void test_rank() {
+    common_spec_ew_line l;
+    for (int k = 0; k < 20; ++k) {
+        l.add(8.0, 4.0);
+    }
+    check(l.n_distinct(4) == 1, "one x: one distinct length");
+    double a = 0.0, b = 0.0;
+    check(l.get(a, b, 0.25), "one x: warm (8+ samples) - the warm-up alone is not the rank");
+    l.add(6.0, 4.0); l.add(6.0, 4.0); l.add(6.0, 4.0);
+    check(l.n_distinct(4) == 1, "3 samples at a second x: not yet");
+    l.add(6.0, 4.0);
+    check(l.n_distinct(4) == 2, "4 samples at a second x: 2 distinct");
+    l.add(1e9, 1.0);
+    check(l.n_at[common_spec_ew_line::N_X - 1] == 1, "x clamped into the last count");
+
+    // the sol counterexample's samples: constant-width rounds n = 8 (draft 4 ms, verify 9 ms of 9 rows) -> no rank
+    common_spec_tput_fits f;
+    for (int k = 0; k < 64; ++k) {
+        f.draft.add(8.0, 4.0); f.ckpt.add(8.0, 0.0); f.verify.add(9.0, 9.0); f.catchup.add(9.0, 0.0); f.host_d.add(9.0, 0.0);
+    }
+    check(!f.ranked(), "constant-width samples: no rank -> the policy plays n_max (off)");
+
+    // the exploration cadence: rounds 16, 32 draft n_max - 2, the others n_max
+    std::string seq;
+    for (int r = 1; r <= 32; ++r) {
+        const int n = common_spec_tput_explore_n(f, 1, 8);
+        if (n != 8) {
+            seq += std::to_string(r) + ":" + std::to_string(n) + " ";
+        }
+    }
+    check(seq == "16:6 32:6 ", "exploration every 16th unranked round at n_max - 2 (got " + seq + ")");
+    common_spec_tput_fits g;
+    seq.clear();
+    for (int r = 1; r <= 16; ++r) {
+        seq += std::to_string(common_spec_tput_explore_n(g, 3, 4));
+    }
+    check(seq == "4444444444444443", "n_max - 2 below n_lo: explores at n_lo = 3 (got " + seq + ")");
+    common_spec_tput_fits h;
+    bool all_max = true;
+    for (int r = 1; r <= 64; ++r) {
+        all_max = all_max && common_spec_tput_explore_n(h, 4, 4) == 4;
+    }
+    check(all_max, "no keepable shorter length (n_lo = n_max): never explores");
+
+    // exploration rounds reach the rank: 4 samples at the second length in both the draft and the verify fit
+    for (int k = 0; k < 3; ++k) {
+        f.draft.add(6.0, 4.0); f.verify.add(7.0, 9.0);
+    }
+    check(!f.ranked(), "3 exploration samples: no rank yet");
+    f.verify.add(7.0, 9.0);
+    check(!f.ranked(), "verify ranked, draft not: no rank");
+    f.draft.add(6.0, 4.0);
+    check(f.ranked(), "4 exploration samples in draft and verify: rank");
+}
+
 static void test_cooldown() {
     common_spec_cooldown cd;
 
@@ -355,6 +413,7 @@ int main() {
     test_timing_hygiene();
     test_rule_hygiene();
     test_cooldown();
+    test_rank();
     if (n_fail) {
         printf("test-spec-draft-policy: %d failures (%d checks ok)\n", n_fail, n_ok);
         return 1;

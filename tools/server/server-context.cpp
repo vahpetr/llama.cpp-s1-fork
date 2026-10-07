@@ -546,6 +546,7 @@ struct server_slot {
     int                  spec_tput_n_att = 0;   // draft positions the drafter sampled this round (p_min stop included)
     int                  spec_tput_n_kept = 0;  // tokens it drafted before the n_min rule
     int                  spec_tput_n_draft_rounds = 0; // drafting rounds of this task (the first one is cold)
+    bool                 spec_tput_ranked = false; // this round's bucket had rank (else `off`: no cooldown observation)
     // the last decision's state for /slots (also at n = 0): the rule's n*, the cost model of the slot's depth bucket
     bool                  spec_tput_active   = false;
     bool                  spec_tput_measured = false;
@@ -684,6 +685,7 @@ struct server_slot {
         spec_tput_n_att    = 0;
         spec_tput_n_kept   = 0;
         spec_tput_n_draft_rounds = 0;
+        spec_tput_ranked   = false;
         spec_tput_active   = false;
         spec_tput_measured = false;
         spec_tput_rule     = 0;
@@ -1074,6 +1076,7 @@ struct server_slot {
                 t["n_kv"]            = spec_tput_n_kv;
                 t["bucket"]          = common_spec_tput_bucket(spec_tput_n_kv);
                 t["measured"]        = spec_tput_measured;
+                t["ranked"]          = spec_tput_ranked;
                 t["rate_tok_per_ms"] = spec_tput_rate;
                 t["fit"]             = fit;
                 res["spec_draft"]["tput"] = t;
@@ -4196,7 +4199,7 @@ private:
         double h_b = 0.0;
         // the fits of this slot's depth bucket only (samples from other depths never price this one); a bucket
         //   that is not warm yet takes the prior path below (the configured length, cooldown still on)
-        const auto & f = spec_tput_fits.at(n_kv);
+        auto & f = spec_tput_fits.at(n_kv);
         // the host intercept from zero rounds (no draft, no checkpoint); while none were measured at this depth, the
         //   drafting rounds' host fit (checkpoint time excluded) at one row
         double h_a = 0.0;
@@ -4231,19 +4234,31 @@ private:
         if (n_rule < 0) {
             n_rule = n_max_cfg;
         }
-        const bool was_cooling = slot.spec_cd.cooling();
-        int n = std::min(slot.spec_cd.decide(n_rule), n_max_cfg);
-        if (was_cooling && n > 0) {
-            // the probe: the shortest length the drafter keeps (none fits the remaining space: no probe this round)
-            n = n_lo <= n_max_cfg ? n_lo : 0;
-        }
-        if (was_cooling && n > 0) {
-            slot.stats.n_spec_probe_rounds++;
+        // v51 r2 (Codex sol §4 Major): without rank in this bucket the fits do not identify the slopes a zero or a
+        //   shorter draft extrapolates along - the policy is `off` there (n_max, no zero, no cooldown entry: the
+        //   cooldown is dropped and the round is not observed), except the exploration rounds that build the rank
+        const bool ranked = f.ranked();
+        slot.spec_tput_ranked = ranked;
+        int n = 0;
+        if (!ranked) {
+            slot.spec_cd = common_spec_cooldown();
+            n_rule = common_spec_tput_explore_n(f, std::min(n_lo, n_max_cfg), n_max_cfg);
+            n      = n_rule;
+        } else {
+            const bool was_cooling = slot.spec_cd.cooling();
+            n = std::min(slot.spec_cd.decide(n_rule), n_max_cfg);
+            if (was_cooling && n > 0) {
+                // the probe: the shortest length the drafter keeps (none fits the remaining space: no probe this round)
+                n = n_lo <= n_max_cfg ? n_lo : 0;
+            }
+            if (was_cooling && n > 0) {
+                slot.stats.n_spec_probe_rounds++;
+            }
         }
         if (trace > 0 && n != slot.spec_n_max_last) {
             SLT_INF(slot, "draft policy tput: %d -> %d (rule %d, %s, cooldown %d, n_kv %d bucket %d, draft %.2f+%.2fn, verify %.2f+%.2fm, "
                     "catch-up %.2f+%.2fm, ckpt %.2f+%.2fn, host %.2f ms, rollback %.2f+%.2fr free %d, %.4f tok/ms)\n", slot.spec_n_max_last, n, n_rule,
-                    ok ? "measured" : "warm-up", slot.spec_cd.c, n_kv, common_spec_tput_bucket(n_kv), c.d0, c.d1, c.v0, c.v1, c.c0, c.c1, c.k0, c.k1, c.host,
+                    !ranked ? "no rank" : ok ? "measured" : "warm-up", slot.spec_cd.c, n_kv, common_spec_tput_bucket(n_kv), c.d0, c.d1, c.v0, c.v1, c.c0, c.c1, c.k0, c.k1, c.host,
                     c.r0, c.r1, c.n_rb_free, rate);
         }
         slot.spec_n_max_last = n;
@@ -4251,7 +4266,7 @@ private:
         spec_rt.n_kv         = n_kv;
 
         slot.spec_tput_active   = true;
-        slot.spec_tput_measured = ok;
+        slot.spec_tput_measured = ok && ranked;
         slot.spec_tput_rule     = n_rule;
         slot.spec_tput_n_kv     = n_kv;
         slot.spec_tput_rate     = rate;
@@ -4780,7 +4795,9 @@ private:
                     } else if (slot.spec_tput_n_att > slot.spec_tput_n_kept) {
                         slot.spec_acc_observe_stop((size_t) slot.spec_tput_n_kept, n_max_cfg);
                     }
-                    slot.spec_cd.observe(0, 0);
+                    if (slot.spec_tput_ranked) {
+                        slot.spec_cd.observe(0, 0);
+                    }
                 }
             }
 
@@ -6008,7 +6025,7 @@ private:
                         const bool short_draft = n_committed_in == 0 && n_fresh_draft > 0 &&
                                                  slot.spec_tput_n_att > (int) n_fresh_draft;
                         slot.spec_acc_update(n_fresh_draft + (short_draft ? 1 : 0), n_fresh_acc, common_speculative_n_max(spec.get()));
-                        if (n_fresh_draft > 0) {
+                        if (n_fresh_draft > 0 && slot.spec_tput_ranked) {
                             slot.spec_cd.observe((int) n_fresh_draft, (int) n_fresh_acc);
                         }
                     } else {
