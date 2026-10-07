@@ -413,8 +413,10 @@ private:
     std::vector<graph_cache_entry> graph_cache; // most recently used first
     llm_graph_result_ptr  graph_cache_check_res;
     ggml_backend_sched_ptr graph_cache_check_sched;
+    ggml_backend_sched_t   graph_cache_check_owner = nullptr; // the main scheduler the scratch one was made for
+    size_t                 graph_cache_check_nodes = 0;       // and its node budget
     struct graph_cache_stats {
-        int64_t hit = 0, miss = 0, check = 0, inval = 0, evict = 0, clear = 0, check2 = 0;
+        int64_t hit = 0, miss = 0, check = 0, inval = 0, evict = 0, clear = 0, check2 = 0, check_sched = 0;
     };
     graph_cache_stats graph_cache_tot;
 

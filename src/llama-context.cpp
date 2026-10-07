@@ -848,8 +848,8 @@ llama_context::~llama_context() {
         // [TAG_GRAPH_CACHE] totals of this context
         const auto & t = graph_cache_tot;
         LLAMA_LOG_INFO("graph-cache: ctx=%s K=%d hit=%" PRId64 " miss=%" PRId64 " check=%" PRId64 " inval=%" PRId64
-                " evict=%" PRId64 " clear=%" PRId64 " check2=%" PRId64 "\n", sched_prof_ctx_name(cparams.ctx_type), graph_cache_k,
-                t.hit, t.miss, t.check, t.inval, t.evict, t.clear, t.check2);
+                " evict=%" PRId64 " clear=%" PRId64 " check2=%" PRId64 " check_sched=%" PRId64 "\n", sched_prof_ctx_name(cparams.ctx_type),
+                graph_cache_k, t.hit, t.miss, t.check, t.inval, t.evict, t.clear, t.check2, t.check_sched);
         graph_cache.clear(); // before the scheduler (the snapshots reference its tensors only by pointer)
     }
 
@@ -990,6 +990,9 @@ void llama_context::sched_reserve() {
 
     graph_cache_clear(); // [TAG_GRAPH_CACHE] the scheduler is replaced below
     graph_cache_max_nodes = max_nodes;
+    graph_cache_check_res.reset(); // the CHECK scratch objects follow the scheduler and its node budget
+    graph_cache_check_sched.reset();
+    graph_cache_check_owner = nullptr;
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
@@ -1834,10 +1837,16 @@ llm_graph_result * llama_context::graph_cache_get(const llama_ubatch & ubatch, l
 
         if (graph_cache_check) {
             // rebuild into a scratch result on a scratch scheduler (nothing is allocated) and compare
-            if (!graph_cache_check_sched) {
+            if (!graph_cache_check_sched || graph_cache_check_owner != s || graph_cache_check_nodes != graph_cache_max_nodes) {
+                // (re)made for the current scheduler and node budget (a replaced scheduler / a grown budget, e.g.
+                // after a LoRA load, must not leave CHECK on the old capacity)
+                graph_cache_check_res.reset();
                 graph_cache_check_sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                         graph_cache_max_nodes, false, cparams.op_offload));
                 graph_cache_check_res.reset(new llm_graph_result(graph_cache_max_nodes));
+                graph_cache_check_owner = s;
+                graph_cache_check_nodes = graph_cache_max_nodes;
+                graph_cache_tot.check_sched++;
             }
             ggml_backend_sched_reset(graph_cache_check_sched.get());
             graph_cache_check_res->reset();

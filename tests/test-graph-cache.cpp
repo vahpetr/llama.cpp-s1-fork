@@ -130,7 +130,7 @@ struct run_out {
     std::vector<llama_token> drafts;
     std::vector<std::string> qsa_ids; // [qsa-ids] lines without the graph counter
     int64_t hit[2] = {0, 0}, miss[2] = {0, 0}, check[2] = {0, 0}, inval[2] = {0, 0}; // [0] main, [1] mtp
-    int64_t evict[2] = {0, 0}, clear[2] = {0, 0}, check2[2] = {0, 0};
+    int64_t evict[2] = {0, 0}, clear[2] = {0, 0}, check2[2] = {0, 0}, check_sched[2] = {0, 0};
 };
 
 static run_out run(gguf_context * meta, const char * k, const char * check, const std::string & stderr_path) {
@@ -214,6 +214,12 @@ static run_out run(gguf_context * meta, const char * k, const char * check, cons
                 n_past += (llama_pos) pp.size();
                 id_last = pp.back();
             }
+            if (r == 20) {
+                // the target's scheduler is replaced at the next decode (a reserve, as after an adapter change): the
+                // cache is cleared and CHECK must remake its scratch scheduler for the new one
+                llama_set_causal_attn(ctx_tgt.get(), false);
+                llama_set_causal_attn(ctx_tgt.get(), true);
+            }
             std::vector<llama_token> drafted;
             auto & dp = common_speculative_get_draft_params(spec, 0);
             dp.drafting = true;
@@ -254,12 +260,12 @@ static run_out run(gguf_context * meta, const char * k, const char * check, cons
     while (std::getline(ls, line)) {
         char ctx[16] = {0};
         int kk = 0;
-        long long h = 0, m = 0, c = 0, inv = 0, ev = 0, cl = 0, c2 = 0;
-        if (sscanf(line.c_str(), "graph-cache: ctx=%15s K=%d hit=%lld miss=%lld check=%lld inval=%lld evict=%lld clear=%lld check2=%lld",
-                   ctx, &kk, &h, &m, &c, &inv, &ev, &cl, &c2) == 9) {
+        long long h = 0, m = 0, c = 0, inv = 0, ev = 0, cl = 0, c2 = 0, cs = 0;
+        if (sscanf(line.c_str(), "graph-cache: ctx=%15s K=%d hit=%lld miss=%lld check=%lld inval=%lld evict=%lld clear=%lld check2=%lld check_sched=%lld",
+                   ctx, &kk, &h, &m, &c, &inv, &ev, &cl, &c2, &cs) == 10) {
             const int i = strcmp(ctx, "mtp") == 0 ? 1 : 0;
             out.hit[i] += h; out.miss[i] += m; out.check[i] += c; out.inval[i] += inv;
-            out.evict[i] += ev; out.clear[i] += cl; out.check2[i] += c2;
+            out.evict[i] += ev; out.clear[i] += cl; out.check2[i] += c2; out.check_sched[i] += cs;
         }
     }
     return out;
@@ -315,6 +321,8 @@ int main(int argc, char ** argv) {
     expect(off.hit[0] == 0 && off.miss[0] == 0, "cache off: no graph-cache activity");
     expect(on.hit[0] > on.miss[0] && on.hit[1] > 0, "K=8: the target hits more than it misses, the MTP context hits");
     expect(chk.check[0] == chk.hit[0] && chk.check[1] == chk.hit[1] && chk.hit[0] > 0, "CHECK: every hit rebuilt and compared");
+    expect(chk.check_sched[0] >= 2 && chk.clear[0] >= 1,
+           "CHECK: the scratch scheduler was remade after the target's scheduler was replaced (check_sched >= 2)");
     expect(same(off.logits, ch2.logits) && same(off.drafts, ch2.drafts) && off.qsa_ids == ch2.qsa_ids,
            "CHECK=2: logits, drafts and [qsa-ids] identical to cache off");
     expect(ch2.check2[0] == ch2.hit[0] && ch2.check2[1] == ch2.hit[1] && ch2.check[0] == ch2.hit[0] && ch2.hit[0] > 0,
