@@ -2224,16 +2224,15 @@ private:
         // [TAG_DISK_PROMPT_CACHE] a stored conversation that shares clearly more with the new prompt than this slot
         //   is loaded instead of re-processed; whatever the slot is about to lose (all of it on a load, or most of it
         //   when the new prompt diverges early) is written to disk first
-        // [TAG_REPLACE_ANY_TASK] an embedding / rerank replaces the whole sequence of the slot: the outgoing
-        //   conversation is saved regardless of the LCP. An infill keeps its common prefix only with cache_prompt
-        //   (an editor's next FIM request), so it saves like a completion under rule (b). No lookup / load for them
+        // [TAG_REPLACE_ANY_TASK] an embedding / rerank / infill may replace the whole sequence of the slot: the
+        //   outgoing conversation is saved regardless of the LCP (spec: unconditional). (Codex gate r1 B3 Major 4) an
+        //   infill's textual LCP does not prove its prefix is kept - infill makes no prompt checkpoints, so a rewind
+        //   past a recurrent model's rollback window still resets the whole sequence; the cost is one save per
+        //   infill on a slot holding another prompt (a no-op when an entry already holds exactly these tokens).
+        //   No lookup / load for them
         if (ret && disk_cache && !ret->is_processing() && task.type != SERVER_TASK_TYPE_COMPLETION &&
             ret->prompt.n_tokens() > 0) {
-            const size_t keep = task.type == SERVER_TASK_TYPE_INFILL && task.params.cache_prompt
-                ? ret->prompt.tokens.get_common_prefix(task.tokens) : 0;
-            if (2*keep < ret->prompt.tokens.size()) {
-                ret->disk_save(*disk_cache);
-            }
+            ret->disk_save(*disk_cache);
         }
 
         if (ret && disk_cache && !ret->is_processing() && task.type == SERVER_TASK_TYPE_COMPLETION) {
