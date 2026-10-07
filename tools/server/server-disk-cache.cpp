@@ -556,9 +556,59 @@ uint64_t server_disk_cache::total_bytes() const {
         }
     }
     for (const auto & it : ckpts) {
+        // (Codex gate r2 Major 5) an adopt source's checkpoint is foreign storage: it never presses own eviction
+        if (!it.second.src_dir.empty()) {
+            continue;
+        }
         res += !gc_hold || ck_refs.count(it.first) ? it.second.bytes : 0;
     }
     return res;
+}
+
+// (Codex gate r2 Major 5) the storage split reported by GET /disk-cache: own (= total_bytes, the own quota's
+//   charge), foreign (foreign / legacy namespace files incl. adopted checkpoints + the blocks only their maps
+//   reference: the foreign cap's charge, quota / 2), shared (blocks referenced by own entries AND foreign maps:
+//   inside own), held (gc_hold: checkpoints / blocks nothing known references, kept this run, in neither budget)
+json server_disk_cache::storage_split() const {
+    std::set<std::string> own_refs, foreign_refs;
+    for (const auto & e : entries) {
+        if (e.src.empty()) {
+            own_refs.insert(e.blobs.begin(), e.blobs.end());
+        }
+    }
+    for (const auto & ns : foreign) {
+        foreign_refs.insert(ns.blocks.begin(), ns.blocks.end());
+    }
+    uint64_t shared = 0, foreign_blk = 0, held = 0;
+    for (const auto & b : blobs) {
+        const bool o = own_refs.count(b.first) > 0, f = foreign_refs.count(b.first) > 0;
+        shared      += o && f ? b.second : 0;
+        foreign_blk += !o && f ? b.second : 0;
+        held        += gc_hold && !o && !f ? b.second : 0;
+    }
+    if (gc_hold) {
+        std::set<std::string> ck_refs;
+        for (const auto & e : entries) {
+            ck_refs.insert(e.ckpt_keys.begin(), e.ckpt_keys.end());
+            for (const auto & r : e.deep) {
+                ck_refs.insert(r.key);
+            }
+        }
+        for (const auto & it : ckpts) {
+            held += it.second.src_dir.empty() && !ck_refs.count(it.first) ? it.second.bytes : 0;
+        }
+    }
+    uint64_t foreign_files = 0;
+    for (const auto & ns : foreign) {
+        foreign_files += ns.bytes;
+    }
+    return {
+        { "own",            total_bytes()               },
+        { "foreign",        foreign_files + foreign_blk },
+        { "foreign_blocks", foreign_blk                 },
+        { "shared",         shared                      },
+        { "held",           held                        },
+    };
 }
 
 void server_disk_cache::erase(size_t idx) {
@@ -2175,6 +2225,7 @@ void server_disk_cache::refresh_status() {
         { "dir",            dir                 },
         { "quota_bytes",    quota               },
         { "bytes_on_disk",  total_bytes()       },
+        { "storage",        storage_split()     },
         { "min_tokens",     n_min_tokens        },
         { "ttl_days",       ttl_days            },
         { "ckpt_ratio",     ckpt_ratio          },
@@ -2344,9 +2395,24 @@ bool server_disk_cache::scan_foreign() {
     std::sort(foreign.begin(), foreign.end(), [](const foreign_ns & a, const foreign_ns & b) { return a.t_newest < b.t_newest; });
 
     const int64_t t_now = now_s();
+    // (Codex gate r2 Major 5) the foreign cap counts the namespaces' files AND the blocks only foreign / legacy maps
+    //   reference (each once); a block an own entry references is own storage
+    std::set<std::string> own_refs;
+    for (const auto & e : entries) {
+        if (e.src.empty()) {
+            own_refs.insert(e.blobs.begin(), e.blobs.end());
+        }
+    }
+    std::map<std::string, int> foreign_only; // block -> foreign namespaces referencing it
     uint64_t total = 0;
     for (const auto & ns : foreign) {
         total += ns.bytes;
+        for (const auto & b : ns.blocks) {
+            if (!own_refs.count(b) && foreign_only[b]++ == 0) {
+                const auto bt = blobs.find(b);
+                total += bt != blobs.end() ? bt->second : 0;
+            }
+        }
     }
     for (size_t i = 0; i < foreign.size();) {
         const foreign_ns & ns = foreign[i];
@@ -2357,6 +2423,13 @@ bool server_disk_cache::scan_foreign() {
                     ns.legacy ? " (legacy)" : "", ns.n_entries, ns.bytes / (1024.0 * 1024.0 * 1024.0),
                     (t_now - ns.t_newest) / 86400.0, expired ? "ttl" : "cap");
             total -= ns.bytes;
+            for (const auto & b : ns.blocks) {
+                auto fo = foreign_only.find(b);
+                if (fo != foreign_only.end() && --fo->second == 0) {
+                    const auto bt = blobs.find(b);
+                    total -= bt != blobs.end() ? std::min<uint64_t>(total, bt->second) : 0;
+                }
+            }
             remove_foreign(ns);
             foreign.erase(foreign.begin() + i);
         } else {

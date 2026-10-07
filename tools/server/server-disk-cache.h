@@ -167,6 +167,7 @@ struct server_disk_cache {
     // the stored conversations and totals for GET /disk-cache; thread-safe (a snapshot the server loop refreshes)
     json status() const;
     void refresh_status();
+    json storage_split() const; // own / foreign / shared / held bytes (Codex gate r2 Major 5)
 
     // after a model reload (wake-up from idle sleep): a changed fingerprint switches to that fingerprint's namespace
     //   (the old one stays as a foreign namespace)
