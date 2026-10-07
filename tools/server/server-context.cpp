@@ -1267,13 +1267,21 @@ public:
     // [TAG_DISK_PROMPT_CACHE] the server is stopping (the loop has returned): keep every slot's conversation, so a
     //   restart or a deploy loses nothing; runs on the main thread before the contexts are freed
     void save_on_exit() {
+        save_all_slots("exit");
+    }
+
+    // [TAG_DISK_PROMPT_CACHE] best-effort: a failed save is logged and the conversation is lost (also used before
+    //   the idle sleep frees the contexts, [TAG_SLEEP_SAVE])
+    void save_all_slots(const char * why) {
         if (!disk_cache || sleeping || ctx_tgt == nullptr) {
             return;
         }
         for (auto & slot : slots) {
             if (slot.prompt.n_tokens() > 0) {
-                SLT_INF(slot, "saving %d tokens to the disk cache before exit\n", slot.prompt.n_tokens());
-                slot.disk_save(*disk_cache);
+                SLT_INF(slot, "saving %d tokens to the disk cache before %s\n", slot.prompt.n_tokens(), why);
+                if (!slot.disk_save(*disk_cache)) {
+                    SLT_WRN(slot, "disk cache: the %d tokens were not saved before %s\n", slot.prompt.n_tokens(), why);
+                }
             }
         }
     }
@@ -1472,6 +1480,9 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            // [TAG_SLEEP_SAVE] destroy() frees the slots' state: keep their conversations first (RAM-tier entries are
+            //   lost with it; the RAM path already wrote its outgoing slots to disk, [TAG_RAM_TIER_DISK])
+            save_all_slots("sleep");
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
