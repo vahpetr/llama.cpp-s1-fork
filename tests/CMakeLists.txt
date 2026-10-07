@@ -173,6 +173,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-draft-accept-eog.cpp) # [TAG_UP29638] no draft acceptance after an EOG (both call sites)
     target_include_directories(test-draft-accept-eog PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-draft-accept-eog PRIVATE server-context)
+    llama_build_and_test(test-cache-compat-key.cpp) # [TAG_CACHE_COMPAT2] disk cache key v2 + env registry
+    target_include_directories(test-cache-compat-key PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-cache-compat-key PRIVATE server-context)
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
         llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
