@@ -2179,6 +2179,13 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                // [TAG_RAM_TIER_DISK] the RAM tier is volatile (lost on a restart, evicted by size): entering the
+                //   replacement path writes the outgoing slot to disk first, regardless of the divergence rules; the
+                //   disk hook below then sees the slot as the RAM load left it (its LCP is recomputed there)
+                if (disk_cache && ret->prompt.n_tokens() > 0) {
+                    ret->disk_save(*disk_cache);
+                }
+
                 ret->prompt_save(*prompt_cache);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
@@ -3356,7 +3363,10 @@ private:
                                 }
 
                                 if (params_base.kv_unified) {
-                                    // [TAG_IDLE_SLOT_CLEAR]
+                                    // [TAG_IDLE_SLOT_CLEAR] [TAG_RAM_TIER_DISK] the cleared slot survives a restart
+                                    if (disk_cache && slot.prompt.n_tokens() > 0) {
+                                        slot.disk_save(*disk_cache);
+                                    }
                                     slot.prompt_clear();
                                 }
                             }
