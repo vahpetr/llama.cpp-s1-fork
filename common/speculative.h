@@ -201,6 +201,8 @@ struct common_spec_ew_line {
 
     // a non-finite n or t, or t < 0, is rejected (counted, not fitted)
     void add(double n, double t_ms);
+    // the weighted means of x and t: from the first sample on (false before any)
+    bool mean(double & n, double & t) const;
     // false before W_MIN samples, or when the fit is not finite; a slope that the samples do not identify (one row count only, or a negative fit)
     // falls back to b_prior, capped so that the intercept through the mean keeps at least half of the mean time (a
     // prior from another machine must not turn the measured fixed cost into a per-row one)
@@ -221,6 +223,7 @@ struct common_spec_tput_fits {
     common_spec_ew_line host;    // the rest of a zero round (the host intercept)
     common_spec_ew_line host_d;  // the rest of a drafting round (checkpoint excluded) vs rows: fallback for host
     common_spec_ew_line rb;      // the rollback cycle (restore + replay pass) vs the replay rows
+    common_spec_ew_line restore; // every checkpoint restore of a rollback (x = 0; multi-slot passes included)
 
     uint32_t n_unranked_rounds = 0; // drafting decisions taken in this bucket while it had no rank (exploration cadence)
 
@@ -230,7 +233,11 @@ struct common_spec_tput_fits {
     bool ranked() const;
 
     // the round cost model of this bucket (n_rb_free left to the caller); b_prior: the draft / verify slope while a
-    //   fit does not identify it. false while a component is not warm (or not finite): the caller's prior path
+    //   fit does not identify it. false while a component is not warm (or not finite): the caller's prior path.
+    //   The rollback cycle while rb has < W_MIN samples (v51 r2, Codex sol §1): priced conservatively as the measured
+    //   restore (its mean; before the first restore: the checkpoint save's mean) + a whole plain pass of r = a+2 rows
+    //   (verify + catch-up + host), r0 = t_restore + v0 + c0 + host, r1 = v1 + c1 - lifted so that it is never
+    //   cheaper than the rb samples taken so far (at their mean rows)
     bool cost(double b_prior, common_spec_tput_cost & c) const;
 };
 

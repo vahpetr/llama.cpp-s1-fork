@@ -393,6 +393,61 @@ static void test_margin() {
     check(common_spec_tput_best_n(q2, 4, g, nullptr, 1, 0.10) == 0, "zero far ahead of n_max: zero");
 }
 
+// v51 r2 (Codex sol §1): until the rollback fit has W_MIN samples the replay is priced conservatively: the measured
+//   restore + a whole plain pass of a+2 rows, never cheaper than the rb samples so far
+static void test_replay_fallback() {
+    common_spec_tput_fits f;
+    for (int k = 0; k < 16; ++k) {
+        const double n = 1 + k % 4, m = n + 1;
+        f.draft  .add(n, 1.0 + 2.0*n);
+        f.ckpt   .add(n, 3.0);
+        f.verify .add(m, 10.0 + 1.0*m);
+        f.catchup.add(m, 1.0 + 0.5*m);
+        f.host   .add(0.0, 2.0);
+    }
+    common_spec_tput_cost c;
+    check(f.cost(0.5, c), "replay fallback: cost model warm");
+    check(std::fabs(c.r1 - 1.5) < 1e-9, "replay fallback: r1 = verify + catch-up per-row cost");
+    check(std::fabs(c.r0 - (3.0 + 10.0 + 1.0 + 2.0)) < 1e-9,
+          "replay fallback before any restore: the checkpoint save's mean stands in for the restore (r0 = 16)");
+    f.restore.add(0.0, 5.0);
+    f.cost(0.5, c);
+    check(std::fabs(c.r0 - (5.0 + 13.0)) < 1e-9, "one measured restore: r0 = restore + v0 + c0 + host = 18");
+    check(c.r0 > c.v0 + c.c0 + c.host, "the restore is never excluded from the replay price");
+    // rb samples below the fallback do not cheapen it
+    for (int k = 0; k < 3; ++k) {
+        f.rb.add(4.0, 10.0);
+    }
+    f.cost(0.5, c);
+    check(std::fabs(c.r0 - 18.0) < 1e-9, "cheap partial rb samples: the fallback stands (r0 = 18)");
+    // rb samples above it lift it: mean 40 ms at r = 4 -> r0 = 40 - 1.5*4 = 34 (bit-for-bit the measured mean there)
+    common_spec_tput_fits g = f;
+    g.rb = common_spec_ew_line();
+    for (int k = 0; k < 3; ++k) {
+        g.rb.add(4.0, 40.0);
+    }
+    g.cost(0.5, c);
+    check(std::fabs(c.r0 - 34.0) < 1e-9 && std::fabs(c.r0 + 4.0*c.r1 - 40.0) < 1e-9,
+          "expensive partial rb samples: the fallback is lifted to them (r0 = 34)");
+    // the rollback raises the cost of a rejecting draft: with a FULL target, a long draft at p = 0.5 costs more than
+    //   the same draft with the old restore-free replay estimate
+    common_spec_tput_cost old_c = c;
+    old_c.r0 = c.v0 + c.c0 + c.host;
+    c.n_rb_free = old_c.n_rb_free = 0;
+    double g1 = 0.0, t1 = 0.0, g0 = 0.0, t0 = 0.0;
+    const std::vector<float> p(4, 0.5f);
+    common_spec_tput_eval(p, 4, c, g1, t1);
+    common_spec_tput_eval(p, 4, old_c, g0, t0);
+    check(g1 == g0 && t1 > t0, "conservative replay: same gain, higher cost than the restore-free estimate");
+    // W_MIN rb samples: the fit takes over
+    g.rb = common_spec_ew_line();
+    for (int k = 0; k < 8; ++k) {
+        g.rb.add(2.0 + k % 3, 30.0 + 2.0*(2.0 + k % 3));
+    }
+    g.cost(0.5, c);
+    check(c.r1 > 1.9 && c.r1 < 2.1, "warm rb: the fit's slope (r1 ~ 2)");
+}
+
 static void test_cooldown() {
     common_spec_cooldown cd;
 
@@ -469,6 +524,7 @@ int main() {
     test_cooldown();
     test_rank();
     test_margin();
+    test_replay_fallback();
     if (n_fail) {
         printf("test-spec-draft-policy: %d failures (%d checks ok)\n", n_fail, n_ok);
         return 1;

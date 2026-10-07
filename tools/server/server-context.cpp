@@ -554,7 +554,7 @@ struct server_slot {
     int                   spec_tput_n_kv     = 0;
     double                spec_tput_rate     = 0.0;
     common_spec_tput_cost spec_tput_cost;
-    int                   spec_tput_fit_n[7] = { 0 }; // samples: draft, ckpt, verify, catchup, host, host_d, rb
+    int                   spec_tput_fit_n[8] = { 0 }; // samples: draft, ckpt, verify, catchup, host, host_d, rb, restore
     int64_t              spec_rb_restore_us = 0; // the checkpoint restore of the last rollback (charged to its replay)
 
     static constexpr float SPEC_ACC_EMA_ALPHA = 1.0f/32.0f;
@@ -1051,8 +1051,8 @@ struct server_slot {
                 const auto & c = spec_tput_cost;
                 const auto ab = [](double x, double y) { return json::array({ x, y }); };
                 json n_samples = json::object();
-                const char * fit_names[7] = { "draft", "ckpt", "verify", "catchup", "host", "host_d", "rollback" };
-                for (int k = 0; k < 7; ++k) {
+                const char * fit_names[8] = { "draft", "ckpt", "verify", "catchup", "host", "host_d", "rollback", "restore" };
+                for (int k = 0; k < 8; ++k) {
                     n_samples[fit_names[k]] = spec_tput_fit_n[k];
                 }
                 json fit = json::object();
@@ -4256,8 +4256,8 @@ private:
         slot.spec_tput_n_kv     = n_kv;
         slot.spec_tput_rate     = rate;
         slot.spec_tput_cost     = c;
-        const common_spec_ew_line * fl[7] = { &f.draft, &f.ckpt, &f.verify, &f.catchup, &f.host, &f.host_d, &f.rb };
-        for (int k = 0; k < 7; ++k) {
+        const common_spec_ew_line * fl[8] = { &f.draft, &f.ckpt, &f.verify, &f.catchup, &f.host, &f.host_d, &f.rb, &f.restore };
+        for (int k = 0; k < 8; ++k) {
             slot.spec_tput_fit_n[k] = fl[k]->n_samples;
         }
         metrics.spec_adaptive_n_max = (uint64_t) n;
@@ -6064,6 +6064,8 @@ private:
                         if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
                             slot.spec_rb_restore_us = ggml_time_us() - t_restore0;
                             spec_rt.restore_us     += slot.spec_rb_restore_us;
+                            // every restore is measured (multi-slot passes too): the rollback fallback's restore term
+                            spec_tput_fits.at(spec_n_kv_depth(slot)).restore.add(0.0, slot.spec_rb_restore_us / 1e3);
                         }
 
                         // the sampler is deliberately NOT rolled back: the tokens accepted just above are the

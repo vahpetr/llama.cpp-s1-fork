@@ -3365,15 +3365,31 @@ bool common_spec_tput_fits::cost(double b_prior, common_spec_tput_cost & c) cons
                     verify .get(c.v0, c.v1, b_prior) &&
                     catchup.get(c.c0, c.c1, 0.0) &&
                     ok_host;
-    // the rollback cycle (restore + replay pass of r rows); before its fit is usable: a replay pass priced as a
-    //   plain round of r rows (no restore)
+    // the rollback cycle (restore + replay pass of r rows); before its fit is usable: the conservative fallback
     double r_b = 0.0;
     if (!rb.get(c.r0, r_b, c.v1 + c.c1)) {
-        c.r0 = c.v0 + c.c0 + c.host;
+        double x = 0.0, t_restore = 0.0;
+        if (!restore.mean(x, t_restore) && !ckpt.mean(x, t_restore)) {
+            t_restore = 0.0;
+        }
         r_b  = c.v1 + c.c1;
+        c.r0 = t_restore + c.v0 + c.c0 + c.host;
+        double rb_n = 0.0, rb_t = 0.0;
+        if (rb.mean(rb_n, rb_t)) {
+            c.r0 = std::max(c.r0, rb_t - r_b*rb_n);
+        }
     }
     c.r1 = r_b;
     return ok;
+}
+
+bool common_spec_ew_line::mean(double & n, double & t) const {
+    if (n_samples <= 0 || !(w > 0.0)) {
+        return false;
+    }
+    n = s_n / w;
+    t = s_t / w;
+    return std::isfinite(n) && std::isfinite(t);
 }
 
 int common_spec_tput_explore_n(common_spec_tput_fits & f, int n_lo, int n_max) {
