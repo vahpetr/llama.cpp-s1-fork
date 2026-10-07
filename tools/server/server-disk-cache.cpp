@@ -21,13 +21,20 @@
 
 #define DSK_INF(fmt, ...) LOG_INF("srv  %12.*s: " fmt, 12, "disk_cache", __VA_ARGS__)
 #define DSK_WRN(fmt, ...) LOG_WRN("srv  %12.*s: " fmt, 12, "disk_cache", __VA_ARGS__)
+#define DSK_DBG(fmt, ...) LOG_DBG("srv  %12.*s: " fmt, 12, "disk_cache", __VA_ARGS__)
 
 namespace fs = std::filesystem;
 
-static constexpr uint32_t DISK_CACHE_VERSION = 6; // 6: user-message starts at the end of .aux (optional: a 5 entry loads with them unknown) // 5: sealed (checksummed) .tok / .aux / .ck and map segments // 2: deep checkpoint refs in .aux, 3: block-deduplicated state streams, 4: .aux checkpoints by key
+static constexpr uint32_t DISK_CACHE_VERSION = 7; // 7: envelope (magic, version, descriptor hash, length) at the head of .tgt / .dft maps and .ck // 6: user-message starts at the end of .aux (optional: a 5 entry loads with them unknown) // 5: sealed (checksummed) .tok / .aux / .ck and map segments // 2: deep checkpoint refs in .aux, 3: block-deduplicated state streams, 4: .aux checkpoints by key
 static constexpr uint32_t AUX_MAGIC          = 0x58554144; // "DAUX"
-static constexpr uint32_t CKPT_MAGIC         = 0x334b4344; // "DCK3"
-static constexpr uint32_t MAP_MAGIC          = 0x3250414d; // "MAP2"
+static constexpr uint32_t CKPT_MAGIC         = 0x334b4344; // "DCK3" (format 5 / 6: no envelope)
+static constexpr uint32_t CKPT_ENV_MAGIC     = 0x344b4344; // "DCK4": fingerprint, envelope version, descriptor hash
+static constexpr uint32_t MAP_MAGIC          = 0x3250414d; // "MAP2" (format 5 / 6: no envelope)
+static constexpr uint32_t MAP_ENV_MAGIC      = 0x3350414d; // "MAP3": envelope version, descriptor hash, stream length
+static constexpr uint32_t ENVELOPE_VERSION   = 1;
+// [TAG_STATE_DESCRIPTOR] bump on any change of what a restored checkpoint means (its flags, the draft-prefix retention,
+//   the replay rules after a deep rewind) that keeps the bytes the same
+static constexpr uint32_t SERVER_CKPT_SEMANTICS_REV = 1;
 static constexpr uint32_t SEAL_MAGIC         = 0x4c414553; // "SEAL"
 static constexpr size_t   BLOB_BYTES         = 4ull << 20; // block size of the state streams (aligned within each tensor)
 
@@ -378,6 +385,7 @@ bool server_disk_cache::write_meta(const server_disk_cache_entry & e) const {
     const json j = {
         { "version",     DISK_CACHE_VERSION },
         { "fingerprint", fingerprint        },
+        { "descriptor",  desc_h             },
         { "n_tokens",    e.tokens.size()    },
         { "bytes",       e.bytes            },
         { "t_saved",     e.t_saved          },
@@ -529,7 +537,10 @@ void server_disk_cache::init() {
             std::ifstream f(de.path(), std::ios::binary);
             uint32_t magic = 0;
             std::string fp;
-            ok = get(f, magic) && magic == CKPT_MAGIC && get_str(f, fp) && fp == fp_short && get_str(f, m.key) &&
+            uint32_t env_ver = 0;
+            std::string dh;
+            ok = get(f, magic) && magic == CKPT_ENV_MAGIC && get_str(f, fp) && fp == fp_short && get(f, env_ver) &&
+                 get_str(f, dh) && dh == desc_h && get_str(f, m.key) &&
                  get(f, m.n_tokens) && get(f, m.pos_min) && get(f, m.pos_max) && m.key + ".ck" == name;
             // the header is indexed without reading the 113 MiB body (its seal is checked on use): bound it, and the
             // key carries the token count, so a corrupt n_tokens cannot reach prefix_keys
@@ -722,9 +733,9 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     // [TAG_DISK_DELTA] the KV / recurrent state streams through 4 MiB content blocks: a block already on disk (the
     //   unchanged part of a conversation saved before, a branch, a copy) is referenced, only new ones are written
     uint64_t n_logical = 0, n_written = 0;
-    ok = ok && save_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), e.blobs, n_logical, n_written);
+    ok = ok && save_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), desc_tgt_h, e.blobs, n_logical, n_written);
     if (ok && ctx_dft) {
-        ok = save_stream(ctx_dft, id_slot, path(e.id, ".dft"), e.blobs, n_logical, n_written);
+        ok = save_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_h, e.blobs, n_logical, n_written);
     }
 
     if (ok) {
@@ -842,10 +853,10 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
     }
 
     llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
-    server_disk_load_result res = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"));
+    server_disk_load_result res = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), desc_tgt_h, false);
     if (res == SERVER_DISK_LOAD_OK && ctx_dft) {
         llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
-        res = e.has_dft ? load_stream(ctx_dft, id_slot, path(e.id, ".dft")) : SERVER_DISK_LOAD_INVALID;
+        res = e.has_dft ? load_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_h, false) : SERVER_DISK_LOAD_INVALID;
     }
     if (res != SERVER_DISK_LOAD_OK) {
         // [TAG_DISK_LOAD_RESULT] the caller clears the slot; only an invalid entry goes
@@ -961,8 +972,10 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
     bool ok = false;
     {
         std::ostringstream f;
-        put<uint32_t>(f, CKPT_MAGIC);
+        put<uint32_t>(f, CKPT_ENV_MAGIC);
         put_str(f, fingerprint.substr(0, 16));
+        put<uint32_t>(f, ENVELOPE_VERSION);
+        put_str(f, desc_h);
         put_str(f, key);
         put<int64_t>(f, c.n_tokens);
         put<int32_t>(f, c.pos_min);
@@ -1126,9 +1139,18 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         int64_t  n_tokens = 0;
         int32_t  pos_min = 0, pos_max = 0;
         uint32_t ft = 0, fd = 0;
-        const bool ok = get(f, magic) && magic == CKPT_MAGIC && get_str(f, fp) && get_str(f, k) && k == key &&
-                        get(f, n_tokens) && get(f, pos_min) && get(f, pos_max) && get(f, ft) && get(f, fd) &&
-                        get_vec(f, out.data_tgt) && get_vec(f, out.data_dft) && get_vec(f, out.data_spec);
+        uint32_t env_ver = 0;
+        std::string dh;
+        bool ok = get(f, magic) && magic == CKPT_ENV_MAGIC && get_str(f, fp) && get(f, env_ver) && get_str(f, dh);
+        // [TAG_STATE_DESCRIPTOR] checked before anything reaches the contexts: a checkpoint of another state layout
+        //   is a miss (it would otherwise abort in common_prompt_checkpoint::load_tgt on a size mismatch)
+        if (ok && (env_ver != ENVELOPE_VERSION || dh != desc_h)) {
+            throw std::runtime_error("state descriptor mismatch (" + dh + ", expected " + desc_h + ")");
+        }
+        ok = ok && get_str(f, k) && k == key &&
+             get(f, n_tokens) && get(f, pos_min) && get(f, pos_max) && get(f, ft) && get(f, fd) &&
+             get_vec(f, out.data_tgt) && get_vec(f, out.data_dft) && get_vec(f, out.data_spec) &&
+             f.peek() == std::char_traits<char>::eof();
         if (!ok) {
             throw std::runtime_error("truncated or corrupt");
         }
@@ -1187,10 +1209,17 @@ std::string server_disk_cache::blob_path(const std::string & key) const {
 }
 
 bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
-                                    std::vector<std::string> & keys, uint64_t & n_logical, uint64_t & n_written) {
+                                    const std::string & env_h, std::vector<std::string> & keys, uint64_t & n_logical,
+                                    uint64_t & n_written) {
     const std::string tmp = map_path + ".tmp";
     std::ofstream fm(tmp, std::ios::binary | std::ios::trunc);
-    put<uint32_t>(fm, MAP_MAGIC);
+    // [TAG_STATE_DESCRIPTOR] envelope: magic, version, descriptor hash, stream length (patched at the end)
+    put<uint32_t>(fm, MAP_ENV_MAGIC);
+    put<uint32_t>(fm, ENVELOPE_VERSION);
+    put_str(fm, env_h);
+    const auto len_at = fm.tellp();
+    put<uint64_t>(fm, 0);
+    const uint64_t n_logical0 = n_logical;
 
     std::vector<uint8_t> inl;
     std::vector<uint8_t> buf;
@@ -1262,9 +1291,12 @@ bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const 
         }
     };
 
-    ok = llama_state_seq_write_cb(ctx, id_slot, 0, w) > 0 && ok;
+    const size_t n_stream = llama_state_seq_write_cb(ctx, id_slot, 0, w);
+    ok = n_stream > 0 && n_stream == n_logical - n_logical0 && ok;
     flush_inline();
     put<uint8_t>(fm, 255);
+    fm.seekp(len_at);
+    put<uint64_t>(fm, (uint64_t) n_stream);
     fm.close();
     ok = ok && (bool) fm;
 
@@ -1282,8 +1314,16 @@ bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const 
 bool server_disk_cache::read_map_keys(const std::string & map_path, std::vector<std::string> & keys) {
     std::ifstream fm(map_path, std::ios::binary);
     uint32_t magic = 0;
-    if (!get(fm, magic) || magic != MAP_MAGIC) {
+    if (!get(fm, magic) || (magic != MAP_MAGIC && magic != MAP_ENV_MAGIC)) {
         return false;
+    }
+    if (magic == MAP_ENV_MAGIC) {
+        uint32_t ver = 0;
+        std::string h;
+        uint64_t n = 0;
+        if (!get(fm, ver) || !get_str(fm, h) || !get(fm, n)) {
+            return false;
+        }
     }
     for (;;) {
         uint8_t kind = 0;
@@ -1315,12 +1355,25 @@ bool server_disk_cache::read_map_keys(const std::string & map_path, std::vector<
     }
 }
 
-server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path) {
+server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
+                                                       const std::string & env_h, bool legacy_ok) {
     std::ifstream fm(map_path, std::ios::binary);
     uint32_t magic = 0;
-    if (!get(fm, magic) || magic != MAP_MAGIC) {
+    if (!get(fm, magic) || (magic != MAP_ENV_MAGIC && !(legacy_ok && magic == MAP_MAGIC))) {
+        DSK_WRN("%s: no state envelope\n", map_path.c_str());
         return SERVER_DISK_LOAD_INVALID;
     }
+    // [TAG_STATE_DESCRIPTOR] the stream must describe this context's state, checked before the context is touched
+    uint64_t n_total = 0;
+    if (magic == MAP_ENV_MAGIC) {
+        uint32_t ver = 0;
+        std::string h;
+        if (!get(fm, ver) || ver != ENVELOPE_VERSION || !get_str(fm, h) || h != env_h || !get(fm, n_total) || n_total == 0) {
+            DSK_WRN("%s: state envelope mismatch (descriptor %s, expected %s)\n", map_path.c_str(), h.c_str(), env_h.c_str());
+            return SERVER_DISK_LOAD_INVALID;
+        }
+    }
+    uint64_t n_consumed = 0;
 
     // the current segment: inline bytes come from the map itself, a block from its (verified) buffer
     uint64_t seg_left = 0;
@@ -1410,6 +1463,7 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
             out      += n;
             size     -= n;
             seg_left -= n;
+            n_consumed += n;
         }
         return true;
     };
@@ -1434,9 +1488,14 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
     }, &hook);
     const bool ok = llama_state_seq_read_cb(ctx, id_slot, 0, r) > 0;
     llama_log_set(hook.cb, hook.ud);
-    GGML_UNUSED(done);
 
     if (ok && !corrupt) {
+        // full consumption: nothing of the stream is left unread (an unread suffix is state this context dropped)
+        const bool rest_empty = seg_left == 0 && !next_segment() && done && !corrupt;
+        if (!rest_empty || (n_total > 0 && n_consumed != n_total)) {
+            DSK_WRN("%s: stream not fully consumed (%" PRIu64 " of %" PRIu64 " bytes)\n", map_path.c_str(), n_consumed, n_total);
+            return SERVER_DISK_LOAD_INVALID;
+        }
         return SERVER_DISK_LOAD_OK;
     }
     if (corrupt || read_failed) {
@@ -1528,4 +1587,23 @@ void server_disk_cache::refresh_status() {
 json server_disk_cache::status() const {
     std::lock_guard<std::mutex> lock(status_mtx);
     return status_snap;
+}
+
+void server_disk_cache::set_descriptor(llama_context * ctx_tgt, llama_context * ctx_dft, const std::string & spec_types) {
+    // the speculative carry: implementation names + the MTP pending-hidden schema (magic "MPTH", one f32 row of n_embd)
+    const std::string srv = string_format("|carry=%s/mtp-pending-h:4854504d-f32|tokens=%u|mtmd=%d|ckpt=%u",
+                                          spec_types.c_str(), SERVER_TOKENS_STATE_VERSION, MTMD_SERIALIZATION_VERSION,
+                                          SERVER_CKPT_SEMANTICS_REV);
+    const auto h16 = [](const std::string & s) {
+        return hash_key(reinterpret_cast<const uint8_t *>(s.data()), s.size()).substr(0, 16);
+    };
+    const std::string tgt = "tgt:" + (ctx_tgt ? llama_state_seq_descriptor(ctx_tgt) : std::string("none")) + srv;
+    const std::string dft = "dft:" + (ctx_dft ? llama_state_seq_descriptor(ctx_dft) : std::string("none")) + srv;
+    desc_tgt_h = h16(tgt);
+    desc_dft_h = h16(dft);
+    desc_h     = h16(tgt + "\n" + dft);
+    DSK_INF("state descriptor %s (target %s, draft %s)\n", desc_h.c_str(), desc_tgt_h.c_str(), desc_dft_h.c_str());
+    DSK_DBG("target descriptor: %s\n", tgt.c_str());
+    DSK_DBG("draft descriptor: %s\n", dft.c_str());
+    refresh_status();
 }

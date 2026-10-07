@@ -3000,3 +3000,32 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
 }
+
+// [TAG_STATE_DESCRIPTOR] cell metadata (pos, seq ids, the x/y/tok extension as three 32-bit fields when present),
+//   then per layer K rows and V rows (row-wise, or element-wise when transposed); types carry their block encoding
+static std::string llama_state_type_desc(const ggml_tensor * t) {
+    if (t == nullptr) {
+        return "none";
+    }
+    return format("%s/b%lld/s%zu/%lldx%lld", ggml_type_name(t->type), (long long) ggml_blck_size(t->type),
+                         ggml_type_size(t->type), (long long) t->ne[0], (long long) t->ne[1]);
+}
+
+std::string llama_kv_cache::state_descriptor() const {
+    std::string res = format("kv{size=%u,n_stream=%u,n_seq_max=%u,v_trans=%d,n_swa=%u,swa_type=%d,rot_k=%d,rot_v=%d,"
+                                    "cell_ext=%s,layers=[", get_size(), n_stream, n_seq_max, (int) v_trans, n_swa,
+                                    (int) swa_type, (int) attn_rot_k, (int) attn_rot_v,
+                                    has_cell_ext() ? "xyt-i32-v1" : "none");
+    for (const auto & layer : layers) {
+        res += format("%u:k=%s:v=%s:ks=%zu;", layer.il, llama_state_type_desc(layer.k).c_str(),
+                             llama_state_type_desc(layer.v).c_str(), layer.k_stream.size());
+    }
+    // shared / reused layers serialize through their owner: record the mapping (model layer -> cache layer)
+    std::vector<std::pair<int32_t, int32_t>> ids(map_layer_ids.begin(), map_layer_ids.end());
+    std::sort(ids.begin(), ids.end());
+    res += "],map=[";
+    for (const auto & it : ids) {
+        res += format("%d>%d;", it.first, it.second);
+    }
+    return res + "]}";
+}

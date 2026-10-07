@@ -4898,3 +4898,27 @@ size_t llama_state_seq_read_cb(llama_context * ctx, llama_seq_id seq_id, llama_s
         return 0;
     }
 }
+
+std::string llama_state_seq_descriptor(const llama_context * ctx) {
+    const auto & cp = ctx->get_cparams();
+    const auto & hp = ctx->get_model().hparams;
+    // stream flags: PARTIAL_ONLY skips the full-only sections (marked "(full-only)" below), ON_DEVICE is a snapshot
+    //   location, never a disk stream
+    std::string res = format("abi=%d;flags=partial-only:1;ctx_type=%d;other=%d;causal=%d;n_ctx_seq=%u;n_seq_max=%u;"
+                                    "unified=%d;flash_attn=%d;", LLAMA_STATE_ABI_REV, (int) cp.ctx_type,
+                                    (int) (cp.ctx_other != nullptr), (int) cp.causal_attn, cp.n_ctx_seq, cp.n_seq_max,
+                                    (int) cp.kv_unified, (int) cp.flash_attn);
+    res += format("rope{type=%d,sections=%d/%d/%d/%d,base=%a,scale=%a,orig=%u,ext=%a,attn=%a,beta=%a/%a,rot=[",
+                         (int) hp.rope_type, hp.rope_sections[0], hp.rope_sections[1], hp.rope_sections[2],
+                         hp.rope_sections[3], cp.rope_freq_base, cp.rope_freq_scale, cp.n_ctx_orig_yarn,
+                         cp.yarn_ext_factor, cp.yarn_attn_factor, cp.yarn_beta_fast, cp.yarn_beta_slow);
+    std::string qsa;
+    for (uint32_t il = 0; il < hp.n_layer(); il++) {
+        res += format("%u;", hp.n_rot(il));
+        qsa += format("%u;", llama_hparams_qsa_ratio(hp, cp.qsa_ratio, il));
+    }
+    res += "]};qsa=[" + qsa + "];mem=";
+    const llama_memory_t mem = ctx->get_memory();
+    res += mem ? mem->state_descriptor() : std::string("none");
+    return res;
+}

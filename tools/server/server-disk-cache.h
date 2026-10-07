@@ -143,6 +143,13 @@ struct server_disk_cache {
     // after a model reload (wake-up from idle sleep): a changed fingerprint drops every stored state
     void revalidate(const std::string & fingerprint);
 
+    // [TAG_STATE_DESCRIPTOR] what the state streams of these contexts contain (llama_state_seq_descriptor + the
+    //   speculative carry schema, the token / media serialization versions and the checkpoint semantics revision);
+    //   its hash heads every .tgt / .dft / .ck this cache writes and must match on every read. Called before init()
+    //   and before every revalidate().
+    void set_descriptor(llama_context * ctx_tgt, llama_context * ctx_dft, const std::string & spec_types);
+    const std::string & descriptor_hash() const { return desc_h; }
+
   private:
     std::string dir;
     uint64_t    quota;
@@ -150,6 +157,10 @@ struct server_disk_cache {
     int32_t     ttl_days;
     std::string fingerprint;
     bool        has_mtmd;
+
+    std::string desc_h;     // hash16 of the combined descriptor (target + draft): .meta, .ck, /disk-cache
+    std::string desc_tgt_h; // envelope hash of the .tgt streams
+    std::string desc_dft_h; // envelope hash of the .dft streams
     float       ckpt_ratio;
     int32_t     ckpt_min_step;
     int32_t     ckpt_max;
@@ -167,9 +178,11 @@ struct server_disk_cache {
 
     bool ckpt_store(const std::string & key, const common_prompt_checkpoint & c, bool * written);
     std::string blob_path(const std::string & key) const;
-    bool save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
+    bool save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path, const std::string & env_h,
                      std::vector<std::string> & keys, uint64_t & n_logical, uint64_t & n_written);
-    server_disk_load_result load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path);
+    // env_h: the envelope hash the stream must carry; legacy_ok: a stream without an envelope (format 5 / 6) is accepted
+    server_disk_load_result load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
+                                        const std::string & env_h, bool legacy_ok);
     static bool read_map_keys(const std::string & map_path, std::vector<std::string> & keys);
     void blob_gc();
 

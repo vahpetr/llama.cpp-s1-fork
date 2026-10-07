@@ -3068,3 +3068,9 @@ void llama_memory_hybrid_idx_context::qsa_store_publish(bool ok) const {
 
     st->publish(ok);
 }
+
+std::string llama_memory_hybrid_idx::state_descriptor() const {
+    // [TAG_HYBRID_IDX_STATE] attention, recurrent, then the K-only indexer (full streams only)
+    return "hybrid_idx{" + llama_memory_hybrid::state_descriptor() + ",idx(full-only)=" +
+           (mem_idx ? mem_idx->state_descriptor() : std::string("none")) + "}";
+}

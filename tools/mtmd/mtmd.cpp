@@ -26,8 +26,7 @@
 #include <type_traits>
 #include <vector>
 
-// remember to bump this if the serialization format changes
-#define MTMD_SERIALIZATION_VERSION 1
+// MTMD_SERIALIZATION_VERSION (mtmd.h): remember to bump it if the serialization format changes
 
 struct mtmd_serialization {
     // note: using 64-bit here for future-proofing

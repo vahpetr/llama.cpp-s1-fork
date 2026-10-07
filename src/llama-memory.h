@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 
 #include <map>
+#include <string>
 #include <memory>
 #include <functional>
 
@@ -132,6 +133,11 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // [TAG_STATE_DESCRIPTOR] what a sequence state stream of this memory contains (sections in stream order, per-layer
+    //   presence / types / serialized row widths, layout flags), as canonical text; a memory without an implementation
+    //   reports itself opaque (its streams are then identified by the build only)
+    virtual std::string state_descriptor() const { return "opaque"; }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

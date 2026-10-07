@@ -9,6 +9,9 @@
 
 #include "json.h"
 
+// serialization version of server_tokens::serialize (part of the disk cache state descriptor)
+constexpr uint32_t SERVER_TOKENS_STATE_VERSION = 1;
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>

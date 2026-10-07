@@ -1869,12 +1869,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        if (data.size() != sizeof(uint32_t) + row_bytes) {
-            return;
-        }
         uint32_t magic = 0;
-        std::memcpy(&magic, data.data(), sizeof(uint32_t));
-        if (magic != PENDING_H_MAGIC) {
+        if (data.size() >= sizeof(uint32_t)) {
+            std::memcpy(&magic, data.data(), sizeof(uint32_t));
+        }
+        if (data.size() != sizeof(uint32_t) + row_bytes || magic != PENDING_H_MAGIC) {
+            // [TAG_STATE_DESCRIPTOR] another implementation's blob (the broadcast) or another width: reported, the
+            //   carry keeps its value
+            if (!data.empty() && magic == PENDING_H_MAGIC) {
+                LOG_WRN("%s: MTP carry size mismatch (%zu bytes, expected %zu), carry not restored\n", __func__,
+                        data.size(), sizeof(uint32_t) + row_bytes);
+            }
             return;
         }
         std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(uint32_t), row_bytes);

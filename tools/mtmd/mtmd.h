@@ -8,6 +8,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+// version of the serialized media chunks (bump on any format change)
+#define MTMD_SERIALIZATION_VERSION 1
+
 #ifdef __cplusplus
 #include <map>
 #include <string>

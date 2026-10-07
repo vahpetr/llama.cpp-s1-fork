@@ -283,3 +283,7 @@ const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
 }
+
+std::string llama_memory_hybrid::state_descriptor() const {
+    return "hybrid{attn(full-only)=" + mem_attn->state_descriptor() + ",recr=" + mem_recr->state_descriptor() + "}";
+}

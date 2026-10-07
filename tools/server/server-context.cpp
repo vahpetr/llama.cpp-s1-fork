@@ -1908,8 +1908,10 @@ private:
                 server_disk_cache_fingerprint(params_base, n_ctx), mctx != nullptr,
                 params_base.cache_disk_ckpt_ratio, params_base.checkpoint_min_step, params_base.cache_disk_ckpt_max);
             disk_cache->live_refs = [this]() { return live_deep_refs(); };
+            disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types));
             disk_cache->init();
         } else if (disk_cache) {
+            disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types));
             disk_cache->revalidate(server_disk_cache_fingerprint(params_base, n_ctx));
         }
 

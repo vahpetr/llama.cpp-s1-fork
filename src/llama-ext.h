@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <string>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -156,3 +157,11 @@ LLAMA_API size_t llama_state_seq_write_cb(struct llama_context * ctx, llama_seq_
                                           const llama_state_seq_writer & writer);
 LLAMA_API size_t llama_state_seq_read_cb (struct llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags,
                                           const llama_state_seq_reader & reader);
+
+// [TAG_STATE_DESCRIPTOR] canonical text of what a sequence state stream of ctx contains: the state ABI revision, the
+//   full / partial stream rule, the memory sections in stream order with per-layer presence, types (block encoding)
+//   and serialized widths, streams / unified mode / capacities, causal mode, the effective RoPE / YaRN parameters and
+//   the per-layer QSA ratio. Two contexts with different descriptors must not exchange state streams. The revision
+//   moves with any change of the stream's meaning that keeps its fields (e.g. a channel repacking).
+#define LLAMA_STATE_ABI_REV 1
+LLAMA_API std::string llama_state_seq_descriptor(const struct llama_context * ctx);

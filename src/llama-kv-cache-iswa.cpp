@@ -371,3 +371,7 @@ const llama_kv_cache_context * llama_kv_cache_iswa_context::get_swa()  const {
 
     return static_cast<const llama_kv_cache_context *>(ctx_swa.get());
 }
+
+std::string llama_kv_cache_iswa::state_descriptor() const {
+    return "iswa{base(full-only)=" + kv_base->state_descriptor() + ",swa=" + kv_swa->state_descriptor() + "}";
+}

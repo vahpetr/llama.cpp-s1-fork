@@ -1362,3 +1362,18 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     }
     return (int32_t)(idx * mem->size) + src0;
 }
+
+std::string llama_memory_recurrent::state_descriptor() const {
+    // logical current row per sequence: R (n_embd_r), the PLE conv history P (ple_conv_state) when present, S (n_embd_s)
+    std::string res = format("recr{size=%u,n_seq_max=%u,n_embd_r=%u,n_embd_s=%u,ple=%u,layers=[", size, n_seq_max,
+                                    hparams.n_embd_r(), hparams.n_embd_s(), hparams.ple_conv_state());
+    for (size_t il = 0; il < r_l.size(); il++) {
+        const auto td = [](const ggml_tensor * t) {
+            return t ? format("%s/b%lld/s%zu", ggml_type_name(t->type), (long long) ggml_blck_size(t->type),
+                                     ggml_type_size(t->type)) : std::string("none");
+        };
+        res += format("%zu:r=%s:s=%s:p=%s;", il, td(r_l[il]).c_str(), td(s_l[il]).c_str(),
+                             td(il < p_l.size() ? p_l[il] : nullptr).c_str());
+    }
+    return res + "]}";
+}
