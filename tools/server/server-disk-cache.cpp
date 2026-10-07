@@ -18,6 +18,8 @@
 #include <sstream>
 #include <unistd.h> // environ
 #include <sys/stat.h>
+#include <sys/file.h> // flock
+#include <fcntl.h>
 
 #define DSK_INF(fmt, ...) LOG_INF("srv  %12.*s: " fmt, 12, "disk_cache", __VA_ARGS__)
 #define DSK_WRN(fmt, ...) LOG_WRN("srv  %12.*s: " fmt, 12, "disk_cache", __VA_ARGS__)
@@ -644,6 +646,31 @@ sealed_status server_disk_cache::read_entry(const std::string & id, const std::s
 
 void server_disk_cache::init() {
     std::error_code ec;
+    // [TAG_DISK_LOCK] (Codex gate r2 Major 4) one writer per cache root: the scan, the collection and the block
+    //   publication assume no other process changes the tree. A second server on the same root runs without the
+    //   disk cache (shared writers are not supported); the lock goes with the process (flock, released at exit)
+    if (lock_fd == -2) {
+        return; // refused at the first init: disabled for the whole run (a re-init after a sleep does not retry)
+    }
+    if (lock_fd < 0) {
+        fs::create_directories(root, ec);
+        const std::string lp = (fs::path(root) / ".lock").string();
+        const int fd = ec ? -1 : open(lp.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            const int err = errno;
+            DSK_WRN("%s: %s - disk cache disabled for this run (one server per cache directory)\n", lp.c_str(),
+                    fd < 0 ? (ec ? ec.message().c_str() : strerror(err)) :
+                    err == EWOULDBLOCK ? "held by another process" : strerror(err));
+            if (fd >= 0) {
+                close(fd);
+            }
+            quota   = 0;
+            lock_fd = -2;
+            refresh_status();
+            return;
+        }
+        lock_fd = fd;
+    }
     fs::create_directories(fs::path(dir) / "ckpt", ec);
     if (ec) {
         DSK_WRN("cannot create %s: %s, disk cache disabled\n", dir.c_str(), ec.message().c_str());

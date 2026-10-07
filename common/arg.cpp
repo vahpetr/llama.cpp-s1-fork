@@ -1720,7 +1720,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--cache-disk"}, "PATH",
         "directory for the disk tier of the prompt cache: a slot state that another conversation evicts is written "
-        "there and loaded back when its conversation returns (default: disabled)",
+        "there and loaded back when its conversation returns (default: disabled). One server per directory: "
+        "it holds <dir>/.lock while running; a second server started on the same directory runs without the "
+        "disk cache (shared writers are not supported)",
         [](common_params & params, const std::string & value) {
             params.cache_disk_path = value;
         }
