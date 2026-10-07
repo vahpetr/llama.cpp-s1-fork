@@ -3171,7 +3171,11 @@ private:
         for (auto it = slot.prompt.checkpoints.begin();
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            // [TAG_CKPT_PIN_RESTORED] the pinned restored checkpoint is never a spacing victim; it still counts as
+            //   the predecessor of the next one. At capacity 1 the pin and a new checkpoint cannot both be kept (the
+            //   capacity eviction below takes the pin then).
+            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step &&
+                it->n_tokens != slot.ckpt_pinned_n_tokens) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
