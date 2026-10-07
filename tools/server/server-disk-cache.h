@@ -140,7 +140,8 @@ struct server_disk_cache {
     json status() const;
     void refresh_status();
 
-    // after a model reload (wake-up from idle sleep): a changed fingerprint drops every stored state
+    // after a model reload (wake-up from idle sleep): a changed fingerprint switches to that fingerprint's namespace
+    //   (the old one stays as a foreign namespace)
     void revalidate(const std::string & fingerprint);
 
     // [TAG_STATE_DESCRIPTOR] what the state streams of these contexts contain (llama_state_seq_descriptor + the
@@ -151,7 +152,25 @@ struct server_disk_cache {
     const std::string & descriptor_hash() const { return desc_h; }
 
   private:
-    std::string dir;
+    // [TAG_DISK_NAMESPACE] <root>/ns-<key>/ holds this fingerprint's entries and ckpt/; <root>/blk/ the shared blocks;
+    //   the flat top level (entries + ckpt/ of a format <= 6 build) is a legacy namespace, kept in place for a rollback
+    struct foreign_ns {
+        std::string key;      // hash16 of its fingerprint
+        std::string path;     // its directory (the root for the legacy namespace)
+        bool        legacy  = false;
+        size_t      n_entries = 0;
+        uint64_t    bytes   = 0; // its own files (entries + checkpoints), not the shared blocks
+        int64_t     t_newest = 0; // mtime of its newest file
+        std::vector<std::string> ids; // legacy: its entry ids at the top level
+        std::set<std::string> blocks; // blocks its maps reference (kept by the block collection)
+    };
+    std::vector<foreign_ns> foreign;
+    void scan_foreign();
+    void remove_foreign(const foreign_ns & ns);
+    bool foreign_protected(const foreign_ns & ns) const;
+
+    std::string root;
+    std::string dir; // the own namespace
     uint64_t    quota;
     int32_t     n_min_tokens;
     int32_t     ttl_days;

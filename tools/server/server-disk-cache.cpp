@@ -362,9 +362,45 @@ std::string server_disk_cache_fingerprint(const common_params & params, int32_t 
 server_disk_cache::server_disk_cache(std::string dir, uint64_t quota_bytes, int32_t min_tokens, int32_t ttl_days,
                                      std::string fingerprint, bool has_mtmd, float ckpt_ratio, int32_t ckpt_min_step,
                                      int32_t ckpt_max)
-    : dir(std::move(dir)), quota(quota_bytes), n_min_tokens(min_tokens), ttl_days(ttl_days),
+    : root(std::move(dir)), quota(quota_bytes), n_min_tokens(min_tokens), ttl_days(ttl_days),
       fingerprint(std::move(fingerprint)), has_mtmd(has_mtmd), ckpt_ratio(ckpt_ratio),
-      ckpt_min_step(std::max(1, ckpt_min_step)), ckpt_max(std::max(2, ckpt_max)) {}
+      ckpt_min_step(std::max(1, ckpt_min_step)), ckpt_max(std::max(2, ckpt_max)) {
+    this->dir = (fs::path(root) / ("ns-" + this->fingerprint.substr(0, 16))).string();
+}
+
+static int64_t mtime_s(const fs::path & p) {
+    std::error_code ec;
+    const auto mt = fs::last_write_time(p, ec);
+    return ec ? 0 : std::chrono::duration_cast<std::chrono::seconds>(
+        (mt - fs::file_time_type::clock::now()) + std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// the fingerprint recorded in an entry's .meta, empty if unreadable
+static std::string meta_fingerprint(const std::string & path) {
+    try {
+        std::ifstream fm(path);
+        if (!fm) {
+            return "";
+        }
+        const std::string text((std::istreambuf_iterator<char>(fm)), std::istreambuf_iterator<char>());
+        return json::parse(text).value("fingerprint", std::string());
+    } catch (const std::exception &) {
+        return "";
+    }
+}
+
+// the fingerprint hash16 in a .ck header (DCK3 and DCK4 alike), empty if unreadable
+static std::string ckpt_fingerprint(const fs::path & p) {
+    std::ifstream f(p, std::ios::binary);
+    uint32_t magic = 0;
+    std::string fp;
+    if (get(f, magic) && (magic == CKPT_MAGIC || magic == CKPT_ENV_MAGIC) && get_str(f, fp)) {
+        return fp;
+    }
+    return "";
+}
+
+static const char * const ENTRY_EXTS[] = { ".meta", ".tok", ".tgt", ".dft", ".aux" };
 
 std::string server_disk_cache::ckpt_path(const std::string & key) const {
     return (fs::path(dir) / "ckpt" / (key + ".ck")).string();
@@ -407,9 +443,16 @@ bool server_disk_cache::write_meta(const server_disk_cache_entry & e) const {
 }
 
 uint64_t server_disk_cache::total_bytes() const {
-    uint64_t res = blob_bytes;
+    // [TAG_DISK_NAMESPACE] the own quota: the own namespace + the blocks its entries reference
+    uint64_t res = 0;
+    std::set<std::string> refs;
     for (const auto & e : entries) {
         res += e.own_bytes; // .tok, .aux and the maps (which hold the small fields inline)
+        refs.insert(e.blobs.begin(), e.blobs.end());
+    }
+    for (const auto & k : refs) {
+        const auto it = blobs.find(k);
+        res += it != blobs.end() ? it->second : 0;
     }
     for (const auto & it : ckpts) {
         res += it.second.bytes;
@@ -424,11 +467,43 @@ void server_disk_cache::erase(size_t idx) {
 
 void server_disk_cache::init() {
     std::error_code ec;
-    fs::create_directories(dir, ec);
+    fs::create_directories(fs::path(dir) / "ckpt", ec);
     if (ec) {
         DSK_WRN("cannot create %s: %s, disk cache disabled\n", dir.c_str(), ec.message().c_str());
         quota = 0;
         return;
+    }
+    const std::string key = fingerprint.substr(0, 16);
+
+    // [TAG_DISK_NAMESPACE] flat entries / checkpoints of this very fingerprint move into the own namespace (rename,
+    //   atomic per file; the .meta last, so an interrupted move leaves an incomplete flat entry that is skipped);
+    //   flat files of another fingerprint stay where they are (legacy namespace: a rollback still finds them)
+    {
+        std::set<std::string> flat;
+        for (const auto & de : fs::directory_iterator(root, ec)) {
+            const std::string name = de.path().filename().string();
+            if (de.is_regular_file() && name.find('.') == 16) {
+                flat.insert(name.substr(0, 16));
+            }
+        }
+        for (const auto & id : flat) {
+            if (meta_fingerprint((fs::path(root) / (id + ".meta")).string()) == fingerprint) {
+                for (const char * ext : { ".tok", ".tgt", ".dft", ".aux", ".meta" }) {
+                    std::error_code ec_m;
+                    if (fs::exists(fs::path(root) / (id + ext), ec_m)) {
+                        fs::rename(fs::path(root) / (id + ext), fs::path(dir) / (id + ext), ec_m);
+                    }
+                }
+                DSK_INF("moved flat entry %s into namespace %s\n", id.c_str(), key.c_str());
+            }
+        }
+        for (const auto & de : fs::directory_iterator(fs::path(root) / "ckpt", ec)) {
+            if (ckpt_fingerprint(de.path()) == key) {
+                std::error_code ec_m;
+                fs::rename(de.path(), fs::path(dir) / "ckpt" / de.path().filename(), ec_m);
+            }
+        }
+        ec.clear();
     }
 
     std::set<std::string> ids;
@@ -488,8 +563,8 @@ void server_disk_cache::init() {
     }
 
     // block store: every complete block file (a crash leaves only .tmp files); unreferenced ones go in enforce()
-    fs::create_directories(fs::path(dir) / "blk", ec);
-    for (const auto & de : fs::directory_iterator(fs::path(dir) / "blk", ec)) {
+    fs::create_directories(fs::path(root) / "blk", ec);
+    for (const auto & de : fs::directory_iterator(fs::path(root) / "blk", ec)) {
         const std::string name = de.path().filename().string();
         if (name.size() > 4 && name.compare(name.size() - 4, 4, ".blk") == 0) {
             const uint64_t n = file_size_or_0(de.path().string());
@@ -561,8 +636,11 @@ void server_disk_cache::init() {
         }
     }
 
+    scan_foreign();
+
     enforce("");
 
+    DSK_INF("own key %s (descriptor %s), %zu foreign namespaces\n", key.c_str(), desc_h.c_str(), foreign.size());
     DSK_INF("dir %s: %zu entries + %zu deep checkpoints, %.2f GiB (quota %.0f GiB, min %d tokens, ttl %d days, "
             "deep ratio %.2f min step %d max %d), %zu + %zu stale/foreign dropped\n",
             dir.c_str(), entries.size(), ckpts.size(), total_bytes() / (1024.0 * 1024.0 * 1024.0),
@@ -1205,7 +1283,7 @@ void server_disk_cache::deep_gc() {
 // conversation produce the same blocks again.
 
 std::string server_disk_cache::blob_path(const std::string & key) const {
-    return (fs::path(dir) / "blk" / (key + ".blk")).string();
+    return (fs::path(root) / "blk" / (key + ".blk")).string();
 }
 
 bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
@@ -1509,6 +1587,14 @@ void server_disk_cache::blob_gc() {
     for (const auto & e : entries) {
         referenced.insert(e.blobs.begin(), e.blobs.end());
     }
+    // [TAG_DISK_NAMESPACE] blocks of every other namespace on disk (incl. other live processes) stay: rescan them
+    //   only when something would be deleted
+    if (std::any_of(blobs.begin(), blobs.end(), [&](const auto & b) { return !referenced.count(b.first); })) {
+        scan_foreign();
+        for (const auto & ns : foreign) {
+            referenced.insert(ns.blocks.begin(), ns.blocks.end());
+        }
+    }
     for (auto it = blobs.begin(); it != blobs.end();) {
         if (!referenced.count(it->first)) {
             std::error_code ec;
@@ -1525,18 +1611,17 @@ void server_disk_cache::revalidate(const std::string & fp) {
     if (fp == fingerprint) {
         return;
     }
-    DSK_WRN("%s", "the model / context / flags changed since the cache was opened: dropping every stored state\n");
+    // [TAG_DISK_NAMESPACE] a mismatch is a miss, never a delete: open the new fingerprint's namespace, the old one
+    //   stays as a foreign namespace (TTL / cap)
+    DSK_WRN("the model / context / flags changed since the cache was opened: switching namespace %s -> %s\n",
+            fingerprint.substr(0, 16).c_str(), fp.substr(0, 16).c_str());
     fingerprint = fp;
-    while (!entries.empty()) {
-        erase(entries.size() - 1);
-    }
-    for (const auto & it : ckpts) {
-        std::error_code ec;
-        fs::remove(ckpt_path(it.first), ec);
-    }
+    dir = (fs::path(root) / ("ns-" + fp.substr(0, 16))).string();
+    entries.clear();
     ckpts.clear();
-    blob_gc();
-    refresh_status();
+    blobs.clear();
+    blob_bytes = 0;
+    init();
 }
 
 void server_disk_cache::refresh_status() {
@@ -1554,8 +1639,21 @@ void server_disk_cache::refresh_status() {
             { "value",       entry_value(e, now_s()) },
         });
     }
+    json fl = json::array();
+    for (const auto & ns : foreign) {
+        fl.push_back({
+            { "key",       ns.key       },
+            { "legacy",    ns.legacy    },
+            { "n_entries", ns.n_entries },
+            { "bytes",     ns.bytes     },
+            { "age_s",     now_s() - ns.t_newest },
+        });
+    }
     json j = {
         { "enabled",        quota > 0           },
+        { "key",            fingerprint.substr(0, 16) },
+        { "descriptor",     desc_h              },
+        { "foreign",        fl                  },
         { "dir",            dir                 },
         { "quota_bytes",    quota               },
         { "bytes_on_disk",  total_bytes()       },
@@ -1606,4 +1704,119 @@ void server_disk_cache::set_descriptor(llama_context * ctx_tgt, llama_context * 
     DSK_DBG("target descriptor: %s\n", tgt.c_str());
     DSK_DBG("draft descriptor: %s\n", dft.c_str());
     refresh_status();
+}
+
+// [TAG_DISK_NAMESPACE] every other namespace: ns-<key>/ directories and the flat legacy top level (grouped by the
+//   fingerprint in its .meta files); TTL (newest file older than ttl_days) and cap (all together <= quota / 2, oldest
+//   first) remove whole namespaces; the blocks they reference are kept by blob_gc
+void server_disk_cache::scan_foreign() {
+    const std::string own = fingerprint.substr(0, 16);
+    std::map<std::string, foreign_ns> found;
+    std::error_code ec;
+    const auto add_maps = [](foreign_ns & ns, const fs::path & base, const std::string & id) {
+        std::vector<std::string> keys;
+        for (const char * ext : { ".tgt", ".dft" }) {
+            keys.clear();
+            if (read_map_keys((base / (id + ext)).string(), keys)) {
+                ns.blocks.insert(keys.begin(), keys.end());
+            }
+        }
+    };
+    for (const auto & de : fs::directory_iterator(root, ec)) {
+        const std::string name = de.path().filename().string();
+        if (de.is_directory() && name.rfind("ns-", 0) == 0 && name.size() == 19 && name.substr(3) != own) {
+            foreign_ns & ns = found["ns:" + name.substr(3)];
+            ns.key  = name.substr(3);
+            ns.path = de.path().string();
+            ns.t_newest = mtime_s(de.path()); // a namespace just created by another process is not idle
+            std::error_code ec_r;
+            for (const auto & f : fs::recursive_directory_iterator(de.path(), ec_r)) {
+                if (!f.is_regular_file()) {
+                    continue;
+                }
+                const std::string fn = f.path().filename().string();
+                ns.bytes   += file_size_or_0(f.path().string());
+                ns.t_newest = std::max(ns.t_newest, mtime_s(f.path()));
+                if (f.path().parent_path() == de.path() && fn.size() == 21 && fn.compare(16, 5, ".meta") == 0) {
+                    ns.n_entries++;
+                    add_maps(ns, de.path(), fn.substr(0, 16));
+                }
+            }
+        } else if (de.is_regular_file() && name.size() == 21 && name.compare(16, 5, ".meta") == 0) {
+            const std::string fp = meta_fingerprint(de.path().string());
+            const std::string k  = fp.size() >= 16 ? fp.substr(0, 16) : std::string("unknown");
+            foreign_ns & ns = found["legacy:" + k];
+            ns.key    = k;
+            ns.path   = root;
+            ns.legacy = true;
+            ns.n_entries++;
+            const std::string id = name.substr(0, 16);
+            ns.ids.push_back(id);
+            for (const char * ext : ENTRY_EXTS) {
+                const fs::path p = fs::path(root) / (id + ext);
+                ns.bytes   += file_size_or_0(p.string());
+                ns.t_newest = std::max(ns.t_newest, mtime_s(p));
+            }
+            add_maps(ns, fs::path(root), id);
+        }
+    }
+    for (const auto & de : fs::directory_iterator(fs::path(root) / "ckpt", ec)) {
+        const std::string k = ckpt_fingerprint(de.path());
+        auto it = found.find("legacy:" + k);
+        if (it != found.end()) {
+            it->second.bytes   += file_size_or_0(de.path().string());
+            it->second.t_newest = std::max(it->second.t_newest, mtime_s(de.path()));
+        }
+    }
+
+    foreign.clear();
+    for (auto & it : found) {
+        foreign.push_back(std::move(it.second));
+    }
+    std::sort(foreign.begin(), foreign.end(), [](const foreign_ns & a, const foreign_ns & b) { return a.t_newest < b.t_newest; });
+
+    const int64_t t_now = now_s();
+    uint64_t total = 0;
+    for (const auto & ns : foreign) {
+        total += ns.bytes;
+    }
+    for (size_t i = 0; i < foreign.size();) {
+        const foreign_ns & ns = foreign[i];
+        const bool expired = ttl_days > 0 && t_now - ns.t_newest > (int64_t) ttl_days * 86400;
+        const bool over    = total > quota / 2; // oldest first (sorted)
+        if ((expired || over) && !foreign_protected(ns)) {
+            DSK_INF("removing foreign namespace %s%s (%zu entries, %.2f GiB, idle %.1f days): %s\n", ns.key.c_str(),
+                    ns.legacy ? " (legacy)" : "", ns.n_entries, ns.bytes / (1024.0 * 1024.0 * 1024.0),
+                    (t_now - ns.t_newest) / 86400.0, expired ? "ttl" : "cap");
+            total -= ns.bytes;
+            remove_foreign(ns);
+            foreign.erase(foreign.begin() + i);
+        } else {
+            i++;
+        }
+    }
+}
+
+bool server_disk_cache::foreign_protected(const foreign_ns & ns) const {
+    GGML_UNUSED(ns);
+    return false;
+}
+
+void server_disk_cache::remove_foreign(const foreign_ns & ns) {
+    std::error_code ec;
+    if (!ns.legacy) {
+        fs::remove_all(ns.path, ec);
+        return;
+    }
+    for (const auto & id : ns.ids) {
+        for (const char * ext : ENTRY_EXTS) {
+            fs::remove(fs::path(root) / (id + ext), ec);
+        }
+    }
+    for (const auto & de : fs::directory_iterator(fs::path(root) / "ckpt", ec)) {
+        if (ckpt_fingerprint(de.path()) == ns.key) {
+            std::error_code ec_r;
+            fs::remove(de.path(), ec_r);
+        }
+    }
 }
