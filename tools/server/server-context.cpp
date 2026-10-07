@@ -546,6 +546,14 @@ struct server_slot {
     int                  spec_tput_n_att = 0;   // draft positions the drafter sampled this round (p_min stop included)
     int                  spec_tput_n_kept = 0;  // tokens it drafted before the n_min rule
     int                  spec_tput_n_draft_rounds = 0; // drafting rounds of this task (the first one is cold)
+    // the last decision's state for /slots (also at n = 0): the rule's n*, the cost model of the slot's depth bucket
+    bool                  spec_tput_active   = false;
+    bool                  spec_tput_measured = false;
+    int                   spec_tput_rule     = 0;
+    int                   spec_tput_n_kv     = 0;
+    double                spec_tput_rate     = 0.0;
+    common_spec_tput_cost spec_tput_cost;
+    int                   spec_tput_fit_n[7] = { 0 }; // samples: draft, ckpt, verify, catchup, host, host_d, rb
     int64_t              spec_rb_restore_us = 0; // the checkpoint restore of the last rollback (charged to its replay)
 
     static constexpr float SPEC_ACC_EMA_ALPHA = 1.0f/32.0f;
@@ -676,6 +684,13 @@ struct server_slot {
         spec_tput_n_att    = 0;
         spec_tput_n_kept   = 0;
         spec_tput_n_draft_rounds = 0;
+        spec_tput_active   = false;
+        spec_tput_measured = false;
+        spec_tput_rule     = 0;
+        spec_tput_n_kv     = 0;
+        spec_tput_rate     = 0.0;
+        spec_tput_cost     = common_spec_tput_cost();
+        std::fill(std::begin(spec_tput_fit_n), std::end(spec_tput_fit_n), 0);
         spec_rb_restore_us = 0;
 
         n_predict_max = -1;
@@ -1015,7 +1030,7 @@ struct server_slot {
 
         // adaptive draft length (--spec-draft-n-max-adaptive): the effective n-max this slot last
         // asked the drafter for, and the cost model it came from - so a bench can see the rule work
-        if (spec_n_max_last > 0) {
+        if (spec_n_max_last > 0 || spec_tput_active) {
             json acc_ema = json::array();
             for (const float p : spec_acc_ema) {
                 acc_ema.push_back(p);
@@ -1029,6 +1044,40 @@ struct server_slot {
                 {"cost_n_kv",     spec_cost_n_kv},
                 {"cost_measured", spec_cost_measured},
             };
+
+            if (spec_tput_active) { // [TAG_SPEC_DRAFT_POLICY] the tput state, also while the slot plays n = 0
+                const auto & c = spec_tput_cost;
+                const auto ab = [](double x, double y) { return json::array({ x, y }); };
+                json n_samples = json::object();
+                const char * fit_names[7] = { "draft", "ckpt", "verify", "catchup", "host", "host_d", "rollback" };
+                for (int k = 0; k < 7; ++k) {
+                    n_samples[fit_names[k]] = spec_tput_fit_n[k];
+                }
+                json fit = json::object();
+                fit["draft"]     = ab(c.d0, c.d1);
+                fit["ckpt"]      = ab(c.k0, c.k1);
+                fit["verify"]    = ab(c.v0, c.v1);
+                fit["catchup"]   = ab(c.c0, c.c1);
+                fit["host"]      = c.host;
+                fit["rollback"]  = ab(c.r0, c.r1);
+                fit["n_rb_free"] = c.n_rb_free;
+                fit["n_samples"] = n_samples;
+                json t = json::object();
+                t["n_rule"]          = spec_tput_rule;
+                t["cooldown_c"]      = spec_cd.c;
+                t["probe_in"]        = spec_cd.c > 0 ? spec_cd.wait : -1;
+                t["n_fail"]          = spec_cd.n_fail;
+                t["n_zero_rounds"]   = stats.n_spec_zero_rounds;
+                t["n_probe_rounds"]  = stats.n_spec_probe_rounds;
+                t["p_eff"]           = common_spec_tput_p_eff(spec_acc_ema, spec_acc_nobs);
+                t["acc_n_obs"]       = spec_acc_nobs;
+                t["n_kv"]            = spec_tput_n_kv;
+                t["bucket"]          = common_spec_tput_bucket(spec_tput_n_kv);
+                t["measured"]        = spec_tput_measured;
+                t["rate_tok_per_ms"] = spec_tput_rate;
+                t["fit"]             = fit;
+                res["spec_draft"]["tput"] = t;
+            }
         }
 
         const auto & ptask = task ? task : task_prev;
@@ -4097,6 +4146,7 @@ private:
         int n_rows        = 0;
         int n_rows_expect = 0;
         int n_kv          = 0; // the depth of the round's slot: its fits bucket
+        int n_rows_gen    = 0; // tput: target rows of the pass's true-zero and replay slots (the rest: prefill)
         int n_draft_att   = 0; // tput: draft positions sampled (the draft fit's x), tokens drafted (the ckpt fit's x)
         int n_draft_out   = 0;
         bool cold         = false; // tput: the slot's first drafting round of the task (allocation / graph warm-up)
@@ -4199,6 +4249,17 @@ private:
         slot.spec_n_max_last = n;
         slot.spec_tput_n_req = n;
         spec_rt.n_kv         = n_kv;
+
+        slot.spec_tput_active   = true;
+        slot.spec_tput_measured = ok;
+        slot.spec_tput_rule     = n_rule;
+        slot.spec_tput_n_kv     = n_kv;
+        slot.spec_tput_rate     = rate;
+        slot.spec_tput_cost     = c;
+        const common_spec_ew_line * fl[7] = { &f.draft, &f.ckpt, &f.verify, &f.catchup, &f.host, &f.host_d, &f.rb };
+        for (int k = 0; k < 7; ++k) {
+            slot.spec_tput_fit_n[k] = fl[k]->n_samples;
+        }
         metrics.spec_adaptive_n_max = (uint64_t) n;
         return n;
     }
@@ -4207,9 +4268,28 @@ private:
     void spec_round_finish() {
         if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
             spec_tput_feed();
-            if (spec_rt.slot_ids.empty() && !spec_rt.zero_ids.empty()) { // a true-zero round: not a prefill pass
+            if (spec_rt.slot_ids.empty() && (!spec_rt.zero_ids.empty() || !spec_rt.replay_ids.empty())) {
+                // no drafting slot, but true-zero / replay rows: their catch-up is theirs, the prefill rows' share of a
+                //   mixed pass (by rows) keeps the prefill accounting
+                const int     n_gen = std::min(spec_rt.n_rows_gen, spec_rt.n_rows);
+                const int64_t t_pf  = spec_rt.n_rows > 0 ? spec_rt.catchup_us * (spec_rt.n_rows - n_gen) / spec_rt.n_rows : 0;
+                const int64_t t_gen = spec_rt.catchup_us - t_pf;
+                if (t_pf > 0) {
+                    metrics.n_spec_catchup_pf_passes += 1;
+                    metrics.t_spec_catchup_pf_us     += t_pf;
+                    llama_kqvis_prof_add_catchup_pf(ctx_tgt, t_pf);
+                }
+                if (!spec_rt.zero_ids.empty()) {
+                    metrics.n_spec_zero_passes     += 1;
+                    metrics.t_spec_zero_catchup_us += spec_rt.replay_ids.empty() ? t_gen : t_gen / 2;
+                }
+                if (!spec_rt.replay_ids.empty()) {
+                    metrics.n_spec_replay_passes     += 1;
+                    metrics.t_spec_replay_catchup_us += spec_rt.zero_ids.empty() ? t_gen : t_gen - t_gen / 2;
+                }
                 spec_rt.catchup_us = 0;
                 spec_rt.zero_ids.clear();
+                spec_rt.replay_ids.clear();
                 return;
             }
         }
@@ -4315,6 +4395,7 @@ private:
             spec_rt.n_rows        = 0;
             spec_rt.n_rows_expect = 0;
             spec_rt.n_kv          = 0;
+            spec_rt.n_rows_gen    = 0;
             spec_rt.n_draft_att   = 0;
             spec_rt.n_draft_out   = 0;
             spec_rt.cold          = false;
@@ -4547,6 +4628,7 @@ private:
                             spec_rt.replay_restore_us = slot.spec_rb_restore_us;
                             spec_rt.n_kv              = spec_n_kv_depth(slot);
                             spec_rt.n_rows_expect     = 1 + (int) slot.spec_draft.size();
+                            spec_rt.n_rows_gen       += 1 + (int) slot.spec_draft.size();
                             slot.spec_rb_restore_us   = 0;
                         }
                     } else {
@@ -4561,6 +4643,7 @@ private:
                                 slot.stats.n_spec_zero_rounds++;
                                 spec_rt.zero_ids.push_back(slot.id);
                                 spec_rt.n_rows_expect = 1;
+                                spec_rt.n_rows_gen   += 1;
                                 return;
                             }
                         }

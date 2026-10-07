@@ -371,7 +371,13 @@ doubling to 64 on a failed probe) and then probes the shortest kept length (1, o
 halves C, below 4 the cooldown ends. It replaces
 `--spec-draft-n-max-adaptive` while on. Verify widths change, so the target output is the same only up to the backend's
 batch-width class (on the CPU a 1-row decode differs from wider batches by ~1e-8 in the logits). The slot's end-of-task
-log shows the zero rounds and probes; `LLAMA_TRACE=1` logs each length change with the fitted costs.
+log shows the zero rounds and probes; `LLAMA_TRACE=1` logs each length change with the fitted costs. While a slot generates,
+`/slots` shows `spec_draft.tput` also at n = 0: the rule's `n_rule`, the cooldown (`cooldown_c`, `probe_in` rounds to the
+next probe, `n_fail`), zero / probe counters, `p_eff` and the observations per position, the depth `n_kv` / `bucket`,
+and the bucket's fitted coefficients (`[intercept, slope]` of draft, ckpt, verify, catch-up, rollback; host; the sample
+count of each fit). `/metrics` counts the passes without a drafting slot that took a true-zero or a replay round and
+their catch-up (`spec_zero_*`, `spec_replay_*`); the prefill rows' share of a mixed pass stays in
+`spec_catchup_prefill_*`.
 
 ### Multimodal support
 

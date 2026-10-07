@@ -1623,6 +1623,22 @@ std::string server_task_result_metrics::to_metrics() {
             "Speculative: passes without a drafting slot that ran the draft catch-up (prompt processing)",
             (double) metrics.n_spec_catchup_pf_passes
         }, {
+            "spec_zero_passes_total",
+            "Speculative (--spec-draft-policy tput): passes whose generating slots took a true-zero round",
+            (double) metrics.n_spec_zero_passes
+        }, {
+            "spec_zero_catchup_seconds_total",
+            "Speculative (--spec-draft-policy tput): draft catch-up of the true-zero rows (prefill rows' share excluded)",
+            metrics.t_spec_zero_catchup_us / 1e6
+        }, {
+            "spec_replay_passes_total",
+            "Speculative (--spec-draft-policy tput): replay passes after a checkpoint restore without a drafting slot",
+            (double) metrics.n_spec_replay_passes
+        }, {
+            "spec_replay_catchup_seconds_total",
+            "Speculative (--spec-draft-policy tput): draft catch-up of the replay rows (prefill rows' share excluded)",
+            metrics.t_spec_replay_catchup_us / 1e6
+        }, {
             "spec_verify_seconds_total",
             "Speculative: wall time of the verify decode (llama_decode + sync) per round",
             metrics.t_spec_verify_us / 1e6

@@ -543,6 +543,12 @@ struct server_metrics {
     // counted separately so the fill's catch-up share is measurable
     uint64_t n_spec_catchup_pf_passes = 0;
     int64_t  t_spec_catchup_pf_us     = 0;
+    // [TAG_SPEC_DRAFT_POLICY] tput passes without a drafting slot but with a true-zero or a replay slot: their own
+    // catch-up (the prefill rows' share of a mixed pass stays in the prefill counters above)
+    uint64_t n_spec_zero_passes       = 0;
+    int64_t  t_spec_zero_catchup_us   = 0;
+    uint64_t n_spec_replay_passes     = 0;
+    int64_t  t_spec_replay_catchup_us = 0;
 
     // adaptive draft length (--spec-draft-n-max-adaptive) - gauges, last decision taken by any slot
     uint64_t spec_adaptive_n_max    = 0;  // effective draft length asked of the drafter
