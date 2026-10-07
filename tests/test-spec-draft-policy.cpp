@@ -20,23 +20,36 @@ static void check(bool ok, const std::string & what) {
     }
 }
 
-// brute force reference: tokens per ms of every n, argmax with ties to the shorter draft
+// brute force reference: enumerate the outcomes of a round (a accepted of n, probability P_a*(1 - p_{a+1}) or P_n),
+// each with its committed tokens and wall time (+ the restore/replay cycle when the rollback n - a needs a restore);
+// argmax of E[tokens]/E[time] with ties to the shorter draft
+static double ref_rate(const std::vector<float> & p, int n, const common_spec_tput_cost & c) {
+    const auto pj = [&](int j) { return j - 1 < (int) p.size() ? (double) p[j - 1] : 1.0; };
+    const double m    = n + 1.0;
+    const double base = (n ? c.d0 + c.d1*n : 0.0) + c.v0 + c.v1*m + c.c0 + c.c1*m + c.host;
+    double e_tok = 0.0, e_t = 0.0;
+    for (int a = 0; a <= n; ++a) {
+        double pr = 1.0;
+        for (int j = 1; j <= a; ++j) {
+            pr *= pj(j);
+        }
+        if (a < n) {
+            pr *= 1.0 - pj(a + 1);
+        }
+        const bool rb = a < n && n - a > c.n_rb_free;
+        e_tok += pr*(a + 1 + (rb ? 1 : 0));
+        e_t   += pr*(base + (rb ? c.r0 + c.r1*(a + 2) : 0.0));
+    }
+    return e_tok / e_t;
+}
+
 static int ref_best(const std::vector<float> & p, int n_max, const common_spec_tput_cost & c) {
     int best = 0;
     double best_r = -1.0;
     for (int n = 0; n <= n_max; ++n) {
-        double gain = 1.0;
-        for (int i = 1; i <= n; ++i) {
-            double P = 1.0;
-            for (int j = 1; j <= i; ++j) {
-                P *= j - 1 < (int) p.size() ? p[j - 1] : 1.0;
-            }
-            gain += P;
-        }
-        const double m = n + 1.0;
-        const double t = (n ? c.d0 + c.d1*n : 0.0) + c.v0 + c.v1*m + c.c0 + c.c1*m + c.host;
-        if (gain / t > best_r) {
-            best_r = gain / t;
+        const double r = ref_rate(p, n, c);
+        if (r > best_r + 1e-12) {
+            best_r = r;
             best   = n;
         }
     }
@@ -84,6 +97,52 @@ static void test_rule() {
     }
     printf("rule sweep: %d cases match the brute force; n* distribution 0:%d 1:%d 2:%d 3:%d 4:%d 5:%d\n",
            n_cmp, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
+}
+
+// (v51 r1, C Major) the complete verification/restore/replay cycle: with a FULL target every rejection restores the
+// checkpoint and replays a+2 rows in the next pass; that cost (and the replay's extra token) moves n*
+static void test_rollback_cycle() {
+    common_spec_tput_cost c;
+    c.d0 = 1.0; c.d1 = 2.2; c.v0 = 25.0; c.v1 = 1.5; c.c0 = 0.8; c.c1 = 0.2; c.host = 1.2;
+    const std::vector<float> p = { 0.6f, 0.6f, 0.6f, 0.6f, 0.6f };
+
+    const int n_free = common_spec_tput_best_n(p, 5, c); // no restore (partial seq_rm)
+    common_spec_tput_cost f = c;
+    f.n_rb_free = 0;                                      // FULL: every rejection restores
+    f.r0 = 30.0; f.r1 = 1.7;                              // restore 2 ms + a replay pass of a+2 rows
+    const int n_full = common_spec_tput_best_n(p, 5, f);
+    printf("rollback cycle: p = 0.6 x5, no restore n* = %d, FULL restore+replay n* = %d\n", n_free, n_full);
+    check(n_full < n_free, "the rollback cycle cost lowers n* at low P_i");
+    check(n_full == ref_best(p, 5, f), "FULL rollback: n* matches the outcome enumeration");
+
+    // the term is exact against the enumeration: rate(n) for every n, FULL and RS (restore only beyond n_rs_seq = 2)
+    for (int free : { 0, 2, 1 << 30 }) {
+        common_spec_tput_cost g = f;
+        g.n_rb_free = free;
+        for (int n = 0; n <= 5; ++n) {
+            double gain = 0.0, cost = 0.0;
+            common_spec_tput_eval(p, n, g, gain, cost);
+            check(std::fabs(gain/cost - ref_rate(p, n, g)) < 1e-12, "eval == enumeration (free " + std::to_string(free) +
+                  ", n " + std::to_string(n) + ")");
+        }
+    }
+    // a restore-free rollback shallower than n_rs_seq costs nothing extra: RS with free >= n_max == no restore
+    common_spec_tput_cost rs = f;
+    rs.n_rb_free = 5;
+    check(common_spec_tput_best_n(p, 5, rs) == n_free, "RS rollback within n_rs_seq: no cycle cost");
+    // a cheap rollback (replay pass ~ free) with the replay's extra token does not shorten the draft
+    common_spec_tput_cost cheap = f;
+    cheap.r0 = 0.0; cheap.r1 = 0.0;
+    check(common_spec_tput_best_n(p, 5, cheap) >= n_free, "a free replay (extra token) never shortens the draft");
+    // sweep vs the enumeration, FULL
+    for (int a = 0; a <= 10; ++a) {
+        for (double r0 : { 5.0, 30.0, 80.0 }) {
+            const std::vector<float> q = { a / 10.0f, 0.8f, 0.5f, 0.9f };
+            common_spec_tput_cost h = f;
+            h.r0 = r0;
+            check(common_spec_tput_best_n(q, 4, h) == ref_best(q, 4, h), "FULL sweep vs enumeration");
+        }
+    }
 }
 
 static void test_cooldown() {
@@ -146,6 +205,7 @@ static void test_cooldown() {
 
 int main() {
     test_rule();
+    test_rollback_cycle();
     test_cooldown();
     if (n_fail) {
         printf("test-spec-draft-policy: %d failures (%d checks ok)\n", n_fail, n_ok);

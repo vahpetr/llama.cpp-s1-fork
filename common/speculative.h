@@ -136,14 +136,26 @@ common_speculative_init_result_ptr common_speculative_init_from_params(common_pa
 //   One round with n drafted tokens commits 1 + sum_{i<=n} P_i tokens on average (P_i = prod_{j<=i} p_j, p_j the
 //   per-position conditional acceptance) and costs T_draft(n) + T_verify(n+1) + T_catchup(n+1) + T_host; n = 0 is a
 //   plain one-token decode (no draft call: T_draft(0) = 0). All costs in ms, affine in the row count.
+//   Complete cycle (v51 r1, Codex C Major): a round whose rejection rolls back deeper than n_rb_free (a FULL target:
+//   every rejection, an RS target: deeper than n_rs_seq) restores the per-round checkpoint and replays the accepted
+//   prefix in the next pass. With a accepted (first rejection at position a+1, probability q_a = P_a*(1 - p_{a+1}))
+//   the replay pass decodes a + 2 rows and commits one token more than a plain rejection (the replay's own sample);
+//   its cost r0 + r1*(a+2) (restore + the whole replay pass, fitted) and that token are attributed to the round:
+//     gain(n) = 1 + sum_{i<=n} P_i + sum_{a<n, n-a>n_rb_free} q_a
+//     cost(n) = T_draft(n) + T_verify(n+1) + T_catchup(n+1) + T_host + sum_{a<n, n-a>n_rb_free} q_a*(r0 + r1*(a+2))
 struct common_spec_tput_cost {
     double d0 = 0.0, d1 = 0.0; // the draft call for n >= 1 tokens: d0 + d1*n
     double v0 = 0.0, v1 = 0.0; // the target decode of m = n+1 rows: v0 + v1*m
     double c0 = 0.0, c1 = 0.0; // the MTP process() catch-up of m rows: c0 + c1*m
     double host = 0.0;         // per-round host time
+    double r0 = 0.0, r1 = 0.0; // a rollback cycle: checkpoint restore + the replay pass of r = a+2 rows: r0 + r1*r
+    int    n_rb_free = 1 << 30; // the deepest rollback that needs no restore (FULL: 0, RS: n_rs_seq, else never)
 };
 
-// n* = argmax over n in [0, n_max] of the committed tokens per ms; p[i] = p_{i+1} (missing entries count as 1);
+// the expected committed tokens (gain) and wall ms (cost) of one round that drafts n tokens (see above)
+void common_spec_tput_eval(const std::vector<float> & p, int n, const common_spec_tput_cost & c, double & gain, double & cost);
+
+// n* = argmax over n in [0, n_max] of gain/cost; p[i] = p_{i+1} (missing entries count as 1);
 // ties go to the shorter draft. rate_out (optional): the expected tokens per ms at n*.
 int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const common_spec_tput_cost & c,
                             double * rate_out = nullptr);

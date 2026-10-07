@@ -3240,18 +3240,33 @@ void common_speculative_print_stats(const common_speculative * spec) {
 }
 
 // [TAG_SPEC_DRAFT_POLICY]
+void common_spec_tput_eval(const std::vector<float> & p, int n, const common_spec_tput_cost & c, double & gain, double & cost) {
+    const double m = (double) (n + 1);
+    gain = 1.0;
+    cost = c.v0 + c.v1*m + c.c0 + c.c1*m + c.host;
+    if (n <= 0) {
+        return;
+    }
+    cost += c.d0 + c.d1*(double) n;
+    double P = 1.0; // P_a: the first a drafted tokens accepted
+    for (int a = 0; a < n; ++a) {
+        const double pa = a < (int) p.size() ? std::min(std::max((double) p[a], 0.0), 1.0) : 1.0;
+        if (n - a > c.n_rb_free) { // first rejection at a+1 -> restore + replay of a+2 rows, one extra token
+            const double q = P*(1.0 - pa);
+            gain += q;
+            cost += q*(c.r0 + c.r1*(double) (a + 2));
+        }
+        P    *= pa;
+        gain += P;
+    }
+}
+
 int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const common_spec_tput_cost & c, double * rate_out) {
     int    best_n    = 0;
     double best_rate = -1.0;
-    double p_cum     = 1.0;
-    double gain      = 1.0; // 1 + sum_{i<=n} P_i
     for (int n = 0; n <= std::max(0, n_max); ++n) {
-        if (n > 0) {
-            p_cum *= (n - 1 < (int) p.size()) ? std::min(std::max((double) p[n - 1], 0.0), 1.0) : 1.0;
-            gain  += p_cum;
-        }
-        const double m    = (double) (n + 1);
-        const double cost = (n > 0 ? c.d0 + c.d1*(double) n : 0.0) + c.v0 + c.v1*m + c.c0 + c.c1*m + c.host;
+        double gain = 0.0, cost = 0.0;
+        common_spec_tput_eval(p, n, c, gain, cost);
         const double rate = cost > 0.0 ? gain / cost : gain * 1e30;
         if (rate > best_rate) {
             best_rate = rate;

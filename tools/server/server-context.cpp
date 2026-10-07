@@ -542,6 +542,7 @@ struct server_slot {
     // [TAG_SPEC_DRAFT_POLICY] --spec-draft-policy tput: the cooldown state and the length requested this round
     common_spec_cooldown spec_cd;
     int                  spec_tput_n_req = 0;
+    int64_t              spec_rb_restore_us = 0; // the checkpoint restore of the last rollback (charged to its replay)
 
     static constexpr float SPEC_ACC_EMA_ALPHA = 1.0f/32.0f;
 
@@ -649,6 +650,7 @@ struct server_slot {
         spec_cost_measured = false;
         spec_cd            = common_spec_cooldown();
         spec_tput_n_req    = 0;
+        spec_rb_restore_us = 0;
 
         n_predict_max = -1;
 
@@ -1722,6 +1724,8 @@ private:
     // [TAG_SPEC_DRAFT_POLICY] --spec-draft-policy tput: per-round cost fits (draft wall vs drafted n, verify and
     // catch-up wall vs batch rows, host wall)
     server_spec_ew_line spec_fit_draft, spec_fit_verify, spec_fit_catchup, spec_fit_host;
+    // the rollback cycle: checkpoint restore + the replay pass, vs the replay rows (a + 2)
+    server_spec_ew_line spec_fit_rb;
 
     json json_ui_settings = json::object();
 
@@ -4105,16 +4109,27 @@ private:
         int n_draft_req   = 0;
         int n_rows        = 0;
         int n_rows_expect = 0;
+        // tput: slots whose pass is the replay after a checkpoint restore, that restore's wall, and the restores
+        //   done in this pass (not host time of this pass: charged to the replay that follows)
+        std::vector<int> replay_ids;
+        int64_t replay_restore_us = 0;
+        int64_t restore_us        = 0;
     } spec_rt;
 
     // [TAG_SPEC_DRAFT_POLICY] one single-slot pure round -> the cost fits
     void spec_tput_feed() {
-        const size_t n_slots = spec_rt.slot_ids.size() + spec_rt.zero_ids.size();
+        const size_t n_slots = spec_rt.slot_ids.size() + spec_rt.zero_ids.size() + spec_rt.replay_ids.size();
         if (n_slots != 1 || spec_rt.n_rows <= 0 || spec_rt.n_rows != spec_rt.n_rows_expect) {
             return;
         }
         const int64_t t_round = ggml_time_us() - spec_rt.t0_us;
-        const int64_t t_host  = std::max<int64_t>(0, t_round - spec_rt.draft_us - spec_rt.catchup_us - spec_rt.verify_us);
+        if (!spec_rt.replay_ids.empty()) {
+            // the complete rollback cycle: the restore (in the rejecting pass) + this whole replay pass
+            spec_fit_rb.add(spec_rt.n_rows, (spec_rt.replay_restore_us + t_round) / 1e3);
+            return;
+        }
+        const int64_t t_host  = std::max<int64_t>(0, t_round - spec_rt.draft_us - spec_rt.catchup_us - spec_rt.verify_us -
+                                                     spec_rt.restore_us);
         if (!spec_rt.slot_ids.empty()) {
             spec_fit_draft.add(spec_rt.n_draft_req, spec_rt.draft_us / 1e3);
         }
@@ -4137,6 +4152,17 @@ private:
                         spec_fit_verify .get(c.v0, c.v1, 0.5*t_tok) &&
                         spec_fit_catchup.get(c.c0, c.c1, 0.0) &&
                         spec_fit_host   .get(c.host, h_b, 0.0);
+        // the rollback cycle (restore + replay pass of r rows); before its fit is usable: a replay pass priced as a
+        //   plain round of r rows (no restore)
+        double r_b = 0.0;
+        if (!spec_fit_rb.get(c.r0, r_b, c.v1 + c.c1)) {
+            c.r0 = c.v0 + c.c0 + c.host;
+            r_b  = c.v1 + c.c1;
+        }
+        c.r1 = r_b;
+        c.n_rb_free = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? 0
+                    : ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ? (int) llama_n_rs_seq(ctx_tgt)
+                    : (1 << 30);
         double rate = 0.0;
         // before the fits are usable: today's length (n_max), the cooldown still applies
         int n_rule = ok ? common_spec_tput_best_n(slot.spec_acc_ema, n_max_cfg, c, &rate) : n_max_cfg;
@@ -4151,8 +4177,9 @@ private:
         }
         if (trace > 0 && n != slot.spec_n_max_last) {
             SLT_INF(slot, "draft policy tput: %d -> %d (rule %d, %s, cooldown %d, n_kv %d, draft %.2f+%.2fn, verify %.2f+%.2fm, "
-                    "catch-up %.2f+%.2fm, host %.2f ms, %.4f tok/ms)\n", slot.spec_n_max_last, n, n_rule,
-                    ok ? "measured" : "warm-up", slot.spec_cd.c, n_kv, c.d0, c.d1, c.v0, c.v1, c.c0, c.c1, c.host, rate);
+                    "catch-up %.2f+%.2fm, host %.2f ms, rollback %.2f+%.2fr free %d, %.4f tok/ms)\n", slot.spec_n_max_last, n, n_rule,
+                    ok ? "measured" : "warm-up", slot.spec_cd.c, n_kv, c.d0, c.d1, c.v0, c.v1, c.c0, c.c1, c.host,
+                    c.r0, c.r1, c.n_rb_free, rate);
         }
         slot.spec_n_max_last = n;
         slot.spec_tput_n_req = n;
@@ -4271,6 +4298,9 @@ private:
             spec_rt.n_draft_req   = 0;
             spec_rt.n_rows        = 0;
             spec_rt.n_rows_expect = 0;
+            spec_rt.replay_ids.clear();
+            spec_rt.replay_restore_us = 0;
+            spec_rt.restore_us        = 0;
         }
 
         try {
@@ -4488,6 +4518,14 @@ private:
                         // we have a previous (partial) draft to reuse
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
+                        }
+                        // [TAG_SPEC_DRAFT_POLICY] tput: the replay after a restore closes its round's rollback cycle
+                        if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT &&
+                                slot.spec_is_replay && slot.spec_n_committed == slot.spec_draft.size()) {
+                            spec_rt.replay_ids.push_back(slot.id);
+                            spec_rt.replay_restore_us = slot.spec_rb_restore_us;
+                            spec_rt.n_rows_expect     = 1 + (int) slot.spec_draft.size();
+                            slot.spec_rb_restore_us   = 0;
                         }
                     } else {
                         GGML_ASSERT(slot.spec_i_batch.empty());
@@ -5867,6 +5905,8 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
+                        const int64_t t_restore0 = ggml_time_us(); // [TAG_SPEC_DRAFT_POLICY] the rollback cycle
+
                         // this run's own speculative checkpoint: a size mismatch is a bug, not a cache miss
                         if (!ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
                             GGML_ABORT("speculative checkpoint size mismatch\n");
@@ -5885,6 +5925,11 @@ private:
                         common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+
+                        if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
+                            slot.spec_rb_restore_us = ggml_time_us() - t_restore0;
+                            spec_rt.restore_us     += slot.spec_rb_restore_us;
+                        }
 
                         // the sampler is deliberately NOT rolled back: the tokens accepted just above are the
                         // ones the replay round will emit, so the live (post-verification) sampler already has
