@@ -65,6 +65,29 @@ function streamStorageKey(conversationId: string): string {
 	return STREAM_RESUME_LOCALSTORAGE_KEY_PREFIX + conversationId;
 }
 
+// tool results written before R79 W1 stored their attachments twice ([a, b, a, b]); a list
+// whose second half repeats its first (same type, same data) is sent once, as the loop sent it
+function undoubleToolExtras(extras: DatabaseMessageExtra[]): DatabaseMessageExtra[] {
+	const half = extras.length / 2;
+	const data = (e: DatabaseMessageExtra) =>
+		e.type === AttachmentType.IMAGE
+			? (e as DatabaseMessageExtraImageFile).base64Url
+			: e.type === AttachmentType.AUDIO
+				? (e as DatabaseMessageExtraAudioFile).base64Data
+				: JSON.stringify(e);
+
+	if (half < 1 || !Number.isInteger(half)) return extras;
+
+	for (let i = 0; i < half; i++) {
+		const a = extras[i];
+		const b = extras[i + half];
+
+		if (a.type !== b.type || data(a) !== data(b)) return extras;
+	}
+
+	return extras.slice(0, half);
+}
+
 export class ChatService {
 	// Per-chunk localStorage writes are throttled to at most one per
 	// conversation per interval (saveStreamStateThrottled). The resume offset
@@ -153,7 +176,7 @@ export class ChatService {
 				{ text: message.content, type: ContentPartType.TEXT }
 			];
 
-			for (const extra of message.extra ?? []) {
+			for (const extra of undoubleToolExtras(message.extra ?? [])) {
 				if (extra.type === AttachmentType.IMAGE) {
 					parts.push({
 						image_url: { url: (extra as DatabaseMessageExtraImageFile).base64Url },
