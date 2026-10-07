@@ -350,12 +350,40 @@ std::string server_cache_file_identity(const std::string & path);
 // model + draft + mmproj content identity: every shard of a split GGUF, "," joined per file, "|" between files
 std::string server_disk_cache_model_identity(const common_params & params);
 
+// [TAG_CACHE_COMPAT2] the parsed-param digest (Codex compat2 A): a normalized digest of the semantic parsed
+//   configuration of BOTH contexts. In: requested + effective n_batch / n_ubatch, n_parallel / n_seq_max, threads
+//   (generation + batch, target + draft, requested + effective), devices, n_gpu_layers, main GPU, split mode,
+//   tensor split, tensor-buffer overrides, KV / op offload, extra buffer types (repack), host buffers, flash
+//   attention, KV types, SWA-full, unified KV, the QSA ratio, --override-kv (model metadata overrides), the loaded
+//   indexer / QSA metadata (selection budget + policy per layer), and the speculative configuration (types, synthetic
+//   acceptance, draft limits, adaptive policy, split / min probabilities, backend sampling, draft placement + KV
+//   types, n-gram parameters). Argv and LLAMA_ARG_* env give the same parsed values, hence the same digest.
+//   Exact-qualified exclusions (do not change the state bytes a token sequence produces):
+//   - model / draft / mmproj paths, HF / URL sources: the content identity (model_id) is keyed instead
+//   - n_ctx, RoPE / YaRN, n_ctx_seq: the effective values are in the state descriptor (desc)
+//   - mmap / mlock / direct-io / check-tensors / fit-params*: loading method; fit's effects land in the effective
+//     values above (ngl, tensor split, n_ctx)
+//   - cpu masks / priority / poll / strict placement: scheduling of the same per-row work, thread counts are in
+//   - sampling defaults, grammar, chat template / jinja / reasoning, stop words: they choose tokens; a stored state
+//     is keyed by its tokens
+//   - host / port / API key / timeouts / slots / metrics / webui / log options: control plane
+//   - cache-ram, cache-disk-*, ctx-checkpoints, checkpoint-min-step, cache-reuse: where / which states are kept,
+//     not their bytes
+//   - context shift, n_keep, n_predict: generation policy after a restore, not stored bytes
+//   - LoRA adapters: the disk cache is disabled with LoRA
+//   - ngram lookup cache paths: draft proposals only, verified against the target like any draft (n-gram params in)
+std::string server_cache_param_canon(const common_params & params);
+std::string server_cache_ctx_canon(const llama_context * ctx);
+std::string server_cache_param_digest(const common_params & params, const llama_context * ctx_tgt,
+                                      const llama_context * ctx_dft);
+
 struct server_cache_key_parts {
     std::string model_id;   // server_disk_cache_model_identity
     std::string desc_h;     // server_disk_cache::descriptor_key()
     std::string measure_h;  // the short-context measurement (hash16)
     uint32_t    depth_version = DISK_CACHE_DEPTH_VERSION;
     std::string env_digest; // server_cache_env_digest
+    std::string param_digest; // server_cache_param_digest
 };
 
 // the v2 fingerprint: "<key16> <cheap body>|compat2=<len>:<v2 body>" - the cheap body keeps the adopt structure

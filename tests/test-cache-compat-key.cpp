@@ -1,6 +1,7 @@
 // [TAG_CACHE_COMPAT2] compatibility key v2 of the disk prompt cache: key composition, identity comparison, env
 //   registry classification and digest, sampled model identity, measurement memo
 #include "server-disk-cache.h"
+#include "arg.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +30,7 @@ static server_cache_key_parts parts() {
     p.desc_h     = "aaaaaaaaaaaaaaaa";
     p.measure_h  = "bbbbbbbbbbbbbbbb";
     p.env_digest = "-";
+    p.param_digest = "ffffffffffffffff";
     return p;
 }
 
@@ -44,7 +46,7 @@ int main() {
     CHECK(fa != fb);
     CHECK(server_disk_cache_same_identity(fa, fb));
     CHECK(server_disk_cache_compat2_body(fa) == "c2|model=m:0123456789abcdef|d:none|p:none|desc=aaaaaaaaaaaaaaaa|"
-                                                "meas=bbbbbbbbbbbbbbbb|depth=" + std::to_string(DISK_CACHE_DEPTH_VERSION) + "|env=-");
+                                                "meas=bbbbbbbbbbbbbbbb|depth=" + std::to_string(DISK_CACHE_DEPTH_VERSION) + "|env=-|param=ffffffffffffffff");
     CHECK(server_disk_cache_compat2_body(cheap_a).empty());
     // the cheap body stays parseable for adopt eligibility, and equal structures stay equal
     CHECK(server_disk_cache_fingerprint_structure(fa) == server_disk_cache_fingerprint_structure(cheap_a));
@@ -65,6 +67,50 @@ int main() {
         const std::string fe = server_disk_cache_fingerprint_v2(cheap_a, p);
         CHECK(fe.substr(0, 16) != k0);
         CHECK(!server_disk_cache_same_identity(fa, fe));
+        p = parts(); p.param_digest = "0000000000000000";
+        CHECK(server_disk_cache_fingerprint_v2(cheap_a, p).substr(0, 16) != k0);
+    }
+
+    // [TAG_CACHE_COMPAT2] parsed-param digest: argv and LLAMA_ARG_* env aliases of one option give one digest;
+    //   a semantic option changes it (effective batch, threads, offload, speculative, --override-kv)
+    {
+        const auto canon = [](std::vector<const char *> argv, std::vector<std::pair<const char *, const char *>> env) {
+            for (auto & e : env) {
+                setenv(e.first, e.second, 1);
+            }
+            common_params params;
+            argv.insert(argv.begin(), "llama-server");
+            const bool ok = common_params_parse((int) argv.size(), const_cast<char **>(argv.data()), params,
+                                                LLAMA_EXAMPLE_SERVER);
+            for (auto & e : env) {
+                unsetenv(e.first);
+            }
+            return ok ? server_cache_param_canon(params) : std::string("parse-failed");
+        };
+        const std::string base = canon({ "-m", "x.gguf" }, {});
+        CHECK(base != "parse-failed");
+        const std::string a1 = canon({ "-m", "x.gguf", "-b", "64", "-ub", "32", "-t", "3", "-nkvo", "--spec-draft-n-max", "5" }, {});
+        const std::string e1 = canon({ "-m", "x.gguf" }, { { "LLAMA_ARG_BATCH", "64" }, { "LLAMA_ARG_UBATCH", "32" },
+                                                          { "LLAMA_ARG_THREADS", "3" }, { "LLAMA_ARG_NO_KV_OFFLOAD", "1" },
+                                                          { "LLAMA_ARG_SPEC_DRAFT_N_MAX", "5" } });
+        CHECK(a1 != "parse-failed");
+        CHECK(a1 == e1);
+        CHECK(a1 != base);
+        for (auto args : std::vector<std::vector<const char *>>{
+                 { "-b", "64" }, { "-ub", "32" }, { "-t", "3" }, { "-tb", "3" }, { "-nkvo" }, { "-fa", "off" },
+                 { "--spec-draft-n-max", "5" }, { "--override-kv", "qwen4exp.indexer_top_k=int:512" }, { "--no-op-offload" } }) {
+            args.insert(args.begin(), { "-m", "x.gguf" });
+            const std::string c = canon(args, {});
+            if (c == base || c == "parse-failed") {
+                fprintf(stderr, "FAIL param digest unchanged by %s\n", args[2]);
+                n_fail++;
+            }
+        }
+        // order of options does not matter
+        CHECK(canon({ "-m", "x.gguf", "-t", "3", "-b", "64" }, {}) == canon({ "-b", "64", "-m", "x.gguf", "-t", "3" }, {}));
+        // a control-plane option (exact-qualified) leaves it
+        CHECK(canon({ "-m", "x.gguf", "--port", "18999" }, {}) == base);
+        CHECK(server_cache_env_digest({ "LLAMA_ARG_BATCH=64" }) == "-");
     }
     // v1 fingerprints keep exact comparison; v1 vs v2 never match
     CHECK(server_disk_cache_same_identity(cheap_a, cheap_a));
@@ -76,7 +122,7 @@ int main() {
     // env registry: exact knobs (appendix) vs semantic (registered or unregistered)
     for (const char * n : { "LLAMA_TRACE", "LLAMA_KQ_VIS_PROF", "LLAMA_GTT_ADMISSION_MIB", "LLAMA_SERVER_SLOTS_DEBUG",
                             "GGML_VK_PERF_LOGGER", "GGML_VK_PREFER_HOST_MEMORY", "GGML_SCHED_DEBUG", "GGML_VULKAN_SKIP_CHECKS",
-                            "LLAMA_ARG_CACHE_DISK", "LLAMA_ARG_CACHE_DISK_ADOPT", "LLAMA_ARG_PORT", "LLAMA_CACHE" }) {
+                            "LLAMA_ARG_CACHE_DISK", "LLAMA_ARG_CACHE_DISK_ADOPT", "LLAMA_ARG_PORT", "LLAMA_CACHE", "LLAMA_ARG_ROPE_SCALING", "LLAMA_ARG_BATCH" }) {
         if (server_cache_env_classify(n) != SERVER_CACHE_ENV_EXACT) {
             fprintf(stderr, "expected exact: %s\n", n);
             n_fail++;
@@ -84,7 +130,7 @@ int main() {
     }
     for (const char * n : { "LLAMA_ATTN_ROT_DISABLE", "LLAMA_MTP_CARRIER_ZERO", "LLAMA_QSA_MIN_KV", "LLAMA_KQ_VIS",
                             "LLAMA_QSA_POOL_REMAP", "GGML_VK_DISABLE_F16", "GGML_VK_DISABLE_COOPMAT", "GGML_VK_QSA_TOPK",
-                            "GGML_TOTAL_THREADS", "LLAMA_MTP_QSA", "LLAMA_ARG_ROPE_SCALING", "LLAMA_PROBE_DUMMY",
+                            "GGML_TOTAL_THREADS", "LLAMA_MTP_QSA", "LLAMA_PROBE_DUMMY",
                             "GGML_SOMETHING_NEW", "LLAMA_TRACEX", "GGML_VK_PERF_LOGGER_X" }) {
         if (server_cache_env_classify(n) != SERVER_CACHE_ENV_SEMANTIC) {
             fprintf(stderr, "expected semantic: %s\n", n);

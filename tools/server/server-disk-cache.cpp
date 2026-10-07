@@ -524,6 +524,112 @@ static std::string h16_of(const std::string & s) {
     return string_format("%016llx", h1 ^ (h2 * 0x9E3779B97F4A7C15ull));
 }
 
+// [TAG_CACHE_COMPAT2] the parsed-param digest (Codex compat2 A): the semantic parsed configuration, normalized
+//   (field = value, fixed order, by meaning - not by spelling): the same configuration reached through argv or the
+//   LLAMA_ARG_* environment gives the same string. The exact-qualified exclusions are listed in the header
+static std::string canon_cpu(const common_cpu_params & c) {
+    return string_format("thr=%d", c.n_threads);
+}
+
+static std::string canon_devices(const std::vector<ggml_backend_dev_t> & devs) {
+    std::string r = "[";
+    for (auto * d : devs) {
+        r += d ? std::string(ggml_backend_dev_name(d)) + ";" : std::string("null;");
+    }
+    return r + "]";
+}
+
+static std::string canon_buft(const std::vector<llama_model_tensor_buft_override> & v) {
+    std::string r = "[";
+    for (const auto & o : v) {
+        if (o.pattern == nullptr) {
+            continue; // the terminating sentinel
+        }
+        r += string_format("%zu:%s=%s;", strlen(o.pattern), o.pattern, o.buft ? ggml_backend_buft_name(o.buft) : "null");
+    }
+    return r + "]";
+}
+
+std::string server_cache_param_canon(const common_params & p) {
+    std::string r = string_format("nb=%d;ub=%d;npar=%d;%s;b%s;dev=%s;ngl=%d;main=%d;split=%d;ts=[",
+                                  p.n_batch, p.n_ubatch, p.n_parallel, canon_cpu(p.cpuparams).c_str(),
+                                  canon_cpu(p.cpuparams_batch).c_str(), canon_devices(p.devices).c_str(), p.n_gpu_layers,
+                                  p.main_gpu, (int) p.split_mode);
+    for (size_t i = 0; i < llama_max_devices() && i < 128; i++) {
+        r += string_format("%a;", p.tensor_split[i]);
+    }
+    r += string_format("];buft=%s;nokvo=%d;noopo=%d;noxb=%d;nohost=%d;fa=%d;k=%d;v=%d;swa_full=%d;unified=%d;qsa=%d;kvo=[",
+                       canon_buft(p.tensor_buft_overrides).c_str(), (int) p.no_kv_offload, (int) p.no_op_offload,
+                       (int) p.no_extra_bufts, (int) p.no_host, (int) p.flash_attn_type, (int) p.cache_type_k,
+                       (int) p.cache_type_v, (int) p.swa_full, (int) p.kv_unified, p.qsa_ratio);
+    for (const auto & o : p.kv_overrides) {
+        if (o.key[0] == 0) {
+            continue; // the terminating sentinel
+        }
+        std::string v;
+        switch (o.tag) {
+            case LLAMA_KV_OVERRIDE_TYPE_INT:   v = std::to_string(o.val_i64); break;
+            case LLAMA_KV_OVERRIDE_TYPE_FLOAT: v = string_format("%a", o.val_f64); break;
+            case LLAMA_KV_OVERRIDE_TYPE_BOOL:  v = o.val_bool ? "true" : "false"; break;
+            case LLAMA_KV_OVERRIDE_TYPE_STR:   v = std::string(o.val_str, strnlen(o.val_str, sizeof(o.val_str))); break;
+        }
+        const std::string k(o.key, strnlen(o.key, sizeof(o.key)));
+        r += string_format("%zu:%s=%d:%zu:%s;", k.size(), k.c_str(), (int) o.tag, v.size(), v.c_str());
+    }
+    const auto & sp = p.speculative;
+    const auto & d  = sp.draft;
+    r += "];spec{types=";
+    for (auto t : sp.types) {
+        r += std::to_string((int) t) + ",";
+    }
+    r += string_format(";synth=%a;rates=", sp.synth_len);
+    for (double x : sp.synth_rates) {
+        r += string_format("%a,", x);
+    }
+    r += string_format(";nmax=%d;nmin=%d;adapt=%d/%a/%a/%a/%a/%d;psplit=%a;pmin=%a;bs=%d;ngl=%d;k=%d;v=%d;%s;b%s;dev=%s;"
+                       "buft=%s;ngram_mod=%d/%d/%d;ngram_simple=%u/%u/%u;ngram_k=%u/%u/%u;ngram_k4v=%u/%u/%u}",
+                       d.n_max, d.n_min, (int) d.n_max_adaptive, d.n_max_adaptive_t_tok, d.n_max_adaptive_t_dec,
+                       d.n_max_adaptive_k_tok, d.n_max_adaptive_k_dec, (int) d.n_max_adaptive_measure, d.p_split,
+                       d.p_min, (int) d.backend_sampling, d.n_gpu_layers, (int) d.cache_type_k, (int) d.cache_type_v,
+                       canon_cpu(d.cpuparams).c_str(), canon_cpu(d.cpuparams_batch).c_str(),
+                       canon_devices(d.devices).c_str(), canon_buft(d.tensor_buft_overrides).c_str(),
+                       sp.ngram_mod.n_match, sp.ngram_mod.n_max, sp.ngram_mod.n_min,
+                       sp.ngram_simple.size_n, sp.ngram_simple.size_m, sp.ngram_simple.min_hits,
+                       sp.ngram_map_k.size_n, sp.ngram_map_k.size_m, sp.ngram_map_k.min_hits,
+                       sp.ngram_map_k4v.size_n, sp.ngram_map_k4v.size_m, sp.ngram_map_k4v.min_hits);
+    return r;
+}
+
+std::string server_cache_ctx_canon(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return "none";
+    }
+    llama_context * c = const_cast<llama_context *>(ctx);
+    std::string r = string_format("nb=%u;ub=%u;seq=%u;thr=%d/%d;qsa_meta=[", llama_n_batch(ctx), llama_n_ubatch(ctx),
+                                  llama_n_seq_max(ctx), llama_n_threads(c), llama_n_threads_batch(c));
+    // QSA selection budget / policy as loaded (GGUF metadata; --override-kv is in the parsed part): indexer_* keys
+    const llama_model * m = llama_get_model(ctx);
+    char kb[256], vb[1024];
+    for (int32_t i = 0; m && i < llama_model_meta_count(m); i++) {
+        if (llama_model_meta_key_by_index(m, i, kb, sizeof(kb)) < 0) {
+            continue;
+        }
+        const std::string k = kb;
+        if (k.find("indexer") == std::string::npos && k.find("qsa") == std::string::npos) {
+            continue;
+        }
+        const int n = llama_model_meta_val_str_by_index(m, i, vb, sizeof(vb));
+        r += string_format("%zu:%s=%d:%s;", k.size(), k.c_str(), n, n >= 0 ? vb : "");
+    }
+    return r + "]";
+}
+
+std::string server_cache_param_digest(const common_params & params, const llama_context * ctx_tgt,
+                                      const llama_context * ctx_dft) {
+    return h16_of("p:" + server_cache_param_canon(params) + "|t:" + server_cache_ctx_canon(ctx_tgt) + "|d:" +
+                  server_cache_ctx_canon(ctx_dft));
+}
+
 // the env registry, seeded from spec series D "Appendix: Registry seed" (Codex 2026-10-07). Only the exact class is
 //   listed name by name: everything else - the registered semantic / unclear names AND every unregistered LLAMA_* /
 //   GGML_* name - is semantic (unknown => strict). The inventory comes from the readers (helpers such as the Vulkan
@@ -557,8 +663,11 @@ static const char * const CACHE_ENV_EXACT[] = {
 };
 
 server_cache_env_class server_cache_env_classify(const std::string & name) {
-    if (name.rfind("LLAMA_ARG_CACHE_DISK", 0) == 0) {
-        return SERVER_CACHE_ENV_EXACT; // the disk cache's own options (neutral since v1)
+    if (name.rfind("LLAMA_ARG_", 0) == 0) {
+        // the disk cache's own options (neutral since v1) and every other option alias: common_params_parse reads it
+        //   into common_params like its argv form, so the parsed-param digest (server_cache_param_canon) carries its
+        //   semantic meaning - argv and env aliases of one option give one key
+        return SERVER_CACHE_ENV_EXACT;
     }
     for (const char * e : CACHE_ENV_EXACT) {
         if (name == e) {
@@ -647,8 +756,9 @@ std::string server_disk_cache_model_identity(const common_params & params) {
 }
 
 std::string server_disk_cache_fingerprint_v2(const std::string & cheap, const server_cache_key_parts & p) {
-    const std::string body = string_format("c2|model=%s|desc=%s|meas=%s|depth=%u|env=%s", p.model_id.c_str(),
-                                           p.desc_h.c_str(), p.measure_h.c_str(), p.depth_version, p.env_digest.c_str());
+    const std::string body = string_format("c2|model=%s|desc=%s|meas=%s|depth=%u|env=%s|param=%s", p.model_id.c_str(),
+                                           p.desc_h.c_str(), p.measure_h.c_str(), p.depth_version, p.env_digest.c_str(),
+                                           p.param_digest.c_str());
     const auto sp = cheap.find(' ');
     const std::string cheap_body = sp == std::string::npos ? cheap : cheap.substr(sp + 1);
     return h16_of(body) + " " + cheap_body + "|compat2=" + std::to_string(body.size()) + ":" + body;

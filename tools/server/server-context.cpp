@@ -1594,10 +1594,11 @@ private:
         p.desc_h     = disk_cache->descriptor_key();
         p.measure_h  = meas;
         p.env_digest = server_cache_env_digest(server_cache_environ());
+        p.param_digest = server_cache_param_digest(params_base, ctx_tgt, ctx_dft);
         const std::string fp = server_disk_cache_fingerprint_v2(cheap, p);
-        SRV_INF("cache-compat: key %s = model %s | desc %s | meas %s | depth %u | env %s (cheap %s)\n",
+        SRV_INF("cache-compat: key %s = model %s | desc %s | meas %s | depth %u | env %s | param %s (cheap %s)\n",
                 fp.substr(0, 16).c_str(), p.model_id.c_str(), p.desc_h.c_str(), meas.c_str(), p.depth_version,
-                p.env_digest.c_str(), cheap.substr(0, 16).c_str());
+                p.env_digest.c_str(), p.param_digest.c_str(), cheap.substr(0, 16).c_str());
         return fp;
     }
 
