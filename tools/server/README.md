@@ -169,6 +169,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
+| `--cache-disk-adopt KEY[,KEY...]` | open these foreign `--cache-disk` namespaces (the hash16 `key` another build shows in `GET /disk-cache` and logs as "own key") read-only as extra load sources, e.g. the previous image's after an exact deploy. A source is eligible only if its model / draft / mmproj files, context size and KV types match; its entries are verified at load and the next save goes to the own namespace; the source is never written. A format 5 / 6 entry has no state descriptor and is accepted on the operator's word (approve it with a gate record). Not part of the cache fingerprint.<br/>(env: LLAMA_ARG_CACHE_DISK_ADOPT) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
 | `-sp, --special` | special tokens output enabled (default: false) |
@@ -1151,6 +1152,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 
+The file is a legacy target-context-only snapshot: the target model's KV / recurrent state of the slot's sequence and its tokens. It holds no draft-model KV, no context checkpoints and no speculative-decoding carry (MTP / eagle3 state).
+
 *Options:*
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
@@ -1170,6 +1173,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 ```
 
 ### POST `/slots/{id_slot}?action=restore`: Restore the prompt cache of the specified slot from a file.
+
+Only the target state is restored (see `action=save`): the slot's draft side (draft KV, speculative carry) is reset, and with a draft model the restored prompt is marked partial (its draft KV is not rebuilt) - it is not published to the disk cache (`--cache-disk`) or as a deep checkpoint until a full recompute of the prompt clears the mark.
 
 *Options:*
 
@@ -1199,6 +1204,17 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
     "n_erased": 1745
 }
 ```
+
+### GET `/disk-cache`: Get the state of the disk prompt cache
+
+Available with `--cache-disk`; without it the response is `{"enabled": false}`. `enabled` is also `false` when the cache directory could not be created or listed at start (the cache is then off for the run and no file is touched). Main fields:
+
+- `key`: hash16 of this server's cache fingerprint (its namespace `ns-<key>`; the value other builds pass to `--cache-disk-adopt`)
+- `descriptor`: hash16 of the state descriptor (target + draft state layout) the stored streams must match
+- `foreign[]`: other namespaces in the same directory - `key`, `legacy`, `n_entries`, `bytes`, `age_s`
+- `adopt[]`: the `--cache-disk-adopt` sources opened read-only - `key`, `legacy`, `n_entries`, `hits`, `dropped`
+- `load_failures`: loads that found the entry invalid (dropped); `load_failures_capacity`: loads refused because the state did not fit the free cells (entry kept); `load_failures_other`: inconclusive loads, e.g. a read error (entry kept)
+- `entries[]`: the own and adopted entries (`id`, `n_tokens`, `source`, `adopted_from`, ...), plus counters (`saves`, `loads`, `evictions`, `bytes_on_disk`, `quota_bytes`, ...)
 
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 
