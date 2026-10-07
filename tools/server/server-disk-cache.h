@@ -250,6 +250,10 @@ struct server_disk_cache {
     std::set<std::string> blk_legacy;           // keys with a file in <root>/blk (never written, only collected)
     std::map<std::string, std::string> blk_src; // key -> an adopt source's <ns>/blk holding it (read-only)
     void blob_drop_copy(const std::string & key); // a damaged read-location copy: forget it (remove it if writable)
+    // (Codex gate r5 Major 1) blob_gc() removal: true when the file is gone (removed or already absent); any other
+    //   error keeps the file inventoried and charged (warned once per run)
+    bool gc_unlink(const std::string & path);
+    bool warned_gc_unlink = false;
     uint64_t blob_bytes = 0;
     // [TAG_DISK_READ_STATUS] (Hermes gate Major 1) an own entry / block / checkpoint skipped at start on an I/O error:
     //   what it references is unknown, so no block or checkpoint is collected for the rest of this run

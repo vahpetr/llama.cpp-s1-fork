@@ -2414,24 +2414,72 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
                                            : SERVER_DISK_LOAD_OTHER;
 }
 
+bool server_disk_cache::gc_unlink(const std::string & path) {
+    std::error_code ec;
+    fs::remove(path, ec); // an absent file: false without an error
+    if (!ec || ec == std::errc::no_such_file_or_directory) {
+        return true;
+    }
+    if (!warned_gc_unlink) {
+        warned_gc_unlink = true;
+        DSK_WRN("block collection: cannot remove %s (%s): kept inventoried and charged, retried at the next "
+                "collection (further failures this run are not logged)\n", path.c_str(), ec.message().c_str());
+    }
+    return false;
+}
+
+// (Codex gate r5 Major 2) a physical presence check: 1 present, 0 confirmed absent, -1 unknown (an I/O error)
+static int file_present(const fs::path & p) {
+    std::error_code ec;
+    const bool r = fs::is_regular_file(p, ec);
+    if (r) {
+        return 1;
+    }
+    return !ec || ec == std::errc::no_such_file_or_directory ? 0 : -1;
+}
+
 void server_disk_cache::blob_gc() {
     if (gc_hold) {
         return; // [TAG_DISK_READ_STATUS] an entry skipped at start may reference any of them
     }
-    std::set<std::string> referenced, own_referenced, elsewhere;
+    std::set<std::string> referenced, own_referenced;
+    std::map<std::string, std::string> elsewhere; // key -> a foreign namespace's <ns>/blk holding it
     for (const auto & e : entries) {
         referenced.insert(e.blobs.begin(), e.blobs.end());
         if (e.src.empty()) {
             own_referenced.insert(e.blobs.begin(), e.blobs.end());
         }
     }
+    // (Codex gate r5 Major 2) the alternative an own copy would fall back to must exist now: a stale record (the
+    //   file went behind this process) is forgotten (confirmed absent) and the own copy stays
+    const auto alt_present = [&](const std::string & k) {
+        if (blk_legacy.count(k)) {
+            const int p = file_present(fs::path(root) / "blk" / (k + ".blk"));
+            if (p > 0) {
+                return true;
+            }
+            if (p == 0) {
+                blk_legacy.erase(k);
+            }
+        }
+        const auto s = blk_src.find(k);
+        if (s != blk_src.end()) {
+            const int p = file_present(fs::path(s->second) / (k + ".blk"));
+            if (p > 0) {
+                return true;
+            }
+            if (p == 0) {
+                blk_src.erase(s);
+            }
+        }
+        return false;
+    };
     // (Codex gate r4 Major) an own-store copy no own entry needs goes when another store still holds the key (an
     //   adopted / legacy original: the read location falls back to it) - foreign references never pin a redundant own
-    //   copy; no rescan needed for that
-    std::error_code ec;
+    //   copy; no rescan needed for that. (Codex gate r5 Major 1) the record goes only with the file
     for (auto it = blk_own.begin(); it != blk_own.end();) {
-        if (!own_referenced.count(*it) && (blk_legacy.count(*it) || blk_src.count(*it))) {
-            fs::remove((fs::path(dir) / "blk" / (*it + ".blk")).string(), ec);
+        if (!own_referenced.count(*it) && alt_present(*it) &&
+            gc_unlink((fs::path(dir) / "blk" / (*it + ".blk")).string())) {
             it = blk_own.erase(it);
         } else {
             ++it;
@@ -2447,18 +2495,21 @@ void server_disk_cache::blob_gc() {
         entry_refs = referenced;
         for (const auto & ns : foreign) {
             referenced.insert(ns.blocks.begin(), ns.blocks.end());
-            elsewhere.insert(ns.stored.begin(), ns.stored.end());
+            for (const auto & k : ns.stored) {
+                elsewhere.emplace(k, (fs::path(ns.path) / "blk").string());
+            }
         }
     }
     for (auto it = blobs.begin(); it != blobs.end();) {
         // an own copy only foreign maps reference, held in that namespace's own <ns>/blk too (not adopted this run,
         //   e.g. a restart without the adopt key): redundant, reclaimed; the sole physical copy of a block a foreign
         //   map references stays (charged to own)
+        const auto el = elsewhere.find(it->first);
         const bool own_only_foreign = referenced.count(it->first) && blk_own.count(it->first) &&
-                                      !entry_refs.count(it->first) && elsewhere.count(it->first);
-        if (own_only_foreign) {
+                                      !entry_refs.count(it->first) && el != elsewhere.end() &&
+                                      file_present(fs::path(el->second) / (it->first + ".blk")) > 0;
+        if (own_only_foreign && gc_unlink((fs::path(dir) / "blk" / (it->first + ".blk")).string())) {
             blk_own.erase(it->first);
-            fs::remove((fs::path(dir) / "blk" / (it->first + ".blk")).string(), ec);
             if (!blk_legacy.count(it->first) && !blk_src.count(it->first)) {
                 blob_bytes -= it->second;
                 it = blobs.erase(it);
@@ -2467,12 +2518,26 @@ void server_disk_cache::blob_gc() {
         }
         if (!referenced.count(it->first)) {
             // every physical copy: the own one, a legacy one nothing on disk references; an adopt source's is
-            //   only forgotten (never written)
-            if (blk_own.erase(it->first)) {
-                fs::remove((fs::path(dir) / "blk" / (it->first + ".blk")).string(), ec);
+            //   only forgotten (never written). (Codex gate r5 Major 1) a copy that cannot be removed stays
+            //   inventoried and charged (the key with it), retried at the next collection
+            bool gone = true;
+            if (blk_own.count(it->first)) {
+                if (gc_unlink((fs::path(dir) / "blk" / (it->first + ".blk")).string())) {
+                    blk_own.erase(it->first);
+                } else {
+                    gone = false;
+                }
             }
-            if (blk_legacy.erase(it->first)) {
-                fs::remove((fs::path(root) / "blk" / (it->first + ".blk")).string(), ec);
+            if (blk_legacy.count(it->first)) {
+                if (gc_unlink((fs::path(root) / "blk" / (it->first + ".blk")).string())) {
+                    blk_legacy.erase(it->first);
+                } else {
+                    gone = false;
+                }
+            }
+            if (!gone) {
+                ++it;
+                continue;
             }
             blk_src.erase(it->first);
             blob_bytes -= it->second;
@@ -2957,7 +3022,10 @@ void server_disk_cache::open_adopt_sources() {
             adopted.push_back(a); // still protected from the foreign TTL / cap
             continue;
         }
-        // [TAG_DISK_BLK_NS] a namespaced source keeps its blocks in <ns>/blk: indexed read-only (own / legacy first)
+        // [TAG_DISK_BLK_NS] a namespaced source keeps its blocks in <ns>/blk: indexed read-only (own / legacy first).
+        //   (Codex gate r5 Major 2) collected here, published to the inventory only once the source is accepted: a
+        //   refused / empty source is not protected from the foreign TTL / cap, so its blocks are never an alternative
+        std::map<std::string, uint64_t> src_blk;
         if (!a.legacy) {
             std::vector<fs::directory_entry> ls_sb;
             std::error_code ec_d;
@@ -2970,13 +3038,7 @@ void server_disk_cache::open_adopt_sources() {
                         continue;
                     }
                     const std::string k = name.substr(0, name.size() - 4);
-                    // (Codex gate r4 Major) inventoried even behind an own / legacy copy: a reclaimed own copy
-                    //   falls back to it
-                    blk_src.emplace(k, (base / "blk").string());
-                    if (!blobs.count(k)) {
-                        blobs[k] = n;
-                        blob_bytes += n;
-                    }
+                    src_blk.emplace(k, n);
                 }
             }
         }
@@ -3008,6 +3070,14 @@ void server_disk_cache::open_adopt_sources() {
             continue;
         }
         DSK_INF("adopt %s: structure %s\n", key.c_str(), src_struct.c_str());
+        for (const auto & [k, n] : src_blk) {
+            // (Codex gate r4 Major) inventoried even behind an own / legacy copy: a reclaimed own copy falls back to it
+            blk_src.emplace(k, (base / "blk").string());
+            if (!blobs.count(k)) {
+                blobs[k] = n;
+                blob_bytes += n;
+            }
+        }
         for (const auto & id : ids) {
             if (src_dir_of.count(id) || std::any_of(entries.begin(), entries.end(), [&](const auto & o) { return o.id == id; })) {
                 continue;
