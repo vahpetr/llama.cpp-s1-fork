@@ -1419,11 +1419,15 @@ void llm_graph_result::reset() {
     inputs.clear();
     fused_nodes.clear();
 
-    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    const size_t meta_size = ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    if (buf_compute_meta_size != meta_size) {
+        buf_compute_meta.reset(new uint8_t[meta_size]);
+        buf_compute_meta_size = meta_size;
+    }
 
     ggml_init_params params = {
-        /*.mem_size   =*/ buf_compute_meta.size(),
-        /*.mem_buffer =*/ buf_compute_meta.data(),
+        /*.mem_size   =*/ buf_compute_meta_size,
+        /*.mem_buffer =*/ buf_compute_meta.get(),
         /*.no_alloc   =*/ true,
     };
 

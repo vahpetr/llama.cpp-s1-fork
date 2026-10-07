@@ -373,6 +373,9 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_snapshot_valid(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap);
     GGML_API void                 ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snap);
     GGML_API uint64_t             ggml_backend_sched_buffer_gen(ggml_backend_sched_t sched);
+    // the (reset) scheduler drops its context buffer (sized for the worst case of graph_size nodes): from now on
+    // each split sizes one from its graph. With snapshots every parked state keeps the buffer it was split in.
+    GGML_API void                 ggml_backend_sched_release_context(ggml_backend_sched_t sched);
     // test hook: the take after the next n_ok successful ones fails as on an allocation failure (-1 = off)
     GGML_API void                 ggml_backend_sched_snapshot_fail_inject(int n_ok);
     // [TAG_GRAPH_CACHE] read-only view of the current split plan (LLAMA_GRAPH_CACHE_CHECK): split i's backend index,

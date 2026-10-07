@@ -239,6 +239,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-graph-cache.cpp)
     llama_test(test-graph-cache NAME test-graph-cache LABEL mtp ARGS ${CMAKE_CURRENT_BINARY_DIR})
     set_tests_properties(test-graph-cache PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_DUMP_IDS=1")
+    llama_test(test-graph-cache NAME test-graph-cache-mem LABEL mtp ARGS --mem) # [TAG_GRAPH_CACHE] memory per cached graph at the brain node budget
+    set_tests_properties(test-graph-cache-mem PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
     llama_build_and_test(test-qwen4exp-hc-norm.cpp) # [TAG_UP28896] RMS_NORM + MUL adjacency, bit identity on the CPU
     llama_build_and_test(test-vk-mmq-knobs.cpp) # [TAG_MMQ_INT8_KNOBS] GGML_VK_MMQ_INT8_MIN_N / _OPS parsers, CPU only
 

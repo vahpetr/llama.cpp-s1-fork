@@ -967,7 +967,10 @@ public:
     ggml_context_ptr ctx_compute;
 
     // memory buffers used to evaluate the model
-    std::vector<uint8_t> buf_compute_meta;
+    // [TAG_GRAPH_CACHE] not value-initialized: only the metadata a graph uses becomes resident (sized for max_nodes,
+    // ~30 MiB at 81920 nodes, of which a decode graph touches a few MiB; matters with K cached results per context)
+    std::unique_ptr<uint8_t[]> buf_compute_meta;
+    size_t                     buf_compute_meta_size = 0;
 
     ggml_cgraph * gf;
 

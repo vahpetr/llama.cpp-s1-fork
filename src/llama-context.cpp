@@ -1806,6 +1806,10 @@ llm_graph_result * llama_context::graph_cache_get(const llama_ubatch & ubatch, l
         // the live scheduler state may still belong to gf_res_prev: never reuse it while the cache owns the scheduler
         gf_res_prev->reset();
         graph_cache_active = true;
+        // every cached state keeps the split context it was made in: size those from the graphs, not from the
+        // worst case of graph_max_nodes (~ graph_max_nodes * 60 tensors, 1.6 GiB virtual at 81920 nodes)
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_release_context(sched.get());
     }
 
     ggml_backend_sched_t s = sched.get();
@@ -1848,6 +1852,7 @@ llm_graph_result * llama_context::graph_cache_get(const llama_ubatch & ubatch, l
                 graph_cache_check_res.reset();
                 graph_cache_check_sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                         graph_cache_max_nodes, false, cparams.op_offload));
+                ggml_backend_sched_release_context(graph_cache_check_sched.get());
                 graph_cache_check_res.reset(new llm_graph_result(graph_cache_max_nodes));
                 graph_cache_check_owner = s;
                 graph_cache_check_nodes = graph_cache_max_nodes;

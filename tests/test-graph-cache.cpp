@@ -107,7 +107,7 @@ static bool silent_progress(float, void *) { return true; }
 static std::string g_log; // every "graph-cache:" line of the library
 
 static void capture_log(ggml_log_level level, const char * text, void *) {
-    if (strncmp(text, "graph-cache:", 12) == 0 || strstr(text, "reallocating") != nullptr || strstr(text, "graph cache: K") != nullptr) {
+    if (strncmp(text, "graph-cache:", 12) == 0 || strstr(text, "max_nodes = ") != nullptr || strstr(text, "reallocating") != nullptr || strstr(text, "graph cache: K") != nullptr) {
         g_log += text;
         if (getenv("TEST_GRAPH_CACHE_VERBOSE")) {
             fputs(text, stdout);
@@ -288,6 +288,59 @@ static bool same(const std::vector<T> & a, const std::vector<T> & b) {
     return a.size() == b.size() && (a.empty() || memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0);
 }
 
+// [TAG_GRAPH_CACHE] memory of the cache at the brain's node budget: n_ubatch 2048 gives this qwen4exp context
+// graph_max_nodes = max(2048*40, 32*n_tensors) = 81920, as the prod brain (n_ubatch 2048, 1224 tensors). Decode
+// widths 1..9 (each a new graph: a miss) and report VmSize / VmRSS after each; with K=8 every miss from the second
+// on parks one snapshot (+ keeps one llm_graph_result).
+static void proc_mem(int64_t & vsz_kib, int64_t & rss_kib) {
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("VmSize:", 0) == 0) { vsz_kib = atoll(line.c_str() + 7); }
+        if (line.rfind("VmRSS:",  0) == 0) { rss_kib = atoll(line.c_str() + 6); }
+    }
+}
+
+static int mem_report(gguf_context * meta, const char * k, int64_t & per_vsz_kib, int64_t & per_rss_kib) {
+    common_set_env("LLAMA_GRAPH_CACHE", k);
+    common_set_env("LLAMA_GRAPH_CACHE_CHECK", "0");
+    llama_model_params mp = llama_model_default_params();
+    mp.progress_callback = silent_progress;
+    mp.load_mtp          = true;
+    ggml_backend_dev_t devs[2] = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
+    mp.devices = devs;
+    size_t seed = 31;
+    llama_model_ptr model(llama_model_init_from_user(meta, set_tensor_data, &seed, mp));
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = 4096; cp.n_batch = 2048; cp.n_ubatch = 2048; cp.n_seq_max = 1; cp.n_threads = 4; cp.n_threads_batch = 4;
+    g_log.clear();
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+    GGML_ASSERT(ctx);
+    unsigned long long max_nodes = 0;
+    const char * mn = strstr(g_log.c_str(), "max_nodes = ");
+    if (mn) { max_nodes = strtoull(mn + 12, nullptr, 10); }
+    llama_pos n_past = 0;
+    int64_t v0 = 0, r0 = 0, v = 0, r = 0;
+    printf("mem K=%s graph_max_nodes=%llu\n", k, max_nodes);
+    for (int w = 1; w <= 9; ++w) {
+        const auto t = tokens((size_t) w, 500 + (uint32_t) w);
+        llama_batch b = llama_batch_init(w, 0, 1);
+        for (int i = 0; i < w; ++i) {
+            common_batch_add(b, t[i], n_past + i, { 0 }, i == w - 1);
+        }
+        GGML_ASSERT(llama_decode(ctx.get(), b) == 0);
+        llama_batch_free(b);
+        n_past += w;
+        proc_mem(v, r);
+        if (w == 1) { v0 = v; r0 = r; }
+        printf("mem K=%s width %d: VmSize %lld MiB, VmRSS %lld MiB\n", k, w, (long long) v / 1024, (long long) r / 1024);
+    }
+    per_vsz_kib = (v - v0) / 8; // 8 more graphs after the first
+    per_rss_kib = (r - r0) / 8;
+    printf("mem K=%s: per extra graph VmSize %+.1f MiB, VmRSS %+.1f MiB\n", k, per_vsz_kib / 1024.0, per_rss_kib / 1024.0);
+    return (int) max_nodes;
+}
+
 // a CHECK=1 run with one induced corruption of a cached entry (LLAMA_GRAPH_CACHE_CHECK_INJECT) in a child process:
 // it must abort with the matching graph-cache check message
 static bool aborts_with(gguf_context * meta, const char * inject, const std::string & path, const char * msg) {
@@ -314,6 +367,16 @@ int main(int argc, char ** argv) {
     common_set_env("GGML_ALLOC_GROW_SLACK", "0");
     const std::string dir = argc == 2 ? argv[1] : ".";
     gguf_context_ptr meta = make_meta(4096);
+    if (argc >= 2 && strcmp(argv[1], "--mem") == 0) {
+        int64_t v0, r0, v8, r8;
+        mem_report(meta.get(), "0", v0, r0);
+        const int max_nodes = mem_report(meta.get(), "8", v8, r8);
+        const double sv = (v8 - v0) / 1024.0, sr = (r8 - r0) / 1024.0;
+        printf("mem: graph_max_nodes %d; per cached graph (K=8 minus K=0): VmSize %+.1f MiB, VmRSS %+.1f MiB\n", max_nodes, sv, sr);
+        const bool ok = max_nodes == 2048*40 && sv < 256.0;
+        printf("test-graph-cache --mem: %s (virtual reservation per cached graph < 256 MiB)\n", ok ? "OK" : "FAILED");
+        return ok ? 0 : 1;
+    }
     if (argc == 4 && strcmp(argv[1], "--inject") == 0) {
         common_set_env("LLAMA_GRAPH_CACHE_CHECK_INJECT", argv[2]);
         common_set_env("GGML_NO_BACKTRACE", "1");

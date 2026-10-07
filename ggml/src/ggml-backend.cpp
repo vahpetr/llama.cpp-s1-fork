@@ -825,6 +825,7 @@ struct ggml_backend_sched {
 
     char * context_buffer;
     size_t context_buffer_size;
+    size_t context_buffer_size_max; // [TAG_GRAPH_CACHE] the sched_new size; a smaller buffer is sized per graph
 
     bool op_offload;
 
@@ -1073,13 +1074,28 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
 
+    ggml_free(sched->ctx);
+    sched->ctx = NULL;
+
+    if (sched->context_buffer_size < sched->context_buffer_size_max) {
+        // [TAG_GRAPH_CACHE] a buffer sized from the graph (after ggml_backend_sched_take or _release_context): the
+        // copies (<= one per tensor, backend and copy slot) and the input dependency views (<= one per node source)
+        // this graph can create; the sched_new size (the upper bound) is never exceeded
+        const size_t n_t  = (size_t) (graph->n_nodes + graph->n_leafs) * sched->n_backends * sched->n_copies + (size_t) graph->n_nodes * GGML_MAX_SRC;
+        const size_t need = std::min(sched->context_buffer_size_max, n_t*ggml_tensor_overhead() + ggml_graph_overhead_custom(graph->n_nodes + graph->n_leafs, false));
+        if (sched->context_buffer_size < need) {
+            free(sched->context_buffer);
+            sched->context_buffer      = (char *) malloc(need);
+            sched->context_buffer_size = need;
+            GGML_ASSERT(sched->context_buffer != NULL);
+        }
+    }
+
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
         /* .mem_buffer = */ sched->context_buffer,
         /* .no_alloc =   */ true
     };
-
-    ggml_free(sched->ctx);
 
     sched->ctx = ggml_init(params);
     if (sched->ctx == NULL) {
@@ -1945,6 +1961,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
+    sched->context_buffer_size_max = sched->context_buffer_size;
 
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
@@ -2040,6 +2057,7 @@ struct ggml_backend_sched_snapshot {
 
     struct ggml_context * ctx;
     char * context_buffer;
+    size_t context_buffer_size;
 
     uint64_t buffer_gen; // the scheduler's buffer generation when the state was allocated
 };
@@ -2060,6 +2078,7 @@ static void ggml_backend_sched_swap_state(ggml_backend_sched_t sched, ggml_backe
     std::swap(sched->graph_inputs_capacity, snap->graph_inputs_capacity);
     std::swap(sched->ctx,                   snap->ctx);
     std::swap(sched->context_buffer,        snap->context_buffer);
+    std::swap(sched->context_buffer_size,   snap->context_buffer_size);
 }
 
 uint64_t ggml_backend_sched_buffer_gen(ggml_backend_sched_t sched) {
@@ -2095,12 +2114,13 @@ ggml_backend_sched_snapshot_t ggml_backend_sched_take(ggml_backend_sched_t sched
     snap->splits                = (ggml_backend_sched_split *) calloc(snap->splits_capacity, sizeof(snap->splits[0]));
     snap->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
     snap->graph_inputs          = (struct ggml_tensor **) calloc(snap->graph_inputs_capacity, sizeof(struct ggml_tensor *));
-    snap->context_buffer        = (char *) malloc(sched->context_buffer_size);
+    snap->context_buffer        = NULL; // the scheduler's next split sizes a buffer from its graph
+    snap->context_buffer_size   = 0;
     snap->is_reset              = false; // forces the full clear in ggml_backend_sched_reset below
     snap->is_alloc              = false;
 
     if (inject || snap->hash_set.keys == NULL || snap->hash_set.used == NULL || snap->hv_tensor_backend_ids == NULL ||
-        snap->hv_tensor_copies == NULL || snap->splits == NULL || snap->graph_inputs == NULL || snap->context_buffer == NULL) {
+        snap->hv_tensor_copies == NULL || snap->splits == NULL || snap->graph_inputs == NULL) {
         // nothing was swapped yet: the scheduler keeps its allocated state
         ggml_backend_sched_snapshot_free(snap);
         return NULL;
@@ -2137,6 +2157,16 @@ bool ggml_backend_sched_restore(ggml_backend_sched_t sched, ggml_backend_sched_s
 bool ggml_backend_sched_snapshot_valid(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap) {
     GGML_ASSERT(sched);
     return snap != NULL && snap->is_alloc && snap->buffer_gen == ggml_backend_sched_buffer_gen(sched);
+}
+
+void ggml_backend_sched_release_context(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(!sched->is_alloc);
+    ggml_free(sched->ctx);
+    sched->ctx = NULL;
+    free(sched->context_buffer);
+    sched->context_buffer      = NULL;
+    sched->context_buffer_size = 0;
 }
 
 void ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snap) {
