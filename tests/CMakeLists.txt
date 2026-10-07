@@ -209,6 +209,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-archs.cpp)
     llama_build_and_test(test-mtp-carrier.cpp) # [TAG_UP28333] MTP carrier at sequence start + restore; random CPU model
     llama_build_and_test(test-mtp-catchup.cpp LABEL mtp) # [TAG_MTP_CATCHUP_NOATTN] attention-free MTP catch-up == full graph (R80.4)
+    # [TAG_MTP_QSA] the same paired replay over the sparse MTP draft memory (indexer K in the draft state; stage 3), with
+    # the prod QSA env; -mu0: LLAMA_MTP_QSA_MAX_UBATCH=0, the old graph runs every catch-up through the QSA selection
+    set(MTP_QSA_TEST_ENV "LLAMA_MTP_QSA=1;LLAMA_QSA_POOLED_CACHE=1;LLAMA_QSA_COMPACT_BIAS=1;LLAMA_QSA_CENSUS_INC=1;LLAMA_QSA_INPUTS_INC=1;LLAMA_QSA_POOL_REMAP=copy;LLAMA_QSA_CHUNK=256;LLAMA_KQ_VIS=1;LLAMA_QSA_VIS=1;LLAMA_QSA_PREFILL=indexed")
+    llama_test(test-mtp-catchup NAME test-mtp-catchup-qsa LABEL mtp)
+    set_tests_properties(test-mtp-catchup-qsa PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
+    llama_test(test-mtp-catchup NAME test-mtp-catchup-qsa-mu0 LABEL mtp)
+    set_tests_properties(test-mtp-catchup-qsa-mu0 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_MTP_QSA_MAX_UBATCH=0")
     llama_build_and_test(test-qwen4exp-hc-norm.cpp) # [TAG_UP28896] RMS_NORM + MUL adjacency, bit identity on the CPU
     llama_build_and_test(test-vk-mmq-knobs.cpp) # [TAG_MMQ_INT8_KNOBS] GGML_VK_MMQ_INT8_MIN_N / _OPS parsers, CPU only
 

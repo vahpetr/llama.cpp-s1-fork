@@ -16,6 +16,13 @@
 //     MoE (MUL_MAT_ID); the old one has them;
 //  4. a timing line (CPU, indication only): the catch-up per ubatch, old vs new, over a deeper fill.
 // Variants: draft KV f16 (no rotation), q8_0 (K/V Hadamard rotations in the store path), f16 + backend draft sampling.
+//
+// [TAG_MTP_QSA] sparse MTP draft (0159, stage 3): the ctests test-mtp-catchup-qsa / -qsa-mu0 run this binary with
+// LLAMA_MTP_QSA=1 (+ the prod QSA env, see tests/CMakeLists.txt). The draft memory is then a llama_memory_hybrid_idx in
+// recr_none mode, whose state stream carries the attention K/V AND the indexer K (q8_0) whatever the flags, so every
+// draft-state comparison above also covers the indexer cache (Codex B2: the kv-only catch-up writes the indexer K
+// cache-only). The op census then expects three cache writes (K, V, indexer K) in the new graph, and the draft step
+// of the paired replay runs the real QSA selection (TOP_K in its census; top_k 8, ratio 4 => width 11 < n_kv).
 
 #include "common.h"
 #include "log.h"
@@ -43,6 +50,12 @@
 #include <vector>
 
 static const uint32_t N_VOCAB = 128;
+
+// [TAG_MTP_QSA] set by the ctest variants; read once (the library caches it the same way)
+static bool mtp_qsa_mode() {
+    const char * s = getenv("LLAMA_MTP_QSA");
+    return s != nullptr && atoi(s) != 0;
+}
 
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     size_t seed = *(const size_t *) userdata;
@@ -146,7 +159,7 @@ struct mtp_env {
 static bool silent_progress(float, void *) { return true; }
 
 static void quiet_log(ggml_log_level level, const char * text, void *) {
-    if (level >= GGML_LOG_LEVEL_WARN || strstr(text, "LLAMA_MTP_CATCHUP_ATTN") != nullptr) {
+    if (level >= GGML_LOG_LEVEL_WARN || strstr(text, "LLAMA_MTP_CATCHUP_ATTN") != nullptr || strstr(text, "mtp_qsa") != nullptr) {
         fputs(text, stderr);
     }
 }
@@ -410,13 +423,15 @@ static void run_pair(gguf_context * meta, ggml_type type_kv, bool backend_sampli
     const draft_out fb = draft(B, pos, id_last);
     check(fa.toks == fb.toks && eq(fa.logits, fb.logits), std::string(tn) + " final draft tokens + logits");
 
-    printf("draft KV %-7s: %d catch-ups (sizes 1,31,32,33,64,64+37,7 + %d verify rounds, %d rolled back, %d drafted tokens accepted): "
+    const size_t n_state = snapshot(A).dft.size();
+    printf("%sdraft KV %-7s (draft state %zu B): %d catch-ups (sizes 1,31,32,33,64,64+37,7 + %d verify rounds, %d rolled back, %d drafted tokens accepted): "
            "draft state + carry + target logits identical old vs new: %s\n",
-           tn, n_catchups, n_rounds, n_reject, n_acc_total, n_fail == 0 ? "yes" : "NO");
+           mtp_qsa_mode() ? "[sparse MTP] " : "", tn, n_state, n_catchups, n_rounds, n_reject, n_acc_total, n_fail == 0 ? "yes" : "NO");
 }
 
 // the op census of one catch-up ubatch of 64 rows at pos 64 (after a first ubatch)
-static std::map<std::string, int> census(gguf_context * meta, ggml_type type_kv, const char * knob, int * total) {
+static std::map<std::string, int> census(gguf_context * meta, ggml_type type_kv, const char * knob, int * total,
+        std::map<std::string, int> * draft_ops = nullptr) {
     mtp_env E;
     init_env(E, meta, { knob, type_kv, 512, true });
     common_speculative_begin(E.spec, 0, {});
@@ -425,13 +440,23 @@ static std::map<std::string, int> census(gguf_context * meta, ggml_type type_kv,
     E.census.total = 0;
     feed(E, tokens(64, 8), 64);
     *total = E.census.total;
-    return E.census.n;
+    auto res = E.census.n;
+    if (draft_ops) {
+        // [TAG_MTP_QSA] one draft step at depth 128 (the selection's width 11 < n_kv): the ops its graphs ran
+        E.census.n.clear();
+        E.census.active = true;
+        draft(E, 128, 5);
+        E.census.active = false;
+        *draft_ops = E.census.n;
+    }
+    return res;
 }
 
 static void op_table(gguf_context * meta, ggml_type type_kv) {
     int t_old = 0, t_new = 0;
+    std::map<std::string, int> d;
     auto o = census(meta, type_kv, "1", &t_old);
-    auto n = census(meta, type_kv, "0", &t_new);
+    auto n = census(meta, type_kv, "0", &t_new, &d);
     std::map<std::string, int> all = o;
     for (auto & kv : n) {
         all[kv.first] += 0;
@@ -442,11 +467,19 @@ static void op_table(gguf_context * meta, ggml_type type_kv) {
     }
     printf("  %-16s %5d %5d\n", "TOTAL", t_old, t_new);
     const std::string tn = ggml_type_name(type_kv);
+    if (mtp_qsa_mode()) {
+        // [TAG_MTP_QSA] + the indexer K (cache_only); the old graph may add the pooled-store writes (MAX_UBATCH=0)
+        check(n["SET_ROWS"] == 3 && o["SET_ROWS"] >= 3, tn + " census: K + V + indexer K cache writes in both graphs");
+        check(d["TOP_K"] > 0,                            tn + " census: the draft step runs the QSA selection (TOP_K)");
+        printf("  draft step (sparse MTP): TOP_K %d, SET_ROWS %d\n", d["TOP_K"], d["SET_ROWS"]);
+    } else {
     check(n["SET_ROWS"] == 2 && o["SET_ROWS"] == 2,      tn + " census: K + V cache writes in both graphs");
+    }
     check(n["FLASH_ATTN_EXT"] == 0 && n["SOFT_MAX"] == 0, tn + " census: no attention op in the new graph");
     check(o["FLASH_ATTN_EXT"] + o["SOFT_MAX"] > 0,        tn + " census: the old graph attends");
     check(n["MUL_MAT_ID"] == 0 && o["MUL_MAT_ID"] > 0,    tn + " census: no MoE in the new graph");
-    check(n["ROPE"] == 1 && o["ROPE"] == 2,                tn + " census: K rope only (old: Q + K)");
+    // sparse MTP, old graph: the indexer's pooled keys / query may add ropes (MAX_UBATCH=0)
+    check(n["ROPE"] == 1 && (mtp_qsa_mode() ? o["ROPE"] >= 2 : o["ROPE"] == 2), tn + " census: K rope only (old: Q + K)");
     if (type_kv != GGML_TYPE_F16) {
         // the cache rotation (llama_mul_mat_hadamard): old = Q, K, V and the output's V inverse; new = K, V
         check(n["MUL_MAT"] < o["MUL_MAT"], tn + " census: fewer matmuls");
@@ -456,6 +489,7 @@ static void op_table(gguf_context * meta, ggml_type type_kv) {
 static void timing(gguf_context * meta) {
     const int n_ub = 32; // 32 ubatches of 64 rows = 2048 cells
     double ms[2] = { 0, 0 };
+    int reused[2] = { 0, 0 };
     const char * knobs[2] = { "1", "0" };
     for (int k = 0; k < 2; ++k) {
         mtp_env E;
@@ -464,7 +498,13 @@ static void timing(gguf_context * meta) {
         for (int u = 0; u < n_ub; ++u) {
             feed(E, tokens(64, 1000 + u), u * 64, &ms[k]);
         }
+        reused[k] = llama_perf_context(E.ctx_dft.get()).n_reused;
     }
+    // [TAG_MTP_QSA] the kv-only catch-up graph is reused across ubatches in both modes (the sparse memory's forced
+    // cache-only indexer input does not veto the reuse once the depth passes the selection width)
+    printf("graph reuse, draft context, %d catch-up ubatches: old %d, new %d\n", n_ub, reused[0], reused[1]);
+    // the draft KV's n_kv grows in steps of 256 cells: one rebuild per step (8 over the fill) plus the first graph
+    check(reused[1] >= n_ub - 2048/256 - 1, "new catch-up graphs reused (all but one per 256-cell n_kv step)");
     printf("timing (CPU, 4 threads, tiny model, indication only): MTP catch-up per 64-row ubatch over a 0..2048 fill: "
            "old %.3f ms, new %.3f ms (%.1f %% less)\n", ms[0] / n_ub, ms[1] / n_ub, 100.0 * (1.0 - ms[1] / ms[0]));
 }
@@ -475,6 +515,8 @@ int main() {
     llama_backend_init();
 
     gguf_context_ptr meta = make_meta(4096);
+
+    printf("mode: %s\n", mtp_qsa_mode() ? "sparse MTP draft (LLAMA_MTP_QSA=1)" : "dense MTP draft");
 
     for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
         run_pair(meta.get(), t, false);

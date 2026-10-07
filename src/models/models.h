@@ -2407,7 +2407,10 @@ struct llama_model_qwen4exp : public llama_model_base {
                            bool   cache_only,
                        qsa_prep * prep = nullptr,
                     ggml_tensor * vis_cells = nullptr,  // [TAG_QSA_VIS] both non-null: select over the metadata
-                    ggml_tensor * vis_toks  = nullptr);
+                    ggml_tensor * vis_toks  = nullptr,
+                           // [TAG_MTP_QSA] cache_only by the caller's rule (the MTP catch-up / MAX_UBATCH), not by
+                           // the exhaustive test: can_reuse then skips the dense check (n_tokens / n_outputs key it)
+                           bool   cache_only_forced = false);
 
         // the block pooling chain over n_rows blocks per stream, shared by the recompute and the
         // [TAG_QSA_POOLED_CACHE] dirty-block write

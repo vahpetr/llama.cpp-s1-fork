@@ -3499,6 +3499,13 @@ void llama_memory_hybrid_idx_context::qsa_store_publish(bool ok) const {
 }
 
 std::string llama_memory_hybrid_idx::state_descriptor() const {
+    // [TAG_MTP_QSA] the MTP draft memory (no recurrent layer): attention then indexer, both written whatever
+    // PARTIAL_ONLY says (state_write's recr_none branch), so neither is "(full-only)" and there is no recr section
+    if (recr_none) {
+        return "hybrid_idx{recr=none,attn=" + get_mem_attn()->state_descriptor() + ",idx=" +
+               (mem_idx ? mem_idx->state_descriptor() : std::string("none")) + "}";
+    }
+
     // [TAG_HYBRID_IDX_STATE] attention, recurrent, then the K-only indexer (full streams only)
     return "hybrid_idx{" + llama_memory_hybrid::state_descriptor() + ",idx(full-only)=" +
            (mem_idx ? mem_idx->state_descriptor() : std::string("none")) + "}";

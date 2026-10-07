@@ -1349,6 +1349,46 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             &inject, il);
     cb(cur, "mtp_hc_attn_pre", il);
 
+    if (mctx_hyb && kv_only) {
+        // [TAG_MTP_QSA] + [TAG_MTP_CATCHUP_NOATTN] the sparse draft's zero-output catch-up: the cache writes of
+        // build_layer_attn and nothing else - the indexer K (build_qsa_top_k cache_only: index_k_proj(cur) -> cpy_k, the
+        // same node the exhaustive / MAX_UBATCH / sparse branches emit; Codex B2), then K (wk, k norm, IMRoPE) and V (wv)
+        // through build_attn_store_kv (the store half of build_attn / build_attn_qsa: same rotations, same cpy_k/cpy_v).
+        // Exact: every stored byte (attention K/V cells, indexer K cells) is a function of cur and the positions only.
+        // The pooled-key store is not touched here; the census marks these cells dirty (0158) and the next sparse plan
+        // pools them, as after an exhaustive ubatch.
+        const int64_t n_embd_head = hparams.n_embd_head_v();
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+        const uint32_t qsa_ratio = llama_hparams_qsa_ratio(hparams, cparams.qsa_ratio, (uint32_t) il);
+        if (mctx_hyb->get_idx() != nullptr && qsa_ratio > 0) {
+            build_qsa_top_k(mctx_hyb, cur, inp_pos, inp_attn->get_kq_mask(), sections, il, /*cache_only=*/ true,
+                    nullptr, nullptr, nullptr, /*cache_only_forced=*/ true);
+        }
+
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        cb(Kcur, "Kcur", il);
+
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        cb(Vcur, "Vcur", il);
+
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, "Kcur_normed", il);
+
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(Kcur, "Kcur", il);
+        cb(Vcur, "Vcur", il);
+
+        // the cache writes are the graph's only roots; no t_logits / t_h_nextn
+        build_attn_store_kv(inp_attn, Kcur, Vcur, il);
+        return;
+    }
+
     if (mctx_hyb) {
         // [TAG_MTP_QSA] the trunk's full-attention layer, QSA included: the indexer reads the block's normed input
         // `cur` (the HC attention mixer's output, the same tensor q/k/v are projected from), exactly as the trunk's
@@ -1557,7 +1597,8 @@ public:
                 qwen4exp_qsa_depth(mctx, params.ubatch, n_kv));
 
         if (cache_only) {
-            res &= dense;
+            // [TAG_MTP_QSA] a forced cache-only input (the MTP catch-up / MAX_UBATCH) is one whatever the depth
+            res &= dense || cache_only_forced;
 
             return res;
         }
@@ -1649,6 +1690,10 @@ public:
     // [TAG_QSA_BYPASS_EXHAUSTIVE] only k_idxs is live; cell_blk/blk_cells/blk_pos/bias are nullptr
     const bool cache_only;
 
+    // [TAG_MTP_QSA] cache_only by the graph's own rule (MTP kv-only catch-up, LLAMA_MTP_QSA_MAX_UBATCH), which depends
+    // on n_tokens / n_outputs only - both already key the reuse - not on the exhaustive test
+    bool cache_only_forced = false;
+
     // hparams.indexer_top_k, copied so can_reuse() can re-evaluate the bypass condition
     uint32_t bypass_top_k = 0;
 
@@ -1719,8 +1764,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         bool                                    cache_only,
         qsa_prep *                              prep,
         ggml_tensor *                           vis_cells,
-        ggml_tensor *                           vis_toks) {
+        ggml_tensor *                           vis_toks,
+        bool                                    cache_only_forced) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
+
+    GGML_ASSERT(!cache_only_forced || cache_only);
 
     const int64_t idx_dim  = hparams.indexer_head_size;
     const int64_t n_idx_h  = hparams.indexer_n_head;
@@ -1768,9 +1816,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // every layer sharing a ratio also shares the exhaustive/not decision (it is a function of
         // n_kv, r and the ubatch's sequence depth alone), so a cached input set can never be the wrong kind
         GGML_ASSERT(inp->cache_only == cache_only);
+        GGML_ASSERT(inp->cache_only_forced == cache_only_forced);
         GGML_ASSERT(cache_only || inp->compact == compact);
     } else {
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, cache_only);
+        qsa->cache_only_forced = cache_only_forced;
 
         qsa->k_idxs        = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->bypass_top_k  = qwen4exp_qsa_top_k(hparams, il);
@@ -2671,7 +2721,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     // [TAG_MTP_QSA] the MTP block: a ubatch above LLAMA_MTP_QSA_MAX_UBATCH (catch-up / prompt-size process(), and the
     // load-time reserve) is dense + the indexer K write, so every draft row still lands in the indexer cache
+    // With LLAMA_MTP_CATCHUP_ATTN=0 the zero-output catch-up never gets here (graph_mtp's kv-only branch writes the
+    // indexer K cache-only itself); what remains of this rule: the load-time reserve (it requests outputs, so the MTP
+    // compute buffer stays the dense one), ubatches with outputs above N (a prompt-size process() that wants logits),
+    // and every catch-up while LLAMA_MTP_CATCHUP_ATTN=1 / unset.
+    bool mtp_forced = false;
     if (qsa && il >= (int) hparams.n_layer() && qwen4exp_mtp_qsa_max_ubatch() > 0 && n_tokens > qwen4exp_mtp_qsa_max_ubatch()) {
+        mtp_forced     = true;
         qsa_exhaustive = true;
     }
 
@@ -2696,7 +2752,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, qsa_exhaustive,
             chunked ? &prep : nullptr,
-            qsa_vis ? inp->self_kq_vis_cells : nullptr, qsa_vis ? inp->self_kq_vis_toks : nullptr) : nullptr;
+            qsa_vis ? inp->self_kq_vis_cells : nullptr, qsa_vis ? inp->self_kq_vis_toks : nullptr, mtp_forced) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
