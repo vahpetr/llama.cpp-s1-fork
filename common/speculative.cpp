@@ -1746,6 +1746,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             n_drafting++;
             drafting[seq_id] = true;
+            dp.n_attempted = 0;
+            dp.n_kept      = 0;
             common_sampler_reset(smpls[seq_id].get());
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
@@ -1806,6 +1808,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
+                auto & dp = dparams.at(seq_id);
+                dp.n_attempted++; // [TAG_SPEC_DRAFT_POLICY] this position was sampled (kept or a p_min stop)
+
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
@@ -1819,7 +1824,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
@@ -1873,6 +1877,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            dp.n_kept = (int32_t) dp.result->size();
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
@@ -3267,7 +3272,13 @@ int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const commo
     for (int n = 0; n <= std::max(0, n_max); ++n) {
         double gain = 0.0, cost = 0.0;
         common_spec_tput_eval(p, n, c, gain, cost);
-        const double rate = cost > 0.0 ? gain / cost : gain * 1e30;
+        if (!std::isfinite(cost) || !(cost > 0.0) || !std::isfinite(gain)) {
+            if (rate_out) {
+                *rate_out = 0.0;
+            }
+            return -1;
+        }
+        const double rate = gain / cost;
         if (rate > best_rate) {
             best_rate = rate;
             best_n    = n;
@@ -3280,6 +3291,11 @@ int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const commo
 }
 
 void common_spec_ew_line::add(double n, double t_ms) {
+    if (!std::isfinite(n) || !std::isfinite(t_ms) || t_ms < 0.0) {
+        n_rejected++;
+        return;
+    }
+    n_samples++;
     const double d = 1.0 - ALPHA;
     w    = d*w    + 1.0;
     s_n  = d*s_n  + n;
@@ -3289,7 +3305,7 @@ void common_spec_ew_line::add(double n, double t_ms) {
 }
 
 bool common_spec_ew_line::get(double & a, double & b, double b_prior) const {
-    if (w < W_MIN) {
+    if (n_samples < (int) W_MIN) {
         return false;
     }
     const double mean_n = s_n / w;
@@ -3300,7 +3316,7 @@ bool common_spec_ew_line::get(double & a, double & b, double b_prior) const {
         b = std::min(b_prior, 0.5*mean_t / std::max(mean_n, 1.0));
     }
     a = std::max(0.0, mean_t - b*mean_n);
-    return true;
+    return std::isfinite(a) && std::isfinite(b);
 }
 
 int common_spec_tput_bucket(int n_kv) {

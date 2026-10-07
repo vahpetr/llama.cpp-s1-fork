@@ -199,6 +199,38 @@ static void test_ckpt_cost() {
     check(n_pooled > 0 && n_sep == 0, "a checkpoint cost the draft cannot pay -> true zero");
 }
 
+// (v51 r1, D Minors) timing hygiene: non-finite / negative samples are rejected, the warm-up is 8 samples, a cost model
+// with a non-finite or non-positive candidate cost is invalid (-1: the caller's prior path)
+static void test_timing_hygiene() {
+    common_spec_ew_line l;
+    double a = 0.0, b = 0.0;
+    for (int k = 0; k < 7; ++k) {
+        l.add(1 + k % 3, 10.0 + (1 + k % 3));
+    }
+    check(!l.get(a, b, 0.0), "7 samples: not warm");
+    l.add(NAN, 5.0);
+    l.add(2.0, INFINITY);
+    l.add(2.0, -1.0);
+    l.add(2.0, NAN);
+    check(l.n_rejected == 4 && l.n_samples == 7 && !l.get(a, b, 0.0), "non-finite / negative samples rejected");
+    l.add(2.0, 12.0);
+    check(l.get(a, b, 0.0) && std::fabs(a - 10.0) < 1e-9 && std::fabs(b - 1.0) < 1e-9, "the 8th sample warms the fit");
+
+    common_spec_tput_cost c;
+    c.d0 = 1.0; c.d1 = 2.2; c.v0 = 25.0; c.v1 = 1.5; c.c0 = 0.8; c.c1 = 0.2; c.host = 1.2;
+    double rate = 1.0;
+    common_spec_tput_cost z = c;
+    z.v0 = -27.0; // n = 0 costs -27 + 1.5 + 0.8 + 0.2 + 1.2 < 0
+    check(common_spec_tput_best_n({ 0.9f }, 2, z, &rate) == -1 && rate == 0.0, "a non-positive cost -> invalid (-1)");
+    common_spec_tput_cost n = c;
+    n.d1 = NAN;
+    check(common_spec_tput_best_n({ 0.9f }, 2, n) == -1, "a non-finite cost -> invalid (-1)");
+    common_spec_tput_cost i = c;
+    i.r0 = INFINITY; i.n_rb_free = 0;
+    check(common_spec_tput_best_n({ 0.9f }, 2, i) == -1, "an infinite rollback cost -> invalid (-1)");
+    check(common_spec_tput_best_n({ 0.9f }, 2, c) >= 0, "a valid model -> n*");
+}
+
 static void test_cooldown() {
     common_spec_cooldown cd;
 
@@ -262,6 +294,7 @@ int main() {
     test_rollback_cycle();
     test_depth_buckets();
     test_ckpt_cost();
+    test_timing_hygiene();
     test_cooldown();
     if (n_fail) {
         printf("test-spec-draft-policy: %d failures (%d checks ok)\n", n_fail, n_ok);

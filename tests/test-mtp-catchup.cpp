@@ -172,6 +172,8 @@ struct env_cfg {
     uint32_t     n_ctx;
     bool         census;
     bool         backend_sampling = false;
+    float        p_min            = 0.0f;
+    int          n_min            = 0;
 };
 
 static void init_env(mtp_env & env, gguf_context * meta, const env_cfg & cfg) {
@@ -220,8 +222,8 @@ static void init_env(mtp_env & env, gguf_context * meta, const env_cfg & cfg) {
 
     env.params.types                  = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
     env.params.draft.n_max            = 4;
-    env.params.draft.n_min            = 0;
-    env.params.draft.p_min            = 0.0f;
+    env.params.draft.n_min            = cfg.n_min;
+    env.params.draft.p_min            = cfg.p_min;
     env.params.draft.backend_sampling = cfg.backend_sampling;
     env.params.draft.ctx_tgt          = env.ctx_tgt.get();
     env.params.draft.ctx_dft          = env.ctx_dft.get();
@@ -786,6 +788,42 @@ static void draft_policy_e2e(gguf_context * meta) {
     line("tput q8_0", rc);
 }
 
+// [TAG_SPEC_DRAFT_POLICY] (v51 r1, Codex D Minor) the MTP drafter reports the positions it sampled (n_attempted, a p_min
+// stop included) and the tokens it drafted before the n_min rule (n_kept): the server prices the draft call by the
+// attempted length and observes a stop at its real position
+static void draft_attempt_report(gguf_context * meta) {
+    struct tc { float p_min; int n_min; int n_max; int att; int kept; size_t out; const char * what; };
+    for (const tc & t : { tc{ 0.0f,  0, 4, 4, 4, 4, "full draft: attempted 4, kept 4" },
+                          tc{ 1.01f, 0, 4, 1, 0, 0, "p_min stop at position 0: attempted 1, kept 0" },
+                          tc{ 0.0f,  3, 2, 2, 2, 0, "n_min 3 clears a 2-token draft: kept 2 reported" } }) {
+        mtp_env e;
+        env_cfg cfg = { "", GGML_TYPE_F16, 512, false };
+        cfg.p_min = t.p_min;
+        cfg.n_min = t.n_min;
+        init_env(e, meta, cfg);
+        const auto prompt = tokens(24, 7);
+        const auto v = feed(e, prompt, 0);
+        llama_token id_last = 0;
+        for (size_t j = 1; j < N_VOCAB; ++j) {
+            if (v[(prompt.size() - 1)*N_VOCAB + j] > v[(prompt.size() - 1)*N_VOCAB + id_last]) {
+                id_last = (llama_token) j;
+            }
+        }
+        llama_tokens out;
+        auto & dp = common_speculative_get_draft_params(e.spec, 0);
+        dp.drafting = true;
+        dp.n_max    = t.n_max;
+        dp.n_past   = (llama_pos) prompt.size();
+        dp.id_last  = id_last;
+        dp.prompt   = nullptr;
+        dp.result   = &out;
+        common_speculative_draft(e.spec);
+        check(dp.n_attempted == t.att && dp.n_kept == t.kept && out.size() == t.out,
+              std::string(t.what) + " (got attempted " + std::to_string(dp.n_attempted) + ", kept " +
+              std::to_string(dp.n_kept) + ", result " + std::to_string(out.size()) + ")");
+    }
+}
+
 int main() {
     llama_log_set(quiet_log, nullptr);
     common_log_set_verbosity_thold(-1);
@@ -804,6 +842,7 @@ int main() {
 
     draft_kv_type_pair(meta.get());
     draft_policy_e2e(meta.get());
+    draft_attempt_report(meta.get());
 
     timing(meta.get());
 

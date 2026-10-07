@@ -542,6 +542,9 @@ struct server_slot {
     // [TAG_SPEC_DRAFT_POLICY] --spec-draft-policy tput: the cooldown state and the length requested this round
     common_spec_cooldown spec_cd;
     int                  spec_tput_n_req = 0;
+    int                  spec_tput_n_att = 0;   // draft positions the drafter sampled this round (p_min stop included)
+    int                  spec_tput_n_kept = 0;  // tokens it drafted before the n_min rule
+    int                  spec_tput_n_draft_rounds = 0; // drafting rounds of this task (the first one is cold)
     int64_t              spec_rb_restore_us = 0; // the checkpoint restore of the last rollback (charged to its replay)
 
     static constexpr float SPEC_ACC_EMA_ALPHA = 1.0f/32.0f;
@@ -568,6 +571,20 @@ struct server_slot {
         for (size_t i = 0; i < n_draft && i <= n_accepted && i < spec_acc_ema.size(); ++i) {
             const float obs = (i < n_accepted) ? 1.0f : 0.0f;
             spec_acc_ema[i] += SPEC_ACC_EMA_ALPHA * (obs - spec_acc_ema[i]);
+        }
+    }
+
+    // [TAG_SPEC_DRAFT_POLICY] a drafter stop at position k with positions < k unverified (a draft the n_min rule
+    //   cleared): only the stop itself is observed, as a failure at k
+    void spec_acc_observe_stop(size_t k, int n_max_cfg) {
+        if (n_max_cfg <= 0) {
+            return;
+        }
+        if (spec_acc_ema.empty()) {
+            spec_acc_ema.assign(n_max_cfg, 1.0f);
+        }
+        if (k < spec_acc_ema.size()) {
+            spec_acc_ema[k] += SPEC_ACC_EMA_ALPHA * (0.0f - spec_acc_ema[k]);
         }
     }
 
@@ -650,6 +667,9 @@ struct server_slot {
         spec_cost_measured = false;
         spec_cd            = common_spec_cooldown();
         spec_tput_n_req    = 0;
+        spec_tput_n_att    = 0;
+        spec_tput_n_kept   = 0;
+        spec_tput_n_draft_rounds = 0;
         spec_rb_restore_us = 0;
 
         n_predict_max = -1;
@@ -4071,6 +4091,9 @@ private:
         int n_rows        = 0;
         int n_rows_expect = 0;
         int n_kv          = 0; // the depth of the round's slot: its fits bucket
+        int n_draft_att   = 0; // tput: draft positions sampled (the draft fit's x), tokens drafted (the ckpt fit's x)
+        int n_draft_out   = 0;
+        bool cold         = false; // tput: the slot's first drafting round of the task (allocation / graph warm-up)
         // tput: slots whose pass is the replay after a checkpoint restore, that restore's wall, and the restores
         //   done in this pass (not host time of this pass: charged to the replay that follows)
         std::vector<int> replay_ids;
@@ -4082,7 +4105,7 @@ private:
     // [TAG_SPEC_DRAFT_POLICY] one single-slot pure round -> the cost fits
     void spec_tput_feed() {
         const size_t n_slots = spec_rt.slot_ids.size() + spec_rt.zero_ids.size() + spec_rt.replay_ids.size();
-        if (n_slots != 1 || spec_rt.n_rows <= 0 || spec_rt.n_rows != spec_rt.n_rows_expect) {
+        if (n_slots != 1 || spec_rt.n_rows <= 0 || spec_rt.n_rows != spec_rt.n_rows_expect || spec_rt.cold) {
             return;
         }
         const int64_t t_round = ggml_time_us() - spec_rt.t0_us;
@@ -4095,8 +4118,8 @@ private:
                                                      spec_rt.restore_us - spec_rt.ckpt_us);
         auto & f = spec_tput_fits.at(spec_rt.n_kv);
         if (!spec_rt.slot_ids.empty()) {
-            f.draft .add(spec_rt.n_draft_req, spec_rt.draft_us / 1e3);
-            f.ckpt  .add(spec_rt.n_draft_req, spec_rt.ckpt_us  / 1e3);
+            f.draft .add(spec_rt.n_draft_att, spec_rt.draft_us / 1e3);
+            f.ckpt  .add(spec_rt.n_draft_out, spec_rt.ckpt_us  / 1e3);
             f.host_d.add(spec_rt.n_rows,      t_host           / 1e3);
         } else {
             f.host  .add(0.0,                 t_host           / 1e3); // the host intercept: zero rounds only
@@ -4143,8 +4166,12 @@ private:
                     : ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ? (int) llama_n_rs_seq(ctx_tgt)
                     : (1 << 30);
         double rate = 0.0;
-        // before the fits are usable: today's length (n_max), the cooldown still applies
-        int n_rule = ok ? common_spec_tput_best_n(slot.spec_acc_ema, n_max_cfg, c, &rate) : n_max_cfg;
+        // before the fits are usable, or when they give no valid cost model (non-finite / non-positive costs): the
+        //   prior path = today's length (n_max), the cooldown still applies
+        int n_rule = ok ? common_spec_tput_best_n(slot.spec_acc_ema, n_max_cfg, c, &rate) : -1;
+        if (n_rule < 0) {
+            n_rule = n_max_cfg;
+        }
         const bool was_cooling = slot.spec_cd.cooling();
         int n = std::min(slot.spec_cd.decide(n_rule), n_max_cfg);
         if (n > 0) {
@@ -4279,6 +4306,9 @@ private:
             spec_rt.n_rows        = 0;
             spec_rt.n_rows_expect = 0;
             spec_rt.n_kv          = 0;
+            spec_rt.n_draft_att   = 0;
+            spec_rt.n_draft_out   = 0;
+            spec_rt.cold          = false;
             spec_rt.replay_ids.clear();
             spec_rt.replay_restore_us = 0;
             spec_rt.restore_us        = 0;
@@ -4636,17 +4666,30 @@ private:
 
             slot.stats.n_draft_tokens += draft.size();
 
+            if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
+                // [TAG_SPEC_DRAFT_POLICY] what the drafter attempted (a drafter that does not report it: the request)
+                const auto & dpo = common_speculative_get_draft_params(spec.get(), slot.id);
+                slot.spec_tput_n_att  = dpo.n_attempted >= 0 ? dpo.n_attempted : slot.spec_tput_n_req;
+                slot.spec_tput_n_kept = dpo.n_kept      >= 0 ? dpo.n_kept      : (int) draft.size();
+                spec_rt.cold          = slot.spec_tput_n_draft_rounds++ == 0;
+                spec_rt.n_draft_req   = slot.spec_tput_n_req;
+                spec_rt.n_draft_att   = slot.spec_tput_n_att;
+                spec_rt.n_draft_out   = (int) draft.size();
+                spec_rt.n_rows_expect = 1 + (int) draft.size();
+            }
             if (draft.empty()) {
                 slot.stats.n_spec_empty_drafts += 1;
                 if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
-                    // [TAG_SPEC_DRAFT_POLICY] an empty draft is a failure at position 0
-                    slot.spec_acc_update(1, 0, common_speculative_n_max(spec.get()));
+                    // [TAG_SPEC_DRAFT_POLICY] an empty draft: a stop at position 0 is a failure there; a draft the
+                    //   n_min rule cleared stopped at n_kept (positions before it were never verified: unobserved)
+                    const int n_max_cfg = common_speculative_n_max(spec.get());
+                    if (slot.spec_tput_n_kept == 0) {
+                        slot.spec_acc_update(1, 0, n_max_cfg);
+                    } else if (slot.spec_tput_n_att > slot.spec_tput_n_kept) {
+                        slot.spec_acc_observe_stop((size_t) slot.spec_tput_n_kept, n_max_cfg);
+                    }
                     slot.spec_cd.observe(0, 0);
                 }
-            }
-            if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
-                spec_rt.n_draft_req   = slot.spec_tput_n_req;
-                spec_rt.n_rows_expect = 1 + (int) draft.size();
             }
 
             // [TAG_SPEC_DRAFT_POLICY] tput: the draft-context restore and the per-round checkpoints below are the
@@ -5871,7 +5914,7 @@ private:
                     if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
                         // [TAG_SPEC_DRAFT_POLICY] a drafter that stopped short (p_min exit) failed at the next position
                         const bool short_draft = n_committed_in == 0 && n_fresh_draft > 0 &&
-                                                 (int) n_fresh_draft < slot.spec_tput_n_req;
+                                                 slot.spec_tput_n_att > (int) n_fresh_draft;
                         slot.spec_acc_update(n_fresh_draft + (short_draft ? 1 : 0), n_fresh_acc, common_speculative_n_max(spec.get()));
                         if (n_fresh_draft > 0) {
                             slot.spec_cd.observe((int) n_fresh_draft, (int) n_fresh_acc);

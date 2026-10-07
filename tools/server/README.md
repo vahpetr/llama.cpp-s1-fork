@@ -356,7 +356,11 @@ from exponentially weighted fits of the server's own single-slot round times (dr
 catch-up vs batch rows, the per-round checkpoint save + draft-context restore vs n (charged to n > 0 only), the host
 intercept from zero rounds only (drafting rounds' host, checkpoint excluded, until a zero round was seen)), kept per KV-depth bucket (log2: [0, 8k), [8k, 16k), ... 107k -> 4, 524k -> 7, 1M -> 8),
 so a deep slot is priced only from rounds at its own depth. The prior path: until the slot's bucket has 8 rounds of its
-own the slot drafts n-max (the cooldown still applies); other buckets are never borrowed. A FULL / deep-RS rejection's
+own the slot drafts n-max (the cooldown still applies); other buckets are never borrowed. The draft call is fitted against
+the positions the drafter actually sampled (a `p_min` stop included), not the requested length; a draft the
+`--spec-draft-n-min` rule cleared is observed as a stop at its real position (earlier positions were never verified);
+the first drafting round of a task (cold allocation / graph work) and non-finite or negative samples are not fitted, and
+a cost model with a non-finite or non-positive candidate cost falls back to the prior path. A FULL / deep-RS rejection's
 restore + replay pass is priced too (its own fit, charged to the round with the replay's extra token; prior until warm:
 a plain round of the replay's rows). n = 0 is a true zero: no draft call,
 no per-round checkpoint, a plain one-token decode (the draft KV still catches up). A cooldown keeps zero from being

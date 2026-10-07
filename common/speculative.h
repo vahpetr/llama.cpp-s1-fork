@@ -69,6 +69,12 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // [TAG_SPEC_DRAFT_POLICY] outputs of the last _draft() call (-1: the implementation does not report them):
+    //   n_attempted = draft positions sampled for this sequence (incl. the one a p_min exit stopped at), n_kept = tokens
+    //   drafted before the n_min rule (a draft shorter than n_min is cleared from result, not from n_kept)
+    int32_t n_attempted = -1;
+    int32_t n_kept      = -1;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -160,6 +166,7 @@ void common_spec_tput_eval(const std::vector<float> & p, int n, const common_spe
 
 // n* = argmax over n in [0, n_max] of gain/cost; p[i] = p_{i+1} (missing entries count as 1);
 // ties go to the shorter draft. rate_out (optional): the expected tokens per ms at n*.
+//   -1: the cost model is invalid (a candidate's cost is non-finite or <= 0) - the caller takes its prior path.
 int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const common_spec_tput_cost & c,
                             double * rate_out = nullptr);
 
@@ -170,9 +177,12 @@ struct common_spec_ew_line {
     static constexpr double VAR_MIN = 0.25;
 
     double w = 0.0, s_n = 0.0, s_t = 0.0, s_nn = 0.0, s_nt = 0.0;
+    int    n_samples  = 0; // accepted samples (the warm-up counts these: W_MIN of them, not the decayed weight)
+    int    n_rejected = 0; // non-finite or negative samples dropped
 
+    // a non-finite n or t, or t < 0, is rejected (counted, not fitted)
     void add(double n, double t_ms);
-    // false before W_MIN samples; a slope that the samples do not identify (one row count only, or a negative fit)
+    // false before W_MIN samples, or when the fit is not finite; a slope that the samples do not identify (one row count only, or a negative fit)
     // falls back to b_prior, capped so that the intercept through the mean keeps at least half of the mean time (a
     // prior from another machine must not turn the measured fixed cost into a per-row one)
     bool get(double & a, double & b, double b_prior) const;
