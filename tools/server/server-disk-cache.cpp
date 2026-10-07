@@ -514,6 +514,138 @@ std::string server_disk_cache_fingerprint(const common_params & params, int32_t 
     return string_format("%016llx", (unsigned long long) std::hash<std::string>{}(s)) + " " + s;
 }
 
+// [TAG_CACHE_COMPAT2] ---------------------------------------------------------------------------------------------
+// hash_key's first 16 hex digits cover only lanes a / c (bytes 0-7 and 16-23 of every 32-byte block): fold both
+//   halves so every input byte counts
+static std::string h16_of(const std::string & s) {
+    const std::string k = hash_key(reinterpret_cast<const uint8_t *>(s.data()), s.size());
+    const unsigned long long h1 = std::stoull(k.substr(0, 16), nullptr, 16);
+    const unsigned long long h2 = std::stoull(k.substr(16, 16), nullptr, 16);
+    return string_format("%016llx", h1 ^ (h2 * 0x9E3779B97F4A7C15ull));
+}
+
+std::string server_cache_file_identity(const std::string & p) {
+    if (p.empty()) {
+        return "none";
+    }
+    std::error_code ec;
+    const uint64_t n = fs::file_size(p, ec);
+    std::ifstream f(p, std::ios::binary);
+    if (ec || !f.is_open()) {
+        return "absent";
+    }
+    // 4 samples of 1 MiB at fixed relative offsets (head, 1/3, 2/3, tail) + the size: 4 MiB per shard
+    constexpr uint64_t W = 1ull << 20;
+    constexpr int      K = 4;
+    const uint64_t len = std::min(W, n);
+    std::string buf = string_format("n=%llu;", (unsigned long long) n);
+    std::vector<char> tmp(len);
+    for (int i = 0; i < K; i++) {
+        const uint64_t off = n <= W ? 0 : i == K - 1 ? n - W : (n - W) / (K - 1) * i;
+        f.seekg((std::streamoff) off);
+        f.read(tmp.data(), (std::streamsize) len);
+        if (!f || (uint64_t) f.gcount() != len) {
+            return "absent";
+        }
+        buf.append(tmp.data(), len);
+        if (n <= W) {
+            break;
+        }
+    }
+    return h16_of(buf);
+}
+
+std::string server_disk_cache_model_identity(const common_params & params) {
+    // every shard of a split GGUF (<name>-00001-of-0000N.gguf)
+    const auto shards = [](const std::string & p) {
+        std::string id = server_cache_file_identity(p);
+        const auto at = p.rfind("-00001-of-");
+        if (at != std::string::npos && p.size() >= at + 15) {
+            const int n = atoi(p.substr(at + 10, 5).c_str());
+            for (int i = 2; i <= n && i < 100000; i++) {
+                id += "," + server_cache_file_identity(p.substr(0, at) + string_format("-%05d-of-", i) + p.substr(at + 10));
+            }
+        }
+        return id;
+    };
+    return "m:" + shards(params.model.path) + "|d:" + shards(params.speculative.draft.mparams.path) +
+           "|p:" + shards(params.mmproj.path);
+}
+
+std::string server_disk_cache_fingerprint_v2(const std::string & cheap, const server_cache_key_parts & p) {
+    const std::string body = string_format("c2|model=%s|desc=%s|meas=%s|depth=%u|env=%s", p.model_id.c_str(),
+                                           p.desc_h.c_str(), p.measure_h.c_str(), p.depth_version, p.env_digest.c_str());
+    const auto sp = cheap.find(' ');
+    const std::string cheap_body = sp == std::string::npos ? cheap : cheap.substr(sp + 1);
+    return h16_of(body) + " " + cheap_body + "|compat2=" + std::to_string(body.size()) + ":" + body;
+}
+
+std::string server_disk_cache_compat2_body(const std::string & fp) {
+    const auto at = fp.rfind("|compat2=");
+    if (at == std::string::npos) {
+        return "";
+    }
+    const size_t a = at + 9;
+    const auto c = fp.find(':', a);
+    if (c == std::string::npos || c == a || c - a > 9 || fp.find_first_not_of("0123456789", a) != c) {
+        return "";
+    }
+    const size_t n = std::stoul(fp.substr(a, c - a));
+    return fp.size() == c + 1 + n ? fp.substr(c + 1) : "";
+}
+
+bool server_disk_cache_same_identity(const std::string & a, const std::string & b) {
+    const std::string ba = server_disk_cache_compat2_body(a);
+    const std::string bb = server_disk_cache_compat2_body(b);
+    if (ba.empty() || bb.empty()) {
+        return a == b;
+    }
+    return a.size() >= 16 && b.size() >= 16 && a.compare(0, 16, b, 0, 16) == 0 && ba == bb;
+}
+
+std::string server_cache_memo_key(const std::string & cheap, const std::string & gpu_id) {
+    return h16_of(string_format("cheap=%s|probe=%u|gpu=%s", cheap.c_str(), DISK_CACHE_PROBE_REVISION, gpu_id.c_str()));
+}
+
+static fs::path memo_path(const std::string & root, const std::string & memo_key) {
+    return fs::path(root) / "compat-memo" / (memo_key + ".txt");
+}
+
+bool server_cache_memo_get(const std::string & root, const std::string & memo_key, std::string & measure_h) {
+    std::ifstream f(memo_path(root, memo_key));
+    std::string v;
+    if (!f.is_open() || !std::getline(f, v) || v.size() != 16 || v.find_first_not_of("0123456789abcdef") != std::string::npos) {
+        return false;
+    }
+    measure_h = v;
+    return true;
+}
+
+bool server_cache_memo_put(const std::string & root, const std::string & memo_key, const std::string & measure_h) {
+    std::error_code ec;
+    const fs::path p = memo_path(root, memo_key);
+    fs::create_directories(p.parent_path(), ec);
+    const fs::path tmp = p.string() + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        f << measure_h << "\n";
+        if (!f.good()) {
+            return false;
+        }
+    }
+    fs::rename(tmp, p, ec);
+    return !ec;
+}
+
+std::string server_cache_measure_hash(const std::string & bytes) {
+    return h16_of(bytes);
+}
+
+void server_disk_cache::set_fingerprint(const std::string & fp) {
+    fingerprint = fp;
+    dir = (fs::path(root) / ("ns-" + fp.substr(0, 16))).string();
+}
+
 server_disk_cache::server_disk_cache(std::string dir, uint64_t quota_bytes, int32_t min_tokens, int32_t ttl_days,
                                      std::string fingerprint, bool has_mtmd, float ckpt_ratio, int32_t ckpt_min_step,
                                      int32_t ckpt_max)
@@ -2814,6 +2946,7 @@ void server_disk_cache::set_descriptor(llama_context * ctx_tgt, llama_context * 
     desc_tgt_h = h16(tgt);
     desc_dft_h = h16(dft);
     desc_h     = h16(tgt + "\n" + dft);
+    desc_key   = h16_of(tgt + "\n" + dft); // [TAG_CACHE_COMPAT2] every byte counts (desc_h stays: the envelopes)
     DSK_INF("state descriptor %s (target %s, draft %s)\n", desc_h.c_str(), desc_tgt_h.c_str(), desc_dft_h.c_str());
     DSK_DBG("target descriptor: %s\n", tgt.c_str());
     DSK_DBG("draft descriptor: %s\n", dft.c_str());

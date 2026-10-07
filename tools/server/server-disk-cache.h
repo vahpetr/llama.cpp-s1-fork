@@ -196,6 +196,12 @@ struct server_disk_cache {
     //   and before every revalidate().
     void set_descriptor(llama_context * ctx_tgt, llama_context * ctx_dft, const std::string & spec_types);
     const std::string & descriptor_hash() const { return desc_h; }
+    const std::string & descriptor_key() const { return desc_key; } // [TAG_CACHE_COMPAT2] the key v2 component
+
+    // [TAG_CACHE_COMPAT2] replace the fingerprint (and the own namespace) before init(): the v2 key is known only
+    //   after set_descriptor() and the measurement
+    void set_fingerprint(const std::string & fp);
+    const std::string & root_dir() const { return root; }
 
   private:
     // [TAG_DISK_NAMESPACE] <root>/ns-<key>/ holds this fingerprint's entries, ckpt/ and blk/ (its new blocks,
@@ -249,6 +255,7 @@ struct server_disk_cache {
     bool        has_mtmd;
 
     std::string desc_h;     // hash16 of the combined descriptor (target + draft): .meta, .ck, /disk-cache
+    std::string desc_key;   // [TAG_CACHE_COMPAT2] full-coverage hash16 of the combined descriptor (key v2)
     std::string desc_tgt_h; // envelope hash of the .tgt streams
     std::string desc_dft_h; // envelope hash of the .dft streams
     float       ckpt_ratio;
@@ -309,5 +316,48 @@ struct server_disk_cache {
 };
 
 // identity of everything a stored state depends on: model + draft files, context size, KV types, the binary,
-// its command line and the LLAMA_* / GGML_* environment knobs
+// its command line and the LLAMA_* / GGML_* environment knobs. Since key v2 [TAG_CACHE_COMPAT2] this is the CHEAP
+// identity: it keys the measurement memo and carries the adopt structure; the namespace key is the v2 key below
 std::string server_disk_cache_fingerprint(const common_params & params, int32_t n_ctx);
+
+// [TAG_CACHE_COMPAT2] compatibility key v2 (R80.2 parts 2-3, spec series D4): namespace key = hash of
+//   {model content identity (sampled hash per shard), state descriptor hash, short-context measurement hash,
+//    depth version, semantic-env digest}. The libraries, sources, argv and exact env knobs stay in the cheap identity
+//   only: a rebuild / flag change that writes the same states keeps the namespace.
+
+// bumped only by the gate (outputs at depth differ)
+static constexpr uint32_t DISK_CACHE_DEPTH_VERSION = 1;
+// the measurement's probe (tokens, positions, outputs, ubatch schedule, hashed sections); a change re-measures
+static constexpr uint32_t DISK_CACHE_PROBE_REVISION = 1;
+
+// sampled content hash of a file (size + fixed-offset samples, a few MiB): "<hash16>"; "absent" when it cannot be read
+std::string server_cache_file_identity(const std::string & path);
+
+// model + draft + mmproj content identity: every shard of a split GGUF, "," joined per file, "|" between files
+std::string server_disk_cache_model_identity(const common_params & params);
+
+struct server_cache_key_parts {
+    std::string model_id;   // server_disk_cache_model_identity
+    std::string desc_h;     // server_disk_cache::descriptor_key()
+    std::string measure_h;  // the short-context measurement (hash16)
+    uint32_t    depth_version = DISK_CACHE_DEPTH_VERSION;
+    std::string env_digest; // server_cache_env_digest
+};
+
+// the v2 fingerprint: "<key16> <cheap body>|compat2=<len>:<v2 body>" - the cheap body keeps the adopt structure
+//   (server_disk_cache_fingerprint_structure) parseable, key16 = hash of the v2 body alone
+std::string server_disk_cache_fingerprint_v2(const std::string & cheap, const server_cache_key_parts & p);
+
+// the v2 body of a fingerprint ("" for a v1 fingerprint)
+std::string server_disk_cache_compat2_body(const std::string & fp);
+
+// same namespace identity: two v2 fingerprints compare by key16 + v2 body (the cheap part may differ), else exact
+bool server_disk_cache_same_identity(const std::string & a, const std::string & b);
+
+// the measurement memo, on disk under <root>/compat-memo/: key = cheap identity + probe revision + GPU device identity
+std::string server_cache_memo_key(const std::string & cheap, const std::string & gpu_id);
+bool server_cache_memo_get(const std::string & root, const std::string & memo_key, std::string & measure_h);
+bool server_cache_memo_put(const std::string & root, const std::string & memo_key, const std::string & measure_h);
+
+// the hash16 of measurement bytes (target, draft, carry sections as given)
+std::string server_cache_measure_hash(const std::string & bytes);
