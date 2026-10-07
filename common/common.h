@@ -1218,6 +1218,10 @@ struct common_prompt_checkpoint {
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
+    // [TAG_CACHE_COMPAT2] read from an adopted pre-format-8 source (weak-hash envelope) and never restored in this
+    //   process: usable from RAM, but never written into own storage under the full descriptor (astra compat2 r2)
+    bool foreign_unverified = false;
+
     size_t size() const;
 
     bool empty() const;

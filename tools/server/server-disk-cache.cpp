@@ -1756,6 +1756,17 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
         refresh_status();
         return false;
     }
+    // [TAG_CACHE_COMPAT2] (astra compat2 r2) a slot that came from an adopted entry is resaved under this namespace
+    //   (full descriptor) only because its state was fully restored here (load() sets adopted_from after streams +
+    //   carry) AND its source is an adopt key approved for this run (--cache-disk-adopt). A target-only adopted load
+    //   ([TAG_ADOPT_TARGET_ONLY]) restored the target stream + reset the draft side: its target state is canonical,
+    //   saved draft-partial ([TAG_DRAFT_PARTIAL])
+    if (!prompt.adopted_from.empty() &&
+        std::none_of(adopted.begin(), adopted.end(), [&](const adopt_src & a) { return a.key == prompt.adopted_from; })) {
+        DSK_WRN("not saving %zu tokens: adopted from %s, which is not an approved adopt source of this run\n", n,
+                prompt.adopted_from.c_str());
+        return false;
+    }
 
     if (spec && common_speculative_n_stateful(spec) > 1) {
         // (Codex gate r3 Major 2) the carry container holds one implementation's state: with several stateful ones
@@ -1818,17 +1829,29 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
             std::ostringstream f;
             // the in-RAM checkpoints go to the content-addressed store (a later save of the same conversation, a
             // branch or a copy writes them once), the .aux keeps their keys
-            std::vector<size_t> ns;
+            // [TAG_CACHE_COMPAT2] adopted pre-8 checkpoints (foreign_unverified) are left out: never stamped
+            std::vector<const common_prompt_checkpoint *> own;
             for (const auto & c : prompt.checkpoints) {
-                ns.push_back((size_t) c.n_tokens);
+                if (!c.foreign_unverified) {
+                    own.push_back(&c);
+                }
+            }
+            if (own.size() != prompt.checkpoints.size()) {
+                DSK_INF("%zu adopted pre-8 checkpoint(s) not written under the full descriptor (read-only at their "
+                        "source)\n", prompt.checkpoints.size() - own.size());
+            }
+            std::vector<size_t> ns;
+            for (const auto * c : own) {
+                ns.push_back((size_t) c->n_tokens);
             }
             std::vector<size_t> ns_sorted = ns;
             std::sort(ns_sorted.begin(), ns_sorted.end());
             ns_sorted.erase(std::unique(ns_sorted.begin(), ns_sorted.end()), ns_sorted.end());
             const std::vector<std::string> keys_sorted = prompt.tokens.prefix_keys(ns_sorted);
             put<uint32_t>(f, AUX_MAGIC);
-            put<uint32_t>(f, (uint32_t) prompt.checkpoints.size());
-            for (const auto & c : prompt.checkpoints) {
+            put<uint32_t>(f, (uint32_t) own.size());
+            for (const auto * cp : own) {
+                const auto & c = *cp;
                 const auto at = std::lower_bound(ns_sorted.begin(), ns_sorted.end(), (size_t) c.n_tokens) - ns_sorted.begin();
                 const std::string & key = keys_sorted[at];
                 bool written = false;
@@ -1865,7 +1888,10 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
             //   missing / damaged (deep_get dropped it from the index) is left out: an explicitly reported gap
             for (const auto & r : prompt.deep) {
                 const auto ck = ckpts.find(r.key);
-                if (ck != ckpts.end() && !ck->second.src_dir.empty()) {
+                if (ck != ckpts.end() && !ck->second.src_dir.empty() && ck->second.src_version < 8) {
+                    // [TAG_CACHE_COMPAT2] (astra compat2 r2) a pre-8 source's checkpoint was never restored here: no
+                    //   copy under the full descriptor - the ref stays, read-only at its source (a gap without it)
+                } else if (ck != ckpts.end() && !ck->second.src_dir.empty()) {
                     common_prompt_checkpoint c;
                     bool written = false;
                     bool io      = false;
@@ -1969,7 +1995,7 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
         e.t_saved = e.t_used = now_s();
         e.bytes   = n_logical + file_size_or_0(path(e.id, ".tok")) + file_size_or_0(path(e.id, ".aux"));
         for (const auto & c : prompt.checkpoints) {
-            e.bytes += c.size();
+            e.bytes += c.foreign_unverified ? 0 : c.size();
         }
         for (const char * ext : { ".tok", ".aux", ".tgt", ".dft" }) {
             e.own_bytes += file_size_or_0(path(e.id, ext));
@@ -2354,6 +2380,13 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
         return SERVER_DISK_LOAD_INVALID;
     }
 
+    // [TAG_CACHE_COMPAT2] (astra compat2 r2) the .aux checkpoints of an adopted pre-8 entry were checked against the
+    //   weak descriptor hash only and are not restored by this load: never re-stamped into own storage
+    if (!e.src.empty() && e.version < 8) {
+        for (auto & c : checkpoints) {
+            c.foreign_unverified = true;
+        }
+    }
     prompt.tokens      = e.tokens.clone();
     prompt.checkpoints = std::move(checkpoints);
     prompt.user_starts = std::move(user_starts); // [TAG_TURN_BOUNDARY]
@@ -2521,6 +2554,9 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
 
 void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_checkpoint & c, uint8_t kind) {
     if (prompt.noncanonical || prompt.partial) { // [TAG_NONCANONICAL] [TAG_PARTIAL_PROMPT] C1
+        return;
+    }
+    if (c.foreign_unverified) { // [TAG_CACHE_COMPAT2] adopted pre-8 bytes: no full-descriptor stamp
         return;
     }
     if (prompt.draft_partial() && !c.data_dft.empty()) { // [TAG_DRAFT_PARTIAL] see save(): stored draft-less
@@ -2721,6 +2757,7 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
             out.data_dft.clear();
             n_ckpt_target_only++;
         }
+        out.foreign_unverified = from_src && it->second.src_version < 8; // [TAG_CACHE_COMPAT2]
     } catch (const std::bad_alloc &) {
         // [TAG_DISK_READ_STATUS] inconclusive: the checkpoint and its file stay
         DSK_WRN("deep checkpoint %s: out of memory reading it, keeping it\n", key.c_str());

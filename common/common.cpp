@@ -2309,6 +2309,7 @@ void common_prompt_checkpoint::clear() {
     data_spec.clear();
 
     flags_tgt = 0;
+    foreign_unverified = false;
     flags_dft = 0;
 }
 
