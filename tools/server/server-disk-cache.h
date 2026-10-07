@@ -401,6 +401,13 @@ std::string server_cache_model_placement(const llama_model * m);
 std::string server_cache_placement_identity(const common_params & params, const llama_context * ctx_tgt,
                                             const llama_context * ctx_dft);
 std::string server_cache_ctx_canon(const llama_context * ctx);
+// [TAG_CACHE_COMPAT2] an entry's metadata descriptor (descriptor_full) against this context's: mandatory for an own
+//   entry and for any format >= 8 entry (absent / empty => miss), optional only for an adopted pre-8 entry
+bool server_disk_cache_desc_ok(bool own, uint32_t version, const std::string & desc_full, const std::string & desc_key);
+// [TAG_CACHE_COMPAT2] the RAM cache's state descriptor hash: target + draft llama_state_seq_descriptor and the carry
+//   schema (common_speculative_state_schema) - a RAM entry is swapped in only under the same descriptor
+std::string server_cache_state_desc(const llama_context * ctx_tgt, const llama_context * ctx_dft,
+                                    const std::string & carry_schema);
 std::string server_cache_param_digest(const common_params & params, const llama_context * ctx_tgt,
                                       const llama_context * ctx_dft);
 

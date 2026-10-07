@@ -2,6 +2,7 @@
 //   registry classification and digest, sampled model identity, measurement memo
 #include "server-disk-cache.h"
 #include "arg.h"
+#include "server-task.h"
 
 #include <atomic>
 #include <cstdio>
@@ -290,6 +291,29 @@ int main() {
             CHECK(n_tmp == 0);
         }
         fs::remove_all(dir);
+    }
+    // [TAG_CACHE_COMPAT2] descriptor_full is mandatory for own / format >= 8 entries (astra r2)
+    {
+        const std::string dk = "0123456789abcdef";
+        CHECK(server_disk_cache_desc_ok(true, 8, dk, dk));
+        CHECK(!server_disk_cache_desc_ok(true, 8, "", dk));       // own, absent => miss
+        CHECK(!server_disk_cache_desc_ok(true, 8, "fedcba9876543210", dk));
+        CHECK(!server_disk_cache_desc_ok(false, 8, "", dk));      // adopted format 8 without it => miss
+        CHECK(server_disk_cache_desc_ok(false, 7, "", dk));       // adopted pre-8: per-stream envelope checks decide
+        CHECK(!server_disk_cache_desc_ok(false, 7, "fedcba9876543210", dk));
+        CHECK(server_disk_cache_desc_ok(false, 8, dk, dk));
+    }
+    // [TAG_CACHE_COMPAT2] the RAM cache swaps in only a state of the loading contexts' descriptor
+    {
+        server_prompt_cache pc(64, 0);
+        server_prompt pr;
+        pr.tokens = server_tokens(llama_tokens{ 1, 2, 3, 4, 5, 6, 7, 8 }, false);
+        CHECK(pc.alloc(pr, 0, 0, "aaaaaaaaaaaaaaaa") != nullptr);
+        server_prompt slot;
+        const server_tokens next(llama_tokens{ 1, 2, 3, 4, 5, 6, 7, 8, 9 }, false);
+        CHECK(pc.load(slot, next, nullptr, nullptr, 0, "bbbbbbbbbbbbbbbb")); // no swap: other descriptor
+        CHECK(slot.tokens.size() == 0 && pc.states.size() == 1);
+        CHECK(server_cache_state_desc(nullptr, nullptr, "") != server_cache_state_desc(nullptr, nullptr, "mtp:1"));
     }
     // [TAG_CACHE_COMPAT2] mapped-library identity (astra r2): the device + inode of a maps line must match stat() of
     //   the path; a replaced / unlinked / missing file is unverifiable, and an unverifiable runtime has no memo key

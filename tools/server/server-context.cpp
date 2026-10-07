@@ -406,7 +406,7 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, state_desc());
         if (cur == nullptr) {
             return false;
         }
@@ -434,8 +434,13 @@ struct server_slot {
         return disk_cache.load(idx, ctx_tgt, ctx_dft, spec, id, prompt);
     }
 
+    // [TAG_CACHE_COMPAT2] the RAM cache's descriptor guard (server_cache_state_desc)
+    std::string state_desc() const {
+        return server_cache_state_desc(ctx_tgt, ctx_dft, spec ? common_speculative_state_schema(spec) : std::string());
+    }
+
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, state_desc());
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }

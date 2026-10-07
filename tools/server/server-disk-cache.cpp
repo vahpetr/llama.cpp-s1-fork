@@ -661,6 +661,12 @@ std::string server_cache_placement_identity(const common_params & p, const llama
                                 server_cache_model_placement(ctx_dft ? llama_get_model(ctx_dft) : nullptr).c_str()));
 }
 
+std::string server_cache_state_desc(const llama_context * ctx_tgt, const llama_context * ctx_dft,
+                                    const std::string & carry_schema) {
+    return h16_of("tgt:" + (ctx_tgt ? llama_state_seq_descriptor(ctx_tgt) : std::string("none")) + "\ndft:" +
+                  (ctx_dft ? llama_state_seq_descriptor(ctx_dft) : std::string("none")) + "\ncarry:" + carry_schema);
+}
+
 std::string server_cache_ctx_canon(const llama_context * ctx) {
     if (ctx == nullptr) {
         return "none";
@@ -1073,11 +1079,20 @@ std::string server_cache_measure_hash(const std::string & bytes) {
     return h16_of(bytes);
 }
 
+bool server_disk_cache_desc_ok(bool own, uint32_t version, const std::string & desc_full, const std::string & desc_key) {
+    const bool need_full = own || version >= 8;
+    return (!need_full && desc_full.empty()) || desc_full == desc_key;
+}
+
 server_disk_cache::stream_rule server_disk_cache::rule_for(const server_disk_cache_entry & e, bool tgt, bool tgt_only) const {
     stream_rule r;
-    // the writer's full descriptor, when its metadata carries one (format >= 8), must be ours: else nothing passes
-    //   (an adopt source's target-only entry: its draft differs by design, each stream's own hash decides)
-    if (!(tgt_only && !e.src.empty()) && !e.desc_full.empty() && e.desc_full != desc_key) {
+    // the writer's full descriptor must be ours, else nothing passes. Mandatory (absent / empty => miss) for an own
+    //   entry and for any format >= 8 entry (astra compat2 r2); optional only for an adopted pre-8 entry, which has none.
+    //   [TAG_ADOPT_TARGET_ONLY] an adopt source's target-only entry: its descriptor_full names its own draft, which
+    //   differs by design - still mandatory (present) at format >= 8, each stream's own full-coverage hash decides
+    const bool desc_pass = (tgt_only && !e.src.empty()) ? (e.version < 8 || !e.desc_full.empty())
+                                                       : server_disk_cache_desc_ok(e.src.empty(), e.version, e.desc_full, desc_key);
+    if (!desc_pass) {
         DSK_WRN("entry %s: written under descriptor %s, this context is %s\n", e.id.c_str(), e.desc_full.c_str(),
                 desc_key.c_str());
         return r;
@@ -1781,6 +1796,7 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     server_disk_cache_entry e;
     e.id      = random_id();
     e.version = DISK_CACHE_VERSION;
+    e.desc_full = desc_key; // [TAG_CACHE_COMPAT2] in memory as in its .meta: an own entry is checked against it
     e.adopted_from = prompt.adopted_from; // [TAG_DISK_ADOPT] provenance of a resave after an adopted load
     e.has_dft = ctx_dft != nullptr;
     // [TAG_DRAFT_PARTIAL] the prompt rows the draft history holds: all of them, or n - draft_gap for a draft-partial
