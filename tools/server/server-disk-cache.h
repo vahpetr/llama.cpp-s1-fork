@@ -136,6 +136,11 @@ struct server_disk_cache {
     std::string protect_id;
 
     int find_id(const std::string & id) const;
+
+    // [TAG_DISK_VERIFY] (Codex gate r1 A3 Major 2) check entry idx completely without touching any context: the .aux,
+    //   its checkpoint files, the .tgt / .dft maps and every block they reference (hashes). OK = verified; INVALID =
+    //   damaged, the entry is dropped (as by load()); OTHER = inconclusive (I/O), kept. Gates a capacity-driven purge.
+    server_disk_load_result verify(int idx);
     const std::string & entry_id(int idx) const { return entries[idx].id; }
     uint64_t bytes_written  = 0;
     uint64_t bytes_loaded   = 0;
@@ -227,6 +232,8 @@ struct server_disk_cache {
     server_disk_load_result load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
                                         const std::string & env_h, bool legacy_ok);
     static bool read_map_keys(const std::string & map_path, std::vector<std::string> & keys);
+    server_disk_load_result verify_stream(const std::string & map_path, const std::string & env_h, bool legacy_ok);
+    void drop_invalid(int idx); // erase an invalid entry, count it, collect what it alone referenced
     void blob_gc();
 
     std::string path(const std::string & id, const char * ext) const;

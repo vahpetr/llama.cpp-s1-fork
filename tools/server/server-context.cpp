@@ -2271,6 +2271,17 @@ private:
                     //   kept from eviction meanwhile (a victim's save can evict entries and move the others)
                     if (res == SERVER_DISK_LOAD_CAPACITY) {
                         disk_cache->protect_id = disk_cache->entry_id(idx);
+                        // [TAG_DISK_VERIFY] (Codex gate r1 A3 Major 2) the library reports no room while reading
+                        //   the stream's metadata, before the tensor blocks: only a completely verified entry
+                        //   (maps, every block hash, .aux, checkpoints) may cost the other slots a purge
+                        ret->prompt_clear();
+                        const int idx_verify = disk_cache->find_id(disk_cache->protect_id);
+                        const server_disk_load_result verified =
+                            idx_verify >= 0 ? disk_cache->verify(idx_verify) : SERVER_DISK_LOAD_INVALID;
+                        if (verified != SERVER_DISK_LOAD_OK) {
+                            SLT_WRN(*ret, "disk cache: %s did not verify, no purge\n", disk_cache->protect_id.c_str());
+                            res = verified;
+                        }
                         while (res == SERVER_DISK_LOAD_CAPACITY) {
                             ret->prompt_clear();
                             if (!try_clear_idle_slots()) {

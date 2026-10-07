@@ -967,6 +967,151 @@ int server_disk_cache::find_id(const std::string & id) const {
     return -1;
 }
 
+void server_disk_cache::drop_invalid(int idx) {
+    const std::string src = entries[idx].src;
+    for (auto & a : adopted) {
+        a.dropped += a.key == src;
+    }
+    erase(idx);
+    n_load_failed++;
+    deep_gc(); // [TAG_DISK_GC] the dropped entry's checkpoints and blocks may now be unreferenced
+    blob_gc();
+}
+
+server_disk_load_result server_disk_cache::verify_stream(const std::string & map_path, const std::string & env_h,
+                                                         bool legacy_ok) {
+    std::ifstream fm;
+    const sealed_status st_open = open_for_read(map_path, fm);
+    if (st_open != SEALED_OK) {
+        return st_open == SEALED_IO ? SERVER_DISK_LOAD_OTHER : SERVER_DISK_LOAD_INVALID;
+    }
+    uint32_t magic = 0;
+    uint64_t n_total = 0;
+    if (!get(fm, magic) || (magic != MAP_ENV_MAGIC && !(legacy_ok && magic == MAP_MAGIC))) {
+        return fm.bad() ? SERVER_DISK_LOAD_OTHER : SERVER_DISK_LOAD_INVALID;
+    }
+    if (magic == MAP_ENV_MAGIC) {
+        uint32_t ver = 0;
+        std::string h;
+        if (!get(fm, ver) || ver != ENVELOPE_VERSION || !get_str(fm, h) || h != env_h || !get(fm, n_total) || n_total == 0) {
+            return fm.bad() ? SERVER_DISK_LOAD_OTHER : SERVER_DISK_LOAD_INVALID;
+        }
+    }
+    uint64_t n_seen = 0;
+    std::vector<uint8_t> buf;
+    try {
+        while (true) {
+            uint8_t kind = 0;
+            if (!get(fm, kind)) {
+                break;
+            }
+            if (kind == 255) {
+                return n_total == 0 || n_seen == n_total ? SERVER_DISK_LOAD_OK : SERVER_DISK_LOAD_INVALID;
+            }
+            if (kind == 0) {
+                uint64_t n = 0;
+                std::string h;
+                if (!get(fm, n) || n > (1ull << 32)) {
+                    break;
+                }
+                buf.resize(n);
+                if (!fm.read(reinterpret_cast<char *>(buf.data()), n) || !get_str(fm, h)) {
+                    break;
+                }
+                if (hash_key(buf.data(), n) != h) {
+                    DSK_WRN("%s: inline segment corrupt\n", map_path.c_str());
+                    return SERVER_DISK_LOAD_INVALID;
+                }
+                n_seen += n;
+                continue;
+            }
+            std::string key;
+            if (kind != 1 || !get_str(fm, key)) {
+                break;
+            }
+            const auto it = blobs.find(key);
+            if (it == blobs.end()) {
+                DSK_WRN("block %s is missing\n", key.c_str());
+                return SERVER_DISK_LOAD_INVALID;
+            }
+            buf.resize(it->second);
+            std::ifstream fb;
+            const sealed_status st = open_for_read(blob_path(key), fb);
+            const bool got = st == SEALED_OK && (bool) fb.read(reinterpret_cast<char *>(buf.data()), buf.size());
+            if (st == SEALED_IO || (st == SEALED_OK && !got && fb.bad())) {
+                DSK_WRN("block %s: read error, keeping it\n", key.c_str());
+                return SERVER_DISK_LOAD_OTHER;
+            }
+            if (!got || hash_key(buf.data(), buf.size()) != key) {
+                DSK_WRN("block %s is corrupt, dropping it\n", key.c_str());
+                std::error_code ec;
+                fs::remove(blob_path(key), ec);
+                blob_bytes -= it->second;
+                blobs.erase(it);
+                return SERVER_DISK_LOAD_INVALID;
+            }
+            n_seen += buf.size();
+        }
+    } catch (const std::bad_alloc &) {
+        return SERVER_DISK_LOAD_OTHER;
+    }
+    // the map ended before its end marker
+    return fm.bad() ? SERVER_DISK_LOAD_OTHER : SERVER_DISK_LOAD_INVALID;
+}
+
+server_disk_load_result server_disk_cache::verify(int idx) {
+    auto & e = entries[idx];
+    const std::string id = e.id;
+
+    server_disk_load_result res = SERVER_DISK_LOAD_OK;
+    {
+        std::list<common_prompt_checkpoint> checkpoints;
+        std::vector<uint8_t> spec_state;
+        std::vector<server_deep_ref> deep;
+        std::vector<std::string> keys;
+        sealed_status st = SEALED_OK;
+        try {
+            st = read_aux(path(id, ".aux"), true, &checkpoints, &spec_state, deep, keys);
+        } catch (const std::bad_alloc &) {
+            st = SEALED_IO;
+        }
+        if (st == SEALED_IO) {
+            res = SERVER_DISK_LOAD_OTHER;
+        } else if (st != SEALED_OK || keys.size() != checkpoints.size()) {
+            res = SERVER_DISK_LOAD_INVALID;
+        }
+        // the prompt checkpoints load() restores: present in the index and sealed intact
+        for (size_t i = 0; res == SERVER_DISK_LOAD_OK && i < keys.size(); i++) {
+            const auto it = ckpts.find(keys[i]);
+            if (it == ckpts.end()) {
+                res = SERVER_DISK_LOAD_INVALID;
+                break;
+            }
+            std::string body;
+            const sealed_status sc = read_sealed(ckpt_path(keys[i]), body);
+            if (sc != SEALED_OK) {
+                res = sc == SEALED_IO ? SERVER_DISK_LOAD_OTHER : SERVER_DISK_LOAD_INVALID;
+            }
+        }
+    }
+    if (res == SERVER_DISK_LOAD_OK) {
+        res = verify_stream(path(id, ".tgt"), desc_tgt_h, !e.src.empty());
+    }
+    if (res == SERVER_DISK_LOAD_OK && e.has_dft) {
+        res = verify_stream(path(id, ".dft"), desc_dft_h, !e.src.empty());
+    }
+
+    if (res == SERVER_DISK_LOAD_INVALID) {
+        DSK_WRN("entry %s: verification failed (invalid), dropping it\n", id.c_str());
+        drop_invalid(idx);
+    } else if (res == SERVER_DISK_LOAD_OTHER) {
+        DSK_WRN("entry %s: verification inconclusive, keeping it\n", id.c_str());
+        n_load_other++;
+    }
+    refresh_status();
+    return res;
+}
+
 server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt, llama_context * ctx_dft,
                                                 common_speculative * spec, int32_t id_slot, server_prompt & prompt) {
     auto & e = entries[idx];
@@ -1029,13 +1174,7 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
         if (res == SERVER_DISK_LOAD_INVALID) {
             DSK_WRN("entry %s: state load failed (invalid), dropping it%s\n", e.id.c_str(),
                     e.src.empty() ? "" : " from the adopt sources (its files stay)");
-            for (auto & a : adopted) {
-                a.dropped += a.key == e.src;
-            }
-            erase(idx);
-            n_load_failed++;
-            deep_gc(); // [TAG_DISK_GC] the dropped entry's checkpoints and blocks may now be unreferenced
-            blob_gc();
+            drop_invalid(idx);
         } else if (res == SERVER_DISK_LOAD_CAPACITY) {
             DSK_WRN("entry %s: state load failed (no room in the KV cache), keeping it\n", e.id.c_str());
             n_load_capacity++;
