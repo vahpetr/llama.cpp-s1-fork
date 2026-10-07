@@ -1920,10 +1920,12 @@ private:
                 params_base.cache_disk_ckpt_ratio, params_base.checkpoint_min_step, params_base.cache_disk_ckpt_max);
             disk_cache->live_refs = [this]() { return live_deep_refs(); };
             disk_cache->adopt_keys = string_split<std::string>(params_base.cache_disk_adopt, ',');
-            disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types));
+            disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types) +
+                                      "/" + common_speculative_state_schema(spec.get()));
             disk_cache->init();
         } else if (disk_cache) {
-            disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types));
+            disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types) +
+                                      "/" + common_speculative_state_schema(spec.get()));
             disk_cache->revalidate(server_disk_cache_fingerprint(params_base, n_ctx));
         }
 
@@ -4619,6 +4621,11 @@ private:
                                             restored = it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
                                         }
                                     }
+                                    if (!do_reset && restored && !common_speculative_set_state(spec.get(), slot.id, it->data_spec)) {
+                                        // the draft's speculative state did not restore (Codex gate r2 Major 1): the same miss
+                                        common_speculative_reset_state(spec.get(), slot.id);
+                                        restored = false;
+                                    }
                                     if (!do_reset && !restored) {
                                         // [TAG_CKPT_LOAD_CHECKED] (Codex gate r2 Blocker 1) the stored state's length differs from
                                         //   what the context consumed: a cache miss, not an abort - clear the partially restored
@@ -4649,9 +4656,6 @@ private:
                                         do_reset = true;
                                     }
                                     if (!do_reset) {
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
-
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                         slot.b0_ckpt_n_tokens = it->n_tokens;

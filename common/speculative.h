@@ -87,7 +87,12 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+// false: the blob was not restored (no implementation claims it, or the claiming one rejects its width / size);
+//   an empty blob restores nothing and is true
+bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+
+// the per-seq carry schemas of the stateful implementations (schema id, tag and row width), "," joined; "" = none
+std::string common_speculative_state_schema(const common_speculative * spec);
 
 // [TAG_SPEC_RESET] forget the per-seq carry of every implementation (the seq's target state was replaced)
 void common_speculative_reset_state(common_speculative * spec, llama_seq_id seq_id);

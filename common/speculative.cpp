@@ -174,7 +174,17 @@ struct common_speculative_impl {
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
-    virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+    // (Codex gate r2 Major 1) restoration status: SET_STATE_NOT_MINE (another implementation's blob, nothing
+    //   changed), SET_STATE_OK (restored), SET_STATE_FAILED (this implementation's tag but not restorable: wrong
+    //   width / size; nothing changed)
+    virtual int set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) { return SET_STATE_NOT_MINE; }
+    // the carry schema this implementation writes with get_state ("" = it has no per-seq state): goes into the disk
+    //   cache's state descriptor, so a change of schema or width is a descriptor mismatch, not a silent misload
+    virtual std::string state_schema() const { return ""; }
+
+    static constexpr int SET_STATE_NOT_MINE = 0;
+    static constexpr int SET_STATE_OK       = 1;
+    static constexpr int SET_STATE_FAILED   = -1;
 
     // [TAG_SPEC_RESET] (optional) forget the per-seq cross-batch carry, as for a sequence that never ran: used when
     //   the target state of the seq is replaced by one this drafter never saw (legacy /slots restore). set_state()
@@ -901,12 +911,16 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return true;
     }
 
-    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+    std::string state_schema() const override {
+        return need_boundary_stash() ? string_format("eagle3-boundary:%08x-f32x%d", BOUNDARY_G_MAGIC, n_embd_dec) : "";
+    }
+
+    int set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
         if (!need_boundary_stash()) {
-            return;
+            return SET_STATE_NOT_MINE;
         }
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || data.empty()) {
-            return;
+            return SET_STATE_NOT_MINE;
         }
         const size_t hdr = 2 * sizeof(uint32_t) + sizeof(llama_pos);
         uint32_t magic = 0;
@@ -917,13 +931,14 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
         if (magic != BOUNDARY_G_MAGIC) {
             // another implementation's blob (the broadcast) or a legacy untagged one: the boundary keeps its value
+            //   (a legacy untagged blob is claimed by no implementation: the caller treats it as not restorable)
             LOG_DBG("%s: not an eagle3 boundary blob (magic %08x, %zu bytes), ignored\n", __func__, magic, data.size());
-            return;
+            return SET_STATE_NOT_MINE;
         }
         if (width != (uint32_t) n_embd_dec || data.size() != hdr + (size_t) n_embd_dec * sizeof(float)) {
             LOG_WRN("%s: eagle3 boundary width mismatch (%u, %zu bytes, expected %d), boundary not restored\n", __func__,
                     width, data.size(), n_embd_dec);
-            return;
+            return SET_STATE_FAILED;
         }
 
         llama_pos pos = -1;
@@ -932,6 +947,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         pending_pos_last[seq_id] = pos;
         pending_g_last[seq_id].resize(n_embd_dec);
         std::memcpy(pending_g_last[seq_id].data(), data.data() + hdr, (size_t) n_embd_dec * sizeof(float));
+        return SET_STATE_OK;
     }
 
     void reset_state(llama_seq_id seq_id) override { // [TAG_SPEC_RESET] no deferred boundary, no verify rows
@@ -1887,9 +1903,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
-    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+    std::string state_schema() const override {
+        return string_format("mtp-pending-h:%08x-f32x%d", PENDING_H_MAGIC, n_embd);
+    }
+
+    int set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-            return;
+            return SET_STATE_NOT_MINE;
         }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         uint32_t magic = 0;
@@ -1902,10 +1922,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!data.empty() && magic == PENDING_H_MAGIC) {
                 LOG_WRN("%s: MTP carry size mismatch (%zu bytes, expected %zu), carry not restored\n", __func__,
                         data.size(), sizeof(uint32_t) + row_bytes);
+                return SET_STATE_FAILED;
             }
-            return;
+            return SET_STATE_NOT_MINE;
         }
         std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(uint32_t), row_bytes);
+        return SET_STATE_OK;
     }
 
     // [TAG_SPEC_RESET] the carrier as at construction (zero row, like LLAMA_MTP_CARRIER_ZERO at a sequence start), no
@@ -3087,14 +3109,40 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
     return false;
 }
 
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
-    if (spec == nullptr) {
-        return;
+bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+    if (spec == nullptr || data.empty()) {
+        return true; // nothing to restore
     }
 
+    // (Codex gate r2 Major 1) one implementation must claim and restore the blob; a claimed-but-rejected blob or one
+    //   nobody claims (a legacy untagged eagle3 boundary, another schema) is a failed restoration
+    bool ok = false;
+    bool failed = false;
     for (auto & impl : spec->impls) {
-        impl->set_state(seq_id, data);
+        const int r = impl->set_state(seq_id, data);
+        ok     = ok     || r == common_speculative_impl::SET_STATE_OK;
+        failed = failed || r == common_speculative_impl::SET_STATE_FAILED;
     }
+    if (!ok || failed) {
+        LOG_WRN("%s: speculative state of seq %d not restored (%zu bytes, %s)\n", __func__, seq_id, data.size(),
+                failed ? "rejected" : "no implementation claims it");
+        return false;
+    }
+    return true;
+}
+
+std::string common_speculative_state_schema(const common_speculative * spec) {
+    std::string res;
+    if (spec == nullptr) {
+        return res;
+    }
+    for (const auto & impl : spec->impls) {
+        const std::string sc = impl->state_schema();
+        if (!sc.empty()) {
+            res += (res.empty() ? "" : ",") + sc;
+        }
+    }
+    return res;
 }
 
 void common_speculative_reset_state(common_speculative * spec, llama_seq_id seq_id) {

@@ -1316,8 +1316,15 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
         return res;
     }
 
-    if (spec && !spec_state.empty()) {
-        common_speculative_set_state(spec, id_slot, spec_state);
+    if (spec && !spec_state.empty() && !common_speculative_set_state(spec, id_slot, spec_state)) {
+        // (Codex gate r2 Major 1) a half-restored state (streams in, carry not) is worse than a miss: the entry is
+        //   invalid (an adopt source's files stay), the caller clears the slot
+        common_speculative_reset_state(spec, id_slot);
+        DSK_WRN("entry %s: speculative carry not restorable, dropping it%s\n", e.id.c_str(),
+                e.src.empty() ? "" : " from the adopt sources (its files stay)");
+        drop_invalid(idx);
+        refresh_status();
+        return SERVER_DISK_LOAD_INVALID;
     }
 
     prompt.tokens      = e.tokens.clone();
@@ -2147,8 +2154,9 @@ json server_disk_cache::status() const {
 }
 
 void server_disk_cache::set_descriptor(llama_context * ctx_tgt, llama_context * ctx_dft, const std::string & spec_types) {
-    // the speculative carry: implementation names + the MTP pending-hidden schema (magic "MPTH", one f32 row of n_embd)
-    const std::string srv = string_format("|carry=%s/mtp-pending-h:4854504d-f32|tokens=%u|mtmd=%d|ckpt=%u",
+    // the speculative carry: implementation names + each stateful implementation's schema, tag and row width
+    //   (common_speculative_state_schema, Codex gate r2 Major 1)
+    const std::string srv = string_format("|carry=%s|tokens=%u|mtmd=%d|ckpt=%u",
                                           spec_types.c_str(), SERVER_TOKENS_STATE_VERSION, MTMD_SERIALIZATION_VERSION,
                                           SERVER_CKPT_SEMANTICS_REV);
     const auto h16 = [](const std::string & s) {
