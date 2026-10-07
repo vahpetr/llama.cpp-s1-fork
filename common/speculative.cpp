@@ -3247,7 +3247,7 @@ void common_spec_tput_eval(const std::vector<float> & p, int n, const common_spe
     if (n <= 0) {
         return;
     }
-    cost += c.d0 + c.d1*(double) n;
+    cost += c.d0 + c.d1*(double) n + c.k0 + c.k1*(double) n;
     double P = 1.0; // P_a: the first a drafted tokens accepted
     for (int a = 0; a < n; ++a) {
         const double pa = a < (int) p.size() ? std::min(std::max((double) p[a], 0.0), 1.0) : 1.0;

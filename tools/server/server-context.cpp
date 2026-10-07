@@ -4076,6 +4076,7 @@ private:
         std::vector<int> replay_ids;
         int64_t replay_restore_us = 0;
         int64_t restore_us        = 0;
+        int64_t ckpt_us           = 0; // tput: the per-round checkpoint save + draft-context restore of a drafting round
     } spec_rt;
 
     // [TAG_SPEC_DRAFT_POLICY] one single-slot pure round -> the cost fits
@@ -4091,14 +4092,17 @@ private:
             return;
         }
         const int64_t t_host  = std::max<int64_t>(0, t_round - spec_rt.draft_us - spec_rt.catchup_us - spec_rt.verify_us -
-                                                     spec_rt.restore_us);
+                                                     spec_rt.restore_us - spec_rt.ckpt_us);
         auto & f = spec_tput_fits.at(spec_rt.n_kv);
         if (!spec_rt.slot_ids.empty()) {
-            f.draft.add(spec_rt.n_draft_req, spec_rt.draft_us / 1e3);
+            f.draft .add(spec_rt.n_draft_req, spec_rt.draft_us / 1e3);
+            f.ckpt  .add(spec_rt.n_draft_req, spec_rt.ckpt_us  / 1e3);
+            f.host_d.add(spec_rt.n_rows,      t_host           / 1e3);
+        } else {
+            f.host  .add(0.0,                 t_host           / 1e3); // the host intercept: zero rounds only
         }
         f.verify .add(spec_rt.n_rows, spec_rt.verify_us  / 1e3);
         f.catchup.add(spec_rt.n_rows, spec_rt.catchup_us / 1e3);
-        f.host   .add(0.0,            t_host             / 1e3);
     }
 
     // [TAG_SPEC_DRAFT_POLICY] the draft length of this round for a slot that may draft up to n_draft_max (0 = true zero)
@@ -4114,10 +4118,19 @@ private:
         // the fits of this slot's depth bucket only (samples from other depths never price this one); a bucket
         //   that is not warm yet takes the prior path below (the configured length, cooldown still on)
         const auto & f = spec_tput_fits.at(n_kv);
+        // the host intercept from zero rounds (no draft, no checkpoint); while none were measured at this depth, the
+        //   drafting rounds' host fit (checkpoint time excluded) at one row
+        double h_a = 0.0;
+        bool ok_host = f.host.get(c.host, h_b, 0.0);
+        if (!ok_host && f.host_d.get(h_a, h_b, 0.0)) {
+            c.host  = h_a + h_b;
+            ok_host = true;
+        }
         const bool ok = f.draft  .get(c.d0, c.d1, 0.5*t_tok) &&
+                        f.ckpt   .get(c.k0, c.k1, 0.0) &&
                         f.verify .get(c.v0, c.v1, 0.5*t_tok) &&
                         f.catchup.get(c.c0, c.c1, 0.0) &&
-                        f.host   .get(c.host, h_b, 0.0);
+                        ok_host;
         // the rollback cycle (restore + replay pass of r rows); before its fit is usable: a replay pass priced as a
         //   plain round of r rows (no restore)
         double r_b = 0.0;
@@ -4143,8 +4156,8 @@ private:
         }
         if (trace > 0 && n != slot.spec_n_max_last) {
             SLT_INF(slot, "draft policy tput: %d -> %d (rule %d, %s, cooldown %d, n_kv %d bucket %d, draft %.2f+%.2fn, verify %.2f+%.2fm, "
-                    "catch-up %.2f+%.2fm, host %.2f ms, rollback %.2f+%.2fr free %d, %.4f tok/ms)\n", slot.spec_n_max_last, n, n_rule,
-                    ok ? "measured" : "warm-up", slot.spec_cd.c, n_kv, common_spec_tput_bucket(n_kv), c.d0, c.d1, c.v0, c.v1, c.c0, c.c1, c.host,
+                    "catch-up %.2f+%.2fm, ckpt %.2f+%.2fn, host %.2f ms, rollback %.2f+%.2fr free %d, %.4f tok/ms)\n", slot.spec_n_max_last, n, n_rule,
+                    ok ? "measured" : "warm-up", slot.spec_cd.c, n_kv, common_spec_tput_bucket(n_kv), c.d0, c.d1, c.v0, c.v1, c.c0, c.c1, c.k0, c.k1, c.host,
                     c.r0, c.r1, c.n_rb_free, rate);
         }
         slot.spec_n_max_last = n;
@@ -4269,6 +4282,7 @@ private:
             spec_rt.replay_ids.clear();
             spec_rt.replay_restore_us = 0;
             spec_rt.restore_us        = 0;
+            spec_rt.ckpt_us           = 0;
         }
 
         try {
@@ -4512,6 +4526,8 @@ private:
                             }
                         }
 
+                        const int64_t t_ckpt0 = n_tput > 0 ? ggml_time_us() : 0; // [TAG_SPEC_DRAFT_POLICY] ckpt cost
+
                         slot.spec_ckpt.update_pos(
                                 slot.prompt.n_tokens(),
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
@@ -4519,6 +4535,10 @@ private:
 
                         if (use_ckpt_dft) {
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                        }
+
+                        if (n_tput > 0) {
+                            spec_rt.ckpt_us += ggml_time_us() - t_ckpt0;
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -4629,6 +4649,11 @@ private:
                 spec_rt.n_rows_expect = 1 + (int) draft.size();
             }
 
+            // [TAG_SPEC_DRAFT_POLICY] tput: the draft-context restore and the per-round checkpoints below are the
+            //   checkpoint cost of a drafting round (charged to n > 0 only, not host time)
+            const bool    tput_ckpt = params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT;
+            const int64_t t_ckpt0   = tput_ckpt ? ggml_time_us() : 0;
+
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
@@ -4677,6 +4702,10 @@ private:
                 if (use_ckpt_dft) {
                     ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
                 }
+            }
+
+            if (tput_ckpt) {
+                spec_rt.ckpt_us += ggml_time_us() - t_ckpt0;
             }
         });
 

@@ -174,6 +174,31 @@ static void test_depth_buckets() {
           "the shallow bucket's fit is untouched by deep rounds");
 }
 
+// (v51 r1, D Major) the checkpoint save/restore is charged to drafting candidates only, not as a common intercept
+static void test_ckpt_cost() {
+    common_spec_tput_cost c;
+    c.d0 = 1.0; c.d1 = 2.2; c.v0 = 25.0; c.v1 = 1.5; c.c0 = 0.8; c.c1 = 0.2; c.host = 1.2;
+    common_spec_tput_cost k = c;
+    k.k0 = 6.0; k.k1 = 0.5;
+    double g0 = 0.0, t0 = 0.0, g1 = 0.0, t1 = 0.0;
+    common_spec_tput_eval({ 0.5f }, 0, c, g0, t0);
+    common_spec_tput_eval({ 0.5f }, 0, k, g1, t1);
+    check(t0 == t1, "n = 0 pays no checkpoint");
+    for (int n = 1; n <= 4; ++n) {
+        common_spec_tput_eval({ 0.5f, 0.5f, 0.5f, 0.5f }, n, c, g0, t0);
+        common_spec_tput_eval({ 0.5f, 0.5f, 0.5f, 0.5f }, n, k, g1, t1);
+        check(std::fabs(t1 - t0 - (6.0 + 0.5*n)) < 1e-12, "n > 0 pays k0 + k1*n");
+    }
+    // the same 6.5 ms as a common host intercept (the old pooling) keeps drafting; charged to n > 0 it flips to 0
+    const std::vector<float> p = { 0.3f, 0.5f, 0.5f };
+    common_spec_tput_cost pooled = c;
+    pooled.host += 6.5;
+    const int n_pooled = common_spec_tput_best_n(p, 3, pooled);
+    const int n_sep    = common_spec_tput_best_n(p, 3, k);
+    printf("ckpt cost: p = 0.3/0.5/0.5, pooled into host n* = %d, charged to n > 0 n* = %d\n", n_pooled, n_sep);
+    check(n_pooled > 0 && n_sep == 0, "a checkpoint cost the draft cannot pay -> true zero");
+}
+
 static void test_cooldown() {
     common_spec_cooldown cd;
 
@@ -236,6 +261,7 @@ int main() {
     test_rule();
     test_rollback_cycle();
     test_depth_buckets();
+    test_ckpt_cost();
     test_cooldown();
     if (n_fail) {
         printf("test-spec-draft-policy: %d failures (%d checks ok)\n", n_fail, n_ok);

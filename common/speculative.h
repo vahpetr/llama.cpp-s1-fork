@@ -135,7 +135,8 @@ common_speculative_init_result_ptr common_speculative_init_from_params(common_pa
 // [TAG_SPEC_DRAFT_POLICY] (v51) --spec-draft-policy tput: the throughput-max draft length (server only).
 //   One round with n drafted tokens commits 1 + sum_{i<=n} P_i tokens on average (P_i = prod_{j<=i} p_j, p_j the
 //   per-position conditional acceptance) and costs T_draft(n) + T_verify(n+1) + T_catchup(n+1) + T_host; n = 0 is a
-//   plain one-token decode (no draft call: T_draft(0) = 0). All costs in ms, affine in the row count.
+//   plain one-token decode (no draft call: T_draft(0) = 0, no checkpoint: T_ckpt(0) = 0). All costs in ms, affine in
+//   the row count; T_draft(n) below includes the checkpoint term k0 + k1*n.
 //   Complete cycle (v51 r1, Codex C Major): a round whose rejection rolls back deeper than n_rb_free (a FULL target:
 //   every rejection, an RS target: deeper than n_rs_seq) restores the per-round checkpoint and replays the accepted
 //   prefix in the next pass. With a accepted (first rejection at position a+1, probability q_a = P_a*(1 - p_{a+1}))
@@ -147,7 +148,9 @@ struct common_spec_tput_cost {
     double d0 = 0.0, d1 = 0.0; // the draft call for n >= 1 tokens: d0 + d1*n
     double v0 = 0.0, v1 = 0.0; // the target decode of m = n+1 rows: v0 + v1*m
     double c0 = 0.0, c1 = 0.0; // the MTP process() catch-up of m rows: c0 + c1*m
-    double host = 0.0;         // per-round host time
+    double k0 = 0.0, k1 = 0.0; // the per-round checkpoint save + draft-context restore for n >= 1: k0 + k1*n (n = 0
+                               //   takes none: not part of the host intercept, v51 r1 Codex D Major)
+    double host = 0.0;         // per-round host time (from zero rounds: no draft, no checkpoint)
     double r0 = 0.0, r1 = 0.0; // a rollback cycle: checkpoint restore + the replay pass of r = a+2 rows: r0 + r1*r
     int    n_rb_free = 1 << 30; // the deepest rollback that needs no restore (FULL: 0, RS: n_rs_seq, else never)
 };
@@ -185,7 +188,9 @@ struct common_spec_tput_fits {
     common_spec_ew_line draft;   // draft wall vs drafted n
     common_spec_ew_line verify;  // target decode wall vs batch rows
     common_spec_ew_line catchup; // MTP process() wall vs batch rows
-    common_spec_ew_line host;    // the rest of the pass
+    common_spec_ew_line ckpt;    // the checkpoint save + draft-context restore of a drafting round vs drafted n
+    common_spec_ew_line host;    // the rest of a zero round (the host intercept)
+    common_spec_ew_line host_d;  // the rest of a drafting round (checkpoint excluded) vs rows: fallback for host
     common_spec_ew_line rb;      // the rollback cycle (restore + replay pass) vs the replay rows
 };
 

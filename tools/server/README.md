@@ -353,7 +353,8 @@ enters the state descriptor and the `--cache-disk` compat key: entries saved wit
 maximises the committed tokens per ms, `(1 + sum_{i<=n} P_i) / (T_draft(n) + T_verify(n+1) + T_catchup(n+1) + T_host)`:
 P_i from the per-position acceptance EMA (an empty or short draft counts as a failure at the stop position), the costs
 from exponentially weighted fits of the server's own single-slot round times (draft call vs n, target decode and MTP
-catch-up vs batch rows, host rest), kept per KV-depth bucket (log2: [0, 8k), [8k, 16k), ... 107k -> 4, 524k -> 7, 1M -> 8),
+catch-up vs batch rows, the per-round checkpoint save + draft-context restore vs n (charged to n > 0 only), the host
+intercept from zero rounds only (drafting rounds' host, checkpoint excluded, until a zero round was seen)), kept per KV-depth bucket (log2: [0, 8k), [8k, 16k), ... 107k -> 4, 524k -> 7, 1M -> 8),
 so a deep slot is priced only from rounds at its own depth. The prior path: until the slot's bucket has 8 rounds of its
 own the slot drafts n-max (the cooldown still applies); other buckets are never borrowed. A FULL / deep-RS rejection's
 restore + replay pass is priced too (its own fit, charged to the round with the replay's extra token; prior until warm:
