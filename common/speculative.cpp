@@ -875,6 +875,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
     }
 
+    // [TAG_STATE_DESCRIPTOR] (Hermes gate Minor 3) the boundary blob is self-identifying - magic, row width, pos,
+    //   row - like MTP's "MPTH" carry: common_speculative_set_state()'s broadcast hands every implementation the same
+    //   blob, and a size match alone (n_embd == n_embd_dec) would install MTP's carry row as the boundary vector
+    static constexpr uint32_t BOUNDARY_G_MAGIC = 0x47423345; // "E3BG"
+
     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
         if (!need_boundary_stash()) {
             return false;
@@ -885,10 +890,14 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
         const llama_pos          pos = pending_pos_last[seq_id];
         const std::vector<float> & g = pending_g_last[seq_id];
+        const uint32_t       width = (uint32_t) g.size();
 
-        data.resize(sizeof(llama_pos) + g.size() * sizeof(float));
-        std::memcpy(data.data(),                     &pos,     sizeof(llama_pos));
-        std::memcpy(data.data() + sizeof(llama_pos), g.data(), g.size() * sizeof(float));
+        const size_t hdr = 2 * sizeof(uint32_t) + sizeof(llama_pos);
+        data.resize(hdr + g.size() * sizeof(float));
+        std::memcpy(data.data(),                        &BOUNDARY_G_MAGIC, sizeof(uint32_t));
+        std::memcpy(data.data() + sizeof(uint32_t),     &width,            sizeof(uint32_t));
+        std::memcpy(data.data() + 2 * sizeof(uint32_t), &pos,              sizeof(llama_pos));
+        std::memcpy(data.data() + hdr,                  g.data(),          g.size() * sizeof(float));
         return true;
     }
 
@@ -896,19 +905,33 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (!need_boundary_stash()) {
             return;
         }
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || data.empty()) {
             return;
         }
-        if (data.size() != sizeof(llama_pos) + (size_t) n_embd_dec * sizeof(float)) {
+        const size_t hdr = 2 * sizeof(uint32_t) + sizeof(llama_pos);
+        uint32_t magic = 0;
+        uint32_t width = 0;
+        if (data.size() >= hdr) {
+            std::memcpy(&magic, data.data(),                    sizeof(uint32_t));
+            std::memcpy(&width, data.data() + sizeof(uint32_t), sizeof(uint32_t));
+        }
+        if (magic != BOUNDARY_G_MAGIC) {
+            // another implementation's blob (the broadcast) or a legacy untagged one: the boundary keeps its value
+            LOG_DBG("%s: not an eagle3 boundary blob (magic %08x, %zu bytes), ignored\n", __func__, magic, data.size());
+            return;
+        }
+        if (width != (uint32_t) n_embd_dec || data.size() != hdr + (size_t) n_embd_dec * sizeof(float)) {
+            LOG_WRN("%s: eagle3 boundary width mismatch (%u, %zu bytes, expected %d), boundary not restored\n", __func__,
+                    width, data.size(), n_embd_dec);
             return;
         }
 
         llama_pos pos = -1;
-        std::memcpy(&pos, data.data(), sizeof(llama_pos));
+        std::memcpy(&pos, data.data() + 2 * sizeof(uint32_t), sizeof(llama_pos));
 
         pending_pos_last[seq_id] = pos;
         pending_g_last[seq_id].resize(n_embd_dec);
-        std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
+        std::memcpy(pending_g_last[seq_id].data(), data.data() + hdr, (size_t) n_embd_dec * sizeof(float));
     }
 
     void reset_state(llama_seq_id seq_id) override { // [TAG_SPEC_RESET] no deferred boundary, no verify rows
