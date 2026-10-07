@@ -612,6 +612,11 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     }
 
     for (const auto & ckpt : prompt.checkpoints) {
+        // [TAG_NONSPLIT_REPLACE] a checkpoint must lie inside this prompt (its key is a prefix of these tokens)
+        if (ckpt.n_tokens < 0 || ckpt.n_tokens > (int64_t) n) {
+            DSK_WRN("a checkpoint at %" PRId64 " tokens lies outside the %zu-token prompt, not saving\n", ckpt.n_tokens, n);
+            return false;
+        }
         if ((ckpt.flags_tgt | ckpt.flags_dft) & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
             DSK_WRN("%s", "a checkpoint lives on the device, not saving\n");
             return false;

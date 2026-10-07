@@ -4205,6 +4205,12 @@ private:
                                 slot.release();
                                 return;
                             }
+
+                            // [TAG_NONSPLIT_REPLACE] n_past stays 0: the whole sequence is replaced, so the previous
+                            //   conversation's checkpoints, deep refs and pin go before the new tokens are observable
+                            slot.prompt.checkpoints.clear();
+                            slot.prompt.deep.clear();
+                            slot.ckpt_pinned_n_tokens = -1;
                         } else {
                             if (slot.task->n_tokens() >= slot.n_ctx) {
                                 send_error(slot,
