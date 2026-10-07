@@ -103,7 +103,24 @@ struct llama_qsa_census_flags {
 // (cell_blk [n_kv]) and the rope positions: blk_pos[sec*pos_stride + b] (the caller zero-fills them)
 void llama_qsa_census_full(const llama_kv_cells & cells, bool is_pos_2d, int64_t n_kv, int64_t n_blocks, int64_t r,
                            bool blk_bias, int32_t * cell_blk, int32_t * blk_cells, int32_t * blk_pos, int64_t pos_stride,
-                           llama_qsa_census_stream & cs, llama_qsa_census_flags * flags = nullptr);
+                           llama_qsa_census_stream & cs, llama_qsa_census_flags * flags = nullptr, int64_t phase = 0);
+
+// [TAG_MTP_QSA_PHASE] LLAMA_MTP_QSA_PHASE=1 (default 0, read once per process; honoured only in the MTP draft memory,
+// i.e. an indexer cache that holds no trunk layer): the reference block phase for the sparse MTP draft (M1 of
+// docs/verification/2026-10-07-mtp-indexer-parity.md). The draft stores e_k = (h_{k-1}, x_k) at position k plus a carrier
+// row at 0; SGLang stores e_k at k - 1. With phase 1 every census works on idx = pos - 1: bucket (pos - 1)/r, block rope
+// start pb*r + 1, tail start (q/r)*r + 1 - the reference's 4-blocks and tail. The carrier (idx -1) has no block, ever,
+// and is handled as the reference's absent entry: in both selection forms it goes to the second unused block id, which
+// the bias scores -inf (when no second unused id exists - the cache full to its last block - it keeps the tail boost of
+// the unpooled cells). The dense paths (below LLAMA_QSA_MIN_KV, the catch-up) still attend it, as today.
+// Phase 0 is today's code, byte for byte.
+bool llama_mtp_qsa_phase_env();
+
+// [TAG_MTP_QSA_PHASE] the census index of a cell or query is its position (rank, for a ranked census) minus the phase;
+// its bucket is qsa_idx_bucket (-1 for the carrier's index -1, which has no block). The tail of a query at census
+// index qi starts at llama_qsa_tail_start(qi, r) (qi = -1 -> 0); every block key (bid_idx) is a census index too.
+static inline int64_t llama_qsa_idx_bucket(int64_t idx, int64_t r) { return idx < 0 ? -1 : idx/r; }
+static inline int64_t llama_qsa_tail_start(int64_t qi, int64_t r)  { return (qi + 1)/r*r; }
 
 //
 // [TAG_QSA_POOLED_CACHE] (M3 v1) the pooled-key cache
@@ -132,6 +149,7 @@ struct llama_qsa_pooled_store {
     uint32_t n_stream = 0;
     uint32_t n_slots  = 0;   // ceil(kv_size/ratio)
     uint32_t n_rows   = 0;   // n_slots + 1 (the spare row)
+    int32_t  phase    = 0;   // [TAG_MTP_QSA_PHASE] 0 or 1, the memory's census phase
 
     // il -> F32 [idx_dim, n_rows*n_stream]
     std::map<int32_t, ggml_tensor *> layers;
@@ -441,6 +459,9 @@ public:
     // n_seq_max <= 32): the per-block bias travels as two small tables instead of the [n_blocks, n_tps] plane
     bool qsa_compact_bias() const { return qsa_compact; }
 
+    // [TAG_MTP_QSA_PHASE] the census phase of this memory: 1 for the MTP draft memory under LLAMA_MTP_QSA_PHASE=1, else 0
+    int32_t qsa_phase() const { return qsa_phase_v; }
+
 private:
     // [TAG_QSA_POOLED_CACHE] drop the derived entries of seq_id's stream (every stream if seq_id < 0)
     void qsa_store_invalidate(llama_seq_id seq_id);
@@ -465,6 +486,9 @@ private:
     // cache it replaces - partial seq_rm, positions and state (PARTIAL_ONLY ignored, as llama_kv_cache does) come from
     // the attention + indexer caches; the layerless recurrent cache is skipped
     bool recr_none = false;
+
+    // [TAG_MTP_QSA_PHASE]
+    int32_t qsa_phase_v = 0;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {

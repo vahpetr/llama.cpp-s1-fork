@@ -17,7 +17,11 @@
 // Negative controls (each in a child process): drop one mutator's mark -> the comparison (or an internal assert) must fail.
 // Bench mode: µs per plan, full vs incremental, on a synthetic single-sequence decode with MTP rollbacks.
 //
-// usage: test-qsa-census-inc [n_seq = 10000] [seed = 42] [neg | bench [n_cells ...]]
+// [TAG_MTP_QSA_PHASE] mode `phase`: both stores run the census at phase 1 (the MTP draft memory under
+// LLAMA_MTP_QSA_PHASE=1); the frozen reference knows no phase, so inc is compared with the full path only (+ the state
+// check and the mirrors), and the negative controls are skipped.
+//
+// usage: test-qsa-census-inc [n_seq = 10000] [seed = 42] [neg | bench [n_cells ...] | phase]
 
 #include "ggml.h"
 
@@ -65,6 +69,9 @@ static drop_t g_drop = DROP_NONE;
 
 // [TAG_QSA_INPUTS_INC] negative control of the input mirrors: drop the change hints before every mirror update
 static bool g_drop_mir = false;
+
+// [TAG_MTP_QSA_PHASE] the census phase of both stores (mode `phase`)
+static int32_t g_phase = 0;
 
 // [TAG_QSA_INPUTS_INC] the device mirrors as host arrays (poisoned, so a missing write shows)
 struct mirror_sim : llama_qsa_mirror_writer {
@@ -223,6 +230,8 @@ struct world {
         }
         store_init(st_inc,  r, kv_size, n_stream, true);
         store_init(st_full, r, kv_size, n_stream, false);
+        st_inc.phase  = g_phase;
+        st_full.phase = g_phase;
         st_ref.init(r, kv_size, n_stream);
         mir.init(kv_size, st_inc.n_slots, n_stream);
         tail_fix = rng.p(0.7);
@@ -531,8 +540,13 @@ struct world {
 
         n_plans++;
 
-        std::string d = llama_qsa_plan_compare(rpl, rp.stamps, rst, pi, st_inc, r);
-        if (d.empty()) {
+        std::string d = g_phase != 0 ? llama_qsa_plan_compare(pf, stamps_full, st_full, pi, st_inc, r)
+                                     : llama_qsa_plan_compare(rpl, rp.stamps, rst, pi, st_inc, r);
+        if (g_phase != 0) {
+            if (!d.empty()) {
+                d = "[inc vs full, phase " + std::to_string(g_phase) + "] " + d;
+            }
+        } else if (d.empty()) {
             d = llama_qsa_plan_compare(rpl, rp.stamps, rst, pf, st_full, r, &stamps_full);
             if (!d.empty()) {
                 d = "[full path vs frozen ref] " + d;
@@ -906,6 +920,10 @@ int main(int argc, char ** argv) {
         if (sizes.empty()) { sizes = { 262144, 524288 }; }
         for (const int64_t n : sizes) { run_bench(n, seed); }
         return 0;
+    }
+
+    if (mode == "phase") {
+        g_phase = 1;
     }
 
     int rc = run_parser();

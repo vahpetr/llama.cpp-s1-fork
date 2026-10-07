@@ -216,6 +216,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-mtp-catchup-qsa PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
     llama_test(test-mtp-catchup NAME test-mtp-catchup-qsa-mu0 LABEL mtp)
     set_tests_properties(test-mtp-catchup-qsa-mu0 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_MTP_QSA_MAX_UBATCH=0")
+    # [TAG_MTP_QSA_PHASE] LLAMA_MTP_QSA_PHASE=1: the sparse draft's block phase vs the reference selection (both selection
+    # forms of the carrier), and the incremental census == the full one at phase 1
+    llama_build_and_test(test-mtp-qsa-phase.cpp LABEL mtp)
+    llama_test(test-mtp-qsa-phase NAME test-mtp-qsa-phase-whole-blocks LABEL mtp)
+    set_tests_properties(test-mtp-qsa-phase-whole-blocks PROPERTIES ENVIRONMENT "LLAMA_QSA_WHOLE_BLOCKS=1")
+    llama_test(test-qsa-census-inc NAME test-qsa-census-inc-phase ARGS 3000 11 phase LABEL mtp)
+    llama_test(test-qsa-census-inc NAME test-qsa-census-inc-phase-whole-blocks ARGS 2000 13 phase LABEL mtp)
+    set_tests_properties(test-qsa-census-inc-phase-whole-blocks PROPERTIES ENVIRONMENT "LLAMA_QSA_WHOLE_BLOCKS=1")
     llama_build_and_test(test-qwen4exp-hc-norm.cpp) # [TAG_UP28896] RMS_NORM + MUL adjacency, bit identity on the CPU
     llama_build_and_test(test-vk-mmq-knobs.cpp) # [TAG_MMQ_INT8_KNOBS] GGML_VK_MMQ_INT8_MIN_N / _OPS parsers, CPU only
 

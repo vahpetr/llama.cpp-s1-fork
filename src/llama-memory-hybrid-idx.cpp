@@ -60,6 +60,15 @@ bool llama_qsa_whole_blocks() {
     return enabled;
 }
 
+// [TAG_MTP_QSA_PHASE] LLAMA_MTP_QSA_PHASE (see the header)
+bool llama_mtp_qsa_phase_env() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_MTP_QSA_PHASE");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return enabled;
+}
+
 int llama_qsa_pool_remap_parse(const char * s) {
     if (s == nullptr || s[0] == '\0' || strcmp(s, "indexed") == 0) {
         return 1;
@@ -395,6 +404,25 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         }
     }
 
+    // [TAG_MTP_QSA_PHASE] the MTP draft memory - an indexer cache that holds no trunk layer (only il >= n_layer, the
+    // trailing MTP block) - takes the reference block phase under LLAMA_MTP_QSA_PHASE=1; every other memory keeps 0
+    if (mem_idx && llama_mtp_qsa_phase_env()) {
+        bool any_idx   = false;
+        bool trunk_idx = false;
+        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+            if (filter_idx && filter_idx(il)) {
+                any_idx    = true;
+                trunk_idx |= il < model.hparams.n_layer();
+            }
+        }
+        if (any_idx && !trunk_idx) {
+            qsa_phase_v = 1;
+            LLAMA_LOG_WARN("%s: qsa_phase = 1 (LLAMA_MTP_QSA_PHASE=1): MTP draft memory, reference block phase - bucket "
+                           "(pos-1)/r, block start pb*r+1, tail start (q/r)*r+1; the carrier row at pos 0 is unpooled and never selected\n",
+                           __func__);
+        }
+    }
+
     // [TAG_QSA_WHOLE_BLOCKS] read (and prove) the selection form at load
     if (mem_idx) {
         (void) llama_qsa_whole_blocks();
@@ -456,6 +484,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     st->n_stream = mem_idx->get_n_stream();
     st->n_slots  = (st->kv_size + ratio - 1)/ratio;
     st->n_rows   = st->n_slots + 1;
+    st->phase    = qsa_phase_v;   // [TAG_MTP_QSA_PHASE]
 
     // one context per buffer type, as llama_kv_cache places its layers
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
@@ -1193,7 +1222,8 @@ void llama_qsa_census_full(
         int32_t * blk_pos,
         int64_t pos_stride,
         llama_qsa_census_stream & cs,
-        llama_qsa_census_flags * flags) {
+        llama_qsa_census_flags * flags,
+        int64_t phase) {
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
     // from zero, so the bucket alone would pool two sequences into one block
     GGML_ASSERT(r <= 64);
@@ -1262,7 +1292,13 @@ void llama_qsa_census_full(
                 continue;
             }
 
-            const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+            const int64_t idx = (ranked ? rank[j] : cells.pos_get(j)) - phase;
+
+            // [TAG_MTP_QSA_PHASE] the MTP carrier row (index -1 with phase 1) never joins a block
+            if (idx < 0) {
+                continue;
+            }
+
             const int64_t pb  = idx/r;
 
             if (pb >= n_blocks) {
@@ -1365,7 +1401,10 @@ void llama_qsa_census_full(
     cs.n_bid = n_bid;
 
     for (int32_t b = 0; b < n_bid; ++b) {
-        int32_t sec_pos[4] = { bid_idx[b], bid_idx[b], bid_idx[b], bid_idx[b] };
+        // [TAG_MTP_QSA_PHASE] the rope position of the block's first member: its index + the phase
+        const int32_t p0 = bid_idx[b] + (int32_t) phase;
+
+        int32_t sec_pos[4] = { p0, p0, p0, p0 };
 
         if (ranked) {
             const int32_t   c = bid_slot0[b];
@@ -1395,7 +1434,7 @@ void llama_qsa_census_full(
         blk_of[j] = g < 0 ? -1 : grp_bid[g];
 
         if (blk_of[j] >= 0) {
-            const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+            const int64_t idx = (ranked ? rank[j] : cells.pos_get(j)) - phase;
 
             cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
         }
@@ -1414,7 +1453,7 @@ void llama_qsa_census_full(
     // such group); so does every fragment when no second unused id exists (n_bid + 1 == n_blocks: the cache is full
     // to the last block). With one sequence and no position holes there is no fragment and nothing changes.
     if (llama_qsa_whole_blocks() && n_bid < n_blocks) {
-        const int64_t newest_rank = ranked ? (int64_t) order.size() - 1 : -1;
+        const int64_t newest_rank = ranked ? (int64_t) order.size() - 1 - phase : -1;
 
         int64_t n_unrouted = 0;
 
@@ -1423,15 +1462,16 @@ void llama_qsa_census_full(
                 continue;
             }
 
-            const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+            const int64_t idx = (ranked ? rank[j] : cells.pos_get(j)) - phase;
 
             bool tail_of_some = false;
             if (ranked) {
-                tail_of_some = idx/r == newest_rank/r;
+                tail_of_some = llama_qsa_idx_bucket(idx, r) == llama_qsa_idx_bucket(newest_rank, r);
             } else {
                 const auto & set = cells.seq_set((uint32_t) j);
                 for (int32_t sq = 0; sq < LLAMA_MAX_SEQ && !tail_of_some; ++sq) {
-                    tail_of_some = set.test(sq) && idx/r == (int64_t) cells.seq_pos_max(sq)/r;
+                    tail_of_some = set.test(sq) &&
+                        llama_qsa_idx_bucket(idx, r) == llama_qsa_idx_bucket((int64_t) cells.seq_pos_max(sq) - phase, r);
                 }
             }
 
@@ -1452,6 +1492,16 @@ void llama_qsa_census_full(
                 LLAMA_LOG_WARN("%s: LLAMA_QSA_WHOLE_BLOCKS=1: %" PRId64 " fragment cell(s) keep the tail boost: no second "
                                "unused block id (n_bid %d + 1 == n_blocks %" PRId64 "); warned once\n",
                                __func__, n_unrouted, n_bid, n_blocks);
+            }
+        }
+    }
+
+    // [TAG_MTP_QSA_PHASE] the carrier (index < 0) is no entry of the reference: in both selection forms it goes to the
+    // second unused id, which both bias fills score -inf (the spare id would boost it); none left: it keeps the boost
+    if (phase > 0 && n_bid + 1 < n_blocks) {
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (!cells.is_empty(j) && (ranked ? rank[j] : cells.pos_get(j)) < phase) {
+                cur_cell_blk[j] = n_bid + 1;
             }
         }
     }
@@ -1483,14 +1533,15 @@ void llama_memory_hybrid_idx_context::qsa_census(
     const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
 
     llama_qsa_census_full(cells, ubatch->is_pos_2d(), n_kv, n_blocks, r, blk_bias, cur_cell_blk, cur_blk_cells,
-                          dst_blk_pos + s*n_blocks, n_blocks*n_ns, cs);
+                          dst_blk_pos + s*n_blocks, n_blocks*n_ns, cs, nullptr, mem->qsa_phase());
 }
 
 // [TAG_QSA_COMPACT_BIAS] the query side of the bias, shared by qsa_fill_bias and qsa_fill_bias_compact so both
 // fills see the same integers: the query's position - or, for a ranked (M-RoPE image) census, its rank among the
 // stream's cells, found by a binary search over `order` - and the start of its incomplete tail block
+// [TAG_MTP_QSA_PHASE] minus the memory's phase: the query's census index
 static int64_t qsa_query_pos(const llama_ubatch * ubatch, int64_t i, bool ranked, const std::vector<int32_t> & order,
-                             const llama_kv_cells & cells) {
+                             const llama_kv_cells & cells, int64_t phase) {
     const int64_t n_tokens = ubatch->n_tokens;
 
     int64_t q = ubatch->pos[i];
@@ -1518,11 +1569,11 @@ static int64_t qsa_query_pos(const llama_ubatch * ubatch, int64_t i, bool ranked
         q = lo - 1;
     }
 
-    return q;
+    return q - phase;
 }
 
 static inline int64_t qsa_tail_start(int64_t q, int64_t r) {
-    return (q + 1)/r*r;
+    return llama_qsa_tail_start(q, r);
 }
 
 // the per-token bias of stream s from its census
@@ -1542,6 +1593,8 @@ void llama_memory_hybrid_idx_context::qsa_fill_bias(
 
     const bool tail_fix    = qsa_tail_fix_enabled();     // [TAG_QSA_TAIL_FIX]
     const bool tail_assert = qsa_tail_assert_enabled();
+
+    const int64_t phase    = mem->qsa_phase();           // [TAG_MTP_QSA_PHASE]
 
     const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
     const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
@@ -1565,7 +1618,7 @@ void llama_memory_hybrid_idx_context::qsa_fill_bias(
         const int64_t      i      = s*n_tps + ii;
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
-        const int64_t q = qsa_query_pos(ubatch, i, ranked, order, cells);
+        const int64_t q = qsa_query_pos(ubatch, i, ranked, order, cells, phase);
 
         // the tail is an incomplete block and is always visible, as in the reference
         const int64_t tail_start = qsa_tail_start(q, r);
@@ -1600,7 +1653,7 @@ void llama_memory_hybrid_idx_context::qsa_fill_bias(
                         continue;
                     }
 
-                    const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+                    const int64_t idx = (ranked ? rank[j] : cells.pos_get(j)) - phase;
 
                     if (idx < tail_start || idx > q) {
                         continue;
@@ -1620,7 +1673,7 @@ void llama_memory_hybrid_idx_context::qsa_fill_bias(
             float v = -INFINITY;
 
             if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
-                const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+                const int64_t idx = (ranked ? rank[j] : cells.pos_get(j)) - phase;
 
                 if (idx <= q) {
                     // finite, so it can never meet a -inf and produce a nan
@@ -1704,7 +1757,7 @@ void llama_memory_hybrid_idx_context::qsa_fill_bias_compact(
 
         GGML_ASSERT(seq_id >= 0 && seq_id < 32);
 
-        const int64_t tail = qsa_tail_start(qsa_query_pos(ubatch, i, cs.ranked, cs.order, cells), r);
+        const int64_t tail = qsa_tail_start(qsa_query_pos(ubatch, i, cs.ranked, cs.order, cells, mem->qsa_phase()), r);
 
         GGML_ASSERT(tail >= 0 && tail < INT32_MAX);
 
@@ -1866,7 +1919,7 @@ int64_t llama_qsa_plan_full(llama_qsa_pooled_store & st_ref, const llama_qsa_pla
         const uint32_t g     = in.g[s];
 
         llama_qsa_census_full(cells, in.is_pos_2d, n_kv, n_blocks, r, blk_bias, cur_cell_blk, cur_blk_cells,
-                              pl.blk_pos.data() + s*n_blocks, n_blocks*n_ns, cs);
+                              pl.blk_pos.data() + s*n_blocks, n_blocks*n_ns, cs, nullptr, st->phase);
 
         GGML_ASSERT(g < st->n_stream);
         GGML_ASSERT((s == 0 || g == strm_of[0] + s) && "qsa: the ubatch streams are one contiguous range (get_k)");
@@ -2160,7 +2213,11 @@ static int llama_qsa_census_inc(llama_qsa_pooled_store & st, uint32_t g, const l
 
     const int32_t n_bid_old = C.cs.n_bid;
 
-    const int64_t lo_pb = std::min<int64_t>(C.tail_pb, C.inc_lo_pos == INT32_MAX ? INT64_MAX : (int64_t) C.inc_lo_pos/r);
+    // [TAG_MTP_QSA_PHASE] every bucket below is one of census indices (position - phase)
+    const int64_t phase = st.phase;
+
+    const int64_t lo_pb = std::min<int64_t>(C.tail_pb, C.inc_lo_pos == INT32_MAX ? INT64_MAX :
+                                                       llama_qsa_idx_bucket((int64_t) C.inc_lo_pos - phase, r));
 
     // block ids ascend with the position bucket (one group per bucket with one sequence)
     const int32_t region_b0 = (int32_t) (std::lower_bound(C.cs.bid_idx.begin(), C.cs.bid_idx.begin() + n_bid_old,
@@ -2207,8 +2264,9 @@ static int llama_qsa_census_inc(llama_qsa_pooled_store & st, uint32_t g, const l
         add((int32_t) j);
     }
 
-    std::vector<std::pair<llama_pos, int32_t>> region;   // (pos, cell) of the non-empty candidates
+    std::vector<std::pair<llama_pos, int32_t>> region;   // (census index, cell) of the non-empty candidates
     std::vector<int32_t>                       emptied;  // the empty candidates
+    std::vector<int32_t>                       carrier;  // [TAG_MTP_QSA_PHASE] the candidates at index < 0 (no block)
 
     region.reserve(cand.size());
 
@@ -2218,7 +2276,13 @@ static int llama_qsa_census_inc(llama_qsa_pooled_store & st, uint32_t g, const l
             continue;
         }
 
-        const llama_pos p  = cells.pos_get(j);
+        const llama_pos p  = cells.pos_get(j) - (llama_pos) phase;
+
+        if (p < 0) {
+            carrier.push_back(j);
+            continue;
+        }
+
         const int64_t   pb = p/r;
 
         if (pb < lo_pb || pb >= n_blocks) {
@@ -2316,7 +2380,7 @@ static int llama_qsa_census_inc(llama_qsa_pooled_store & st, uint32_t g, const l
         std::fill(C.blk_pos.begin() + sec*stride + region_b0, C.blk_pos.begin() + sec*stride + max_bid, 0);
     }
 
-    std::vector<int32_t> unpooled;
+    std::vector<int32_t> unpooled = carrier;
 
     for (const auto & [p, j] : region) {
         const int32_t b = cs.blk_of[j];
@@ -2330,7 +2394,7 @@ static int llama_qsa_census_inc(llama_qsa_pooled_store & st, uint32_t g, const l
 
     for (int32_t b = region_b0; b < n_bid_new; ++b) {
         for (int64_t sec = 0; sec < 4; ++sec) {
-            C.blk_pos[sec*stride + b] = cs.bid_idx[b];
+            C.blk_pos[sec*stride + b] = cs.bid_idx[b] + (int32_t) phase;
         }
     }
 
@@ -2392,12 +2456,13 @@ static int llama_qsa_census_inc(llama_qsa_pooled_store & st, uint32_t g, const l
         int64_t n_unrouted = 0;
 
         for (const int32_t j : unpooled) {
-            const int64_t idx = cells.pos_get(j);
+            const int64_t idx = (int64_t) cells.pos_get(j) - phase;
 
             bool tail_of_some = false;
             const auto & set = cells.seq_set((uint32_t) j);
             for (int32_t sq = 0; sq < LLAMA_MAX_SEQ && !tail_of_some; ++sq) {
-                tail_of_some = set.test(sq) && idx/r == (int64_t) cells.seq_pos_max(sq)/r;
+                tail_of_some = set.test(sq) &&
+                    llama_qsa_idx_bucket(idx, r) == llama_qsa_idx_bucket((int64_t) cells.seq_pos_max(sq) - phase, r);
             }
 
             if (tail_of_some) {
@@ -2421,6 +2486,13 @@ static int llama_qsa_census_inc(llama_qsa_pooled_store & st, uint32_t g, const l
         }
     }
 
+    // [TAG_MTP_QSA_PHASE] the carrier's kill id, as the full census routes it (every carrier cell is a candidate)
+    if (n_bid_new + 1 < n_blocks) {
+        for (const int32_t j : carrier) {
+            C.cell_blk[j] = n_bid_new + 1;
+        }
+    }
+
     // the stamps of the new blocks
     const auto & gen = st.strm[g].gen;
 
@@ -2429,12 +2501,15 @@ static int llama_qsa_census_inc(llama_qsa_pooled_store & st, uint32_t g, const l
         C.stamps.push_back(qsa_block_stamp(cells, gen, g, r, false, C.blk_cells.data() + b*r, C.blk_pos.data(), stride, b));
     }
 
-    int64_t tail_pb = n_bid_new > 0 ? cs.bid_idx[n_bid_new - 1]/r + 1 : 0;
-    if (!unpooled.empty()) {
-        tail_pb = INT64_MAX;
-        for (const int32_t j : unpooled) {
-            tail_pb = std::min<int64_t>(tail_pb, cells.pos_get(j)/r);
+    int64_t tail_pb = INT64_MAX;
+    for (const int32_t j : unpooled) {
+        // [TAG_MTP_QSA_PHASE] the carrier (index < 0) is unpooled for good: it bounds no region
+        if ((int64_t) cells.pos_get(j) >= phase) {
+            tail_pb = std::min<int64_t>(tail_pb, ((int64_t) cells.pos_get(j) - phase)/r);
         }
+    }
+    if (tail_pb == INT64_MAX) {
+        tail_pb = n_bid_new > 0 ? cs.bid_idx[n_bid_new - 1]/r + 1 : 0;
     }
 
     cs.n_bid  = n_bid_new;
@@ -2516,7 +2591,7 @@ int64_t llama_qsa_plan_inc(llama_qsa_pooled_store & st, const llama_qsa_plan_in 
 
             llama_qsa_census_flags fl;
             llama_qsa_census_full(cells, in.is_pos_2d, n_kv, n_blocks, r, blk_bias, C.cell_blk.data(), C.blk_cells.data(),
-                                  C.blk_pos.data(), stride, C.cs, &fl);
+                                  C.blk_pos.data(), stride, C.cs, &fl, st.phase);
 
             C.n_kv     = n_kv;
             C.n_blocks = n_blocks;
@@ -2534,11 +2609,14 @@ int64_t llama_qsa_plan_inc(llama_qsa_pooled_store & st, const llama_qsa_plan_in 
                         C.empty.push_back((int32_t) j);
                     } else if (C.cs.blk_of[j] < 0) {
                         C.unpooled.push_back((int32_t) j);
-                        tail_pb = std::min<int64_t>(tail_pb, cells.pos_get(j)/r);
+                        // [TAG_MTP_QSA_PHASE] the carrier (index < 0) is unpooled for good: it bounds no region
+                        if ((int64_t) cells.pos_get(j) >= st.phase) {
+                            tail_pb = std::min<int64_t>(tail_pb, ((int64_t) cells.pos_get(j) - st.phase)/r);
+                        }
                     }
                 }
 
-                if (C.unpooled.empty()) {
+                if (tail_pb == INT64_MAX) {
                     tail_pb = C.cs.n_bid > 0 ? C.cs.bid_idx[C.cs.n_bid - 1]/r + 1 : 0;
                 }
 
@@ -3161,7 +3239,7 @@ std::string llama_qsa_census_state_check(const llama_qsa_pooled_store & st, uint
             return "census state g=" + std::to_string(g) + ": cell " + std::to_string(j) + " unpooled=" + std::to_string(unp) +
                    " but list=" + std::to_string(in_unpooled[j]);
         }
-        if (unp && cells.pos_get(j)/r < C.tail_pb) {
+        if (unp && (int64_t) cells.pos_get(j) >= st.phase && ((int64_t) cells.pos_get(j) - st.phase)/r < C.tail_pb) {
             return "census state g=" + std::to_string(g) + ": unpooled cell " + std::to_string(j) + " below tail_pb " +
                    std::to_string(C.tail_pb);
         }
@@ -3243,6 +3321,7 @@ int64_t llama_memory_hybrid_idx_context::qsa_store_plan(const llama_ubatch & uba
         st_ref_view.ratio   = st->ratio;
         st_ref_view.n_slots = st->n_slots;
         st_ref_view.n_rows  = st->n_rows;
+        st_ref_view.phase   = st->phase;
         llama_qsa_store_restore(st_ref_view, after_ref);
 
         std::string diff = llama_qsa_plan_compare(ref, ref_stamps, st_ref_view, pl, *st, ratio);
@@ -3502,8 +3581,10 @@ std::string llama_memory_hybrid_idx::state_descriptor() const {
     // [TAG_MTP_QSA] the MTP draft memory (no recurrent layer): attention then indexer, both written whatever
     // PARTIAL_ONLY says (state_write's recr_none branch), so neither is "(full-only)" and there is no recr section
     if (recr_none) {
+        // [TAG_MTP_QSA_PHASE] the phase changes what the indexer cells mean to the census: its own key (absent at 0)
         return "hybrid_idx{recr=none,attn=" + get_mem_attn()->state_descriptor() + ",idx=" +
-               (mem_idx ? mem_idx->state_descriptor() : std::string("none")) + "}";
+               (mem_idx ? mem_idx->state_descriptor() : std::string("none")) +
+               (qsa_phase_v != 0 ? ",qsa_phase=" + std::to_string(qsa_phase_v) : std::string()) + "}";
     }
 
     // [TAG_HYBRID_IDX_STATE] attention, recurrent, then the K-only indexer (full streams only)
