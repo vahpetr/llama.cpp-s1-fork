@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, expectTypeOf, it, vi } from 'vitest';
 
 // node env unit project has no DOM, install a minimal localStorage backed by a Map
 beforeAll(() => {
@@ -21,6 +21,7 @@ beforeAll(() => {
 	(globalThis as unknown as { localStorage: Storage }).localStorage = polyfill;
 });
 
+import { MESSAGE_EXTRA_STORAGE_VERSION } from '$lib/constants';
 import {
 	AttachmentType,
 	BuiltInTool,
@@ -40,6 +41,7 @@ import type {
 	DatabaseConversation,
 	DatabaseMessage,
 	DatabaseMessageExtra,
+	DatabaseMessageExtraAudioFile,
 	DatabaseMessageExtraImageFile
 } from '$lib/types/database';
 
@@ -168,6 +170,7 @@ describe('W1: tool-result attachments are stored once', () => {
 
 		expect(row.extra).toHaveLength(1);
 		expect((row.extra![0] as DatabaseMessageExtraImageFile).base64Url).toBe(IMG);
+		expect(row.extraVersion).toBe(MESSAGE_EXTRA_STORAGE_VERSION);
 		const active = conversationsStore.activeMessages.find((m) => m.id === row.id);
 
 		expect(active?.extra).toHaveLength(1);
@@ -178,7 +181,14 @@ describe('W1: tool-result attachments are stored once', () => {
 
 		expect(row.extra).toHaveLength(1);
 		expect((row.extra![0] as DatabaseMessageExtraImageFile).base64Url).toBe(IMG);
+		expect(row.extraVersion).toBe(MESSAGE_EXTRA_STORAGE_VERSION);
 	}, 60000);
+
+	it('the attachment-storage marker is an optional numeric field of DatabaseMessage', () => {
+		expectTypeOf<DatabaseMessage['extraVersion']>().toEqualTypeOf<number | undefined>();
+		expectTypeOf(MESSAGE_EXTRA_STORAGE_VERSION).toEqualTypeOf<number>();
+		expect(MESSAGE_EXTRA_STORAGE_VERSION).toBe(2);
+	});
 });
 
 describe('W1: the history rebuild repairs doubled legacy lists', () => {
@@ -219,5 +229,85 @@ describe('W1: the history rebuild repairs doubled legacy lists', () => {
 		);
 
 		expect(imageUrls(halvesDiffer.content)).toEqual([IMG, IMG2, IMG2, IMG]);
+	});
+
+	const audio = (data: string, mimeType: string): DatabaseMessageExtra =>
+		({ base64Data: data, mimeType, name: 'a', type: AttachmentType.AUDIO }) as DatabaseMessageExtra;
+	const audioParts = (content: unknown) =>
+		(content as { input_audio?: { data: string; format: string } }[])
+			.filter((p) => p.input_audio)
+			.map((p) => p.input_audio!);
+
+	it('a legacy doubled audio list is halved only when data and mimeType both repeat', async () => {
+		const same = await ChatService.convertDbMessageToApiChatMessageData(
+			toolMsg([audio('QUFB', 'audio/wav'), audio('QUFB', 'audio/wav')])
+		);
+
+		expect(audioParts(same.content)).toHaveLength(1);
+
+		const mimeDiffers = await ChatService.convertDbMessageToApiChatMessageData(
+			toolMsg([audio('QUFB', 'audio/wav'), audio('QUFB', 'audio/mpeg')])
+		);
+
+		expect(audioParts(mimeDiffers.content)).toHaveLength(2);
+	});
+
+	it('a legacy doubled list with a non-image/audio attachment is never repaired', async () => {
+		const text = { content: 'x', name: 't.txt', type: AttachmentType.TEXT } as DatabaseMessageExtra;
+		const m = toolMsg([text, img(IMG), text, img(IMG)]);
+		const out = await ChatService.convertDbMessageToApiChatMessageData(m);
+
+		expect(imageUrls(out.content)).toEqual([IMG, IMG]);
+	});
+});
+
+describe('W1: records written by the fixed code are sent as stored', () => {
+	const img = (url: string): DatabaseMessageExtra =>
+		({
+			base64Url: url,
+			name: 'mcp-attachment-1.png',
+			type: AttachmentType.IMAGE
+		}) as DatabaseMessageExtra;
+	const toolMsg = (extra: DatabaseMessageExtra[]) =>
+		msg({
+			content: 'shot taken',
+			extra,
+			extraVersion: MESSAGE_EXTRA_STORAGE_VERSION,
+			role: MessageRole.TOOL,
+			toolCallId: 'call_1'
+		});
+	const imageUrls = (content: unknown): string[] =>
+		(content as { image_url?: { url: string } }[])
+			.filter((p) => p.image_url)
+			.map((p) => p.image_url!.url);
+
+	it('a legitimate repeated list [a, b, a, b] is sent in full', async () => {
+		const out = await ChatService.convertDbMessageToApiChatMessageData(
+			toolMsg([img(IMG), img(IMG2), img(IMG), img(IMG2)])
+		);
+
+		expect(imageUrls(out.content)).toEqual([IMG, IMG2, IMG, IMG2]);
+	});
+
+	it('a legitimate repeated list [a, a] is sent in full', async () => {
+		const out = await ChatService.convertDbMessageToApiChatMessageData(
+			toolMsg([img(IMG), img(IMG)])
+		);
+
+		expect(imageUrls(out.content)).toEqual([IMG, IMG]);
+	});
+
+	it('a versioned repeated audio list is sent in full', async () => {
+		const a = {
+			base64Data: 'QUFB',
+			mimeType: 'audio/wav',
+			name: 'a',
+			type: AttachmentType.AUDIO
+		} as DatabaseMessageExtraAudioFile;
+		const out = await ChatService.convertDbMessageToApiChatMessageData(toolMsg([a, a]));
+
+		expect((out.content as { input_audio?: unknown }[]).filter((p) => p.input_audio)).toHaveLength(
+			2
+		);
 	});
 });

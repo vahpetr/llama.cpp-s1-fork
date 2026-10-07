@@ -140,6 +140,8 @@ export interface DatabaseMessage {
 	isSynthetic?: boolean;
 	children: string[];
 	extra?: DatabaseMessageExtra[];
+	/** Attachment-storage version of `extra` (MESSAGE_EXTRA_STORAGE_VERSION); absent = legacy record */
+	extraVersion?: number;
 	timings?: ChatMessageTimings;
 	model?: string;
 }

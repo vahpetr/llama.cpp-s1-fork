@@ -60,24 +60,30 @@ function streamStorageKey(conversationId: string): string {
 	return STREAM_RESUME_LOCALSTORAGE_KEY_PREFIX + conversationId;
 }
 
-// tool results written before R79 W1 stored their attachments twice ([a, b, a, b]); a list
-// whose second half repeats its first (same type, same data) is sent once, as the loop sent it
-function undoubleToolExtras(extras: DatabaseMessageExtra[]): DatabaseMessageExtra[] {
+// tool results written before R79 W1 stored their attachments twice ([a, b, a, b]). Records
+// written since carry extraVersion and are sent as stored, repeats included. Only a legacy
+// (unversioned) image/audio list whose second half repeats its first in every field the request
+// uses (image: base64Url; audio: base64Data and mimeType) is sent once, as the loop sent it.
+function undoubleToolExtras(message: DatabaseMessage): DatabaseMessageExtra[] {
+	const extras = message.extra ?? [];
 	const half = extras.length / 2;
-	const data = (e: DatabaseMessageExtra) =>
-		e.type === AttachmentType.IMAGE
-			? (e as DatabaseMessageExtraImageFile).base64Url
-			: e.type === AttachmentType.AUDIO
-				? (e as DatabaseMessageExtraAudioFile).base64Data
-				: JSON.stringify(e);
+	const key = (e: DatabaseMessageExtra): string | null => {
+		if (e.type === AttachmentType.IMAGE)
+			return `i:${(e as DatabaseMessageExtraImageFile).base64Url}`;
+		if (e.type !== AttachmentType.AUDIO) return null;
 
+		const audio = e as DatabaseMessageExtraAudioFile;
+
+		return `a:${audio.mimeType}:${audio.base64Data}`;
+	};
+
+	if (message.extraVersion !== undefined) return extras;
 	if (half < 1 || !Number.isInteger(half)) return extras;
 
 	for (let i = 0; i < half; i++) {
-		const a = extras[i];
-		const b = extras[i + half];
+		const a = key(extras[i]);
 
-		if (a.type !== b.type || data(a) !== data(b)) return extras;
+		if (a === null || a !== key(extras[i + half])) return extras;
 	}
 
 	return extras.slice(0, half);
@@ -171,7 +177,7 @@ export class ChatService {
 				{ text: message.content, type: ContentPartType.TEXT }
 			];
 
-			for (const extra of undoubleToolExtras(message.extra ?? [])) {
+			for (const extra of undoubleToolExtras(message)) {
 				if (extra.type === AttachmentType.IMAGE) {
 					parts.push({
 						image_url: { url: (extra as DatabaseMessageExtraImageFile).base64Url },

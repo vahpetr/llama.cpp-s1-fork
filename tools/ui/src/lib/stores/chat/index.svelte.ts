@@ -9,7 +9,12 @@
  * Uses ChatService for the API layer and conversationsStore for persistence.
  */
 
-import { CWD_CLEARED_TEXT, SYSTEM_MESSAGE_PLACEHOLDER, TITLE_GENERATION } from '$lib/constants';
+import {
+	CWD_CLEARED_TEXT,
+	MESSAGE_EXTRA_STORAGE_VERSION,
+	SYSTEM_MESSAGE_PLACEHOLDER,
+	TITLE_GENERATION
+} from '$lib/constants';
 import {
 	ErrorDialogType,
 	MessageRole,
@@ -956,6 +961,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 						content,
 						convId,
 						extra: extras,
+						// attachments stored once: the rebuild sends them as stored (no legacy repair)
+						extraVersion: MESSAGE_EXTRA_STORAGE_VERSION,
 						role: MessageRole.TOOL,
 						timestamp: Date.now(),
 						toolCallId,
