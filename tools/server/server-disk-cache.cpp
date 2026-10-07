@@ -1105,8 +1105,27 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
                 common_speculative_get_state(spec, id_slot, spec_state);
             }
             put_vec(f, spec_state);
-            put<uint32_t>(f, (uint32_t) prompt.deep.size());
+            // [TAG_DISK_ADOPT] (Codex gate r2 Major 7) a deep checkpoint still indexed from an adopt source is copied
+            //   into the own namespace before the entry is published, so the branch history survives without the
+            //   adopt key; one that cannot be copied now is left out of the refs (a gap in the schedule)
+            std::vector<server_deep_ref> deep;
             for (const auto & r : prompt.deep) {
+                const auto ck = ckpts.find(r.key);
+                if (ck != ckpts.end() && !ck->second.src_dir.empty()) {
+                    common_prompt_checkpoint c;
+                    bool written = false;
+                    if (!deep_get(r.key, c) || !ckpt_store(r.key, c, &written)) {
+                        DSK_WRN("deep checkpoint %s: cannot copy it from its adopt source, left out of the entry\n",
+                                r.key.c_str());
+                        continue;
+                    }
+                    n_ckpt_written += written ? file_size_or_0(ckpt_path(r.key)) : 0;
+                    n_deep_copied++;
+                }
+                deep.push_back(r);
+            }
+            put<uint32_t>(f, (uint32_t) deep.size());
+            for (const auto & r : deep) {
                 put<int64_t>(f, r.n_tokens);
                 put<uint8_t>(f, r.kind);
                 put_str(f, r.key);
@@ -2294,6 +2313,7 @@ void server_disk_cache::refresh_status() {
         { "load_failures_other",    n_load_other    },
         { "deep_rewinds",   n_deep_rewinds      },
         { "ckpt_dropped",   n_ckpt_dropped      },
+        { "deep_copied",    n_deep_copied       },
         { "evictions",      n_evict             },
         { "bytes_written",  bytes_written       },
         { "bytes_loaded",   bytes_loaded        },

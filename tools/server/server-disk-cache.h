@@ -136,7 +136,8 @@ struct server_disk_cache {
     uint64_t n_loads = 0;
     uint64_t n_evict = 0;
     uint64_t n_deep_rewinds = 0;
-    uint64_t n_ckpt_dropped = 0; // deep checkpoints that did not restore
+    uint64_t n_ckpt_dropped = 0;
+    uint64_t n_deep_copied  = 0; // adopted deep checkpoints copied into the own namespace at a resave // deep checkpoints that did not restore
     uint64_t n_load_failed  = 0; // invalid: the entry was dropped
     uint64_t n_load_capacity = 0; // the state did not fit the free cells: the entry was kept
     uint64_t n_load_other   = 0; // inconclusive: the entry was kept
