@@ -716,6 +716,12 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     if (!ok) {
         DSK_WRN("failed to save %zu tokens, removing the partial entry\n", n);
         remove_files(e.id);
+        // [TAG_DISK_GC] the aborted save is a transaction boundary: blocks and checkpoints it wrote that no
+        //   registered entry or live slot references go now (never inside erase(): during a prefix replacement the
+        //   new entry's files exist before it is registered)
+        deep_gc();
+        blob_gc();
+        refresh_status();
         return false;
     }
 
@@ -800,6 +806,8 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
         DSK_WRN("entry %s: unreadable .aux (%s), dropping it\n", e.id.c_str(), err.what());
         erase(idx);
         n_load_failed++;
+        deep_gc(); // [TAG_DISK_GC] the dropped entry's checkpoints and blocks may now be unreferenced
+        blob_gc();
         refresh_status();
         return SERVER_DISK_LOAD_INVALID;
     }
@@ -816,6 +824,8 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
             DSK_WRN("entry %s: state load failed (invalid), dropping it\n", e.id.c_str());
             erase(idx);
             n_load_failed++;
+            deep_gc(); // [TAG_DISK_GC] the dropped entry's checkpoints and blocks may now be unreferenced
+            blob_gc();
         } else if (res == SERVER_DISK_LOAD_CAPACITY) {
             DSK_WRN("entry %s: state load failed (no room in the KV cache), keeping it\n", e.id.c_str());
             n_load_capacity++;

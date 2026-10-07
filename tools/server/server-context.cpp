@@ -3563,6 +3563,9 @@ private:
 
                     slot->prompt_clear();
 
+                    // [TAG_DISK_GC] a transaction boundary: deep checkpoints only this slot referenced are collected
+                    deep_gc();
+
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
