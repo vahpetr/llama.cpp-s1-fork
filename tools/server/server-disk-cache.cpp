@@ -664,10 +664,15 @@ json server_disk_cache::storage_split() const {
         foreign_refs.insert(ns.blocks.begin(), ns.blocks.end());
     }
     uint64_t shared = 0, foreign_blk = 0, held = 0;
+    const std::string legacy_blk = (fs::path(root) / "blk").string();
     for (const auto & b : blobs) {
         const bool o = own_refs.count(b.first) > 0, f = foreign_refs.count(b.first) > 0;
+        // (Codex gate r3 Minor 1) each physical file once, as scan_foreign() charges the foreign cap: a block in a
+        //   namespace's own <ns>/blk is already part of that namespace's bytes; only the shared legacy store adds
+        const auto bd = blob_dir_of.find(b.first);
+        const bool in_legacy = bd != blob_dir_of.end() && bd->second == legacy_blk;
         shared      += o && f ? b.second : 0;
-        foreign_blk += !o && f ? b.second : 0;
+        foreign_blk += !o && f && in_legacy ? b.second : 0;
         held        += gc_hold && !o && !f ? b.second : 0;
     }
     if (gc_hold) {
