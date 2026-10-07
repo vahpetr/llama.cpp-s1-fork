@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <utility>
+#include <atomic>
 #include <string.h>
 #include <algorithm>
 #include <vector>
@@ -2086,10 +2087,12 @@ uint64_t ggml_backend_sched_buffer_gen(ggml_backend_sched_t sched) {
     return ggml_gallocr_buffer_gen(sched->galloc);
 }
 
-static int g_sched_snapshot_fail_after = -1; // [TAG_GRAPH_CACHE] test hook
+// [TAG_GRAPH_CACHE] test hook, process-wide: atomic, so takes on several schedulers (contexts) in parallel count
+// down without a race; which scheduler's take fails is then the first to reach zero
+static std::atomic<int> g_sched_snapshot_fail_after{-1};
 
 void ggml_backend_sched_snapshot_fail_inject(int n_ok) {
-    g_sched_snapshot_fail_after = n_ok;
+    g_sched_snapshot_fail_after.store(n_ok);
 }
 
 ggml_backend_sched_snapshot_t ggml_backend_sched_take(ggml_backend_sched_t sched) {
@@ -2097,8 +2100,11 @@ ggml_backend_sched_snapshot_t ggml_backend_sched_take(ggml_backend_sched_t sched
     GGML_ASSERT(sched->is_alloc);
 
     bool inject = false;
-    if (g_sched_snapshot_fail_after >= 0) {
-        inject = g_sched_snapshot_fail_after-- == 0;
+    {
+        int v = g_sched_snapshot_fail_after.load();
+        while (v >= 0 && !g_sched_snapshot_fail_after.compare_exchange_weak(v, v - 1)) {
+        }
+        inject = v == 0; // 0 -> -1: fires once, then off
     }
 
     // an empty state of the same sizes as ggml_backend_sched_new allocates

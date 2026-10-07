@@ -363,7 +363,9 @@ extern "C" {
     // run strictly in sequence and every input must be fully rewritten before each compute.
     //  take:    moves the allocated per-graph state (split graph, splits, tensor assignments and copies) into a new
     //           snapshot; the scheduler is left reset (as after ggml_backend_sched_reset). Returns NULL if the
-    //           snapshot cannot be allocated: the scheduler is then left untouched (still allocated)
+    //           snapshot cannot be allocated: the scheduler is then left untouched (still allocated). Recoverable
+    //           are the calloc/malloc failures of the snapshot struct and its arrays (and the test hook below);
+    //           the hash set comes from ggml_hash_set_new, whose allocation aborts on OOM (not recoverable)
     //  restore: swaps the snapshot's state with the scheduler's (the snapshot then holds the previous state); returns
     //           false (and resets the scheduler) if the snapshot is stale, i.e. the buffer generation changed
     //  buffer_gen: bumped whenever a compute buffer is freed or (re)allocated and on every ggml_backend_sched_reserve
@@ -376,7 +378,8 @@ extern "C" {
     // the (reset) scheduler drops its context buffer (sized for the worst case of graph_size nodes): from now on
     // each split sizes one from its graph. With snapshots every parked state keeps the buffer it was split in.
     GGML_API void                 ggml_backend_sched_release_context(ggml_backend_sched_t sched);
-    // test hook: the take after the next n_ok successful ones fails as on an allocation failure (-1 = off)
+    // test hook: the take after the next n_ok successful ones fails as on an allocation failure (-1 = off); one
+    // process-wide atomic countdown shared by all schedulers (arm it while one context takes snapshots)
     GGML_API void                 ggml_backend_sched_snapshot_fail_inject(int n_ok);
     // [TAG_GRAPH_CACHE] read-only view of the current split plan (LLAMA_GRAPH_CACHE_CHECK): split i's backend index,
     // node range [i_start, i_end) of the split graph, and its inputs (the source tensor each backend copy is fed from)
