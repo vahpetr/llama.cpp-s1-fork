@@ -515,6 +515,30 @@ std::string server_disk_cache_fingerprint(const common_params & params, int32_t 
 }
 
 // [TAG_CACHE_COMPAT2] ---------------------------------------------------------------------------------------------
+// (Codex compat2 C) an envelope-less stream / checkpoint (MAP2 / DCK3) is read only when it arrives through adopt AND
+//   its payload format is one that had no envelope (5 / 6): an adopted entry of a format with envelopes that carries
+//   an envelope-less stream is damaged or forged, never a legacy entry
+static bool legacy_format(uint32_t version) {
+    return version == 5 || version == 6;
+}
+
+static bool legacy_payload_ok(const server_disk_cache_entry & e) {
+    return !e.src.empty() && legacy_format(e.version);
+}
+
+// the payload format a fingerprint was written with: its "v<N>" field (0 when it does not parse)
+static uint32_t fingerprint_format(const std::string & fp) {
+    const auto sp = fp.find(' ');
+    size_t at = sp == std::string::npos ? 0 : sp + 1;
+    if (at >= fp.size() || fp[at] != 'v') {
+        return 0;
+    }
+    uint32_t v = 0;
+    for (at++; at < fp.size() && isdigit((unsigned char) fp[at]) && v < 100000; at++) {
+        v = v * 10 + (fp[at] - '0');
+    }
+    return v;
+}
 // hash_key's first 16 hex digits cover only lanes a / c (bytes 0-7 and 16-23 of every 32-byte block): fold both
 //   halves so every input byte counts
 static std::string h16_of(const std::string & s) {
@@ -2015,10 +2039,10 @@ server_disk_load_result server_disk_cache::verify(int idx) {
         }
     }
     if (res == SERVER_DISK_LOAD_OK) {
-        res = verify_stream(path(id, ".tgt"), desc_tgt_h, !e.src.empty());
+        res = verify_stream(path(id, ".tgt"), desc_tgt_h, legacy_payload_ok(e));
     }
     if (res == SERVER_DISK_LOAD_OK && e.has_dft && !tgt_only) {
-        res = verify_stream(path(id, ".dft"), desc_dft_h, !e.src.empty());
+        res = verify_stream(path(id, ".dft"), desc_dft_h, legacy_payload_ok(e));
     }
 
     if (res == SERVER_DISK_LOAD_INVALID) {
@@ -2112,10 +2136,10 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
     }
 
     llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
-    server_disk_load_result res = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), desc_tgt_h, !e.src.empty());
+    server_disk_load_result res = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), desc_tgt_h, legacy_payload_ok(e));
     if (res == SERVER_DISK_LOAD_OK && ctx_dft) {
         llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
-        res = tgt_only ? SERVER_DISK_LOAD_OK : e.has_dft ? load_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_h, !e.src.empty()) : SERVER_DISK_LOAD_INVALID;
+        res = tgt_only ? SERVER_DISK_LOAD_OK : e.has_dft ? load_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_h, legacy_payload_ok(e)) : SERVER_DISK_LOAD_INVALID;
     }
     if (res != SERVER_DISK_LOAD_OK) {
         // [TAG_DISK_LOAD_RESULT] the caller clears the slot; only an invalid entry goes
@@ -2461,9 +2485,11 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         uint32_t ft = 0, fd = 0;
         uint32_t env_ver = 0;
         std::string dh;
-        // [TAG_DISK_ADOPT] an adopt source's format 5 / 6 checkpoint has no envelope: accepted on the operator's word
+        // [TAG_DISK_ADOPT] an adopt source's format 5 / 6 checkpoint has no envelope: accepted on the operator's word,
+        //   only from a source whose format had no envelope (Codex compat2 C)
         const bool from_src = !it->second.src_dir.empty();
-        bool ok = get_le(f, magic) && (magic == CKPT_ENV_MAGIC || (from_src && magic == CKPT_MAGIC)) && get_str_le(f, fp);
+        const bool legacy_ok = from_src && legacy_format(it->second.src_version);
+        bool ok = get_le(f, magic) && (magic == CKPT_ENV_MAGIC || (legacy_ok && magic == CKPT_MAGIC)) && get_str_le(f, fp);
         if (ok && magic == CKPT_ENV_MAGIC) {
             ok = get_le(f, env_ver) && get_str_le(f, dh);
         } else {
@@ -3667,6 +3693,7 @@ void server_disk_cache::open_adopt_sources() {
                 src_dir_of.erase(id);
             }
         }
+        a.version = fingerprint_format(a.fingerprint);
         size_t n_ck = 0;
         for (const auto & de : ls_ck) {
             std::ifstream f(de.path(), std::ios::binary);
@@ -3683,6 +3710,7 @@ void server_disk_cache::open_adopt_sources() {
                 m.bytes   = file_size_or_0(de.path().string());
                 m.t_used  = mtime_s(de.path());
                 m.src_dir = ckdir.string();
+                m.src_version = a.version;
                 ckpts[m.key] = m;
                 n_ck++;
             }

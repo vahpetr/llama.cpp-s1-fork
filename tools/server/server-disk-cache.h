@@ -83,6 +83,7 @@ struct server_deep_ckpt_meta {
     int64_t     t_used   = 0;
     int32_t     hits     = 0;
     std::string src_dir; // [TAG_DISK_ADOPT] the adopt source's ckpt/ (read-only); empty: the own namespace
+    uint32_t    src_version = 0; // [TAG_CACHE_COMPAT2] the adopt source's payload format (its fingerprint's v<N>)
 };
 
 // the structural identity of a disk-cache fingerprint (named, length-delimited fields; shard identity arrays) for
@@ -227,6 +228,7 @@ struct server_disk_cache {
     struct adopt_src {
         std::string key;
         std::string fingerprint;
+        uint32_t    version = 0; // [TAG_CACHE_COMPAT2] its payload format (fingerprint_format)
         bool        legacy = false;
         size_t      n_entries = 0;
         uint64_t    hits = 0;
