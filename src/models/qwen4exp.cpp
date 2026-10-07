@@ -1215,8 +1215,19 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     res->add_input(std::move(inp));
 
+    // [TAG_MTP_CATCHUP_NOATTN] LLAMA_MTP_CATCHUP_ATTN=0 (cparams.mtp_catchup_attn = false): a ubatch that requests no
+    // output row and no unmasked hidden export - the speculative catch-up of prefill and verification rows, whose
+    // pending_h / verify rows come from the TARGET's embeddings - needs only the draft block's K/V cache writes. Build
+    // the embedding / hidden mixing, K proj + norm + RoPE, V proj, the cache's rotations and cpy_k/cpy_v; skip Q, the
+    // gate, the attention, wo, the hc combines, the FFN and the head. Exact: none of the skipped nodes feeds a stored
+    // byte (K/V depend on cur = build_hc_mix(eh_proj(...)) and the positions only), and a zero-output ubatch extracts
+    // nothing. Mixed-output ubatches and the reserve graph (it requests outputs) keep the full graph; graph reuse keys
+    // on n_outputs, so the two shapes never alias.
+    const bool kv_only = !cparams.mtp_catchup_attn && n_outputs == 0 &&
+            (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) && !cparams.embeddings;
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -1274,21 +1285,26 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
-    cb(Qcur_full, "mtp_Qcur_full", il);
+    ggml_tensor * Qcur = nullptr;
+    ggml_tensor * gate = nullptr;
 
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
-    Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Qcur, "mtp_Qcur_normed", il);
+    if (!kv_only) {
+        ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
+        cb(Qcur_full, "mtp_Qcur_full", il);
 
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-        ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
-    cb(gate, "mtp_gate", il);
+        Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+        Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Qcur, "mtp_Qcur_normed", il);
+
+        gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+            ggml_element_size(Qcur_full) * n_embd_head);
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+        cb(gate, "mtp_gate", il);
+    }
 
     ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -1300,14 +1316,24 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(Vcur, "mtp_Vcur", il);
 
     // IMRoPE, same convention and freq_base as the trunk
-    Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
+    if (!kv_only) {
+        Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+    }
     Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
-    cb(Qcur, "mtp_Qcur", il);
+    if (!kv_only) {
+        cb(Qcur, "mtp_Qcur", il);
+    }
     cb(Kcur, "mtp_Kcur", il);
+
+    if (kv_only) {
+        // [TAG_MTP_CATCHUP_NOATTN] the cache writes are the graph's only roots; no t_logits / t_h_nextn
+        build_attn_store_kv(inp_attn, Kcur, Vcur, il);
+        return;
+    }
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;

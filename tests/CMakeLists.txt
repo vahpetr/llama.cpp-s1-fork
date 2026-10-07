@@ -208,6 +208,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build_and_test(test-llama-archs.cpp)
     llama_build_and_test(test-mtp-carrier.cpp) # [TAG_UP28333] MTP carrier at sequence start + restore; random CPU model
+    llama_build_and_test(test-mtp-catchup.cpp LABEL mtp) # [TAG_MTP_CATCHUP_NOATTN] attention-free MTP catch-up == full graph (R80.4)
     llama_build_and_test(test-qwen4exp-hc-norm.cpp) # [TAG_UP28896] RMS_NORM + MUL adjacency, bit identity on the CPU
     llama_build_and_test(test-vk-mmq-knobs.cpp) # [TAG_MMQ_INT8_KNOBS] GGML_VK_MMQ_INT8_MIN_N / _OPS parsers, CPU only
 

@@ -1209,6 +1209,15 @@ struct llm_graph_context {
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
 
+    // [TAG_MTP_CATCHUP_NOATTN] the store half of build_attn(llm_graph_input_attn_kv *, ...) alone: the K/V Hadamard
+    // rotations and the cpy_k/cpy_v roots, node for node as build_attn emits them, without the attention (the KQ
+    // mask input is then left unallocated, which set_input already tolerates)
+    void build_attn_store_kv(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+                    int   il) const;
+
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,
             ggml_tensor * wo,
