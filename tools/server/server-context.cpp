@@ -1420,6 +1420,130 @@ private:
 
     std::unique_ptr<server_disk_cache> disk_cache; // [TAG_DISK_PROMPT_CACHE]
 
+    // [TAG_CACHE_COMPAT2] the GPU device identity of the measurement memo: every GPU / iGPU device's name,
+    //   description and device id (not the driver version alone)
+    static std::string cache_gpu_identity() {
+        std::string id;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const auto type = ggml_backend_dev_type(dev);
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                continue;
+            }
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            id += string_format("%s/%s/%s;", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                                props.device_id ? props.device_id : "-");
+        }
+        return id.empty() ? "cpu" : id;
+    }
+
+    // [TAG_CACHE_COMPAT2] the short-context measurement (spec D4): on sequence 0 before serving, from a cleared
+    //   target and draft memory, a temporary fresh speculative object driven through target decode + its process(),
+    //   a fixed 64-token probe in 4 ubatches of 16 (output on the last token only, like a prompt); hashes the target,
+    //   draft and carry host payloads (flags 0). n_ubatch is part of the schedule identity: the server's prefill of a
+    //   stored state follows it and a 64-token probe cannot observe it. Leaves both memories cleared. "" on failure
+    std::string cache_compat_measure() {
+        constexpr int N = 64;
+        constexpr int CH = 16;
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        std::string bytes = string_format("probe=%u;n=%d;chunk=%d;ub=%u;", DISK_CACHE_PROBE_REVISION, N, CH,
+                                          (unsigned) params_base.n_ubatch);
+        llama_memory_clear(llama_get_memory(ctx_tgt), true);
+        if (ctx_dft) {
+            llama_memory_clear(llama_get_memory(ctx_dft), true);
+        }
+        common_speculative_ptr tmp;
+        if (spec) {
+            try {
+                tmp.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+            } catch (const std::exception & e) {
+                SRV_WRN("cache-compat: temporary speculative object failed: %s\n", e.what());
+                return "";
+            }
+        }
+        bool ok = n_vocab > 0;
+        llama_batch b = llama_batch_init(CH, 0, 1);
+        for (int i0 = 0; ok && i0 < N; i0 += CH) {
+            common_batch_clear(b);
+            for (int i = i0; i < i0 + CH; i++) {
+                common_batch_add(b, (llama_token) ((1009 + 7919LL * i) % n_vocab), i, { 0 }, i == N - 1);
+            }
+            ok = llama_decode(ctx_tgt, b) == 0;
+            llama_synchronize(ctx_tgt);
+            if (ok && tmp) {
+                ok = common_speculative_process(tmp.get(), b);
+            }
+        }
+        llama_batch_free(b);
+        const auto section = [&](const char * name, llama_context * ctx) {
+            const size_t n = llama_state_seq_get_size_ext(ctx, 0, 0);
+            std::vector<uint8_t> buf(n);
+            const size_t got = n ? llama_state_seq_get_data_ext(ctx, buf.data(), n, 0, 0) : 0;
+            bytes += string_format("%s=%zu:", name, got);
+            bytes.append(reinterpret_cast<const char *>(buf.data()), got);
+            return got == n;
+        };
+        if (ok) {
+            llama_synchronize(ctx_tgt);
+            ok = section("tgt", ctx_tgt);
+            if (ok && ctx_dft) {
+                llama_synchronize(ctx_dft);
+                ok = section("dft", ctx_dft);
+            }
+            std::vector<uint8_t> carry;
+            if (ok && tmp && common_speculative_n_stateful(tmp.get()) > 0) {
+                ok = common_speculative_get_state(tmp.get(), 0, carry);
+            }
+            bytes += string_format("carry=%zu:", carry.size());
+            bytes.append(reinterpret_cast<const char *>(carry.data()), carry.size());
+        }
+        tmp.reset();
+        llama_memory_clear(llama_get_memory(ctx_tgt), true);
+        if (ctx_dft) {
+            llama_memory_clear(llama_get_memory(ctx_dft), true);
+        }
+        if (spec) {
+            common_speculative_reset_state(spec.get(), 0);
+        }
+        return ok ? server_cache_measure_hash(bytes) : "";
+    }
+
+    // [TAG_CACHE_COMPAT2] key v2 from the cheap identity: the measurement comes from the memo (cheap identity + probe
+    //   revision + GPU identity) or is computed now - a memo miss means a new cheap identity, i.e. the cache root can
+    //   only hold entries of another cheap identity, or none (this server is then the first writer and seeds its own
+    //   measurement before its first save)
+    std::string cache_compat_key(const std::string & cheap) {
+        const std::string memo = server_cache_memo_key(cheap, cache_gpu_identity());
+        std::string meas;
+        if (server_cache_memo_get(disk_cache->root_dir(), memo, meas)) {
+            SRV_INF("cache-compat: measurement %s (memo hit)\n", meas.c_str());
+        } else {
+            const int64_t t0 = ggml_time_us();
+            meas = cache_compat_measure();
+            const int64_t ms = (ggml_time_us() - t0) / 1000;
+            if (meas.empty()) {
+                meas = "unmeasured-" + cheap.substr(0, 16); // matches no other cheap identity: a miss, never a mixup
+                SRV_WRN("cache-compat: measurement failed (%" PRId64 " ms), key bound to the cheap identity\n", ms);
+            } else {
+                SRV_INF("cache-compat: measurement %s (computed %" PRId64 " ms)\n", meas.c_str(), ms);
+                if (!server_cache_memo_put(disk_cache->root_dir(), memo, meas)) {
+                    SRV_WRN("%s", "cache-compat: the measurement memo could not be written\n");
+                }
+            }
+        }
+        server_cache_key_parts p;
+        p.model_id   = server_disk_cache_model_identity(params_base);
+        p.desc_h     = disk_cache->descriptor_key();
+        p.measure_h  = meas;
+        p.env_digest = server_cache_env_digest(server_cache_environ());
+        const std::string fp = server_disk_cache_fingerprint_v2(cheap, p);
+        SRV_INF("cache-compat: key %s = model %s | desc %s | meas %s | depth %u | env %s (cheap %s)\n",
+                fp.substr(0, 16).c_str(), p.model_id.c_str(), p.desc_h.c_str(), meas.c_str(), p.depth_version,
+                p.env_digest.c_str(), cheap.substr(0, 16).c_str());
+        return fp;
+    }
+
     // [TAG_DEEP_CKPT] a checkpoint leaving the slot's in-RAM list goes to the deep store (if the schedule keeps it)
     void deep_spill(server_slot & slot, const common_prompt_checkpoint & ckpt, uint8_t kind) {
         // (Codex gate r3 Major 2) not persisted with more than one stateful speculative implementation (one carry)
@@ -1930,11 +2054,12 @@ private:
             disk_cache->adopt_keys = string_split<std::string>(params_base.cache_disk_adopt, ',');
             disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types) +
                                       "/" + common_speculative_state_schema(spec.get()));
+            disk_cache->set_fingerprint(cache_compat_key(server_disk_cache_fingerprint(params_base, n_ctx)));
             disk_cache->init();
         } else if (disk_cache) {
             disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types) +
                                       "/" + common_speculative_state_schema(spec.get()));
-            disk_cache->revalidate(server_disk_cache_fingerprint(params_base, n_ctx));
+            disk_cache->revalidate(cache_compat_key(server_disk_cache_fingerprint(params_base, n_ctx)));
         }
 
         if (params_base.n_ctx_checkpoints > 0) {
