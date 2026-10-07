@@ -167,10 +167,15 @@ void common_spec_tput_eval(const std::vector<float> & p, int n, const common_spe
 // n* = argmax over n in {0} U [max(1, n_min), n_max] of gain/cost (v51 r1, Codex C Minor: the drafter clears a draft
 // shorter than n_min, so those lengths are not candidates - compared directly, not promoted after the choice);
 // p[i] = p_{i+1} (missing entries count as 1, see common_spec_tput_p_eff for the server's estimate);
-// ties go to the shorter draft. rate_out (optional): the expected tokens per ms at n*.
+// ties between drafting lengths go to the shorter draft (a zero never wins a tie, see below). rate_out (optional): the expected tokens per ms at n*.
 //   -1: the cost model is invalid (a candidate's cost is non-finite or <= 0) - the caller takes its prior path.
+// v51 r2 (Codex sol §4 safety bound): n* = 0 only when the modeled rate of 0 exceeds the modeled rate of n_max by
+//   more than zero_margin (rate(0) > (1 + zero_margin)*rate(n_max)); otherwise (ties, inside the margin) the best
+//   drafting length - the fits are not exact, so an uncertain zero keeps drafting (server: LLAMA_SPEC_TPUT_MARGIN, 0.10)
 int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const common_spec_tput_cost & c,
-                            double * rate_out = nullptr, int n_min = 1);
+                            double * rate_out = nullptr, int n_min = 1, double zero_margin = 0.0);
+
+#define COMMON_SPEC_TPUT_MARGIN_DEFAULT 0.10
 
 // the acceptance the rule sees: p_eff[i] = ema[i] where position i was observed (n_obs[i] > 0); a never-reached
 //   position takes the estimate of the deepest observed position before it (v51 r1, Codex C Minor: not the optimistic
@@ -223,6 +228,10 @@ struct common_spec_tput_fits {
     //   extrapolate are identified - the draft fit's samples span >= 2 distinct attempted lengths and the verify fit's
     //   >= 2 distinct row counts, each with >= COMMON_SPEC_TPUT_RANK_MIN samples. Until then the policy is `off`.
     bool ranked() const;
+
+    // the round cost model of this bucket (n_rb_free left to the caller); b_prior: the draft / verify slope while a
+    //   fit does not identify it. false while a component is not warm (or not finite): the caller's prior path
+    bool cost(double b_prior, common_spec_tput_cost & c) const;
 };
 
 #define COMMON_SPEC_TPUT_RANK_MIN     4

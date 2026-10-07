@@ -3267,9 +3267,13 @@ void common_spec_tput_eval(const std::vector<float> & p, int n, const common_spe
 }
 
 int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const common_spec_tput_cost & c, double * rate_out,
-                            int n_min) {
+                            int n_min, double zero_margin) {
     int    best_n    = 0;
     double best_rate = -1.0;
+    int    pos_n     = 0;    // the best drafting length (n >= n_lo) and its rate
+    double pos_rate  = -1.0;
+    double rate_0    = 0.0;
+    double rate_max  = 0.0;  // the rate of n_max
     const int n_lo   = std::max(1, n_min);
     for (int n = 0; n <= std::max(0, n_max); n = n == 0 ? n_lo : n + 1) {
         double gain = 0.0, cost = 0.0;
@@ -3285,6 +3289,19 @@ int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const commo
             best_rate = rate;
             best_n    = n;
         }
+        if (n == 0) {
+            rate_0 = rate;
+        } else if (rate > pos_rate) {
+            pos_rate = rate;
+            pos_n    = n;
+        }
+        if (n == n_max) {
+            rate_max = rate;
+        }
+    }
+    if (best_n == 0 && pos_n > 0 && !(rate_0 > (1.0 + std::max(0.0, zero_margin))*rate_max)) {
+        best_n    = pos_n; // an uncertain zero keeps drafting
+        best_rate = pos_rate;
     }
     if (rate_out) {
         *rate_out = best_rate;
@@ -3332,6 +3349,31 @@ int common_spec_ew_line::n_distinct(int min_count) const {
 
 bool common_spec_tput_fits::ranked() const {
     return draft.n_distinct(COMMON_SPEC_TPUT_RANK_MIN) >= 2 && verify.n_distinct(COMMON_SPEC_TPUT_RANK_MIN) >= 2;
+}
+
+bool common_spec_tput_fits::cost(double b_prior, common_spec_tput_cost & c) const {
+    // the host intercept from zero rounds (no draft, no checkpoint); while none were measured at this depth, the
+    //   drafting rounds' host fit (checkpoint time excluded) at one row
+    double h_a = 0.0, h_b = 0.0;
+    bool ok_host = host.get(c.host, h_b, 0.0);
+    if (!ok_host && host_d.get(h_a, h_b, 0.0)) {
+        c.host  = h_a + h_b;
+        ok_host = true;
+    }
+    const bool ok = draft  .get(c.d0, c.d1, b_prior) &&
+                    ckpt   .get(c.k0, c.k1, 0.0) &&
+                    verify .get(c.v0, c.v1, b_prior) &&
+                    catchup.get(c.c0, c.c1, 0.0) &&
+                    ok_host;
+    // the rollback cycle (restore + replay pass of r rows); before its fit is usable: a replay pass priced as a
+    //   plain round of r rows (no restore)
+    double r_b = 0.0;
+    if (!rb.get(c.r0, r_b, c.v1 + c.c1)) {
+        c.r0 = c.v0 + c.c0 + c.host;
+        r_b  = c.v1 + c.c1;
+    }
+    c.r1 = r_b;
+    return ok;
 }
 
 int common_spec_tput_explore_n(common_spec_tput_fits & f, int n_lo, int n_max) {

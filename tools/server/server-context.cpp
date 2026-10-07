@@ -4196,31 +4196,10 @@ private:
         const int    n_kv  = spec_n_kv_depth(slot);
         const double t_tok = (double) dp.n_max_adaptive_t_tok + (double) dp.n_max_adaptive_k_tok*(double) n_kv;
         common_spec_tput_cost c;
-        double h_b = 0.0;
         // the fits of this slot's depth bucket only (samples from other depths never price this one); a bucket
         //   that is not warm yet takes the prior path below (the configured length, cooldown still on)
         auto & f = spec_tput_fits.at(n_kv);
-        // the host intercept from zero rounds (no draft, no checkpoint); while none were measured at this depth, the
-        //   drafting rounds' host fit (checkpoint time excluded) at one row
-        double h_a = 0.0;
-        bool ok_host = f.host.get(c.host, h_b, 0.0);
-        if (!ok_host && f.host_d.get(h_a, h_b, 0.0)) {
-            c.host  = h_a + h_b;
-            ok_host = true;
-        }
-        const bool ok = f.draft  .get(c.d0, c.d1, 0.5*t_tok) &&
-                        f.ckpt   .get(c.k0, c.k1, 0.0) &&
-                        f.verify .get(c.v0, c.v1, 0.5*t_tok) &&
-                        f.catchup.get(c.c0, c.c1, 0.0) &&
-                        ok_host;
-        // the rollback cycle (restore + replay pass of r rows); before its fit is usable: a replay pass priced as a
-        //   plain round of r rows (no restore)
-        double r_b = 0.0;
-        if (!f.rb.get(c.r0, r_b, c.v1 + c.c1)) {
-            c.r0 = c.v0 + c.c0 + c.host;
-            r_b  = c.v1 + c.c1;
-        }
-        c.r1 = r_b;
+        const bool ok = f.cost(0.5*t_tok, c);
         c.n_rb_free = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? 0
                     : ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ? (int) llama_n_rs_seq(ctx_tgt)
                     : (1 << 30);
@@ -4229,8 +4208,14 @@ private:
         //   prior path = today's length (n_max), the cooldown still applies
         // candidates {0} U [n_lo, n_max]: the drafter clears a draft shorter than --spec-draft-n-min
         const int n_lo = std::max(1, dp.n_min);
+        // a zero must beat n_max by the margin (v51 r2, Codex sol §4: the fits carry no performance bound by themselves)
+        static const double zero_margin = [] {
+            const char * e = getenv("LLAMA_SPEC_TPUT_MARGIN");
+            const double m = e ? atof(e) : COMMON_SPEC_TPUT_MARGIN_DEFAULT;
+            return std::isfinite(m) && m >= 0.0 ? m : COMMON_SPEC_TPUT_MARGIN_DEFAULT;
+        }();
         int n_rule = ok ? common_spec_tput_best_n(common_spec_tput_p_eff(slot.spec_acc_ema, slot.spec_acc_nobs),
-                                                  n_max_cfg, c, &rate, n_lo) : -1;
+                                                  n_max_cfg, c, &rate, n_lo, zero_margin) : -1;
         if (n_rule < 0) {
             n_rule = n_max_cfg;
         }

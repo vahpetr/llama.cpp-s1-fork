@@ -339,6 +339,60 @@ static void test_rank() {
     check(f.ranked(), "4 exploration samples in draft and verify: rank");
 }
 
+// v51 r2 (Codex sol §4 counterexample + safety bound): a zero decision must beat n_max by the margin
+static void test_margin() {
+    // the sol counterexample, end to end: the world has constant costs (draft 4 ms for any n >= 1, verify 9 ms for any
+    //   width, everything else 0), p_i = 0.4, n_max = 8. Samples at n = 8 alone: no rank -> n_max (test_rank). With the
+    //   exploration rounds (n = 6, 7 rows) the slopes are identified as 0 and the rule keeps n_max: off's 1.666/13 =
+    //   0.128 tok/ms beats the true zero's 1/9 = 0.111.
+    common_spec_tput_fits f;
+    for (int k = 0; k < 64; ++k) {
+        const bool x = k % 16 == 15;
+        f.draft  .add(x ? 6.0 : 8.0, 4.0);
+        f.ckpt   .add(x ? 6.0 : 8.0, 0.0);
+        f.verify .add(x ? 7.0 : 9.0, 9.0);
+        f.catchup.add(x ? 7.0 : 9.0, 0.0);
+        f.host_d .add(x ? 7.0 : 9.0, 0.0);
+    }
+    check(f.ranked(), "counterexample world with exploration: ranked");
+    common_spec_tput_cost c;
+    check(f.cost(0.5, c), "counterexample world: cost model warm");
+    check(std::fabs(c.d1) < 1e-9 && std::fabs(c.v1) < 1e-9 && std::fabs(c.d0 - 4.0) < 1e-9 && std::fabs(c.v0 - 9.0) < 1e-9,
+          "counterexample world: identified slopes 0 (draft 4 + 0n, verify 9 + 0m)");
+    const std::vector<float> p(8, 0.4f);
+    double rate = 0.0;
+    const int n = common_spec_tput_best_n(p, 8, c, &rate, 1, COMMON_SPEC_TPUT_MARGIN_DEFAULT);
+    check(n == 8, "counterexample: chooses n_max, not 0 (got " + std::to_string(n) + ")");
+    check(rate > 1.0/9.0, "counterexample: the chosen rate beats the true zero");
+
+    // the review's mis-identified model (d = 2 + 0.25n, v = 4.5 + 0.5m) models zero 56 % ahead: beyond any small
+    //   margin - only the rank condition (no rank at one width) protects that case, the margin covers fit noise
+    common_spec_tput_cost m;
+    m.d0 = 2.0; m.d1 = 0.25; m.v0 = 4.5; m.v1 = 0.5;
+    check(common_spec_tput_best_n(p, 8, m, nullptr, 1, COMMON_SPEC_TPUT_MARGIN_DEFAULT) == 0,
+          "a 56 % modeled advantage passes the margin (the rank guards the unidentified case)");
+
+    // a zero within the margin keeps drafting: rate(0) = 0.1, rate(1) = 1.1/11.55 = 0.1/1.05 (zero 5 % ahead)
+    common_spec_tput_cost t;
+    t.v0 = 10.0; t.d0 = 1.55;
+    const std::vector<float> q(1, 0.1f);
+    double r = 0.0;
+    check(common_spec_tput_best_n(q, 1, t, &r, 1, 0.0) == 0, "no margin: the 5 % zero wins");
+    check(common_spec_tput_best_n(q, 1, t, &r, 1, 0.04) == 0, "margin 4 %: the 5 % zero wins");
+    check(common_spec_tput_best_n(q, 1, t, &r, 1, 0.10) == 1 && std::fabs(r - 1.1/11.55) < 1e-9,
+          "margin 10 %: the 5 % zero keeps drafting (n_max), rate_out = the drafting rate");
+    // an exact tie: drafting (ties no longer go to the zero)
+    common_spec_tput_cost e;
+    e.v0 = 10.0; e.d0 = 1.0;
+    check(common_spec_tput_best_n(q, 1, e, nullptr, 1, 0.10) == 1, "an exact tie keeps drafting");
+    // the margin compares against n_max: zero 20 % ahead of n_max passes even if a shorter draft is closer
+    common_spec_tput_cost g;
+    g.v0 = 10.0; g.d0 = 0.5; g.d1 = 3.0;
+    const std::vector<float> q2(4, 0.1f);
+    // rate(0) = 0.1; rate(1) = 1.1/13.5 = 0.0815; rate(4) = 1.1111/22.5 = 0.0494
+    check(common_spec_tput_best_n(q2, 4, g, nullptr, 1, 0.10) == 0, "zero far ahead of n_max: zero");
+}
+
 static void test_cooldown() {
     common_spec_cooldown cd;
 
@@ -414,6 +468,7 @@ int main() {
     test_rule_hygiene();
     test_cooldown();
     test_rank();
+    test_margin();
     if (n_fail) {
         printf("test-spec-draft-policy: %d failures (%d checks ok)\n", n_fail, n_ok);
         return 1;
