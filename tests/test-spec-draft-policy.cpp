@@ -231,6 +231,56 @@ static void test_timing_hygiene() {
     check(common_spec_tput_best_n({ 0.9f }, 2, c) >= 0, "a valid model -> n*");
 }
 
+// (v51 r1, C Minors) {0} U [n_min, n_max] compared directly; never-reached positions take the last observed estimate
+static void test_rule_hygiene() {
+    common_spec_tput_cost c;
+    c.d0 = 1.0; c.d1 = 2.2; c.v0 = 25.0; c.v1 = 1.5; c.c0 = 0.8; c.c1 = 0.2; c.host = 1.2;
+    const std::vector<float> p = { 0.3f, 0.05f, 0.05f, 0.05f };
+    check(common_spec_tput_best_n(p, 4, c) == 1, "unconstrained: n* = 1");
+    // n_min = 3: the old rule promoted 1 -> 3 after the choice; the direct comparison finds 0 better than 3
+    const int n3 = common_spec_tput_best_n(p, 4, c, nullptr, 3);
+    int ref = 0;
+    double best = ref_rate(p, 0, c);
+    for (int n = 3; n <= 4; ++n) {
+        if (ref_rate(p, n, c) > best + 1e-12) {
+            best = ref_rate(p, n, c);
+            ref  = n;
+        }
+    }
+    check(n3 == 0 && ref == 0, "n_min 3: {0} U [3, 4] -> 0 (not a promoted 3)");
+    check(common_spec_tput_best_n({ 0.95f, 0.95f, 0.95f, 0.95f }, 4, c, nullptr, 3) == 4, "n_min 3, easy text -> n_max");
+    check(common_spec_tput_best_n({ 0.95f }, 2, c, nullptr, 3) == 0, "n_min above n_max: only 0 is a candidate");
+    for (int a = 0; a <= 10; ++a) {
+        for (int n_min = 1; n_min <= 5; ++n_min) {
+            const std::vector<float> q = { a / 10.0f, 0.7f, 0.4f, 0.8f, 0.6f };
+            const int got = common_spec_tput_best_n(q, 5, c, nullptr, n_min);
+            int r = 0;
+            double rb = ref_rate(q, 0, c);
+            for (int n = n_min; n <= 5; ++n) {
+                if (ref_rate(q, n, c) > rb + 1e-12) {
+                    rb = ref_rate(q, n, c);
+                    r  = n;
+                }
+            }
+            check(got == r, "n_min sweep vs the restricted enumeration");
+        }
+    }
+
+    // p_eff: an unobserved position takes the deepest observed estimate before it, 1.0 only with no observation
+    const auto e1 = common_spec_tput_p_eff({ 0.8f, 0.5f, 1.0f, 1.0f }, { 10, 3, 0, 0 });
+    check(e1 == std::vector<float>({ 0.8f, 0.5f, 0.5f, 0.5f }), "never-reached tail -> the last observed estimate");
+    const auto e2 = common_spec_tput_p_eff({ 0.7f, 1.0f, 0.4f }, { 5, 0, 2 });
+    check(e2 == std::vector<float>({ 0.7f, 0.7f, 0.4f }), "a gap takes the estimate before it");
+    const auto e3 = common_spec_tput_p_eff({ 1.0f, 1.0f }, { 0, 0 });
+    check(e3 == std::vector<float>({ 1.0f, 1.0f }), "nothing observed -> 1.0");
+    // the optimistic tail drafted n_max; the conservative one stops earlier
+    const std::vector<float> ema = { 0.6f, 0.6f, 1.0f, 1.0f, 1.0f };
+    const int n_opt  = common_spec_tput_best_n(ema, 5, c);
+    const int n_cons = common_spec_tput_best_n(common_spec_tput_p_eff(ema, { 50, 20, 0, 0, 0 }), 5, c);
+    printf("rule hygiene: ema 0.6/0.6 + unobserved tail: optimistic 1.0 n* = %d, last-observed n* = %d\n", n_opt, n_cons);
+    check(n_cons < n_opt, "the conservative tail prior shortens the draft");
+}
+
 static void test_cooldown() {
     common_spec_cooldown cd;
 
@@ -263,13 +313,21 @@ static void test_cooldown() {
     cd.observe(0, 0);
     check(cd.c == c_before && cd.cooling(), "empty probe at the cap stays cooling");
     while (cd.decide(5) == 0) {}
-    // a non-zero acceptance leaves the cooldown, the rule passes through again
+    // a success halves C (spec §3): 64 -> 32 -> 16 -> 8 -> 4, then below c_min the cooldown ends
     cd.observe(1, 1);
-    check(!cd.cooling() && cd.decide(4) == 4, "success resets the cooldown");
-    // the next zero decision starts from c_min again
+    check(cd.cooling() && cd.c == 32 && cd.wait == 32, "a success halves C (64 -> 32)");
+    seq.clear();
+    for (int k = 0; k < 4; ++k) {
+        cd.observe(1, 1);
+        seq += std::to_string(cd.c) + " ";
+    }
+    check(seq == "16 8 4 0 " && !cd.cooling(), "successes halve C down to the end of the cooldown (got " + seq + ")");
+    check(cd.decide(4) == 4, "out of the cooldown the rule passes through again");
+    // the next zero decision starts from c_min again; one success at c_min ends it
     cd.decide(0);
     check(cd.c == cd.c_min, "a new cooldown starts at c_min");
     cd.observe(1, 1);
+    check(!cd.cooling(), "a success at c_min ends the cooldown");
 
     // K = 3 consecutive failed rounds (0 accepted or empty) start a cooldown although the rule says draft
     common_spec_cooldown k;
@@ -295,6 +353,7 @@ int main() {
     test_depth_buckets();
     test_ckpt_cost();
     test_timing_hygiene();
+    test_rule_hygiene();
     test_cooldown();
     if (n_fail) {
         printf("test-spec-draft-policy: %d failures (%d checks ok)\n", n_fail, n_ok);

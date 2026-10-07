@@ -531,6 +531,7 @@ struct server_slot {
     // untouched (greedy accept-if-equal at temp 0, unchanged rejection sampling above it), so the
     // emitted distribution is unchanged; only the round structure differs.
     std::vector<float> spec_acc_ema;    // p_i per draft position, EMA
+    std::vector<uint32_t> spec_acc_nobs; // [TAG_SPEC_DRAFT_POLICY] observations per position (0 = never reached)
     int                spec_n_max_last = 0; // last adaptive draft length (also reported in /slots)
 
     // last cost model evaluation, for /slots and /metrics (diagnostics only)
@@ -568,9 +569,11 @@ struct server_slot {
 
         // positions 0..n_accepted-1 were accepted; position n_accepted (if it was drafted) was
         // rejected. positions after a rejection are not observed - they follow a broken prefix.
+        spec_acc_nobs.resize(spec_acc_ema.size(), 0);
         for (size_t i = 0; i < n_draft && i <= n_accepted && i < spec_acc_ema.size(); ++i) {
             const float obs = (i < n_accepted) ? 1.0f : 0.0f;
             spec_acc_ema[i] += SPEC_ACC_EMA_ALPHA * (obs - spec_acc_ema[i]);
+            spec_acc_nobs[i]++;
         }
     }
 
@@ -583,8 +586,10 @@ struct server_slot {
         if (spec_acc_ema.empty()) {
             spec_acc_ema.assign(n_max_cfg, 1.0f);
         }
+        spec_acc_nobs.resize(spec_acc_ema.size(), 0);
         if (k < spec_acc_ema.size()) {
             spec_acc_ema[k] += SPEC_ACC_EMA_ALPHA * (0.0f - spec_acc_ema[k]);
+            spec_acc_nobs[k]++;
         }
     }
 
@@ -660,6 +665,7 @@ struct server_slot {
         stats = {};
         n_accepted_per_pos.clear();
         spec_acc_ema.clear();
+        spec_acc_nobs.clear();
         spec_n_max_last    = 0;
         spec_cost_t_tok    = 0.0f;
         spec_cost_t_dec    = 0.0f;
@@ -4168,15 +4174,18 @@ private:
         double rate = 0.0;
         // before the fits are usable, or when they give no valid cost model (non-finite / non-positive costs): the
         //   prior path = today's length (n_max), the cooldown still applies
-        int n_rule = ok ? common_spec_tput_best_n(slot.spec_acc_ema, n_max_cfg, c, &rate) : -1;
+        // candidates {0} U [n_lo, n_max]: the drafter clears a draft shorter than --spec-draft-n-min
+        const int n_lo = std::max(1, dp.n_min);
+        int n_rule = ok ? common_spec_tput_best_n(common_spec_tput_p_eff(slot.spec_acc_ema, slot.spec_acc_nobs),
+                                                  n_max_cfg, c, &rate, n_lo) : -1;
         if (n_rule < 0) {
             n_rule = n_max_cfg;
         }
         const bool was_cooling = slot.spec_cd.cooling();
         int n = std::min(slot.spec_cd.decide(n_rule), n_max_cfg);
-        if (n > 0) {
-            // --spec-draft-n-min: the drafter throws away a shorter draft, so a probe of 1 would always come back empty
-            n = std::max(n, std::min(dp.n_min, n_max_cfg));
+        if (was_cooling && n > 0) {
+            // the probe: the shortest length the drafter keeps (none fits the remaining space: no probe this round)
+            n = n_lo <= n_max_cfg ? n_lo : 0;
         }
         if (was_cooling && n > 0) {
             slot.stats.n_spec_probe_rounds++;

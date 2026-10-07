@@ -164,11 +164,18 @@ struct common_spec_tput_cost {
 // the expected committed tokens (gain) and wall ms (cost) of one round that drafts n tokens (see above)
 void common_spec_tput_eval(const std::vector<float> & p, int n, const common_spec_tput_cost & c, double & gain, double & cost);
 
-// n* = argmax over n in [0, n_max] of gain/cost; p[i] = p_{i+1} (missing entries count as 1);
+// n* = argmax over n in {0} U [max(1, n_min), n_max] of gain/cost (v51 r1, Codex C Minor: the drafter clears a draft
+// shorter than n_min, so those lengths are not candidates - compared directly, not promoted after the choice);
+// p[i] = p_{i+1} (missing entries count as 1, see common_spec_tput_p_eff for the server's estimate);
 // ties go to the shorter draft. rate_out (optional): the expected tokens per ms at n*.
 //   -1: the cost model is invalid (a candidate's cost is non-finite or <= 0) - the caller takes its prior path.
 int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const common_spec_tput_cost & c,
-                            double * rate_out = nullptr);
+                            double * rate_out = nullptr, int n_min = 1);
+
+// the acceptance the rule sees: p_eff[i] = ema[i] where position i was observed (n_obs[i] > 0); a never-reached
+//   position takes the estimate of the deepest observed position before it (v51 r1, Codex C Minor: not the optimistic
+//   1.0 of the EMA's start, which overvalues long tails after a workload change); 1.0 only while nothing was observed
+std::vector<float> common_spec_tput_p_eff(const std::vector<float> & ema, const std::vector<uint32_t> & n_obs);
 
 // exponentially weighted least squares t = a + b*n of one round component (ms), for --spec-draft-policy tput
 struct common_spec_ew_line {
@@ -213,7 +220,8 @@ struct common_spec_tput_model {
 
 // the cooldown around true-zero decisions: without a draft the acceptance estimate never moves, so after a zero
 //   decision (or K consecutive rounds that proposed nothing / had nothing accepted) the slot plays n = 0 for C rounds and
-//   then probes n = 1; a failed probe doubles C (c_min .. c_max), a non-zero acceptance leaves the cooldown (C resets).
+//   then probes n = 1; a failed probe doubles C (c_min .. c_max), a success (a non-zero acceptance) halves C (spec §3;
+//   below c_min the cooldown ends).
 struct common_spec_cooldown {
     int k_fail = 3;  // consecutive failed rounds that start a cooldown
     int c_min  = 4;

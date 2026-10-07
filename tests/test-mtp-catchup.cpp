@@ -695,20 +695,23 @@ struct tput_policy : loop_policy {
     common_spec_tput_cost c;
     common_spec_cooldown  cd;
     std::vector<float>    ema;
+    std::vector<uint32_t> nobs;
     int n_max = 4;
     tput_policy() {
         c.d0 = 1.0; c.d1 = 2.2; c.v0 = 25.0; c.v1 = 1.5; c.c0 = 0.8; c.c1 = 0.2; c.host = 1.2;
     }
     int decide() override {
-        return std::min(cd.decide(common_spec_tput_best_n(ema, n_max, c)), n_max);
+        return std::min(cd.decide(common_spec_tput_best_n(common_spec_tput_p_eff(ema, nobs), n_max, c)), n_max);
     }
     void observe(int n_req, int n_proposed, int n_acc) override {
         if (ema.empty()) {
             ema.assign(n_max, 1.0f);
+            nobs.assign(n_max, 0);
         }
         const int n_obs = n_proposed < n_req ? n_proposed + 1 : n_proposed;
         for (int i = 0; i < n_obs && i <= n_acc && i < (int) ema.size(); ++i) {
             ema[i] += (1.0f/32.0f) * ((i < n_acc ? 1.0f : 0.0f) - ema[i]);
+            nobs[i]++;
         }
         cd.observe(n_proposed, n_acc);
     }

@@ -349,9 +349,11 @@ enters the state descriptor and the `--cache-disk` compat key: entries saved wit
 ### Draft length policy (`--spec-draft-policy`)
 
 `--spec-draft-policy tput` (env `LLAMA_ARG_SPEC_DRAFT_POLICY`; default `off` = `--spec-draft-n-max` /
-`--spec-draft-n-max-adaptive` as before, byte-identical) picks the draft length per round as the n in [0, n-max] that
+`--spec-draft-n-max-adaptive` as before, byte-identical) picks the draft length per round as the n in
+{0} ∪ [max(1, `--spec-draft-n-min`), n-max] (a shorter draft would be cleared by the drafter) that
 maximises the committed tokens per ms, `(1 + sum_{i<=n} P_i) / (T_draft(n) + T_verify(n+1) + T_catchup(n+1) + T_host)`:
-P_i from the per-position acceptance EMA (an empty or short draft counts as a failure at the stop position), the costs
+P_i from the per-position acceptance EMA (an empty or short draft counts as a failure at the stop position; a position
+never reached yet takes the estimate of the deepest observed position before it, not an optimistic 1.0), the costs
 from exponentially weighted fits of the server's own single-slot round times (draft call vs n, target decode and MTP
 catch-up vs batch rows, the per-round checkpoint save + draft-context restore vs n (charged to n > 0 only), the host
 intercept from zero rounds only (drafting rounds' host, checkpoint excluded, until a zero round was seen)), kept per KV-depth bucket (log2: [0, 8k), [8k, 16k), ... 107k -> 4, 524k -> 7, 1M -> 8),
@@ -365,7 +367,8 @@ restore + replay pass is priced too (its own fit, charged to the round with the 
 a plain round of the replay's rows). n = 0 is a true zero: no draft call,
 no per-round checkpoint, a plain one-token decode (the draft KV still catches up). A cooldown keeps zero from being
 final: after a zero decision or 3 consecutive rounds with nothing accepted the slot plays 0 for C rounds (C = 4,
-doubling to 64 on a failed probe) and then probes n = 1; any accepted token leaves the cooldown. It replaces
+doubling to 64 on a failed probe) and then probes the shortest kept length (1, or n-min); a probe with an accepted token
+halves C, below 4 the cooldown ends. It replaces
 `--spec-draft-n-max-adaptive` while on. Verify widths change, so the target output is the same only up to the backend's
 batch-width class (on the CPU a 1-row decode differs from wider batches by ~1e-8 in the logits). The slot's end-of-task
 log shows the zero rounds and probes; `LLAMA_TRACE=1` logs each length change with the fitted costs.

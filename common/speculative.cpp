@@ -3266,10 +3266,12 @@ void common_spec_tput_eval(const std::vector<float> & p, int n, const common_spe
     }
 }
 
-int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const common_spec_tput_cost & c, double * rate_out) {
+int common_spec_tput_best_n(const std::vector<float> & p, int n_max, const common_spec_tput_cost & c, double * rate_out,
+                            int n_min) {
     int    best_n    = 0;
     double best_rate = -1.0;
-    for (int n = 0; n <= std::max(0, n_max); ++n) {
+    const int n_lo   = std::max(1, n_min);
+    for (int n = 0; n <= std::max(0, n_max); n = n == 0 ? n_lo : n + 1) {
         double gain = 0.0, cost = 0.0;
         common_spec_tput_eval(p, n, c, gain, cost);
         if (!std::isfinite(cost) || !(cost > 0.0) || !std::isfinite(gain)) {
@@ -3327,6 +3329,18 @@ int common_spec_tput_bucket(int n_kv) {
     return b;
 }
 
+std::vector<float> common_spec_tput_p_eff(const std::vector<float> & ema, const std::vector<uint32_t> & n_obs) {
+    std::vector<float> p(ema.size(), 1.0f);
+    float last = 1.0f;
+    for (size_t i = 0; i < ema.size(); ++i) {
+        if (i < n_obs.size() && n_obs[i] > 0) {
+            last = ema[i];
+        }
+        p[i] = last;
+    }
+    return p;
+}
+
 int common_spec_cooldown::decide(int n_rule) {
     if (c > 0) {
         if (wait > 0) {
@@ -3346,8 +3360,11 @@ int common_spec_cooldown::decide(int n_rule) {
 void common_spec_cooldown::observe(int n_proposed, int n_accepted) {
     if (n_proposed > 0 && n_accepted > 0) {
         n_fail = 0;
-        c      = 0;
-        wait   = 0;
+        c      = c / 2; // a success halves C; below c_min the cooldown ends
+        if (c < c_min) {
+            c = 0;
+        }
+        wait   = c;
         return;
     }
     if (c > 0) { // a failed probe
