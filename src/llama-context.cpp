@@ -4887,16 +4887,23 @@ size_t llama_state_seq_write_cb(llama_context * ctx, llama_seq_id seq_id, llama_
 }
 
 size_t llama_state_seq_read_cb(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags,
-                               const llama_state_seq_reader & reader) {
+                               const llama_state_seq_reader & reader, llama_state_read_status * status) {
     ctx->synchronize();
 
+    llama_io_read_cb io(reader);
+    size_t n_read = 0;
     try {
-        llama_io_read_cb io(reader);
-        return ctx->state_seq_read_io(io, seq_id, flags);
+        n_read = ctx->state_seq_read_io(io, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error reading sequence state: %s\n", __func__, err.what());
-        return 0;
+        n_read = 0;
     }
+    if (status) {
+        *status = n_read > 0      ? LLAMA_STATE_READ_OK
+                : io.status != 0  ? (llama_state_read_status) io.status
+                                  : LLAMA_STATE_READ_OTHER;
+    }
+    return n_read;
 }
 
 std::string llama_state_seq_descriptor(const llama_context * ctx) {

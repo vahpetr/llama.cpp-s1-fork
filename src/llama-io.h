@@ -32,4 +32,13 @@ public:
     virtual size_t n_bytes() = 0;
 
     void read_string(std::string & str);
+
+    // [TAG_STATE_READ_STATUS] why the read failed, a llama_state_read_status value (llama-ext.h) recorded by the memory
+    //   reader at the failure site; the first reason wins, 0 = none recorded
+    int status = 0;
+    void set_status(int s) {
+        if (status == 0) {
+            status = s;
+        }
+    }
 };

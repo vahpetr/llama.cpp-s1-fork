@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "llama-ext.h"
 #include "llama-batch.h"
 #include "llama-model.h"
 
@@ -1040,6 +1041,7 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
             io.read(&n_seq_id, sizeof(n_seq_id));
 
             if (n_seq_id != 0) {
+                io.set_status(LLAMA_STATE_READ_INVALID);
                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
                 return false;
             }
@@ -1050,6 +1052,7 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
         ubatch.seq_id[0] = &dest_seq_id;
 
         if (!find_slot(ubatch)) {
+            io.set_status(LLAMA_STATE_READ_NO_SPACE);
             LLAMA_LOG_ERROR("%s: failed to find available cells in kv cache\n", __func__);
             return false;
         }
@@ -1065,6 +1068,7 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
         // whole KV cache restore
 
         if (cell_count > size) {
+            io.set_status(LLAMA_STATE_READ_INVALID);
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
             return false;
         }
@@ -1087,6 +1091,7 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
                 io.read(&seq_id, sizeof(seq_id));
 
                 if (seq_id < 0 || (uint32_t) seq_id >= this->n_seq_max) {
+                    io.set_status(LLAMA_STATE_READ_INVALID);
                     LLAMA_LOG_ERROR("%s: invalid seq_id, %d is out of range [0, %u)\n", __func__, seq_id, this->n_seq_max);
                     return false;
                 }
@@ -1095,6 +1100,7 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
 
                 int32_t & tail = cells[seq_id].tail;
                 if (tail != -1) {
+                    io.set_status(LLAMA_STATE_READ_INVALID);
                     LLAMA_LOG_ERROR("%s: duplicate tail for seq_id %d in cell %d and %d\n", __func__, seq_id, i, tail);
                     return false;
                 }
@@ -1122,14 +1128,17 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     io.read(&n_layer, sizeof(n_layer));
 
     if (n_layer != hparams.n_layer()) {
+        io.set_status(LLAMA_STATE_READ_INVALID);
         LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, hparams.n_layer());
         return false;
     }
     if (cell_count > size) {
+        io.set_status(LLAMA_STATE_READ_INVALID);
         LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, size);
         return false;
     }
     if (false != (bool) s_trans) {
+        io.set_status(LLAMA_STATE_READ_INVALID);
         LLAMA_LOG_ERROR("%s: incompatible s transposition\n", __func__);
         return false;
     }
@@ -1144,6 +1153,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         io.read(&r_type_i_ref, sizeof(r_type_i_ref));
         const int32_t r_type_i = (int32_t) r_l[il]->type;
         if (r_type_i != r_type_i_ref) {
+            io.set_status(LLAMA_STATE_READ_INVALID);
             LLAMA_LOG_ERROR("%s: mismatched r type (%d != %d, layer %d)\n", __func__, r_type_i, r_type_i_ref, il);
             return false;
         }
@@ -1153,6 +1163,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         io.read(&r_size_row_ref, sizeof(r_size_row_ref));
         const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
         if (r_size_row != r_size_row_ref) {
+            io.set_status(LLAMA_STATE_READ_INVALID);
             LLAMA_LOG_ERROR("%s: mismatched r row size (%zu != %zu, layer %d)\n", __func__, r_size_row, (size_t) r_size_row_ref, il);
             return false;
         }
@@ -1167,6 +1178,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             io.read(&p_size_row_ref, sizeof(p_size_row_ref));
             const size_t p_size_row = ggml_row_size(p_l[il]->type, hparams.ple_conv_state());
             if (p_size_row != p_size_row_ref) {
+                io.set_status(LLAMA_STATE_READ_INVALID);
                 LLAMA_LOG_ERROR("%s: mismatched ple row size (%zu != %zu, layer %d)\n", __func__, p_size_row, (size_t) p_size_row_ref, il);
                 return false;
             }
@@ -1188,6 +1200,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             const int32_t s_type_i = (int32_t)s_l[il]->type;
 
             if (s_type_i != s_type_i_ref) {
+                io.set_status(LLAMA_STATE_READ_INVALID);
                 LLAMA_LOG_ERROR("%s: mismatched s type (%d != %d, layer %d)\n", __func__, s_type_i, s_type_i_ref, il);
                 return false;
             }
@@ -1197,6 +1210,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             io.read(&s_size_row_ref, sizeof(s_size_row_ref));
             const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
             if (s_size_row != s_size_row_ref) {
+                io.set_status(LLAMA_STATE_READ_INVALID);
                 LLAMA_LOG_ERROR("%s: mismatched s row size (%zu != %zu, layer %d)\n", __func__, s_size_row, (size_t) s_size_row_ref, il);
                 return false;
             }
@@ -1219,6 +1233,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             io.read(&s_type_i_ref, sizeof(s_type_i_ref));
             const int32_t s_type_i = (int32_t)s_l[il]->type;
             if (s_type_i != s_type_i_ref) {
+                io.set_status(LLAMA_STATE_READ_INVALID);
                 LLAMA_LOG_ERROR("%s: mismatched s type (%d != %d, layer %d)\n", __func__, s_type_i, s_type_i_ref, il);
                 return false;
             }
@@ -1228,6 +1243,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             io.read(&s_size_el_ref, sizeof(s_size_el_ref));
             const size_t s_size_el = ggml_type_size(s_l[il]->type);
             if (s_size_el != s_size_el_ref) {
+                io.set_status(LLAMA_STATE_READ_INVALID);
                 LLAMA_LOG_ERROR("%s: mismatched s element size (%zu != %zu, layer %d)\n", __func__, s_size_el, (size_t) s_size_el_ref, il);
                 return false;
             }
@@ -1236,6 +1252,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             uint32_t n_embd_s_ref;
             io.read(&n_embd_s_ref, sizeof(n_embd_s_ref));
             if (n_embd_s != n_embd_s_ref) {
+                io.set_status(LLAMA_STATE_READ_INVALID);
                 LLAMA_LOG_ERROR("%s: mismatched s embedding size (%u != %u, layer %d)\n", __func__, n_embd_s, n_embd_s_ref, il);
                 return false;
             }

@@ -1612,26 +1612,11 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
         return true;
     };
 
-    // [TAG_DISK_LOAD_RESULT] the library reports "no room" only through its log ("failed to find ... available cells
-    //   in kv cache", KV and recurrent memory alike), so the read runs under a log hook that forwards everything and
-    //   notes that line (the same wrapping as common/fit.cpp)
-    struct cap_hook {
-        ggml_log_callback cb = nullptr;
-        void *            ud = nullptr;
-        bool              no_room = false;
-    } hook;
-    llama_log_get(&hook.cb, &hook.ud);
-    llama_log_set([](ggml_log_level level, const char * text, void * ud) {
-        auto * h = static_cast<cap_hook *>(ud);
-        if (text && strstr(text, "available cells in kv cache")) {
-            h->no_room = true;
-        }
-        if (h->cb) {
-            h->cb(level, text, h->ud);
-        }
-    }, &hook);
-    const bool ok = llama_state_seq_read_cb(ctx, id_slot, 0, r) > 0;
-    llama_log_set(hook.cb, hook.ud);
+    // [TAG_DISK_LOAD_RESULT] [TAG_STATE_READ_STATUS] the library returns why the read failed: NO_SPACE ("failed to
+    //   find ... available cells", KV and recurrent memory alike) is a capacity failure, INVALID a stream that
+    //   contradicts this context; no log hook, so nothing process-global is touched
+    llama_state_read_status st = LLAMA_STATE_READ_OK;
+    const bool ok = llama_state_seq_read_cb(ctx, id_slot, 0, r, &st) > 0;
 
     if (ok && !corrupt) {
         // full consumption: nothing of the stream is left unread (an unread suffix is state this context dropped)
@@ -1645,7 +1630,9 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
     if (corrupt || read_failed) {
         return SERVER_DISK_LOAD_INVALID;
     }
-    return hook.no_room ? SERVER_DISK_LOAD_CAPACITY : SERVER_DISK_LOAD_OTHER;
+    return st == LLAMA_STATE_READ_NO_SPACE ? SERVER_DISK_LOAD_CAPACITY
+         : st == LLAMA_STATE_READ_INVALID  ? SERVER_DISK_LOAD_INVALID
+                                           : SERVER_DISK_LOAD_OTHER;
 }
 
 void server_disk_cache::blob_gc() {

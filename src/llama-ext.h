@@ -155,8 +155,21 @@ struct llama_state_seq_reader {
 // returns the number of bytes in the stream, 0 on failure
 LLAMA_API size_t llama_state_seq_write_cb(struct llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags,
                                           const llama_state_seq_writer & writer);
+// [TAG_STATE_READ_STATUS] why a sequence state read failed, set by the memory readers at the failure site (the first
+//   reason wins): NO_SPACE = the stream is well-formed so far but this context has no room for its cells (KV and
+//   recurrent "failed to find ... available cells"), INVALID = the stream contradicts this context (layer count, types,
+//   row sizes, cell / seq_id ranges, stream count), OTHER = anything else (a short stream, an allocation or I/O error)
+enum llama_state_read_status {
+    LLAMA_STATE_READ_OK       = 0,
+    LLAMA_STATE_READ_NO_SPACE = 1,
+    LLAMA_STATE_READ_INVALID  = 2,
+    LLAMA_STATE_READ_OTHER    = 3,
+};
+
+// status (optional): LLAMA_STATE_READ_OK on success, else the failure reason
 LLAMA_API size_t llama_state_seq_read_cb (struct llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags,
-                                          const llama_state_seq_reader & reader);
+                                          const llama_state_seq_reader & reader,
+                                          enum llama_state_read_status * status = nullptr);
 
 // [TAG_STATE_DESCRIPTOR] canonical text of what a sequence state stream of ctx contains: the state ABI revision, the
 //   full / partial stream rule, the memory sections in stream order with per-layer presence, types (block encoding)
