@@ -130,11 +130,12 @@ struct run_out {
     std::vector<llama_token> drafts;
     std::vector<std::string> qsa_ids; // [qsa-ids] lines without the graph counter
     int64_t hit[2] = {0, 0}, miss[2] = {0, 0}, check[2] = {0, 0}, inval[2] = {0, 0}; // [0] main, [1] mtp
-    int64_t evict[2] = {0, 0}, clear[2] = {0, 0}, check2[2] = {0, 0}, check_sched[2] = {0, 0};
+    int64_t evict[2] = {0, 0}, clear[2] = {0, 0}, check2[2] = {0, 0}, check_sched[2] = {0, 0}, park_fail[2] = {0, 0};
 };
 
-static run_out run(gguf_context * meta, const char * k, const char * check, const std::string & stderr_path) {
+static run_out run(gguf_context * meta, const char * k, const char * check, const std::string & stderr_path, int fail_take = -1) {
     run_out out;
+    ggml_backend_sched_snapshot_fail_inject(fail_take); // -1 = off; n = the take after n successful ones fails
     common_set_env("LLAMA_GRAPH_CACHE",       k);
     common_set_env("LLAMA_GRAPH_CACHE_CHECK", check);
     g_log.clear();
@@ -260,12 +261,12 @@ static run_out run(gguf_context * meta, const char * k, const char * check, cons
     while (std::getline(ls, line)) {
         char ctx[16] = {0};
         int kk = 0;
-        long long h = 0, m = 0, c = 0, inv = 0, ev = 0, cl = 0, c2 = 0, cs = 0;
-        if (sscanf(line.c_str(), "graph-cache: ctx=%15s K=%d hit=%lld miss=%lld check=%lld inval=%lld evict=%lld clear=%lld check2=%lld check_sched=%lld",
-                   ctx, &kk, &h, &m, &c, &inv, &ev, &cl, &c2, &cs) == 10) {
+        long long h = 0, m = 0, c = 0, inv = 0, ev = 0, cl = 0, c2 = 0, cs = 0, pf = 0;
+        if (sscanf(line.c_str(), "graph-cache: ctx=%15s K=%d hit=%lld miss=%lld check=%lld inval=%lld evict=%lld clear=%lld check2=%lld check_sched=%lld park_fail=%lld",
+                   ctx, &kk, &h, &m, &c, &inv, &ev, &cl, &c2, &cs, &pf) == 11) {
             const int i = strcmp(ctx, "mtp") == 0 ? 1 : 0;
             out.hit[i] += h; out.miss[i] += m; out.check[i] += c; out.inval[i] += inv;
-            out.evict[i] += ev; out.clear[i] += cl; out.check2[i] += c2; out.check_sched[i] += cs;
+            out.evict[i] += ev; out.clear[i] += cl; out.check2[i] += c2; out.check_sched[i] += cs; out.park_fail[i] += pf;
         }
     }
     return out;
@@ -306,7 +307,8 @@ int main(int argc, char ** argv) {
         fclose(f);
     }
 
-    for (const run_out * r : { &off, &on, &chk, &ch2 }) {
+    const run_out pfl = run(meta.get(), "8", "1", dir + "/test-graph-cache-parkfail.stderr", 10);
+    for (const run_out * r : { &off, &on, &chk, &ch2, &pfl }) {
         printf("run: %zu logits, %zu draft tokens, %zu [qsa-ids] lines; main hit=%" PRId64 " miss=%" PRId64 " check=%" PRId64
                " inval=%" PRId64 "; mtp hit=%" PRId64 " miss=%" PRId64 " check=%" PRId64 " inval=%" PRId64 "\n",
                r->logits.size(), r->drafts.size(), r->qsa_ids.size(), r->hit[0], r->miss[0], r->check[0], r->inval[0],
@@ -321,6 +323,9 @@ int main(int argc, char ** argv) {
     expect(off.hit[0] == 0 && off.miss[0] == 0, "cache off: no graph-cache activity");
     expect(on.hit[0] > on.miss[0] && on.hit[1] > 0, "K=8: the target hits more than it misses, the MTP context hits");
     expect(chk.check[0] == chk.hit[0] && chk.check[1] == chk.hit[1] && chk.hit[0] > 0, "CHECK: every hit rebuilt and compared");
+    expect(pfl.park_fail[0] + pfl.park_fail[1] == 1 && same(off.logits, pfl.logits) && same(off.drafts, pfl.drafts) &&
+           pfl.check[0] == pfl.hit[0] && pfl.hit[0] > 0,
+           "a snapshot allocation failure drops the resident graph cleanly: identical, CHECK green (park_fail == 1)");
     expect(chk.check_sched[0] >= 2 && chk.clear[0] >= 1,
            "CHECK: the scratch scheduler was remade after the target's scheduler was replaced (check_sched >= 2)");
     expect(same(off.logits, ch2.logits) && same(off.drafts, ch2.drafts) && off.qsa_ids == ch2.qsa_ids,

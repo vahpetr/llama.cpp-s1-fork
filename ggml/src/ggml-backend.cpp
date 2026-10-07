@@ -2067,12 +2067,26 @@ uint64_t ggml_backend_sched_buffer_gen(ggml_backend_sched_t sched) {
     return ggml_gallocr_buffer_gen(sched->galloc);
 }
 
+static int g_sched_snapshot_fail_after = -1; // [TAG_GRAPH_CACHE] test hook
+
+void ggml_backend_sched_snapshot_fail_inject(int n_ok) {
+    g_sched_snapshot_fail_after = n_ok;
+}
+
 ggml_backend_sched_snapshot_t ggml_backend_sched_take(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     GGML_ASSERT(sched->is_alloc);
 
+    bool inject = false;
+    if (g_sched_snapshot_fail_after >= 0) {
+        inject = g_sched_snapshot_fail_after-- == 0;
+    }
+
     // an empty state of the same sizes as ggml_backend_sched_new allocates
     auto * snap = (ggml_backend_sched_snapshot *) calloc(1, sizeof(struct ggml_backend_sched_snapshot));
+    if (snap == NULL) {
+        return NULL;
+    }
     snap->hash_set              = ggml_hash_set_new(sched->hash_set.size);
     GGML_ASSERT(snap->hash_set.size == sched->hash_set.size);
     snap->hv_tensor_backend_ids = (int *) malloc(snap->hash_set.size * sizeof(snap->hv_tensor_backend_ids[0]));
@@ -2084,6 +2098,13 @@ ggml_backend_sched_snapshot_t ggml_backend_sched_take(ggml_backend_sched_t sched
     snap->context_buffer        = (char *) malloc(sched->context_buffer_size);
     snap->is_reset              = false; // forces the full clear in ggml_backend_sched_reset below
     snap->is_alloc              = false;
+
+    if (inject || snap->hash_set.keys == NULL || snap->hash_set.used == NULL || snap->hv_tensor_backend_ids == NULL ||
+        snap->hv_tensor_copies == NULL || snap->splits == NULL || snap->graph_inputs == NULL || snap->context_buffer == NULL) {
+        // nothing was swapped yet: the scheduler keeps its allocated state
+        ggml_backend_sched_snapshot_free(snap);
+        return NULL;
+    }
 
     ggml_backend_sched_swap_state(sched, snap);
     snap->buffer_gen = ggml_backend_sched_buffer_gen(sched);
@@ -2124,7 +2145,7 @@ void ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snap) {
     }
     ggml_free(snap->ctx);
     ggml_hash_set_free(&snap->hash_set);
-    for (int i = 0; i < snap->splits_capacity; i++) {
+    for (int i = 0; snap->splits != NULL && i < snap->splits_capacity; i++) {
         free(snap->splits[i].inputs);
     }
     free(snap->splits);

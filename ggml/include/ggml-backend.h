@@ -362,7 +362,8 @@ extern "C" {
     // without re-splitting or re-allocating. All snapshot graphs share the scheduler's compute buffers, so they must
     // run strictly in sequence and every input must be fully rewritten before each compute.
     //  take:    moves the allocated per-graph state (split graph, splits, tensor assignments and copies) into a new
-    //           snapshot; the scheduler is left reset (as after ggml_backend_sched_reset)
+    //           snapshot; the scheduler is left reset (as after ggml_backend_sched_reset). Returns NULL if the
+    //           snapshot cannot be allocated: the scheduler is then left untouched (still allocated)
     //  restore: swaps the snapshot's state with the scheduler's (the snapshot then holds the previous state); returns
     //           false (and resets the scheduler) if the snapshot is stale, i.e. the buffer generation changed
     //  buffer_gen: bumped whenever a compute buffer is freed or (re)allocated and on every ggml_backend_sched_reserve
@@ -372,6 +373,8 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_snapshot_valid(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap);
     GGML_API void                 ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snap);
     GGML_API uint64_t             ggml_backend_sched_buffer_gen(ggml_backend_sched_t sched);
+    // test hook: the take after the next n_ok successful ones fails as on an allocation failure (-1 = off)
+    GGML_API void                 ggml_backend_sched_snapshot_fail_inject(int n_ok);
     // [TAG_GRAPH_CACHE] read-only view of the current split plan (LLAMA_GRAPH_CACHE_CHECK): split i's backend index,
     // node range [i_start, i_end) of the split graph, and its inputs (the source tensor each backend copy is fed from)
     GGML_API int                  ggml_backend_sched_get_split(ggml_backend_sched_t sched, int i, int * backend_id, int * i_start, int * i_end); // returns n_inputs

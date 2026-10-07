@@ -167,6 +167,25 @@ int main() {
         ggml_backend_sched_free(sched);
     }
 
+    // 3. a snapshot that cannot be allocated: take returns NULL and the scheduler keeps its allocated state
+    {
+        ggml_backend_sched_t sched = ggml_backend_sched_new(&backend, nullptr, 1, 1024, false, false);
+        test_graph ga(NA);
+        CHECK(ggml_backend_sched_alloc_graph(sched, ga.gf));
+        const auto va = rnd((size_t) NA*NA, rng);
+        const auto vb = rnd((size_t) NA*4, rng);
+        ggml_backend_sched_snapshot_fail_inject(0);
+        CHECK(ggml_backend_sched_take(sched) == nullptr);
+        const auto got  = run_inputs(sched, ga, va, vb); // still allocated: computes without a re-alloc
+        const auto want = run_fresh(backend, NA, va, vb);
+        CHECK(memcmp(got.data(), want.data(), got.size()*sizeof(float)) == 0);
+        ggml_backend_sched_snapshot_t sa = ggml_backend_sched_take(sched); // the hook fired once
+        CHECK(sa != nullptr && ggml_backend_sched_snapshot_valid(sched, sa));
+        ggml_backend_sched_snapshot_free(sa);
+        ggml_backend_sched_free(sched);
+        printf("take-alloc-failure: ok\n");
+    }
+
     ggml_backend_free(backend);
     printf("test-sched-snapshot: OK\n");
     return 0;

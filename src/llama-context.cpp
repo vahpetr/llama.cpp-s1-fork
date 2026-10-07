@@ -848,8 +848,9 @@ llama_context::~llama_context() {
         // [TAG_GRAPH_CACHE] totals of this context
         const auto & t = graph_cache_tot;
         LLAMA_LOG_INFO("graph-cache: ctx=%s K=%d hit=%" PRId64 " miss=%" PRId64 " check=%" PRId64 " inval=%" PRId64
-                " evict=%" PRId64 " clear=%" PRId64 " check2=%" PRId64 " check_sched=%" PRId64 "\n", sched_prof_ctx_name(cparams.ctx_type),
-                graph_cache_k, t.hit, t.miss, t.check, t.inval, t.evict, t.clear, t.check2, t.check_sched);
+                " evict=%" PRId64 " clear=%" PRId64 " check2=%" PRId64 " check_sched=%" PRId64 " park_fail=%" PRId64 "\n",
+                sched_prof_ctx_name(cparams.ctx_type), graph_cache_k, t.hit, t.miss, t.check, t.inval, t.evict, t.clear,
+                t.check2, t.check_sched, t.park_fail);
         graph_cache.clear(); // before the scheduler (the snapshots reference its tensors only by pointer)
     }
 
@@ -1881,13 +1882,23 @@ llm_graph_result * llama_context::graph_cache_get(const llama_ubatch & ubatch, l
     graph_cache_tot.miss++;
     resident_it = std::find_if(graph_cache.begin(), graph_cache.end(), [](const graph_cache_entry & e) { return e.resident; });
     if (resident_it != graph_cache.end()) {
-        resident_it->snap.reset(ggml_backend_sched_take(s));
-        resident_it->resident = false;
+        ggml_backend_sched_snapshot_t snap = ggml_backend_sched_take(s);
+        if (snap != nullptr) {
+            resident_it->snap.reset(snap);
+            resident_it->resident = false;
+        } else {
+            // the live state cannot be parked (allocation failure): drop its entry, the scheduler starts over
+            LLAMA_LOG_WARN("%s: graph cache: cannot park the resident graph, dropping it\n", __func__);
+            ggml_backend_sched_reset(s);
+            graph_cache.erase(resident_it);
+            graph_cache_tot.park_fail++;
+        }
     }
     while ((int32_t) graph_cache.size() >= graph_cache_k) {
         graph_cache.pop_back();
         graph_cache_tot.evict++;
     }
+    graph_cache.reserve(graph_cache_k); // the insertion below cannot reallocate (no throw after the allocation)
 
     graph_cache_entry e;
     e.res.reset(new llm_graph_result(graph_cache_max_nodes));
@@ -1899,20 +1910,28 @@ llm_graph_result * llama_context::graph_cache_get(const llama_ubatch & ubatch, l
     ggml_cgraph * gf = model.build_graph(gparams);
     if (!gf) {
         LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+        ggml_backend_sched_reset(s); // no live state may refer to the result destroyed on return
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
     if (!ggml_backend_sched_alloc_graph(s, gf)) {
         LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+        ggml_backend_sched_reset(s);
         ret = GGML_STATUS_ALLOC_FAILED;
         return nullptr;
     }
-    e.resident   = true;
-    e.buffer_gen = ggml_backend_sched_buffer_gen(s);
-    if (graph_cache_check) {
-        graph_cache_manifest_take(e);
+    try {
+        e.resident   = true;
+        e.buffer_gen = ggml_backend_sched_buffer_gen(s);
+        if (graph_cache_check) {
+            graph_cache_manifest_take(e);
+        }
+        graph_cache.insert(graph_cache.begin(), std::move(e));
+    } catch (...) {
+        // the live state refers to e's graph, which is destroyed on unwinding: leave the scheduler reset
+        ggml_backend_sched_reset(s);
+        throw;
     }
-    graph_cache.insert(graph_cache.begin(), std::move(e));
     return graph_cache.front().res.get();
 }
 
