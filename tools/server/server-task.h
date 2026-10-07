@@ -596,6 +596,10 @@ struct server_prompt {
     //   until a full recompute (n_past = 0) clears it
     bool partial = false;
 
+    // [TAG_DISK_ADOPT] (Hermes gate Minor 2) the adopt source this state was loaded from, stamped as adopted_from on
+    //   its next disk save; it lives with the prompt, so every clear / erase / invalidation / full reset drops it
+    std::string adopted_from;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
@@ -603,6 +607,7 @@ struct server_prompt {
         noncanonical = false;
         user_starts.clear();
         partial = false;
+        adopted_from.clear();
     }
 
     // [TAG_TURN_BOUNDARY] a user message of this prompt starts at or after pos: a whole later turn lies there
@@ -627,6 +632,7 @@ struct server_prompt {
             noncanonical,
             user_starts,
             partial,
+            adopted_from,
         };
     }
 };

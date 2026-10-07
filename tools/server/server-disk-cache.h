@@ -196,7 +196,6 @@ struct server_disk_cache {
     };
     std::vector<adopt_src> adopted;
     std::map<std::string, std::string> src_dir_of; // adopt entry id -> its directory
-    std::map<int32_t, std::string> slot_adopted;    // slot -> adopt source of the state it loaded
     void open_adopt_sources();
     sealed_status read_entry(const std::string & id, const std::string & fp, server_disk_cache_entry & e) const;
     bool scan_foreign(); // false: a listing failed, the foreign block sets are incomplete

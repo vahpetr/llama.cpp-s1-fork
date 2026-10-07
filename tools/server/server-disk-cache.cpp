@@ -933,9 +933,7 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     server_disk_cache_entry e;
     e.id      = random_id();
     e.version = DISK_CACHE_VERSION;
-    if (slot_adopted.count(id_slot)) {
-        e.adopted_from = slot_adopted[id_slot]; // [TAG_DISK_ADOPT] provenance of a resave after an adopted load
-    }
+    e.adopted_from = prompt.adopted_from; // [TAG_DISK_ADOPT] provenance of a resave after an adopted load
     e.has_dft = ctx_dft != nullptr;
 
     uint64_t n_ckpt_written = 0;
@@ -1334,9 +1332,8 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
     e.hits++;
     write_meta(e); // a no-op for an adopt source
     n_loads++;
-    slot_adopted.erase(id_slot);
+    prompt.adopted_from = e.src;
     if (!e.src.empty()) {
-        slot_adopted[id_slot] = e.src;
         for (auto & a : adopted) {
             a.hits += a.key == e.src;
         }

@@ -4669,6 +4669,7 @@ private:
                             slot.ckpt_branch_pos      = -1;
                             slot.prompt.noncanonical = false; // [TAG_NONCANONICAL] a full recompute
                             slot.prompt.partial      = false; // [TAG_PARTIAL_PROMPT] the draft side is rebuilt too
+                            slot.prompt.adopted_from.clear(); // [TAG_DISK_ADOPT] recomputed, not the adopted state
                         }
 
                         // [TAG_TURN_BOUNDARY] the user-message starts of the prompt this slot is about to hold: the
@@ -4754,6 +4755,7 @@ private:
                         slot.ckpt_branch_pos      = -1;
                         slot.prompt.noncanonical = false; // [TAG_NONCANONICAL]
                         slot.prompt.partial      = false; // [TAG_PARTIAL_PROMPT]
+                        slot.prompt.adopted_from.clear(); // [TAG_DISK_ADOPT]
 
                         slot.stats.n_prompt_cached = 0;
 
