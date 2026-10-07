@@ -971,6 +971,11 @@ void server_disk_cache::init() {
         }
     }
 
+    // (Codex gate r3 Major 1, belt-and-braces) the adopt sources' block stores are indexed before the own entries'
+    //   missing-block check: an own entry published by an earlier build that still references an adopted block is
+    //   kept while its source is adopted (since r3 every published entry owns its blocks)
+    open_adopt_sources();
+
     // entries whose blocks are gone (a crash between writes, a manual cleanup) cannot be loaded; one that references
     //   a block or checkpoint not inspectable now is skipped for this run with its files kept
     for (size_t i = 0; i < entries.size();) {
@@ -999,7 +1004,6 @@ void server_disk_cache::init() {
                 "this run\n", n_skipped, io_keys.size());
     }
 
-    open_adopt_sources();
     scan_foreign();
 
     enforce("");
@@ -1205,6 +1209,50 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     ok = ok && save_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), desc_tgt_h, e.blobs, n_logical, n_written);
     if (ok && ctx_dft) {
         ok = save_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_h, e.blobs, n_logical, n_written);
+    }
+
+    // [TAG_DISK_BLK_NS] (Codex gate r3 Major 1) an own entry depends on no other store: every block it references
+    //   that is served from an adopt source's <ns>/blk or the legacy <root>/blk (the unchanged prefix of an adopted
+    //   conversation) is copied into the own store before the .meta commits - otherwise a restart without the adopt
+    //   key (or with it: the own entries are checked before the sources are indexed) drops the entry as "blocks
+    //   gone", and a v47 rollback collecting the legacy block breaks it. One-time per conversation; a failed copy
+    //   aborts the publication (the source block stays served as before)
+    uint64_t n_blk_copied = 0, n_blk_copied_bytes = 0;
+    if (ok) {
+        std::set<std::string> seen;
+        for (const auto & k : e.blobs) {
+            if (!seen.insert(k).second || !blob_dir_of.count(k)) {
+                continue;
+            }
+            const std::string src = blob_path(k);
+            const std::string fin = (fs::path(dir) / "blk" / (k + ".blk")).string();
+            const std::string tmp = fin + ".tmp";
+            std::error_code ec;
+            fs::copy_file(src, tmp, fs::copy_options::overwrite_existing, ec);
+            if (!ec && file_size_or_0(tmp) != blobs[k]) {
+                ec = std::make_error_code(std::errc::io_error); // a short copy
+            }
+            if (!ec) {
+                fs::rename(tmp, fin, ec);
+            }
+            if (ec) {
+                std::error_code ec_r;
+                fs::remove(tmp, ec_r);
+                DSK_WRN("block %s: cannot copy it from %s into the own store (%s), not publishing the entry\n",
+                        k.c_str(), src.c_str(), ec.message().c_str());
+                ok = false;
+                break;
+            }
+            blob_dir_of.erase(k); // served from the own copy from now on
+            n_blk_copied++;
+            n_blk_copied_bytes += blobs[k];
+        }
+        if (n_blk_copied > 0) {
+            DSK_INF("entry %s: %" PRIu64 " blocks (%.1f MiB) copied from adopted / legacy stores into the own store\n",
+                    e.id.c_str(), n_blk_copied, n_blk_copied_bytes / (1024.0 * 1024.0));
+            n_written += n_blk_copied_bytes;
+            n_blk_copied_total += n_blk_copied;
+        }
     }
 
     if (ok) {
@@ -2380,6 +2428,7 @@ void server_disk_cache::refresh_status() {
         { "deep_rewinds",   n_deep_rewinds      },
         { "ckpt_dropped",   n_ckpt_dropped      },
         { "deep_copied",    n_deep_copied       },
+        { "blk_copied",     n_blk_copied_total  },
         { "evictions",      n_evict             },
         { "bytes_written",  bytes_written       },
         { "bytes_loaded",   bytes_loaded        },
