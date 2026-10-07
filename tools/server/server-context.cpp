@@ -954,9 +954,11 @@ struct server_slot {
 
         const auto & ptask = task ? task : task_prev;
 
+        // the resident token count, also for a slot that ran no task yet (a legacy /slots restore, a fresh start)
+        res["n_prompt_tokens"] = (int32_t) prompt.tokens.size();
+
         if (ptask) {
             res["id_task"] = ptask->id;
-            res["n_prompt_tokens"]           = (int32_t) prompt.tokens.size();
             res["n_prompt_tokens_processed"] = stats.n_prompt_processed;
             res["n_prompt_tokens_cache"]     = stats.n_prompt_cached;
             res["params"] = ptask->params.to_json(only_metrics);
