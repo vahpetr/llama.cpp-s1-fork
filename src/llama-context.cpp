@@ -1842,6 +1842,11 @@ llm_graph_result * llama_context::graph_cache_get(const llama_ubatch & ubatch, l
             auto gp_check = graph_params(graph_cache_check_res.get(), ubatch, mctx, gtype);
             gp_check.sched = graph_cache_check_sched.get();
             ggml_cgraph * gf_check = model.build_graph(gp_check);
+            if (gf_check != nullptr) {
+                // the cached graph went through the split (backend graph_optimize may reorder nodes in place):
+                // split the fresh one the same way (no allocation)
+                ggml_backend_sched_split_graph(graph_cache_check_sched.get(), gf_check);
+            }
             std::string why;
             if (gf_check == nullptr || !llm_graph_topology_equal(e.res->get_gf(), gf_check, why)) {
                 GGML_ABORT("graph-cache check: the cached graph differs from a fresh build: %s", gf_check ? why.c_str() : "rebuild failed");
