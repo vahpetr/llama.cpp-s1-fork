@@ -1870,7 +1870,7 @@ llm_graph_result * llama_context::graph_cache_get(const llama_ubatch & ubatch, l
                 ggml_backend_sched_split_graph(graph_cache_check_sched.get(), gf_check);
             }
             llm_graph_topology_cmp cmp;
-            if (!graph_cache_inject.empty()) {
+            if (graph_cache_inject == "ptr" || graph_cache_inject == "view" || graph_cache_inject == "route") {
                 // test seam: corrupt the cached entry once; the checks below must abort
                 for (const auto & r : e.manifest) {
                     auto * t = const_cast<ggml_tensor *>(r.t);
@@ -1961,23 +1961,41 @@ llm_graph_result * llama_context::graph_cache_get(const llama_ubatch & ubatch, l
     return graph_cache.front().res.get();
 }
 
-// every tensor the graph reaches (nodes, sources incl. backend copies, view sources), each once
-static void graph_cache_collect(ggml_cgraph * gf, std::vector<const ggml_tensor *> & out) {
+// every tensor the graph and its scheduler state reach, each once: the graph's nodes, then the scheduler's split
+// graph copy (sched != nullptr: its nodes = the split input dependency views + the input copies + the split nodes,
+// its leafs = the graph's leafs), and from each of these the sources and view sources. A split replaces node->src by a backend
+// copy with no link back, so an original input consumed only through a copy is reached here through its leaf entry
+// and through the dependency view's src[0]. Two equal plans (CHECK=1 compared them) are walked in the same order.
+static void graph_cache_collect(ggml_cgraph * gf, ggml_backend_sched_t sched, std::vector<const ggml_tensor *> & out) {
     std::unordered_set<const ggml_tensor *> seen;
     std::vector<const ggml_tensor *> stack;
-    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-        stack.push_back(ggml_graph_node(gf, i));
-    }
-    while (!stack.empty()) {
-        const ggml_tensor * t = stack.back();
-        stack.pop_back();
-        if (t == nullptr || !seen.insert(t).second) {
-            continue;
+    auto walk = [&](const ggml_tensor * root) {
+        stack.push_back(root);
+        while (!stack.empty()) {
+            const ggml_tensor * t = stack.back();
+            stack.pop_back();
+            if (t == nullptr || !seen.insert(t).second) {
+                continue;
+            }
+            out.push_back(t);
+            stack.push_back(t->view_src);
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                stack.push_back(t->src[j]);
+            }
         }
-        out.push_back(t);
-        stack.push_back(t->view_src);
-        for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            stack.push_back(t->src[j]);
+    };
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        walk(ggml_graph_node(gf, i));
+    }
+    if (sched != nullptr) {
+        ggml_tensor ** leafs = nullptr;
+        int n_leafs = 0;
+        ggml_cgraph * gs = ggml_backend_sched_get_graph_copy(sched, &leafs, &n_leafs);
+        for (int i = 0; i < ggml_graph_n_nodes(gs); ++i) {
+            walk(ggml_graph_node(gs, i));
+        }
+        for (int i = 0; i < n_leafs; ++i) {
+            walk(leafs[i]);
         }
     }
 }
@@ -1988,7 +2006,7 @@ static bool graph_cache_is_compute(const ggml_tensor * t) {
 
 void llama_context::graph_cache_manifest_take(graph_cache_entry & e) {
     std::vector<const ggml_tensor *> ts;
-    graph_cache_collect(e.res->get_gf(), ts);
+    graph_cache_collect(e.res->get_gf(), sched.get(), ts);
     e.manifest.clear();
     for (const ggml_tensor * t : ts) {
         if (!graph_cache_is_compute(t) || t->data == nullptr) {
@@ -2010,7 +2028,7 @@ void llama_context::graph_cache_manifest_check(const graph_cache_entry & e) {
         by_t[r.t] = &r;
     }
     std::vector<const ggml_tensor *> ts;
-    graph_cache_collect(e.res->get_gf(), ts);
+    graph_cache_collect(e.res->get_gf(), sched.get(), ts);
     for (const ggml_tensor * t : ts) {
         if (t->buffer == nullptr && t->data == nullptr) {
             continue;
@@ -2062,7 +2080,7 @@ void llama_context::graph_cache_check_exec_pre(llm_graph_result * res, const lla
     std::vector<std::pair<const ggml_tensor *, std::vector<uint8_t>>> before;
     {
         std::vector<const ggml_tensor *> ts;
-        graph_cache_collect(gf_c, ts);
+        graph_cache_collect(gf_c, sched.get(), ts);
         std::set<std::pair<const void *, size_t>> seen;
         for (const ggml_tensor * t : ts) {
             if (t->buffer == nullptr || t->data == nullptr || graph_cache_is_compute(t) ||
@@ -2091,8 +2109,8 @@ void llama_context::graph_cache_check_exec_pre(llm_graph_result * res, const lla
         // e.g. a pending recurrent rollback is consumed by the first call). Equal topologies are collected in the
         // same order, so the i-th tensors correspond.
         std::vector<const ggml_tensor *> tc, tf;
-        graph_cache_collect(gf_c, tc);
-        graph_cache_collect(gf_f, tf);
+        graph_cache_collect(gf_c, sched.get(), tc);
+        graph_cache_collect(gf_f, cs, tf);
         GGML_ASSERT(tc.size() == tf.size());
         std::vector<uint8_t> buf;
         for (size_t i = 0; i < tc.size(); ++i) {
@@ -2102,6 +2120,27 @@ void llama_context::graph_cache_check_exec_pre(llm_graph_result * res, const lla
             GGML_ASSERT((tf[i]->flags & GGML_TENSOR_FLAG_INPUT) && ggml_nbytes(tc[i]) == ggml_nbytes(tf[i]));
             graph_cache_read(tc[i], buf);
             ggml_backend_tensor_set(const_cast<ggml_tensor *>(tf[i]), buf.data(), 0, buf.size());
+        }
+    }
+    if (graph_cache_inject == "split-input") {
+        // test seam (once): zero the largest original INPUT that the fresh plan consumes only through a backend copy
+        // (a split input; zero keeps index inputs in bounds). The fresh outputs then differ: the check must abort
+        ggml_tensor * victim = nullptr;
+        for (int i = 0; i < ggml_backend_sched_get_n_splits(cs); ++i) {
+            int b, i0, i1;
+            const int n_in = ggml_backend_sched_get_split(cs, i, &b, &i0, &i1);
+            for (int j = 0; j < n_in; ++j) {
+                ggml_tensor * in = nullptr, * cpy = nullptr;
+                ggml_backend_sched_get_split_input(cs, i, j, &in, &cpy);
+                if ((in->flags & GGML_TENSOR_FLAG_INPUT) && (victim == nullptr || ggml_nbytes(in) > ggml_nbytes(victim))) {
+                    victim = in;
+                }
+            }
+        }
+        if (victim != nullptr) { // else: stays armed for a later hit
+            LLAMA_LOG_WARN("graph-cache: inject split-input: zeroing %s (consumed through a backend copy)\n", victim->name);
+            ggml_backend_tensor_memset(victim, 0, 0, ggml_nbytes(victim));
+            graph_cache_inject.clear();
         }
     }
     if (graph_compute(gf_f, ubatch.n_tokens > 1, cs) != GGML_STATUS_SUCCESS) {

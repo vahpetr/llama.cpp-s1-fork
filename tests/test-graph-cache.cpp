@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 #include "llama.h"
 #include "llama-cpp.h"
 #include "speculative.h"
@@ -18,6 +19,7 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <cinttypes>
 #include <csignal>
@@ -102,6 +104,95 @@ static gguf_context_ptr make_meta(uint32_t n_ctx_train) {
     return ret;
 }
 
+
+// [TAG_GRAPH_CACHE] a synthetic second device for the split-input tests (--split): "FAKE" computes with an inner CPU
+// backend, but its buffer type is not host and it supports only its own buffer type, while the CPU device does not
+// support FAKE's. Layers are offloaded to it; the inputs stay on the CPU, so the scheduler splits the graph and the
+// FAKE splits read inputs (inp_pos, masks, ...) only through backend copies - the Vulkan + CPU topology, on the CPU.
+namespace fake {
+static ggml_backend_t g_cpu = nullptr; // the inner compute backend
+static ggml_backend_buffer_type g_buft;
+static ggml_backend_device g_dev;
+static ggml_backend_reg g_reg;
+
+static void   buf_free(ggml_backend_buffer_t b) { ggml_backend_buffer_free((ggml_backend_buffer_t) b->context); }
+static void * buf_base(ggml_backend_buffer_t b) { return ggml_backend_buffer_get_base((ggml_backend_buffer_t) b->context); }
+static void   buf_memset(ggml_backend_buffer_t, ggml_tensor * t, uint8_t v, size_t o, size_t n) { memset((char *) t->data + o, v, n); }
+static void   buf_set(ggml_backend_buffer_t, ggml_tensor * t, const void * d, size_t o, size_t n) { memcpy((char *) t->data + o, d, n); }
+static void   buf_get(ggml_backend_buffer_t, const ggml_tensor * t, void * d, size_t o, size_t n) { memcpy(d, (const char *) t->data + o, n); }
+static bool   buf_cpy(ggml_backend_buffer_t, const ggml_tensor *, ggml_tensor *) { return false; }
+static void   buf_clear(ggml_backend_buffer_t b, uint8_t v) { memset(buf_base(b), v, b->size); }
+
+static const char * buft_name(ggml_backend_buffer_type_t) { return "FAKE"; }
+static ggml_backend_buffer_t buft_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_buffer_t inner = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    if (inner == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_i iface = {
+        buf_free, buf_base, nullptr, buf_memset, buf_set, buf_get, nullptr, nullptr, buf_cpy, buf_clear, nullptr,
+    };
+    return ggml_backend_buffer_init(buft, iface, inner, size);
+}
+static size_t buft_align(ggml_backend_buffer_type_t) { return ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type()); }
+static bool   buft_is_host(ggml_backend_buffer_type_t) { return false; }
+
+static const char * be_name(ggml_backend_t) { return "FAKE"; }
+static void be_free(ggml_backend_t b) { delete b; }
+static ggml_status be_compute(ggml_backend_t, ggml_cgraph * gf) { return ggml_backend_graph_compute(g_cpu, gf); }
+
+static const char * dev_name(ggml_backend_dev_t) { return "FAKE"; }
+static void dev_memory(ggml_backend_dev_t, size_t * free, size_t * total) { *free = *total = (size_t) 16 << 30; }
+static enum ggml_backend_dev_type dev_type(ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; }
+static void dev_props(ggml_backend_dev_t d, ggml_backend_dev_props * p) {
+    memset(p, 0, sizeof(*p));
+    p->name = p->description = "FAKE";
+    p->type = dev_type(d);
+    dev_memory(d, &p->memory_free, &p->memory_total);
+}
+static ggml_backend_t dev_init(ggml_backend_dev_t d, const char *) {
+    static ggml_guid guid = { 0xfa, 0x4e };
+    ggml_backend_i iface = {};
+    iface.get_name      = be_name;
+    iface.free          = be_free;
+    iface.graph_compute = be_compute;
+    return new ggml_backend { &guid, iface, d, nullptr };
+}
+static ggml_backend_buffer_type_t dev_buft(ggml_backend_dev_t) { return &g_buft; }
+static bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor * op) {
+    return ggml_backend_dev_supports_op(ggml_backend_get_device(g_cpu), op);
+}
+static bool dev_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) { return buft == &g_buft; }
+static bool dev_offload_op(ggml_backend_dev_t, const ggml_tensor *) { return false; }
+
+static const char * reg_name(ggml_backend_reg_t) { return "FAKE"; }
+static size_t reg_count(ggml_backend_reg_t) { return 1; }
+static ggml_backend_dev_t reg_dev(ggml_backend_reg_t, size_t) { return &g_dev; }
+static void * reg_proc(ggml_backend_reg_t, const char *) { return nullptr; }
+
+static ggml_backend_dev_t init() {
+    g_cpu = ggml_backend_cpu_init();
+    ggml_backend_cpu_set_n_threads(g_cpu, 4);
+    g_buft = { { buft_name, buft_alloc, buft_align, nullptr, nullptr, buft_is_host }, &g_dev, nullptr };
+    g_reg  = { GGML_BACKEND_API_VERSION, { reg_name, reg_count, reg_dev, reg_proc }, nullptr };
+    ggml_backend_device_i di = {};
+    di.get_name        = dev_name;
+    di.get_description = dev_name;
+    di.get_memory      = dev_memory;
+    di.get_type        = dev_type;
+    di.get_props       = dev_props;
+    di.init_backend    = dev_init;
+    di.get_buffer_type = dev_buft;
+    di.supports_op     = dev_supports_op;
+    di.supports_buft   = dev_supports_buft;
+    di.offload_op      = dev_offload_op;
+    g_dev = { di, &g_reg, nullptr };
+    return &g_dev;
+}
+} // namespace fake
+
+static ggml_backend_dev_t g_split_dev = nullptr; // --split: offload to the FAKE device
+
 static bool silent_progress(float, void *) { return true; }
 
 static std::string g_log; // every "graph-cache:" line of the library
@@ -154,6 +245,9 @@ static run_out run(gguf_context * meta, const char * k, const char * check, cons
         ggml_backend_dev_t devs[2] = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
         if (getenv("TEST_GRAPH_CACHE_GPU") != nullptr) {
             devs[0] = nullptr; // all devices (Vulkan run)
+        }
+        if (g_split_dev != nullptr) {
+            devs[0] = g_split_dev; // --split: layers on FAKE, inputs on the CPU
         }
         mp.devices = devs[0] ? devs : nullptr;
         size_t seed = 31;
@@ -435,13 +529,14 @@ static int mem_report(gguf_context * meta, const char * k, int64_t & per_vsz_kib
 
 // a CHECK=1 run with one induced corruption of a cached entry (LLAMA_GRAPH_CACHE_CHECK_INJECT) in a child process:
 // it must abort with the matching graph-cache check message
-static bool aborts_with(gguf_context * meta, const char * inject, const std::string & path, const char * msg) {
+static bool aborts_with(gguf_context * meta, const char * inject, const std::string & path, const char * msg,
+                        const char * check = "1", const char * mode = "plain") {
     fflush(stdout);
     GGML_UNUSED(meta);
     // fork + exec (a plain fork of this multi-threaded process can deadlock): the child is this binary in inject mode
     const pid_t pid = fork();
     if (pid == 0) {
-        execl("/proc/self/exe", "test-graph-cache", "--inject", inject, path.c_str(), (char *) nullptr);
+        execl("/proc/self/exe", "test-graph-cache", "--inject", inject, path.c_str(), check, mode, (char *) nullptr);
         _exit(127);
     }
     int st = 0;
@@ -469,11 +564,33 @@ int main(int argc, char ** argv) {
         printf("test-graph-cache --mem: %s (virtual reservation per cached graph < 256 MiB)\n", ok ? "OK" : "FAILED");
         return ok ? 0 : 1;
     }
-    if (argc == 4 && strcmp(argv[1], "--inject") == 0) {
+    if (argc == 6 && strcmp(argv[1], "--inject") == 0) {
+        // --inject <seam> <stderr> <CHECK level> <plain|split>
         common_set_env("LLAMA_GRAPH_CACHE_CHECK_INJECT", argv[2]);
         common_set_env("GGML_NO_BACKTRACE", "1");
-        run(meta.get(), "8", "1", argv[3]);
+        if (strcmp(argv[5], "split") == 0) {
+            g_split_dev = fake::init();
+        }
+        run(meta.get(), "8", argv[4], argv[3]);
         return 0; // not aborted: the check missed the corruption
+    }
+    if (argc == 3 && strcmp(argv[1], "--split") == 0) {
+        // [TAG_GRAPH_CACHE] split-only inputs: the layers on FAKE, the inputs on the CPU (see namespace fake)
+        const std::string sdir = argv[2];
+        g_split_dev = fake::init();
+        const run_out s_off = run(meta.get(), "0", "0", sdir + "/test-graph-cache-split-off.stderr");
+        const run_out s_ch2 = run(meta.get(), "8", "2", sdir + "/test-graph-cache-split-check2.stderr");
+        printf("split: %zu logits; CHECK=2 main hit=%" PRId64 " check2=%" PRId64 "; mtp hit=%" PRId64 " check2=%" PRId64 "\n",
+               s_off.logits.size(), s_ch2.hit[0], s_ch2.check2[0], s_ch2.hit[1], s_ch2.check2[1]);
+        expect(!s_off.logits.empty() && same(s_off.logits, s_ch2.logits) && same(s_off.drafts, s_ch2.drafts) && s_off.qsa_ids == s_ch2.qsa_ids,
+               "split (FAKE + CPU): K=8 + CHECK=2 identical to cache off");
+        expect(s_ch2.hit[0] > 0 && s_ch2.check2[0] == s_ch2.hit[0] && s_ch2.check2[1] == s_ch2.hit[1],
+               "split: CHECK=2 green on every hit (inputs consumed only through backend copies are transferred)");
+        expect(aborts_with(meta.get(), "split-input", sdir + "/test-graph-cache-split-inject.stderr",
+                           "differs between the cached and a fresh plan", "2", "split"),
+               "split: CHECK=2 aborts when an input consumed only through a backend copy is poisoned in the fresh plan");
+        printf("test-graph-cache --split: %s\n", n_fail == 0 ? "OK" : "FAILED");
+        return n_fail == 0 ? 0 : 1;
     }
 
     const run_out off = run(meta.get(), "0", "0", dir + "/test-graph-cache-off.stderr");

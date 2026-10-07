@@ -382,6 +382,12 @@ extern "C" {
     // node range [i_start, i_end) of the split graph, and its inputs (the source tensor each backend copy is fed from)
     GGML_API int                  ggml_backend_sched_get_split(ggml_backend_sched_t sched, int i, int * backend_id, int * i_start, int * i_end); // returns n_inputs
     GGML_API void                 ggml_backend_sched_get_split_input(ggml_backend_sched_t sched, int i, int j, struct ggml_tensor ** input, struct ggml_tensor ** copy);
+    // the scheduler's split graph copy (valid while allocated): every split's input dependency views and input copies,
+    // followed by the split's nodes; its leafs are the original leafs (+ the input copies with n_copies > 1). Unlike
+    // the user graph it reaches the scheduler-only tensors: a split input is replaced in node->src by its copy, which
+    // has no link back to the original (CHECK collects the originals through the dependency views' src[0]).
+    // leafs / n_leafs (optional): the copy's leaf array (the original graph's leafs included)
+    GGML_API struct ggml_cgraph * ggml_backend_sched_get_graph_copy(ggml_backend_sched_t sched, struct ggml_tensor *** leafs, int * n_leafs);
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);

@@ -2305,6 +2305,17 @@ void ggml_backend_sched_get_split_input(ggml_backend_sched_t sched, int i, int j
     *copy  = tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
 }
 
+struct ggml_cgraph * ggml_backend_sched_get_graph_copy(ggml_backend_sched_t sched, struct ggml_tensor *** leafs, int * n_leafs) {
+    GGML_ASSERT(sched);
+    if (leafs != NULL) {
+        *leafs = sched->graph.leafs;
+    }
+    if (n_leafs != NULL) {
+        *n_leafs = sched->graph.n_leafs;
+    }
+    return &sched->graph;
+}
+
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;
