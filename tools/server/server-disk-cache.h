@@ -397,7 +397,13 @@ std::string server_disk_cache_compat2_body(const std::string & fp);
 bool server_disk_cache_same_identity(const std::string & a, const std::string & b);
 
 // the measurement memo, on disk under <root>/compat-memo/: key = cheap identity + probe revision + GPU device identity
-std::string server_cache_memo_key(const std::string & cheap, const std::string & gpu_id);
+// [TAG_CACHE_COMPAT2] the runtime identity of the memo (Codex compat2 A "stale memo"): GPU devices (name,
+//   description, PCI id), every backend's feature list (CPU ISA), the mapped driver / runtime shared objects (path +
+//   size + mtime + inode; ours are content-hashed in the cheap identity) and the driver environment (RADV_ / MESA_ /
+//   AMD_ / VK_ / ...) - a driver change forces a re-measurement. Gap: ggml's device description carries no Vulkan
+//   driverVersion / apiVersion; a driver update that replaces no mapped file (e.g. firmware) is not seen
+std::string server_cache_runtime_identity();
+std::string server_cache_memo_key(const std::string & cheap, const std::string & runtime_id);
 bool server_cache_memo_get(const std::string & root, const std::string & memo_key, std::string & measure_h);
 bool server_cache_memo_put(const std::string & root, const std::string & memo_key, const std::string & measure_h);
 

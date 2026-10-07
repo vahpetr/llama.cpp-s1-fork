@@ -1420,24 +1420,6 @@ private:
 
     std::unique_ptr<server_disk_cache> disk_cache; // [TAG_DISK_PROMPT_CACHE]
 
-    // [TAG_CACHE_COMPAT2] the GPU device identity of the measurement memo: every GPU / iGPU device's name,
-    //   description and device id (not the driver version alone)
-    static std::string cache_gpu_identity() {
-        std::string id;
-        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            const auto type = ggml_backend_dev_type(dev);
-            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                continue;
-            }
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(dev, &props);
-            id += string_format("%s/%s/%s;", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
-                                props.device_id ? props.device_id : "-");
-        }
-        return id.empty() ? "cpu" : id;
-    }
-
     // [TAG_CACHE_COMPAT2] the short-context measurement (spec D4): on sequence 0 before serving, from a cleared
     //   target and draft memory, a temporary fresh speculative object driven through target decode + its process(),
     //   a fixed 64-token probe (output on the last token only, like a prompt); hashes the target, draft and carry
@@ -1555,7 +1537,7 @@ private:
         cache_meas_how.clear();
         cache_memo_key_pending.clear();
         const std::string cheap = server_disk_cache_fingerprint(params_base, n_ctx);
-        const std::string memo = server_cache_memo_key(cheap, cache_gpu_identity());
+        const std::string memo = server_cache_memo_key(cheap, server_cache_runtime_identity());
         if (server_cache_memo_get(params_base.cache_disk_path, memo, cache_meas)) {
             cache_meas_how = "memo hit";
             return;

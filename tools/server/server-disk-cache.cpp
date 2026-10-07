@@ -787,8 +787,87 @@ bool server_disk_cache_same_identity(const std::string & a, const std::string & 
     return a.size() >= 16 && b.size() >= 16 && a.compare(0, 16, b, 0, 16) == 0 && ba == bb;
 }
 
-std::string server_cache_memo_key(const std::string & cheap, const std::string & gpu_id) {
-    return h16_of(string_format("cheap=%s|probe=%u|gpu=%s", cheap.c_str(), DISK_CACHE_PROBE_REVISION, gpu_id.c_str()));
+std::string server_cache_runtime_identity() {
+    // GPU devices: name, description, PCI id (ggml's device description carries no driver version - the Vulkan
+    //   backend's description is the device name only; the driver is covered by its mapped libraries below)
+    std::string gpu;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const auto type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        gpu += string_format("%s/%s/%s;", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                             props.device_id ? props.device_id : "-");
+    }
+    // backend features (the CPU backend's ISA list: AVX2, AVX512, ... and any other backend's feature list)
+    std::string feat;
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        auto get = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
+        feat += std::string(ggml_backend_reg_name(reg)) + "{";
+        for (const ggml_backend_feature * f = get ? get(reg) : nullptr; f && f->name; f++) {
+            feat += string_format("%s=%s,", f->name, f->value ? f->value : "");
+        }
+        feat += "}";
+    }
+    // the driver / runtime: every other mapped shared object (Vulkan loader + ICD, libdrm, LLVM, libc / libm /
+    //   libstdc++, ...) by path + size + mtime + inode - an upgrade or a swap changes it. libllama / libggml* /
+    //   libmtmd are content-hashed in the cheap identity already
+    std::set<std::string> libs;
+    {
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        while (std::getline(maps, line)) {
+            const auto at = line.find('/');
+            if (at == std::string::npos) {
+                continue;
+            }
+            const std::string p = line.substr(at);
+            const std::string base = fs::path(p).filename().string();
+            if (base.find(".so") == std::string::npos || base.rfind("libllama", 0) == 0 ||
+                base.rfind("libggml", 0) == 0 || base.rfind("libmtmd", 0) == 0) {
+                continue;
+            }
+            struct stat st {};
+            libs.insert(stat(p.c_str(), &st) == 0 ?
+                string_format("%s:%lld:%lld.%09ld:%llu", p.c_str(), (long long) st.st_size, (long long) st.st_mtim.tv_sec,
+                              (long) st.st_mtim.tv_nsec, (unsigned long long) st.st_ino) : p + ":?");
+        }
+    }
+    std::string lib;
+    for (const auto & l : libs) {
+        lib += l + ";";
+    }
+    // the driver's own environment (not LLAMA_* / GGML_*): RADV / Mesa / ACO / AMD / Vulkan loader / ROCm / CUDA /
+    //   OpenMP switches can change the compiled kernels
+    std::vector<std::string> denv;
+    static const char * const DRIVER_ENV[] = { "RADV_", "MESA_", "ACO_", "AMD_", "VK_", "NIR_", "HSA_", "HIP_", "ROCR_",
+                                               "ROC_", "CUDA_", "NVIDIA_", "__GL", "OMP_", "GOMP_", "KMP_", "ZES_",
+                                               "SYCL_", "ONEAPI_", "DRI_", "LD_PRELOAD", "LD_LIBRARY_PATH" };
+    for (char ** ep = environ; ep && *ep; ep++) {
+        const std::string kv = *ep;
+        for (const char * pre : DRIVER_ENV) {
+            if (kv.rfind(pre, 0) == 0) {
+                denv.push_back(kv);
+                break;
+            }
+        }
+    }
+    std::sort(denv.begin(), denv.end());
+    std::string env;
+    for (const auto & kv : denv) {
+        env += std::to_string(kv.size()) + ":" + kv + ";";
+    }
+    return "gpu=" + (gpu.empty() ? std::string("none") : gpu) + "|feat=" + feat + "|libs=" + h16_of(lib) +
+           "|denv=" + h16_of(env);
+}
+
+std::string server_cache_memo_key(const std::string & cheap, const std::string & runtime_id) {
+    return h16_of(string_format("cheap=%s|probe=%u|runtime=%s", cheap.c_str(), DISK_CACHE_PROBE_REVISION,
+                                runtime_id.c_str()));
 }
 
 static fs::path memo_path(const std::string & root, const std::string & memo_key) {

@@ -180,6 +180,18 @@ int main() {
         CHECK(server_cache_memo_get(dir.string(), mk, m) && m == "0123456789abcdef");
         fs::remove_all(dir);
     }
+    // [TAG_CACHE_COMPAT2] runtime identity of the memo: stable within a process, carries the CPU feature list and the
+    //   driver environment (a driver switch forces a re-measurement)
+    {
+        const std::string r0 = server_cache_runtime_identity();
+        CHECK(r0 == server_cache_runtime_identity());
+        CHECK(r0.find("|feat=") != std::string::npos && r0.find("|libs=") != std::string::npos);
+        setenv("RADV_DEBUG", "nocache", 1);
+        const std::string r1 = server_cache_runtime_identity();
+        unsetenv("RADV_DEBUG");
+        CHECK(r1 != r0);
+        CHECK(server_cache_memo_key(cheap_a, r0) != server_cache_memo_key(cheap_a, r1));
+    }
     CHECK(server_cache_measure_hash("abc") == server_cache_measure_hash("abc"));
     CHECK(server_cache_measure_hash("abc") != server_cache_measure_hash("abd"));
 
