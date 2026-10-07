@@ -205,6 +205,31 @@ static sealed_status open_for_read(const std::string & path, std::ifstream & f) 
     return !fs::exists(path, ec) && !ec ? SEALED_BAD : SEALED_IO;
 }
 
+// [TAG_DISK_READ_STATUS] (Codex gate r3 Major 3) the rest of an open stream through checked reads: SEALED_IO on a read
+//   error (EIO, allocation) - libstdc++'s filebuf throws ios_base::failure from underflow(), which istream::read turns
+//   into badbit (an istreambuf_iterator would let it escape and be classified as a format error)
+static sealed_status read_text(std::istream & f, std::string & out) {
+    out.clear();
+    try {
+        std::vector<char> buf(1 << 16);
+        while (true) {
+            f.read(buf.data(), (std::streamsize) buf.size());
+            const std::streamsize n = f.gcount();
+            if (n > 0) {
+                out.append(buf.data(), (size_t) n);
+            }
+            if (!f) {
+                break;
+            }
+        }
+        return f.bad() || !f.eof() ? SEALED_IO : SEALED_OK;
+    } catch (const std::ios_base::failure &) {
+        return SEALED_IO;
+    } catch (const std::bad_alloc &) {
+        return SEALED_IO;
+    }
+}
+
 // a file that must be non-empty: SEALED_BAD if it is missing or empty, SEALED_IO if it cannot be inspected now
 static sealed_status nonempty_file(const std::string & path) {
     std::error_code ec;
@@ -382,9 +407,9 @@ std::string server_disk_cache_fingerprint(const common_params & params, int32_t 
         for (const auto & it : libs) {
             struct stat st {};
             std::ifstream f(it.first, std::ios::binary);
-            const std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-            if (!f.good() && !f.eof()) {
-                ok = false;
+            std::string bytes;
+            if (!f.is_open() || read_text(f, bytes) != SEALED_OK) {
+                ok = false; // (Codex gate r3 Major 3) checked reads: a read error is no exception here
             }
             if (stat(it.first.c_str(), &st) != 0 || (unsigned long long) st.st_ino != it.second || bytes.empty()) {
                 ok = false; // not the file that is mapped
@@ -498,14 +523,19 @@ static std::string meta_fingerprint(const std::string & path, bool * io_error = 
             }
             return "";
         }
-        const std::string text((std::istreambuf_iterator<char>(fm)), std::istreambuf_iterator<char>());
-        if (fm.bad()) {
+        std::string text;
+        if (read_text(fm, text) != SEALED_OK) { // (Codex gate r3 Major 3) a read error is I/O, not damage
             if (io_error) {
                 *io_error = true;
             }
             return "";
         }
         return json::parse(text).value("fingerprint", std::string());
+    } catch (const std::ios_base::failure &) {
+        if (io_error) {
+            *io_error = true;
+        }
+        return "";
     } catch (const std::bad_alloc &) {
         if (io_error) {
             *io_error = true;
@@ -682,9 +712,9 @@ sealed_status server_disk_cache::read_entry(const std::string & id, const std::s
         if (const auto st = open_for_read(path(id, ".meta"), fm); st != SEALED_OK) {
             return st;
         }
-        const std::string text((std::istreambuf_iterator<char>(fm)), std::istreambuf_iterator<char>());
-        if (fm.bad()) {
-            return SEALED_IO;
+        std::string text;
+        if (const auto st = read_text(fm, text); st != SEALED_OK) { // (Codex gate r3 Major 3) checked reads
+            return st;
         }
         const json j = json::parse(text);
         const uint32_t ver = j.value("version", 0u);
@@ -738,6 +768,10 @@ sealed_status server_disk_cache::read_entry(const std::string & id, const std::s
         return SEALED_OK;
     } catch (const std::bad_alloc & err) {
         DSK_WRN("entry %s not readable now: %s\n", id.c_str(), err.what());
+        return SEALED_IO;
+    } catch (const std::ios_base::failure & err) {
+        // (Codex gate r3 Major 3) a stream-buffer read error: inconclusive, the files stay (JSON / format errors below)
+        DSK_WRN("entry %s not readable now (I/O): %s\n", id.c_str(), err.what());
         return SEALED_IO;
     } catch (const std::exception & err) {
         DSK_WRN("entry %s unreadable: %s\n", id.c_str(), err.what());
