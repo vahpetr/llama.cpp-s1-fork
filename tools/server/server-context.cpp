@@ -4656,6 +4656,14 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
                         if (n_past == 0) {
+                            // [TAG_FULL_RESET] (Codex gate r1 C1) nothing of the old prompt survives a full recompute:
+                            //   the trim above keeps checkpoints with pos_max <= 0 (e.g. the n_tokens = 1 checkpoint
+                            //   of a one-token legacy restore), which would otherwise be published under the new
+                            //   prompt once the flags below no longer block the disk save
+                            slot.prompt.checkpoints.clear();
+                            slot.prompt.deep.clear(); // [TAG_DEEP_CKPT]
+                            slot.ckpt_pinned_n_tokens = -1;
+                            slot.ckpt_branch_pos      = -1;
                             slot.prompt.noncanonical = false; // [TAG_NONCANONICAL] a full recompute
                             slot.prompt.partial      = false; // [TAG_PARTIAL_PROMPT] the draft side is rebuilt too
                         }
@@ -4739,6 +4747,8 @@ private:
                         slot.prompt.tokens.keep_first(0);
                         slot.prompt.checkpoints.clear();
                         slot.prompt.deep.clear(); // [TAG_DEEP_CKPT]
+                        slot.ckpt_pinned_n_tokens = -1; // [TAG_FULL_RESET]
+                        slot.ckpt_branch_pos      = -1;
                         slot.prompt.noncanonical = false; // [TAG_NONCANONICAL]
                         slot.prompt.partial      = false; // [TAG_PARTIAL_PROMPT]
 
