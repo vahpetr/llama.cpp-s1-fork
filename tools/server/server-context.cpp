@@ -2194,6 +2194,18 @@ private:
         // [TAG_DISK_PROMPT_CACHE] a stored conversation that shares clearly more with the new prompt than this slot
         //   is loaded instead of re-processed; whatever the slot is about to lose (all of it on a load, or most of it
         //   when the new prompt diverges early) is written to disk first
+        // [TAG_REPLACE_ANY_TASK] an embedding / rerank replaces the whole sequence of the slot: the outgoing
+        //   conversation is saved regardless of the LCP. An infill keeps its common prefix only with cache_prompt
+        //   (an editor's next FIM request), so it saves like a completion under rule (b). No lookup / load for them
+        if (ret && disk_cache && !ret->is_processing() && task.type != SERVER_TASK_TYPE_COMPLETION &&
+            ret->prompt.n_tokens() > 0) {
+            const size_t keep = task.type == SERVER_TASK_TYPE_INFILL && task.params.cache_prompt
+                ? ret->prompt.tokens.get_common_prefix(task.tokens) : 0;
+            if (2*keep < ret->prompt.tokens.size()) {
+                ret->disk_save(*disk_cache);
+            }
+        }
+
         if (ret && disk_cache && !ret->is_processing() && task.type == SERVER_TASK_TYPE_COMPLETION) {
             // [TAG_NO_CACHE_PROMPT] cache_prompt:false re-processes the whole prompt: no lookup / load, and the slot
             //   keeps nothing of its prompt (the retained prefix counts as 0 for the outgoing save)
@@ -3313,6 +3325,16 @@ private:
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
                             queue_tasks.defer(std::move(task));
                             break;
+                        }
+                        // [TAG_REPLACE_ANY_TASK] the child slots are overwritten by copy_state_to() (and cleared on
+                        //   release): their conversations are saved now that all required slots are available, before
+                        //   the launch - not inside the copy, which a cancel or a launch failure would never reach
+                        if (disk_cache) {
+                            for (server_slot * child : child_slots) {
+                                if (child->prompt.n_tokens() > 0) {
+                                    child->disk_save(*disk_cache);
+                                }
+                            }
                         }
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
