@@ -3480,6 +3480,11 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
+                    // [TAG_PARTIAL_PROMPT] /slots save is a target-only legacy snapshot: it writes the target context's
+                    //   sequence and the tokens - no draft KV, no prompt checkpoints / deep refs, no speculative carry,
+                    //   no turn boundaries. A restore of it is therefore marked partial on a speculative profile and
+                    //   is not published to the disk cache until recomputed (SLOT_RESTORE below). The full-tuple save /
+                    //   restore is deferred (D11); the disk cache (--cache-disk) keeps the full tuple
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
