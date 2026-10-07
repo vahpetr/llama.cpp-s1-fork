@@ -1442,6 +1442,12 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_result::get_one_shot_inputs(std::vector<ggml_tensor *> & out) const {
+    for (const auto & input : inputs) {
+        input->get_one_shot(out);
+    }
+}
+
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);

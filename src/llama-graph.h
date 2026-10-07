@@ -117,6 +117,12 @@ public:
         GGML_UNUSED(params);
         return false;
     }
+
+    // [TAG_GRAPH_CACHE] input tensors whose set_input is not idempotent (a second call prepares different bytes):
+    // LLAMA_GRAPH_CACHE_CHECK=3 copies these from the cached graph instead of preparing them again
+    virtual void get_one_shot(std::vector<ggml_tensor *> & out) const {
+        GGML_UNUSED(out);
+    }
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -267,6 +273,13 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+
+    // s_copy: mctx->s_copy() consumes a pending recurrent rollback (rs_idx is reset by the first call)
+    void get_one_shot(std::vector<ggml_tensor *> & out) const override {
+        if (s_copy) {
+            out.push_back(s_copy);
+        }
+    }
 
     ggml_tensor * s_copy;  // I32 [n_rs]
 
@@ -689,6 +702,11 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void get_one_shot(std::vector<ggml_tensor *> & out) const override { // [TAG_GRAPH_CACHE]
+        if (inp_rs) {
+            inp_rs->get_one_shot(out);
+        }
+    }
 
     std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
     std::unique_ptr<llm_graph_input_rs>      inp_rs;
@@ -717,6 +735,11 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void get_one_shot(std::vector<ggml_tensor *> & out) const override { // [TAG_GRAPH_CACHE]
+        if (inp_rs) {
+            inp_rs->get_one_shot(out);
+        }
+    }
 
     std::unique_ptr<llm_graph_input_attn_k> inp_attn;
     std::unique_ptr<llm_graph_input_rs>      inp_rs;
@@ -745,6 +768,11 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    void get_one_shot(std::vector<ggml_tensor *> & out) const override { // [TAG_GRAPH_CACHE]
+        if (inp_rs) {
+            inp_rs->get_one_shot(out);
+        }
+    }
 
     std::unique_ptr<llm_graph_input_attn_kv_iswa> inp_attn;
     std::unique_ptr<llm_graph_input_rs>          inp_rs;
@@ -929,6 +957,7 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+    void get_one_shot_inputs(std::vector<ggml_tensor *> & out) const; // [TAG_GRAPH_CACHE] see llm_graph_input_i::get_one_shot
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it

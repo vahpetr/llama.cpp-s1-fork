@@ -63,3 +63,20 @@ A full fix would keep per-graph uniform tensors in `llm_graph_input_sampling` an
   and K=8 with `LLAMA_GRAPH_CACHE_CHECK=1`, using the prod QSA environment.
 - `test-llama-archs`, `test-mtp-carrier` and `test-mtp-catchup*` pass with `LLAMA_GRAPH_CACHE=8
   LLAMA_GRAPH_CACHE_CHECK=1`.
+
+## One-shot inputs and `LLAMA_GRAPH_CACHE_CHECK=3`
+
+`CHECK=2` gives the fresh plan the cached graph's input bytes, so it proves same-input execution equivalence
+only: an input the cached graph got stale is stale in both runs. `CHECK=3` fills the cached graph's
+compute-buffer inputs with 0xA5 before its `set_inputs`, the fresh plan's with 0x5A, and prepares the fresh
+inputs with a second `set_inputs`; a region either call leaves unwritten then differs.
+
+A second `set_inputs` is idempotent except for the inputs listed by `llm_graph_input_i::get_one_shot`:
+
+| Input | Why one-shot | CHECK=3 |
+|---|---|---|
+| recurrent `s_copy` (`llm_graph_input_rs`, also inside mem_hybrid / _k / _iswa) | `llama_memory_recurrent_context::s_copy` resets the pending rollback index `rs_idx` on the first call (llama-memory-recurrent.cpp:1363) | copied from the cached graph |
+
+Other side effects of a repeated call: the QSA incremental mirrors live in the store's own buffers and the
+first call cleared their dirty runs, so the second writes nothing; `qsa_store_plan` and the dsv4 plans are
+cached per ubatch key. Without the copy of `s_copy`, the transitions test (rollback) aborts at its 9th hit.

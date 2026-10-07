@@ -577,6 +577,31 @@ int main(int argc, char ** argv) {
         run(meta.get(), "8", argv[4], argv[3]);
         return 0; // not aborted: the check missed the corruption
     }
+    if (argc == 3 && strcmp(argv[1], "--check3") == 0) {
+        // [TAG_GRAPH_CACHE] CHECK=3: the fresh plan prepares its inputs by a second set_inputs (one-shot inputs
+        // copied), both plans' inputs pre-filled with different sentinels
+        const std::string cdir = argv[2];
+        const run_out c_off = run(meta.get(), "0", "0", cdir + "/test-graph-cache-check3-off.stderr");
+        const run_out c_ch3 = run(meta.get(), "8", "3", cdir + "/test-graph-cache-check3.stderr");
+        const run_out t_off = run_transitions(meta.get(), "0", "0", cdir + "/test-graph-cache-check3-trans-off.stderr");
+        const run_out t_ch3 = run_transitions(meta.get(), "8", "3", cdir + "/test-graph-cache-check3-trans.stderr");
+        printf("check3: main hit=%" PRId64 " check2=%" PRId64 "; mtp hit=%" PRId64 " check2=%" PRId64 "; transitions hit=%" PRId64 " check2=%" PRId64 "\n",
+               c_ch3.hit[0], c_ch3.check2[0], c_ch3.hit[1], c_ch3.check2[1], t_ch3.hit[0], t_ch3.check2[0]);
+        expect(same(c_off.logits, c_ch3.logits) && same(c_off.drafts, c_ch3.drafts) && c_off.qsa_ids == c_ch3.qsa_ids,
+               "CHECK=3: logits, drafts and [qsa-ids] identical to cache off");
+        expect(c_ch3.hit[0] > 0 && c_ch3.check2[0] == c_ch3.hit[0] && c_ch3.check2[1] == c_ch3.hit[1],
+               "CHECK=3: every hit executed fresh from independently prepared inputs, outputs + state bytes equal");
+        expect(same(t_off.logits, t_ch3.logits) && t_ch3.hit[0] > 0 && t_ch3.check2[0] == t_ch3.hit[0],
+               "CHECK=3 transitions (recurrent rollback: the one-shot s_copy copied): identical, green on every hit");
+        expect(aborts_with(meta.get(), "stale", cdir + "/test-graph-cache-check3-stale.stderr",
+                           "differs between the cached and a fresh plan", "3"),
+               "CHECK=3 aborts on an induced partial input refresh");
+        expect(!aborts_with(meta.get(), "stale", cdir + "/test-graph-cache-check2-stale.stderr",
+                            "differs between the cached and a fresh plan", "2"),
+               "CHECK=2 does not see the same partial refresh (common-mode inputs; the reason for CHECK=3)");
+        printf("test-graph-cache --check3: %s\n", n_fail == 0 ? "OK" : "FAILED");
+        return n_fail == 0 ? 0 : 1;
+    }
     if (argc == 3 && strcmp(argv[1], "--kvonly") == 0) {
         // [TAG_GRAPH_CACHE] state-only graphs: LLAMA_MTP_CATCHUP_ATTN=0 makes the zero-output MTP catch-up ubatches
         // KV-only (the cache writes are the graph's only roots); CHECK=2 compares their state bytes

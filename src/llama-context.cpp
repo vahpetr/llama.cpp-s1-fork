@@ -2066,6 +2066,18 @@ static void graph_cache_read(const ggml_tensor * t, std::vector<uint8_t> & out) 
     ggml_backend_tensor_get(t, out.data(), 0, out.size());
 }
 
+// CHECK=3: fill every compute-buffer INPUT tensor the graph (and its scheduler state) reaches with a sentinel. Split
+// input copies carry no INPUT flag (one copy slot): the scheduler rewrites them from their source on every compute
+static void graph_cache_poison_inputs(ggml_cgraph * gf, ggml_backend_sched_t sched, uint8_t v) {
+    std::vector<const ggml_tensor *> ts;
+    graph_cache_collect(gf, sched, ts);
+    for (const ggml_tensor * t : ts) {
+        if ((t->flags & GGML_TENSOR_FLAG_INPUT) && t->view_src == nullptr && t->data != nullptr && graph_cache_is_compute(t)) {
+            ggml_backend_tensor_memset(const_cast<ggml_tensor *>(t), v, 0, ggml_nbytes(t));
+        }
+    }
+}
+
 void llama_context::graph_cache_check_exec_pre(llm_graph_result * res, const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx) {
     ggml_backend_sched_synchronize(sched.get()); // the previous graph may still be writing the state
     auto & x = graph_cache_exec;
@@ -2104,10 +2116,33 @@ void llama_context::graph_cache_check_exec_pre(llm_graph_result * res, const lla
         GGML_ABORT("graph-cache check=2: the fresh plan could not be built/allocated");
     }
     graph_cache_exec_n_tokens = ubatch.n_tokens;
-    {
-        // the inputs exactly as the cached graph got them: set_inputs is not repeated (some inputs are one-shot,
-        // e.g. a pending recurrent rollback is consumed by the first call). Equal topologies are collected in the
-        // same order, so the i-th tensors correspond.
+    if (graph_cache_check >= 3) {
+        // CHECK=3: the fresh plan prepares its inputs independently - a second set_inputs over a sentinel fill (0x5A;
+        // the cached graph's inputs were filled with 0xA5 before its own set_inputs), so a region either set_inputs
+        // leaves unwritten differs between the two plans. The one-shot inputs (get_one_shot: the recurrent s_copy,
+        // whose first preparation consumed a pending rollback) are copied from the cached graph instead.
+        // Other set_input side effects are idempotent: the QSA incremental mirrors (persistent store buffers, the
+        // second call finds nothing dirty) and the plan caches keyed by the ubatch.
+        graph_cache_poison_inputs(gf_f, cs, 0x5A);
+        graph_cache_check_res->set_inputs(&ubatch);
+        std::vector<ggml_tensor *> oc, of;
+        res->get_one_shot_inputs(oc);
+        graph_cache_check_res->get_one_shot_inputs(of);
+        GGML_ASSERT(oc.size() == of.size());
+        std::vector<uint8_t> buf;
+        for (size_t i = 0; i < oc.size(); ++i) {
+            if (oc[i]->data == nullptr || of[i]->data == nullptr) {
+                continue;
+            }
+            GGML_ASSERT(ggml_nbytes(oc[i]) == ggml_nbytes(of[i]));
+            graph_cache_read(oc[i], buf);
+            ggml_backend_tensor_set(of[i], buf.data(), 0, buf.size());
+        }
+    } else {
+        // CHECK=2: the inputs exactly as the cached graph got them: set_inputs is not repeated (some inputs are
+        // one-shot, see above). This proves same-input execution equivalence only: a stale input the cached graph
+        // got is given to the fresh plan as well (CHECK=3 prepares them independently). Equal topologies are
+        // collected in the same order, so the i-th tensors correspond.
         std::vector<const ggml_tensor *> tc, tf;
         graph_cache_collect(gf_c, sched.get(), tc);
         graph_cache_collect(gf_f, cs, tf);
@@ -2342,8 +2377,33 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     {
         //const auto t_start_us = ggml_time_us();
 
+        // [TAG_GRAPH_CACHE] CHECK=3: the cached graph's inputs get a sentinel first (see graph_cache_check_exec_pre)
+        const bool gc_check3 = use_graph_cache && kq_reused && graph_cache_check >= 3;
+        if (gc_check3) {
+            ggml_backend_sched_synchronize(sched.get()); // the previous graph may still use the shared buffers
+            graph_cache_poison_inputs(res->get_gf(), sched.get(), 0xA5);
+        }
+        // test seam LLAMA_GRAPH_CACHE_CHECK_INJECT=stale (CHECK >= 2, once): the first token's position is left
+        // unrefreshed (its bytes from before set_inputs are put back), as by a set_input that skips a region
+        ggml_tensor * gc_stale = nullptr;
+        std::vector<uint8_t> gc_stale_old;
+        if (use_graph_cache && kq_reused && graph_cache_check >= 2 && graph_cache_inject == "stale") {
+            for (const auto & inp : res->inputs) {
+                if (auto * ip = dynamic_cast<llm_graph_input_pos *>(inp.get()); ip != nullptr && ip->pos && ip->pos->data) {
+                    gc_stale = ip->pos;
+                    graph_cache_read(gc_stale, gc_stale_old);
+                }
+            }
+        }
+
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+
+        if (gc_stale != nullptr) {
+            ggml_backend_tensor_set(gc_stale, gc_stale_old.data(), 0, ggml_type_size(gc_stale->type));
+            LLAMA_LOG_WARN("graph-cache: inject stale: %s left partly unrefreshed\n", gc_stale->name);
+            graph_cache_inject.clear();
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
