@@ -69,7 +69,6 @@ import type {
 	ChatMessageToolCallTiming
 } from '$lib/types/chat';
 import type {
-	DatabaseMessage,
 	DatabaseMessageExtra,
 	DatabaseMessageExtraAudioFile,
 	DatabaseMessageExtraImageFile
@@ -466,7 +465,6 @@ class AgenticStore {
 			createAssistantMessage,
 			createToolResultMessage,
 			onAssistantTurnComplete,
-			onAttachments,
 			onChunk,
 			onCompletionId,
 			onFlowComplete,
@@ -935,25 +933,18 @@ class AgenticStore {
 				// arrived via updateToolResultMessage. Skip the second
 				// create call - just attach any base64 attachments found in
 				// the final accumulator (rare, since chunks usually don't
-				// carry image data URIs) and emit the attachments callback.
-				let toolResultMessage: DatabaseMessage | undefined;
-
+				// carry image data URIs). Both paths store the attachments
+				// once; a second append doubled them in the rebuilt history.
 				if (createdToolResultMessageId) {
-					toolResultMessage = { id: createdToolResultMessageId } as DatabaseMessage;
-
 					if (attachments.length > 0 && updateToolResultMessage) {
 						await updateToolResultMessage(createdToolResultMessageId, cleanedResult, attachments);
 					}
 				} else if (createToolResultMessage) {
-					toolResultMessage = await createToolResultMessage(
+					await createToolResultMessage(
 						toolCall.id,
 						cleanedResult,
 						attachments.length > 0 ? attachments : undefined
 					);
-				}
-
-				if (attachments.length > 0 && toolResultMessage) {
-					onAttachments?.(toolResultMessage.id, attachments);
 				}
 
 				// Build content parts for session history (including images for vision models)

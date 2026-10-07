@@ -14,7 +14,6 @@ import {
 	API_STREAM,
 	CONTROL_ACTION,
 	HEADERS,
-	LEGACY_AGENTIC_REGEX,
 	REASONING_EFFORT_TOKENS,
 	SETTINGS_KEYS,
 	SSE_DATA_PREFIX,
@@ -35,11 +34,7 @@ import {
 } from '$lib/enums';
 import { modelsStore } from '$lib/stores/models/index.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
-import type {
-	DatabaseMessageExtraMcpPrompt,
-	DatabaseMessageExtraMcpResource,
-	OpenAIToolDefinition
-} from '$lib/types';
+import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
 import type {
 	ApiChatCompletionToolCall,
 	ApiChatMessageContentPart,
@@ -63,6 +58,35 @@ interface ResumableStreamState {
 
 function streamStorageKey(conversationId: string): string {
 	return STREAM_RESUME_LOCALSTORAGE_KEY_PREFIX + conversationId;
+}
+
+// tool results written before R79 W1 stored their attachments twice ([a, b, a, b]). Records
+// written since carry extraVersion and are sent as stored, repeats included. Only a legacy
+// (unversioned) image/audio list whose second half repeats its first in every field the request
+// uses (image: base64Url; audio: base64Data and mimeType) is sent once, as the loop sent it.
+function undoubleToolExtras(message: DatabaseMessage): DatabaseMessageExtra[] {
+	const extras = message.extra ?? [];
+	const half = extras.length / 2;
+	const key = (e: DatabaseMessageExtra): string | null => {
+		if (e.type === AttachmentType.IMAGE)
+			return `i:${(e as DatabaseMessageExtraImageFile).base64Url}`;
+		if (e.type !== AttachmentType.AUDIO) return null;
+
+		const audio = e as DatabaseMessageExtraAudioFile;
+
+		return `a:${audio.mimeType}:${audio.base64Data}`;
+	};
+
+	if (message.extraVersion !== undefined) return extras;
+	if (half < 1 || !Number.isInteger(half)) return extras;
+
+	for (let i = 0; i < half; i++) {
+		const a = key(extras[i]);
+
+		if (a === null || a !== key(extras[i + half])) return extras;
+	}
+
+	return extras.slice(0, half);
 }
 
 export class ChatService {
@@ -153,7 +177,7 @@ export class ChatService {
 				{ text: message.content, type: ContentPartType.TEXT }
 			];
 
-			for (const extra of message.extra ?? []) {
+			for (const extra of undoubleToolExtras(message)) {
 				if (extra.type === AttachmentType.IMAGE) {
 					parts.push({
 						image_url: { url: (extra as DatabaseMessageExtraImageFile).base64Url },
@@ -866,50 +890,17 @@ export class ChatService {
 
 	/**
 	 * Fire-and-forget request to pre-encode the conversation in the server's KV cache.
-	 * Re-submits the full conversation with n_predict=0 so the server processes the prompt
-	 * without generating tokens, warming the cache for the next turn.
+	 * Sends the conversation through sendMessage, the builder of the real requests (tools,
+	 * kwargs, custom JSON, capability filters), with n_predict=0: the server processes the
+	 * prompt without generating tokens, warming the cache for the next turn.
 	 */
 	static async preEncode(
 		messages: ApiChatMessageData[] | (DatabaseMessage & { extra?: DatabaseMessageExtra[] })[],
-		model?: string | null,
-		excludeReasoning?: boolean,
-		signal?: AbortSignal,
-		tools?: OpenAIToolDefinition[]
+		options: SettingsChatServiceOptions,
+		signal?: AbortSignal
 	): Promise<void> {
-		const normalizedMessages: ApiChatMessageData[] =
-			await ChatService.normalizeMessagesForApi(messages);
-		const requestBody: Record<string, unknown> = {
-			messages: normalizedMessages.map((msg: ApiChatMessageData) => {
-				const mapped: Record<string, unknown> = {
-					content: excludeReasoning ? ChatService.stripReasoningContent(msg.content) : msg.content,
-					role: msg.role,
-					tool_call_id: msg.tool_call_id,
-					tool_calls: msg.tool_calls
-				};
-
-				if (!excludeReasoning && msg.reasoning_content) {
-					mapped.reasoning_content = msg.reasoning_content;
-				}
-
-				return mapped;
-			}),
-			n_predict: 0,
-			stream: false,
-			// the same prompt start as the conversation's requests (its frozen tool list)
-			...(tools && tools.length > 0 ? { tools } : {})
-		};
-
-		if (model) {
-			requestBody.model = model;
-		}
-
 		try {
-			await fetch(API_CHAT.COMPLETIONS, {
-				body: JSON.stringify(requestBody),
-				headers: getJsonHeaders(),
-				method: 'POST',
-				signal
-			});
+			await ChatService.sendMessage(messages, { ...options, n_predict: 0 }, undefined, signal);
 		} catch (error) {
 			if (!isAbortError(error)) {
 				console.warn('[ChatService] Pre-encode request failed:', error);
@@ -1078,6 +1069,7 @@ export class ChatService {
 			frequency_penalty,
 			max_tokens,
 			min_p,
+			n_predict,
 			onChunk,
 			onComplete,
 			onCompletionId,
@@ -1273,6 +1265,9 @@ export class ChatService {
 				console.warn('Failed to parse custom parameters:', error);
 			}
 		}
+
+		// after the custom JSON: a pre-encode never generates
+		if (n_predict !== undefined) requestBody.n_predict = n_predict;
 
 		try {
 			const headers: Record<string, string> = { ...getJsonHeaders() };
@@ -1676,29 +1671,6 @@ export class ChatService {
 
 			return fallback;
 		}
-	}
-
-	/**
-	 * Strips legacy inline reasoning content tags from message content.
-	 * Handles both plain string content and multipart content arrays.
-	 */
-	private static stripReasoningContent(
-		content: string | ApiChatMessageContentPart[]
-	): string | ApiChatMessageContentPart[] {
-		const stripFromString = (text: string): string =>
-			text.replace(LEGACY_AGENTIC_REGEX.REASONING_BLOCK, '').trim();
-
-		if (typeof content === 'string') {
-			return stripFromString(content);
-		}
-
-		return content.map((part) => {
-			if (part.type === ContentPartType.TEXT && part.text) {
-				return { ...part, text: stripFromString(part.text) };
-			}
-
-			return part;
-		});
 	}
 
 	// write the resume state straight to localStorage, bypassing the throttle

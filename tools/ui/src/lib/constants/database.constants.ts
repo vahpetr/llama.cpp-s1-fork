@@ -27,3 +27,10 @@ export const IDXDB_STORES = {
 	[IDXDB_TABLES.conversations]: IDXDB_STORE_SCHEMAS.conversations,
 	[IDXDB_TABLES.messages]: IDXDB_STORE_SCHEMAS.messages
 } as const;
+
+/**
+ * Attachment-storage version a message's `extra` list was written with (DatabaseMessage.extraVersion).
+ * Absent = legacy: tool results written before R79 W1 stored their attachments twice.
+ * 2 = stored once, exactly as the agentic loop sent them.
+ */
+export const MESSAGE_EXTRA_STORAGE_VERSION = 2;

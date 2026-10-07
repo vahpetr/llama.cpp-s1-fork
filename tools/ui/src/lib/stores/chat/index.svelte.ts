@@ -9,7 +9,12 @@
  * Uses ChatService for the API layer and conversationsStore for persistence.
  */
 
-import { CWD_CLEARED_TEXT, SYSTEM_MESSAGE_PLACEHOLDER, TITLE_GENERATION } from '$lib/constants';
+import {
+	CWD_CLEARED_TEXT,
+	MESSAGE_EXTRA_STORAGE_VERSION,
+	SYSTEM_MESSAGE_PLACEHOLDER,
+	TITLE_GENERATION
+} from '$lib/constants';
 import {
 	ErrorDialogType,
 	MessageRole,
@@ -36,11 +41,13 @@ import type {
 	ChatMessagePromptProgress,
 	ChatMessageTimings,
 	ChatStreamCallbacks,
+	DatabaseConversation,
 	DatabaseMessage,
 	DatabaseMessageExtra,
 	ErrorDialogState
 } from '$lib/types';
 import {
+	filterByLeafNodeId,
 	findMessageById,
 	formatCwdMessage,
 	getConversationModel,
@@ -374,7 +381,11 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		return this.activity.loadingConvs;
 	}
 
-	getApiOptions(): Record<string, unknown> {
+	/**
+	 * Request options of a real turn. Conversation-specific options (reasoning effort) come
+	 * from `conversation` when given, else from the active conversation.
+	 */
+	getApiOptions(conversation?: DatabaseConversation | null): Record<string, unknown> {
 		const currentConfig = settingsStore.config;
 		const hasValue = (value: unknown): boolean =>
 			value !== undefined && value !== null && value !== '';
@@ -393,7 +404,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		if (currentConfig.excludeReasoningFromContext) apiOptions.excludeReasoningFromContext = true;
 
 		// an explicit reasoning choice overrides the server default, DEFAULT sends nothing
-		const effort = conversationsStore.preferences.getReasoningEffort();
+		// (undefined = the active conversation)
+		const effort = conversationsStore.preferences.getReasoningEffort(conversation);
 
 		if (effort !== ReasoningEffort.DEFAULT) {
 			apiOptions.enableThinking = effort !== ReasoningEffort.OFF;
@@ -955,6 +967,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 						content,
 						convId,
 						extra: extras,
+						// attachments stored once: the rebuild sends them as stored (no legacy repair)
+						extraVersion: MESSAGE_EXTRA_STORAGE_VERSION,
 						role: MessageRole.TOOL,
 						timestamp: Date.now(),
 						toolCallId,
@@ -1019,19 +1033,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					await DatabaseService.updateCurrentNode(convId, currentMessageId);
 				}
 			},
-			onAttachments: (messageId: string, extras: DatabaseMessageExtra[]) => {
-				if (!extras.length) return;
-
-				const idx = conversationsStore.findMessageIndex(messageId);
-
-				if (idx === -1) return;
-
-				const msg = conversationsStore.activeMessages[idx];
-				const updatedExtras = [...(msg.extra || []), ...extras];
-
-				conversationsStore.updateMessageAtIndex(idx, { extra: updatedExtras });
-				DatabaseService.updateMessage(messageId, { extra: updatedExtras }).catch(console.error);
-			},
 			onChunk: (chunk: string) => {
 				streamedContent += chunk;
 				updateStreamingUI();
@@ -1087,13 +1088,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 				// Pre-encode conversation in KV cache for faster next turn
 				if (settingsStore.config.preEncodeConversation) {
-					this.triggerPreEncode(
-						allMessages,
-						assistantMessage,
-						streamedContent,
-						effectiveModel,
-						!!settingsStore.config.excludeReasoningFromContext
-					);
+					this.triggerPreEncode(convId, effectiveModel);
 				}
 			},
 			onModel: (modelName: string) => recordModel(modelName),
@@ -1430,13 +1425,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		}
 	}
 
-	private async triggerPreEncode(
-		allMessages: DatabaseMessage[],
-		assistantMessage: DatabaseMessage,
-		assistantContent: string,
-		model?: string | null,
-		excludeReasoning?: boolean
-	): Promise<void> {
+	private async triggerPreEncode(convId: string, model?: string | null): Promise<void> {
 		this.cancelPreEncode();
 		this.preEncodeAbortController = new AbortController();
 
@@ -1447,20 +1436,29 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 			if (!allIdle || signal.aborted) return;
 
-			const messagesWithAssistant: DatabaseMessage[] = [
-				...allMessages,
-				{ ...assistantMessage, content: assistantContent }
-			];
-			const frozenTools = parseToolsSnapshot(
-				(await DatabaseService.getConversation(assistantMessage.convId))?.toolsSnapshot
-			);
+			// the path the next request rebuilds from the database (tool calls, tool results,
+			// reasoning), with the request options of a real turn and the frozen tool list;
+			// conversation-specific options come from this conversation's own record, never
+			// from the active one (the user may have switched conversations meanwhile)
+			const conversation = await DatabaseService.getConversation(convId);
+
+			if (!conversation) return;
+
+			const path = filterByLeafNodeId(
+				await DatabaseService.getConversationMessages(convId),
+				conversation.currNode,
+				false
+			) as DatabaseMessage[];
+			const frozenTools = parseToolsSnapshot(conversation.toolsSnapshot);
 
 			await ChatService.preEncode(
-				messagesWithAssistant,
-				model,
-				excludeReasoning,
-				signal,
-				frozenTools ?? undefined
+				path,
+				{
+					...this.getApiOptions(conversation),
+					...(model ? { model } : {}),
+					tools: frozenTools ?? undefined
+				},
+				signal
 			);
 		} catch (err) {
 			if (!isAbortError(err)) {
