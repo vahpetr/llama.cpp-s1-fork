@@ -4478,6 +4478,15 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
     return ctx->set_sampler(seq_id, smpl);
 }
 
+llama_sampler * llama_get_sampler(const llama_context * ctx, llama_seq_id seq_id) {
+    return ctx->get_sampler(seq_id);
+}
+
+llama_sampler * llama_context::get_sampler(llama_seq_id seq_id) const {
+    const auto it = sampling.samplers.find(seq_id);
+    return it == sampling.samplers.end() ? nullptr : it->second;
+}
+
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 

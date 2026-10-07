@@ -258,6 +258,7 @@ public:
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    llama_sampler * get_sampler(llama_seq_id seq_id) const;
 
     // [TAG_SPEC_ROUND_TIMING] adds one speculative round to the open kqvis-prof window (llama_kqvis_prof_add_spec_round)
     void kqvis_prof_add_spec_round(int64_t t_draft_us, int64_t t_catchup_us, int64_t t_verify_us, int64_t t_host_us) const;
