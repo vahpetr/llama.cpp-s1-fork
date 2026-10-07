@@ -3576,6 +3576,21 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // [TAG_PARTIAL_PROMPT] the snapshot holds the target state only: the draft context's sequence
+                        //   and the drafter's carry belong to the previous conversation - drop them ([TAG_SPEC_RESET]);
+                        //   the empty draft KV is not rebuilt for the restored prefix, so the prompt is partial
+                        if (ctx_dft) {
+                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                        }
+                        if (spec) {
+                            common_speculative_reset_state(spec.get(), slot->id);
+                        }
+                        slot->prompt.partial = ctx_dft != nullptr; // n-gram drafters rebuild from the tokens
+                        if (slot->prompt.partial) {
+                            SLT_INF(*slot, "legacy restore of %zu tokens: draft sequence and carry reset, the prompt is partial (not published to the disk cache until fully recomputed)\n",
+                                    slot->prompt.tokens.size());
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -4594,6 +4609,7 @@ private:
                         slot.prompt.tokens.keep_first(n_past);
                         if (n_past == 0) {
                             slot.prompt.noncanonical = false; // [TAG_NONCANONICAL] a full recompute
+                            slot.prompt.partial      = false; // [TAG_PARTIAL_PROMPT] the draft side is rebuilt too
                         }
 
                         // [TAG_TURN_BOUNDARY] the user-message starts of the prompt this slot is about to hold: the
@@ -4676,6 +4692,7 @@ private:
                         slot.prompt.checkpoints.clear();
                         slot.prompt.deep.clear(); // [TAG_DEEP_CKPT]
                         slot.prompt.noncanonical = false; // [TAG_NONCANONICAL]
+                        slot.prompt.partial      = false; // [TAG_PARTIAL_PROMPT]
 
                         slot.stats.n_prompt_cached = 0;
 

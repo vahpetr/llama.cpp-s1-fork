@@ -617,6 +617,10 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
         DSK_INF("not saving %zu tokens: the state was shifted (not the state of this prefix)\n", n);
         return false;
     }
+    if (prompt.partial) { // [TAG_PARTIAL_PROMPT]
+        DSK_INF("not saving %zu tokens: a partial prompt (legacy /slots restore, draft side incomplete)\n", n);
+        return false;
+    }
 
     // already stored: exactly this prompt (a longer entry does not count: its recurrent state is at its own end,
     // so this prefix could only come back through a checkpoint)
@@ -996,7 +1000,7 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
 }
 
 void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_checkpoint & c, uint8_t kind) {
-    if (prompt.noncanonical) { // [TAG_NONCANONICAL]
+    if (prompt.noncanonical || prompt.partial) { // [TAG_NONCANONICAL] [TAG_PARTIAL_PROMPT]
         return;
     }
     // below min-step a re-process is cheaper than 113 MiB of disk (a short system prompt, a tiny chat)

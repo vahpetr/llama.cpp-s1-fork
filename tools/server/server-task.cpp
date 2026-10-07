@@ -1910,6 +1910,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.deep        =*/ prompt.deep,
             /*.noncanonical=*/ prompt.noncanonical,
             /*.user_starts =*/ prompt.user_starts, // [TAG_TURN_BOUNDARY]
+            /*.partial     =*/ prompt.partial,     // [TAG_PARTIAL_PROMPT]
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),

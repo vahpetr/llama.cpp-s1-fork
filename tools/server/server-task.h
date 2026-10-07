@@ -591,12 +591,18 @@ struct server_prompt {
     //   unknown (raw /completion, a legacy snapshot, a v5 disk entry): the late-branch save rule is then inactive
     std::vector<int32_t> user_starts;
 
+    // [TAG_PARTIAL_PROMPT] the draft side is incomplete (a legacy /slots restore brings the target state only: the
+    //   draft KV restarts empty and is not rebuilt for the restored prefix); never published (disk save, deep_put)
+    //   until a full recompute (n_past = 0) clears it
+    bool partial = false;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
         deep.clear();
         noncanonical = false;
         user_starts.clear();
+        partial = false;
     }
 
     // [TAG_TURN_BOUNDARY] a user message of this prompt starts at or after pos: a whole later turn lies there
@@ -620,6 +626,7 @@ struct server_prompt {
             deep,
             noncanonical,
             user_starts,
+            partial,
         };
     }
 };

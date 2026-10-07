@@ -175,6 +175,11 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // [TAG_SPEC_RESET] (optional) forget the per-seq cross-batch carry, as for a sequence that never ran: used when
+    //   the target state of the seq is replaced by one this drafter never saw (legacy /slots restore). set_state()
+    //   with an empty blob cannot do it (it ignores a blob of the wrong size)
+    virtual void reset_state(llama_seq_id /*seq_id*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -904,6 +909,14 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         pending_pos_last[seq_id] = pos;
         pending_g_last[seq_id].resize(n_embd_dec);
         std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
+    }
+
+    void reset_state(llama_seq_id seq_id) override { // [TAG_SPEC_RESET] no deferred boundary, no verify rows
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        pending_pos_last[seq_id] = -1;
+        verify_g_rows[seq_id]    = 0;
     }
 };
 
@@ -1865,6 +1878,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
         std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(uint32_t), row_bytes);
+    }
+
+    // [TAG_SPEC_RESET] the carrier as at construction (zero row, like LLAMA_MTP_CARRIER_ZERO at a sequence start), no
+    //   verify rows to pick the next carrier from
+    void reset_state(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        verify_h_rows[seq_id] = 0;
     }
 };
 
@@ -3043,6 +3066,16 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
+    }
+}
+
+void common_speculative_reset_state(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->reset_state(seq_id);
     }
 }
 
