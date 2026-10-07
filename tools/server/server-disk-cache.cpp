@@ -485,13 +485,16 @@ std::string server_disk_cache_fingerprint(const common_params & params, int32_t 
         }
         return id;
     };
-    const std::string s = string_format("v%u|%s|%s|%s|%s|ctx%d|k%d|v%d|dk%d|dv%d|%s|%s|%s|%s",
+    // (Codex gate r3 Major 4) "v<N>L": the paths are length-delimited ("<len>:<path>"), so the structural fields
+    //   parse unambiguously even with a '|' in a path (server_disk_cache_fingerprint_structure)
+    const auto lp = [](const std::string & p) { return std::to_string(p.size()) + ":" + p; };
+    const std::string s = string_format("v%uL|%s|%s|%s|%s|ctx%d|k%d|v%d|dk%d|dv%d|%s|%s|%s|%s",
         DISK_CACHE_VERSION,
-        params.model.path.c_str(), model_id(params.model.path).c_str(),
-        params.speculative.draft.mparams.path.c_str(), model_id(params.speculative.draft.mparams.path).c_str(),
+        lp(params.model.path).c_str(), model_id(params.model.path).c_str(),
+        lp(params.speculative.draft.mparams.path).c_str(), model_id(params.speculative.draft.mparams.path).c_str(),
         n_ctx, (int) params.cache_type_k, (int) params.cache_type_v,
         (int) params.speculative.draft.cache_type_k, (int) params.speculative.draft.cache_type_v,
-        params.mmproj.path.c_str(), file_id(params.mmproj.path).c_str(), exe_id.c_str(), env_id.c_str());
+        lp(params.mmproj.path).c_str(), file_id(params.mmproj.path).c_str(), exe_id.c_str(), env_id.c_str());
     return string_format("%016llx", (unsigned long long) std::hash<std::string>{}(s)) + " " + s;
 }
 
@@ -2692,13 +2695,16 @@ bool server_disk_cache::foreign_protected(const foreign_ns & ns) const {
     return std::any_of(adopted.begin(), adopted.end(), [&](const adopt_src & a) { return a.key == ns.key; });
 }
 
-// [TAG_DISK_ADOPT] (Codex gate r2 Major 3) the structural part of a fingerprint (model / draft / mmproj paths with the
-//   size@mtime of every file - each shard of a split GGUF -, n_ctx, KV types), parsed into named fields and
-//   re-encoded length-delimited with arrays of shard identities: "name=<len>:<value>;" / "name=[<n>]<len>:<v>...;".
-//   The v6 / v7 fingerprint text is positional ("v|model|id[|shard id...]|draft|id[|shard id...]|ctxN|kN|vN|dkN|dvN|
-//   mmproj|id|binary|env"): the number of shard identities after a path follows from its "-00001-of-NNNNN" suffix,
-//   as server_disk_cache_fingerprint writes them. Anything that does not parse unambiguously (a '|' in a path, a
-//   shard count that does not match, a malformed identity or field) returns "" with the reason: adoption is refused.
+// [TAG_DISK_ADOPT] (Codex gate r2 Major 3, r3 Major 4) the structural part of a fingerprint (model / draft / mmproj
+//   paths with the size@mtime of every file - each shard of a split GGUF -, n_ctx, KV types), parsed into named fields
+//   and re-encoded length-delimited with arrays of shard identities: "name=<len>:<value>;" / "name=[<n>]<len>:<v>...;".
+//   Two source formats ("v|model|id[|shard id...]|draft|id[|shard id...]|ctxN|kN|vN|dkN|dvN|mmproj|id|binary|env"):
+//   - "v<N>L" (written since r3): every path is length-delimited ("<len>:<path>"), so a '|' in a path is unambiguous;
+//   - "v<N>" (legacy, v47): positional. A '|' inside a path shifts every later field, so the parse is strict: every
+//     field must match its grammar INCLUDING the binary identity after the mmproj id ("<lib>=<hash>;..." /
+//     "<size>:<mtime>" / "unverifiable:<id>"), and the rest (environment knobs, argv) must hold no '|'-delimited file
+//     identity or binary identity - otherwise the boundaries cannot be established and "" is returned (adoption
+//     refused). The number of shard identities after a path follows from its "-00001-of-NNNNN" suffix.
 std::string server_disk_cache_fingerprint_structure(const std::string & fp, std::string * why) {
     const auto fail = [&](const std::string & w) {
         if (why) {
@@ -2707,44 +2713,98 @@ std::string server_disk_cache_fingerprint_structure(const std::string & fp, std:
         return std::string();
     };
     const auto sp = fp.find(' ');
-    const std::vector<std::string> f = string_split<std::string>(sp == std::string::npos ? fp : fp.substr(sp + 1), '|');
-    size_t i = 1;
-    const auto is_file_id = [](const std::string & v) { // "<size>@<mtime>"
-        const auto at = v.find('@');
-        if (at == std::string::npos || at == 0 || at + 1 >= v.size()) {
+    const std::string t = sp == std::string::npos ? fp : fp.substr(sp + 1);
+    size_t pos = 0;
+    // the next '|'-delimited token; false at the end of the text
+    const auto token = [&](std::string & out) -> bool {
+        if (pos > t.size()) {
             return false;
         }
-        for (size_t k = 0; k < v.size(); k++) {
-            const char c = v[k];
-            if (k != at && !(c >= '0' && c <= '9') && !(c == '-' && k == at + 1)) {
+        const auto e = t.find('|', pos);
+        out = t.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
+        pos = e == std::string::npos ? t.size() + 1 : e + 1;
+        return true;
+    };
+    const auto all_of = [](const std::string & v, size_t a, size_t b, const char * set) {
+        return a < b && v.find_first_not_of(set, a) >= b;
+    };
+    const auto is_file_id = [&](const std::string & v) { // "<size>@<mtime>"
+        const auto at = v.find('@');
+        if (at == std::string::npos || !all_of(v, 0, at, "0123456789")) {
+            return false;
+        }
+        const size_t m = at + 1 < v.size() && v[at + 1] == '-' ? at + 2 : at + 1;
+        return all_of(v, m, v.size(), "0123456789");
+    };
+    const auto is_exe_id = [&](const std::string & v) { // "<lib>=<hash>;..." | "<size>:<mtime>" | "unverifiable:<id>"
+        static const char * const NAME = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-";
+        static const char * const HASH = "0123456789abcdefABCDEF-";
+        if (v.rfind("unverifiable:", 0) == 0) {
+            return all_of(v, 13, v.size(), "0123456789abcdef");
+        }
+        const auto c = v.find(':');
+        if (c != std::string::npos && v.find('=') == std::string::npos) {
+            const size_t m = c + 1 < v.size() && v[c + 1] == '-' ? c + 2 : c + 1;
+            return all_of(v, 0, c, "0123456789") && all_of(v, m, v.size(), "0123456789");
+        }
+        size_t a = 0;
+        while (a < v.size()) {
+            const auto eq = v.find('=', a);
+            const auto sc = v.find(';', a);
+            if (eq == std::string::npos || sc == std::string::npos || sc < eq || !all_of(v, a, eq, NAME) ||
+                !all_of(v, eq + 1, sc, HASH)) {
                 return false;
             }
+            a = sc + 1;
         }
-        return true;
+        return !v.empty();
     };
     const auto field = [](const std::string & name, const std::string & v) {
         return name + "=" + std::to_string(v.size()) + ":" + v + ";";
     };
+
+    std::string ver;
+    if (!token(ver) || ver.size() < 2 || ver[0] != 'v') {
+        return fail("no version field");
+    }
+    const bool ld = ver.back() == 'L';
+    if (!all_of(ver, 1, ver.size() - (ld ? 1 : 0), "0123456789")) {
+        return fail("version field does not parse");
+    }
+    // a path: length-delimited "<len>:<path>|" (ld) or the next token (legacy)
+    const auto read_path = [&](std::string & out) -> bool {
+        if (!ld) {
+            return token(out);
+        }
+        const auto c = t.find(':', pos);
+        if (c == std::string::npos || c - pos > 9 || !all_of(t, pos, c, "0123456789")) {
+            return false;
+        }
+        const size_t n = std::stoul(t.substr(pos, c - pos));
+        if (c + 1 + n >= t.size() || t[c + 1 + n] != '|') {
+            return false;
+        }
+        out = t.substr(c + 1, n);
+        pos = c + 2 + n;
+        return true;
+    };
     std::string res;
     // a path and the identities of its files: 1 + (N - 1) shards for "<name>-00001-of-0000N.gguf"
     const auto path_files = [&](const char * name) -> bool {
-        if (i + 1 >= f.size()) {
+        std::string p;
+        if (!read_path(p)) {
             return false;
         }
-        const std::string & p = f[i++];
         size_t n = 1;
         const auto at = p.rfind("-00001-of-");
         if (at != std::string::npos && p.size() >= at + 15) {
             const int ns = atoi(p.substr(at + 10, 5).c_str());
             n = (size_t) std::max(1, std::min(ns, 99999));
         }
-        if (i + n > f.size()) {
-            return false;
-        }
         std::string arr = std::string(name) + "_files=[" + std::to_string(n) + "]";
         for (size_t k = 0; k < n; k++) {
-            const std::string & id = f[i++];
-            if (!is_file_id(id)) {
+            std::string id;
+            if (!token(id) || !is_file_id(id)) {
                 return false;
             }
             arr += std::to_string(id.size()) + ":" + id;
@@ -2752,9 +2812,6 @@ std::string server_disk_cache_fingerprint_structure(const std::string & fp, std:
         res += field(name, p) + arr + ";";
         return true;
     };
-    if (f.size() < 2 || f[0].empty() || f[0][0] != 'v') {
-        return fail("no version field");
-    }
     if (!path_files("model")) {
         return fail("model path / shard identities do not parse (a '|' in the path or a shard count mismatch)");
     }
@@ -2763,16 +2820,33 @@ std::string server_disk_cache_fingerprint_structure(const std::string & fp, std:
     }
     for (const char * name : { "ctx", "k", "v", "dk", "dv" }) {
         const std::string pre = name;
-        if (i >= f.size() || f[i].rfind(pre, 0) != 0 || f[i].size() == pre.size() ||
-            f[i].find_first_not_of("-0123456789", pre.size()) != std::string::npos) {
+        std::string v;
+        if (!token(v) || v.rfind(pre, 0) != 0 || v.size() == pre.size() ||
+            v.find_first_not_of("-0123456789", pre.size()) != std::string::npos) {
             return fail("field " + pre + " does not parse");
         }
-        res += field(name, f[i++].substr(pre.size()));
+        res += field(name, v.substr(pre.size()));
     }
-    if (i + 1 >= f.size() || !is_file_id(f[i + 1])) {
+    std::string mp, mid;
+    if (!read_path(mp) || !token(mid) || !is_file_id(mid)) {
         return fail("mmproj path / identity does not parse");
     }
-    res += field("mmproj", f[i]) + field("mmproj_file", f[i + 1]);
+    // (Codex gate r3 Major 4) the binary identity closes the structural part: it anchors the field boundaries
+    std::string exe;
+    if (!token(exe) || !is_exe_id(exe)) {
+        return fail("the binary identity after the mmproj does not parse (a '|' in a path shifts the fields)");
+    }
+    if (!ld) {
+        // legacy: what follows (server-src, environment knobs, argv) must not look like a shifted structural field
+        std::string rest;
+        while (token(rest)) {
+            if (is_file_id(rest) || (rest.find('=') != std::string::npos && rest.rfind("server-src=", 0) != 0 &&
+                                     rest.find("argv:") == std::string::npos && is_exe_id(rest))) {
+                return fail("ambiguous field boundaries (a '|' inside a path): '" + rest + "' after the binary identity");
+            }
+        }
+    }
+    res += field("mmproj", mp) + field("mmproj_file", mid);
     return res;
 }
 
