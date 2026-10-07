@@ -954,7 +954,11 @@ struct server_slot {
 
         const auto & ptask = task ? task : task_prev;
 
-        // the resident token count, also for a slot that ran no task yet (a legacy /slots restore, a fresh start)
+        // n_prompt_tokens: the slot's tracked token count, also for a slot that ran no task yet (a legacy /slots
+        //   restore, a fresh start). (Codex gate r1 C2) on an idle slot it is the resident count; while the slot is
+        //   processing it is NOT committed residency: it already includes rows queued for a decode that has not run
+        //   yet (yielding prefill) and unaccepted draft proposals (speculative verification), and the draft-side
+        //   catch-up may lag it
         res["n_prompt_tokens"] = (int32_t) prompt.tokens.size();
 
         if (ptask) {

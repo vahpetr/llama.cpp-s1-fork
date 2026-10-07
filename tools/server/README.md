@@ -1121,6 +1121,8 @@ If query param `?fail_on_no_slot=1` is set, this endpoint will respond with stat
 
 </details>
 
+`n_prompt_tokens` is the slot's tracked token count. On an idle slot it is the number of resident tokens; while the slot is processing it already includes rows queued for a decode that has not run yet and unaccepted draft proposals, so it is not committed residency.
+
 ### GET `/metrics`: Prometheus compatible metrics exporter
 
 This endpoint is only accessible if `--metrics` is set.
