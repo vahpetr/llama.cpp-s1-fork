@@ -143,37 +143,68 @@ static bool write_sealed(const std::string & path, const std::string & body) {
     return (bool) f;
 }
 
-static bool read_sealed(const std::string & path, std::string & body) {
-    std::ifstream f(path, std::ios::binary);
-    std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+// [TAG_DISK_READ_STATUS] (Codex gate r1 A3 Major 1) a read that could not be done (open / read / allocation error)
+//   is inconclusive and keeps the files; only verified damage (missing file, truncation, format, checksum) is BAD
+enum sealed_status { SEALED_OK, SEALED_IO, SEALED_BAD };
+
+// opens path for reading: SEALED_BAD if it does not exist, SEALED_IO if it exists but cannot be opened
+static sealed_status open_for_read(const std::string & path, std::ifstream & f) {
+    f.open(path, std::ios::binary);
+    if (f.is_open()) {
+        return SEALED_OK;
+    }
+    std::error_code ec;
+    return !fs::exists(path, ec) && !ec ? SEALED_BAD : SEALED_IO;
+}
+
+static sealed_status read_sealed(const std::string & path, std::string & body) {
+    std::ifstream f;
+    if (const auto st = open_for_read(path, f); st != SEALED_OK) {
+        return st;
+    }
+    std::string all;
+    try {
+        f.seekg(0, std::ios::end);
+        const std::streamoff n = f.tellg();
+        f.seekg(0, std::ios::beg);
+        if (n < 0 || !f) {
+            return SEALED_IO;
+        }
+        all.resize((size_t) n);
+        if (n > 0 && !f.read(all.data(), n)) {
+            return SEALED_IO;
+        }
+    } catch (const std::exception &) { // allocation
+        return SEALED_IO;
+    }
     if (all.size() < 8) {
-        return false;
+        return SEALED_BAD;
     }
     uint32_t klen = 0, magic = 0;
     memcpy(&klen,  all.data() + all.size() - 8, 4);
     memcpy(&magic, all.data() + all.size() - 4, 4);
     if (magic != SEAL_MAGIC || klen == 0 || klen > 256 || all.size() < 8 + (size_t) klen) {
-        return false;
+        return SEALED_BAD;
     }
     const size_t n_body = all.size() - 8 - klen;
     const std::string key = all.substr(n_body, klen);
     if (hash_key(reinterpret_cast<const uint8_t *>(all.data()), n_body) != key) {
-        return false;
+        return SEALED_BAD;
     }
     all.resize(n_body);
     body = std::move(all);
-    return true;
+    return SEALED_OK;
 }
 
 // .aux layout: magic, n_ckpt, n_ckpt x {n_tokens, pos_min, pos_max, flags_tgt, flags_dft, tgt, dft, spec},
 // spec_state, n_deep, n_deep x {n_tokens, kind, key}, [v6: n_user, n_user x pos]. with_data = false seeks over the
 // state blobs. [TAG_TURN_BOUNDARY] the user-message starts are optional: a v5 body ends before them (unknown = empty)
-static bool read_aux(const std::string & path, bool with_data, std::list<common_prompt_checkpoint> * checkpoints,
+static sealed_status read_aux(const std::string & path, bool with_data, std::list<common_prompt_checkpoint> * checkpoints,
                      std::vector<uint8_t> * spec_state, std::vector<server_deep_ref> & deep,
                      std::vector<std::string> & ckpt_keys, std::vector<int32_t> * user_starts = nullptr) {
     std::string body;
-    if (!read_sealed(path, body)) {
-        return false;
+    if (const auto st = read_sealed(path, body); st != SEALED_OK) {
+        return st;
     }
     std::istringstream f(body);
     uint32_t magic = 0, n_ckpt = 0;
@@ -222,7 +253,7 @@ static bool read_aux(const std::string & path, bool with_data, std::list<common_
             }
         }
     }
-    return ok;
+    return ok ? SEALED_OK : SEALED_BAD;
 }
 
 static bool get_vec(std::istream & f, std::vector<uint8_t> & v) {
@@ -504,14 +535,14 @@ bool server_disk_cache::read_entry(const std::string & id, const std::string & f
                 e.has_dft = j.at("has_dft").get<bool>();
 
                 std::string raw;
-                if (read_sealed(path(id, ".tok"), raw) && !raw.empty() && raw.size() % sizeof(llama_token) == 0) {
+                if (read_sealed(path(id, ".tok"), raw) == SEALED_OK && !raw.empty() && raw.size() % sizeof(llama_token) == 0) {
                     llama_tokens packed(raw.size() / sizeof(llama_token));
                     memcpy(packed.data(), raw.data(), raw.size());
                     e.tokens = server_tokens::deserialize(packed, has_mtmd);
                     ok = e.tokens.size() == j.at("n_tokens").get<size_t>() &&
                          file_size_or_0(path(id, ".tgt")) > 0 &&
                          (!e.has_dft || file_size_or_0(path(id, ".dft")) > 0) &&
-                         read_aux(path(id, ".aux"), false, nullptr, nullptr, e.deep, e.ckpt_keys) &&
+                         read_aux(path(id, ".aux"), false, nullptr, nullptr, e.deep, e.ckpt_keys) == SEALED_OK &&
                          read_map_keys(path(id, ".tgt"), e.blobs) &&
                          (!e.has_dft || read_map_keys(path(id, ".dft"), e.blobs));
                     for (const char * ext : { ".tok", ".aux", ".tgt", ".dft" }) {
@@ -946,20 +977,33 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
     std::vector<uint8_t> spec_state;
     std::vector<server_deep_ref> deep;
     std::vector<int32_t> user_starts;
+    // [TAG_DISK_READ_STATUS] only verified damage (aux_invalid) drops the entry; an I/O or allocation failure while
+    //   reading the .aux or a checkpoint file is inconclusive: the entry and its files stay
+    struct aux_invalid : std::runtime_error {
+        using std::runtime_error::runtime_error;
+    };
     try {
         std::vector<std::string> keys;
-        if (!read_aux(path(e.id, ".aux"), true, &checkpoints, &spec_state, deep, keys, &user_starts) || keys.size() != checkpoints.size()) {
-            throw std::runtime_error("truncated or corrupt");
+        const sealed_status st = read_aux(path(e.id, ".aux"), true, &checkpoints, &spec_state, deep, keys, &user_starts);
+        if (st == SEALED_IO) {
+            throw std::runtime_error("read error");
+        }
+        if (st != SEALED_OK || keys.size() != checkpoints.size()) {
+            throw aux_invalid("truncated or corrupt");
         }
         size_t i = 0;
         for (auto & c : checkpoints) {
             common_prompt_checkpoint full;
-            if (!deep_get(keys[i++], full) || full.n_tokens != c.n_tokens) {
-                throw std::runtime_error("a checkpoint is missing");
+            bool io_error = false;
+            if (!deep_get(keys[i++], full, &io_error) || full.n_tokens != c.n_tokens) {
+                if (io_error) {
+                    throw std::runtime_error("a checkpoint read error");
+                }
+                throw aux_invalid("a checkpoint is missing");
             }
             c = std::move(full);
         }
-    } catch (const std::exception & err) {
+    } catch (const aux_invalid & err) {
         DSK_WRN("entry %s: unreadable .aux (%s), dropping it\n", e.id.c_str(), err.what());
         erase(idx);
         n_load_failed++;
@@ -967,6 +1011,11 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
         blob_gc();
         refresh_status();
         return SERVER_DISK_LOAD_INVALID;
+    } catch (const std::exception & err) {
+        DSK_WRN("entry %s: .aux or checkpoint not readable (%s), keeping it\n", e.id.c_str(), err.what());
+        n_load_other++;
+        refresh_status();
+        return SERVER_DISK_LOAD_OTHER;
     }
 
     llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
@@ -1255,14 +1304,23 @@ std::vector<server_deep_ckpt_meta> server_disk_cache::deep_candidates(const serv
     return res;
 }
 
-bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoint & out) {
+bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoint & out, bool * io_error) {
     auto it = ckpts.find(key);
     if (it == ckpts.end()) {
         return false;
     }
     try {
         std::string body;
-        if (!read_sealed(ckpt_path(key), body)) {
+        const sealed_status st = read_sealed(ckpt_path(key), body);
+        if (st == SEALED_IO) {
+            // [TAG_DISK_READ_STATUS] inconclusive: the checkpoint and its file stay
+            DSK_WRN("deep checkpoint %s: read error, keeping it\n", key.c_str());
+            if (io_error) {
+                *io_error = true;
+            }
+            return false;
+        }
+        if (st != SEALED_OK) {
             throw std::runtime_error("checksum mismatch or truncated");
         }
         std::istringstream f(body);
@@ -1300,6 +1358,13 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         out.flags_tgt = ft;
         out.flags_dft = fd;
         out.id_task   = -1;
+    } catch (const std::bad_alloc &) {
+        // [TAG_DISK_READ_STATUS] inconclusive: the checkpoint and its file stay
+        DSK_WRN("deep checkpoint %s: out of memory reading it, keeping it\n", key.c_str());
+        if (io_error) {
+            *io_error = true;
+        }
+        return false;
     } catch (const std::exception & err) {
         DSK_WRN("deep checkpoint %s unreadable (%s), dropping it\n", key.c_str(), err.what());
         std::error_code ec;
@@ -1501,7 +1566,12 @@ bool server_disk_cache::read_map_keys(const std::string & map_path, std::vector<
 
 server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
                                                        const std::string & env_h, bool legacy_ok) {
-    std::ifstream fm(map_path, std::ios::binary);
+    std::ifstream fm;
+    if (open_for_read(map_path, fm) == SEALED_IO) {
+        // [TAG_DISK_READ_STATUS] the map exists but cannot be opened: inconclusive, the entry stays
+        DSK_WRN("%s: cannot open the state map\n", map_path.c_str());
+        return SERVER_DISK_LOAD_OTHER;
+    }
     uint32_t magic = 0;
     if (!get(fm, magic) || (magic != MAP_ENV_MAGIC && !(legacy_ok && magic == MAP_MAGIC))) {
         DSK_WRN("%s: no state envelope\n", map_path.c_str());
@@ -1526,6 +1596,7 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
     size_t   blk_pos = 0;
     bool done = false;
     bool corrupt = false;
+    bool io_error = false; // [TAG_DISK_READ_STATUS] a read error (not verified damage): inconclusive, nothing dropped
 
     const auto next_segment = [&]() -> bool {
         uint8_t kind = 0;
@@ -1567,8 +1638,17 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
         // hang must fail the load (and go), not restore wrong state
         blk.resize(it->second);
         {
-            std::ifstream fb(blob_path(key), std::ios::binary);
-            if (!fb.read(reinterpret_cast<char *>(blk.data()), blk.size()) || hash_key(blk.data(), blk.size()) != key) {
+            std::ifstream fb;
+            const sealed_status st = open_for_read(blob_path(key), fb);
+            const bool got = st == SEALED_OK && (bool) fb.read(reinterpret_cast<char *>(blk.data()), blk.size());
+            // [TAG_DISK_READ_STATUS] an open / read error is inconclusive and keeps the block; a missing file, a short
+            //   file (end of file before the indexed size) or a hash mismatch is verified damage
+            if (st == SEALED_IO || (st == SEALED_OK && !got && fb.bad())) {
+                DSK_WRN("block %s: read error, keeping it\n", key.c_str());
+                io_error = true;
+                return false;
+            }
+            if (!got || hash_key(blk.data(), blk.size()) != key) {
                 DSK_WRN("block %s is corrupt, dropping it\n", key.c_str());
                 std::error_code ec;
                 fs::remove(blob_path(key), ec);
@@ -1621,11 +1701,17 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
     if (ok && !corrupt) {
         // full consumption: nothing of the stream is left unread (an unread suffix is state this context dropped)
         const bool rest_empty = seg_left == 0 && !next_segment() && done && !corrupt;
+        if (!rest_empty && (io_error || fm.bad())) {
+            return SERVER_DISK_LOAD_OTHER; // [TAG_DISK_READ_STATUS]
+        }
         if (!rest_empty || (n_total > 0 && n_consumed != n_total)) {
             DSK_WRN("%s: stream not fully consumed (%" PRIu64 " of %" PRIu64 " bytes)\n", map_path.c_str(), n_consumed, n_total);
             return SERVER_DISK_LOAD_INVALID;
         }
         return SERVER_DISK_LOAD_OK;
+    }
+    if (io_error || fm.bad()) {
+        return SERVER_DISK_LOAD_OTHER;
     }
     if (corrupt || read_failed) {
         return SERVER_DISK_LOAD_INVALID;

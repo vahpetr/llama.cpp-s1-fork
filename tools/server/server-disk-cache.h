@@ -103,7 +103,8 @@ struct server_disk_cache {
     // stored checkpoints with n_tokens <= n_max whose prefix matches tokens, deepest first
     std::vector<server_deep_ckpt_meta> deep_candidates(const server_tokens & tokens, int64_t n_max) const;
 
-    bool deep_get(const std::string & key, common_prompt_checkpoint & out);
+    // io_error (optional): set when the file could not be read (inconclusive, the checkpoint is kept)
+    bool deep_get(const std::string & key, common_prompt_checkpoint & out, bool * io_error = nullptr);
 
     // reference a stored checkpoint a deep rewind used from prompt.deep (it then survives the collection)
     void deep_adopt(server_prompt & prompt, const server_deep_ckpt_meta & m);
