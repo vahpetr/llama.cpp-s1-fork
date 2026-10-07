@@ -966,7 +966,7 @@ sealed_status server_disk_cache::read_entry(const std::string & id, const std::s
         }
         const json j = json::parse(text);
         const uint32_t ver = j.value("version", 0u);
-        if (ver < 5 || ver > DISK_CACHE_VERSION || j.value("fingerprint", std::string()) != fp) {
+        if (ver < 5 || ver > DISK_CACHE_VERSION || !server_disk_cache_same_identity(j.value("fingerprint", std::string()), fp)) {
             return SEALED_BAD;
         }
         e.version = ver;
@@ -2900,7 +2900,8 @@ void server_disk_cache::blob_gc() {
 }
 
 void server_disk_cache::revalidate(const std::string & fp) {
-    if (fp == fingerprint) {
+    if (server_disk_cache_same_identity(fp, fingerprint)) {
+        fingerprint = fp; // [TAG_CACHE_COMPAT2] same namespace key: only the cheap part may differ
         return;
     }
     // [TAG_DISK_NAMESPACE] a mismatch is a miss, never a delete: open the new fingerprint's namespace, the old one
