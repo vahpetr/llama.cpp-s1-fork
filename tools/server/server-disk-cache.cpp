@@ -84,6 +84,22 @@ static uint64_t file_size_or_0(const std::string & p) {
 
 // estimated seconds to re-process a prompt of n tokens from scratch: linear MLP/recurrent part + quadratic
 // attention part, fitted to s1 Flash-Next brain prefills (27k -> 55 s, 139k -> 468 s); only the order matters
+// a block key ends in "-<bytes>" (the startup check drops a file whose size does not match): its size, 0 if malformed
+static uint64_t blob_key_bytes(const std::string & key) {
+    const auto dash = key.rfind('-');
+    if (dash == std::string::npos || dash + 1 >= key.size()) {
+        return 0;
+    }
+    uint64_t n = 0;
+    for (size_t i = dash + 1; i < key.size(); i++) {
+        if (key[i] < '0' || key[i] > '9') {
+            return 0;
+        }
+        n = n * 10 + (uint64_t) (key[i] - '0');
+    }
+    return n;
+}
+
 static double prefill_seconds(size_t n) {
     const double x = (double) n;
     return x / 520.0 + 1.0e-8 * x * x;
@@ -615,6 +631,10 @@ bool server_disk_cache::write_meta(const server_disk_cache_entry & e) const {
 
 uint64_t server_disk_cache::total_bytes() const {
     // [TAG_DISK_NAMESPACE] the own quota: the own namespace + the blocks its entries reference
+    // (Codex gate r4 Major) every physical file of the own store is charged, referenced or not (a copy of an adopted /
+    //   legacy block kept after its entry went is own storage until blob_gc() reclaims it); a legacy-store original
+    //   an own entry references is charged here too (it is kept for that entry); an adopt source's files are its
+    //   namespace's bytes (foreign)
     uint64_t res = 0;
     std::set<std::string> refs;
     for (const auto & e : entries) {
@@ -624,9 +644,15 @@ uint64_t server_disk_cache::total_bytes() const {
         res += e.own_bytes; // .tok, .aux and the maps (which hold the small fields inline)
         refs.insert(e.blobs.begin(), e.blobs.end());
     }
+    for (const auto & k : blk_own) {
+        // [TAG_DISK_READ_STATUS] held for the entries skipped at start: an unreferenced block is not collected this
+        //   run, so it must not push the quota into evicting entries that can be read (as the checkpoints below)
+        if (!gc_hold || refs.count(k)) {
+            res += blob_key_bytes(k);
+        }
+    }
     for (const auto & k : refs) {
-        const auto it = blobs.find(k);
-        res += it != blobs.end() ? it->second : 0;
+        res += blk_legacy.count(k) ? blob_key_bytes(k) : 0;
     }
     std::set<std::string> ck_refs;
     if (gc_hold) {
@@ -651,7 +677,7 @@ uint64_t server_disk_cache::total_bytes() const {
 
 // (Codex gate r2 Major 5) the storage split reported by GET /disk-cache: own (= total_bytes, the own quota's
 //   charge), foreign (foreign / legacy namespace files incl. adopted checkpoints + the blocks only their maps
-//   reference: the foreign cap's charge, quota / 2), shared (blocks referenced by own entries AND foreign maps:
+//   reference: the foreign cap's charge, quota / 2), shared (legacy-store blocks an own entry references:
 //   inside own), held (gc_hold: checkpoints / blocks nothing known references, kept this run, in neither budget)
 json server_disk_cache::storage_split() const {
     std::set<std::string> own_refs, foreign_refs;
@@ -663,17 +689,22 @@ json server_disk_cache::storage_split() const {
     for (const auto & ns : foreign) {
         foreign_refs.insert(ns.blocks.begin(), ns.blocks.end());
     }
-    uint64_t shared = 0, foreign_blk = 0, held = 0;
-    const std::string legacy_blk = (fs::path(root) / "blk").string();
-    for (const auto & b : blobs) {
-        const bool o = own_refs.count(b.first) > 0, f = foreign_refs.count(b.first) > 0;
-        // (Codex gate r3 Minor 1) each physical file once, as scan_foreign() charges the foreign cap: a block in a
-        //   namespace's own <ns>/blk is already part of that namespace's bytes; only the shared legacy store adds
-        const auto bd = blob_dir_of.find(b.first);
-        const bool in_legacy = bd != blob_dir_of.end() && bd->second == legacy_blk;
-        shared      += o && f ? b.second : 0;
-        foreign_blk += !o && f && in_legacy ? b.second : 0;
-        held        += gc_hold && !o && !f ? b.second : 0;
+    // (Codex gate r4 Major) per physical file, each once: the own store's files are own (held: unreferenced under
+    //   gc_hold); a legacy-store file is own when an own entry references it ("shared": inside own), foreign when only
+    //   foreign maps do ("foreign_blocks"), held when nothing known does under gc_hold; a namespace's own <ns>/blk is
+    //   part of that namespace's bytes (Codex gate r3 Minor 1)
+    uint64_t shared = 0, foreign_blk = 0, held = 0, own_blk = 0, legacy_blk = 0;
+    for (const auto & k : blk_own) {
+        own_blk += blob_key_bytes(k);
+        held    += gc_hold && !own_refs.count(k) ? blob_key_bytes(k) : 0;
+    }
+    for (const auto & k : blk_legacy) {
+        const bool o = own_refs.count(k) > 0, f = foreign_refs.count(k) > 0;
+        const uint64_t n = blob_key_bytes(k);
+        legacy_blk  += n;
+        shared      += o ? n : 0;
+        foreign_blk += !o && f ? n : 0;
+        held        += gc_hold && !o && !f ? n : 0;
     }
     if (gc_hold) {
         std::set<std::string> ck_refs;
@@ -697,6 +728,8 @@ json server_disk_cache::storage_split() const {
         { "foreign_blocks", foreign_blk                 },
         { "shared",         shared                      },
         { "held",           held                        },
+        { "own_blocks",     own_blk                     }, // physical: <ns>/blk
+        { "legacy_blocks",  legacy_blk                  }, // physical: <root>/blk
     };
 }
 
@@ -887,7 +920,9 @@ void server_disk_cache::init() {
             entries.clear();
             ckpts.clear();
             blobs.clear();
-            blob_dir_of.clear();
+            blk_own.clear();
+            blk_legacy.clear();
+            blk_src.clear();
             blob_bytes = 0;
             foreign.clear();
             adopted.clear();
@@ -924,9 +959,11 @@ void server_disk_cache::init() {
 
     // block store: every complete block file (a crash leaves only .tmp files); unreferenced ones go in enforce()
     std::set<std::string> io_keys; // blocks / checkpoints present but not inspectable now: kept, not indexed
-    blob_dir_of.clear();
-    const std::string legacy_blk = (fs::path(root) / "blk").string();
-    // the legacy store first, the own store second: a block present in both is served from the own store
+    blk_own.clear();
+    blk_legacy.clear();
+    blk_src.clear();
+    // (Codex gate r4 Major) both stores are inventoried: a block present in both is served from the own store, and
+    //   its legacy original stays counted (and collectable) as a file of the legacy store
     for (const auto * ls : { &ls_blk, &ls_oblk }) {
         const bool legacy = ls == &ls_blk;
         for (const auto & de : *ls) {
@@ -939,33 +976,18 @@ void server_disk_cache::init() {
                     io_keys.insert(key);
                     continue;
                 }
-                if (!blobs.count(key)) {
-                    blob_bytes += n;
+                const auto dash = key.rfind('-');
+                if (dash == std::string::npos || std::to_string(n) != key.substr(dash + 1)) {
+                    fs::remove(de.path(), ec); // a block whose size does not match its key is a torn write
+                    continue;
                 }
-                blobs[key] = n;
-                if (legacy) {
-                    blob_dir_of[key] = legacy_blk;
-                } else {
-                    blob_dir_of.erase(key);
+                (legacy ? blk_legacy : blk_own).insert(key);
+                if (!blobs.count(key)) {
+                    blobs[key] = n;
+                    blob_bytes += n;
                 }
             } else if (!legacy) {
                 fs::remove(de.path(), ec); // an own .tmp left by a crash; the legacy store is not written
-            }
-        }
-    }
-    {
-        // a block whose size does not match its key is a torn write
-        for (auto it = blobs.begin(); it != blobs.end();) {
-            const auto dash = it->first.rfind('-');
-            if (dash == std::string::npos || std::to_string(it->second) != it->first.substr(dash + 1)) {
-                if (blob_writable(it->first)) {
-                    fs::remove(blob_path(it->first), ec);
-                }
-                blob_dir_of.erase(it->first);
-                blob_bytes -= it->second;
-                it = blobs.erase(it);
-            } else {
-                ++it;
             }
         }
     }
@@ -1285,7 +1307,7 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     if (ok) {
         std::set<std::string> seen;
         for (const auto & k : e.blobs) {
-            if (!seen.insert(k).second || !blob_dir_of.count(k)) {
+            if (!seen.insert(k).second || blk_own.count(k)) {
                 continue;
             }
             const std::string src = blob_path(k);
@@ -1307,7 +1329,7 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
                 ok = false;
                 break;
             }
-            blob_dir_of.erase(k); // served from the own copy from now on
+            blk_own.insert(k); // served from the own copy from now on; the original stays inventoried in its store
             n_blk_copied++;
             n_blk_copied_bytes += blobs[k];
         }
@@ -1482,13 +1504,7 @@ server_disk_load_result server_disk_cache::verify_stream(const std::string & map
             }
             if (!got || hash_key(buf.data(), buf.size()) != key) {
                 DSK_WRN("block %s is corrupt, dropping it\n", key.c_str());
-                std::error_code ec;
-                if (blob_writable(key)) {
-                    fs::remove(blob_path(key), ec);
-                }
-                blob_dir_of.erase(key);
-                blob_bytes -= it->second;
-                blobs.erase(it);
+                blob_drop_copy(key);
                 return SERVER_DISK_LOAD_INVALID;
             }
             n_seen += buf.size();
@@ -2025,16 +2041,40 @@ void server_disk_cache::deep_gc() {
 // the own store or the legacy store (whose blocks an unreferenced / damaged state may remove); never an adopt
 //   source's store
 bool server_disk_cache::blob_writable(const std::string & key) const {
-    const auto it = blob_dir_of.find(key);
-    return it == blob_dir_of.end() || it->second == (fs::path(root) / "blk").string();
+    return blk_own.count(key) || blk_legacy.count(key) || !blk_src.count(key);
 }
 
+// the read location: own > legacy > an adopt source; a key in none of them is a new own block
 std::string server_disk_cache::blob_path(const std::string & key) const {
-    const auto it = blob_dir_of.find(key);
-    if (it != blob_dir_of.end()) {
-        return (fs::path(it->second) / (key + ".blk")).string(); // legacy store / an adopt source's store
+    if (!blk_own.count(key)) {
+        if (blk_legacy.count(key)) {
+            return (fs::path(root) / "blk" / (key + ".blk")).string();
+        }
+        const auto it = blk_src.find(key);
+        if (it != blk_src.end()) {
+            return (fs::path(it->second) / (key + ".blk")).string();
+        }
     }
     return (fs::path(dir) / "blk" / (key + ".blk")).string();
+}
+
+// a damaged read-location copy: removed when writable (own / legacy), forgotten when an adopt source's; the key stays
+//   indexed while another store still holds it (the next read verifies that copy)
+void server_disk_cache::blob_drop_copy(const std::string & key) {
+    std::error_code ec;
+    if (blob_writable(key)) {
+        fs::remove(blob_path(key), ec);
+    }
+    if (!blk_own.erase(key) && !blk_legacy.erase(key)) {
+        blk_src.erase(key);
+    }
+    if (!blk_own.count(key) && !blk_legacy.count(key) && !blk_src.count(key)) {
+        const auto it = blobs.find(key);
+        if (it != blobs.end()) {
+            blob_bytes -= it->second;
+            blobs.erase(it);
+        }
+    }
 }
 
 bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
@@ -2110,7 +2150,7 @@ bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const 
                     break;
                 }
                 blobs[key] = n;
-                blob_dir_of.erase(key); // written to the own store
+                blk_own.insert(key); // written to the own store
                 blob_bytes += n;
                 n_written += n;
             }
@@ -2306,13 +2346,7 @@ server_disk_load_result server_disk_cache::load_stream(llama_context * ctx, int3
             }
             if (!got || hash_key(blk.data(), blk.size()) != key) {
                 DSK_WRN("block %s is corrupt, dropping it\n", key.c_str());
-                std::error_code ec;
-                if (blob_writable(key)) {
-                    fs::remove(blob_path(key), ec);
-                }
-                blob_dir_of.erase(key);
-                blob_bytes -= it->second;
-                blobs.erase(it);
+                blob_drop_copy(key);
                 corrupt = true;
                 return false;
             }
@@ -2384,30 +2418,63 @@ void server_disk_cache::blob_gc() {
     if (gc_hold) {
         return; // [TAG_DISK_READ_STATUS] an entry skipped at start may reference any of them
     }
-    std::set<std::string> referenced;
+    std::set<std::string> referenced, own_referenced, elsewhere;
     for (const auto & e : entries) {
         referenced.insert(e.blobs.begin(), e.blobs.end());
+        if (e.src.empty()) {
+            own_referenced.insert(e.blobs.begin(), e.blobs.end());
+        }
+    }
+    // (Codex gate r4 Major) an own-store copy no own entry needs goes when another store still holds the key (an
+    //   adopted / legacy original: the read location falls back to it) - foreign references never pin a redundant own
+    //   copy; no rescan needed for that
+    std::error_code ec;
+    for (auto it = blk_own.begin(); it != blk_own.end();) {
+        if (!own_referenced.count(*it) && (blk_legacy.count(*it) || blk_src.count(*it))) {
+            fs::remove((fs::path(dir) / "blk" / (*it + ".blk")).string(), ec);
+            it = blk_own.erase(it);
+        } else {
+            ++it;
+        }
     }
     // [TAG_DISK_NAMESPACE] blocks of every other namespace on disk (incl. other live processes) stay: rescan them
     //   only when something would be deleted; a failed rescan deletes nothing
+    std::set<std::string> entry_refs; // the blocks the loaded entries (own + adopted) reference, set when rescanned
     if (std::any_of(blobs.begin(), blobs.end(), [&](const auto & b) { return !referenced.count(b.first); })) {
         if (!scan_foreign()) {
             return;
         }
+        entry_refs = referenced;
         for (const auto & ns : foreign) {
             referenced.insert(ns.blocks.begin(), ns.blocks.end());
+            elsewhere.insert(ns.stored.begin(), ns.stored.end());
         }
     }
     for (auto it = blobs.begin(); it != blobs.end();) {
+        // an own copy only foreign maps reference, held in that namespace's own <ns>/blk too (not adopted this run,
+        //   e.g. a restart without the adopt key): redundant, reclaimed; the sole physical copy of a block a foreign
+        //   map references stays (charged to own)
+        const bool own_only_foreign = referenced.count(it->first) && blk_own.count(it->first) &&
+                                      !entry_refs.count(it->first) && elsewhere.count(it->first);
+        if (own_only_foreign) {
+            blk_own.erase(it->first);
+            fs::remove((fs::path(dir) / "blk" / (it->first + ".blk")).string(), ec);
+            if (!blk_legacy.count(it->first) && !blk_src.count(it->first)) {
+                blob_bytes -= it->second;
+                it = blobs.erase(it);
+                continue;
+            }
+        }
         if (!referenced.count(it->first)) {
-            const auto bd = blob_dir_of.find(it->first);
-            std::error_code ec;
-            if (bd == blob_dir_of.end() || bd->second == (fs::path(root) / "blk").string()) {
-                fs::remove(blob_path(it->first), ec); // own store, or a legacy block nothing on disk references
+            // every physical copy: the own one, a legacy one nothing on disk references; an adopt source's is
+            //   only forgotten (never written)
+            if (blk_own.erase(it->first)) {
+                fs::remove((fs::path(dir) / "blk" / (it->first + ".blk")).string(), ec);
             }
-            if (bd != blob_dir_of.end()) {
-                blob_dir_of.erase(bd);
+            if (blk_legacy.erase(it->first)) {
+                fs::remove((fs::path(root) / "blk" / (it->first + ".blk")).string(), ec);
             }
+            blk_src.erase(it->first);
             blob_bytes -= it->second;
             it = blobs.erase(it);
         } else {
@@ -2429,6 +2496,9 @@ void server_disk_cache::revalidate(const std::string & fp) {
     entries.clear();
     ckpts.clear();
     blobs.clear();
+    blk_own.clear();
+    blk_legacy.clear();
+    blk_src.clear();
     blob_bytes = 0;
     init();
 }
@@ -2581,6 +2651,9 @@ bool server_disk_cache::scan_foreign() {
                 if (f.path().parent_path() == de.path() && fn.size() == 21 && fn.compare(16, 5, ".meta") == 0) {
                     ns.n_entries++;
                     add_maps(ns, de.path(), fn.substr(0, 16));
+                } else if (f.path().parent_path() == de.path() / "blk" && fn.size() > 4 &&
+                           fn.compare(fn.size() - 4, 4, ".blk") == 0) {
+                    ns.stored.insert(fn.substr(0, fn.size() - 4));
                 }
             }
             if (ec_r) {
@@ -2662,11 +2735,9 @@ bool server_disk_cache::scan_foreign() {
         total += ns.bytes;
         for (const auto & b : ns.blocks) {
             // a block in the shared legacy store (one in a namespace's own blk/ is part of its ns.bytes)
-            const auto bd = blob_dir_of.find(b);
-            if (!own_refs.count(b) && bd != blob_dir_of.end() && bd->second == (fs::path(root) / "blk").string() &&
-                    foreign_only[b]++ == 0) {
-                const auto bt = blobs.find(b);
-                total += bt != blobs.end() ? bt->second : 0;
+            //   (Codex gate r4 Major) by the legacy inventory: an original shadowed by an own copy stays counted
+            if (!own_refs.count(b) && blk_legacy.count(b) && foreign_only[b]++ == 0) {
+                total += blob_key_bytes(b);
             }
         }
     }
@@ -2682,8 +2753,7 @@ bool server_disk_cache::scan_foreign() {
             for (const auto & b : ns.blocks) {
                 auto fo = foreign_only.find(b);
                 if (fo != foreign_only.end() && --fo->second == 0) {
-                    const auto bt = blobs.find(b);
-                    total -= bt != blobs.end() ? std::min<uint64_t>(total, bt->second) : 0;
+                    total -= std::min<uint64_t>(total, blob_key_bytes(b));
                 }
             }
             remove_foreign(ns);
@@ -2900,9 +2970,11 @@ void server_disk_cache::open_adopt_sources() {
                         continue;
                     }
                     const std::string k = name.substr(0, name.size() - 4);
+                    // (Codex gate r4 Major) inventoried even behind an own / legacy copy: a reclaimed own copy
+                    //   falls back to it
+                    blk_src.emplace(k, (base / "blk").string());
                     if (!blobs.count(k)) {
                         blobs[k] = n;
-                        blob_dir_of[k] = (base / "blk").string();
                         blob_bytes += n;
                     }
                 }

@@ -199,6 +199,7 @@ struct server_disk_cache {
         int64_t     t_newest = 0; // mtime of its newest file
         std::vector<std::string> ids; // legacy: its entry ids at the top level
         std::set<std::string> blocks; // blocks its maps reference (kept by the block collection)
+        std::set<std::string> stored; // blocks in its own <ns>/blk (Codex gate r4 Major: an own copy of one is redundant)
     };
     std::vector<foreign_ns> foreign;
 
@@ -242,7 +243,13 @@ struct server_disk_cache {
 
     // [TAG_DISK_DELTA] content-addressed blocks of the state streams: key -> bytes on disk
     std::map<std::string, uint64_t> blobs;
-    std::map<std::string, std::string> blob_dir_of; // [TAG_DISK_BLK_NS] a block outside the own store: its directory
+    // [TAG_DISK_BLK_NS] (Codex gate r4 Major) physical inventories, apart from the read location: a key can sit in
+    //   several stores at once (an own copy of an adopted / legacy block, its original kept). Read location: own >
+    //   legacy > adopt source. Accounting charges each physical file; collection decides per store
+    std::set<std::string> blk_own;              // keys with a file in <dir>/blk
+    std::set<std::string> blk_legacy;           // keys with a file in <root>/blk (never written, only collected)
+    std::map<std::string, std::string> blk_src; // key -> an adopt source's <ns>/blk holding it (read-only)
+    void blob_drop_copy(const std::string & key); // a damaged read-location copy: forget it (remove it if writable)
     uint64_t blob_bytes = 0;
     // [TAG_DISK_READ_STATUS] (Hermes gate Major 1) an own entry / block / checkpoint skipped at start on an I/O error:
     //   what it references is unknown, so no block or checkpoint is collected for the rest of this run
