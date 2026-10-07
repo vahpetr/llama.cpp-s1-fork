@@ -2201,7 +2201,16 @@ private:
 
             const bool will_load = disk_cache->find(task.tokens, lcp_slot + margin, ret->n_ctx, nullptr) >= 0;
 
-            if (n_slot > 0 && (will_load || 2*lcp_slot < n_slot)) {
+            // [TAG_TURN_BOUNDARY] a late branch: a whole later user turn of the resident prompt is cut off and the
+            //   lost tail is worth a load. Best-effort: needs the user-message starts (message_spans of a chat
+            //   request); without them (raw /completion, a legacy snapshot, a v5 entry) only the rules above apply.
+            //   A normal next turn or a regenerate diverges inside the last assistant answer - no user start there
+            const bool late_branch = n_slot - lcp_slot >= margin && ret->prompt.user_start_from((int32_t) lcp_slot);
+
+            if (n_slot > 0 && (will_load || 2*lcp_slot < n_slot || late_branch)) {
+                if (late_branch && !will_load && 2*lcp_slot >= n_slot) {
+                    SLT_INF(*ret, "disk cache: a late branch at %zu of %zu tokens cuts off a user turn, saving\n", lcp_slot, n_slot);
+                }
                 ret->disk_save(*disk_cache);
             }
 
@@ -4312,6 +4321,7 @@ private:
                                     //   edited position describe a sequence that no longer exists
                                     if (first_edit >= 0) {
                                         slot.prompt.noncanonical = true;
+                                        slot.prompt.user_starts.clear(); // [TAG_TURN_BOUNDARY] positions moved
                                         slot.prompt.checkpoints.remove_if([&](const auto & c) { return c.n_tokens > first_edit; });
                                         slot.prompt.deep.erase(std::remove_if(slot.prompt.deep.begin(), slot.prompt.deep.end(),
                                                     [&](const auto & r) { return r.n_tokens > first_edit; }), slot.prompt.deep.end());
@@ -4538,6 +4548,25 @@ private:
                         slot.prompt.tokens.keep_first(n_past);
                         if (n_past == 0) {
                             slot.prompt.noncanonical = false; // [TAG_NONCANONICAL] a full recompute
+                        }
+
+                        // [TAG_TURN_BOUNDARY] the user-message starts of the prompt this slot is about to hold: the
+                        //   task's own spans describe all of it; without spans (raw /completion) the known starts of
+                        //   the kept prefix stay
+                        {
+                            auto & us = slot.prompt.user_starts;
+                            std::vector<int32_t> task_us;
+                            for (const auto & sp : slot.task->params.message_spans.spans) {
+                                if (sp.role == COMMON_CHAT_ROLE_USER) {
+                                    task_us.push_back((int32_t) sp.pos);
+                                }
+                            }
+                            if (!task_us.empty()) {
+                                std::sort(task_us.begin(), task_us.end());
+                                us = std::move(task_us);
+                            } else {
+                                us.erase(std::remove_if(us.begin(), us.end(), [&](int32_t p) { return p >= n_past; }), us.end());
+                            }
                         }
 
                         // [TAG_DEEP_CKPT] stored checkpoints past the kept prefix belong to the old continuation

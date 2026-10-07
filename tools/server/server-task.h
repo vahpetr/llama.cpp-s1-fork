@@ -586,11 +586,27 @@ struct server_prompt {
     //   n_cache_reuse shift): it is not the state of this token prefix, so it is never published (disk save, deep_put)
     bool noncanonical = false;
 
+    // [TAG_TURN_BOUNDARY] token positions of the user-message starts of this prompt (from the task's message_spans),
+    //   ascending; positions >= tokens.size() are stale (a trimmed prompt) and ignored by users_beyond(). Empty =
+    //   unknown (raw /completion, a legacy snapshot, a v5 disk entry): the late-branch save rule is then inactive
+    std::vector<int32_t> user_starts;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
         deep.clear();
         noncanonical = false;
+        user_starts.clear();
+    }
+
+    // [TAG_TURN_BOUNDARY] a user message of this prompt starts at or after pos: a whole later turn lies there
+    bool user_start_from(int32_t pos) const {
+        for (const int32_t p : user_starts) {
+            if (p >= pos && p < (int32_t) tokens.size()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     int n_tokens() const {
@@ -603,6 +619,7 @@ struct server_prompt {
             checkpoints,
             deep,
             noncanonical,
+            user_starts,
         };
     }
 };

@@ -24,7 +24,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr uint32_t DISK_CACHE_VERSION = 5; // 5: sealed (checksummed) .tok / .aux / .ck and map segments // 2: deep checkpoint refs in .aux, 3: block-deduplicated state streams, 4: .aux checkpoints by key
+static constexpr uint32_t DISK_CACHE_VERSION = 6; // 6: user-message starts at the end of .aux (optional: a 5 entry loads with them unknown) // 5: sealed (checksummed) .tok / .aux / .ck and map segments // 2: deep checkpoint refs in .aux, 3: block-deduplicated state streams, 4: .aux checkpoints by key
 static constexpr uint32_t AUX_MAGIC          = 0x58554144; // "DAUX"
 static constexpr uint32_t CKPT_MAGIC         = 0x334b4344; // "DCK3"
 static constexpr uint32_t MAP_MAGIC          = 0x3250414d; // "MAP2"
@@ -159,10 +159,11 @@ static bool read_sealed(const std::string & path, std::string & body) {
 }
 
 // .aux layout: magic, n_ckpt, n_ckpt x {n_tokens, pos_min, pos_max, flags_tgt, flags_dft, tgt, dft, spec},
-// spec_state, n_deep, n_deep x {n_tokens, kind, key}. with_data = false seeks over the state blobs.
+// spec_state, n_deep, n_deep x {n_tokens, kind, key}, [v6: n_user, n_user x pos]. with_data = false seeks over the
+// state blobs. [TAG_TURN_BOUNDARY] the user-message starts are optional: a v5 body ends before them (unknown = empty)
 static bool read_aux(const std::string & path, bool with_data, std::list<common_prompt_checkpoint> * checkpoints,
                      std::vector<uint8_t> * spec_state, std::vector<server_deep_ref> & deep,
-                     std::vector<std::string> & ckpt_keys) {
+                     std::vector<std::string> & ckpt_keys, std::vector<int32_t> * user_starts = nullptr) {
     std::string body;
     if (!read_sealed(path, body)) {
         return false;
@@ -201,6 +202,17 @@ static bool read_aux(const std::string & path, bool with_data, std::list<common_
         ok = get(f, r.n_tokens) && get(f, r.kind) && get_str(f, r.key);
         if (ok) {
             deep.push_back(std::move(r));
+        }
+    }
+    if (ok && f.peek() != std::char_traits<char>::eof()) {
+        uint32_t n_user = 0;
+        ok = get(f, n_user) && n_user < (1u << 20);
+        for (uint32_t i = 0; ok && i < n_user; i++) {
+            int32_t p = 0;
+            ok = get(f, p);
+            if (ok && user_starts) {
+                user_starts->push_back(p);
+            }
         }
     }
     return ok;
@@ -430,7 +442,8 @@ void server_disk_cache::init() {
             if (fm) {
                 const std::string text((std::istreambuf_iterator<char>(fm)), std::istreambuf_iterator<char>());
                 const json j = json::parse(text);
-                if (j.value("version", 0u) == DISK_CACHE_VERSION && j.value("fingerprint", std::string()) == fingerprint) {
+                const uint32_t ver = j.value("version", 0u);
+                if ((ver == DISK_CACHE_VERSION || ver == 5) && j.value("fingerprint", std::string()) == fingerprint) {
                     e.bytes   = j.at("bytes").get<uint64_t>();
                     e.t_saved = j.at("t_saved").get<int64_t>();
                     e.t_used  = j.at("t_used").get<int64_t>();
@@ -684,6 +697,17 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
                 put<uint8_t>(f, r.kind);
                 put_str(f, r.key);
             }
+            // [TAG_TURN_BOUNDARY] v6 trailer: the user-message starts inside this prompt
+            std::vector<int32_t> users;
+            for (const int32_t p : prompt.user_starts) {
+                if (p >= 0 && p < (int32_t) n) {
+                    users.push_back(p);
+                }
+            }
+            put<uint32_t>(f, (uint32_t) users.size());
+            for (const int32_t p : users) {
+                put<int32_t>(f, p);
+            }
             ok = ok && (bool) f && write_sealed(path(e.id, ".aux"), f.str());
         }
     } catch (const std::exception & err) {
@@ -789,9 +813,10 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
     std::list<common_prompt_checkpoint> checkpoints;
     std::vector<uint8_t> spec_state;
     std::vector<server_deep_ref> deep;
+    std::vector<int32_t> user_starts;
     try {
         std::vector<std::string> keys;
-        if (!read_aux(path(e.id, ".aux"), true, &checkpoints, &spec_state, deep, keys) || keys.size() != checkpoints.size()) {
+        if (!read_aux(path(e.id, ".aux"), true, &checkpoints, &spec_state, deep, keys, &user_starts) || keys.size() != checkpoints.size()) {
             throw std::runtime_error("truncated or corrupt");
         }
         size_t i = 0;
@@ -843,6 +868,7 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
 
     prompt.tokens      = e.tokens.clone();
     prompt.checkpoints = std::move(checkpoints);
+    prompt.user_starts = std::move(user_starts); // [TAG_TURN_BOUNDARY]
     prompt.deep.clear();
     for (auto & r : deep) {
         if (ckpts.count(r.key)) { // a collected checkpoint is just a gap in the schedule

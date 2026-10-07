@@ -1908,6 +1908,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
             /*.deep        =*/ prompt.deep,
+            /*.noncanonical=*/ prompt.noncanonical,
+            /*.user_starts =*/ prompt.user_starts, // [TAG_TURN_BOUNDARY]
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
