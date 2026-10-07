@@ -118,6 +118,12 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// [TAG_SPEC_ROUND_TIMING] (R80.1 v49) add one speculative round's host wall times (us) to the context's open
+// kqvis-prof window (LLAMA_KQ_VIS_PROF=1; a no-op otherwise): the drafter call, the draft catch-up (process), the
+// verify decode and the rest of the round. Pure telemetry: never changes what the context computes.
+LLAMA_API void llama_kqvis_prof_add_spec_round(struct llama_context * ctx, int64_t t_draft_us, int64_t t_catchup_us,
+        int64_t t_verify_us, int64_t t_host_us);
+
 //
 // model/context data extraction
 //

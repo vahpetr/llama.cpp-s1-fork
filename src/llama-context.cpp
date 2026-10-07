@@ -74,6 +74,7 @@ static const char * sched_prof_ctx_name(llama_context_type ctx_type) {
 //     graphs reused tok nkv_min nkv_max nkv_avg build_us inputs_us fill_us fill_avg in_wait_us in_copy_us kq_copy_us
 //     kq_kib compute_us compute_avg sync_us sync_avg n_sync t0_ms t1_ms
 //     plan_us n_plan plan_avg plan_inc cen_inc cen_full fb=<mark>/<shape>/<shrink>/<region>
+//     qin_us mir_kib mir_runs mir_full n_round t_draft_ms t_catchup_ms t_verify_ms t_host_ms
 // [TAG_QSA_CENSUS_INC] plan_* (appended; all 0 without LLAMA_QSA_POOLED_CACHE): plan_us = the QSA store plan time of the window
 // (census + stamps + slot plan, llama_qsa_pooled_store::stats.t_plan_us; it runs inside build_us), n_plan = plans,
 // plan_avg = plan_us/n_plan, plan_inc = plans whose every stream took the incremental fast path, cen_inc / cen_full =
@@ -82,6 +83,11 @@ static const char * sched_prof_ctx_name(llama_context_type ctx_type) {
 // [TAG_QSA_INPUTS_INC] then (appended) qin_us mir_kib mir_runs mir_full: qin_us = time in the QSA store inputs'
 // set_input (inside inputs_us; either mode), mir_kib / mir_runs / mir_full = KiB and runs written to the device-resident
 // input mirrors and the (array, stream) writes of a whole array (all 0 without LLAMA_QSA_INPUTS_INC=1)
+// [TAG_SPEC_ROUND_TIMING] then (appended) n_round t_draft_ms t_catchup_ms t_verify_ms t_host_ms: the speculative rounds
+// the server reported to this context (llama_kqvis_prof_add_spec_round, at the end of each round, so a round lands in the
+// window open when it ended) and their summed host wall times: the drafter call (common_speculative_draft), the catch-up
+// (common_speculative_process), the verify decode (llama_decode + its sync) and the rest of the round (host = round wall
+// - the three); all 0 without a speculative server / in the MTP context
 // per graph: build = process_ubatch() start .. set_inputs (apply, reuse check, build + alloc); inputs = all set_inputs;
 // fill = the KQ mask / metadata fill inside it; compute = graph_compute() host time, which contains the scheduler's
 // user-input uploads (in_wait = the synchronize before each upload, in_copy = the uploads, kq_copy/kq_kib = the
@@ -93,6 +99,16 @@ static std::atomic<uint64_t> g_kqvis_epoch{0};   // +1 at every idle gap > 1.5 s
 
 static int64_t kqvis_unix_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+void llama_context::kqvis_prof_add_spec_round(int64_t t_draft_us, int64_t t_catchup_us, int64_t t_verify_us,
+        int64_t t_host_us) const {
+    auto & w = kqvis_win; // [TAG_SPEC_ROUND_TIMING]
+    w.n_round      += 1;
+    w.t_draft_us   += t_draft_us;
+    w.t_catchup_us += t_catchup_us;
+    w.t_verify_us  += t_verify_us;
+    w.t_host_us    += t_host_us;
 }
 
 void llama_context::kqvis_prof_flush(const char * reason) const {
@@ -107,7 +123,8 @@ void llama_context::kqvis_prof_flush(const char * reason) const {
                 " t0_ms=%" PRId64 " t1_ms=%" PRId64
                 " plan_us=%" PRId64 " n_plan=%" PRId64 " plan_avg=%.1f plan_inc=%" PRId64 " cen_inc=%" PRId64
                 " cen_full=%" PRId64 " fb=%" PRId64 "/%" PRId64 "/%" PRId64 "/%" PRId64
-                " qin_us=%" PRId64 " mir_kib=%" PRId64 " mir_runs=%" PRId64 " mir_full=%" PRId64 "\n",
+                " qin_us=%" PRId64 " mir_kib=%" PRId64 " mir_runs=%" PRId64 " mir_full=%" PRId64
+                " n_round=%" PRId64 " t_draft_ms=%.3f t_catchup_ms=%.3f t_verify_ms=%.3f t_host_ms=%.3f\n",
                 sched_prof_ctx_name(cparams.ctx_type), mode_name[w.mode & 3], w.cls == 1 ? "pp" : "dec", kqvis_n_win, reason,
                 w.graphs, w.reused, w.tokens, w.n_kv_min, w.n_kv_max, w.n_kv_sum/g, w.build_us, w.inputs_us,
                 w.fill_us, w.fill_us/g, w.in_wait_us, w.in_copy_us, w.kq_copy_us,
@@ -115,7 +132,8 @@ void llama_context::kqvis_prof_flush(const char * reason) const {
                 w.t0_ms, w.t1_ms,
                 w.plan_us, w.n_plan, w.n_plan > 0 ? (double) w.plan_us/w.n_plan : 0.0, w.n_plan_inc, w.n_cen_inc,
                 w.n_cen_full, w.n_cen_fb[1], w.n_cen_fb[2], w.n_cen_fb[3], w.n_cen_fb[4],
-                w.qin_us, w.mir_bytes/1024, w.mir_runs, w.mir_full);
+                w.qin_us, w.mir_bytes/1024, w.mir_runs, w.mir_full,
+                w.n_round, w.t_draft_us/1000.0, w.t_catchup_us/1000.0, w.t_verify_us/1000.0, w.t_host_us/1000.0);
         kqvis_n_win++;
     }
     kqvis_win = kqvis_prof_window();
@@ -4832,6 +4850,13 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+void llama_kqvis_prof_add_spec_round(struct llama_context * ctx, int64_t t_draft_us, int64_t t_catchup_us,
+        int64_t t_verify_us, int64_t t_host_us) {
+    if (ctx != nullptr && llama_kqvis_prof_enabled()) {
+        ctx->kqvis_prof_add_spec_round(t_draft_us, t_catchup_us, t_verify_us, t_host_us);
+    }
 }
 
 //

@@ -1603,6 +1603,26 @@ std::string server_task_result_metrics::to_metrics() {
             "Speculative: replays following a rejection inside a folded round",
             (double) metrics.n_spec_fold_rejected
         }, {
+            "spec_timed_rounds_total",
+            "Speculative: rounds (server passes that ran the drafter) with the wall times below",
+            (double) metrics.n_spec_timed_rounds
+        }, {
+            "spec_draft_seconds_total",
+            "Speculative: wall time of the drafter call (common_speculative_draft) per round",
+            metrics.t_spec_draft_us / 1e6
+        }, {
+            "spec_catchup_seconds_total",
+            "Speculative: wall time of the draft catch-up (common_speculative_process) per round",
+            metrics.t_spec_catchup_us / 1e6
+        }, {
+            "spec_verify_seconds_total",
+            "Speculative: wall time of the verify decode (llama_decode + sync) per round",
+            metrics.t_spec_verify_us / 1e6
+        }, {
+            "spec_host_seconds_total",
+            "Speculative: rest of the round wall time (round - draft - catch-up - verify)",
+            metrics.t_spec_host_us / 1e6
+        }, {
             "prompt_checkpoint_restores_total",
             "Prompt-checkpoint restores (a new prompt resumed from a context checkpoint)",
             (double) metrics.n_prompt_restores

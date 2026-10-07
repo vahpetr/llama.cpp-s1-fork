@@ -377,6 +377,14 @@ struct server_slot_stats {
     uint64_t n_spec_empty_drafts  = 0; // drafter was asked and returned nothing (subset of plain)
     uint64_t n_spec_fold_rejected = 0; // replays that follow a rejection inside a folded round
 
+    // [TAG_SPEC_ROUND_TIMING] (R80.1 v49) host wall time of the speculative rounds this slot drafted in (one round = one
+    // update_slots pass that ran the drafter; a pass shared by several drafting slots is counted in full for each)
+    uint64_t n_spec_timed_rounds = 0;
+    int64_t  t_spec_draft_us     = 0; // common_speculative_draft (the yield block)
+    int64_t  t_spec_catchup_us   = 0; // common_speculative_process (draft catch-up) of the pass's batch views
+    int64_t  t_spec_verify_us    = 0; // llama_decode + sync of the pass's batch views (the verify decode)
+    int64_t  t_spec_host_us      = 0; // the rest of the pass (round wall - draft - catch-up - verify)
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;
@@ -522,6 +530,13 @@ struct server_metrics {
     uint64_t n_spec_plain_rounds  = 0;
     uint64_t n_spec_empty_drafts  = 0;
     uint64_t n_spec_fold_rejected = 0;
+
+    // [TAG_SPEC_ROUND_TIMING] counters, added live at the end of every speculative round (each round once)
+    uint64_t n_spec_timed_rounds = 0;
+    int64_t  t_spec_draft_us     = 0;
+    int64_t  t_spec_catchup_us   = 0;
+    int64_t  t_spec_verify_us    = 0;
+    int64_t  t_spec_host_us      = 0;
 
     // adaptive draft length (--spec-draft-n-max-adaptive) - gauges, last decision taken by any slot
     uint64_t spec_adaptive_n_max    = 0;  // effective draft length asked of the drafter

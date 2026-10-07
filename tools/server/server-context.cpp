@@ -914,6 +914,13 @@ struct server_slot {
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
 
+        if (stats.n_spec_timed_rounds > 0) { // [TAG_SPEC_ROUND_TIMING]
+            const double nr = (double) stats.n_spec_timed_rounds;
+            SLT_INF(*this, "round time: %" PRIu64 " rounds, per round draft %.3f ms, catch-up %.3f ms, verify %.3f ms, host %.3f ms\n",
+                    stats.n_spec_timed_rounds, stats.t_spec_draft_us/1e3/nr, stats.t_spec_catchup_us/1e3/nr,
+                    stats.t_spec_verify_us/1e3/nr, stats.t_spec_host_us/1e3/nr);
+        }
+
         common_speculative_print_stats(spec);
     }
 
@@ -3794,6 +3801,40 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
+
+    // [TAG_SPEC_ROUND_TIMING] (R80.1 v49) wall times of the current update_slots pass; a pass that ran the drafter is one
+    // speculative round. Timers only: nothing here feeds back into scheduling, sampling or the batch.
+    struct spec_round_timing {
+        int64_t t0_us      = 0;
+        int64_t draft_us   = 0; // the common_speculative_draft yield block
+        int64_t catchup_us = 0; // the common_speculative_process yield blocks of the pass's batch views
+        int64_t verify_us  = 0; // the llama_decode (+ sync) yield blocks of the pass's batch views
+        std::vector<int> slot_ids; // slots that drafted in this pass (empty: not a round)
+    } spec_rt;
+
+    // end of a pass: a round -> the slots' stats, the /metrics counters and the main context's kqvis-prof window
+    void spec_round_finish() {
+        if (spec_rt.slot_ids.empty()) {
+            return;
+        }
+        const int64_t t_round  = ggml_time_us() - spec_rt.t0_us;
+        const int64_t t_host   = std::max<int64_t>(0, t_round - spec_rt.draft_us - spec_rt.catchup_us - spec_rt.verify_us);
+        for (const int id : spec_rt.slot_ids) {
+            auto & st = slots[id].stats;
+            st.n_spec_timed_rounds += 1;
+            st.t_spec_draft_us     += spec_rt.draft_us;
+            st.t_spec_catchup_us   += spec_rt.catchup_us;
+            st.t_spec_verify_us    += spec_rt.verify_us;
+            st.t_spec_host_us      += t_host;
+        }
+        metrics.n_spec_timed_rounds += 1;
+        metrics.t_spec_draft_us     += spec_rt.draft_us;
+        metrics.t_spec_catchup_us   += spec_rt.catchup_us;
+        metrics.t_spec_verify_us    += spec_rt.verify_us;
+        metrics.t_spec_host_us      += t_host;
+        llama_kqvis_prof_add_spec_round(ctx_tgt, spec_rt.draft_us, spec_rt.catchup_us, spec_rt.verify_us, t_host);
+        spec_rt.slot_ids.clear();
+    }
 // #define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
@@ -3856,6 +3897,14 @@ private:
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
             }
+        }
+
+        if (spec) { // [TAG_SPEC_ROUND_TIMING] the pass starts
+            spec_rt.t0_us      = ggml_time_us();
+            spec_rt.draft_us   = 0;
+            spec_rt.catchup_us = 0;
+            spec_rt.verify_us  = 0;
+            spec_rt.slot_ids.clear();
         }
 
         try {
@@ -3943,6 +3992,8 @@ private:
                 break; // stop any further processing
             }
         }
+
+        spec_round_finish(); // [TAG_SPEC_ROUND_TIMING]
 
         // [TAG_SLOT_INVALIDATE] what the batch wrote for a slot invalidated in this pass goes too
         for (const int32_t id : slots_invalidated) {
@@ -4160,9 +4211,14 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t t_draft0 = ggml_time_us(); // [TAG_SPEC_ROUND_TIMING]
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            spec_rt.draft_us += ggml_time_us() - t_draft0;
+            for (const server_slot * s : drafting) {
+                spec_rt.slot_ids.push_back(s->id);
+            }
         }
 
         // make checkpoints if needed
@@ -5087,6 +5143,7 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t t_verify0 = ggml_time_us(); // [TAG_SPEC_ROUND_TIMING]
         queue_tasks.yield_to_queue([&]() {
             llama_set_rs_rollback_depth(ctx_tgt, rs_depth);
             ret = llama_decode(ctx_tgt, batch_view);
@@ -5094,6 +5151,7 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         });
+        spec_rt.verify_us += ggml_time_us() - t_verify0;
 
         if (ret != 0) {
             {
@@ -5153,9 +5211,11 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t t_catchup0 = ggml_time_us(); // [TAG_SPEC_ROUND_TIMING]
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
+            spec_rt.catchup_us += ggml_time_us() - t_catchup0;
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
