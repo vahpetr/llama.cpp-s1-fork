@@ -2235,6 +2235,25 @@ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     return sched->n_splits;
 }
 
+int ggml_backend_sched_get_split(ggml_backend_sched_t sched, int i, int * backend_id, int * i_start, int * i_end) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(i >= 0 && i < sched->n_splits);
+    const struct ggml_backend_sched_split * split = &sched->splits[i];
+    *backend_id = split->backend_id;
+    *i_start    = split->i_start;
+    *i_end      = split->i_end;
+    return split->n_inputs;
+}
+
+void ggml_backend_sched_get_split_input(ggml_backend_sched_t sched, int i, int j, struct ggml_tensor ** input, struct ggml_tensor ** copy) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(i >= 0 && i < sched->n_splits);
+    const struct ggml_backend_sched_split * split = &sched->splits[i];
+    GGML_ASSERT(j >= 0 && j < split->n_inputs);
+    *input = split->inputs[j];
+    *copy  = tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
+}
+
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;

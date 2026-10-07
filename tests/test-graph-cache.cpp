@@ -130,6 +130,7 @@ struct run_out {
     std::vector<llama_token> drafts;
     std::vector<std::string> qsa_ids; // [qsa-ids] lines without the graph counter
     int64_t hit[2] = {0, 0}, miss[2] = {0, 0}, check[2] = {0, 0}, inval[2] = {0, 0}; // [0] main, [1] mtp
+    int64_t evict[2] = {0, 0}, clear[2] = {0, 0}, check2[2] = {0, 0};
 };
 
 static run_out run(gguf_context * meta, const char * k, const char * check, const std::string & stderr_path) {
@@ -253,10 +254,12 @@ static run_out run(gguf_context * meta, const char * k, const char * check, cons
     while (std::getline(ls, line)) {
         char ctx[16] = {0};
         int kk = 0;
-        long long h = 0, m = 0, c = 0, inv = 0;
-        if (sscanf(line.c_str(), "graph-cache: ctx=%15s K=%d hit=%lld miss=%lld check=%lld inval=%lld", ctx, &kk, &h, &m, &c, &inv) == 6) {
+        long long h = 0, m = 0, c = 0, inv = 0, ev = 0, cl = 0, c2 = 0;
+        if (sscanf(line.c_str(), "graph-cache: ctx=%15s K=%d hit=%lld miss=%lld check=%lld inval=%lld evict=%lld clear=%lld check2=%lld",
+                   ctx, &kk, &h, &m, &c, &inv, &ev, &cl, &c2) == 9) {
             const int i = strcmp(ctx, "mtp") == 0 ? 1 : 0;
             out.hit[i] += h; out.miss[i] += m; out.check[i] += c; out.inval[i] += inv;
+            out.evict[i] += ev; out.clear[i] += cl; out.check2[i] += c2;
         }
     }
     return out;
@@ -283,6 +286,7 @@ int main(int argc, char ** argv) {
     const run_out off = run(meta.get(), "0", "0", dir + "/test-graph-cache-off.stderr");
     const run_out on  = run(meta.get(), "8", "0", dir + "/test-graph-cache-on.stderr");
     const run_out chk = run(meta.get(), "8", "1", dir + "/test-graph-cache-check.stderr");
+    const run_out ch2 = run(meta.get(), "8", "2", dir + "/test-graph-cache-check2.stderr");
 
     if (const char * dump = getenv("TEST_GRAPH_CACHE_DUMP")) {
         // the cache-off run, for a byte comparison with another build (K = 0 must equal the parent commit)
@@ -296,7 +300,7 @@ int main(int argc, char ** argv) {
         fclose(f);
     }
 
-    for (const run_out * r : { &off, &on, &chk }) {
+    for (const run_out * r : { &off, &on, &chk, &ch2 }) {
         printf("run: %zu logits, %zu draft tokens, %zu [qsa-ids] lines; main hit=%" PRId64 " miss=%" PRId64 " check=%" PRId64
                " inval=%" PRId64 "; mtp hit=%" PRId64 " miss=%" PRId64 " check=%" PRId64 " inval=%" PRId64 "\n",
                r->logits.size(), r->drafts.size(), r->qsa_ids.size(), r->hit[0], r->miss[0], r->check[0], r->inval[0],
@@ -311,6 +315,10 @@ int main(int argc, char ** argv) {
     expect(off.hit[0] == 0 && off.miss[0] == 0, "cache off: no graph-cache activity");
     expect(on.hit[0] > on.miss[0] && on.hit[1] > 0, "K=8: the target hits more than it misses, the MTP context hits");
     expect(chk.check[0] == chk.hit[0] && chk.check[1] == chk.hit[1] && chk.hit[0] > 0, "CHECK: every hit rebuilt and compared");
+    expect(same(off.logits, ch2.logits) && same(off.drafts, ch2.drafts) && off.qsa_ids == ch2.qsa_ids,
+           "CHECK=2: logits, drafts and [qsa-ids] identical to cache off");
+    expect(ch2.check2[0] == ch2.hit[0] && ch2.check2[1] == ch2.hit[1] && ch2.check[0] == ch2.hit[0] && ch2.hit[0] > 0,
+           "CHECK=2: every hit also executed fresh from the same state, outputs + state bytes equal");
     expect(on.inval[0] + on.inval[1] > 0, "regrow past kv_graph_span invalidated snapshots (inval > 0)");
 
     printf("test-graph-cache: %s\n", n_fail == 0 ? "OK" : "FAILED");

@@ -372,6 +372,10 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_snapshot_valid(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap);
     GGML_API void                 ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snap);
     GGML_API uint64_t             ggml_backend_sched_buffer_gen(ggml_backend_sched_t sched);
+    // [TAG_GRAPH_CACHE] read-only view of the current split plan (LLAMA_GRAPH_CACHE_CHECK): split i's backend index,
+    // node range [i_start, i_end) of the split graph, and its inputs (the source tensor each backend copy is fed from)
+    GGML_API int                  ggml_backend_sched_get_split(ggml_backend_sched_t sched, int i, int * backend_id, int * i_start, int * i_end); // returns n_inputs
+    GGML_API void                 ggml_backend_sched_get_split_input(ggml_backend_sched_t sched, int i, int j, struct ggml_tensor ** input, struct ggml_tensor ** copy);
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);

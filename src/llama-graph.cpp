@@ -4023,78 +4023,116 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
 }
 
 // [TAG_GRAPH_CACHE]
-bool llm_graph_topology_equal(ggml_cgraph * cached, ggml_cgraph * fresh, std::string & why) {
+bool llm_graph_topology_cmp::ref_eq(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a == nullptr || b == nullptr) {
+        return a == b;
+    }
+    const auto ia = ida.find(a);
+    const auto ib = idb.find(b);
+    if (ia != ida.end() || ib != idb.end()) {
+        return ia != ida.end() && ib != idb.end() && ia->second == ib->second;
+    }
+    // first reference of a tensor outside the node list: number it and compare it
+    const int id = -(++n_other);
+    ida[a] = id;
+    idb[b] = id;
+    return tensor_eq(a, b, "leaf", n_other - 1);
+}
+
+// the buffer a tensor lives in: an unallocated view of a persistent tensor gets its buffer only at allocation
+static ggml_backend_buffer_t tensor_buffer(const ggml_tensor * t) {
+    return t->buffer ? t->buffer : t->view_src ? t->view_src->buffer : nullptr;
+}
+
+bool llm_graph_topology_cmp::tensor_eq(const ggml_tensor * a, const ggml_tensor * b, const char * kind, int i) {
+    const char * what = nullptr;
+    if (a->op != b->op) {
+        what = "op";
+    } else if (a->type != b->type) {
+        what = "type";
+    } else if (memcmp(a->ne, b->ne, sizeof(a->ne)) != 0) {
+        what = "ne";
+    } else if (memcmp(a->nb, b->nb, sizeof(a->nb)) != 0) {
+        what = "nb";
+    } else if (memcmp(a->op_params, b->op_params, sizeof(a->op_params)) != 0) {
+        what = "op_params";
+    } else if (a->flags != b->flags) {
+        what = "flags";
+    } else if (a->view_offs != b->view_offs || !ref_eq(a->view_src, b->view_src)) {
+        what = "view";
+    } else if (b->data != nullptr && (a->data != b->data || tensor_buffer(a) != tensor_buffer(b))) {
+        what = "data/buffer"; // a tensor that exists outside the compute buffer (weights, KV-cache views)
+    } else if (a->data == nullptr) {
+        what = "unallocated";
+    } else {
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (!ref_eq(a->src[s], b->src[s])) {
+                what = "src";
+                break;
+            }
+        }
+    }
+    if (what) {
+        if (why.empty()) {
+            why = format("%s %d (%s / %s): %s differs", kind, i, a->name, b->name, what);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool llm_graph_topology_cmp::graph_eq(ggml_cgraph * cached, ggml_cgraph * fresh) {
     const int na = ggml_graph_n_nodes(cached);
     const int nb = ggml_graph_n_nodes(fresh);
     if (na != nb) {
         why = format("n_nodes %d vs %d", na, nb);
         return false;
     }
-
-    // tensor -> position: node i -> i; any other tensor (leafs, views of weights / KV) -> -(k + 1) in the order of
-    // first reference, so equal topologies number them identically
-    std::unordered_map<const ggml_tensor *, int> ida, idb;
     for (int i = 0; i < na; ++i) {
         ida[ggml_graph_node(cached, i)] = i;
         idb[ggml_graph_node(fresh,  i)] = i;
     }
-    int n_other = 0;
-
-    std::function<bool(const ggml_tensor *, const ggml_tensor *, const char *, int)> tensor_eq;
-    auto ref_eq = [&](const ggml_tensor * a, const ggml_tensor * b) -> bool {
-        if (a == nullptr || b == nullptr) {
-            return a == b;
-        }
-        const auto ia = ida.find(a);
-        const auto ib = idb.find(b);
-        if (ia != ida.end() || ib != idb.end()) {
-            return ia != ida.end() && ib != idb.end() && ia->second == ib->second;
-        }
-        // first reference of a tensor outside the node list: number it and compare it
-        const int id = -(++n_other);
-        ida[a] = id;
-        idb[b] = id;
-        return tensor_eq(a, b, "leaf", n_other - 1);
-    };
-    tensor_eq = [&](const ggml_tensor * a, const ggml_tensor * b, const char * kind, int i) -> bool {
-        const char * what = nullptr;
-        if (a->op != b->op) {
-            what = "op";
-        } else if (a->type != b->type) {
-            what = "type";
-        } else if (memcmp(a->ne, b->ne, sizeof(a->ne)) != 0) {
-            what = "ne";
-        } else if (memcmp(a->nb, b->nb, sizeof(a->nb)) != 0) {
-            what = "nb";
-        } else if (memcmp(a->op_params, b->op_params, sizeof(a->op_params)) != 0) {
-            what = "op_params";
-        } else if (a->flags != b->flags) {
-            what = "flags";
-        } else if (a->view_offs != b->view_offs || !ref_eq(a->view_src, b->view_src)) {
-            what = "view";
-        } else if (b->data != nullptr && a->data != b->data) {
-            what = "data"; // a tensor that exists outside the compute buffer (weights, KV-cache views)
-        } else if (a->data == nullptr) {
-            what = "unallocated";
-        } else {
-            for (int s = 0; s < GGML_MAX_SRC; ++s) {
-                if (!ref_eq(a->src[s], b->src[s])) {
-                    what = "src";
-                    break;
-                }
-            }
-        }
-        if (what) {
-            if (why.empty()) {
-                why = format("%s %d (%s / %s): %s differs", kind, i, a->name, b->name, what);
-            }
-            return false;
-        }
-        return true;
-    };
     for (int i = 0; i < na; ++i) {
         if (!tensor_eq(ggml_graph_node(cached, i), ggml_graph_node(fresh, i), "node", i)) {
             return false;
+        }
+    }
+    return true;
+}
+
+bool llm_graph_topology_cmp::sched_eq(ggml_backend_sched_t sa, ggml_cgraph * cached, ggml_backend_sched_t sb, ggml_cgraph * fresh) {
+    // backend assignment of every node (both schedulers are built from the same backend list)
+    for (int i = 0; i < ggml_graph_n_nodes(cached); ++i) {
+        if (ggml_backend_sched_get_tensor_backend(sa, ggml_graph_node(cached, i)) != ggml_backend_sched_get_tensor_backend(sb, ggml_graph_node(fresh, i))) {
+            why = format("node %d (%s): backend assignment differs", i, ggml_graph_node(cached, i)->name);
+            return false;
+        }
+    }
+    // splits: backend, node range and input -> copy routing (which source tensor feeds each backend copy)
+    const int ns = ggml_backend_sched_get_n_splits(sa);
+    if (ns != ggml_backend_sched_get_n_splits(sb)) {
+        why = format("n_splits %d vs %d", ns, ggml_backend_sched_get_n_splits(sb));
+        return false;
+    }
+    for (int i = 0; i < ns; ++i) {
+        int ba, sta, ea, bb, stb, eb;
+        const int nia = ggml_backend_sched_get_split(sa, i, &ba, &sta, &ea);
+        const int nib = ggml_backend_sched_get_split(sb, i, &bb, &stb, &eb);
+        if (nia != nib || ba != bb || sta != stb || ea != eb) {
+            why = format("split %d: backend/range/n_inputs differs (%d %d-%d %d vs %d %d-%d %d)", i, ba, sta, ea, nia, bb, stb, eb, nib);
+            return false;
+        }
+        for (int j = 0; j < nia; ++j) {
+            ggml_tensor * ia, * ca, * ib, * cb;
+            ggml_backend_sched_get_split_input(sa, i, j, &ia, &ca);
+            ggml_backend_sched_get_split_input(sb, i, j, &ib, &cb);
+            if (!ref_eq(ia, ib) || !ref_eq(ca, cb)) {
+                if (why.empty() || why.rfind("split", 0) != 0) {
+                    why = format("split %d input %d (%s -> %s): copy routing differs%s%s", i, j, ia ? ia->name : "-", ca ? ca->name : "-",
+                            why.empty() ? "" : ": ", why.c_str());
+                }
+                return false;
+            }
         }
     }
     return true;

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <vector>
 #include <memory>
+#include <unordered_map>
 #include <set>
 #include <functional>
 #include <map>
@@ -984,12 +985,23 @@ private:
 
 using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 
-// [TAG_GRAPH_CACHE] LLAMA_GRAPH_CACHE_CHECK: true if `cached` (an allocated graph) has the topology of `fresh` (the
-// same graph rebuilt, not allocated): node order, ops, types, shapes, strides, op_params, flags, sources,
-// views and view offsets, and the data address of every tensor that `fresh` already has (weights, KV-cache views).
-// Compute-buffer offsets are not compared: they come from the allocator's plan at allocation time. `why` names the
-// first difference.
-bool llm_graph_topology_equal(ggml_cgraph * cached, ggml_cgraph * fresh, std::string & why);
+// [TAG_GRAPH_CACHE] LLAMA_GRAPH_CACHE_CHECK: compares `cached` (an allocated graph) with `fresh` (the same graph rebuilt
+// and split on a scratch scheduler, not allocated) under one normalized numbering (node i -> i, every other tensor in
+// the order of first reference). graph_eq: node order, ops, types, shapes, strides, op_params, flags, sources, views
+// and view offsets, and the buffer + data address of every tensor that `fresh` already has (weights, KV-cache
+// views). sched_eq (after graph_eq): the backend of every node and the split plan - backend, node range and, per
+// split input, the source tensor and the backend copy it feeds. Compute-buffer offsets are validated separately
+// (the allocation manifest of the cache entry). `why` names the first difference.
+struct llm_graph_topology_cmp {
+    std::unordered_map<const ggml_tensor *, int> ida, idb;
+    int n_other = 0;
+    std::string why;
+
+    bool ref_eq(const ggml_tensor * a, const ggml_tensor * b);
+    bool tensor_eq(const ggml_tensor * a, const ggml_tensor * b, const char * kind, int i);
+    bool graph_eq(ggml_cgraph * cached, ggml_cgraph * fresh);
+    bool sched_eq(ggml_backend_sched_t sa, ggml_cgraph * cached, ggml_backend_sched_t sb, ggml_cgraph * fresh);
+};
 
 //
 // llm_graph_context

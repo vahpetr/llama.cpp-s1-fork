@@ -251,7 +251,7 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, ggml_backend_sched_t s_other = nullptr); // [TAG_GRAPH_CACHE] s_other: CHECK=2 scratch scheduler
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -390,25 +390,49 @@ private:
     struct sched_snapshot_deleter {
         void operator()(ggml_backend_sched_snapshot_t s) const { ggml_backend_sched_snapshot_free(s); }
     };
+    // the allocation manifest of a cache entry: every compute-buffer tensor of the graph as allocated (CHECK)
+    struct graph_cache_alloc_rec {
+        const ggml_tensor *   t;
+        ggml_backend_buffer_t buf;
+        size_t                offs;     // data - base(buf)
+        size_t                size;     // ggml_nbytes
+        const ggml_tensor *   view_src;
+        size_t                view_offs;
+    };
     struct graph_cache_entry {
         llm_graph_result_ptr res;
         std::unique_ptr<ggml_backend_sched_snapshot, sched_snapshot_deleter> snap; // nullptr while resident
         bool resident = false;
+        uint64_t buffer_gen = 0; // the scheduler's buffer generation at allocation
+        std::vector<graph_cache_alloc_rec> manifest; // CHECK only
     };
     int32_t graph_cache_k     = 0;
-    bool    graph_cache_check = false;
+    int32_t graph_cache_check = 0; // 1 = rebuild + compare plan and manifest, 2 = also execute the fresh plan and compare
     bool    graph_cache_active = false; // the live scheduler state belongs to the cache, not to gf_res_prev
     size_t  graph_cache_max_nodes = 0;
     std::vector<graph_cache_entry> graph_cache; // most recently used first
     llm_graph_result_ptr  graph_cache_check_res;
     ggml_backend_sched_ptr graph_cache_check_sched;
     struct graph_cache_stats {
-        int64_t hit = 0, miss = 0, check = 0, inval = 0, evict = 0, clear = 0;
+        int64_t hit = 0, miss = 0, check = 0, inval = 0, evict = 0, clear = 0, check2 = 0;
     };
     graph_cache_stats graph_cache_tot;
 
     // drop every cached graph (the scheduler is about to be reset, reserved or replaced)
     void graph_cache_clear();
+    // CHECK: the allocation manifest of the resident entry's graph / its validation on a hit (abort on mismatch)
+    void graph_cache_manifest_take(graph_cache_entry & e);
+    void graph_cache_manifest_check(const graph_cache_entry & e);
+    // CHECK=2: before the cached graph runs, execute a fresh plan of the same ubatch on the scratch scheduler and
+    // record its outputs and the persistent bytes it writes, then restore those bytes; after the cached graph ran,
+    // compare (abort on mismatch)
+    struct graph_cache_exec_rec {
+        std::vector<std::pair<const ggml_tensor *, std::vector<uint8_t>>> outputs; // cached-graph tensor -> fresh bytes
+        std::vector<std::pair<const ggml_tensor *, std::vector<uint8_t>>> state;   // persistent tensors written
+    };
+    graph_cache_exec_rec graph_cache_exec;
+    void graph_cache_check_exec_pre(llm_graph_result * res, const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx);
+    void graph_cache_check_exec_post(llm_graph_result * res);
     // the cache path of process_ubatch: a reused or newly built and allocated graph, nullptr on failure
     llm_graph_result * graph_cache_get(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool & reused);
 

@@ -19,6 +19,8 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -617,9 +619,9 @@ llama_context::llama_context(
         const char * LLAMA_GRAPH_CACHE       = getenv("LLAMA_GRAPH_CACHE");
         const char * LLAMA_GRAPH_CACHE_CHECK = getenv("LLAMA_GRAPH_CACHE_CHECK");
         graph_cache_k     = LLAMA_GRAPH_CACHE ? std::max(0, atoi(LLAMA_GRAPH_CACHE)) : 0;
-        graph_cache_check = graph_cache_k > 0 && LLAMA_GRAPH_CACHE_CHECK && atoi(LLAMA_GRAPH_CACHE_CHECK) != 0;
+        graph_cache_check = graph_cache_k > 0 && LLAMA_GRAPH_CACHE_CHECK ? std::max(0, atoi(LLAMA_GRAPH_CACHE_CHECK)) : 0;
         if (graph_cache_k > 0) {
-            LLAMA_LOG_INFO("%s: graph cache: K = %d, check = %d\n", __func__, graph_cache_k, graph_cache_check ? 1 : 0);
+            LLAMA_LOG_INFO("%s: graph cache: K = %d, check = %d\n", __func__, graph_cache_k, graph_cache_check);
         }
     }
 
@@ -846,8 +848,8 @@ llama_context::~llama_context() {
         // [TAG_GRAPH_CACHE] totals of this context
         const auto & t = graph_cache_tot;
         LLAMA_LOG_INFO("graph-cache: ctx=%s K=%d hit=%" PRId64 " miss=%" PRId64 " check=%" PRId64 " inval=%" PRId64
-                " evict=%" PRId64 " clear=%" PRId64 "\n", sched_prof_ctx_name(cparams.ctx_type), graph_cache_k,
-                t.hit, t.miss, t.check, t.inval, t.evict, t.clear);
+                " evict=%" PRId64 " clear=%" PRId64 " check2=%" PRId64 "\n", sched_prof_ctx_name(cparams.ctx_type), graph_cache_k,
+                t.hit, t.miss, t.check, t.inval, t.evict, t.clear, t.check2);
         graph_cache.clear(); // before the scheduler (the snapshots reference its tensors only by pointer)
     }
 
@@ -1847,10 +1849,14 @@ llm_graph_result * llama_context::graph_cache_get(const llama_ubatch & ubatch, l
                 // split the fresh one the same way (no allocation)
                 ggml_backend_sched_split_graph(graph_cache_check_sched.get(), gf_check);
             }
-            std::string why;
-            if (gf_check == nullptr || !llm_graph_topology_equal(e.res->get_gf(), gf_check, why)) {
-                GGML_ABORT("graph-cache check: the cached graph differs from a fresh build: %s", gf_check ? why.c_str() : "rebuild failed");
+            llm_graph_topology_cmp cmp;
+            if (gf_check == nullptr || !cmp.graph_eq(e.res->get_gf(), gf_check)) {
+                GGML_ABORT("graph-cache check: the cached graph differs from a fresh build: %s", gf_check ? cmp.why.c_str() : "rebuild failed");
             }
+            if (!cmp.sched_eq(s, e.res->get_gf(), graph_cache_check_sched.get(), gf_check)) {
+                GGML_ABORT("graph-cache check: the cached split plan differs from a fresh build: %s", cmp.why.c_str());
+            }
+            graph_cache_manifest_check(e);
             graph_cache_tot.check++;
             graph_cache_check_res->reset();
         }
@@ -1892,9 +1898,176 @@ llm_graph_result * llama_context::graph_cache_get(const llama_ubatch & ubatch, l
         ret = GGML_STATUS_ALLOC_FAILED;
         return nullptr;
     }
-    e.resident = true;
+    e.resident   = true;
+    e.buffer_gen = ggml_backend_sched_buffer_gen(s);
+    if (graph_cache_check) {
+        graph_cache_manifest_take(e);
+    }
     graph_cache.insert(graph_cache.begin(), std::move(e));
     return graph_cache.front().res.get();
+}
+
+// every tensor the graph reaches (nodes, sources incl. backend copies, view sources), each once
+static void graph_cache_collect(ggml_cgraph * gf, std::vector<const ggml_tensor *> & out) {
+    std::unordered_set<const ggml_tensor *> seen;
+    std::vector<const ggml_tensor *> stack;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        stack.push_back(ggml_graph_node(gf, i));
+    }
+    while (!stack.empty()) {
+        const ggml_tensor * t = stack.back();
+        stack.pop_back();
+        if (t == nullptr || !seen.insert(t).second) {
+            continue;
+        }
+        out.push_back(t);
+        stack.push_back(t->view_src);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            stack.push_back(t->src[j]);
+        }
+    }
+}
+
+static bool graph_cache_is_compute(const ggml_tensor * t) {
+    return t->buffer != nullptr && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+}
+
+void llama_context::graph_cache_manifest_take(graph_cache_entry & e) {
+    std::vector<const ggml_tensor *> ts;
+    graph_cache_collect(e.res->get_gf(), ts);
+    e.manifest.clear();
+    for (const ggml_tensor * t : ts) {
+        if (!graph_cache_is_compute(t) || t->data == nullptr) {
+            continue;
+        }
+        const char * base = (const char *) ggml_backend_buffer_get_base(t->buffer);
+        e.manifest.push_back({ t, t->buffer, (size_t) ((const char *) t->data - base), ggml_nbytes(t), t->view_src, t->view_offs });
+    }
+}
+
+void llama_context::graph_cache_manifest_check(const graph_cache_entry & e) {
+    if (e.buffer_gen != ggml_backend_sched_buffer_gen(sched.get())) {
+        GGML_ABORT("graph-cache check: hit on an entry of buffer generation %" PRIu64 ", current %" PRIu64,
+                e.buffer_gen, ggml_backend_sched_buffer_gen(sched.get()));
+    }
+    // every compute-buffer tensor the graph reaches now must be in the manifest, unchanged, in bounds and consistent
+    std::unordered_map<const ggml_tensor *, const graph_cache_alloc_rec *> by_t;
+    for (const auto & r : e.manifest) {
+        by_t[r.t] = &r;
+    }
+    std::vector<const ggml_tensor *> ts;
+    graph_cache_collect(e.res->get_gf(), ts);
+    for (const ggml_tensor * t : ts) {
+        if (t->buffer == nullptr && t->data == nullptr) {
+            continue;
+        }
+        if (t->buffer == nullptr || !graph_cache_is_compute(t)) {
+            if (by_t.count(t)) {
+                GGML_ABORT("graph-cache check: %s: left its compute buffer", t->name);
+            }
+            continue; // persistent: compared by buffer + data in graph_eq
+        }
+        const auto it = by_t.find(t);
+        if (it == by_t.end()) {
+            GGML_ABORT("graph-cache check: %s: compute tensor not in the allocation manifest", t->name);
+        }
+        const auto & r = *it->second;
+        const char * base = (const char *) ggml_backend_buffer_get_base(t->buffer);
+        const size_t offs = (size_t) ((const char *) t->data - base);
+        if (t->buffer != r.buf || offs != r.offs || ggml_nbytes(t) != r.size) {
+            GGML_ABORT("graph-cache check: %s: allocation differs from the manifest (buffer %p/%p offs %zu/%zu size %zu/%zu)",
+                    t->name, (void *) t->buffer, (void *) r.buf, offs, r.offs, ggml_nbytes(t), r.size);
+        }
+        if ((const char *) t->data < base || offs + r.size > ggml_backend_buffer_get_size(t->buffer)) {
+            GGML_ABORT("graph-cache check: %s: out of the bounds of its buffer (offs %zu size %zu buffer %zu)",
+                    t->name, offs, r.size, ggml_backend_buffer_get_size(t->buffer));
+        }
+        if (t->view_src != r.view_src || t->view_offs != r.view_offs ||
+            (t->view_src != nullptr && (const char *) t->data != (const char *) t->view_src->data + t->view_offs)) {
+            GGML_ABORT("graph-cache check: %s: view inconsistent (data != view_src->data + view_offs or view changed)", t->name);
+        }
+    }
+}
+
+static void graph_cache_read(const ggml_tensor * t, std::vector<uint8_t> & out) {
+    out.resize(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, out.data(), 0, out.size());
+}
+
+void llama_context::graph_cache_check_exec_pre(llm_graph_result * res, const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx) {
+    ggml_backend_sched_synchronize(sched.get()); // the previous graph may still be writing the state
+    auto & x = graph_cache_exec;
+    x.outputs.clear();
+    x.state.clear();
+
+    ggml_cgraph * gf_c = res->get_gf();
+    const int n = ggml_graph_n_nodes(gf_c);
+
+    // the persistent tensors the graph produces in place (KV/recurrent/QSA writes): their bytes before
+    std::vector<std::pair<const ggml_tensor *, std::vector<uint8_t>>> before;
+    for (int i = 0; i < n; ++i) {
+        const ggml_tensor * t = ggml_graph_node(gf_c, i);
+        if (t->buffer != nullptr && !graph_cache_is_compute(t) && t->op != GGML_OP_NONE && t->op != GGML_OP_VIEW &&
+            t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
+            before.emplace_back(t, std::vector<uint8_t>());
+            graph_cache_read(t, before.back().second);
+        }
+    }
+
+    // a fresh plan of the same ubatch on the scratch scheduler, allocated in its own compute buffers
+    ggml_backend_sched_t cs = graph_cache_check_sched.get();
+    ggml_backend_sched_reset(cs);
+    graph_cache_check_res->reset();
+    auto gp = graph_params(graph_cache_check_res.get(), ubatch, mctx, gtype);
+    gp.sched = cs;
+    ggml_cgraph * gf_f = model.build_graph(gp);
+    if (gf_f == nullptr || ggml_graph_n_nodes(gf_f) != n || !ggml_backend_sched_alloc_graph(cs, gf_f)) {
+        GGML_ABORT("graph-cache check=2: the fresh plan could not be built/allocated");
+    }
+    graph_cache_check_res->set_inputs(&ubatch);
+    if (graph_compute(gf_f, ubatch.n_tokens > 1, cs) != GGML_STATUS_SUCCESS) {
+        GGML_ABORT("graph-cache check=2: the fresh plan failed to compute");
+    }
+    for (int i = 0; i < n; ++i) {
+        const ggml_tensor * tf = ggml_graph_node(gf_f, i);
+        if (tf->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            x.outputs.emplace_back(ggml_graph_node(gf_c, i), std::vector<uint8_t>());
+            graph_cache_read(tf, x.outputs.back().second);
+        }
+    }
+    // the state the fresh plan wrote, then the state back as it was for the cached graph
+    for (auto & [t, bytes] : before) {
+        x.state.emplace_back(t, std::vector<uint8_t>());
+        graph_cache_read(t, x.state.back().second);
+    }
+    for (auto & [t, bytes] : before) {
+        ggml_backend_tensor_set(const_cast<ggml_tensor *>(t), bytes.data(), 0, bytes.size());
+    }
+    ggml_backend_sched_reset(cs);
+    graph_cache_check_res->reset();
+}
+
+void llama_context::graph_cache_check_exec_post(llm_graph_result * res) {
+    GGML_UNUSED(res);
+    if (graph_cache_exec.outputs.empty() || graph_cache_exec.state.empty()) {
+        // every decode graph produces outputs and writes the memory state: an empty set means the check saw nothing
+        GGML_ABORT("graph-cache check=2: nothing to compare (%zu outputs, %zu state tensors)",
+                graph_cache_exec.outputs.size(), graph_cache_exec.state.size());
+    }
+    ggml_backend_sched_synchronize(sched.get());
+    std::vector<uint8_t> got;
+    for (const auto * set : { &graph_cache_exec.outputs, &graph_cache_exec.state }) {
+        for (const auto & [t, want] : *set) {
+            graph_cache_read(t, got);
+            if (got != want) {
+                GGML_ABORT("graph-cache check=2: %s %s differs between the cached and a fresh plan",
+                        set == &graph_cache_exec.outputs ? "output" : "state", t->name);
+            }
+        }
+    }
+    graph_cache_exec.outputs.clear();
+    graph_cache_exec.state.clear();
+    graph_cache_tot.check2++;
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -2061,7 +2234,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         kq_t_compute_us = ggml_time_us();
     }
 
+    // [TAG_GRAPH_CACHE] CHECK=2: execute a fresh plan first (state restored), compare after the cached one ran
+    const bool gc_exec = use_graph_cache && kq_reused && graph_cache_check >= 2;
+    if (gc_exec) {
+        graph_cache_check_exec_pre(res, ubatch, gtype, mctx);
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (gc_exec && status == GGML_STATUS_SUCCESS) {
+        graph_cache_check_exec_post(res);
+    }
 
     if (kqprof) {
         // [TAG_KQVIS_PROF] account this graph; first close the open window if the graph does not belong to it
@@ -3304,7 +3487,8 @@ llm_graph_params llama_context::graph_params(
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+   ggml_backend_sched_t   s_other) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3319,6 +3503,11 @@ ggml_status llama_context::graph_compute(
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+    }
+
+    if (s_other != nullptr) {
+        // [TAG_GRAPH_CACHE] CHECK=2: the fresh plan on the scratch scheduler, synchronously, no dumps
+        return ggml_backend_sched_graph_compute(s_other, gf);
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
