@@ -3,6 +3,7 @@
 #include "server-disk-cache.h"
 #include "arg.h"
 #include "server-task.h"
+#include "server-context.h" // [TAG_MULTISLOT] server_multislot_envelope_check
 
 #include <atomic>
 #include <cstdio>
@@ -398,6 +399,38 @@ int main() {
     }
     CHECK(server_cache_measure_hash("abc") == server_cache_measure_hash("abc"));
     CHECK(server_cache_measure_hash("abc") != server_cache_measure_hash("abd"));
+
+    // [TAG_MULTISLOT] stage 5.1 item 2: the support-envelope decision (server_multislot_envelope_check)
+    {
+        // np 1: unchanged, nothing printed, whatever the knob / mmproj / context shift
+        for (const char * k : { (const char *) nullptr, "", "0", "1", "yes" }) {
+            const auto r = server_multislot_envelope_check(k, 1, true, true);
+            CHECK(r.ok && !r.strict && r.proof.empty());
+        }
+        // knob unset / 0 / invalid with np > 1: today's behaviour (mmproj, shift, fork allowed), a WARN proof only
+        for (const char * k : { (const char *) nullptr, "", "0", "on", "2", "1 " }) {
+            const auto r = server_multislot_envelope_check(k, 5, true, true);
+            CHECK(r.ok && !r.strict);
+            CHECK(r.proof.rfind("[multislot-envelope] np=5 text_only=0 shared_prefix=1 ctx_shift=1 strict=0", 0) == 0);
+            CHECK(r.proof.find("NOT qualified") != std::string::npos);
+        }
+        CHECK(server_multislot_envelope_check("on", 2, false, false).proof.find("invalid LLAMA_QSA_HOMOGENEOUS='on'") != std::string::npos);
+        // strict + text only + no shift: starts, the exact startup proof
+        {
+            const auto r = server_multislot_envelope_check("1", 2, false, false);
+            CHECK(r.ok && r.strict && r.error.empty());
+            CHECK(r.proof == "[multislot-envelope] np=2 text_only=1 shared_prefix=0 ctx_shift=0 strict=1");
+            printf("%s\n", r.proof.c_str());
+        }
+        // strict + mmproj: refused; strict + context shift: refused
+        {
+            const auto r = server_multislot_envelope_check("1", 2, true, false);
+            CHECK(!r.ok && r.strict && r.error.find("--mmproj") != std::string::npos);
+            const auto s = server_multislot_envelope_check("1", 4, false, true);
+            CHECK(!s.ok && s.strict && s.error.find("--no-context-shift") != std::string::npos);
+            printf("%s\n%s\n", r.error.c_str(), s.error.c_str());
+        }
+    }
 
     if (n_fail) {
         fprintf(stderr, "%d failure(s)\n", n_fail);

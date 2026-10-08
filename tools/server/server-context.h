@@ -206,3 +206,15 @@ std::vector<llama_token> server_sample_and_accept_replay(
         size_t n_committed,
         bool probe_mismatch,
         int & n_mismatch);
+
+// [TAG_MULTISLOT] stage 5.1 item 2: the multi-slot support envelope. LLAMA_QSA_HOMOGENEOUS=1 with n_parallel > 1 is
+// the qualification mode: text-only (no mmproj), no shared-prefix parent/child requests, no context shift - startup is
+// refused outside it. Unset / 0 = today's behaviour (the hands' 5 slots + mmproj keep running), a WARN only.
+// (defined in server-context.cpp; declared here for tests/test-cache-compat-key)
+struct server_multislot_envelope {
+    bool        strict = false; // the knob is 1 AND n_parallel > 1: shared-prompt (n_cmpl > 1) requests are rejected
+    bool        ok     = true;  // false: refuse startup (error says why)
+    std::string error;
+    std::string proof;          // the [multislot-envelope] line ("" for n_parallel <= 1: unchanged, nothing printed)
+};
+server_multislot_envelope server_multislot_envelope_check(const char * knob, int n_parallel, bool has_mmproj, bool ctx_shift);

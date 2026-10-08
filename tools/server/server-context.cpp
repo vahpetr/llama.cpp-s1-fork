@@ -57,6 +57,36 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
+// [TAG_MULTISLOT] stage 5.1 item 2 (see server-context.h). The knob is parsed strictly like LLAMA_MTP_CARRIER_ZERO:
+// only a plain 0 / 1; anything else is reported in the proof and treated as unset (never as qualification mode)
+server_multislot_envelope server_multislot_envelope_check(const char * knob, int n_parallel, bool has_mmproj, bool ctx_shift) {
+    server_multislot_envelope r;
+    const bool knob_set   = knob != nullptr && knob[0] != '\0';
+    const bool knob_one   = knob_set && strcmp(knob, "1") == 0;
+    const bool knob_valid = !knob_set || knob_one || strcmp(knob, "0") == 0;
+    if (n_parallel <= 1) {
+        return r; // single slot: unchanged, nothing printed
+    }
+    r.strict = knob_one;
+    r.proof  = string_format("[multislot-envelope] np=%d text_only=%d shared_prefix=%d ctx_shift=%d strict=%d",
+                             n_parallel, has_mmproj ? 0 : 1, r.strict ? 0 : 1, ctx_shift ? 1 : 0, r.strict ? 1 : 0);
+    if (!knob_valid) {
+        r.proof += string_format(" (invalid LLAMA_QSA_HOMOGENEOUS='%s', 0 or 1 - treated as unset)", knob);
+    }
+    if (!r.strict) {
+        r.proof += " - multi-slot exactness is NOT qualified outside LLAMA_QSA_HOMOGENEOUS=1 (mmproj, shared-prompt requests, context shift allowed)";
+        return r;
+    }
+    if (has_mmproj) {
+        r.ok    = false;
+        r.error = string_format("[multislot-envelope] LLAMA_QSA_HOMOGENEOUS=1 with n_parallel=%d refuses --mmproj (text-only envelope)", n_parallel);
+    } else if (ctx_shift) {
+        r.ok    = false;
+        r.error = string_format("[multislot-envelope] LLAMA_QSA_HOMOGENEOUS=1 with n_parallel=%d requires --no-context-shift", n_parallel);
+    }
+    return r;
+}
+
 // Replay after a checkpoint restore (partial draft acceptance on a context that cannot seq_rm partially).
 //
 // The leading `n_committed` tokens of `draft` were already sampled AND accepted on this very sampler during the
@@ -1431,6 +1461,10 @@ private:
 
     common_params params_base;
 
+    // [TAG_MULTISLOT] LLAMA_QSA_HOMOGENEOUS=1 with n_parallel > 1 (server_multislot_envelope_check): shared-prompt
+    //   parent/child requests are rejected before any slot is chosen
+    bool multislot_strict = false;
+
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
 
@@ -1870,6 +1904,25 @@ private:
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
+
+        // [TAG_MULTISLOT] the support envelope, decided before anything (mmproj included) is loaded
+        {
+            const auto env = server_multislot_envelope_check(getenv("LLAMA_QSA_HOMOGENEOUS"), params.n_parallel,
+                                                             has_mmproj, params.ctx_shift);
+            if (!env.ok) {
+                SRV_ERR("%s\n", env.error.c_str());
+                return false;
+            }
+            if (!env.proof.empty()) {
+                if (env.strict) {
+                    SRV_INF("%s\n", env.proof.c_str());
+                } else {
+                    SRV_WRN("%s\n", env.proof.c_str());
+                }
+            }
+            multislot_strict = env.strict;
+        }
+
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
@@ -3689,6 +3742,16 @@ private:
                     }
 
                     const int id_task = task.id;
+
+                    // [TAG_MULTISLOT] qualification mode: a parent/child (n_cmpl > 1) request would copy one slot's KV
+                    //   into others (shared physical prefix, outside the envelope) - rejected before any slot is touched
+                    if (multislot_strict && task.is_parent()) {
+                        SRV_WRN("[multislot-envelope] rejected shared-prompt request id_task=%d (n_cmpl=%zu, LLAMA_QSA_HOMOGENEOUS=1)\n",
+                                id_task, task.child_tasks.size() + 1);
+                        send_error(task, "n_cmpl > 1 (shared-prompt parent/child slots) is not supported with LLAMA_QSA_HOMOGENEOUS=1 and n_parallel > 1",
+                                   ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
 
                     server_slot * slot = get_available_slot(task);
 
