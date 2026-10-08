@@ -576,9 +576,27 @@ static int64_t qwen4exp_qsa_depth(const llama_memory_hybrid_idx_context * mctx_h
 // unified pool safe) and asserts that no sparse query belongs to its sequence - this term: the dense attention over
 // the partial window is what LLAMA_MTP_QSA=0 runs there. A complete history keeps one cell per position 0..depth-1, so
 // n_kv >= depth (the reserve: qwen4exp_qsa_depth returns n_kv) and this term never changes a working graph.
-static bool qwen4exp_qsa_dense(int64_t n_kv_idx, int64_t width, int64_t depth) {
+// [TAG_MULTISLOT] (stage 5.1 item 3) LLAMA_QSA_HOMOGENEOUS=1 (the multi-slot qualification mode, read once): the pool
+// high-water is not sequence coverage - under --kv-unified a deep resident B keeps n_kv above a partial A's depth, so
+// `depth > n_kv` misses A. Then the dense term is also taken when ANY sequence of the ubatch lacks a complete indexer
+// history (llama_memory_hybrid_idx_context::qsa_history_complete: min 0, no hole, up to its depth; [qsa-history]).
+// Off (unset / not exactly 1): today's decision bit for bit - an M-RoPE image (repeated + skipped positions) would
+// read as partial and route every image conversation of the hands (5 slots, mmproj) dense.
+static bool qwen4exp_qsa_homogeneous() {
+    static const bool on = [] {
+        const char * s = getenv("LLAMA_QSA_HOMOGENEOUS");
+        return s != nullptr && strcmp(s, "1") == 0;
+    }();
+
+    return on;
+}
+
+static bool qwen4exp_qsa_dense(const llama_memory_hybrid_idx_context * mctx_hyb, const llama_ubatch & ubatch,
+                               int64_t n_kv_idx, int64_t width) {
+    const int64_t depth = qwen4exp_qsa_depth(mctx_hyb, ubatch, n_kv_idx);
     return depth > n_kv_idx
-        || (qwen4exp_qsa_bypass_exhaustive() && width == n_kv_idx) || depth < qwen4exp_qsa_min_kv();
+        || (qwen4exp_qsa_bypass_exhaustive() && width == n_kv_idx) || depth < qwen4exp_qsa_min_kv()
+        || (qwen4exp_qsa_homogeneous() && !mctx_hyb->qsa_history_complete(ubatch));
 }
 
 // [TAG_MTP_QSA] the selection budget (indexer_top_k) of layer il. TEST ONLY: LLAMA_MTP_QSA_TOP_K=N > 0 replaces it for
@@ -1601,8 +1619,9 @@ public:
         // the dense decision depends on n_kv and (LLAMA_QSA_MIN_KV) on the ubatch's sequence depth, so a graph is
         // never reused across it: not a dense graph once the window has grown past the budget or the sequence
         // reached LLAMA_QSA_MIN_KV, and not a QSA graph for a ubatch whose sequences are all below it
-        const bool dense = qwen4exp_qsa_dense(n_kv, std::min<int64_t>(n_kv, (int64_t) bypass_top_k + (int64_t) ratio - 1),
-                qwen4exp_qsa_depth(mctx, params.ubatch, n_kv));
+        // [TAG_MULTISLOT] incl. the sequence coverage: a coverage change at an unchanged shape rejects the reuse
+        const bool dense = qwen4exp_qsa_dense(mctx, params.ubatch, n_kv,
+                std::min<int64_t>(n_kv, (int64_t) bypass_top_k + (int64_t) ratio - 1));
 
         if (cache_only) {
             // [TAG_MTP_QSA] a forced cache-only input (the MTP catch-up / MAX_UBATCH) is one whatever the depth
@@ -2713,7 +2732,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         const int64_t width    = std::min<int64_t>(n_kv_idx, (int64_t) qwen4exp_qsa_top_k(hparams, il) + (int64_t) qsa_ratio - 1);
 
         // [TAG_QSA_MIN_KV] also while the ubatch's sequence depth is below LLAMA_QSA_MIN_KV
-        qsa_exhaustive = qwen4exp_qsa_dense(n_kv_idx, width, qwen4exp_qsa_depth(mctx_hyb, ubatch, n_kv_idx));
+        qsa_exhaustive = qwen4exp_qsa_dense(mctx_hyb, ubatch, n_kv_idx, width);
 
         // the first QSA graph a process builds is the load-time reserve (full memory, n_kv = --kv-graph-span or the
         // cache): below LLAMA_QSA_MIN_KV it reserves the dense graph, and the first QSA ubatch regrows the buffer

@@ -51,6 +51,7 @@
 #include "../src/llama-ext.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -170,7 +171,7 @@ struct mtp_env {
 static bool silent_progress(float, void *) { return true; }
 
 static void quiet_log(ggml_log_level level, const char * text, void *) {
-    if (level >= GGML_LOG_LEVEL_WARN) {
+    if (level >= GGML_LOG_LEVEL_WARN || strstr(text, "[qsa-history]") != nullptr) { // [TAG_MULTISLOT] the proof line
         fputs(text, stderr);
     }
 }
@@ -314,7 +315,8 @@ static run_result run_scenario(gguf_context * meta, bool restore) {
 
 // one draft step of sequence `seq` at n_past `pos` (census active), the draft rows rolled back, then the 1-token target
 // decode + catch-up of id_last; returns the drafted count
-static int draft_step(mtp_env & E, llama_seq_id seq, llama_pos & pos, llama_token & id_last, std::vector<float> & logits) {
+static int draft_step(mtp_env & E, llama_seq_id seq, llama_pos & pos, llama_token & id_last, std::vector<float> & logits,
+                      std::vector<llama_token> * dtoks = nullptr, std::vector<float> * dlogits = nullptr) {
     std::vector<llama_token> drafted;
     auto & dp = common_speculative_get_draft_params(E.spec, seq);
     dp.drafting = true;
@@ -327,6 +329,13 @@ static int draft_step(mtp_env & E, llama_seq_id seq, llama_pos & pos, llama_toke
     common_speculative_draft(E.spec);
     llama_synchronize(E.ctx_dft.get());
     E.census.active = false;
+    if (dtoks) { // [TAG_MULTISLOT] the proposals + the last draft logits
+        dtoks->insert(dtoks->end(), drafted.begin(), drafted.end());
+        const float * l = drafted.empty() ? nullptr : llama_get_logits_ith(E.ctx_dft.get(), -1);
+        if (l != nullptr) {
+            dlogits->insert(dlogits->end(), l, l + N_VOCAB);
+        }
+    }
     llama_memory_seq_rm(llama_get_memory(E.ctx_dft.get()), seq, pos, -1);
 
     feed(E, { id_last }, pos, logits, seq);
@@ -388,6 +397,117 @@ static unified_result run_unified(gguf_context * meta) {
     res.n_graphs_a = E.census.n["FLASH_ATTN_EXT"];
     res.n_topk_a   = E.census.n["TOP_K"] + E.census.n["QSA_TOP_K"];
     return res;
+}
+
+// [TAG_MULTISLOT] stage 5.1 item 3, partial-history dense fallback by sequence coverage. A (seq 0, or 1 = reversed ids)
+// holds a target history of depth A_DEPTH and a PARTIAL draft history: the target-only restore (draft sequence + carry
+// dropped, the catch-up at positions >= A_DEPTH) or an interior hole (draft positions 40..47 removed). Beside it B, deep
+// and complete (L_RESTORED), keeps the unified pool's high-water above A's depth - `depth > n_kv` misses A there.
+// solo: the same A in a one-sequence context. b_active: B drafts + decodes between A's steps.
+static const llama_pos A_DEPTH = 96;
+
+struct partial_result {
+    std::vector<float>       logits_a;   // A's target logits
+    std::vector<llama_token> dtoks_a;    // A's draft proposals
+    std::vector<float>       dlogits_a;  // A's last draft logits per step
+    std::vector<uint8_t>     carry_a;
+    int n_sel_a    = 0;                  // QSA selection nodes over A's draft graphs: QSA_BIAS (compact bias, the
+                                         //   ctest env) + QSA_TOP_K - an n_seq 2 graph has one more TOP_K whatever the
+                                         //   route, so the router-subtracted TOP_K count of run_scenario does not apply
+    int n_graphs_a = 0;
+};
+
+static partial_result run_partial(gguf_context * meta, bool solo, bool b_active, bool reversed, bool hole) {
+    partial_result res;
+    mtp_env E;
+    init_env(E, meta, solo ? 1 : 2);
+    const llama_seq_id A = solo || !reversed ? 0 : 1;
+    const llama_seq_id B = 1 - A;
+    std::vector<float> scratch;
+    llama_pos   pos_b = 0;
+    llama_token id_b  = 0;
+    if (!solo) {
+        common_speculative_begin(E.spec, B, {});
+        for (uint32_t c = 0; pos_b < L_RESTORED; ++c) {
+            const auto toks = tokens(std::min<llama_pos>(128, L_RESTORED - pos_b), 300 + c);
+            feed(E, toks, pos_b, scratch, B);
+            pos_b += (llama_pos) toks.size();
+        }
+        id_b = (llama_token) argmax(scratch.data() + scratch.size() - N_VOCAB);
+    }
+    common_speculative_begin(E.spec, A, {});
+    feed(E, tokens(A_DEPTH, 55), 0, res.logits_a, A);
+    llama_pos pos_a = A_DEPTH;
+    if (hole) {
+        llama_memory_seq_rm(llama_get_memory(E.ctx_dft.get()), A, 40, 48);
+    } else {
+        llama_memory_seq_rm(llama_get_memory(E.ctx_dft.get()), A, -1, -1);
+        common_speculative_reset_state(E.spec, A);
+    }
+    feed(E, tokens(T_CATCHUP, 7), pos_a, res.logits_a, A);
+    pos_a += T_CATCHUP;
+    llama_token id_a = (llama_token) argmax(res.logits_a.data() + res.logits_a.size() - N_VOCAB);
+
+    for (int s = 0; s < N_STEPS; ++s) {
+        if (b_active) {
+            draft_step(E, B, pos_b, id_b, scratch);
+        }
+        const int g0 = E.census.n["FLASH_ATTN_EXT"], t0 = E.census.n["QSA_BIAS"] + E.census.n["QSA_TOP_K"];
+        draft_step(E, A, pos_a, id_a, res.logits_a, &res.dtoks_a, &res.dlogits_a);
+        res.n_graphs_a += E.census.n["FLASH_ATTN_EXT"] - g0;
+        res.n_sel_a    += E.census.n["QSA_BIAS"] + E.census.n["QSA_TOP_K"] - t0;
+    }
+    GGML_ASSERT(common_speculative_get_state(E.spec, A, res.carry_a));
+    return res;
+}
+
+static float max_abs_diff(const std::vector<float> & a, const std::vector<float> & b) {
+    if (a.size() != b.size() || a.empty()) {
+        return 1e9f;
+    }
+    float m = 0.0f;
+    for (size_t i = 0; i < a.size(); ++i) {
+        m = std::max(m, std::fabs(a[i] - b[i]));
+    }
+    return m;
+}
+
+static void partial_history(gguf_context * meta, const std::function<void(bool, const std::string &)> & check) {
+    const char * h  = getenv("LLAMA_QSA_HOMOGENEOUS");
+    const bool   on = h != nullptr && strcmp(h, "1") == 0;
+    const float  TOL = 1e-3f;
+    if (!getenv("LLAMA_QSA_COMPACT_BIAS") || atoi(getenv("LLAMA_QSA_COMPACT_BIAS")) == 0) {
+        printf("partial history: skipped (the route census needs LLAMA_QSA_COMPACT_BIAS=1, see tests/CMakeLists.txt)\n");
+        return;
+    }
+    for (bool hole : { false, true }) {
+        const partial_result solo = run_partial(meta, true, false, false, hole);
+        const std::string kind = hole ? "interior hole" : "target-only restore";
+        printf("partial %-19s solo:          %d draft graphs, QSA selection nodes %d\n", kind.c_str(), solo.n_graphs_a, solo.n_sel_a);
+        if (on) {
+            check(solo.n_graphs_a >= N_STEPS && solo.n_sel_a == 0, "partial " + kind + " solo: A's draft runs dense (incomplete history)");
+        }
+        for (int v = 0; v < 3; ++v) {
+            const bool b_active = v != 1, reversed = v == 2;
+            const partial_result m = run_partial(meta, false, b_active, reversed, hole);
+            const std::string what = "partial " + kind + (b_active ? ", B active" : ", B inactive") + (reversed ? ", reversed ids" : "");
+            printf("%-58s %d draft graphs, QSA selection nodes %d\n", (what + ":").c_str(), m.n_graphs_a, m.n_sel_a);
+            if (!on) {
+                // knob off: today's decision node for node - the pool high-water hides A's partial history (the gap)
+                check(m.n_sel_a > 0, what + ": knob off keeps today's routing (A sparse beside deep B)");
+                continue;
+            }
+            check(m.n_graphs_a >= N_STEPS && m.n_sel_a == 0, what + ": A's draft runs dense beside deep B");
+            const float dt = max_abs_diff(m.logits_a, solo.logits_a), dd = max_abs_diff(m.dlogits_a, solo.dlogits_a);
+            std::vector<float> cm((m.carry_a.size() - 4)/4), cs((solo.carry_a.size() - 4)/4);
+            std::memcpy(cm.data(), m.carry_a.data() + 4, cm.size()*4);
+            std::memcpy(cs.data(), solo.carry_a.data() + 4, cs.size()*4);
+            const float dc = max_abs_diff(cm, cs);
+            check(dt <= TOL, what + ": A target logits == solo (max |d| " + std::to_string(dt) + ")");
+            check(m.dtoks_a == solo.dtoks_a && dd <= TOL, what + ": A draft proposals + logits == solo (max |d| " + std::to_string(dd) + ")");
+            check(dc <= TOL, what + ": A carry == solo (max |d| " + std::to_string(dc) + ")");
+        }
+    }
 }
 
 // the unified pool layout straight into the census: A (seq 0) holds cells 0..T-1 at positions L..L+T-1 (past the
@@ -492,6 +612,8 @@ int main(int argc, char ** argv) {
     printf("restore:    %d drafted tokens, %d draft graphs, QSA selection nodes in them %d\n", rr.n_drafted, rr.n_graphs, rr.n_sel);
     check(rr.n_drafted > 0 && rr.n_graphs >= N_STEPS, "restore: the draft steps ran (no abort)");
     check(rr.n_sel == 0,     "restore: the draft runs dense (depth > the draft's cell window)");
+
+    partial_history(meta.get(), check); // [TAG_MULTISLOT]
 
     const run_result rn = run_scenario(meta.get(), false);
     printf("no restore: %d drafted tokens, %d draft graphs, QSA selection nodes in them %d\n", rn.n_drafted, rn.n_graphs, rn.n_sel);

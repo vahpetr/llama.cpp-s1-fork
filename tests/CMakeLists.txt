@@ -234,6 +234,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-mtp-qsa-restore PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
     llama_test(test-mtp-qsa-restore NAME test-mtp-qsa-restore-phase LABEL mtp)
     set_tests_properties(test-mtp-qsa-restore-phase PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_MTP_QSA_PHASE=1")
+    # [TAG_MULTISLOT] stage 5.1 item 3: LLAMA_QSA_HOMOGENEOUS=1 routes a partial draft history dense beside a deep B
+    # (vs the solo restore), graph cache off and K=8 + CHECK=3 (the stale-input oracle)
+    llama_test(test-mtp-qsa-restore NAME test-mtp-qsa-restore-homogeneous LABEL mtp)
+    set_tests_properties(test-mtp-qsa-restore-homogeneous PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_HOMOGENEOUS=1")
+    llama_test(test-mtp-qsa-restore NAME test-mtp-qsa-restore-homogeneous-gc8 LABEL mtp)
+    set_tests_properties(test-mtp-qsa-restore-homogeneous-gc8 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_HOMOGENEOUS=1;LLAMA_GRAPH_CACHE=8;LLAMA_GRAPH_CACHE_CHECK=3")
     llama_build_and_test(test-spec-draft-policy.cpp LABEL mtp) # [TAG_SPEC_DRAFT_POLICY] tput draft length rule + cooldown (v51)
     # [TAG_GRAPH_CACHE] LLAMA_GRAPH_CACHE off vs K=8 vs K=8 + CHECK: logits / drafts / [qsa-ids] identical, regrow invalidates
     llama_build(test-graph-cache.cpp)

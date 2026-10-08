@@ -1032,6 +1032,7 @@ bool llama_memory_hybrid_idx_context::next() {
     ++i_cur;
 
     qsa_plan.valid = false;
+    hist_valid     = false;
 
     return llama_memory_hybrid_context::next();
 }
@@ -1082,8 +1083,55 @@ bool llama_memory_hybrid_idx_context::apply() {
     }
 
     qsa_plan.valid = false;
+    hist_valid     = false;
 
     return res;
+}
+
+bool llama_memory_hybrid_idx_context::qsa_history_complete(const llama_ubatch & ubatch) const {
+    if (full || mem == nullptr || mem->get_mem_idx() == nullptr || ubatch.n_tokens == 0) {
+        return true;
+    }
+    if (hist_valid) {
+        return hist_complete;
+    }
+
+    // per sequence of the ubatch: its depth = max pos + 1 over its rows (the sequential row of ubatch.pos)
+    std::vector<std::pair<llama_seq_id, llama_pos>> seqs;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            const llama_seq_id s = ubatch.seq_id[i][j];
+            auto it = std::find_if(seqs.begin(), seqs.end(), [s](const auto & e) { return e.first == s; });
+            if (it == seqs.end()) {
+                seqs.emplace_back(s, ubatch.pos[i] + 1);
+            } else {
+                it->second = std::max(it->second, ubatch.pos[i] + 1);
+            }
+        }
+    }
+
+    hist_complete = true;
+    for (const auto & [s, depth] : seqs) {
+        const llama_kv_cells & cells = mem->get_mem_idx()->get_cells(s);
+        const llama_pos p_min = cells.seq_pos_min(s);
+        const llama_pos p_max = cells.seq_pos_max(s);
+        const uint32_t  n_pos = cells.seq_pos_count(s);
+        if (p_min == 0 && (int64_t) n_pos == (int64_t) p_max + 1 && p_max >= depth - 1) {
+            continue;
+        }
+        hist_complete = false;
+        // the proof: the first 16 partial ubatches of the process, then every 256th
+        static std::atomic<uint64_t> n_partial{0};
+        const uint64_t k = n_partial.fetch_add(1);
+        if (k < 16 || k % 256 == 0) {
+            LLAMA_LOG_INFO("[qsa-history] ctx=%s seq=%d depth=%d positions=%u min=%d max=%d complete=0 route=dense reason=partial (#%" PRIu64 ")\n",
+                    mem->is_recr_none() ? "dft" : "tgt", (int) s, (int) depth, n_pos, (int) p_min, (int) p_max, k + 1);
+        }
+        break;
+    }
+    hist_valid = true;
+
+    return hist_complete;
 }
 
 const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {

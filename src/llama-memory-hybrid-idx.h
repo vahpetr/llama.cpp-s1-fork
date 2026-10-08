@@ -459,6 +459,9 @@ public:
     // the cache stream a sequence lives in
     uint32_t qsa_stream_of(llama_seq_id seq_id) const;
 
+    // [TAG_MULTISLOT] the MTP draft memory (recr_none): the [qsa-history] proof's ctx label
+    bool is_recr_none() const { return recr_none; }
+
     // [TAG_QSA_COMPACT_BIAS] LLAMA_QSA_COMPACT_BIAS=1 (read at creation, honoured only with an indexer and
     // n_seq_max <= 32): the per-block bias travels as two small tables instead of the [n_blocks, n_tps] plane
     bool qsa_compact_bias() const { return qsa_compact; }
@@ -562,6 +565,13 @@ public:
     // a full context (init_full): the reserve graphs, whose ubatch carries no real positions
     bool is_full() const { return full; }
 
+    // [TAG_MULTISLOT] stage 5.1 item 3: true when every sequence of the ubatch has a complete indexer history - its
+    // positions 0..depth-1 all present (min 0, distinct count = max + 1, max >= depth - 1, depth = its max pos + 1 in
+    // this ubatch). Sequence-owned counts, never the pool high-water. Evaluated after apply() (the ubatch's own cells
+    // are in), cached per ubatch; the first partial sequence is logged as [qsa-history]. A full (reserve) context or
+    // no indexer: true (the reserve keeps today's worst case and inspects no fabricated metadata).
+    bool qsa_history_complete(const llama_ubatch & ubatch) const;
+
     // plan this ubatch's store update: the block census, the stamps, the dirty list and the remap.
     // Returns the per-stream capacity of the dirty list, the shape the graph must be built with.
     // A full (reserve) context has no census: it returns the cold-rebuild worst case, n_blocks.
@@ -619,6 +629,10 @@ private:
     using qsa_plan_t = llama_qsa_plan;
 
     mutable qsa_plan_t qsa_plan;
+
+    // [TAG_MULTISLOT] qsa_history_complete() of the current ubatch (reset by apply / next)
+    mutable bool hist_valid    = false;
+    mutable bool hist_complete = true;
 
     // a full context builds the reserve graphs: no ubatch, no census
     const bool full = false;

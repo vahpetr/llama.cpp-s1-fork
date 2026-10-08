@@ -537,6 +537,15 @@ public:
         return seq_pos[seq_id].begin()->first;
     }
 
+    // [TAG_MULTISLOT] the number of distinct positions of sequence seq_id currently present (0 if absent): a complete
+    // history 0..max has max + 1 of them (the [qsa-history] sequence-coverage query; O(1), sequence-owned)
+    uint32_t seq_pos_count(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return (uint32_t) seq_pos[seq_id].size();
+    }
+
     // the maximum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
     llama_pos seq_pos_max(llama_seq_id seq_id) const {
