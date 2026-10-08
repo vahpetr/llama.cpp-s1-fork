@@ -669,6 +669,12 @@ llama_context::llama_context(
         LLAMA_LOG_INFO("%s: qsa_ratio             = %d%s\n", __func__, cparams.qsa_ratio,
                 cparams.qsa_ratio < 0  ? " (from the GGUF)" :
                 cparams.qsa_ratio == 0 ? " (forced dense)"  : " (forced sparse)");
+        // [TAG_MULTISLOT] round 2: the complete-history dense fallback, once per context
+        const char * reason = nullptr;
+        const bool   hd     = llama_qsa_history_dense(&reason);
+        const char * hom    = getenv("LLAMA_QSA_HOMOGENEOUS");
+        LLAMA_LOG_INFO("%s: qsa_history_dense = %s (%s)%s\n", __func__, hd ? "on" : "off", reason,
+                hom != nullptr && strcmp(hom, "1") == 0 && !hd ? "; coverage check still on: LLAMA_QSA_HOMOGENEOUS=1" : "");
     }
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
@@ -2860,6 +2866,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
+    }
+
+    // [TAG_MULTISLOT] round 2: an embedding batch of an M-RoPE indexer model (an mtmd image chunk) switches the default
+    // complete-history fallback off for the process (llama_qsa_history_dense)
+    if (batch_inp.token == nullptr && batch_inp.embd != nullptr && model.hparams.n_pos_per_embd() > 1 &&
+        model.hparams.indexer_head_size > 0) {
+        llama_qsa_note_mm_positions();
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();

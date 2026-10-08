@@ -50,6 +50,16 @@ int  llama_qsa_census_inc_parse(const char * s);
 // / `qsa_census = full (...)` at WARN (the memory calls it when it creates the pooled-key cache, so the line is in the
 // load log). CHECK is honoured only with INC on.
 bool llama_qsa_census_inc();
+
+// [TAG_MULTISLOT] round 2 (astra r1 Major 2): the complete-history dense fallback of the QSA routing (R85 "dense until
+// a full recompute") for TEXT sequences, independent of LLAMA_QSA_HOMOGENEOUS. LLAMA_QSA_HISTORY_DENSE (read once):
+// 1 = on, 0 = off (today's routing bit for bit), unset / other = the default: on until this process has decoded an
+// M-RoPE image (an embedding batch of a model with n_pos_per_embd > 1 - llama_qsa_note_mm_positions, sticky), then
+// off - an image's repeated + skipped sequential positions read as an incomplete history and would route every image
+// conversation dense. qwen4exp_qsa_dense takes the coverage term when this or LLAMA_QSA_HOMOGENEOUS=1 holds.
+// `reason` (optional) receives a static string for the start-log proof line.
+bool llama_qsa_history_dense(const char ** reason = nullptr);
+void llama_qsa_note_mm_positions();
 bool llama_qsa_census_check();
 
 //

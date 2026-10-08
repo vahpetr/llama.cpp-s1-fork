@@ -240,11 +240,19 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-mtp-qsa-restore-homogeneous PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_HOMOGENEOUS=1")
     llama_test(test-mtp-qsa-restore NAME test-mtp-qsa-restore-homogeneous-gc8 LABEL mtp)
     set_tests_properties(test-mtp-qsa-restore-homogeneous-gc8 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_HOMOGENEOUS=1;LLAMA_GRAPH_CACHE=8;LLAMA_GRAPH_CACHE_CHECK=3")
+    # [TAG_MULTISLOT] round 2: LLAMA_QSA_HISTORY_DENSE (default on: the plain ctests above run the fallback) - =0 is the
+    # a25b663c1 routing (knob-off assertions + the transition / knob-identity children); gc8 = previous-graph vs K=8
+    llama_test(test-mtp-qsa-restore NAME test-mtp-qsa-restore-hd0 LABEL mtp)
+    set_tests_properties(test-mtp-qsa-restore-hd0 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_HISTORY_DENSE=0")
+    llama_test(test-mtp-qsa-restore NAME test-mtp-qsa-restore-gc8 LABEL mtp)
+    set_tests_properties(test-mtp-qsa-restore-gc8 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_GRAPH_CACHE=8;LLAMA_GRAPH_CACHE_CHECK=3")
     llama_build_and_test(test-spec-draft-policy.cpp LABEL mtp) # [TAG_SPEC_DRAFT_POLICY] tput draft length rule + cooldown (v51)
     # [TAG_GRAPH_CACHE] LLAMA_GRAPH_CACHE off vs K=8 vs K=8 + CHECK: logits / drafts / [qsa-ids] identical, regrow invalidates
     llama_build(test-graph-cache.cpp)
     llama_test(test-graph-cache NAME test-graph-cache LABEL mtp ARGS ${CMAKE_CURRENT_BINARY_DIR})
     set_tests_properties(test-graph-cache PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_DUMP_IDS=1")
+    llama_test(test-graph-cache NAME test-graph-cache-hd0 LABEL mtp ARGS ${CMAKE_BINARY_DIR}) # [TAG_MULTISLOT] round 2: knob off (own stderr dir)
+    set_tests_properties(test-graph-cache-hd0 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_DUMP_IDS=1;LLAMA_QSA_HISTORY_DENSE=0")
     llama_test(test-graph-cache NAME test-graph-cache-mem LABEL mtp ARGS --mem) # [TAG_GRAPH_CACHE] memory per cached graph at the brain node budget
     set_tests_properties(test-graph-cache-mem PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
     llama_test(test-graph-cache NAME test-graph-cache-split LABEL mtp ARGS --split ${CMAKE_CURRENT_BINARY_DIR}) # [TAG_GRAPH_CACHE] split-only inputs (FAKE + CPU)

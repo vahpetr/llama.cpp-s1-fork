@@ -582,6 +582,10 @@ static int64_t qwen4exp_qsa_depth(const llama_memory_hybrid_idx_context * mctx_h
 // history (llama_memory_hybrid_idx_context::qsa_history_complete: min 0, no hole, up to its depth; [qsa-history]).
 // Off (unset / not exactly 1): today's decision bit for bit - an M-RoPE image (repeated + skipped positions) would
 // read as partial and route every image conversation of the hands (5 slots, mmproj) dense.
+// [TAG_MULTISLOT] round 2 (astra r1 Major 2): the same coverage term also under llama_qsa_history_dense()
+// (LLAMA_QSA_HISTORY_DENSE, default on until an M-RoPE image is decoded): a partial draft history (target-only restore,
+// rewind hole) at depth <= n_kv ran sparse over a nonexhaustive selection - R85 says dense until a full recompute.
+// LLAMA_QSA_HISTORY_DENSE=0 without LLAMA_QSA_HOMOGENEOUS=1: the a25b663c1 decision bit for bit.
 static bool qwen4exp_qsa_homogeneous() {
     static const bool on = [] {
         const char * s = getenv("LLAMA_QSA_HOMOGENEOUS");
@@ -596,7 +600,7 @@ static bool qwen4exp_qsa_dense(const llama_memory_hybrid_idx_context * mctx_hyb,
     const int64_t depth = qwen4exp_qsa_depth(mctx_hyb, ubatch, n_kv_idx);
     return depth > n_kv_idx
         || (qwen4exp_qsa_bypass_exhaustive() && width == n_kv_idx) || depth < qwen4exp_qsa_min_kv()
-        || (qwen4exp_qsa_homogeneous() && !mctx_hyb->qsa_history_complete(ubatch));
+        || ((qwen4exp_qsa_homogeneous() || llama_qsa_history_dense()) && !mctx_hyb->qsa_history_complete(ubatch));
 }
 
 // [TAG_MTP_QSA] the selection budget (indexer_top_k) of layer il. TEST ONLY: LLAMA_MTP_QSA_TOP_K=N > 0 replaces it for

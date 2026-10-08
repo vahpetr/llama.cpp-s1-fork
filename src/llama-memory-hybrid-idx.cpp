@@ -150,6 +150,36 @@ bool llama_qsa_census_inc() {
     return enabled;
 }
 
+// [TAG_MULTISLOT] round 2: see the header
+static std::atomic<bool> g_qsa_mm_pos_seen{false};
+
+void llama_qsa_note_mm_positions() {
+    if (!g_qsa_mm_pos_seen.exchange(true)) {
+        const char * reason = nullptr;
+        const bool   on     = llama_qsa_history_dense(&reason);
+        LLAMA_LOG_INFO("qsa_history_dense = %s (%s)\n", on ? "on" : "off", reason);
+    }
+}
+
+bool llama_qsa_history_dense(const char ** reason) {
+    static const int env = [] {
+        const char * s = getenv("LLAMA_QSA_HISTORY_DENSE");
+        return s == nullptr ? -1 : strcmp(s, "1") == 0 ? 1 : strcmp(s, "0") == 0 ? 0 : -1;
+    }();
+    if (env >= 0) {
+        if (reason) {
+            *reason = env ? "LLAMA_QSA_HISTORY_DENSE=1" : "LLAMA_QSA_HISTORY_DENSE=0";
+        }
+        return env == 1;
+    }
+    const bool mm = g_qsa_mm_pos_seen.load(std::memory_order_relaxed);
+    if (reason) {
+        *reason = mm ? "default; M-RoPE image positions decoded in this process, sticky off"
+                     : "default; no M-RoPE image positions decoded";
+    }
+    return !mm;
+}
+
 bool llama_qsa_census_check() {
     return llama_qsa_census_inc() && llama_qsa_census_check_env();
 }
