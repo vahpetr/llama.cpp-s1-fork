@@ -4058,6 +4058,236 @@ private:
         }
     }
 
+    // [TAG_SLOT_FILE_CKPT] (upstream 033df86b6, #26004) the context checkpoints are appended to the slot save file, after
+    //   the llama state payload: they cannot be recreated from the final state alone (a recurrent state cannot be
+    //   rewound). Fork layout (version 2): magic, version, desc_tgt, desc_dft (blobs: server_cache_state_desc of the
+    //   target side / of the draft side + carry schema), ident (blob: slot_file_ident(), the disk-cache namespace
+    //   identity), count, count x {n_tokens, pos_min, pos_max, flags_tgt, flags_dft, tgt, dft, spec}. The flags are the
+    //   ones each blob was saved with (common_prompt_checkpoint); the descriptors gate the restore like the RAM cache's
+    //   guard: another target descriptor drops the appendix, another draft descriptor drops the draft blobs (all
+    //   checkpoints when the drafter's carry is required, review m1). The identity gates their reuse beyond RAM: only an
+    //   equal, non-empty one leaves them publishable, otherwise foreign_unverified (review M2). Version 1 (upstream, no
+    //   flags / descriptors) still reads: blobs saved PARTIAL_ONLY, marked foreign_unverified (usable from RAM, never
+    //   written into own storage). Restored checkpoints carry id_task = SLOT_FILE_CKPT_ID_TASK (their origin)
+    static constexpr uint32_t SLOT_CKPT_MAGIC      = 0x504b4353; // "SCKP"
+    static constexpr uint32_t SLOT_CKPT_VERSION_V1 = 1;          // upstream
+    static constexpr uint32_t SLOT_CKPT_VERSION    = 2;          // fork: + descriptors + identity + per-blob flags
+    static constexpr int      SLOT_FILE_CKPT_ID_TASK = -2;       // the origin mark of a checkpoint read from a slot file
+
+    static bool ckpt_read(std::ifstream & ifs, void * dst, size_t size, size_t & n_read) {
+        if (!ifs.read((char *) dst, size)) {
+            return false;
+        }
+        n_read += size;
+        return true;
+    }
+
+    static bool ckpt_read_buf(std::ifstream & ifs, std::vector<uint8_t> & buf, size_t n_avail, size_t & n_read) {
+        uint64_t n = 0;
+        // check the size against the bytes left in the file before allocating, the size field may be corrupted
+        if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > n_avail - n_read) {
+            return false;
+        }
+        buf.resize(n);
+        return n == 0 || ckpt_read(ifs, buf.data(), n, n_read);
+    }
+
+    static void ckpt_write(std::ofstream & ofs, const void * src, size_t size, size_t & n_written) {
+        ofs.write((const char *) src, size);
+        n_written += size;
+    }
+
+    static void ckpt_write_buf(std::ofstream & ofs, const std::vector<uint8_t> & buf, size_t & n_written) {
+        const uint64_t n = buf.size();
+        ckpt_write(ofs, &n, sizeof(n), n_written);
+        if (n > 0) {
+            ckpt_write(ofs, buf.data(), n, n_written);
+        }
+    }
+
+    static std::vector<uint8_t> slot_file_bytes(const std::string & s) {
+        return std::vector<uint8_t>(s.begin(), s.end());
+    }
+
+    // [TAG_SLOT_FILE_CKPT] the state descriptors of the target side and of the draft side (+ the carry schema)
+    std::string slot_file_desc_tgt() const {
+        return server_cache_state_desc(ctx_tgt, nullptr, "");
+    }
+
+    std::string slot_file_desc_dft() const {
+        return server_cache_state_desc(nullptr, ctx_dft, spec ? common_speculative_state_schema(spec.get()) : std::string());
+    }
+
+    // [TAG_SLOT_FILE_CKPT] (review M2) the disk-cache namespace identity minus the state layout (in the descriptors):
+    //   model files (sampled content + size), the numerics measurement, the semantic env and the parsed-param digest -
+    //   the parts of cache_compat_key(). Empty without a disk cache (nothing is published then) or without a
+    //   measurement: an empty identity never matches
+    std::string slot_file_ident() const {
+        if (!disk_cache || cache_meas.empty()) {
+            return std::string();
+        }
+        return "model=" + server_disk_cache_model_identity(params_base) + "|meas=" + server_cache_measure_component(cache_meas) +
+               "|env=" + server_cache_env_digest(server_cache_environ()) + "|param=" +
+               server_cache_param_digest(params_base, ctx_tgt, ctx_dft);
+    }
+
+    // returns false if the appendix could not be written completely
+    bool save_slot_checkpoints(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
+        n_written = 0;
+        // a device snapshot is no byte stream, an adopted pre-format-8 one has no full-descriptor proof: not written
+        std::vector<const common_prompt_checkpoint *> ckpts;
+        for (const auto & cur : slot.prompt.checkpoints) {
+            if (((cur.flags_tgt | cur.flags_dft) & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) || cur.foreign_unverified || cur.data_tgt.empty()) {
+                continue;
+            }
+            ckpts.push_back(&cur);
+        }
+        if (ckpts.empty()) {
+            return true;
+        }
+        std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
+        if (!ofs) {
+            SLT_WRN(slot, "failed to append context checkpoints to '%s'\n", filepath.c_str());
+            return false;
+        }
+        const uint32_t magic   = SLOT_CKPT_MAGIC;
+        const uint32_t version = SLOT_CKPT_VERSION;
+        const uint32_t count   = (uint32_t) ckpts.size();
+        ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
+        ckpt_write(ofs, &version, sizeof(version), n_written);
+        ckpt_write_buf(ofs, slot_file_bytes(slot_file_desc_tgt()), n_written);
+        ckpt_write_buf(ofs, slot_file_bytes(slot_file_desc_dft()), n_written);
+        ckpt_write_buf(ofs, slot_file_bytes(slot_file_ident()),    n_written);
+        ckpt_write(ofs, &count,   sizeof(count),   n_written);
+        for (const auto * cur : ckpts) {
+            const uint32_t flags_tgt = cur->flags_tgt;
+            const uint32_t flags_dft = cur->flags_dft;
+            ckpt_write(ofs, &cur->n_tokens, sizeof(cur->n_tokens), n_written);
+            ckpt_write(ofs, &cur->pos_min,  sizeof(cur->pos_min),  n_written);
+            ckpt_write(ofs, &cur->pos_max,  sizeof(cur->pos_max),  n_written);
+            ckpt_write(ofs, &flags_tgt,     sizeof(flags_tgt),     n_written);
+            ckpt_write(ofs, &flags_dft,     sizeof(flags_dft),     n_written);
+            ckpt_write_buf(ofs, cur->data_tgt,  n_written);
+            ckpt_write_buf(ofs, cur->data_dft,  n_written);
+            ckpt_write_buf(ofs, cur->data_spec, n_written);
+        }
+        ofs.flush();
+        if (!ofs) {
+            SLT_WRN(slot, "failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
+            return false;
+        }
+        SLT_INF(slot, "appended %u context checkpoint(s) (%.3f MiB) to '%s'\n",
+                count, (float) n_written / 1024 / 1024, filepath.c_str());
+        return true;
+    }
+
+    // returns the number of bytes consumed (the appendix parsed completely, its checkpoints kept or dropped), 0 if
+    //   there is no well-formed appendix at offset
+    size_t load_slot_checkpoints(const std::string & filepath, size_t offset, server_slot & slot) const {
+        std::ifstream ifs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
+        const size_t file_size = ifs ? (size_t) ifs.tellg() : 0;
+        if (!ifs || file_size < offset || !ifs.seekg(offset)) {
+            return 0;
+        }
+        const size_t n_avail = file_size - offset; // bytes after the llama state payload
+        size_t n_read = 0;
+        uint32_t magic   = 0;
+        uint32_t version = 0;
+        uint32_t count   = 0;
+        if (!ckpt_read(ifs, &magic, sizeof(magic), n_read) || magic != SLOT_CKPT_MAGIC) {
+            return 0;
+        }
+        if (!ckpt_read(ifs, &version, sizeof(version), n_read) ||
+            (version != SLOT_CKPT_VERSION && version != SLOT_CKPT_VERSION_V1)) {
+            SLT_WRN(slot, "invalid context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
+            return 0;
+        }
+        const bool v1 = version == SLOT_CKPT_VERSION_V1;
+        std::vector<uint8_t> desc_tgt;
+        std::vector<uint8_t> desc_dft;
+        std::vector<uint8_t> ident;
+        if ((!v1 && (!ckpt_read_buf(ifs, desc_tgt, n_avail, n_read) || !ckpt_read_buf(ifs, desc_dft, n_avail, n_read) ||
+                     !ckpt_read_buf(ifs, ident, n_avail, n_read))) ||
+            !ckpt_read(ifs, &count, sizeof(count), n_read)) {
+            SLT_WRN(slot, "invalid context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
+            return 0;
+        }
+        // (review M2) a layout match alone is no proof of the same model / numerics: only the namespace identity is
+        const std::string ident_own = slot_file_ident();
+        const bool foreign = v1 || ident_own.empty() || std::string(ident.begin(), ident.end()) != ident_own;
+        std::list<common_prompt_checkpoint> checkpoints;
+        for (uint32_t i = 0; i < count; ++i) {
+            common_prompt_checkpoint cur;
+            cur.id_task = SLOT_FILE_CKPT_ID_TASK; // not created by a task - read from a slot file (review m1: its origin)
+            uint32_t flags_tgt = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY; // v1: the upstream server saves them PARTIAL_ONLY
+            uint32_t flags_dft = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            if (!ckpt_read(ifs, &cur.n_tokens, sizeof(cur.n_tokens), n_read) ||
+                !ckpt_read(ifs, &cur.pos_min,  sizeof(cur.pos_min),  n_read) ||
+                !ckpt_read(ifs, &cur.pos_max,  sizeof(cur.pos_max),  n_read) ||
+                (!v1 && !ckpt_read(ifs, &flags_tgt, sizeof(flags_tgt), n_read)) ||
+                (!v1 && !ckpt_read(ifs, &flags_dft, sizeof(flags_dft), n_read)) ||
+                !ckpt_read_buf(ifs, cur.data_tgt,  n_avail, n_read) ||
+                !ckpt_read_buf(ifs, cur.data_dft,  n_avail, n_read) ||
+                !ckpt_read_buf(ifs, cur.data_spec, n_avail, n_read)) {
+                SLT_WRN(slot, "truncated context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
+                return 0;
+            }
+            // a saved checkpoint always holds a target state - an empty blob would roll back without restoring
+            //   anything; a device snapshot is never a file stream
+            if (cur.data_tgt.empty() || ((flags_tgt | flags_dft) & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+                SLT_WRN(slot, "invalid context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
+                return 0;
+            }
+            cur.flags_tgt = flags_tgt;
+            cur.flags_dft = cur.data_dft.empty() ? 0 : flags_dft;
+            cur.foreign_unverified = foreign; // [TAG_CACHE_COMPAT2] no identity proof: RAM use only
+            // a checkpoint must lie inside the restored prompt (its key is a prefix of these tokens)
+            if (cur.n_tokens <= 0 || cur.n_tokens > (int64_t) slot.prompt.tokens.size()) {
+                continue;
+            }
+            checkpoints.push_back(std::move(cur));
+            if (checkpoints.size() > (size_t) std::max(0, params_base.n_ctx_checkpoints)) {
+                checkpoints.pop_front();
+            }
+        }
+        if (!v1 && std::string(desc_tgt.begin(), desc_tgt.end()) != slot_file_desc_tgt()) {
+            SLT_WRN(slot, "%zu context checkpoint(s) in '%s' were saved by another target context - dropped\n",
+                    checkpoints.size(), filepath.c_str());
+            return n_read;
+        }
+        // (review m1) without its draft blobs a checkpoint has no carry either (clear_dft): with a drafter whose carry
+        //   is required (MTP, eagle3 boundary) it could not restore later - drop such checkpoints instead
+        const bool carry_required = spec && common_speculative_n_stateful(spec.get()) > 0;
+        auto drop_draft_side = [&](const char * why) {
+            if (carry_required) {
+                SLT_WRN(slot, "%zu context checkpoint(s) in '%s': %s and the drafter's carry is required - dropped\n",
+                        checkpoints.size(), filepath.c_str(), why);
+                checkpoints.clear();
+                return;
+            }
+            SLT_WRN(slot, "draft data of the context checkpoints in '%s': %s - dropped\n", filepath.c_str(), why);
+            for (auto & cur : checkpoints) {
+                cur.clear_dft();
+            }
+        };
+        if (!v1 && std::string(desc_dft.begin(), desc_dft.end()) != slot_file_desc_dft()) {
+            drop_draft_side("saved by another draft context");
+        }
+        // the draft blobs are not covered by the payload checks - test-load one, drop the draft data if it does not fit
+        //   (the draft sequence is reset here; the draft-state appendix, when present, is loaded after this)
+        if (ctx_dft != nullptr && !checkpoints.empty() && !checkpoints.back().data_dft.empty()) {
+            const bool ok = checkpoints.back().load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+            if (!ok) {
+                drop_draft_side("the draft data does not match the draft context");
+            }
+        }
+        slot.prompt.checkpoints = std::move(checkpoints);
+        SLT_INF(slot, "restored %zu context checkpoint(s) from '%s'%s\n", slot.prompt.checkpoints.size(), filepath.c_str(),
+                foreign ? " (no namespace-identity proof: RAM use only)" : "");
+        return n_read;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -4296,6 +4526,12 @@ private:
                         break;
                     }
 
+                    size_t nwrite_ckpt = 0;
+                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
+                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -4305,7 +4541,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite;
+                    res->n_bytes  = nwrite + nwrite_ckpt;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -4386,6 +4622,9 @@ private:
                         break;
                     }
 
+                    // nread is the end offset of the llama state payload within the file
+                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
+
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -4395,7 +4634,7 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread;
+                    res->n_bytes  = nread + nread_ckpt;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -5936,7 +6175,11 @@ private:
                                         //   destination in both contexts, drop that checkpoint (from disk too when it came from
                                         //   there) and re-process the prompt
                                         const bool from_disk = disk_ck != nullptr && &*it == disk_ck;
-                                        if (disk_cache && !from_disk) {
+                                        if (disk_cache && !from_disk && it->id_task == SLOT_FILE_CKPT_ID_TASK) {
+                                            // [TAG_SLOT_FILE_CKPT] (review m1) its bytes came from a /slots file: a stored deep
+                                            //   checkpoint under the same prefix key is another, valid state - keep it
+                                            disk_ck_key.clear();
+                                        } else if (disk_cache && !from_disk) {
                                             // an in-RAM checkpoint that came with a loaded entry lives in the checkpoint
                                             //   store under its prefix key: drop it there too
                                             try {
