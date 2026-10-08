@@ -1263,9 +1263,14 @@ void llama_qsa_census_full(
 
     const bool one_seq = n_seq_present <= 1;
 
-    // a cell no block covers needs its own -inf, which a per-block bias cannot carry
-    // every cache path keeps the position below the cell window, so this stays false
+    // [TAG_QSA_WINDOW_MISALIGNED] a cell past the cell window (block index >= n_blocks): no block can cover it.
+    // A complete history keeps every position below the window, so this stays false; a memory without its prefix
+    // (the MTP draft after a legacy /slots restore or a dropped draft, its catch-up rows written at positions >= the
+    // restored depth) has such cells, and in a unified pool they sit next to other sequences' cells. They are
+    // excluded from selection below (routed to an id both bias fills score -inf), never pooled.
     bool oor = false;
+
+    cs.oor_seqs.clear();
 
     bool dup = false;
 
@@ -1377,8 +1382,6 @@ void llama_qsa_census_full(
 
         group_cells();
     }
-
-    GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
 
     int32_t n_bid = 0;
 
@@ -1506,10 +1509,54 @@ void llama_qsa_census_full(
         }
     }
 
+    // [TAG_QSA_WINDOW_MISALIGNED] the out-of-window cells (block index >= n_blocks; only reached where this census
+    // used to abort with "qsa: cell position runs past the cell window", so every census without such a cell is
+    // unchanged). Under the per-block bias they are excluded from selection: routed to the second unused id n_bid + 1,
+    // which both bias fills (qsa_fill_bias, the compact tables) score -inf for every query - after the fragment and the
+    // carrier routing above, so neither can boost them. A query of a FOREIGN sequence never sees them anyway (the
+    // attention mask the caller adds is -inf for foreign cells); a query of the OWNING sequence has depth > n_kv and
+    // runs the dense layer (qwen4exp_qsa_dense), which the fills assert (cs.oor_seqs). Without a second unused id
+    // (n_bid + 1 == n_blocks) the cells keep the spare id: for a foreign query the attention mask drops them, exactly
+    // as it drops the empty / foreign cells that already share that id ([TAG_QSA_TAIL_FIX]); an owning query is the
+    // asserted impossible case either way.
+    if (oor) {
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (cells.is_empty(j) || blk_of[j] >= 0) {
+                continue;
+            }
+
+            const int64_t idx = (ranked ? rank[j] : cells.pos_get(j)) - phase;
+
+            if (idx < 0 || idx/r < n_blocks) {
+                continue;
+            }
+
+            if (blk_bias && n_bid + 1 < n_blocks) {
+                cur_cell_blk[j] = n_bid + 1;
+            }
+
+            const auto & set = cells.seq_set((uint32_t) j);
+            for (int32_t sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
+                if (set.test(sq) && std::find(cs.oor_seqs.begin(), cs.oor_seqs.end(), sq) == cs.oor_seqs.end()) {
+                    cs.oor_seqs.push_back(sq);
+                }
+            }
+        }
+    }
+
     if (flags) {
         flags->one_seq = one_seq;
         flags->dup     = dup;
         flags->oor     = oor;
+    }
+}
+
+// [TAG_QSA_WINDOW_MISALIGNED] a sparse query of a sequence that owns an out-of-window cell would lose that cell (or,
+// without a second unused id, see it boosted outside its block): impossible, its depth is past the window
+static void qsa_assert_not_oor_seq(const llama_qsa_census_stream & cs, llama_seq_id seq_id) {
+    if (!cs.oor_seqs.empty()) {
+        GGML_ASSERT(std::find(cs.oor_seqs.begin(), cs.oor_seqs.end(), (int32_t) seq_id) == cs.oor_seqs.end() &&
+                    "qsa: sparse query of a sequence with a cell past the cell window (the layer must run dense)");
     }
 }
 
@@ -1617,6 +1664,10 @@ void llama_memory_hybrid_idx_context::qsa_fill_bias(
     for (int64_t ii = 0; ii < n_tps; ++ii) {
         const int64_t      i      = s*n_tps + ii;
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+        if (blk_bias) {
+            qsa_assert_not_oor_seq(cs, seq_id);
+        }
 
         const int64_t q = qsa_query_pos(ubatch, i, ranked, order, cells, phase);
 
@@ -1756,6 +1807,8 @@ void llama_memory_hybrid_idx_context::qsa_fill_bias_compact(
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
         GGML_ASSERT(seq_id >= 0 && seq_id < 32);
+
+        qsa_assert_not_oor_seq(cs, seq_id);
 
         const int64_t tail = qsa_tail_start(qsa_query_pos(ubatch, i, cs.ranked, cs.order, cells, mem->qsa_phase()), r);
 
@@ -2287,7 +2340,7 @@ static int llama_qsa_census_inc(llama_qsa_pooled_store & st, uint32_t g, const l
 
         if (pb < lo_pb || pb >= n_blocks) {
             // below the region: a mutator left no mark (cannot happen with the marks in place);
-            // past the window: oor, the full census handles (and asserts) it
+            // past the window: oor, the full census handles (excludes) it [TAG_QSA_WINDOW_MISALIGNED]
             return LLAMA_QSA_CEN_FB_SHAPE;
         }
 

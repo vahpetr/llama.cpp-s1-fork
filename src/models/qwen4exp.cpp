@@ -571,9 +571,10 @@ static int64_t qwen4exp_qsa_depth(const llama_memory_hybrid_idx_context * mctx_h
 // shared by build_layer_attn and llm_graph_input_qsa::can_reuse
 // [TAG_QSA_WINDOW_MISALIGNED] or the sequence depth past the indexer cell window: positions beyond n_kv cells, which
 // only a memory without its prefix has (the MTP draft after a legacy /slots restore or a refused draft rewind drops
-// its sequence, and the catch-up writes positions >= the restored depth into cells 0..T). The census cannot block
-// such cells (pb >= n_blocks -> GGML_ASSERT oor in llama_qsa_census_full); the dense attention over the partial
-// window is what LLAMA_MTP_QSA=0 runs there. A complete history keeps one cell per position 0..depth-1, so
+// its sequence, and the catch-up writes positions >= the restored depth into cells 0..T). No block can cover such a
+// cell (pb >= n_blocks); the census excludes it (routed to an id scored -inf, which also keeps another sequence of a
+// unified pool safe) and asserts that no sparse query belongs to its sequence - this term: the dense attention over
+// the partial window is what LLAMA_MTP_QSA=0 runs there. A complete history keeps one cell per position 0..depth-1, so
 // n_kv >= depth (the reserve: qwen4exp_qsa_depth returns n_kv) and this term never changes a working graph.
 static bool qwen4exp_qsa_dense(int64_t n_kv_idx, int64_t width, int64_t depth) {
     return depth > n_kv_idx

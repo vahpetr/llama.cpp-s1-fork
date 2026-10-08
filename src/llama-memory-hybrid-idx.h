@@ -78,6 +78,10 @@ struct llama_qsa_census_stream {
     std::vector<int32_t> order;
     std::vector<int32_t> rank;
     std::vector<int32_t> blk_of;
+    // [TAG_QSA_WINDOW_MISALIGNED] the sequences that own a cell past the cell window (block index >= n_blocks); empty
+    // unless such a cell exists. The census excludes those cells; a query of one of these sequences cannot be served by
+    // the sparse path (its depth is past the window, so the layer runs dense) and the bias fills assert it.
+    std::vector<int32_t> oor_seqs;
 };
 
 // [TAG_QSA_CENSUS_INC] why a stream census took the full path (stats n_cen_fb, the kqvis-prof line)
