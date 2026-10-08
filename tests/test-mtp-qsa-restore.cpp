@@ -22,6 +22,11 @@
 //              are present -> no abort (before the census exclusion: GGML_ASSERT "cell position runs past the cell
 //              window"), B's draft graphs run the QSA selection (one top-k node per graph more than A's last draft,
 //              which runs dense), target logits == the LLAMA_MTP_QSA=0 child.
+//  descriptor: (series D1) children of this binary print llama_state_seq_descriptor of the target and the MTP draft
+//              context under LLAMA_MTP_QSA=0 / =1 / =1 + LLAMA_MTP_QSA_PHASE=1: the draft descriptors are pairwise
+//              different (dense kv{...} vs hybrid_idx{recr=none,attn,idx(K-only q8_0 indexer)[,qsa_phase=1]}), the
+//              target descriptor is the same in all three - so a dense-draft disk entry is a draft-descriptor mismatch
+//              for the sparse context (target-only adoption), and vice versa.
 //  census:     the same pool layout straight into llama_qsa_census_full (blk_bias): every out-of-window cell of A is
 //              routed to the second unused id n_bid + 1 (block table vis 0 = -inf for every query), no compact block
 //              holds an A cell, cs.oor_seqs == {A}.
@@ -43,6 +48,7 @@
 #include "../src/llama-model-saver.h"
 #include "../src/llama-kv-cells.h"
 #include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-ext.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -427,13 +433,26 @@ static void census_unit(const std::function<void(bool, const std::string &)> & c
 }
 
 int main(int argc, char ** argv) {
-    const bool ref = argc > 1 && strcmp(argv[1], "--ref") == 0;
+    const bool ref  = argc > 1 && strcmp(argv[1], "--ref") == 0;
+    const bool desc = argc > 1 && strcmp(argv[1], "--desc") == 0;
 
     llama_log_set(quiet_log, nullptr);
     common_log_set_verbosity_thold(-1);
     llama_backend_init();
 
     gguf_context_ptr meta = make_meta(4096);
+
+    if (desc) {
+        // the child: the two descriptors, one per line
+        mtp_env E;
+        init_env(E, meta.get());
+        printf("T %s\nD %s\n", llama_state_seq_descriptor(E.ctx_tgt.get()).c_str(),
+               llama_state_seq_descriptor(E.ctx_dft.get()).c_str());
+        fflush(stdout);
+        E.ctx_dft.reset(); E.ctx_tgt.reset();
+        llama_backend_free();
+        return 0;
+    }
 
     if (ref) {
         // the child: the scenarios' target logits, raw f32, restore first, unified last
@@ -515,6 +534,32 @@ int main(int argc, char ** argv) {
         }
         const int rc = pclose(p);
         check(rc == 0, "reference child (LLAMA_MTP_QSA=0) exited 0");
+
+        // [series D1] the draft descriptor tells the dense draft memory from the sparse one (and the phase)
+        std::string dt[3], dd[3];
+        const char * envs[3] = { "LLAMA_MTP_QSA=0 LLAMA_MTP_QSA_PHASE=0", "LLAMA_MTP_QSA=1 LLAMA_MTP_QSA_PHASE=0",
+                                 "LLAMA_MTP_QSA=1 LLAMA_MTP_QSA_PHASE=1" };
+        for (int k = 0; k < 3; ++k) {
+            FILE * q = popen((std::string(envs[k]) + " '" + exe + "' --desc").c_str(), "r");
+            GGML_ASSERT(q != nullptr);
+            std::string out;
+            char buf[4096];
+            size_t nr;
+            while ((nr = fread(buf, 1, sizeof(buf), q)) > 0) {
+                out.append(buf, nr);
+            }
+            pclose(q);
+            const size_t t0 = out.find("T "), d0 = out.find("\nD ");
+            if (t0 != std::string::npos && d0 != std::string::npos) {
+                dt[k] = out.substr(t0 + 2, d0 - t0 - 2);
+                dd[k] = out.substr(d0 + 3, out.find('\n', d0 + 1) - d0 - 3);
+            }
+            const size_t m = dd[k].find(";mem=");
+            printf("descriptor: %-38s draft mem=%s\n", envs[k], m == std::string::npos ? "?" : dd[k].substr(m + 5).c_str());
+        }
+        check(!dt[0].empty() && dt[0] == dt[1] && dt[1] == dt[2], "descriptor: target descriptor equal for MTP_QSA 0 / 1 / phase 1");
+        check(!dd[0].empty() && dd[0] != dd[1] && dd[1] != dd[2] && dd[0] != dd[2],
+              "descriptor: draft descriptor differs between dense, sparse and sparse phase 1");
         auto same = [](const std::vector<float> & a, const std::vector<float> & b) {
             return !a.empty() && a.size() == b.size() && memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0;
         };
