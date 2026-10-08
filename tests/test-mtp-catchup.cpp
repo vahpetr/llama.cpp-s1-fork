@@ -1004,12 +1004,18 @@ static int neg_child(gguf_context * meta, const std::string & which) {
         rows = { { -1, 0 } };
     } else if (which == "hole") {
         rows = { { 0, 5 }, { 0, 7 } };                     // position hole inside a run
+    } else if (which == "multiseq") {
+        rows = { { 0, 0 } };                               // one row owned by seq 0 AND seq 1 (n_seq_id 2), below
     } else {
         return 2;
     }
-    llama_batch b = llama_batch_init((int32_t) rows.size(), 0, 1);
+    llama_batch b = llama_batch_init((int32_t) rows.size(), 0, 2);
     for (const auto & [s, p] : rows) {
-        common_batch_add(b, 1, p, { s }, true);
+        if (which == "multiseq") {
+            common_batch_add(b, 1, p, { s, s + 1 }, true); // [TAG_MULTISLOT] round 2 (astra r1): n_seq_id != 1
+        } else {
+            common_batch_add(b, 1, p, { s }, true);
+        }
     }
     g_neg_child = true;
     e.census.active = true;
@@ -1024,7 +1030,7 @@ static void neg_cases(const char * self) {
     (void) self;
     printf("mtp-contiguity negative cases: skipped on _WIN32\n");
 #else
-    for (const char * which : { "interleave", "badid", "negid", "hole" }) {
+    for (const char * which : { "interleave", "badid", "negid", "hole", "multiseq" }) {
         const std::string cmd = std::string("'") + self + "' --neg " + which + " 2>&1";
         FILE * f = popen(cmd.c_str(), "r");
         GGML_ASSERT(f != nullptr);
