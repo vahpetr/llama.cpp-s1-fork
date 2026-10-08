@@ -569,8 +569,15 @@ static int64_t qwen4exp_qsa_depth(const llama_memory_hybrid_idx_context * mctx_h
 // the dense-path decision of a QSA layer: the exhaustive bypass ([TAG_QSA_BYPASS_EXHAUSTIVE], over the pool n_kv
 // the budget width is taken over) or the ubatch's sequence depth below LLAMA_QSA_MIN_KV ([TAG_QSA_MIN_KV]);
 // shared by build_layer_attn and llm_graph_input_qsa::can_reuse
+// [TAG_QSA_WINDOW_MISALIGNED] or the sequence depth past the indexer cell window: positions beyond n_kv cells, which
+// only a memory without its prefix has (the MTP draft after a legacy /slots restore or a refused draft rewind drops
+// its sequence, and the catch-up writes positions >= the restored depth into cells 0..T). The census cannot block
+// such cells (pb >= n_blocks -> GGML_ASSERT oor in llama_qsa_census_full); the dense attention over the partial
+// window is what LLAMA_MTP_QSA=0 runs there. A complete history keeps one cell per position 0..depth-1, so
+// n_kv >= depth (the reserve: qwen4exp_qsa_depth returns n_kv) and this term never changes a working graph.
 static bool qwen4exp_qsa_dense(int64_t n_kv_idx, int64_t width, int64_t depth) {
-    return (qwen4exp_qsa_bypass_exhaustive() && width == n_kv_idx) || depth < qwen4exp_qsa_min_kv();
+    return depth > n_kv_idx
+        || (qwen4exp_qsa_bypass_exhaustive() && width == n_kv_idx) || depth < qwen4exp_qsa_min_kv();
 }
 
 // [TAG_MTP_QSA] the selection budget (indexer_top_k) of layer il. TEST ONLY: LLAMA_MTP_QSA_TOP_K=N > 0 replaces it for
@@ -2698,7 +2705,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         }
     }
 
-    if (qsa && (qwen4exp_qsa_bypass_exhaustive() || qwen4exp_qsa_min_kv() > 0)) {
+    // evaluated for every QSA layer: [TAG_QSA_WINDOW_MISALIGNED] holds whatever the bypass / LLAMA_QSA_MIN_KV knobs
+    if (qsa) {
         // same expression as build_qsa_top_k()'s `width`, over the same n_kv
         const int64_t n_kv_idx = mctx_hyb->get_idx()->get_n_kv();
         const int64_t width    = std::min<int64_t>(n_kv_idx, (int64_t) qwen4exp_qsa_top_k(hparams, il) + (int64_t) qsa_ratio - 1);
