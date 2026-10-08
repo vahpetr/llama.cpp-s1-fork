@@ -595,8 +595,110 @@ static bool qwen4exp_qsa_homogeneous() {
     return on;
 }
 
+// [TAG_MULTISLOT] (stage 5.1 item 4b) the routing-class guard of LLAMA_QSA_HOMOGENEOUS=1: the dense decision above is
+// one per UBATCH (its deepest sequence), also under per-stream KV, so a ubatch mixing a sequence below
+// LLAMA_QSA_MIN_KV with one at/above it would route the shallow one through the deep one's topology. The server keeps
+// such sequences in separate decode calls (homogeneous routing groups); this guard proves it on the executed ubatches
+// (build and reuse): per sequence its depth = max pos + 1 over ITS rows, class = depth >= N; all classes must agree.
+// One sequence whose rows straddle N is valid (one depth); row min/max positions are deliberately not compared.
+// Reserve (full) contexts carry no real positions and are skipped. Strict mode only (the knob); off = no code runs.
+// Proof: [qsa-routing] checks=... multi_seq=... below=... above=... mixed=... every 1024 checks and at exit.
+struct qwen4exp_qsa_routing_stats {
+    std::atomic<uint64_t> checks{0};
+    std::atomic<uint64_t> multi_seq{0};
+    std::atomic<uint64_t> below{0};
+    std::atomic<uint64_t> above{0};
+    std::atomic<uint64_t> mixed{0};
+
+    void print(const char * when) const {
+        // fprintf: also safe from the static destructor at exit, after the logger may be gone
+        fprintf(stderr, "[qsa-routing] checks=%" PRIu64 " multi_seq=%" PRIu64 " below=%" PRIu64 " above=%" PRIu64 " mixed=%" PRIu64 " (%s)\n",
+                checks.load(), multi_seq.load(), below.load(), above.load(), mixed.load(), when);
+    }
+
+    ~qwen4exp_qsa_routing_stats() {
+        if (checks.load() > 0) {
+            print("exit");
+        }
+    }
+};
+
+static qwen4exp_qsa_routing_stats & qwen4exp_qsa_routing() {
+    static qwen4exp_qsa_routing_stats s;
+    return s;
+}
+
+static void qwen4exp_qsa_routing_check(const llama_memory_hybrid_idx_context * mctx_hyb, const llama_ubatch & ubatch) {
+    if (!qwen4exp_qsa_homogeneous() || mctx_hyb->is_full() || ubatch.n_tokens == 0) {
+        return;
+    }
+
+    // build evaluates the decision once per QSA layer, a failed reuse once more: count each ubatch once
+    struct key_t {
+        const void * pos; uint32_t n; llama_pos p0, p1; llama_seq_id s0;
+        bool operator==(const key_t & o) const { return pos == o.pos && n == o.n && p0 == o.p0 && p1 == o.p1 && s0 == o.s0; }
+    };
+    thread_local key_t last = { nullptr, 0, 0, 0, 0 };
+    const key_t key = { ubatch.pos, ubatch.n_tokens, ubatch.pos[0], ubatch.pos[ubatch.n_tokens - 1],
+                        ubatch.n_seq_id[0] > 0 ? ubatch.seq_id[0][0] : -1 };
+    if (key == last) {
+        return;
+    }
+    last = key;
+
+    const int64_t n_min = qwen4exp_qsa_min_kv();
+
+    std::vector<std::pair<llama_seq_id, llama_pos>> seqs; // (seq, depth)
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            const llama_seq_id s = ubatch.seq_id[i][j];
+            auto it = std::find_if(seqs.begin(), seqs.end(), [s](const auto & e) { return e.first == s; });
+            if (it == seqs.end()) {
+                seqs.emplace_back(s, ubatch.pos[i] + 1);
+            } else {
+                it->second = std::max(it->second, ubatch.pos[i] + 1);
+            }
+        }
+    }
+
+    bool any_below = false;
+    bool any_above = false;
+    for (const auto & e : seqs) {
+        if ((int64_t) e.second >= n_min) {
+            any_above = true;
+        } else {
+            any_below = true;
+        }
+    }
+
+    auto & st = qwen4exp_qsa_routing();
+    const uint64_t k = st.checks.fetch_add(1) + 1;
+    if (seqs.size() > 1) {
+        st.multi_seq++;
+    }
+    if (any_below && any_above) {
+        st.mixed++;
+        std::string desc;
+        for (const auto & e : seqs) {
+            desc += format(" seq %d depth %d (%s)", (int) e.first, (int) e.second, (int64_t) e.second >= n_min ? "above" : "below");
+        }
+        st.print("MIXED");
+        GGML_ABORT("[qsa-routing] mixed routing classes in one ubatch (N = %" PRId64 "):%s", n_min, desc.c_str());
+    }
+    if (any_above) {
+        st.above++;
+    } else {
+        st.below++;
+    }
+    if (k % 1024 == 0) {
+        st.print("periodic");
+    }
+}
+
 static bool qwen4exp_qsa_dense(const llama_memory_hybrid_idx_context * mctx_hyb, const llama_ubatch & ubatch,
                                int64_t n_kv_idx, int64_t width) {
+    qwen4exp_qsa_routing_check(mctx_hyb, ubatch);
+
     const int64_t depth = qwen4exp_qsa_depth(mctx_hyb, ubatch, n_kv_idx);
     return depth > n_kv_idx
         || (qwen4exp_qsa_bypass_exhaustive() && width == n_kv_idx) || depth < qwen4exp_qsa_min_kv()
