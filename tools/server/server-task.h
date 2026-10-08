@@ -596,6 +596,28 @@ struct server_prompt {
     //   until a full recompute (n_past = 0) clears it
     bool partial = false;
 
+    // [TAG_DRAFT_PARTIAL] the TARGET state is canonical, only the draft history lacks the rows [0, draft_gap) (an adopted
+    //   target-only disk load, or an entry saved with draft_cover < n_tokens): prefix reuse, disk saves and deep
+    //   checkpoints are allowed; a save records draft_cover = draft_cover_rows(). The rows appended after the load are
+    //   computed by the target and caught up by the draft (decode / catch-up path), so the draft holds [draft_gap, n);
+    //   a trim below draft_gap lowers it, a full recompute (n_past = 0) clears it. Distinct from `partial` (series C:
+    //   the legacy /slots restore, never published)
+    int32_t draft_gap = 0;
+
+    bool draft_partial() const {
+        return draft_gap > 0;
+    }
+
+    // the number of prompt rows present in the draft history
+    int64_t draft_cover_rows() const {
+        return std::max<int64_t>(0, (int64_t) tokens.size() - draft_gap);
+    }
+
+    // a trim of the prompt to n tokens: the draft gap cannot exceed the kept prefix
+    void draft_trim(int64_t n) {
+        draft_gap = (int32_t) std::max<int64_t>(0, std::min<int64_t>(draft_gap, n));
+    }
+
     // [TAG_DISK_ADOPT] (Hermes gate Minor 2) the adopt source this state was loaded from, stamped as adopted_from on
     //   its next disk save; it lives with the prompt, so every clear / erase / invalidation / full reset drops it
     std::string adopted_from;
@@ -607,6 +629,7 @@ struct server_prompt {
         noncanonical = false;
         user_starts.clear();
         partial = false;
+        draft_gap = 0;
         adopted_from.clear();
     }
 
@@ -632,6 +655,7 @@ struct server_prompt {
             noncanonical,
             user_starts,
             partial,
+            draft_gap,
             adopted_from,
         };
     }

@@ -1151,13 +1151,13 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
         DSK_INF("not saving %zu tokens: the state was shifted (not the state of this prefix)\n", n);
         return false;
     }
-    if (prompt.partial) { // [TAG_PARTIAL_PROMPT] C1: a partial prompt is never saved (an adopted target-only load included)
+    if (prompt.partial) { // [TAG_PARTIAL_PROMPT] C1: a partial prompt (legacy /slots restore) is never saved
         n_save_partial++;
-        DSK_INF("not saving %zu tokens: a partial prompt (legacy /slots restore or adopted target-only load, draft side "
-                "incomplete%s)\n", n, prompt.adopted_from.empty() ? "" : "; re-adopted from the source on return");
+        DSK_INF("not saving %zu tokens: a partial prompt (legacy /slots restore, draft side incomplete)\n", n);
         refresh_status();
         return false;
     }
+
     if (spec && common_speculative_n_stateful(spec) > 1) {
         // (Codex gate r3 Major 2) the carry container holds one implementation's state: with several stateful ones
         //   a save would persist an incomplete state - refused until a multi-state container exists
@@ -1199,8 +1199,9 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     e.version = DISK_CACHE_VERSION;
     e.adopted_from = prompt.adopted_from; // [TAG_DISK_ADOPT] provenance of a resave after an adopted load
     e.has_dft = ctx_dft != nullptr;
-    // [TAG_PARTIAL_PROMPT] the draft history covers every prompt row: a partial prompt never reaches this point (C1)
-    e.draft_cover = (int64_t) n;
+    // [TAG_DRAFT_PARTIAL] the prompt rows the draft history holds: all of them, or n - draft_gap for a draft-partial
+    //   prompt (a partial one never reaches this point, C1)
+    e.draft_cover = prompt.draft_cover_rows();
 
     uint64_t n_ckpt_written = 0;
     std::vector<server_deep_ref> deep; // (Codex gate r3 Major 5) the committed deep refs: the .aux and e.deep hold the same set
@@ -1231,7 +1232,16 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
                 const auto at = std::lower_bound(ns_sorted.begin(), ns_sorted.end(), (size_t) c.n_tokens) - ns_sorted.begin();
                 const std::string & key = keys_sorted[at];
                 bool written = false;
-                if (!ckpt_store(key, c, &written)) {
+                // [TAG_DRAFT_PARTIAL] a draft-partial prompt's checkpoint draft data would carry the gap into the shared,
+                //   content-addressed store (another conversation restoring it would get a draft without its first
+                //   rows): stored draft-less, which a restore turns into a draft reset up to it (draft-partial again)
+                if (prompt.draft_partial() && !c.data_dft.empty()) {
+                    common_prompt_checkpoint t = c;
+                    t.data_dft.clear();
+                    if (!ckpt_store(key, t, &written)) {
+                        throw std::runtime_error("cannot store a checkpoint");
+                    }
+                } else if (!ckpt_store(key, c, &written)) {
                     throw std::runtime_error("cannot store a checkpoint");
                 }
                 n_ckpt_written += written ? file_size_or_0(ckpt_path(key)) : 0;
@@ -1398,6 +1408,11 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     const std::string id = e.id;
     bytes_written += n_written + n_ckpt_written + file_size_or_0(path(e.id, ".aux")) + file_size_or_0(path(e.id, ".tok"));
     save_us       += (uint64_t) (ggml_time_us() - t_start);
+    if (e.draft_cover < (int64_t) n) {
+        n_save_draft_partial++;
+        DSK_INF("saved %s draft-partial: draft_cover %" PRId64 " of %zu tokens (the draft lacks the first %" PRId64 " rows)\n",
+                e.id.c_str(), e.draft_cover, n, (int64_t) n - e.draft_cover);
+    }
     entries.push_back(std::move(e));
     n_saves++;
 
@@ -1627,11 +1642,13 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
     std::vector<server_deep_ref> deep;
     std::vector<int32_t> user_starts;
     // [TAG_ADOPT_TARGET_ONLY] an adopt source's entry whose target stream matches this target while its draft stream
-    //   (format / descriptor) does not: the target stream loads, the draft side is reset like a legacy /slots restore
-    //   ([TAG_PARTIAL_PROMPT]); the prompt checkpoints and deep refs (their envelope names the source's combined
-    //   descriptor, draft included) are left out. Own-namespace entries keep the strict rule (both streams).
+    //   (format / descriptor) does not: the target stream loads, the draft sequence and the carry are reset (series C,
+    //   [TAG_SPEC_RESET]); the prompt is draft-partial ([TAG_DRAFT_PARTIAL]), not partial: its target state is canonical.
+    //   The prompt checkpoints and deep refs (their envelope names the source's combined descriptor, draft included)
+    //   load target-only: deep_get learns that descriptor from this entry's checkpoints (same save as the verified
+    //   target stream) and drops their draft data. Own-namespace entries keep the strict rule (both streams).
     const bool tgt_only = ctx_dft != nullptr && target_only(e);
-    size_t keys_left_out = 0;
+    size_t keys_tgt_only = 0;
     if (!tgt_only && ctx_dft && e.has_dft && draft_kv_src(e)) {
         // a source adopted for target-only loads (its draft KV types differ) whose entry does not qualify (a target
         //   descriptor mismatch, an envelope-less legacy stream): its draft stream must never reach this draft context
@@ -1656,21 +1673,27 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
             throw aux_invalid("truncated or corrupt");
         }
         if (tgt_only) {
-            keys_left_out = keys.size();
-            checkpoints.clear();
-            deep.clear();
+            keys_tgt_only = keys.size();
         }
         size_t i = 0;
-        for (auto & c : checkpoints) {
+        for (auto it = checkpoints.begin(); it != checkpoints.end();) {
             common_prompt_checkpoint full;
             bool io_error = false;
-            if (!deep_get(keys[i++], full, &io_error) || full.n_tokens != c.n_tokens) {
+            if (!deep_get(keys[i++], full, &io_error, tgt_only) || full.n_tokens != it->n_tokens) {
                 if (io_error) {
                     throw std::runtime_error("a checkpoint read error");
                 }
+                if (tgt_only) {
+                    // [TAG_ADOPT_TARGET_ONLY] a source checkpoint that does not load target-only (another descriptor)
+                    //   is left out, as before the target-only checkpoint load: the entry stays eligible
+                    it = checkpoints.erase(it);
+                    keys_tgt_only--;
+                    continue;
+                }
                 throw aux_invalid("a checkpoint is missing");
             }
-            c = std::move(full);
+            *it = std::move(full);
+            ++it;
         }
     } catch (const aux_invalid & err) {
         DSK_WRN("entry %s: unreadable .aux (%s), dropping it\n", e.id.c_str(), err.what());
@@ -1743,17 +1766,22 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
     write_meta(e); // a no-op for an adopt source
     n_loads++;
     prompt.adopted_from = e.src;
-    // [TAG_ADOPT_TARGET_ONLY] the draft side is incomplete (empty for the loaded prefix: a sparse MTP draft runs dense
-    //   past its cell window, 86661f3c3): partial, so neither saved nor deep-put (C1); the conversation is re-adopted
-    //   from the source on each return until a full recompute clears partial
-    // [TAG_PARTIAL_PROMPT] (defensive) an entry whose draft history did not cover its prompt at save time
+    // [TAG_DRAFT_PARTIAL] the draft history lacks the first rows: none of the loaded prefix after a target-only load
+    //   (the draft sequence stays empty; a sparse MTP draft runs dense while depth > n_kv, 86661f3c3), the first
+    //   n_tokens - draft_cover of an entry saved draft-partial. The target state is canonical: the prompt is reused as
+    //   a prefix, saved (draft_cover = the rows the draft holds then) and deep-put like any other; `partial` (series C,
+    //   the legacy /slots restore) is not set
     const bool short_cover = ctx_dft != nullptr && e.has_dft && !tgt_only && e.draft_cover < (int64_t) e.tokens.size();
     if (short_cover) {
         n_load_partial_cover++;
-        DSK_WRN("entry %s: draft_cover %" PRId64 " < %zu tokens, the prompt is partial (not published until fully "
-                "recomputed)\n", e.id.c_str(), e.draft_cover, e.tokens.size());
+        DSK_WRN("entry %s: draft_cover %" PRId64 " < %zu tokens, the prompt is draft-partial (the draft lacks the first "
+                "%" PRId64 " rows; the target state is reused and saved)\n", e.id.c_str(), e.draft_cover, e.tokens.size(),
+                (int64_t) e.tokens.size() - std::max<int64_t>(0, e.draft_cover));
     }
-    prompt.partial = tgt_only || short_cover;
+    prompt.partial   = false;
+    prompt.draft_gap = tgt_only ? (int32_t) e.tokens.size()
+                     : short_cover ? (int32_t) ((int64_t) e.tokens.size() - std::max<int64_t>(0, e.draft_cover)) : 0;
+    n_load_draft_partial += prompt.draft_partial();
     if (!e.src.empty()) {
         for (auto & a : adopted) {
             a.hits        += a.key == e.src;
@@ -1762,7 +1790,8 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
         if (tgt_only) {
             n_adopted_target_only++;
             DSK_INF("adopted load (target only; draft descriptor mismatch — draft reset): entry %s from source %s "
-                    "(format %u), %zu prompt checkpoints left out\n", e.id.c_str(), e.src.c_str(), e.version, keys_left_out);
+                    "(format %u), %zu prompt checkpoints loaded target-only, the prompt is draft-partial (gap %d)\n",
+                    e.id.c_str(), e.src.c_str(), e.version, keys_tgt_only, prompt.draft_gap);
         } else {
             DSK_INF("adopted load: entry %s from source %s (format %u)\n", e.id.c_str(), e.src.c_str(), e.version);
         }
@@ -1891,6 +1920,12 @@ void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_che
     if (prompt.noncanonical || prompt.partial) { // [TAG_NONCANONICAL] [TAG_PARTIAL_PROMPT] C1
         return;
     }
+    if (prompt.draft_partial() && !c.data_dft.empty()) { // [TAG_DRAFT_PARTIAL] see save(): stored draft-less
+        common_prompt_checkpoint t = c;
+        t.data_dft.clear();
+        deep_put(prompt, t, kind);
+        return;
+    }
     // below min-step a re-process is cheaper than 113 MiB of disk (a short system prompt, a tiny chat)
     if (quota == 0 || c.data_tgt.empty() || c.n_tokens < ckpt_min_step || c.n_tokens > (int64_t) prompt.tokens.size() ||
         ((c.flags_tgt | c.flags_dft) & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
@@ -1998,7 +2033,7 @@ std::vector<server_deep_ckpt_meta> server_disk_cache::deep_candidates(const serv
     return res;
 }
 
-bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoint & out, bool * io_error) {
+bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoint & out, bool * io_error, bool learn) {
     auto it = ckpts.find(key);
     if (it == ckpts.end()) {
         return false;
@@ -2036,7 +2071,20 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         }
         // [TAG_STATE_DESCRIPTOR] checked before anything reaches the contexts: a checkpoint of another state layout
         //   is a miss (it would otherwise abort in common_prompt_checkpoint::load_tgt on a size mismatch)
-        if (ok && (env_ver != ENVELOPE_VERSION || dh != desc_h)) {
+        // [TAG_ADOPT_TARGET_ONLY] except an adopt source's checkpoint that carries the source's learned target-
+        //   compatible descriptor (or teaches it: `learn`, a target-only load of an entry whose target stream matched,
+        //   written in the same save): its target state loads, its draft data is dropped below
+        bool tgt_only = false;
+        if (ok && env_ver == ENVELOPE_VERSION && dh != desc_h && from_src && magic == CKPT_ENV_MAGIC) {
+            auto lt = tgt_compat_dh.find(it->second.src_dir);
+            if (lt == tgt_compat_dh.end() && learn) {
+                lt = tgt_compat_dh.emplace(it->second.src_dir, dh).first;
+                DSK_INF("adopt source %s: combined descriptor %s is target-compatible (learned from a target-only load)\n",
+                        it->second.src_dir.c_str(), dh.c_str());
+            }
+            tgt_only = lt != tgt_compat_dh.end() && lt->second == dh;
+        }
+        if (ok && (env_ver != ENVELOPE_VERSION || dh != desc_h) && !tgt_only) {
             throw std::runtime_error("state descriptor mismatch (" + dh + ", expected " + desc_h + ")");
         }
         ok = ok && get_str(f, k) && k == key &&
@@ -2056,6 +2104,12 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         out.flags_tgt = ft;
         out.flags_dft = fd;
         out.id_task   = -1;
+        if (tgt_only) {
+            // [TAG_ADOPT_TARGET_ONLY] the draft data has the source's draft layout: dropped (a draft-less checkpoint, as
+            //   [TAG_CKPT_NO_DFT] writes them); the carry is the target's (its schema is part of the target descriptor)
+            out.data_dft.clear();
+            n_ckpt_target_only++;
+        }
     } catch (const std::bad_alloc &) {
         // [TAG_DISK_READ_STATUS] inconclusive: the checkpoint and its file stay
         DSK_WRN("deep checkpoint %s: out of memory reading it, keeping it\n", key.c_str());
@@ -2721,6 +2775,9 @@ void server_disk_cache::refresh_status() {
         { "adopted_target_only",    n_adopted_target_only },
         { "saves_refused_partial",  n_save_partial  },
         { "loads_partial_cover",    n_load_partial_cover },
+        { "loads_draft_partial",    n_load_draft_partial }, // [TAG_DRAFT_PARTIAL]
+        { "saves_draft_partial",    n_save_draft_partial },
+        { "ckpt_target_only",       n_ckpt_target_only   }, // [TAG_ADOPT_TARGET_ONLY]
         { "n_entries_partial_cover", (size_t) std::count_if(entries.begin(), entries.end(), [](const server_disk_cache_entry & e) {
                                         return e.has_dft && e.draft_cover < (int64_t) e.tokens.size(); }) },
         { "deep_rewinds",   n_deep_rewinds      },

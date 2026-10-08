@@ -55,7 +55,7 @@ struct server_disk_cache_entry {
     std::string src;          // [TAG_DISK_ADOPT] the adopt source's key; empty: the own namespace
     std::string adopted_from; // own entry saved after a load from an adopt source: that source's key
     // [TAG_PARTIAL_PROMPT] the number of prompt rows the draft history held at save time (.meta "draft_cover"); a load
-    //   with draft_cover < the token count marks the prompt partial. A .meta without it: the token count (its writer
+    //   with draft_cover < the token count marks the prompt draft-partial ([TAG_DRAFT_PARTIAL]). A .meta without it: the token count (its writer
     //   kept C1), except an own entry with adopted_from (v50rc4 published adopted target-only states): 0
     int64_t     draft_cover = 0;
 };
@@ -118,7 +118,10 @@ struct server_disk_cache {
     std::vector<server_deep_ckpt_meta> deep_candidates(const server_tokens & tokens, int64_t n_max) const;
 
     // io_error (optional): set when the file could not be read (inconclusive, the checkpoint is kept)
-    bool deep_get(const std::string & key, common_prompt_checkpoint & out, bool * io_error = nullptr);
+    // [TAG_ADOPT_TARGET_ONLY] learn: the caller loads an entry target-only (its target stream matched) - its prompt
+    //   checkpoints, written in the same save as that target stream, teach the source's combined descriptor; a
+    //   checkpoint of an adopt source that carries its learned descriptor loads target-only (draft data dropped)
+    bool deep_get(const std::string & key, common_prompt_checkpoint & out, bool * io_error = nullptr, bool learn = false);
 
     // reference a stored checkpoint a deep rewind used from prompt.deep (it then survives the collection)
     void deep_adopt(server_prompt & prompt, const server_deep_ckpt_meta & m);
@@ -149,7 +152,10 @@ struct server_disk_cache {
     uint64_t n_load_capacity = 0; // the state did not fit the free cells: the entry was kept
     uint64_t n_load_other   = 0; // inconclusive: the entry was kept
     uint64_t n_save_partial        = 0; // [TAG_PARTIAL_PROMPT] saves refused: a partial prompt (C1)
-    uint64_t n_load_partial_cover  = 0; // [TAG_PARTIAL_PROMPT] loads marked partial by draft_cover < n_tokens
+    uint64_t n_load_partial_cover  = 0; // [TAG_DRAFT_PARTIAL] own loads with draft_cover < n_tokens (draft-partial)
+    uint64_t n_load_draft_partial  = 0; // [TAG_DRAFT_PARTIAL] loads that left the prompt draft-partial (target-only incl.)
+    uint64_t n_save_draft_partial  = 0; // [TAG_DRAFT_PARTIAL] saves of a draft-partial prompt (draft_cover < n_tokens)
+    uint64_t n_ckpt_target_only    = 0; // [TAG_ADOPT_TARGET_ONLY] adopt-source checkpoints loaded target-only
     uint64_t n_adopted_target_only = 0; // [TAG_ADOPT_TARGET_ONLY] adopted loads of the target stream only (draft reset)
 
     // [TAG_DISK_ADOPT] --cache-disk-adopt: foreign namespace keys opened read-only as extra load sources (set before
@@ -224,6 +230,10 @@ struct server_disk_cache {
     };
     std::vector<adopt_src> adopted;
     std::map<std::string, std::string> src_dir_of; // adopt entry id -> its directory
+    // [TAG_ADOPT_TARGET_ONLY] adopt source checkpoint directory -> its writer's combined state descriptor, learned from the prompt
+    //   checkpoints of an entry whose target stream matched this target (target_only()): its checkpoints and deep
+    //   checkpoints carry that descriptor and load target-only
+    std::map<std::string, std::string> tgt_compat_dh;
     void open_adopt_sources();
     sealed_status read_entry(const std::string & id, const std::string & fp, server_disk_cache_entry & e) const;
     bool scan_foreign(); // false: a listing failed, the foreign block sets are incomplete

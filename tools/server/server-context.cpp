@@ -4680,6 +4680,12 @@ private:
                                                 SLT_WRN(slot, "draft KV rewind to pos %d refused - resetting the draft sequence\n", it->pos_max);
                                                 llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
                                             }
+                                        } else if (ctx_dft && it->data_dft.empty()) {
+                                            // [TAG_DRAFT_PARTIAL] a draft-less checkpoint on a context whose checkpoints
+                                            //   carry the draft (a target-only one from an adopt source): the draft
+                                            //   sequence restarts empty, the prompt becomes draft-partial up to it
+                                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+                                            slot.prompt.draft_gap = std::max<int32_t>(slot.prompt.draft_gap, (int32_t) it->n_tokens);
                                         } else {
                                             restored = it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
                                         }
@@ -4764,6 +4770,7 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+                        slot.prompt.draft_trim(n_past); // [TAG_DRAFT_PARTIAL] the draft rows [gap, n_past) stay
                         if (n_past == 0) {
                             // [TAG_FULL_RESET] (Codex gate r1 C1) nothing of the old prompt survives a full recompute:
                             //   the trim above keeps checkpoints with pos_max <= 0 (e.g. the n_tokens = 1 checkpoint
@@ -4775,6 +4782,7 @@ private:
                             slot.ckpt_branch_pos      = -1;
                             slot.prompt.noncanonical = false; // [TAG_NONCANONICAL] a full recompute
                             slot.prompt.partial      = false; // [TAG_PARTIAL_PROMPT] the draft side is rebuilt too
+                            slot.prompt.draft_gap    = 0;     // [TAG_DRAFT_PARTIAL]
                             slot.prompt.adopted_from.clear(); // [TAG_DISK_ADOPT] recomputed, not the adopted state
                         }
 
@@ -4861,6 +4869,7 @@ private:
                         slot.ckpt_branch_pos      = -1;
                         slot.prompt.noncanonical = false; // [TAG_NONCANONICAL]
                         slot.prompt.partial      = false; // [TAG_PARTIAL_PROMPT]
+                        slot.prompt.draft_gap    = 0;     // [TAG_DRAFT_PARTIAL]
                         slot.prompt.adopted_from.clear(); // [TAG_DISK_ADOPT]
 
                         slot.stats.n_prompt_cached = 0;
