@@ -51,6 +51,10 @@
 #include <string>
 #include <vector>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 static const uint32_t N_VOCAB = 128;
 
 // [TAG_MTP_QSA] set by the ctest variants; read once (the library caches it the same way)
@@ -138,8 +142,16 @@ struct op_census {
     int total = 0;
 };
 
+// [TAG_MULTISLOT] set in a disposable negative-case process: the first draft graph node reports itself, so the parent
+// can require the [mtp-contiguity] diagnostic BEFORE any draft decode
+static bool g_neg_child = false;
+
 static bool census_cb(struct ggml_tensor * t, bool ask, void * ud) {
     auto * c = (op_census *) ud;
+    if (ask && g_neg_child) {
+        fprintf(stderr, "NEG-CHILD: draft decode reached\n");
+        g_neg_child = false;
+    }
     if (ask && c->active) {
         c->n[ggml_op_desc(t)]++;
         c->total++;
@@ -174,6 +186,7 @@ struct env_cfg {
     bool         backend_sampling = false;
     float        p_min            = 0.0f;
     int          n_min            = 0;
+    uint32_t     n_seq            = 1;   // [TAG_MULTISLOT] n_seq_max of both contexts + the speculative n_seq
 };
 
 static void init_env(mtp_env & env, gguf_context * meta, const env_cfg & cfg) {
@@ -200,7 +213,7 @@ static void init_env(mtp_env & env, gguf_context * meta, const env_cfg & cfg) {
     cp.n_ctx           = cfg.n_ctx;
     cp.n_batch         = 128;
     cp.n_ubatch        = 64;
-    cp.n_seq_max       = 1;
+    cp.n_seq_max       = cfg.n_seq;
     cp.n_threads       = 4;
     cp.n_threads_batch = 4;
     env.ctx_tgt.reset(llama_init_from_model(env.model.get(), cp));
@@ -227,7 +240,7 @@ static void init_env(mtp_env & env, gguf_context * meta, const env_cfg & cfg) {
     env.params.draft.backend_sampling = cfg.backend_sampling;
     env.params.draft.ctx_tgt          = env.ctx_tgt.get();
     env.params.draft.ctx_dft          = env.ctx_dft.get();
-    env.spec = common_speculative_init(env.params, 1);
+    env.spec = common_speculative_init(env.params, cfg.n_seq);
     GGML_ASSERT(env.spec && "draft-mtp init failed");
 }
 
@@ -285,9 +298,9 @@ struct draft_out {
     std::vector<float>       logits;
 };
 
-static draft_out draft(mtp_env & env, llama_pos n_past, llama_token id_last) {
+static draft_out draft(mtp_env & env, llama_pos n_past, llama_token id_last, llama_seq_id seq = 0) {
     draft_out out;
-    auto & dp = common_speculative_get_draft_params(env.spec, 0);
+    auto & dp = common_speculative_get_draft_params(env.spec, seq);
     dp.drafting = true;
     dp.n_max    = -1;
     dp.n_past   = n_past;
@@ -300,7 +313,7 @@ static draft_out draft(mtp_env & env, llama_pos n_past, llama_token id_last) {
     if (l != nullptr) {
         out.logits.assign(l, l + N_VOCAB);
     }
-    llama_memory_seq_rm(llama_get_memory(env.ctx_dft.get()), 0, n_past, -1);
+    llama_memory_seq_rm(llama_get_memory(env.ctx_dft.get()), seq, n_past, -1);
     return out;
 }
 
@@ -831,12 +844,220 @@ static void draft_attempt_report(gguf_context * meta) {
     }
 }
 
-int main() {
+// [TAG_MULTISLOT] stage 5.1 item 1: the MTP catch-up of a multi-sequence batch ([0,0,1,1], reversed ids, one-row runs,
+// runs sliced over ubatches, a restored carry, rejection + replay) gives each sequence the carry, the draft logits and
+// the draft proposals of the same runs fed one sequence per batch (same context shape; tolerance for the target's
+// batch-size-dependent rounding, a row mix-up is O(0.1)); then the [mtp-contiguity] proof line with multi_seq > 0
+struct seq_run {
+    llama_seq_id             seq;
+    std::vector<llama_token> toks;
+    llama_pos                pos0;
+};
+
+// one target decode of the runs in order (every row an output) + the catch-up; returns the target logits per run
+static std::vector<std::vector<float>> feed_runs(mtp_env & env, const std::vector<seq_run> & runs) {
+    int32_t n = 0;
+    for (const auto & r : runs) {
+        n += (int32_t) r.toks.size();
+    }
+    llama_batch b = llama_batch_init(n, 0, 1);
+    for (const auto & r : runs) {
+        for (size_t i = 0; i < r.toks.size(); ++i) {
+            common_batch_add(b, r.toks[i], r.pos0 + (llama_pos) i, { r.seq }, true);
+        }
+    }
+    GGML_ASSERT(llama_decode(env.ctx_tgt.get(), b) == 0);
+    std::vector<std::vector<float>> out;
+    int32_t row = 0;
+    for (const auto & r : runs) {
+        out.emplace_back(r.toks.size() * N_VOCAB);
+        for (size_t i = 0; i < r.toks.size(); ++i, ++row) {
+            std::memcpy(out.back().data() + i * N_VOCAB, llama_get_logits_ith(env.ctx_tgt.get(), row), N_VOCAB * sizeof(float));
+        }
+    }
+    GGML_ASSERT(common_speculative_process(env.spec, b));
+    llama_batch_free(b);
+    return out;
+}
+
+static float max_abs_diff(const float * a, const float * b, size_t n) {
+    float m = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        m = std::max(m, std::fabs(a[i] - b[i]));
+    }
+    return m;
+}
+
+static void multi_seq_catchup(gguf_context * meta) {
+    const float TOL = 1e-3f;
+    mtp_env M, S; // M: the runs of one step in ONE batch; S: the same runs, one sequence per batch
+    env_cfg cfg = { "", GGML_TYPE_F16, 1024, false };
+    cfg.n_seq = 2;
+    init_env(M, meta, cfg);
+    init_env(S, meta, cfg);
+
+    llama_pos pos[2] = { 0, 0 };
+    uint32_t  seed   = 100;
+    std::vector<llama_token> last[2];
+    float worst = 0.0f;
+    bool  bytes_same = true;
+
+    const auto compare = [&](const std::string & what) {
+        for (llama_seq_id s = 0; s < 2; ++s) {
+            std::vector<uint8_t> cm, cs;
+            GGML_ASSERT(common_speculative_get_state(M.spec, s, cm) && common_speculative_get_state(S.spec, s, cs));
+            const size_t nf = (cm.size() - sizeof(uint32_t)) / sizeof(float);
+            const float dc = cm.size() == cs.size() ? max_abs_diff((const float *) (cm.data() + 4), (const float *) (cs.data() + 4), nf) : 1e9f;
+            check(dc <= TOL, what + ": seq " + std::to_string(s) + " carry (max |d| " + std::to_string(dc) + ")");
+            bytes_same = bytes_same && eq(cm, cs);
+            worst = std::max(worst, dc);
+            const llama_token id_last = last[s].back();
+            const auto dm = draft(M, pos[s], id_last, s);
+            const auto ds = draft(S, pos[s], id_last, s);
+            check(dm.toks == ds.toks, what + ": seq " + std::to_string(s) + " draft proposals");
+            const float dl = dm.logits.size() == ds.logits.size() && !dm.logits.empty()
+                ? max_abs_diff(dm.logits.data(), ds.logits.data(), N_VOCAB) : 1e9f;
+            check(dl <= TOL, what + ": seq " + std::to_string(s) + " draft logits (max |d| " + std::to_string(dl) + ")");
+            worst = std::max(worst, dl);
+        }
+    };
+    // one step: M gets every run in one batch, S each run alone; target logits compared per run
+    const auto step = [&](const std::string & what, const std::vector<std::pair<llama_seq_id, size_t>> & shape) {
+        std::vector<seq_run> runs;
+        for (const auto & [s, n] : shape) {
+            runs.push_back({ s, tokens(n, seed++), pos[s] });
+            pos[s] += (llama_pos) n;
+            last[s] = runs.back().toks;
+        }
+        const auto lm = feed_runs(M, runs);
+        for (size_t k = 0; k < runs.size(); ++k) {
+            const auto ls = feed_runs(S, { runs[k] });
+            const float d = max_abs_diff(lm[k].data(), ls[0].data(), lm[k].size());
+            check(d <= TOL, what + ": target logits of run " + std::to_string(k) + " (max |d| " + std::to_string(d) + ")");
+        }
+        compare(what);
+    };
+
+    step("[0,0,1,1] prompt runs",     { { 0, 20 }, { 1, 13 } });
+    step("reversed ids [1,1,0,0]",    { { 1, 5 },  { 0, 7 } });
+    step("one-row runs [0,1]",        { { 0, 1 },  { 1, 1 } });
+    step("one-row runs [1,0]",        { { 1, 1 },  { 0, 1 } });
+    step("runs sliced over ubatches", { { 0, 50 }, { 1, 45 } });
+
+    // rejection + replay with a restored carry: per-sequence checkpoints (target state + carry, the server's round
+    // order), verify-like runs of 4, restore both (the recurrent target cannot seq_rm partially), replay different
+    // accepted counts
+    {
+        const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+        mtp_env * envs[2] = { &M, &S };
+        common_prompt_checkpoint ck[2][2];
+        const llama_pos p0[2] = { pos[0], pos[1] };
+        std::vector<llama_token> last0[2] = { last[0], last[1] };
+        for (int e = 0; e < 2; ++e) {
+            auto * mem = llama_get_memory(envs[e]->ctx_tgt.get());
+            for (llama_seq_id q = 0; q < 2; ++q) {
+                ck[e][q].update_pos(p0[q], llama_memory_seq_pos_min(mem, q), llama_memory_seq_pos_max(mem, q));
+                ck[e][q].update_tgt(envs[e]->ctx_tgt.get(), q, flags);
+                ck[e][q].data_spec.clear();
+                GGML_ASSERT(common_speculative_get_state(envs[e]->spec, q, ck[e][q].data_spec));
+            }
+        }
+        step("verify runs [1x4,0x4]", { { 1, 4 }, { 0, 4 } });
+        for (int e = 0; e < 2; ++e) {
+            common_memory mem;
+            mem.init(envs[e]->ctx_tgt.get(), envs[e]->ctx_dft.get());
+            for (llama_seq_id q = 0; q < 2; ++q) {
+                ck[e][q].load_tgt(envs[e]->ctx_tgt.get(), q, flags);
+                ck[e][q].load_dft(envs[e]->ctx_dft.get(), q, flags);
+                mem.seq_rm(q, ck[e][q].pos_max + 1, -1);
+                common_speculative_set_state(envs[e]->spec, q, ck[e][q].data_spec);
+            }
+        }
+        pos[0] = p0[0]; pos[1] = p0[1];
+        last[0] = last0[0]; last[1] = last0[1];
+        compare("after the restore of both carries");
+        seed -= 2; // replay the same draws: the accepted prefixes of the rejected runs + their bonus rows
+        step("replay [1x2,0x3]", { { 1, 2 }, { 0, 3 } });
+    }
+    printf("multi-seq catch-up: %s vs one sequence per batch (max |d| %.2e, carry bytes %s)\n",
+           n_fail == 0 ? "matches" : "DIFFERS", (double) worst, bytes_same ? "identical" : "within tolerance");
+    // the proof line ([mtp-contiguity] ... multi_seq > 0) is printed by M's destructor
+    common_log_set_verbosity_thold(LOG_DEFAULT_LLAMA);
+    common_speculative_free(M.spec);
+    M.spec = nullptr;
+    common_log_set_verbosity_thold(-1);
+}
+
+// [TAG_MULTISLOT] disposable-process negative cases: each child feeds one malformed batch straight to the catch-up
+// (no target decode: the check must fire first) and must abort with the [mtp-contiguity] diagnostic and no draft node
+static int neg_child(gguf_context * meta, const std::string & which) {
+    mtp_env e;
+    env_cfg cfg = { "", GGML_TYPE_F16, 512, true };
+    cfg.n_seq = 2;
+    init_env(e, meta, cfg);
+    std::vector<std::pair<llama_seq_id, llama_pos>> rows;
+    if (which == "interleave") {
+        rows = { { 0, 0 }, { 1, 0 }, { 0, 1 } };           // [0,1,0]
+    } else if (which == "badid") {
+        rows = { { 0, 0 }, { 2, 0 } };                     // id 2 with n_seq 2
+    } else if (which == "negid") {
+        rows = { { -1, 0 } };
+    } else if (which == "hole") {
+        rows = { { 0, 5 }, { 0, 7 } };                     // position hole inside a run
+    } else {
+        return 2;
+    }
+    llama_batch b = llama_batch_init((int32_t) rows.size(), 0, 1);
+    for (const auto & [s, p] : rows) {
+        common_batch_add(b, 1, p, { s }, true);
+    }
+    g_neg_child = true;
+    e.census.active = true;
+    common_speculative_process(e.spec, b);
+    fprintf(stderr, "NEG-CHILD: no abort\n");
+    llama_batch_free(b);
+    return 0;
+}
+
+static void neg_cases(const char * self) {
+#ifdef _WIN32
+    (void) self;
+    printf("mtp-contiguity negative cases: skipped on _WIN32\n");
+#else
+    for (const char * which : { "interleave", "badid", "negid", "hole" }) {
+        const std::string cmd = std::string("'") + self + "' --neg " + which + " 2>&1";
+        FILE * f = popen(cmd.c_str(), "r");
+        GGML_ASSERT(f != nullptr);
+        std::string out;
+        char buf[512];
+        while (fgets(buf, sizeof(buf), f)) {
+            out += buf;
+        }
+        const int st = pclose(f);
+        const bool died = st != 0;
+        const size_t pd = out.find("[mtp-contiguity] violation");
+        const bool decoded = out.find("NEG-CHILD: draft decode reached") != std::string::npos;
+        check(died && pd != std::string::npos && !decoded,
+              std::string("negative case '") + which + "': aborts with the diagnostic before draft decode");
+        if (pd != std::string::npos) {
+            printf("  neg %-10s -> %s", which, out.substr(pd, out.find('\n', pd) - pd + 1).c_str());
+        } else {
+            printf("  neg %-10s -> NO DIAGNOSTIC (status %d)\n", which, st);
+        }
+    }
+#endif
+}
+
+int main(int argc, char ** argv) {
     llama_log_set(quiet_log, nullptr);
     common_log_set_verbosity_thold(-1);
     llama_backend_init();
 
     gguf_context_ptr meta = make_meta(4096);
+
+    if (argc >= 3 && strcmp(argv[1], "--neg") == 0) {
+        return neg_child(meta.get(), argv[2]); // [TAG_MULTISLOT] disposable negative-case process
+    }
 
     printf("mode: %s%s\n", mtp_qsa_mode() ? "sparse MTP draft (LLAMA_MTP_QSA=1)" : "dense MTP draft",
            getenv("TEST_MTP_GPU") && atoi(getenv("TEST_MTP_GPU")) ? ", GPU device (TEST_MTP_GPU=1)" : "");
@@ -850,6 +1071,19 @@ int main() {
     draft_kv_type_pair(meta.get());
     draft_policy_e2e(meta.get());
     draft_attempt_report(meta.get());
+
+    multi_seq_catchup(meta.get());
+    {
+        // the running binary itself (ctest may pass a relative argv[0])
+        char self[4096] = {};
+#ifndef _WIN32
+        const ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+        if (n <= 0) {
+            snprintf(self, sizeof(self), "%s", argc > 0 ? argv[0] : "test-mtp-catchup");
+        }
+#endif
+        neg_cases(self);
+    }
 
     timing(meta.get());
 

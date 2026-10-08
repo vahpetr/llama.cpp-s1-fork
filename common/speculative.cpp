@@ -1442,6 +1442,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
 
+    // [TAG_MULTISLOT] [mtp-contiguity] proof counters (stage 5.1 item 1): batches checked, of them with > 1 sequence,
+    // rows checked; a violation aborts, so the printed violations count is always 0 (positive coverage is the evidence)
+    uint64_t contig_checks   = 0;
+    uint64_t contig_multi    = 0;
+    uint64_t contig_rows     = 0;
+
     // Hidden rows from the most recent target verification batch, grouped by seq.
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
@@ -1562,6 +1568,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (contig_checks > 0) {
+            print_contiguity();
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1599,6 +1608,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    void print_contiguity() const {
+        SPC_INF("[mtp-contiguity] checks=%llu multi_seq=%llu rows=%llu violations=0\n",
+                (unsigned long long) contig_checks, (unsigned long long) contig_multi, (unsigned long long) contig_rows);
+    }
+
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0) {
             return true;
@@ -1615,17 +1629,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
 
+        // [TAG_MULTISLOT] contiguity (stage 5.1 item 1): the shifted embedding input below and the verify_h extraction
+        // index rows by [i_batch_beg, i_batch_end] per sequence, so every row must carry exactly one in-range seq id,
+        // each id one contiguous run (never re-appearing after it ends), positions +1 inside a run; checked here,
+        // before any draft decode, on the attention-free catch-up too (it shares this entry)
+        int32_t n_runs = 0;
         for (int k = 0; k < n_tokens; ++k) {
+            if (batch_in.n_seq_id[k] != 1) {
+                GGML_ABORT("[mtp-contiguity] violation: row %d has n_seq_id=%d (exactly 1 required)", k, (int) batch_in.n_seq_id[k]);
+            }
+            const llama_seq_id seq_id = batch_in.seq_id[k][0];
+            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+                GGML_ABORT("[mtp-contiguity] violation: row %d seq_id=%d out of range [0, %d)", k, (int) seq_id, (int) n_seq);
+            }
+            const bool new_run = k == 0 || batch_in.seq_id[k - 1][0] != seq_id;
+            if (new_run) {
+                if (i_batch_beg[seq_id] >= 0) {
+                    GGML_ABORT("[mtp-contiguity] violation: row %d seq_id=%d re-appears after its run [%d, %d] ended",
+                            k, (int) seq_id, (int) i_batch_beg[seq_id], (int) i_batch_end[seq_id]);
+                }
+                i_batch_beg[seq_id] = k;
+                n_runs++;
+            } else if (batch_in.pos[k] != batch_in.pos[k - 1] + 1) {
+                GGML_ABORT("[mtp-contiguity] violation: row %d seq_id=%d pos=%d after pos=%d (a run must step by +1)",
+                        k, (int) seq_id, (int) batch_in.pos[k], (int) batch_in.pos[k - 1]);
+            }
+            i_batch_end[seq_id] = k;
+        }
+        {
+            // equivalent count form: the rows of each sequence are exactly its [beg, end] span
+            int32_t n_rows_sum = 0;
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                GGML_ASSERT(batch_in.n_seq_id[k] == 1);
-
-                if (batch_in.seq_id[k][0] == seq_id) {
-                    i_batch_end[seq_id] = k;
-                    if (i_batch_beg[seq_id] < 0) {
-                        i_batch_beg[seq_id] = k;
-                    }
+                if (i_batch_beg[seq_id] >= 0) {
+                    n_rows_sum += i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
                 }
             }
+            GGML_ASSERT(n_rows_sum == n_tokens && "[mtp-contiguity] per-sequence spans do not cover the batch");
+        }
+        contig_checks++;
+        contig_multi += n_runs > 1 ? 1 : 0;
+        contig_rows  += (uint64_t) n_tokens;
+        if (contig_checks % 1024 == 0) {
+            print_contiguity();
         }
 
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -1645,7 +1690,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // assumes that the tokens in the batch are sequential for each sequence
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
-            // TODO:this is generally true, but would be nice to assert it
+            // [TAG_MULTISLOT] asserted above ([mtp-contiguity]); the row at each run start is replaced by its carry below
             {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
