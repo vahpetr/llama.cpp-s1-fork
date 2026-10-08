@@ -7155,6 +7155,45 @@ struct test_top_k : public test_case {
     }
 };
 
+// top_k over rows like log-probabilities: distinct negative values, fewer
+// than k +inf (none for k = 1, so the expected indices are unique) and many
+// -inf (masked tokens)
+struct test_top_k_inf : public test_top_k {
+    test_top_k_inf(std::array<int64_t, 4> ne, int k)
+        : test_top_k(GGML_TYPE_F32, ne, k, false) {}
+
+    std::string vars() override {
+        return test_top_k::vars() + ",inf=1";
+    }
+
+    // compare only the output: the input holds infinities, which err() would
+    // read as indices
+    bool run_whole_graph() override { return true; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<float> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = -1.0f - i;
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                const int n_pinf = k / 2;
+                for (int i = 0; i < t->ne[0]; i++) {
+                    if (i < n_pinf) {
+                        data[i] = INFINITY;
+                    } else if (i % 3 == 0) {
+                        data[i] = -INFINITY;
+                    }
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+            }
+        }
+    }
+};
 // Initialization shared by test_topk_qsa (the six-node chain) and test_qsa_top_k (the single
 // GGML_OP_QSA_TOP_K node): the two feed the SAME selection, so the only way to read one against the
 // other is for them to be filled identically. Tensors are keyed by name - "score", "cell_blk",
@@ -12732,6 +12771,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));
         }
     }
+    for (int k : {1, 10, 40}) {
+        test_cases.emplace_back(new test_top_k_inf({4096, 2, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k_inf({248320, 1, 1, 1}, k));
+    }
+
     for (int i = 0; i < 20; ++i) {
         for (int k : {1, 2, 3, 7, 15, 100, 500, 1023, 9999}) {
             if (k <= 1<<i) {
