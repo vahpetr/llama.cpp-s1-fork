@@ -54,6 +54,10 @@ struct server_disk_cache_entry {
     uint32_t    version = 0;  // payload format as written (a 5 / 6 entry of an adopt source stays 5 / 6)
     std::string src;          // [TAG_DISK_ADOPT] the adopt source's key; empty: the own namespace
     std::string adopted_from; // own entry saved after a load from an adopt source: that source's key
+    // [TAG_PARTIAL_PROMPT] the number of prompt rows the draft history held at save time (.meta "draft_cover"); a load
+    //   with draft_cover < the token count marks the prompt partial. A .meta without it: the token count (its writer
+    //   kept C1), except an own entry with adopted_from (v50rc4 published adopted target-only states): 0
+    int64_t     draft_cover = 0;
 };
 
 // [TAG_DISK_LOAD_RESULT] why a load failed decides what happens to the entry: only an invalid entry (seal / hash /
@@ -144,6 +148,8 @@ struct server_disk_cache {
     uint64_t n_load_failed  = 0; // invalid: the entry was dropped
     uint64_t n_load_capacity = 0; // the state did not fit the free cells: the entry was kept
     uint64_t n_load_other   = 0; // inconclusive: the entry was kept
+    uint64_t n_save_partial        = 0; // [TAG_PARTIAL_PROMPT] saves refused: a partial prompt (C1)
+    uint64_t n_load_partial_cover  = 0; // [TAG_PARTIAL_PROMPT] loads marked partial by draft_cover < n_tokens
     uint64_t n_adopted_target_only = 0; // [TAG_ADOPT_TARGET_ONLY] adopted loads of the target stream only (draft reset)
 
     // [TAG_DISK_ADOPT] --cache-disk-adopt: foreign namespace keys opened read-only as extra load sources (set before

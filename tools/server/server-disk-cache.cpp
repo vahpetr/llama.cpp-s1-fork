@@ -609,6 +609,7 @@ bool server_disk_cache::write_meta(const server_disk_cache_entry & e) const {
         { "t_used",      e.t_used           },
         { "hits",        e.hits             },
         { "has_dft",     e.has_dft          },
+        { "draft_cover", e.draft_cover      }, // [TAG_PARTIAL_PROMPT]
     };
     if (!e.src.empty()) {
         return false; // [TAG_DISK_ADOPT] an adopt source is never written
@@ -769,6 +770,12 @@ sealed_status server_disk_cache::read_entry(const std::string & id, const std::s
         e.t_used  = j.at("t_used").get<int64_t>();
         e.hits    = j.at("hits").get<int32_t>();
         e.has_dft = j.at("has_dft").get<bool>();
+        // [TAG_PARTIAL_PROMPT] older .meta files have no draft_cover: their writers kept C1 (no partial prompt saved),
+        //   except v50rc4, which published adopted target-only states (own namespace, adopted_from set) - unknown cover,
+        //   taken as none
+        e.draft_cover = j.contains("draft_cover") ? j.at("draft_cover").get<int64_t>()
+                      : (fp == fingerprint && !e.adopted_from.empty() && e.has_dft) ? 0
+                      : (int64_t) j.at("n_tokens").get<size_t>();
 
         std::string raw;
         if (const auto st = read_sealed(path(id, ".tok"), raw); st != SEALED_OK) {
@@ -1144,8 +1151,11 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
         DSK_INF("not saving %zu tokens: the state was shifted (not the state of this prefix)\n", n);
         return false;
     }
-    if (prompt.partial && prompt.adopted_from.empty()) { // [TAG_PARTIAL_PROMPT] ([TAG_ADOPT_TARGET_ONLY] publishes)
-        DSK_INF("not saving %zu tokens: a partial prompt (legacy /slots restore, draft side incomplete)\n", n);
+    if (prompt.partial) { // [TAG_PARTIAL_PROMPT] C1: a partial prompt is never saved (an adopted target-only load included)
+        n_save_partial++;
+        DSK_INF("not saving %zu tokens: a partial prompt (legacy /slots restore or adopted target-only load, draft side "
+                "incomplete%s)\n", n, prompt.adopted_from.empty() ? "" : "; re-adopted from the source on return");
+        refresh_status();
         return false;
     }
     if (spec && common_speculative_n_stateful(spec) > 1) {
@@ -1189,6 +1199,8 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     e.version = DISK_CACHE_VERSION;
     e.adopted_from = prompt.adopted_from; // [TAG_DISK_ADOPT] provenance of a resave after an adopted load
     e.has_dft = ctx_dft != nullptr;
+    // [TAG_PARTIAL_PROMPT] the draft history covers every prompt row: a partial prompt never reaches this point (C1)
+    e.draft_cover = (int64_t) n;
 
     uint64_t n_ckpt_written = 0;
     std::vector<server_deep_ref> deep; // (Codex gate r3 Major 5) the committed deep refs: the .aux and e.deep hold the same set
@@ -1732,9 +1744,16 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
     n_loads++;
     prompt.adopted_from = e.src;
     // [TAG_ADOPT_TARGET_ONLY] the draft side is incomplete (empty for the loaded prefix: a sparse MTP draft runs dense
-    //   past its cell window, 86661f3c3); partial together with adopted_from still publishes (save, deep_put): the
-    //   next save writes an own-namespace entry of the live tuple
-    prompt.partial = tgt_only;
+    //   past its cell window, 86661f3c3): partial, so neither saved nor deep-put (C1); the conversation is re-adopted
+    //   from the source on each return until a full recompute clears partial
+    // [TAG_PARTIAL_PROMPT] (defensive) an entry whose draft history did not cover its prompt at save time
+    const bool short_cover = ctx_dft != nullptr && e.has_dft && !tgt_only && e.draft_cover < (int64_t) e.tokens.size();
+    if (short_cover) {
+        n_load_partial_cover++;
+        DSK_WRN("entry %s: draft_cover %" PRId64 " < %zu tokens, the prompt is partial (not published until fully "
+                "recomputed)\n", e.id.c_str(), e.draft_cover, e.tokens.size());
+    }
+    prompt.partial = tgt_only || short_cover;
     if (!e.src.empty()) {
         for (auto & a : adopted) {
             a.hits        += a.key == e.src;
@@ -1869,7 +1888,7 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
 }
 
 void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_checkpoint & c, uint8_t kind) {
-    if (prompt.noncanonical || (prompt.partial && prompt.adopted_from.empty())) { // [TAG_NONCANONICAL] [TAG_PARTIAL_PROMPT]
+    if (prompt.noncanonical || prompt.partial) { // [TAG_NONCANONICAL] [TAG_PARTIAL_PROMPT] C1
         return;
     }
     // below min-step a re-process is cheaper than 113 MiB of disk (a short system prompt, a tiny chat)
@@ -2655,6 +2674,7 @@ void server_disk_cache::refresh_status() {
             { "version",     e.version            },
             { "source",      e.src                },
             { "adopted_from", e.adopted_from      },
+            { "draft_cover", e.draft_cover        }, // [TAG_PARTIAL_PROMPT]
             { "value",       entry_value(e, now_s()) },
         });
     }
@@ -2699,6 +2719,10 @@ void server_disk_cache::refresh_status() {
         { "load_failures_capacity", n_load_capacity },
         { "load_failures_other",    n_load_other    },
         { "adopted_target_only",    n_adopted_target_only },
+        { "saves_refused_partial",  n_save_partial  },
+        { "loads_partial_cover",    n_load_partial_cover },
+        { "n_entries_partial_cover", (size_t) std::count_if(entries.begin(), entries.end(), [](const server_disk_cache_entry & e) {
+                                        return e.has_dft && e.draft_cover < (int64_t) e.tokens.size(); }) },
         { "deep_rewinds",   n_deep_rewinds      },
         { "ckpt_dropped",   n_ckpt_dropped      },
         { "deep_copied",    n_deep_copied       },
