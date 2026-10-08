@@ -456,15 +456,18 @@ struct server_slot {
         } else if (swapped && spec && !common_speculative_set_state(spec, id, carry)) {
             // [TAG_CACHE_COMPAT2] (astra compat2 r2) a RAM swap-in replaced the target + draft states: the drafter's
             //   carry must be the swapped-in prompt's. Not restorable (none saved, several stateful implementations,
-            //   schema mismatch): as the legacy /slots restore - drop the draft sequence and the carry, the prompt
-            //   is partial (not published to the disk cache until fully recomputed)
+            //   schema mismatch): drop the draft sequence and the carry. [TAG_DRAFT_PARTIAL] the target state is
+            //   canonical, only the draft history is gone: the prompt is draft-partial (gap = n_tokens, as the
+            //   target-only adopted load), so it stays reusable and saveable (draft_cover = the rows the draft
+            //   computes after the swap-in) - not `partial`
             common_speculative_reset_state(spec, id);
             if (ctx_dft) {
                 llama_memory_seq_rm(llama_get_memory(ctx_dft), id, -1, -1);
+                prompt.draft_gap = (int32_t) prompt.tokens.size();
             }
-            prompt.partial = prompt.partial || ctx_dft != nullptr;
             SLT_INF(*this, "RAM swap-in of %zu tokens: speculative carry not restorable (%zu bytes) - draft sequence "
-                    "and carry reset%s\n", prompt.tokens.size(), carry.size(), prompt.partial ? ", the prompt is partial" : "");
+                    "and carry reset%s\n", prompt.tokens.size(), carry.size(),
+                    prompt.draft_partial() ? ", the prompt is draft-partial" : "");
         } else if (swapped && spec) {
             SLT_DBG(*this, "RAM swap-in of %zu tokens: speculative carry restored (%zu bytes)\n", prompt.tokens.size(),
                     carry.size());
