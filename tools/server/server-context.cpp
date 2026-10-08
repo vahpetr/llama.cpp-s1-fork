@@ -1590,6 +1590,12 @@ private:
         bool        holes_full_chunk   = false;
         int64_t     hw_cells           = 0;     // resident-cell high-water seen by this server
         bool        deferred_this_iter = false;
+        // [TAG_MULTISLOT] (stage 5.1 item 5a) LLAMA_GTT_CONCURRENT_RESERVE_MIB: a measured, deployment-selected
+        //   reserve for concurrent operations (another slot's verify / restore / checkpoint while this prompt runs),
+        //   added to the projection whenever another slot is processing - also for a zero-growth chunk (hole reuse),
+        //   which is otherwise admitted unconditionally. Constant (never retired by unrelated GTT growth, unlike
+        //   LLAMA_GTT_ONCE_MIB). Default 0 = today's admission bit for bit.
+        double      reserve_mib        = 0.0;
     } adm;
 
     enum admission_result { ADM_ADMIT, ADM_DEFER, ADM_REJECT };
@@ -3460,6 +3466,20 @@ private:
 
     // [TAG_GTT_ADMISSION]
     void admission_init() {
+        // [TAG_MULTISLOT] (item 5a) the shape the calibration applies to: N slots, pool C, graph, KV types, rollback
+        adm.reserve_mib = std::max(0.0, env_double("LLAMA_GTT_CONCURRENT_RESERVE_MIB", 0.0));
+        metrics.admission_n_slots     = slots.size();
+        metrics.admission_reserve_mib = adm.reserve_mib;
+        SRV_INF("admission: shape N = %zu slots, pool C = %u cells (kv_unified = %d), graph n_batch = %u n_ubatch = %u, "
+                "KV types K = %s V = %s, rollback depth = %u, concurrent reserve = %.0f MiB (LLAMA_GTT_CONCURRENT_RESERVE_MIB), "
+                "slope = %s B/cell, once = %s MiB\n",
+                slots.size(), ctx_tgt ? llama_n_ctx(ctx_tgt) : 0, params_base.kv_unified ? 1 : 0,
+                ctx_tgt ? llama_n_batch(ctx_tgt) : 0, ctx_tgt ? llama_n_ubatch(ctx_tgt) : 0,
+                ggml_type_name(params_base.cache_type_k), ggml_type_name(params_base.cache_type_v),
+                ctx_tgt ? llama_n_rs_seq(ctx_tgt) : 0, adm.reserve_mib,
+                getenv("LLAMA_GTT_SLOPE_B_PER_CELL") ? getenv("LLAMA_GTT_SLOPE_B_PER_CELL") : "default",
+                getenv("LLAMA_GTT_ONCE_MIB") ? getenv("LLAMA_GTT_ONCE_MIB") : "0");
+
         adm.bar_mib            = env_double("LLAMA_GTT_ADMISSION_MIB",      0.0);
         adm.slope_b_per_cell   = env_double("LLAMA_GTT_SLOPE_B_PER_CELL",   18432.0);
         adm.staging_b_per_cell = env_double("LLAMA_GTT_STAGING_B_PER_CELL", 2048.0);
@@ -3582,15 +3602,26 @@ private:
         const double once_mib = growth > 0 && adm.once_mib > 0.0
             ? std::max(0.0, adm.once_mib - std::max(0.0, used_mib - adm.used_init_mib)) : 0.0;
 
-        const double projected = used_mib + adm.slope_b_per_cell * (double) growth / 1024.0 / 1024.0 + step_mib + once_mib;
+        // [TAG_MULTISLOT] (item 5a) the concurrent-operation reserve while another slot is processing
+        bool concurrent = false;
+        for (const auto & other : slots) {
+            concurrent |= other.id != slot.id && other.is_processing();
+        }
+        const double reserve_mib = concurrent ? adm.reserve_mib : 0.0;
+
+        const double projected = used_mib + adm.slope_b_per_cell * (double) growth / 1024.0 / 1024.0 + step_mib + once_mib + reserve_mib;
 
         slot.adm_projected_mib = projected;
+        metrics.admission_last_reserve_mib = reserve_mib;
 
         metrics.admission_last_used_mib      = used_mib;
         metrics.admission_last_projected_mib = projected;
 
-        if (growth == 0) {
+        if (growth == 0 && (reserve_mib <= 0.0 || projected <= adm.bar_mib)) {
             return admitted("no new cells past the high-water", projected);
+        }
+        if (growth == 0) {
+            metrics.admission_reserve_deferred_total++; // a zero-growth chunk held back by the concurrent reserve
         }
 
         if (projected <= adm.bar_mib) {
@@ -3620,8 +3651,8 @@ private:
 
         if (slot.adm_t_log_us == 0 || t_now - slot.adm_t_log_us > 10 * 1000 * 1000) {
             slot.adm_t_log_us = t_now;
-            SRV_WRN("admission: deferred slot %d (projected %.0f MiB > bar %.0f MiB: used %.0f + %" PRId64 " new cells x %.0f B + step %.0f + once %.0f; chunk %" PRId64 " tokens, resident %" PRId64 ", high-water %" PRId64 ", waiting %.1f s)\n",
-                    slot.id, projected, adm.bar_mib, used_mib, growth, adm.slope_b_per_cell, step_mib, once_mib,
+            SRV_WRN("admission: deferred slot %d (projected %.0f MiB > bar %.0f MiB: used %.0f + %" PRId64 " new cells x %.0f B + step %.0f + once %.0f + concurrent reserve %.0f; chunk %" PRId64 " tokens, resident %" PRId64 ", high-water %" PRId64 ", waiting %.1f s)\n",
+                    slot.id, projected, adm.bar_mib, used_mib, growth, adm.slope_b_per_cell, step_mib, once_mib, reserve_mib,
                     n_chunk, resident, adm.hw_cells, waited_s);
         }
         return ADM_DEFER;

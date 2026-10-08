@@ -1664,6 +1664,10 @@ std::string server_task_result_metrics::to_metrics() {
             "GTT headroom admission: prompts rejected (503) after waiting longer than LLAMA_GTT_ADMISSION_MAX_WAIT_S",
             (double) metrics.admission_rejected_total
         }, {
+            "admission_reserve_deferred_total",
+            "GTT headroom admission: zero-growth prompt chunks deferred by the concurrent-operation reserve",
+            (double) metrics.admission_reserve_deferred_total
+        }, {
             "disk_cache_saves_total", "Disk prompt cache: conversations written", (double) metrics.disk.n_saves
         }, {
             "disk_cache_loads_total", "Disk prompt cache: conversations loaded instead of re-processed", (double) metrics.disk.n_loads
@@ -1737,6 +1741,18 @@ std::string server_task_result_metrics::to_metrics() {
             "admission_bar_mib",
             "GTT headroom admission: bar in MiB",
             metrics.admission_bar_mib
+        }, {
+            "admission_n_slots",
+            "GTT headroom admission: N, the server's slot count the calibration applies to",
+            (double) metrics.admission_n_slots
+        }, {
+            "admission_reserve_mib",
+            "GTT headroom admission: concurrent-operation reserve in MiB (LLAMA_GTT_CONCURRENT_RESERVE_MIB)",
+            metrics.admission_reserve_mib
+        }, {
+            "admission_last_reserve_mib",
+            "GTT headroom admission: reserve charged by the last check (0 when no other slot was processing)",
+            metrics.admission_last_reserve_mib
         }, {
             "admission_last_used_mib",
             "GTT headroom admission: GTT in use at the last check, MiB",

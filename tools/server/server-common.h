@@ -565,6 +565,11 @@ struct server_metrics {
     double   admission_bar_mib            = 0.0;
     double   admission_last_used_mib      = 0.0;
     double   admission_last_projected_mib = 0.0;
+    // [TAG_MULTISLOT] (stage 5.1 item 5a)
+    uint64_t admission_n_slots                 = 0;   // N (slots.size())
+    uint64_t admission_reserve_deferred_total  = 0;   // zero-growth chunks deferred by the concurrent reserve
+    double   admission_reserve_mib             = 0.0; // LLAMA_GTT_CONCURRENT_RESERVE_MIB
+    double   admission_last_reserve_mib        = 0.0; // the reserve the last check charged (0 without concurrency)
 
     void init() {
         t_start = ggml_time_us();
