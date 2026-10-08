@@ -224,6 +224,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_test(test-qsa-census-inc NAME test-qsa-census-inc-phase ARGS 3000 11 phase LABEL mtp)
     llama_test(test-qsa-census-inc NAME test-qsa-census-inc-phase-whole-blocks ARGS 2000 13 phase LABEL mtp)
     set_tests_properties(test-qsa-census-inc-phase-whole-blocks PROPERTIES ENVIRONMENT "LLAMA_QSA_WHOLE_BLOCKS=1")
+    # [TAG_QSA_WINDOW_MISALIGNED] the sparse MTP draft after a legacy /slots restore (draft sequence dropped): no
+    # abort, the draft runs dense, target logits == LLAMA_MTP_QSA=0; without the restore the draft stays sparse
+    llama_build(test-mtp-qsa-restore.cpp)
+    llama_test(test-mtp-qsa-restore LABEL mtp)
+    set_tests_properties(test-mtp-qsa-restore PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
+    llama_test(test-mtp-qsa-restore NAME test-mtp-qsa-restore-phase LABEL mtp)
+    set_tests_properties(test-mtp-qsa-restore-phase PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_MTP_QSA_PHASE=1")
     llama_build_and_test(test-qwen4exp-hc-norm.cpp) # [TAG_UP28896] RMS_NORM + MUL adjacency, bit identity on the CPU
     llama_build_and_test(test-vk-mmq-knobs.cpp) # [TAG_MMQ_INT8_KNOBS] GGML_VK_MMQ_INT8_MIN_N / _OPS parsers, CPU only
 
