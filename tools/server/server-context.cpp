@@ -239,6 +239,12 @@ struct server_batch {
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
 
+    // [TAG_MULTISLOT] (stage 5.1 item 4a) homogeneous routing ranges of LLAMA_QSA_HOMOGENEOUS=1 (np > 1): the end
+    //   offsets (ascending) of the ranges each decode call is clamped to, and of the whole-slot runs inside them (the
+    //   capacity-retry cut points). Empty = one range = today's chunking.
+    std::vector<int32_t> range_end;
+    std::vector<int32_t> run_end;
+
     server_batch() {
         batch.pos = nullptr; // sentinel: uninitialized batch
     }
@@ -284,6 +290,8 @@ struct server_batch {
         embd.clear();
         common_batch_clear(batch);
         slot_batched      = nullptr;
+        range_end.clear();
+        run_end.clear();
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
         batch_rendered    = false;
@@ -301,6 +309,35 @@ struct server_batch {
     void set_output(int32_t idx, bool output) {
         GGML_ASSERT(idx >= 0 && idx < (int32_t)tokens.size());
         tokens[idx].output = output;
+    }
+
+    // [TAG_MULTISLOT] (item 4a) reorder the unrendered rows: order[new] = old; embedding rows move with their token
+    //   rows. Returns map[old] = new (the caller remaps every stored batch index through it).
+    std::vector<int32_t> permute(const std::vector<int32_t> & order) {
+        GGML_ASSERT(!batch_rendered);
+        GGML_ASSERT((int32_t) order.size() == size());
+        std::vector<int32_t> map(order.size(), -1);
+        std::vector<token> tokens_new;
+        tokens_new.reserve(tokens.size());
+        std::vector<float> embd_new;
+        if (has_embd) {
+            GGML_ASSERT(embd.size() == tokens.size() * (size_t) n_embd);
+            embd_new.reserve(embd.size());
+        }
+        for (size_t i = 0; i < order.size(); ++i) {
+            const int32_t o = order[i];
+            GGML_ASSERT(o >= 0 && o < size() && map[o] == -1);
+            map[o] = (int32_t) i;
+            tokens_new.push_back(tokens[o]);
+            if (has_embd) {
+                embd_new.insert(embd_new.end(), embd.begin() + (size_t) o * n_embd, embd.begin() + (size_t) (o + 1) * n_embd);
+            }
+        }
+        tokens.swap(tokens_new);
+        if (has_embd) {
+            embd.swap(embd_new);
+        }
+        return map;
     }
 
     void render() {
@@ -4408,6 +4445,258 @@ private:
     };
 #endif
 
+    // [TAG_MULTISLOT] (stage 5.1 item 4a) homogeneous routing-class scheduling (LLAMA_QSA_HOMOGENEOUS=1, np > 1).
+    //   The QSA dense/sparse topology is chosen per UBATCH from its deepest sequence (qwen4exp_qsa_depth), also under
+    //   per-stream KV, so sequences below and at/above N = LLAMA_QSA_MIN_KV never share a decode call: after pre_decode()
+    //   appended every slot's run, the whole runs are stable-partitioned into homogeneous ranges and each range is
+    //   decoded, caught up (MTP) and post-decoded on its own. Classes: depth = pos + 1 of a run's rows; below = every
+    //   row < N, above = every row >= N (equality at N is above); a run straddling N, or a slot whose target history
+    //   does not start at 0 / does not continue its cached positions (restore, rewind hole) is a singleton range.
+    //   Runs of <= LLAMA_MTP_QSA_MAX_UBATCH rows are grouped only while the range total stays <= it (the MTP catch-up
+    //   / draft limit counts TOTAL tokens), larger runs only with larger runs. Compatible runs are sorted by slot (=
+    //   sequence / stream) id: split_equal needs consecutive increasing ids.
+    static int64_t qsa_env_min_kv() {
+        static const int64_t v = [] {
+            const char * s = getenv("LLAMA_QSA_MIN_KV");
+            const long long n = s ? atoll(s) : 0;   // same normalisation as qwen4exp_qsa_min_kv()
+            return (int64_t) (n > 0 ? n : 0);
+        }();
+        return v;
+    }
+
+    static int64_t qsa_env_mtp_max_ubatch() {
+        static const int64_t v = [] {
+            const char * s = getenv("LLAMA_MTP_QSA_MAX_UBATCH");
+            const long long n = s ? atoll(s) : 8;   // same normalisation as qwen4exp_mtp_qsa_max_ubatch()
+            return (int64_t) (n > 0 ? n : 0);
+        }();
+        return v;
+    }
+
+    // routing class of a depth interval [d_lo, d_hi] (depth = pos + 1); -1 = straddles N (singleton)
+    static int qsa_route_class(int64_t d_lo, int64_t d_hi) {
+        const int64_t n = qsa_env_min_kv();
+        if (d_lo >= n) {
+            return 1; // above (also N = 0: every sequence is above)
+        }
+        if (d_hi < n) {
+            return 0; // below
+        }
+        return -1;
+    }
+
+    uint64_t qsa_route_rounds   = 0; // rounds with >= 1 range
+    uint64_t qsa_route_mixed    = 0; // rounds with > 1 range
+    uint64_t qsa_route_n_log    = 0;
+    std::string qsa_route_desc;      // the current round's range description (logged per range)
+
+    struct qsa_route_run {
+        int32_t id_slot;
+        std::vector<int32_t> rows;
+        llama_pos p_lo = 0;
+        llama_pos p_hi = 0;
+        int cls = 0;       // 0 below, 1 above, -1 singleton
+        bool big = false;  // more rows than LLAMA_MTP_QSA_MAX_UBATCH
+    };
+
+    void qsa_route_partition() {
+        batch.range_end.clear();
+        batch.run_end.clear();
+        if (!multislot_strict || batch.size() == 0) {
+            return;
+        }
+
+        // whole runs per slot, in the order of first appearance (within-slot order preserved)
+        std::vector<qsa_route_run> runs;
+        std::vector<int32_t> run_of(slots.size(), -1);
+        for (int32_t i = 0; i < batch.size(); ++i) {
+            const auto & t = batch.tokens[i];
+            GGML_ASSERT(t.id_slot >= 0 && t.id_slot < (int32_t) slots.size());
+            int32_t & r = run_of[t.id_slot];
+            if (r < 0) {
+                r = (int32_t) runs.size();
+                runs.push_back({ t.id_slot, {}, t.pos, t.pos });
+            }
+            auto & run = runs[r];
+            run.rows.push_back(i);
+            run.p_lo = std::min(run.p_lo, t.pos);
+            run.p_hi = std::max(run.p_hi, t.pos);
+        }
+
+        const int64_t max_ub = qsa_env_mtp_max_ubatch();
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        for (auto & run : runs) {
+            run.cls = qsa_route_class((int64_t) run.p_lo + 1, (int64_t) run.p_hi + 1);
+            run.big = max_ub > 0 && (int64_t) run.rows.size() > max_ub;
+            // partial target history: not starting at 0, or not continuing the cached positions
+            const llama_pos c_min = llama_memory_seq_pos_min(mem, run.id_slot);
+            const llama_pos c_max = llama_memory_seq_pos_max(mem, run.id_slot);
+            if (c_min > 0 || (c_max >= 0 && run.p_lo != c_max + 1) || (c_max < 0 && run.p_lo != 0)) {
+                run.cls = -1;
+            }
+        }
+
+        // groups: singletons alone; (class, big) groups sorted by slot id, small ones chunked at max_ub total rows;
+        // groups ordered by their first run's original position
+        std::vector<std::vector<int32_t>> groups;
+        {
+            std::vector<int32_t> by_id(runs.size());
+            for (size_t r = 0; r < runs.size(); ++r) {
+                by_id[r] = (int32_t) r;
+            }
+            std::stable_sort(by_id.begin(), by_id.end(), [&](int32_t a, int32_t b) { return runs[a].id_slot < runs[b].id_slot; });
+
+            std::vector<std::pair<int32_t, std::vector<int32_t>>> tagged; // (first original row, runs)
+            for (int key = 0; key < 4; ++key) {
+                const int  cls = key >> 1;
+                const bool big = key & 1;
+                std::vector<int32_t> cur;
+                int64_t cur_rows = 0;
+                auto flush = [&]() {
+                    if (!cur.empty()) {
+                        int32_t first = INT32_MAX;
+                        for (int32_t r : cur) {
+                            first = std::min(first, runs[r].rows.front());
+                        }
+                        tagged.emplace_back(first, cur);
+                        cur.clear();
+                        cur_rows = 0;
+                    }
+                };
+                for (int32_t r : by_id) {
+                    if (runs[r].cls != cls || runs[r].big != big) {
+                        continue;
+                    }
+                    const int64_t n = (int64_t) runs[r].rows.size();
+                    if (!big && max_ub > 0 && cur_rows + n > max_ub) {
+                        flush();
+                    }
+                    cur.push_back(r);
+                    cur_rows += n;
+                }
+                flush();
+            }
+            for (size_t r = 0; r < runs.size(); ++r) {
+                if (runs[r].cls < 0) {
+                    tagged.emplace_back(runs[r].rows.front(), std::vector<int32_t>{ (int32_t) r });
+                }
+            }
+            std::stable_sort(tagged.begin(), tagged.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+            for (auto & t : tagged) {
+                groups.push_back(std::move(t.second));
+            }
+        }
+
+        std::vector<int32_t> order;
+        order.reserve(batch.size());
+        qsa_route_desc.clear();
+        for (const auto & g : groups) {
+            std::string gd;
+            for (int32_t r : g) {
+                const auto & run = runs[r];
+                order.insert(order.end(), run.rows.begin(), run.rows.end());
+                batch.run_end.push_back((int32_t) order.size());
+                gd += string_format("%s%d:%d-%d", gd.empty() ? "" : ",", run.id_slot, (int) run.p_lo, (int) run.p_hi);
+            }
+            const int cls = runs[g.front()].cls;
+            qsa_route_desc += string_format(" {%s %s}", cls < 0 ? "single" : cls ? "above" : "below", gd.c_str());
+            batch.range_end.push_back((int32_t) order.size());
+        }
+        GGML_ASSERT((int32_t) order.size() == batch.size());
+
+        const auto map = batch.permute(order);
+        for (auto & slot : slots) {
+            if (slot.i_batch >= 0 && slot.i_batch < (int32_t) map.size()) {
+                slot.i_batch = map[slot.i_batch];
+            }
+            for (auto & i : slot.spec_i_batch) {
+                GGML_ASSERT(i >= 0 && i < (int32_t) map.size());
+                i = map[i];
+            }
+        }
+
+        qsa_route_rounds++;
+        if (groups.size() > 1) {
+            qsa_route_mixed++;
+        }
+    }
+
+    // [TAG_MULTISLOT] (item 4a) routing groups of the drafting slots: a draft step's row of a slot sits at n_past + i
+    //   (i < n_max), depth n_past + 1 .. n_past + n_max; a proposal whose possible range straddles N, or a slot with a
+    //   partial target history, drafts alone; a group holds at most LLAMA_MTP_QSA_MAX_UBATCH slots (one row each per
+    //   step, TOTAL tokens); sorted by slot id
+    std::vector<std::vector<server_slot *>> qsa_route_draft_groups(const std::vector<server_slot *> & drafting) {
+        const int64_t max_ub = qsa_env_mtp_max_ubatch();
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        std::vector<server_slot *> sorted(drafting);
+        std::stable_sort(sorted.begin(), sorted.end(), [](const server_slot * a, const server_slot * b) { return a->id < b->id; });
+
+        std::vector<std::vector<server_slot *>> res;
+        std::vector<server_slot *> cls_groups[2];
+        std::string desc;
+        for (server_slot * s : sorted) {
+            const auto & dp = common_speculative_get_draft_params(spec.get(), s->id);
+            const int64_t n_max = dp.n_max > 0 ? dp.n_max : std::max(1, params_base.speculative.draft.n_max);
+            int cls = qsa_route_class((int64_t) dp.n_past + 1, (int64_t) dp.n_past + n_max);
+            if (llama_memory_seq_pos_min(mem, s->id) > 0) {
+                cls = -1;
+            }
+            desc += string_format(" %d:%d+%d=%s", s->id, (int) dp.n_past, (int) n_max, cls < 0 ? "single" : cls ? "above" : "below");
+            if (cls < 0) {
+                res.push_back({ s });
+                continue;
+            }
+            auto & g = cls_groups[cls];
+            if (max_ub > 0 && (int64_t) g.size() >= max_ub) {
+                res.push_back(g);
+                g.clear();
+            }
+            g.push_back(s);
+        }
+        for (auto & g : cls_groups) {
+            if (!g.empty()) {
+                res.push_back(g);
+            }
+        }
+        if (res.size() > 1 && (qsa_route_n_log < 64 || qsa_route_n_log % 256 == 0)) {
+            SRV_INF("[qsa-route] draft groups=%zu:%s\n", res.size(), desc.c_str());
+        }
+        return res;
+    }
+
+    // [TAG_MULTISLOT] (item 4a) the decode length at off: clamped to its routing range; on a capacity retry
+    //   (n_batch < the rest of the range) cut at a whole-slot run - a run that alone exceeds n_batch may only be split
+    //   when it has at most one output row (a prompt chunk), never a verification run
+    int32_t qsa_route_clamp(int32_t off, int32_t n_tokens) const {
+        if (batch.range_end.empty()) {
+            return n_tokens;
+        }
+        const int32_t r_end = *std::upper_bound(batch.range_end.begin(), batch.range_end.end(), off);
+        if (off + n_tokens >= r_end) {
+            return r_end - off;
+        }
+        int32_t cut = off;
+        for (const int32_t e : batch.run_end) {
+            if (e > off && e - off <= n_tokens) {
+                cut = e;
+            }
+        }
+        if (cut > off) {
+            return cut - off;
+        }
+        // the run at off is longer than n_batch
+        const int32_t e = *std::upper_bound(batch.run_end.begin(), batch.run_end.end(), off);
+        int n_out = 0;
+        for (int32_t i = off; i < e; ++i) {
+            n_out += batch.tokens[i].output ? 1 : 0;
+        }
+        if (n_out > 1) {
+            throw std::runtime_error(string_format("[qsa-route] the verification run of slot %d (%d rows) does not fit n_batch %d",
+                    batch.tokens[off].id_slot, e - off, n_tokens));
+        }
+        return n_tokens;
+    }
+
     void update_slots() {
         slots_invalidated.clear();
 
@@ -4475,6 +4764,7 @@ private:
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
+            qsa_route_partition(); // [TAG_MULTISLOT] (item 4a) before rendering
             batch.render();
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
@@ -4517,13 +4807,27 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
+                n_tokens = qsa_route_clamp(off, n_tokens); // [TAG_MULTISLOT] (item 4a)
+
                 batch_view = batch.get_view(off, n_tokens);
                 bool ok = decode(n_batch, off, batch_view);
+                if (!batch.range_end.empty() && (qsa_route_n_log < 64 || qsa_route_n_log % 256 == 0 || !ok)) {
+                    std::string ids;
+                    for (int32_t i = off; i < off + n_tokens; ++i) {
+                        if (i == off || batch.tokens[i].id_slot != batch.tokens[i - 1].id_slot) {
+                            ids += string_format("%s%d@%d", ids.empty() ? "" : ",", batch.tokens[i].id_slot, (int) batch.tokens[i].pos);
+                        }
+                    }
+                    SRV_INF("[qsa-route] round=%" PRIu64 " ranges=%zu off=%d n=%d slots=[%s] decode=%s (mixed rounds %" PRIu64 ") plan:%s\n",
+                            qsa_route_rounds, batch.range_end.size(), off, n_tokens, ids.c_str(), ok ? "ok" : "retry",
+                            qsa_route_mixed, qsa_route_desc.c_str());
+                }
+                qsa_route_n_log++;
                 if (ok && dbg_fault == 2 && batch_view.n_tokens == 1) { // the first generation step
                     dbg_fault = 0;
                     throw std::runtime_error("debug fault: decode");
@@ -4811,9 +5115,30 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             const int64_t t_draft0 = ggml_time_us(); // [TAG_SPEC_ROUND_TIMING]
-            queue_tasks.yield_to_queue([&]() {
-                common_speculative_draft(spec.get());
-            });
+            // [TAG_MULTISLOT] (item 4a) draft generation homogeneous too: the draft decode steps put one row per drafting
+            //   sequence into one ubatch (common/speculative.cpp), so the drafting slots run in the same routing groups
+            //   - one common_speculative_draft() per group with only its members' dparams.drafting enabled. The wrapper
+            //   resets every flag to false at its end, so a later group re-enables only its own (not yet run, empty
+            //   result) members; a completed proposal is never re-enabled.
+            std::vector<std::vector<server_slot *>> dgroups;
+            if (multislot_strict && drafting.size() > 1) {
+                dgroups = qsa_route_draft_groups(drafting);
+            } else {
+                dgroups.push_back(drafting);
+            }
+            for (size_t g = 0; g < dgroups.size(); ++g) {
+                if (dgroups.size() > 1) {
+                    for (server_slot * s : drafting) {
+                        auto & dp = common_speculative_get_draft_params(spec.get(), s->id);
+                        const bool member = std::find(dgroups[g].begin(), dgroups[g].end(), s) != dgroups[g].end();
+                        GGML_ASSERT(!member || dp.result->empty()); // not yet drafted
+                        dp.drafting = member;
+                    }
+                }
+                queue_tasks.yield_to_queue([&]() {
+                    common_speculative_draft(spec.get());
+                });
+            }
             spec_rt.draft_us += ggml_time_us() - t_draft0;
             for (const server_slot * s : drafting) {
                 spec_rt.slot_ids.push_back(s->id);
@@ -5909,10 +6234,15 @@ private:
                 dbg_fault = 0;
                 throw std::runtime_error("debug fault: slot");
             }
+            // [TAG_MULTISLOT] (item 4a) a slot whose verification rows are all outside this view is not part of it
+            //   (another routing range); a participating slot must have ALL its rows here (never split)
+            size_t n_inside = 0;
             for (auto & i : slot.spec_i_batch) {
-                if (!is_inside_view(i)) {
-                    throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
-                }
+                n_inside += is_inside_view(i) ? 1 : 0;
+            }
+            if (n_inside > 0 && n_inside < slot.spec_i_batch.size()) {
+                throw std::runtime_error(string_format("speculative batch indices of slot %d are split across sub-batches (%zu of %zu inside [%d, %d))",
+                        slot.id, n_inside, slot.spec_i_batch.size(), off, off + n_batch_tokens));
             }
         });
 
@@ -6020,6 +6350,18 @@ private:
                 return;
             }
 
+            // [TAG_MULTISLOT] (item 4a) only the slots verified in this view (all rows inside, checked above)
+            if (!is_inside_view(slot.spec_i_batch.front())) {
+                return;
+            }
+
+            // the samplers read the logits of the last decode = this view: view-local indices (global - off); the
+            // stored indices stay global until here (identical to before when the view starts at 0)
+            std::vector<int32_t> spec_i_view(slot.spec_i_batch);
+            for (auto & i : spec_i_view) {
+                i -= off;
+            }
+
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();
 
@@ -6032,11 +6374,11 @@ private:
                 std::vector<llama_token> accepted;
                 if (!synth_probs.empty()) {
                     accepted = server_sample_and_accept_synth(
-                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            slot.smpl.get(), slot.ctx_tgt, spec_i_view, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_n_committed);
                 } else if (slot.spec_is_replay) {
                     int n_mismatch = 0;
-                    accepted = server_sample_and_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                    accepted = server_sample_and_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_view, slot.spec_draft,
                             slot.spec_n_committed, trace > 0, n_mismatch);
                     if (n_mismatch > 0) {
                         // would have been rejected again by the old code -> checkpoint restore -> replay -> ... (livelock)
@@ -6045,7 +6387,7 @@ private:
                         slot.stats.n_replay_mismatch += n_mismatch;
                     }
                 } else {
-                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_view, slot.spec_draft);
                 }
                 slot.spec_i_batch.clear();
 
