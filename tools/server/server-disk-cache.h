@@ -83,7 +83,9 @@ struct server_deep_ckpt_meta {
 
 // the structural identity of a disk-cache fingerprint (named, length-delimited fields; shard identity arrays) for
 //   adoption eligibility; "" with *why set when it does not parse unambiguously
-std::string server_disk_cache_fingerprint_structure(const std::string & fp, std::string * why = nullptr);
+// draft_kv = false: the draft KV types (dk / dv) are left out ([TAG_ADOPT_TARGET_ONLY]: a source that differs only there
+//   is adopted for target-only loads - the draft stream's descriptor names its KV types, so it never loads)
+std::string server_disk_cache_fingerprint_structure(const std::string & fp, std::string * why = nullptr, bool draft_kv = true);
 
 struct server_disk_cache {
     server_disk_cache(std::string dir, uint64_t quota_bytes, int32_t min_tokens, int32_t ttl_days,
@@ -142,6 +144,7 @@ struct server_disk_cache {
     uint64_t n_load_failed  = 0; // invalid: the entry was dropped
     uint64_t n_load_capacity = 0; // the state did not fit the free cells: the entry was kept
     uint64_t n_load_other   = 0; // inconclusive: the entry was kept
+    uint64_t n_adopted_target_only = 0; // [TAG_ADOPT_TARGET_ONLY] adopted loads of the target stream only (draft reset)
 
     // [TAG_DISK_ADOPT] --cache-disk-adopt: foreign namespace keys opened read-only as extra load sources (set before
     //   init()); eligibility (structural fingerprint part) at init, usability at load
@@ -210,6 +213,8 @@ struct server_disk_cache {
         size_t      n_entries = 0;
         uint64_t    hits = 0;
         uint64_t    dropped = 0; // entries whose load failed invalid: no longer eligible (files kept)
+        uint64_t    target_only = 0; // [TAG_ADOPT_TARGET_ONLY] hits that loaded the target stream only
+        bool        draft_kv_differs = false; // its draft KV types differ: its entries can only load target-only
     };
     std::vector<adopt_src> adopted;
     std::map<std::string, std::string> src_dir_of; // adopt entry id -> its directory
@@ -271,6 +276,10 @@ struct server_disk_cache {
                                         const std::string & env_h, bool legacy_ok);
     static bool read_map_keys(const std::string & map_path, std::vector<std::string> & keys, sealed_status * st = nullptr);
     server_disk_load_result verify_stream(const std::string & map_path, const std::string & env_h, bool legacy_ok);
+    // [TAG_ADOPT_TARGET_ONLY] an adopt source's entry whose .tgt envelope names this target descriptor while its .dft
+    //   envelope names another draft descriptor (or envelope version): its target stream alone is loadable
+    bool target_only(const server_disk_cache_entry & e) const;
+    bool draft_kv_src(const server_disk_cache_entry & e) const; // its adopt source differs in the draft KV types
     void drop_invalid(int idx); // erase an invalid entry, count it, collect what it alone referenced
     void blob_gc();
 

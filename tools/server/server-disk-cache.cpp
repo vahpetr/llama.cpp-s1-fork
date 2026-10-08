@@ -1144,7 +1144,7 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
         DSK_INF("not saving %zu tokens: the state was shifted (not the state of this prefix)\n", n);
         return false;
     }
-    if (prompt.partial) { // [TAG_PARTIAL_PROMPT]
+    if (prompt.partial && prompt.adopted_from.empty()) { // [TAG_PARTIAL_PROMPT] ([TAG_ADOPT_TARGET_ONLY] publishes)
         DSK_INF("not saving %zu tokens: a partial prompt (legacy /slots restore, draft side incomplete)\n", n);
         return false;
     }
@@ -1434,6 +1434,37 @@ void server_disk_cache::drop_invalid(int idx) {
     blob_gc();
 }
 
+// [TAG_ADOPT_TARGET_ONLY] the envelope of a stream map: 1 = read (ver, h set), 0 = no envelope (legacy map) or not
+//   readable - the strict path decides then
+static int read_stream_env(const std::string & map_path, uint32_t & ver, std::string & h) {
+    std::ifstream fm(map_path, std::ios::binary);
+    uint32_t magic = 0;
+    if (!fm.is_open() || !get_le(fm, magic) || magic != MAP_ENV_MAGIC || !get_le(fm, ver) || !get_str_le(fm, h)) {
+        return 0;
+    }
+    return 1;
+}
+
+bool server_disk_cache::draft_kv_src(const server_disk_cache_entry & e) const {
+    return !e.src.empty() && std::any_of(adopted.begin(), adopted.end(),
+                                         [&](const adopt_src & a) { return a.key == e.src && a.draft_kv_differs; });
+}
+
+bool server_disk_cache::target_only(const server_disk_cache_entry & e) const {
+    if (e.src.empty() || !e.has_dft) {
+        return false; // own namespace: both streams must match (strict)
+    }
+    uint32_t tv = 0, dv = 0;
+    std::string th, dh;
+    if (!read_stream_env(path(e.id, ".tgt"), tv, th) || tv != ENVELOPE_VERSION || th != desc_tgt_h) {
+        return false;
+    }
+    if (!read_stream_env(path(e.id, ".dft"), dv, dh)) {
+        return false;
+    }
+    return dv != ENVELOPE_VERSION || dh != desc_dft_h;
+}
+
 server_disk_load_result server_disk_cache::verify_stream(const std::string & map_path, const std::string & env_h,
                                                          bool legacy_ok) {
     std::ifstream fm;
@@ -1521,7 +1552,11 @@ server_disk_load_result server_disk_cache::verify(int idx) {
     const std::string id = e.id;
 
     server_disk_load_result res = SERVER_DISK_LOAD_OK;
-    {
+    const bool tgt_only = target_only(e); // [TAG_ADOPT_TARGET_ONLY] what load() reads: .aux + .tgt
+    if (!tgt_only && e.has_dft && draft_kv_src(e)) {
+        res = SERVER_DISK_LOAD_INVALID; // [TAG_ADOPT_TARGET_ONLY] its draft stream never loads (another draft KV type)
+    }
+    if (res == SERVER_DISK_LOAD_OK) {
         std::list<common_prompt_checkpoint> checkpoints;
         std::vector<uint8_t> spec_state;
         std::vector<server_deep_ref> deep;
@@ -1538,7 +1573,7 @@ server_disk_load_result server_disk_cache::verify(int idx) {
             res = SERVER_DISK_LOAD_INVALID;
         }
         // the prompt checkpoints load() restores: present in the index and sealed intact
-        for (size_t i = 0; res == SERVER_DISK_LOAD_OK && i < keys.size(); i++) {
+        for (size_t i = 0; !tgt_only && res == SERVER_DISK_LOAD_OK && i < keys.size(); i++) {
             const auto it = ckpts.find(keys[i]);
             if (it == ckpts.end()) {
                 res = SERVER_DISK_LOAD_INVALID;
@@ -1554,7 +1589,7 @@ server_disk_load_result server_disk_cache::verify(int idx) {
     if (res == SERVER_DISK_LOAD_OK) {
         res = verify_stream(path(id, ".tgt"), desc_tgt_h, !e.src.empty());
     }
-    if (res == SERVER_DISK_LOAD_OK && e.has_dft) {
+    if (res == SERVER_DISK_LOAD_OK && e.has_dft && !tgt_only) {
         res = verify_stream(path(id, ".dft"), desc_dft_h, !e.src.empty());
     }
 
@@ -1579,6 +1614,21 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
     std::vector<uint8_t> spec_state;
     std::vector<server_deep_ref> deep;
     std::vector<int32_t> user_starts;
+    // [TAG_ADOPT_TARGET_ONLY] an adopt source's entry whose target stream matches this target while its draft stream
+    //   (format / descriptor) does not: the target stream loads, the draft side is reset like a legacy /slots restore
+    //   ([TAG_PARTIAL_PROMPT]); the prompt checkpoints and deep refs (their envelope names the source's combined
+    //   descriptor, draft included) are left out. Own-namespace entries keep the strict rule (both streams).
+    const bool tgt_only = ctx_dft != nullptr && target_only(e);
+    size_t keys_left_out = 0;
+    if (!tgt_only && ctx_dft && e.has_dft && draft_kv_src(e)) {
+        // a source adopted for target-only loads (its draft KV types differ) whose entry does not qualify (a target
+        //   descriptor mismatch, an envelope-less legacy stream): its draft stream must never reach this draft context
+        DSK_WRN("entry %s: its source's draft KV types differ and its target stream does not load alone, dropping it "
+                "from the adopt sources (its files stay)\n", e.id.c_str());
+        drop_invalid(idx);
+        refresh_status();
+        return SERVER_DISK_LOAD_INVALID;
+    }
     // [TAG_DISK_READ_STATUS] only verified damage (aux_invalid) drops the entry; an I/O or allocation failure while
     //   reading the .aux or a checkpoint file is inconclusive: the entry and its files stay
     struct aux_invalid : std::runtime_error {
@@ -1592,6 +1642,11 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
         }
         if (st != SEALED_OK || keys.size() != checkpoints.size()) {
             throw aux_invalid("truncated or corrupt");
+        }
+        if (tgt_only) {
+            keys_left_out = keys.size();
+            checkpoints.clear();
+            deep.clear();
         }
         size_t i = 0;
         for (auto & c : checkpoints) {
@@ -1624,7 +1679,7 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
     server_disk_load_result res = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), desc_tgt_h, !e.src.empty());
     if (res == SERVER_DISK_LOAD_OK && ctx_dft) {
         llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
-        res = e.has_dft ? load_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_h, !e.src.empty()) : SERVER_DISK_LOAD_INVALID;
+        res = tgt_only ? SERVER_DISK_LOAD_OK : e.has_dft ? load_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_h, !e.src.empty()) : SERVER_DISK_LOAD_INVALID;
     }
     if (res != SERVER_DISK_LOAD_OK) {
         // [TAG_DISK_LOAD_RESULT] the caller clears the slot; only an invalid entry goes
@@ -1643,7 +1698,13 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
         return res;
     }
 
-    if (spec && !common_speculative_set_state(spec, id_slot, spec_state)) {
+    if (tgt_only) {
+        // [TAG_ADOPT_TARGET_ONLY] the series-C reset ([TAG_SPEC_RESET]): the draft sequence was removed above (it stays
+        //   empty), the speculative carry of this sequence is reset; the stored carry is not restored
+        if (spec) {
+            common_speculative_reset_state(spec, id_slot);
+        }
+    } else if (spec && !common_speculative_set_state(spec, id_slot, spec_state)) {
         // (Codex gate r2 Major 1) a half-restored state (streams in, carry not) is worse than a miss: the entry is
         //   invalid (an adopt source's files stay), the caller clears the slot. (Codex gate r3 Major 2) an EMPTY carry
         //   is restorable only for stateless implementations: MTP / eagle3 require theirs
@@ -1670,11 +1731,22 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
     write_meta(e); // a no-op for an adopt source
     n_loads++;
     prompt.adopted_from = e.src;
+    // [TAG_ADOPT_TARGET_ONLY] the draft side is incomplete (empty for the loaded prefix: a sparse MTP draft runs dense
+    //   past its cell window, 86661f3c3); partial together with adopted_from still publishes (save, deep_put): the
+    //   next save writes an own-namespace entry of the live tuple
+    prompt.partial = tgt_only;
     if (!e.src.empty()) {
         for (auto & a : adopted) {
-            a.hits += a.key == e.src;
+            a.hits        += a.key == e.src;
+            a.target_only += a.key == e.src && tgt_only;
         }
-        DSK_INF("adopted load: entry %s from source %s (format %u)\n", e.id.c_str(), e.src.c_str(), e.version);
+        if (tgt_only) {
+            n_adopted_target_only++;
+            DSK_INF("adopted load (target only; draft descriptor mismatch — draft reset): entry %s from source %s "
+                    "(format %u), %zu prompt checkpoints left out\n", e.id.c_str(), e.src.c_str(), e.version, keys_left_out);
+        } else {
+            DSK_INF("adopted load: entry %s from source %s (format %u)\n", e.id.c_str(), e.src.c_str(), e.version);
+        }
     }
     bytes_loaded += e.bytes;
     load_us      += (uint64_t) (ggml_time_us() - t_start);
@@ -1797,7 +1869,7 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
 }
 
 void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_checkpoint & c, uint8_t kind) {
-    if (prompt.noncanonical || prompt.partial) { // [TAG_NONCANONICAL] [TAG_PARTIAL_PROMPT]
+    if (prompt.noncanonical || (prompt.partial && prompt.adopted_from.empty())) { // [TAG_NONCANONICAL] [TAG_PARTIAL_PROMPT]
         return;
     }
     // below min-step a re-process is cheaper than 113 MiB of disk (a short system prompt, a tiny chat)
@@ -2600,7 +2672,8 @@ void server_disk_cache::refresh_status() {
     json al = json::array();
     for (const auto & a : adopted) {
         al.push_back({ { "key", a.key }, { "legacy", a.legacy }, { "n_entries", a.n_entries }, { "hits", a.hits },
-                       { "dropped", a.dropped } });
+                       { "dropped", a.dropped }, { "adopted_target_only", a.target_only },
+                       { "draft_kv_differs", a.draft_kv_differs } });
     }
     json j = {
         { "enabled",        quota > 0           },
@@ -2625,6 +2698,7 @@ void server_disk_cache::refresh_status() {
         { "load_failures",  n_load_failed       },
         { "load_failures_capacity", n_load_capacity },
         { "load_failures_other",    n_load_other    },
+        { "adopted_target_only",    n_adopted_target_only },
         { "deep_rewinds",   n_deep_rewinds      },
         { "ckpt_dropped",   n_ckpt_dropped      },
         { "deep_copied",    n_deep_copied       },
@@ -2845,7 +2919,7 @@ bool server_disk_cache::foreign_protected(const foreign_ns & ns) const {
 //     "<size>:<mtime>" / "unverifiable:<id>"), and the rest (environment knobs, argv) must hold no '|'-delimited file
 //     identity or binary identity - otherwise the boundaries cannot be established and "" is returned (adoption
 //     refused). The number of shard identities after a path follows from its "-00001-of-NNNNN" suffix.
-std::string server_disk_cache_fingerprint_structure(const std::string & fp, std::string * why) {
+std::string server_disk_cache_fingerprint_structure(const std::string & fp, std::string * why, bool draft_kv) {
     const auto fail = [&](const std::string & w) {
         if (why) {
             *why = w;
@@ -2965,7 +3039,9 @@ std::string server_disk_cache_fingerprint_structure(const std::string & fp, std:
             v.find_first_not_of("-0123456789", pre.size()) != std::string::npos) {
             return fail("field " + pre + " does not parse");
         }
-        res += field(name, v.substr(pre.size()));
+        if (draft_kv || (pre != "dk" && pre != "dv")) {
+            res += field(name, v.substr(pre.size()));
+        }
     }
     std::string mp, mid;
     if (!read_path(mp) || !token(mid) || !is_file_id(mid)) {
@@ -3065,9 +3141,16 @@ void server_disk_cache::open_adopt_sources() {
             continue;
         }
         if (src_struct != own_struct) {
-            DSK_WRN("adopt %s refused: its structural part (model / draft / mmproj files, n_ctx, KV types) differs: %s\n",
-                    key.c_str(), src_struct.c_str());
-            continue;
+            // [TAG_ADOPT_TARGET_ONLY] only the draft KV types differ: the target stream may still match this target's
+            //   descriptor (checked per entry at load), the draft stream never does (its descriptor names its KV types)
+            const std::string src_tgt_struct = server_disk_cache_fingerprint_structure(a.fingerprint, nullptr, false);
+            if (src_tgt_struct.empty() || src_tgt_struct != server_disk_cache_fingerprint_structure(fingerprint, nullptr, false)) {
+                DSK_WRN("adopt %s refused: its structural part (model / draft / mmproj files, n_ctx, KV types) differs: %s\n",
+                        key.c_str(), src_struct.c_str());
+                continue;
+            }
+            a.draft_kv_differs = true;
+            DSK_INF("adopt %s: only the draft KV types differ, its entries load target-only (draft reset)\n", key.c_str());
         }
         DSK_INF("adopt %s: structure %s\n", key.c_str(), src_struct.c_str());
         for (const auto & [k, n] : src_blk) {
