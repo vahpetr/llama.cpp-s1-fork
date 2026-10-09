@@ -2326,10 +2326,7 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
         }
     } catch (const aux_invalid & err) {
         DSK_WRN("entry %s: unreadable .aux (%s), dropping it\n", e.id.c_str(), err.what());
-        erase(idx);
-        n_load_failed++;
-        deep_gc(); // [TAG_DISK_GC] the dropped entry's checkpoints and blocks may now be unreferenced
-        blob_gc();
+        drop_invalid(idx); // (R92) an adopted entry counts in its source's `dropped`
         refresh_status();
         return SERVER_DISK_LOAD_INVALID;
     } catch (const std::exception & err) {
@@ -2771,7 +2768,9 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         if (it->second.src_dir.empty()) {
             fs::remove(ckpt_path(key), ec);
         }
+        count_src_ckpt_drop(it->second.src_dir); // (R92) e.g. a state descriptor mismatch of an adopted checkpoint
         ckpts.erase(it);
+        refresh_status();
         return false;
     }
     it->second.t_used = now_s();
@@ -2781,6 +2780,18 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         fs::last_write_time(ckpt_path(key), fs::file_time_type::clock::now(), ec); // t_used survives a restart
     }
     return true;
+}
+
+void server_disk_cache::count_src_ckpt_drop(const std::string & src_dir) {
+    if (src_dir.empty()) {
+        return; // an own checkpoint
+    }
+    for (auto & a : adopted) {
+        if (a.ck_dir == src_dir) {
+            a.dropped++;
+            a.dropped_ckpts++;
+        }
+    }
 }
 
 void server_disk_cache::deep_drop(const std::string & key, const char * why) {
@@ -2793,6 +2804,7 @@ void server_disk_cache::deep_drop(const std::string & key, const char * why) {
         std::error_code ec;
         fs::remove(ckpt_path(key), ec);
     }
+    count_src_ckpt_drop(it->second.src_dir); // (R92)
     ckpts.erase(it);
     n_ckpt_dropped++;
     refresh_status();
@@ -3397,7 +3409,8 @@ void server_disk_cache::refresh_status() {
     json al = json::array();
     for (const auto & a : adopted) {
         al.push_back({ { "key", a.key }, { "legacy", a.legacy }, { "n_entries", a.n_entries }, { "hits", a.hits },
-                       { "dropped", a.dropped }, { "adopted_target_only", a.target_only },
+                       { "dropped", a.dropped }, { "dropped_ckpts", a.dropped_ckpts },
+                       { "adopted_target_only", a.target_only },
                        { "draft_kv_differs", a.draft_kv_differs } });
     }
     json j = {
@@ -3825,6 +3838,7 @@ void server_disk_cache::open_adopt_sources() {
             ckdir  = fs::path(root) / "ckpt";
             a.legacy = true;
         }
+        a.ck_dir = ckdir.string(); // (R92) as server_deep_ckpt_meta::src_dir below
         // [TAG_DISK_READ_STATUS] (Hermes gate Major 1) both listings first: a source that cannot be listed now is
         //   not opened this run (its files are never written either way)
         std::vector<fs::directory_entry> ls_base, ls_ck;

@@ -432,6 +432,79 @@ int main() {
         }
     }
 
+    // (R92) an adopted deep checkpoint dropped at a read for a state descriptor mismatch (balkon: "deep checkpoint
+    //   ... unreadable (state descriptor mismatch (v2 ..., expected v2 ...)), dropping it") counts in the adopt
+    //   source's `dropped` of /disk-cache (it reported 0): source A (descriptor X) stores a deep checkpoint, server B
+    //   (descriptor Y, another key, the same structure) adopts A's namespace and reads it
+    {
+        const fs::path base = fs::temp_directory_path() / ("cache-compat-r92-" + std::to_string(getpid()));
+        const fs::path ra = base / "a", rb = base / "b"; // two roots: the cache root lock is held for the process lifetime
+        std::error_code ec;
+        fs::remove_all(base, ec);
+        server_cache_key_parts px = parts(), py = parts();
+        py.desc_h = "cccccccccccccccc";
+        const std::string fpa = server_disk_cache_fingerprint_v2(cheap_a, px);
+        const std::string fpb = server_disk_cache_fingerprint_v2(cheap_a, py);
+        const std::string ka = fpa.substr(0, 16);
+        CHECK(ka != fpb.substr(0, 16));
+        CHECK(server_disk_cache_fingerprint_structure(fpa) == server_disk_cache_fingerprint_structure(fpb));
+        llama_tokens toks;
+        for (int i = 0; i < 64; i++) {
+            toks.push_back(i + 1);
+        }
+        std::string ck_key;
+        {
+            server_disk_cache a(ra.string(), 1ull << 30, 8, 30, fpa, false, 0.5f, 8, 8);
+            a.set_descriptor(nullptr, nullptr, "carry-x");
+            a.init();
+            server_prompt pr;
+            pr.tokens = server_tokens(toks, false);
+            common_prompt_checkpoint c;
+            c.n_tokens = 32;
+            c.pos_min  = 0;
+            c.pos_max  = 31;
+            c.data_tgt.assign(64, 7);
+            a.deep_put(pr, c, server_deep_ref::DEEP_KIND_ANCHOR);
+            CHECK(pr.deep.size() == 1 && a.n_deep_ckpts() == 1);
+            if (!pr.deep.empty()) {
+                ck_key = pr.deep[0].key;
+            }
+        }
+        // an entry of A (adoption needs one; this one does not read: counted as not adopted at the start)
+        fs::create_directories(rb, ec);
+        fs::copy(ra / ("ns-" + ka), rb / ("ns-" + ka), fs::copy_options::recursive, ec);
+        CHECK(!ec);
+        {
+            std::ofstream m(rb / ("ns-" + ka) / "17081d812d27c40a.meta");
+            m << "{\"fingerprint\":\"" << fpa << "\"}";
+        }
+        server_disk_cache b(rb.string(), 1ull << 30, 8, 30, fpb, false, 0.5f, 8, 8);
+        b.set_descriptor(nullptr, nullptr, "carry-y");
+        b.adopt_keys = { ka };
+        b.init();
+        const auto src = [&]() {
+            const json st = b.status();
+            return st.contains("adopt") && st["adopt"].size() == 1 ? st["adopt"][0] : json();
+        };
+        CHECK(src().value("key", std::string()) == ka);
+        const uint64_t d0 = src().value("dropped", (uint64_t) 0);
+        CHECK(src().value("dropped_ckpts", (uint64_t) 99) == 0);
+        CHECK(b.n_deep_ckpts() == 1);
+        common_prompt_checkpoint out;
+        bool io = false;
+        CHECK(!ck_key.empty() && !b.deep_get(ck_key, out, &io));
+        CHECK(!io);
+        CHECK(b.n_deep_ckpts() == 0);
+        CHECK(src().value("dropped", (uint64_t) 0) == d0 + 1);
+        CHECK(src().value("dropped_ckpts", (uint64_t) 0) == 1);
+        printf("R92 adopt drop: dropped %llu -> %llu, dropped_ckpts %llu\n", (unsigned long long) d0,
+               (unsigned long long) src().value("dropped", (uint64_t) 0),
+               (unsigned long long) src().value("dropped_ckpts", (uint64_t) 0));
+        // the source's file stays (read-only)
+        CHECK(fs::exists(rb / ("ns-" + ka) / "ckpt" / (ck_key + ".ck")));
+        fs::remove_all(base, ec);
+    }
+
     if (n_fail) {
         fprintf(stderr, "%d failure(s)\n", n_fail);
         return 1;
