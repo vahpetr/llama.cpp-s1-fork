@@ -2245,6 +2245,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
     GGML_UNUSED(flags);
 
+    // [TAG_MULTISLOT] per-seq state is stream-count agnostic: the format stays "n_stream, then one cell block per
+    //   stream of the writer" (a per-sequence save fills only the sequence's own stream, the rest are empty blocks),
+    //   and state_read_sinfo accepts any stream count for seq_id >= 0 - so a file written at np1 loads at np2
+    //   per-stream / unified and back. A whole-context save (seq_id == -1) still needs the same stream count.
     io.write(&n_stream, sizeof(n_stream));
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2337,7 +2341,12 @@ const slot_info_vec_t *   sinfos_in) {
 
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
-    if (n_stream_cur != n_stream) {
+
+    // [TAG_MULTISLOT] per-seq state is stream-count agnostic: the file's stream blocks are the WRITER's streams, and
+    //   a per-sequence save holds cells in at most one of them (the sequence's own stream). Any stream count is
+    //   accepted; the one non-empty block goes into this process's stream of seq_id (np1 <-> np2 per-stream <->
+    //   unified). A whole-context restore (seq_id == -1) maps streams one to one, so there the count must match.
+    if (seq_id == -1 ? n_stream_cur != n_stream : (n_stream_cur == 0 || n_stream_cur > LLAMA_MAX_SEQ)) {
         io.set_status(LLAMA_STATE_READ_INVALID);
         throw std::runtime_error("n_stream mismatch");
     }
@@ -2348,13 +2357,17 @@ const slot_info_vec_t *   sinfos_in) {
         clear(true);
     }
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
+    // per-seq: the process stream that received the file's non-empty block (n_stream = none yet)
+    uint32_t strm_read = n_stream;
+
+    for (uint32_t s = 0; s < n_stream_cur; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 
         if (cell_count == 0) {
             // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
-            if (sinfos_in && !(*sinfos_in)[s].empty()) {
+            // (per-seq: the file stream is not a process stream - checked once after the loop)
+            if (seq_id == -1 && sinfos_in && !(*sinfos_in)[s].empty()) {
                 throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
             }
             continue;
@@ -2362,10 +2375,17 @@ const slot_info_vec_t *   sinfos_in) {
 
         const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
 
+        if (seq_id != -1 && strm_read != n_stream) {
+            // [TAG_MULTISLOT] a sequence lives in one stream: a second non-empty block is a damaged / foreign file
+            seq_rm(seq_id, -1, -1);
+            io.set_status(LLAMA_STATE_READ_INVALID);
+            throw std::runtime_error("failed to restore kv cache: per-sequence state holds cells in more than one stream");
+        }
+
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[strm] : nullptr);
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2383,7 +2403,22 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         if (sinfos_out) {
-            (*sinfos_out)[s] = sinfo;
+            (*sinfos_out)[strm] = sinfo;
+        }
+
+        strm_read = strm;
+    }
+
+    // [TAG_MULTISLOT] per-seq: the mirrored layout (indexed by this process's streams, like sinfos_out) may hold cells
+    //   only in the stream this restore filled
+    if (seq_id != -1 && sinfos_in) {
+        for (uint32_t p = 0; p < n_stream; ++p) {
+            if (p != strm_read && !(*sinfos_in)[p].empty()) {
+                if (strm_read != n_stream) {
+                    seq_rm(seq_id, -1, -1);
+                }
+                throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
+            }
         }
     }
 }
