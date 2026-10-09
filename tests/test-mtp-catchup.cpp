@@ -1069,7 +1069,7 @@ struct homog_round_out {
     double ms = 0.0;
 };
 
-static std::vector<std::vector<int32_t>> homog_plan(mtp_env & env, const std::vector<seq_run> & runs) {
+static std::vector<std::vector<int32_t>> homog_plan(mtp_env & env, const std::vector<seq_run> & runs, int64_t max_ub = 8) {
     std::vector<server_qsa_route_run> infos;
     auto * mem = llama_get_memory(env.ctx_tgt.get());
     int32_t row = 0;
@@ -1079,7 +1079,7 @@ static std::vector<std::vector<int32_t>> homog_plan(mtp_env & env, const std::ve
         infos.push_back({ r.seq, (int32_t) r.toks.size(), r.pos0, r.pos0 + (llama_pos) r.toks.size() - 1, partial, row });
         row += (int32_t) r.toks.size();
     }
-    auto groups = server_qsa_route_groups(infos, HOMOG_N, 8);
+    auto groups = server_qsa_route_groups(infos, HOMOG_N, max_ub);
     std::string d;
     for (const auto & g : groups) {
         d += " {";
@@ -1092,12 +1092,12 @@ static std::vector<std::vector<int32_t>> homog_plan(mtp_env & env, const std::ve
     return groups;
 }
 
-static homog_round_out homog_exec(mtp_env & env, const std::vector<seq_run> & runs, bool grouped) {
+static homog_round_out homog_exec(mtp_env & env, const std::vector<seq_run> & runs, bool grouped, int64_t max_ub = 8) {
     homog_round_out out;
     out.logits.resize(runs.size());
     std::vector<std::vector<int32_t>> groups;
     if (grouped) {
-        groups = homog_plan(env, runs);
+        groups = homog_plan(env, runs, max_ub);
     } else {
         for (size_t k = 0; k < runs.size(); ++k) {
             groups.push_back({ (int32_t) k });
@@ -1280,6 +1280,48 @@ static void homog_case(gguf_context * meta, uint32_t n_seq) {
     printf("homogeneous np%u: %d runs, %d byte-identical to solo, max |d| %.2e, mixed rounds %d; two-row round %.2f ms mixed (2 calls) vs %.2f ms same-class (1 call)\n",
            n_seq, n_runs, n_bytes_same, (double) worst, n_mixed_rounds,
            n_ms_mixed ? ms_mixed / n_ms_mixed : 0.0, n_ms_single ? ms_single / n_ms_single : 0.0);
+}
+
+// (r3, astra r2 Minor) the target-range row cap: MAX_UBATCH (8) applies to target ranges only with an attention
+// catch-up or LLAMA_QSA_HOMOGENEOUS_TARGET_CAP=1. With the attention-free catch-up (LLAMA_MTP_CATCHUP_ATTN=0, prod) two
+// same-class 6-row verify runs share ONE target call (+ one catch-up); vs solo: tolerance + equal proposals (R81
+// composition: a 12-row decode vs two 6-row ones rounds differently on CPU)
+static void homog_wide_case(gguf_context * meta) {
+    check(server_qsa_route_target_cap(8, nullptr, "0") == 0, "target cap: attention-free catch-up -> uncapped");
+    check(server_qsa_route_target_cap(8, "1", "0") == 8, "target cap: LLAMA_QSA_HOMOGENEOUS_TARGET_CAP=1 -> 8");
+    check(server_qsa_route_target_cap(8, nullptr, nullptr) == 8, "target cap: catch-up attention unset (default 1) -> 8");
+    check(server_qsa_route_target_cap(8, "0", "1") == 8, "target cap: LLAMA_MTP_CATCHUP_ATTN=1 -> 8");
+    const std::vector<server_qsa_route_run> two6 = { { 0, 6, 70, 75, false, 0 }, { 1, 6, 70, 75, false, 6 } };
+    check(server_qsa_route_groups(two6, HOMOG_N, 0).size() == 1, "planner: two same-class 6-row runs, cap 0 -> one group");
+    check(server_qsa_route_groups(two6, HOMOG_N, 8).size() == 2, "planner: two same-class 6-row runs, cap 8 -> two groups");
+
+    const float TOL = 1e-3f;
+    mtp_env M, S;
+    env_cfg cfg = { "0", GGML_TYPE_F16, 2048, false };
+    cfg.n_seq = 2;
+    init_env(M, meta, cfg);
+    init_env(S, meta, cfg);
+    const int64_t cap = server_qsa_route_target_cap(8, nullptr, "0");
+    for (mtp_env * e : { &M, &S }) {
+        feed_runs(*e, { { 0, tokens(70, 901), 0 } });
+        feed_runs(*e, { { 1, tokens(70, 902), 0 } });
+    }
+    const std::vector<seq_run> runs = { { 0, tokens(6, 903), 70 }, { 1, tokens(6, 904), 70 } };
+    const auto om = homog_exec(M, runs, true, cap);
+    const auto os = homog_exec(S, runs, false);
+    check(om.n_calls == 1, "attention-free catch-up: two same-class 6-row verify runs share one target call (" + std::to_string(om.n_calls) + ")");
+    for (size_t k = 0; k < runs.size(); ++k) {
+        const float d = max_abs_diff(om.logits[k].data(), os.logits[k].data(), om.logits[k].size());
+        check(d <= TOL, "12-row call: seq " + std::to_string(k) + " logits vs solo (max |d| " + std::to_string(d) + ")");
+    }
+    std::vector<std::tuple<llama_seq_id, llama_pos, llama_token>> req = { { 0, 76, runs[0].toks.back() }, { 1, 76, runs[1].toks.back() } };
+    int nc_m = 0, nc_s = 0;
+    const auto dm = homog_drafts(M, req, true, &nc_m);
+    const auto ds = homog_drafts(S, req, false, &nc_s);
+    for (const auto & [q, toks] : dm) {
+        check(toks == ds.at(q), "12-row call: seq " + std::to_string(q) + " draft proposals vs solo");
+    }
+    printf("homogeneous wide: two 6-row runs in %d target call(s), cap %lld\n", om.n_calls, (long long) cap);
 }
 
 // the guard's negative case (disposable child): seq 0 at depth 63 and seq 1 at depth 64 in ONE target ubatch (two
@@ -1505,6 +1547,9 @@ int main(int argc, char ** argv) {
     }
     if (argc >= 3 && strcmp(argv[1], "--homog-child") == 0) {
         homog_case(meta.get(), (uint32_t) atoi(argv[2])); // [TAG_MULTISLOT] item 4
+        if (atoi(argv[2]) == 2) {
+            homog_wide_case(meta.get()); // (r3) the relaxed target cap
+        }
         llama_backend_free();
         return n_fail ? 1 : 0;
     }

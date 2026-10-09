@@ -239,6 +239,13 @@ struct server_qsa_route_run {
 // (LLAMA_MTP_QSA_MAX_UBATCH, 0 = no cap), larger runs only with larger runs; groups ordered by first_row
 std::vector<std::vector<int32_t>> server_qsa_route_groups(const std::vector<server_qsa_route_run> & runs, int64_t n_min, int64_t max_ub);
 
+// (r3, astra r2 Minor) the row cap of TARGET ranges: the MAX_UBATCH limit (max_ub) belongs to the MTP layers, so it
+// applies to a target range only when that range's MTP catch-up runs attention (LLAMA_MTP_CATCHUP_ATTN unset / not
+// "0": combining rows can change the catch-up's QSA topology) or LLAMA_QSA_HOMOGENEOUS_TARGET_CAP=1 (the r2
+// conservative cap); with the attention-free catch-up (prod "0") target ranges are uncapped (0). Draft groups always
+// keep max_ub. Arguments are the raw env values (nullptr = unset).
+int64_t server_qsa_route_target_cap(int64_t max_ub, const char * env_target_cap, const char * env_catchup_attn);
+
 // [TAG_MULTISLOT] (stage 5.1 item 5b, astra r2 Major 2) operation-start gate of LLAMA_GTT_CONCURRENT_RESERVE_MIB: before
 // a slot starts draft / speculative-checkpoint work (device GTT) or a restore allocation (RAM swap-in, disk load,
 // /slots restore) while ANOTHER slot is processing, the live GTT usage + the reserve must stay <= the admission bar;

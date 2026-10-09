@@ -156,6 +156,12 @@ std::vector<std::vector<int32_t>> server_qsa_route_groups(const std::vector<serv
     return groups;
 }
 
+int64_t server_qsa_route_target_cap(int64_t max_ub, const char * env_target_cap, const char * env_catchup_attn) {
+    const bool knob      = env_target_cap != nullptr && strcmp(env_target_cap, "1") == 0;
+    const bool attn_free = env_catchup_attn != nullptr && strcmp(env_catchup_attn, "0") == 0;
+    return knob || !attn_free ? max_ub : 0;
+}
+
 // [TAG_MULTISLOT] (stage 5.1 item 5b, see server-context.h) the operation-start gate
 const char * server_adm_op_name(server_adm_op op) {
     switch (op) {
@@ -2062,6 +2068,10 @@ private:
                 }
             }
             multislot_strict = env.strict;
+            if (multislot_strict) {
+                SRV_INF("[qsa-route] row cap: target ranges %lld, draft groups %lld (0 = none; LLAMA_MTP_QSA_MAX_UBATCH, target cap only with an attention catch-up or LLAMA_QSA_HOMOGENEOUS_TARGET_CAP=1)\n",
+                        (long long) qsa_env_target_max_ubatch(), (long long) qsa_env_mtp_max_ubatch());
+            }
         }
 
         const bool has_draft = params.speculative.has_dft();
@@ -4631,7 +4641,9 @@ private:
     //   row < N, above = every row >= N (equality at N is above); a run straddling N, or a slot whose target history
     //   does not start at 0 / does not continue its cached positions (restore, rewind hole) is a singleton range.
     //   Runs of <= LLAMA_MTP_QSA_MAX_UBATCH rows are grouped only while the range total stays <= it (the MTP catch-up
-    //   / draft limit counts TOTAL tokens), larger runs only with larger runs. Compatible runs are sorted by slot (=
+    //   / draft limit counts TOTAL tokens), larger runs only with larger runs. (r3) Target ranges take that cap only
+    //   when the catch-up runs attention or LLAMA_QSA_HOMOGENEOUS_TARGET_CAP=1 (server_qsa_route_target_cap); drafts
+    //   always. Compatible runs are sorted by slot (=
     //   sequence / stream) id: split_equal needs consecutive increasing ids.
     static int64_t qsa_env_min_kv() {
         static const int64_t v = [] {
@@ -4648,6 +4660,13 @@ private:
             const long long n = s ? atoll(s) : 8;   // same normalisation as qwen4exp_mtp_qsa_max_ubatch()
             return (int64_t) (n > 0 ? n : 0);
         }();
+        return v;
+    }
+
+    // target ranges (r3): the cap only with an attention catch-up or LLAMA_QSA_HOMOGENEOUS_TARGET_CAP=1
+    static int64_t qsa_env_target_max_ubatch() {
+        static const int64_t v = server_qsa_route_target_cap(qsa_env_mtp_max_ubatch(),
+                getenv("LLAMA_QSA_HOMOGENEOUS_TARGET_CAP"), getenv("LLAMA_MTP_CATCHUP_ATTN"));
         return v;
     }
 
@@ -4692,7 +4711,7 @@ private:
             run.p_hi = std::max(run.p_hi, t.pos);
         }
 
-        const int64_t max_ub = qsa_env_mtp_max_ubatch();
+        const int64_t max_ub = qsa_env_target_max_ubatch();
         llama_memory_t mem = llama_get_memory(ctx_tgt);
         for (auto & run : runs) {
             // partial history: a draft-partial prompt (target-only load / adoption, [TAG_DRAFT_PARTIAL]), or rows not
