@@ -219,6 +219,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-mtp-catchup-qsa PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
     llama_test(test-mtp-catchup NAME test-mtp-catchup-qsa-mu0 LABEL mtp)
     set_tests_properties(test-mtp-catchup-qsa-mu0 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_MTP_QSA_MAX_UBATCH=0")
+    # [TAG_MULTISLOT] stage 5.1 item 4: homogeneous routing-class scheduling under per-stream KV, N = 64 (np2 / np4)
+    target_include_directories(test-mtp-catchup PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-mtp-catchup PRIVATE server-context)
+    llama_test(test-mtp-catchup NAME test-mtp-catchup-homog-np2 ARGS --homog 2 LABEL mtp)
+    set_tests_properties(test-mtp-catchup-homog-np2 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_HOMOGENEOUS=1;LLAMA_QSA_MIN_KV=64")
+    llama_test(test-mtp-catchup NAME test-mtp-catchup-homog-np4 ARGS --homog 4 LABEL mtp)
+    set_tests_properties(test-mtp-catchup-homog-np4 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_HOMOGENEOUS=1;LLAMA_QSA_MIN_KV=64")
     # [TAG_MTP_QSA_PHASE] LLAMA_MTP_QSA_PHASE=1: the sparse draft's block phase vs the reference selection (both selection
     # forms of the carrier), and the incremental census == the full one at phase 1
     llama_build_and_test(test-mtp-qsa-phase.cpp LABEL mtp)

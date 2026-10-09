@@ -33,6 +33,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "speculative.h"
+#include "server-context.h" // [TAG_MULTISLOT] item 4a: the routing-class planner
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
@@ -1054,6 +1055,293 @@ static void neg_cases(const char * self) {
 #endif
 }
 
+// [TAG_MULTISLOT] (stage 5.1 item 4) homogeneous routing-class scheduling under per-stream KV (no --kv-unified), run
+// in a child process with LLAMA_QSA_HOMOGENEOUS=1 LLAMA_QSA_MIN_KV=64 + the QSA env (ctest). Each round's runs are
+// planned by the server's planner (server_qsa_route_groups, N = 64, MAX_UBATCH = 8) and executed like the server's
+// ranges: one target decode + MTP catch-up per group; drafts per group with only the members' drafting flags. The
+// model guard ([qsa-routing]) aborts on any mixed-class ubatch, so completing proves mixed=0; the parent parses the
+// exit proof line and asserts multi_seq > 0, below > 0, above > 0. M = grouped, S = each run alone (solo reference).
+static const int64_t HOMOG_N = 64;
+
+struct homog_round_out {
+    std::vector<std::vector<float>> logits; // per run
+    int n_calls = 0;
+    double ms = 0.0;
+};
+
+static std::vector<std::vector<int32_t>> homog_plan(mtp_env & env, const std::vector<seq_run> & runs) {
+    std::vector<server_qsa_route_run> infos;
+    auto * mem = llama_get_memory(env.ctx_tgt.get());
+    int32_t row = 0;
+    for (const auto & r : runs) {
+        const llama_pos c_max = llama_memory_seq_pos_max(mem, r.seq);
+        const bool partial = r.pos0 != c_max + 1; // as the server (pos_min is the recurrent part's latest position)
+        infos.push_back({ r.seq, (int32_t) r.toks.size(), r.pos0, r.pos0 + (llama_pos) r.toks.size() - 1, partial, row });
+        row += (int32_t) r.toks.size();
+    }
+    auto groups = server_qsa_route_groups(infos, HOMOG_N, 8);
+    std::string d;
+    for (const auto & g : groups) {
+        d += " {";
+        for (const int32_t k : g) {
+            d += string_format(" %d:%d-%d%s", infos[k].id_slot, (int) infos[k].p_lo, (int) infos[k].p_hi, infos[k].partial ? "(partial)" : "");
+        }
+        d += " }";
+    }
+    printf("  plan:%s\n", d.c_str());
+    return groups;
+}
+
+static homog_round_out homog_exec(mtp_env & env, const std::vector<seq_run> & runs, bool grouped) {
+    homog_round_out out;
+    out.logits.resize(runs.size());
+    std::vector<std::vector<int32_t>> groups;
+    if (grouped) {
+        groups = homog_plan(env, runs);
+    } else {
+        for (size_t k = 0; k < runs.size(); ++k) {
+            groups.push_back({ (int32_t) k });
+        }
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    for (const auto & g : groups) {
+        std::vector<seq_run> part;
+        for (const int32_t k : g) {
+            part.push_back(runs[k]);
+        }
+        const auto l = feed_runs(env, part);
+        for (size_t j = 0; j < g.size(); ++j) {
+            out.logits[g[j]] = l[j];
+        }
+        out.n_calls++;
+    }
+    out.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return out;
+}
+
+// drafts of several sequences: grouped like the server (one common_speculative_draft per group, only its members'
+// drafting flags), or one sequence per call (solo)
+static std::map<llama_seq_id, std::vector<llama_token>> homog_drafts(mtp_env & env,
+        const std::vector<std::tuple<llama_seq_id, llama_pos, llama_token>> & req, bool grouped, int * n_calls) {
+    std::map<llama_seq_id, std::vector<llama_token>> res;
+    const int n_max = env.params.draft.n_max;
+    std::vector<server_qsa_route_run> infos;
+    for (size_t k = 0; k < req.size(); ++k) {
+        const auto & [s, n_past, id] = req[k];
+        res[s] = {};
+        infos.push_back({ s, 1, n_past, n_past + n_max - 1, false, (int32_t) k });
+    }
+    std::vector<std::vector<int32_t>> groups;
+    if (grouped) {
+        groups = server_qsa_route_groups(infos, HOMOG_N, 8);
+    } else {
+        for (size_t k = 0; k < req.size(); ++k) {
+            groups.push_back({ (int32_t) k });
+        }
+    }
+    for (const auto & g : groups) {
+        for (const int32_t k : g) {
+            const auto & [s, n_past, id] = req[k];
+            auto & dp = common_speculative_get_draft_params(env.spec, s);
+            dp.drafting = true;
+            dp.n_max    = -1;
+            dp.n_past   = n_past;
+            dp.id_last  = id;
+            dp.prompt   = nullptr;
+            dp.result   = &res[s];
+        }
+        common_speculative_draft(env.spec);
+        (*n_calls)++;
+    }
+    for (const auto & [s, n_past, id] : req) {
+        llama_memory_seq_rm(llama_get_memory(env.ctx_dft.get()), s, n_past, -1);
+    }
+    return res;
+}
+
+static void homog_case(gguf_context * meta, uint32_t n_seq) {
+    const float TOL = 1e-3f;
+    mtp_env M, S;
+    env_cfg cfg = { "", GGML_TYPE_F16, 1024 * n_seq, false };
+    cfg.n_seq = n_seq;
+    init_env(M, meta, cfg);
+    init_env(S, meta, cfg);
+    GGML_ASSERT(!llama_context_default_params().kv_unified && "per-stream KV expected");
+
+    std::vector<llama_pos> pos(n_seq, 0);
+    std::vector<llama_token> last(n_seq, 0);
+    uint32_t seed = 500;
+    int n_bytes_same = 0, n_runs = 0, n_mixed_rounds = 0;
+    float worst = 0.0f;
+    double ms_mixed = 0.0, ms_single = 0.0;
+    int n_ms_mixed = 0, n_ms_single = 0;
+
+    // one round: shape = (seq, n rows); expect = expected decode calls of the grouped execution
+    const auto round = [&](const std::string & what, const std::vector<std::pair<llama_seq_id, size_t>> & shape, int expect) {
+        std::vector<seq_run> runs;
+        for (const auto & [s, n] : shape) {
+            runs.push_back({ s, tokens(n, seed++), pos[s] });
+            pos[s] += (llama_pos) n;
+            last[s] = runs.back().toks.back();
+        }
+        const auto om = homog_exec(M, runs, true);
+        const auto os = homog_exec(S, runs, false);
+        check(om.n_calls == expect, what + ": " + std::to_string(om.n_calls) + " decode calls (expected " + std::to_string(expect) + ")");
+        if (om.n_calls > 1) {
+            n_mixed_rounds++;
+        }
+        if (shape.size() == 2 && shape[0].second == 1 && shape[1].second == 1) { // two single rows: the cost probe
+            (om.n_calls > 1 ? ms_mixed : ms_single) += om.ms;
+            (om.n_calls > 1 ? n_ms_mixed : n_ms_single)++;
+        }
+        for (size_t k = 0; k < runs.size(); ++k) {
+            const float d = max_abs_diff(om.logits[k].data(), os.logits[k].data(), om.logits[k].size());
+            check(d <= TOL, what + ": run of seq " + std::to_string(runs[k].seq) + " logits vs solo (max |d| " + std::to_string(d) + ")");
+            worst = std::max(worst, d);
+            n_bytes_same += eq(om.logits[k], os.logits[k]) ? 1 : 0;
+            n_runs++;
+        }
+        std::vector<std::tuple<llama_seq_id, llama_pos, llama_token>> req;
+        for (const auto & [s, n] : shape) {
+            req.emplace_back(s, pos[s], last[s]); // the next position, as the server (n_past = n_tokens)
+        }
+        int nc_m = 0, nc_s = 0;
+        const auto dm = homog_drafts(M, req, true, &nc_m);
+        const auto ds = homog_drafts(S, req, false, &nc_s);
+        for (const auto & [s, toks] : dm) {
+            check(toks == ds.at(s), what + ": seq " + std::to_string(s) + " draft proposals vs solo");
+        }
+    };
+
+    const bool np4 = n_seq >= 4;
+    // unequal prompt lengths; seq 2's prompt straddles N (a singleton range)
+    if (np4) {
+        round("prefill unequal lengths A",     { { 0, 61 }, { 3, 30 } }, 1);  // n_batch 128: two prefill rounds
+        round("prefill unequal lengths B",     { { 1, 63 }, { 2, 64 } }, 2);
+        round("depths 62/64/65/31 (ids 0,3 | 1,2)", { { 0, 1 }, { 1, 1 }, { 2, 1 }, { 3, 1 } }, 2);
+        round("verify blocks, seq 0 crosses N",  { { 0, 4 }, { 1, 4 }, { 2, 4 }, { 3, 4 } }, 3);
+        round("same class above + below",       { { 0, 1 }, { 1, 1 }, { 2, 1 }, { 3, 1 } }, 2);
+        round("reversed ids, above",            { { 2, 2 }, { 1, 2 }, { 0, 2 } }, 1);
+    } else {
+        round("prefill unequal lengths",        { { 0, 61 }, { 1, 63 } }, 1);
+        round("depths 62/64 (mixed)",           { { 0, 1 }, { 1, 1 } }, 2);
+        round("verify blocks, seq 0 crosses N", { { 0, 4 }, { 1, 4 } }, 2);
+        round("same class above",               { { 0, 1 }, { 1, 1 } }, 1);
+        round("reversed ids, above",            { { 1, 2 }, { 0, 2 } }, 1);
+    }
+
+    // rejection + replay: checkpoint every sequence (target + carry), verify runs, restore, replay shorter runs
+    {
+        const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+        mtp_env * envs[2] = { &M, &S };
+        std::vector<common_prompt_checkpoint> ck[2];
+        const std::vector<llama_pos> p0 = pos;
+        const std::vector<llama_token> last0 = last;
+        for (int e = 0; e < 2; ++e) {
+            ck[e].resize(n_seq);
+            auto * mem = llama_get_memory(envs[e]->ctx_tgt.get());
+            for (llama_seq_id q = 0; q < (llama_seq_id) n_seq; ++q) {
+                ck[e][q].update_pos(p0[q], llama_memory_seq_pos_min(mem, q), llama_memory_seq_pos_max(mem, q));
+                ck[e][q].update_tgt(envs[e]->ctx_tgt.get(), q, flags);
+                GGML_ASSERT(common_speculative_get_state(envs[e]->spec, q, ck[e][q].data_spec));
+            }
+        }
+        std::vector<std::pair<llama_seq_id, size_t>> vshape, rshape;
+        for (llama_seq_id q = 0; q < (llama_seq_id) n_seq; ++q) {
+            vshape.push_back({ q, 4 });
+            rshape.push_back({ q, (size_t) (1 + q % 3) });
+        }
+        round("verify before rejection", vshape, np4 ? 3 : 1); // np4: above 4+4 | 4 (MAX_UBATCH 8) | below
+        for (int e = 0; e < 2; ++e) {
+            common_memory mem;
+            mem.init(envs[e]->ctx_tgt.get(), envs[e]->ctx_dft.get());
+            for (llama_seq_id q = 0; q < (llama_seq_id) n_seq; ++q) {
+                ck[e][q].load_tgt(envs[e]->ctx_tgt.get(), q, flags);
+                ck[e][q].load_dft(envs[e]->ctx_dft.get(), q, flags);
+                mem.seq_rm(q, ck[e][q].pos_max + 1, -1);
+                common_speculative_set_state(envs[e]->spec, q, ck[e][q].data_spec);
+            }
+        }
+        pos = p0;
+        last = last0;
+        round("replay after rejection", rshape, np4 ? 2 : 1);
+    }
+
+    // cancellation: seq 1 released (both memories cleared), a new short prompt (below) beside an above neighbour
+    for (mtp_env * e : { &M, &S }) {
+        common_memory mem;
+        mem.init(e->ctx_tgt.get(), e->ctx_dft.get());
+        mem.seq_rm(1, -1, -1);
+    }
+    pos[1] = 0;
+    round("cancel seq 1 + new prompt beside seq 0", { { 1, 10 }, { 0, 1 } }, 2);
+    round("new prompt continues beside seq 0",      { { 1, 1 },  { 0, 1 } }, 2);
+
+    printf("homogeneous np%u: %d runs, %d byte-identical to solo, max |d| %.2e, mixed rounds %d; two-row round %.2f ms mixed (2 calls) vs %.2f ms same-class (1 call)\n",
+           n_seq, n_runs, n_bytes_same, (double) worst, n_mixed_rounds,
+           n_ms_mixed ? ms_mixed / n_ms_mixed : 0.0, n_ms_single ? ms_single / n_ms_single : 0.0);
+}
+
+// the guard's negative case (disposable child): seq 0 at depth 63 and seq 1 at depth 64 in ONE target ubatch (two
+// streams) must abort with the [qsa-routing] diagnostic
+static int homog_neg_child(gguf_context * meta) {
+    mtp_env E;
+    env_cfg cfg = { "", GGML_TYPE_F16, 2048, false };
+    cfg.n_seq = 2;
+    init_env(E, meta, cfg);
+    feed_runs(E, { { 0, tokens(62, 1), 0 } });
+    feed_runs(E, { { 1, tokens(63, 2), 0 } });
+    feed_runs(E, { { 0, tokens(1, 3), 62 }, { 1, tokens(1, 4), 63 } }); // must abort
+    printf("NEG-CHILD: mixed ubatch decoded\n");
+    return 0;
+}
+
+static int homog_parent(const char * self, uint32_t n_seq) {
+#ifdef _WIN32
+    (void) self; (void) n_seq;
+    printf("homogeneous routing: skipped on _WIN32\n");
+    return 0;
+#else
+    const std::string cmd = std::string("'") + self + "' --homog-child " + std::to_string(n_seq) + " 2>&1";
+    FILE * f = popen(cmd.c_str(), "r");
+    GGML_ASSERT(f != nullptr);
+    std::string out;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), f)) {
+        out += buf;
+        fputs(buf, stdout);
+    }
+    const int st = pclose(f);
+    check(st == 0, "homogeneous child exits 0 (no [qsa-routing] abort)");
+    const size_t p = out.rfind("[qsa-routing] checks=");
+    unsigned long long c = 0, ms = 0, b = 0, a = 0, x = 1;
+    const bool parsed = p != std::string::npos &&
+        sscanf(out.c_str() + p, "[qsa-routing] checks=%llu multi_seq=%llu below=%llu above=%llu mixed=%llu", &c, &ms, &b, &a, &x) == 5;
+    check(parsed, "the [qsa-routing] exit proof line is printed");
+    check(ms > 0, "multi-sequence ubatches (n_stream > 1) were checked");
+    check(b > 0 && a > 0, "both routing classes were executed");
+    check(x == 0, "mixed=0");
+    {
+        const std::string cmd_neg = std::string("'") + self + "' --homog-neg 2 2>&1";
+        FILE * fn = popen(cmd_neg.c_str(), "r");
+        GGML_ASSERT(fn != nullptr);
+        std::string neg;
+        while (fgets(buf, sizeof(buf), fn)) {
+            neg += buf;
+        }
+        const int stn = pclose(fn);
+        const size_t pd = neg.find("[qsa-routing] mixed routing classes");
+        check(stn != 0 && pd != std::string::npos && neg.find("NEG-CHILD: mixed ubatch decoded") == std::string::npos,
+              "negative: a below + above ubatch aborts with the [qsa-routing] diagnostic");
+        if (pd != std::string::npos) {
+            printf("  neg mixed -> %s", neg.substr(pd, neg.find('\n', pd) - pd + 1).c_str());
+        }
+    }
+    printf("test-mtp-catchup --homog %u: %s (%d checks ok)\n", n_seq, n_fail ? "FAILED" : "OK", n_ok);
+    return n_fail ? 1 : 0;
+#endif
+}
+
 int main(int argc, char ** argv) {
     llama_log_set(quiet_log, nullptr);
     common_log_set_verbosity_thold(-1);
@@ -1063,6 +1351,24 @@ int main(int argc, char ** argv) {
 
     if (argc >= 3 && strcmp(argv[1], "--neg") == 0) {
         return neg_child(meta.get(), argv[2]); // [TAG_MULTISLOT] disposable negative-case process
+    }
+    if (argc >= 3 && strcmp(argv[1], "--homog-child") == 0) {
+        homog_case(meta.get(), (uint32_t) atoi(argv[2])); // [TAG_MULTISLOT] item 4
+        llama_backend_free();
+        return n_fail ? 1 : 0;
+    }
+    if (argc >= 3 && strcmp(argv[1], "--homog-neg") == 0) {
+        return homog_neg_child(meta.get());
+    }
+    if (argc >= 3 && strcmp(argv[1], "--homog") == 0) {
+        char self[4096] = {};
+#ifndef _WIN32
+        const ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+        if (n <= 0) {
+            snprintf(self, sizeof(self), "%s", argv[0]);
+        }
+#endif
+        return homog_parent(self, (uint32_t) atoi(argv[2]));
     }
 
     printf("mode: %s%s\n", mtp_qsa_mode() ? "sparse MTP draft (LLAMA_MTP_QSA=1)" : "dense MTP draft",
