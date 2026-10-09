@@ -255,6 +255,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-mtp-qsa-restore-hd0 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_HISTORY_DENSE=0")
     llama_test(test-mtp-qsa-restore NAME test-mtp-qsa-restore-gc8 LABEL mtp)
     set_tests_properties(test-mtp-qsa-restore-gc8 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_GRAPH_CACHE=8;LLAMA_GRAPH_CACHE_CHECK=3")
+    # [TAG_MULTISLOT] per-seq state is stream-count agnostic: np1 <-> np2 per-stream <-> np2 unified seq restores continue
+    # byte-equal; whole-context stays strict; a two-block per-seq blob is rejected; one descriptor per slot size
+    llama_build_and_test(test-state-portable.cpp LABEL mtp)
+    target_include_directories(test-state-portable PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-state-portable PRIVATE server-context)
+    llama_test(test-state-portable NAME test-state-portable-qsa LABEL mtp)
+    set_tests_properties(test-state-portable-qsa PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
     llama_build_and_test(test-spec-draft-policy.cpp LABEL mtp) # [TAG_SPEC_DRAFT_POLICY] tput draft length rule + cooldown (v51)
     # [TAG_GRAPH_CACHE] LLAMA_GRAPH_CACHE off vs K=8 vs K=8 + CHECK: logits / drafts / [qsa-ids] identical, regrow invalidates
     llama_build(test-graph-cache.cpp)
