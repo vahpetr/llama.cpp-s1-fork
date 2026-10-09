@@ -2177,6 +2177,18 @@ private:
             return false;
         }
 
+        // [TAG_MULTISLOT] the context-creation line `qsa_history_dense = ...` is library INFO (filtered at -lv 3): the
+        //   same information at the server's INFO level (hands proof), next to the [multislot-envelope] line
+        {
+            const char *  reason = nullptr;
+            const int32_t hd     = llama_qsa_history_dense_info(ctx_tgt, &reason);
+            if (hd >= 0) {
+                const char * hom = getenv("LLAMA_QSA_HOMOGENEOUS");
+                SRV_INF("qsa_history_dense = %s (%s)%s\n", hd ? "on" : "off", reason,
+                        hom != nullptr && strcmp(hom, "1") == 0 && !hd ? "; coverage check still on: LLAMA_QSA_HOMOGENEOUS=1" : "");
+            }
+        }
+
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);

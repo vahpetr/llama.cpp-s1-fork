@@ -4902,6 +4902,13 @@ uint32_t llama_n_ctx(const llama_context * ctx) {
     return ctx->n_ctx();
 }
 
+int32_t llama_qsa_history_dense_info(const llama_context * ctx, const char ** reason) {
+    if (ctx == nullptr || ctx->get_model().hparams.indexer_head_size == 0) {
+        return -1;
+    }
+    return llama_qsa_history_dense(reason) ? 1 : 0;
+}
+
 uint32_t llama_n_ctx_seq(const llama_context * ctx) {
     return ctx->n_ctx_seq();
 }

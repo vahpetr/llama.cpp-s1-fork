@@ -409,6 +409,10 @@ int main() {
         };
         check(!st(*ref).empty() && st(*ref) == st(*a) && st(*ref) == st(*b),
               "disk cache: adopt structure (per-slot n_ctx) equal np1 / np2 per-stream / np2 unified");
+        // the server's INFO copy of the context-creation qsa_history_dense line reads this (the fixture has a QSA indexer)
+        const char * hd_reason = nullptr;
+        check(llama_qsa_history_dense_info(ref->ctx_tgt.get(), &hd_reason) >= 0 && hd_reason != nullptr,
+              "qsa_history_dense_info: defined for a QSA-indexer context, with a reason");
         check(llama_n_ctx(a->ctx_tgt.get()) != llama_n_ctx(ref->ctx_tgt.get()),
               "disk cache: (the np2 per-stream total n_ctx differs - the per-slot value is what makes them equal)");
     }

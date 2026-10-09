@@ -188,3 +188,8 @@ LLAMA_API size_t llama_state_seq_read_cb (struct llama_context * ctx, llama_seq_
 //   moves with any change of the stream's meaning that keeps its fields (e.g. a channel repacking).
 #define LLAMA_STATE_ABI_REV 1
 LLAMA_API std::string llama_state_seq_descriptor(const struct llama_context * ctx);
+
+// [TAG_MULTISLOT] the state the context-creation line `qsa_history_dense = on|off (reason)` prints (a library INFO
+//   line, below the server's default verbosity): -1 = the context's model has no QSA indexer (no such line), else
+//   0 = off / 1 = on; reason (optional) receives the same static string
+LLAMA_API int32_t llama_qsa_history_dense_info(const struct llama_context * ctx, const char ** reason);
