@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -609,6 +610,10 @@ struct qwen4exp_qsa_routing_stats {
     std::atomic<uint64_t> below{0};
     std::atomic<uint64_t> above{0};
     std::atomic<uint64_t> mixed{0};
+    // LLAMA_QSA_ROUTING_COST=1: every validation pass (not deduplicated), its rows and wall time - a separate line
+    std::atomic<uint64_t> cost_calls{0};
+    std::atomic<uint64_t> cost_rows{0};
+    std::atomic<uint64_t> cost_ns{0};
 
     void print(const char * when) const {
         // fprintf: also safe from the static destructor at exit, after the logger may be gone
@@ -619,6 +624,11 @@ struct qwen4exp_qsa_routing_stats {
     ~qwen4exp_qsa_routing_stats() {
         if (checks.load() > 0) {
             print("exit");
+        }
+        if (cost_calls.load() > 0) {
+            fprintf(stderr, "[qsa-routing-cost] calls=%" PRIu64 " rows=%" PRIu64 " ns=%" PRIu64 " ns_per_call=%.0f ns_per_row=%.1f (exit)\n",
+                    cost_calls.load(), cost_rows.load(), cost_ns.load(), (double) cost_ns.load() / cost_calls.load(),
+                    (double) cost_ns.load() / std::max<uint64_t>(1, cost_rows.load()));
         }
     }
 };
@@ -633,25 +643,34 @@ static void qwen4exp_qsa_routing_check(const llama_memory_hybrid_idx_context * m
         return;
     }
 
-    // build evaluates the decision once per QSA layer, a failed reuse once more: count each ubatch once
-    struct key_t {
-        const void * pos; uint32_t n; llama_pos p0, p1; llama_seq_id s0;
-        bool operator==(const key_t & o) const { return pos == o.pos && n == o.n && p0 == o.p0 && p1 == o.p1 && s0 == o.s0; }
-    };
-    thread_local key_t last = { nullptr, 0, 0, 0, 0 };
-    const key_t key = { ubatch.pos, ubatch.n_tokens, ubatch.pos[0], ubatch.pos[ubatch.n_tokens - 1],
-                        ubatch.n_seq_id[0] > 0 ? ubatch.seq_id[0][0] : -1 };
-    if (key == last) {
-        return;
-    }
-    last = key;
+    // (r3, astra r2 Major 1) every invocation is validated - no early return on a remembered ubatch: a key over a few
+    // fields (pos pointer, n_tokens, first/last pos, first seq id) let a reused batch buffer whose INTERIOR sequence
+    // changed depth skip the check. The full pass is O(n_tokens x n_seq_id) per call (cost: LLAMA_QSA_ROUTING_COST=1).
+    // Only the proof counters are deduplicated ("one check per ubatch", not per QSA layer): by a hash over the
+    // context, n_tokens and every (seq_id, pos) row - a collision can only under-count, never skip validation.
+    static const bool cost = [] {
+        const char * s = getenv("LLAMA_QSA_ROUTING_COST");
+        return s != nullptr && strcmp(s, "1") == 0;
+    }();
+    const auto t0 = cost ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
     const int64_t n_min = qwen4exp_qsa_min_kv();
 
+    uint64_t h = 1469598103934665603ull; // a word-wise FNV-style mix over (context, n_tokens, every (seq_id, pos) row)
+    const auto mix = [&h](uint64_t v) {
+        h = (h ^ v) * 1099511628211ull;
+        h ^= h >> 29;
+    };
+    mix((uint64_t) (uintptr_t) mctx_hyb);
+    mix(ubatch.n_tokens);
+
     std::vector<std::pair<llama_seq_id, llama_pos>> seqs; // (seq, depth)
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        mix((uint64_t) (uint32_t) ubatch.pos[i]);
+        mix((uint64_t) (uint32_t) ubatch.n_seq_id[i]);
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id s = ubatch.seq_id[i][j];
+            mix((uint64_t) (uint32_t) s);
             auto it = std::find_if(seqs.begin(), seqs.end(), [s](const auto & e) { return e.first == s; });
             if (it == seqs.end()) {
                 seqs.emplace_back(s, ubatch.pos[i] + 1);
@@ -672,11 +691,13 @@ static void qwen4exp_qsa_routing_check(const llama_memory_hybrid_idx_context * m
     }
 
     auto & st = qwen4exp_qsa_routing();
-    const uint64_t k = st.checks.fetch_add(1) + 1;
-    if (seqs.size() > 1) {
-        st.multi_seq++;
+    if (cost) {
+        st.cost_calls++;
+        st.cost_rows += ubatch.n_tokens;
+        st.cost_ns   += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
     }
     if (any_below && any_above) {
+        st.checks++;
         st.mixed++;
         std::string desc;
         for (const auto & e : seqs) {
@@ -684,6 +705,15 @@ static void qwen4exp_qsa_routing_check(const llama_memory_hybrid_idx_context * m
         }
         st.print("MIXED");
         GGML_ABORT("[qsa-routing] mixed routing classes in one ubatch (N = %" PRId64 "):%s", n_min, desc.c_str());
+    }
+    thread_local uint64_t last = 0;
+    if (h == last) {
+        return; // the same ubatch again (another QSA layer of its build, a failed reuse): counted once
+    }
+    last = h;
+    const uint64_t k = st.checks.fetch_add(1) + 1;
+    if (seqs.size() > 1) {
+        st.multi_seq++;
     }
     if (any_above) {
         st.above++;

@@ -1296,6 +1296,50 @@ static int homog_neg_child(gguf_context * meta) {
     return 0;
 }
 
+// (r3, astra r2 Major 1) the guard's same-key negative case (disposable child): ONE llama_batch buffer is decoded
+// twice with an unchanged first/last row (seq 0 @ 80, seq 2 @ 80), n_tokens and first sequence - the r2 dedup key -
+// while the INTERIOR sequence's depth changes: call 1 seq 1 @ 80 (all above N = 64), then a checkpoint rewind of all
+// three and call 2 with seq 1 @ 61 (depth 62, below). Target decodes only (no catch-up in between), so the guard's
+// previous invocation is call 1's ubatch. The r2 guard returned early on the remembered key; r3 must abort
+static int homog_neg_reuse_child(gguf_context * meta) {
+    mtp_env E;
+    env_cfg cfg = { "", GGML_TYPE_F16, 3 * 1024, false };
+    cfg.n_seq = 3;
+    init_env(E, meta, cfg);
+    const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+    auto * mem = llama_get_memory(E.ctx_tgt.get());
+    common_prompt_checkpoint ck[3];
+    const auto take = [&](llama_seq_id q, llama_pos n_past) {
+        ck[q].update_pos(n_past, llama_memory_seq_pos_min(mem, q), llama_memory_seq_pos_max(mem, q));
+        ck[q].update_tgt(E.ctx_tgt.get(), q, flags);
+    };
+    feed_runs(E, { { 0, tokens(80, 11), 0 } });
+    feed_runs(E, { { 2, tokens(80, 12), 0 } });
+    feed_runs(E, { { 1, tokens(61, 13), 0 } });
+    take(1, 61);
+    feed_runs(E, { { 1, tokens(19, 14), 61 } });
+    take(0, 80);
+    take(2, 80);
+
+    llama_batch b = llama_batch_init(3, 0, 1);
+    for (llama_seq_id q = 0; q < 3; ++q) {
+        common_batch_add(b, (llama_token) (7 + q), 80, { q }, true);
+    }
+    GGML_ASSERT(llama_decode(E.ctx_tgt.get(), b) == 0); // homogeneous (above)
+    printf("NEG-REUSE: call 1 (seq 0/1/2 @ 80) decoded\n");
+    fflush(stdout);
+    for (llama_seq_id q = 0; q < 3; ++q) {
+        GGML_ASSERT(ck[q].load_tgt(E.ctx_tgt.get(), q, flags));
+        GGML_ASSERT(llama_memory_seq_rm(mem, q, ck[q].pos_max + 1, -1));
+    }
+    b.pos[1] = 61;   // the interior sequence only: same buffer, same n_tokens, first/last row and first seq id
+    b.token[1] = 9;
+    GGML_ASSERT(llama_decode(E.ctx_tgt.get(), b) == 0); // must abort
+    printf("NEG-CHILD: mixed ubatch decoded\n");
+    llama_batch_free(b);
+    return 0;
+}
+
 static int homog_parent(const char * self, uint32_t n_seq) {
 #ifdef _WIN32
     (void) self; (void) n_seq;
@@ -1337,6 +1381,26 @@ static int homog_parent(const char * self, uint32_t n_seq) {
             printf("  neg mixed -> %s", neg.substr(pd, neg.find('\n', pd) - pd + 1).c_str());
         }
     }
+    {
+        // (r3) the same-key reuse case: call 1 must decode, call 2 must abort with the diagnostic
+        const std::string cmd_neg = std::string("'") + self + "' --homog-neg-reuse 3 2>&1";
+        FILE * fn = popen(cmd_neg.c_str(), "r");
+        GGML_ASSERT(fn != nullptr);
+        std::string neg;
+        while (fgets(buf, sizeof(buf), fn)) {
+            neg += buf;
+        }
+        const int stn = pclose(fn);
+        const size_t pd = neg.find("[qsa-routing] mixed routing classes");
+        check(stn != 0 && neg.find("NEG-REUSE: call 1") != std::string::npos && pd != std::string::npos &&
+              neg.find("NEG-CHILD: mixed ubatch decoded") == std::string::npos,
+              "negative (same dedup key, interior sequence changed): call 1 decodes, call 2 aborts with the [qsa-routing] diagnostic");
+        if (pd != std::string::npos) {
+            printf("  neg reuse -> %s", neg.substr(pd, neg.find('\n', pd) - pd + 1).c_str());
+        } else {
+            printf("  neg reuse child output (status %d):\n%s", stn, neg.c_str());
+        }
+    }
     printf("test-mtp-catchup --homog %u: %s (%d checks ok)\n", n_seq, n_fail ? "FAILED" : "OK", n_ok);
     return n_fail ? 1 : 0;
 #endif
@@ -1359,6 +1423,9 @@ int main(int argc, char ** argv) {
     }
     if (argc >= 3 && strcmp(argv[1], "--homog-neg") == 0) {
         return homog_neg_child(meta.get());
+    }
+    if (argc >= 3 && strcmp(argv[1], "--homog-neg-reuse") == 0) {
+        return homog_neg_reuse_child(meta.get());
     }
     if (argc >= 3 && strcmp(argv[1], "--homog") == 0) {
         char self[4096] = {};
