@@ -2904,6 +2904,22 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    // [TAG_VK_EXPERT_OCC] GGML_VK_EXPERT_OCCUPANCY=1 debug telemetry: a host-visible staging buffer of
+    // vk_expert_occ_slots per-expert count snapshots, the eligible-dispatch counter that drives the
+    // 1-in-N sampling, and the snapshots recorded since the last fence wait (drained and logged by
+    // ggml_vk_synchronize). All three stay empty/zero while the knob is off.
+    struct vk_expert_occ_sample {
+        size_t      offset;  // byte offset of the snapshot in expert_occ_staging
+        uint32_t    n_as;    // experts in the weight tensor (= count words copied)
+        uint32_t    topk;    // experts per token (ids->ne[0])
+        uint32_t    tile_n;  // BN of the chosen matmul_id pipeline (wg_denoms[1])
+        uint64_t    rows;    // tokens in the batch (ids->ne[1])
+        std::string name;    // dst tensor name
+        std::string pipeline;
+    };
+    vk_buffer expert_occ_staging;
+    uint64_t expert_occ_counter {};
+    std::vector<vk_expert_occ_sample> expert_occ_pending;
     // [TAG_QSA_SCRATCH] GGML_VK_QSA_SCRATCH_PRESIZE=1: the largest fused TOPK_QSA select scratch any
     // graph handed to ggml_vk_graph_optimize would need. ggml_backend_sched optimizes every split of
     // every graph, and the *reserve* graphs are optimized at context creation, i.e. before the first
@@ -11470,6 +11486,118 @@ static void ggml_vk_mul_mat_rows(ggml_backend_vk_context * ctx, vk_context& subc
     }
 }
 
+// [TAG_VK_EXPERT_OCC] Opt-in expert-occupancy telemetry for mul_mat_id (Program v7 step 7).
+// count_experts.comp writes the per-expert routed-row count into the first n_as words of the
+// expert_count buffer (both the hoisting and the counting-only layout start with it), and the
+// matmul_id shaders consume it on the GPU; nothing ever reads it back. With
+// GGML_VK_EXPERT_OCCUPANCY=1, every GGML_VK_EXPERT_OCCUPANCY_EVERY-th (default 16) mul_mat_id
+// dispatch with >= 64 tokens (prefill; decode goes through mul_mat_vec_id) records a barrier, a
+// vkCmdCopyBuffer of those n_as words into a host-visible staging slot and a transfer->host
+// barrier. ggml_vk_synchronize drains the slots after its fence wait and logs one
+// "[vk-expert-occ]" line each. The readback is therefore synchronous with the graph (no extra
+// submit or wait is added), and it exists only in this debug mode: with the knob off the cost is
+// one cached-bool test per mul_mat_id. The extra full barrier in debug mode can perturb timing,
+// so do not combine it with a speed measurement.
+static constexpr uint32_t vk_expert_occ_slots = 64;
+static constexpr uint32_t vk_expert_occ_min_rows = 64;
+
+static bool ggml_vk_expert_occ_enabled() {
+    static const bool enabled = ggml_vk_env_bool("GGML_VK_EXPERT_OCCUPANCY", false);
+    return enabled;
+}
+
+static uint32_t ggml_vk_expert_occ_every() {
+    static const uint32_t every = []() {
+        const char * s = getenv("GGML_VK_EXPERT_OCCUPANCY_EVERY");
+        const int v = (s != nullptr && *s != '\0') ? atoi(s) : 16;
+        return (uint32_t) std::max(1, v);
+    }();
+    return every;
+}
+
+static void ggml_vk_expert_occ_record(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * dst,
+                                      const vk_subbuffer & expert_count_buf, const vk_pipeline & pipeline,
+                                      uint64_t n_as, uint64_t topk, uint64_t rows) {
+    if (rows < vk_expert_occ_min_rows || n_as == 0 || n_as > vk_count_experts_max_experts) {
+        return;
+    }
+    if (ctx->expert_occ_counter++ % ggml_vk_expert_occ_every() != 0) {
+        return;
+    }
+    if (ctx->expert_occ_pending.size() >= vk_expert_occ_slots) {
+        return; // more samples than slots between two fence waits: drop the extra ones
+    }
+    const size_t slot_bytes = sizeof(uint32_t) * vk_count_experts_max_experts;
+    if (ctx->expert_occ_staging == nullptr) {
+        // Fixed size, never regrown: a recorded copy may still target it until the next drain.
+        ctx->expert_occ_staging = ggml_vk_create_buffer_check(ctx->device, slot_bytes * vk_expert_occ_slots,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    }
+    const size_t offset = slot_bytes * ctx->expert_occ_pending.size();
+
+    // count_experts' shader writes -> this copy's transfer read
+    ggml_vk_sync_buffers(ctx, subctx);
+    const vk::BufferCopy bc { expert_count_buf.offset, offset, sizeof(uint32_t) * n_as };
+    subctx->s->buffer->buf.copyBuffer(expert_count_buf.buffer->buffer, ctx->expert_occ_staging->buffer, { bc });
+    // the copy's transfer write -> the host read after the fence wait
+    const vk::MemoryBarrier to_host { vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead };
+    subctx->s->buffer->buf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+                                           {}, { to_host }, {}, {});
+
+    ggml_backend_vk_context::vk_expert_occ_sample smp;
+    smp.offset   = offset;
+    smp.n_as     = (uint32_t) n_as;
+    smp.topk     = (uint32_t) topk;
+    smp.tile_n   = pipeline->wg_denoms[1];
+    smp.rows     = rows;
+    smp.name     = dst->name;
+    smp.pipeline = pipeline->name;
+    ctx->expert_occ_pending.push_back(std::move(smp));
+}
+
+// Called only after every submitted batch has completed (end of ggml_vk_synchronize).
+static void ggml_vk_expert_occ_drain(ggml_backend_vk_context * ctx) {
+    if (ctx->expert_occ_pending.empty()) {
+        return;
+    }
+    std::vector<uint32_t> used;
+    for (const auto & smp : ctx->expert_occ_pending) {
+        const uint32_t * c = (const uint32_t *) ((const uint8_t *) ctx->expert_occ_staging->ptr + smp.offset);
+        used.clear();
+        uint64_t routed = 0;
+        for (uint32_t e = 0; e < smp.n_as; e++) {
+            routed += c[e];
+            if (c[e] > 0) {
+                used.push_back(c[e]);
+            }
+        }
+        std::sort(used.begin(), used.end());
+        const size_t k = used.size();
+        // nearest-rank percentile over the experts that received at least one row
+        auto pct = [&](double p) -> uint32_t {
+            if (k == 0) {
+                return 0;
+            }
+            size_t r = (size_t) std::ceil(p * (double) k);
+            return used[std::min(k, std::max<size_t>(r, 1)) - 1];
+        };
+        size_t lt32 = 0, lt64 = 0;
+        for (uint32_t v : used) {
+            lt32 += v < 32;
+            lt64 += v < 64;
+        }
+        const double kd = k > 0 ? (double) k : 1.0;
+        GGML_LOG_INFO("[vk-expert-occ] op=%s rows=%llu experts_used=%zu mean=%.1f p10=%u p50=%u p90=%u max=%u "
+                      "lt32=%.3f lt64=%.3f tile_n=%u n_as=%u topk=%u routed=%llu pipeline=%s\n",
+                      smp.name.c_str(), (unsigned long long) smp.rows, k, (double) routed / kd,
+                      pct(0.10), pct(0.50), pct(0.90), k > 0 ? used.back() : 0u,
+                      (double) lt32 / kd, (double) lt64 / kd, smp.tile_n, smp.n_as, smp.topk,
+                      (unsigned long long) routed, smp.pipeline.c_str());
+    }
+    ctx->expert_occ_pending.clear();
+}
+
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -11803,6 +11931,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
             { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc,
             { hoist_row_ids ? 1u : (uint32_t)n_as, 1, 1});
+    }
+    if (ggml_vk_expert_occ_enabled()) { // [TAG_VK_EXPERT_OCC] off: one cached-bool test
+        ggml_vk_expert_occ_record(ctx, subctx, dst, expert_count_buf, pipeline, n_as, nei0, nei1);
     }
 
     if (x_non_contig) {
@@ -18478,6 +18609,8 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
+    ctx->expert_occ_pending.clear();                  // [TAG_VK_EXPERT_OCC]
+    ggml_vk_destroy_buffer(ctx->expert_occ_staging);  // [TAG_VK_EXPERT_OCC]
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
@@ -19107,6 +19240,9 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     }
 
     ctx->pending_host_read = false;
+
+    // [TAG_VK_EXPERT_OCC] every submitted batch has completed here
+    ggml_vk_expert_occ_drain(ctx);
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {

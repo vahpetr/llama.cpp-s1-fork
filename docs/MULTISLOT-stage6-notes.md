@@ -144,3 +144,34 @@ PASS requirement yet. Measure per-stream startup / restore peaks against 102400 
   One-time consequence: an np>1 server's descriptor (e.g. balkon hands, `--kv-unified --parallel N`) changes, so its
   own disk-cache namespace moves on the next deploy of this code (adopt the previous key to keep it).
 - Tests: `test-state-portable` / `-qsa`.
+
+## v54 telemetry
+
+### Expert occupancy for `mul_mat_id` (`GGML_VK_EXPERT_OCCUPANCY`, `[TAG_VK_EXPERT_OCC]`)
+
+Needed by Program v7 step 7 (how full the per-expert N tiles of the MoE prefill matmuls are).
+`count_experts.comp` writes the routed-row count per expert into the first `n_as` words of the
+expert-count buffer (`prealloc_split_k`, both the hoisting and the counting-only layout); the matmul_id shaders
+consume it on the GPU and it was never read back.
+
+- `GGML_VK_EXPERT_OCCUPANCY=1` (default off; value-parsed like every `ggml_vk_env_bool` knob) samples every
+  `GGML_VK_EXPERT_OCCUPANCY_EVERY`-th (default 16, min 1) eligible `mul_mat_id` dispatch. Eligible = the
+  `ggml_vk_mul_mat_id_q_f16` path with `ids->ne[1]` (tokens) >= 64 and `n_as <= 512`, i.e. prefill (decode goes
+  through `mul_mat_vec_id`). The counter is per backend context.
+- A sample records, right after the `count_experts` dispatch: a full buffer barrier, a `vkCmdCopyBuffer` of the
+  `n_as` count words into a fixed 64-slot host-visible staging buffer (128 KiB, allocated on the first sample,
+  never regrown) and a transfer->host barrier. `ggml_vk_synchronize` drains the slots after its fence wait
+  (every submitted batch complete) and logs one line per sample at INFO; more than 64 samples between two fence
+  waits are dropped. No extra submit or wait is added; the readback is synchronous with the graph and exists only
+  in this mode. Off = one cached-bool test per `mul_mat_id`, no buffer, no barrier.
+- Line: `[vk-expert-occ] op=<dst name> rows=<tokens> experts_used=<experts with >= 1 row> mean=<routed/used>
+  p10= p50= p90= max=<rows per used expert, nearest rank> lt32= lt64=<share of used experts under 32 / 64 rows>
+  tile_n=<BN = pipeline wg_denoms[1]> n_as= topk= routed=<sum = rows * topk> pipeline=<chosen pipeline name>`.
+  `tile_n` is the BN of the size class `ggml_vk_guess_matmul_id_pipeline` picked (L/M/S, see the warptile tables).
+- The extra barrier perturbs timing: never combine the knob with a speed measurement.
+- Check (balkon, Vulkan build `vkbuild`-style in llama-dev:vulkan, hands running, 2026-10-10; the knob run under `flock -n ~/piagent-tuning/.gpu.lock`):
+  `vkrun.sh stage7 -- -o MUL_MAT_ID` OK without the knob; with `GGML_VK_EXPERT_OCCUPANCY=1
+  GGML_VK_EXPERT_OCCUPANCY_EVERY=1` also OK (2/2 backends), 151 lines, `routed == rows * topk` on all 151;
+  e.g. the n_as 512 / topk 10 / 2048-token case: `experts_used=512 mean=40.0 p10=32 p50=40 p90=48 max=59
+  lt32=0.096 lt64=1.000 tile_n=64`. Real-model numbers: run llama-server / llama-bench with the knob and grep
+  `[vk-expert-occ]` (not done here: no model runs on the stage7 scratch).
