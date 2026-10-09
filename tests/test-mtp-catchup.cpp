@@ -1122,7 +1122,8 @@ static homog_round_out homog_exec(mtp_env & env, const std::vector<seq_run> & ru
 // drafts of several sequences: grouped like the server (one common_speculative_draft per group, only its members'
 // drafting flags), or one sequence per call (solo)
 static std::map<llama_seq_id, std::vector<llama_token>> homog_drafts(mtp_env & env,
-        const std::vector<std::tuple<llama_seq_id, llama_pos, llama_token>> & req, bool grouped, int * n_calls) {
+        const std::vector<std::tuple<llama_seq_id, llama_pos, llama_token>> & req, bool grouped, int * n_calls,
+        std::vector<std::vector<float>> * dlogits = nullptr) {
     std::map<llama_seq_id, std::vector<llama_token>> res;
     const int n_max = env.params.draft.n_max;
     std::vector<server_qsa_route_run> infos;
@@ -1152,6 +1153,10 @@ static std::map<llama_seq_id, std::vector<llama_token>> homog_drafts(mtp_env & e
         }
         common_speculative_draft(env.spec);
         (*n_calls)++;
+        if (dlogits != nullptr) { // the last draft output row of this group's call (empty: no draft output)
+            const float * l = llama_get_logits_ith(env.ctx_dft.get(), -1);
+            dlogits->emplace_back(l != nullptr ? std::vector<float>(l, l + N_VOCAB) : std::vector<float>());
+        }
     }
     for (const auto & [s, n_past, id] : req) {
         llama_memory_seq_rm(llama_get_memory(env.ctx_dft.get()), s, n_past, -1);
@@ -1161,12 +1166,24 @@ static std::map<llama_seq_id, std::vector<llama_token>> homog_drafts(mtp_env & e
 
 static void homog_case(gguf_context * meta, uint32_t n_seq) {
     const float TOL = 1e-3f;
-    mtp_env M, S;
+    // (r3, astra r2 Major 3) the exactness standard: G runs the SAME grouped schedule as M (identical prefill / history
+    // construction, ranges and draft groups) with the graph cache K = 8 + CHECK = 3; M is K = 0. M vs G must be BYTE
+    // equal: target logits, draft logits, proposals, carry. M vs S (solo) is R81 composition (different row counts per
+    // decode round differently on CPU): tolerance + equal proposals, the first divergence printed
+    mtp_env M, S, G;
     env_cfg cfg = { "", GGML_TYPE_F16, 1024 * n_seq, false };
     cfg.n_seq = n_seq;
+    common_set_env("LLAMA_GRAPH_CACHE", "0");
+    common_set_env("LLAMA_GRAPH_CACHE_CHECK", "0");
     init_env(M, meta, cfg);
     init_env(S, meta, cfg);
+    common_set_env("LLAMA_GRAPH_CACHE", "8");
+    common_set_env("LLAMA_GRAPH_CACHE_CHECK", "3");
+    init_env(G, meta, cfg);
+    common_set_env("LLAMA_GRAPH_CACHE", "");
+    common_set_env("LLAMA_GRAPH_CACHE_CHECK", "");
     GGML_ASSERT(!llama_context_default_params().kv_unified && "per-stream KV expected");
+    int n_gc_byte = 0, n_gc_cmp = 0, n_solo_div = 0;
 
     std::vector<llama_pos> pos(n_seq, 0);
     std::vector<llama_token> last(n_seq, 0);
@@ -1185,7 +1202,9 @@ static void homog_case(gguf_context * meta, uint32_t n_seq) {
             last[s] = runs.back().toks.back();
         }
         const auto om = homog_exec(M, runs, true);
+        const auto og = homog_exec(G, runs, true);
         const auto os = homog_exec(S, runs, false);
+        check(og.n_calls == om.n_calls, what + ": K=8 schedule == K=0 schedule");
         check(om.n_calls == expect, what + ": " + std::to_string(om.n_calls) + " decode calls (expected " + std::to_string(expect) + ")");
         if (om.n_calls > 1) {
             n_mixed_rounds++;
@@ -1195,7 +1214,23 @@ static void homog_case(gguf_context * meta, uint32_t n_seq) {
             (om.n_calls > 1 ? n_ms_mixed : n_ms_single)++;
         }
         for (size_t k = 0; k < runs.size(); ++k) {
+            // exactness: identical grouping + history, graph cache K = 0 vs K = 8 + CHECK = 3 -> byte equal
+            check(eq(om.logits[k], og.logits[k]), what + ": run of seq " + std::to_string(runs[k].seq) + " target logits K=0 == K=8 (bytes)");
+            n_gc_byte += eq(om.logits[k], og.logits[k]) ? 1 : 0;
+            n_gc_cmp++;
+            // R81 composition vs solo: tolerance is kept ONLY here - the grouped call decodes a different number of rows
+            // per ubatch than the solo one (CPU mul_mat accumulates a 2-row decode differently from a 1-row one)
             const float d = max_abs_diff(om.logits[k].data(), os.logits[k].data(), om.logits[k].size());
+            if (!eq(om.logits[k], os.logits[k])) {
+                size_t i = 0;
+                while (i < om.logits[k].size() && std::memcmp(&om.logits[k][i], &os.logits[k][i], sizeof(float)) == 0) {
+                    ++i;
+                }
+                printf("  composition: %s seq %d first divergence vs solo at row %zu (pos %d) vocab %zu: %.9g vs %.9g\n",
+                       what.c_str(), (int) runs[k].seq, i / N_VOCAB, (int) (runs[k].pos0 + (llama_pos) (i / N_VOCAB)),
+                       i % N_VOCAB, (double) om.logits[k][i], (double) os.logits[k][i]);
+                n_solo_div++;
+            }
             check(d <= TOL, what + ": run of seq " + std::to_string(runs[k].seq) + " logits vs solo (max |d| " + std::to_string(d) + ")");
             worst = std::max(worst, d);
             n_bytes_same += eq(om.logits[k], os.logits[k]) ? 1 : 0;
@@ -1205,11 +1240,18 @@ static void homog_case(gguf_context * meta, uint32_t n_seq) {
         for (const auto & [s, n] : shape) {
             req.emplace_back(s, pos[s], last[s]); // the next position, as the server (n_past = n_tokens)
         }
-        int nc_m = 0, nc_s = 0;
-        const auto dm = homog_drafts(M, req, true, &nc_m);
+        int nc_m = 0, nc_s = 0, nc_g = 0;
+        std::vector<std::vector<float>> dl_m, dl_g;
+        const auto dm = homog_drafts(M, req, true, &nc_m, &dl_m);
+        const auto dg = homog_drafts(G, req, true, &nc_g, &dl_g);
         const auto ds = homog_drafts(S, req, false, &nc_s);
+        check(nc_g == nc_m && dl_m == dl_g, what + ": draft logits K=0 == K=8 (bytes, per draft group)");
         for (const auto & [s, toks] : dm) {
+            check(toks == dg.at(s), what + ": seq " + std::to_string(s) + " draft proposals K=0 == K=8");
             check(toks == ds.at(s), what + ": seq " + std::to_string(s) + " draft proposals vs solo");
+            std::vector<uint8_t> cm, cg;
+            GGML_ASSERT(common_speculative_get_state(M.spec, s, cm) && common_speculative_get_state(G.spec, s, cg));
+            check(cm == cg, what + ": seq " + std::to_string(s) + " carry K=0 == K=8 (bytes)");
         }
     };
 
@@ -1233,11 +1275,11 @@ static void homog_case(gguf_context * meta, uint32_t n_seq) {
     // rejection + replay: checkpoint every sequence (target + carry), verify runs, restore, replay shorter runs
     {
         const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
-        mtp_env * envs[2] = { &M, &S };
-        std::vector<common_prompt_checkpoint> ck[2];
+        mtp_env * envs[3] = { &M, &S, &G };
+        std::vector<common_prompt_checkpoint> ck[3];
         const std::vector<llama_pos> p0 = pos;
         const std::vector<llama_token> last0 = last;
-        for (int e = 0; e < 2; ++e) {
+        for (int e = 0; e < 3; ++e) {
             ck[e].resize(n_seq);
             auto * mem = llama_get_memory(envs[e]->ctx_tgt.get());
             for (llama_seq_id q = 0; q < (llama_seq_id) n_seq; ++q) {
@@ -1252,7 +1294,7 @@ static void homog_case(gguf_context * meta, uint32_t n_seq) {
             rshape.push_back({ q, (size_t) (1 + q % 3) });
         }
         round("verify before rejection", vshape, np4 ? 3 : 1); // np4: above 4+4 | 4 (MAX_UBATCH 8) | below
-        for (int e = 0; e < 2; ++e) {
+        for (int e = 0; e < 3; ++e) {
             common_memory mem;
             mem.init(envs[e]->ctx_tgt.get(), envs[e]->ctx_dft.get());
             for (llama_seq_id q = 0; q < (llama_seq_id) n_seq; ++q) {
@@ -1268,7 +1310,7 @@ static void homog_case(gguf_context * meta, uint32_t n_seq) {
     }
 
     // cancellation: seq 1 released (both memories cleared), a new short prompt (below) beside an above neighbour
-    for (mtp_env * e : { &M, &S }) {
+    for (mtp_env * e : { &M, &S, &G }) {
         common_memory mem;
         mem.init(e->ctx_tgt.get(), e->ctx_dft.get());
         mem.seq_rm(1, -1, -1);
@@ -1277,6 +1319,13 @@ static void homog_case(gguf_context * meta, uint32_t n_seq) {
     round("cancel seq 1 + new prompt beside seq 0", { { 1, 10 }, { 0, 1 } }, 2);
     round("new prompt continues beside seq 0",      { { 1, 1 },  { 0, 1 } }, 2);
 
+    const auto pm = llama_perf_context(M.ctx_tgt.get());
+    const auto pg = llama_perf_context(G.ctx_tgt.get());
+    const auto pgd = llama_perf_context(G.ctx_dft.get());
+    check(n_gc_byte == n_gc_cmp && n_gc_cmp > 0, "exactness: every run byte-equal K=0 vs K=8 + CHECK=3 under identical grouping");
+    check(pg.n_reused > 0, "K=8: positive target graph reuse");
+    printf("homogeneous np%u exactness: %d/%d runs byte-equal K=0 vs K=8+CHECK=3 (target n_reused K=0 %d, K=8 %d, draft K=8 %d); %d runs diverge from solo (composition)\n",
+           n_seq, n_gc_byte, n_gc_cmp, pm.n_reused, pg.n_reused, pgd.n_reused, n_solo_div);
     printf("homogeneous np%u: %d runs, %d byte-identical to solo, max |d| %.2e, mixed rounds %d; two-row round %.2f ms mixed (2 calls) vs %.2f ms same-class (1 call)\n",
            n_seq, n_runs, n_bytes_same, (double) worst, n_mixed_rounds,
            n_ms_mixed ? ms_mixed / n_ms_mixed : 0.0, n_ms_single ? ms_single / n_ms_single : 0.0);
