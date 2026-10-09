@@ -34,8 +34,10 @@ import type { DatabaseConversation, DatabaseMessage } from '$lib/types/database'
 import {
 	compactedConversationName,
 	measureContextUsage,
+	normalizeContextOverrides,
 	planSummaryRequest,
 	replyTokenCap,
+	resolveContextReserveConfig,
 	selectTailMessages,
 	shouldCompact
 } from '$lib/utils/context-reserve';
@@ -204,9 +206,13 @@ describe('W1: compaction against the cached prompt', () => {
 		return new Response(chunks.join(''), { headers: { 'Content-Type': 'text/event-stream' } });
 	}
 
-	async function scenario(full: boolean) {
+	async function scenario(
+		full: boolean,
+		contextSettings?: DatabaseConversation['contextSettings']
+	) {
 		const N_CTX = 20000;
 		const conv = {
+			contextSettings,
 			currNode: 'a2',
 			id: 'c1',
 			lastModified: 0,
@@ -386,6 +392,107 @@ describe('W1: compaction against the cached prompt', () => {
 		// room = n_ctx - (prompt before the truncated reply) - instruction - 1, capped at the reserve
 		expect(bodies[0].max_tokens as number).toBeLessThanOrEqual(2000);
 	}, 60000);
+
+	it("W1.1: a chat's own instruction, reserve and kept messages; the continuation inherits them", async () => {
+		const own = {
+			keepMessages: 1,
+			reserve: 3000,
+			summaryPrompt: 'CHAT RULE: summarize in {{MAX_TOKENS}}'
+		};
+		const { bodies, convs, db } = await scenario(false, own);
+		const [summary, next] = bodies;
+		const last = (summary.messages as Record<string, unknown>[]).at(-1)!;
+
+		expect(String(last.content)).toBe(`CHAT RULE: summarize in ${summary.max_tokens}`);
+		// reserve 3000 - instruction, not the global 2000
+		expect(summary.max_tokens as number).toBeGreaterThan(2000);
+
+		const used = 1000 + 9000 + 20 + Math.ceil('question three'.length / 3) + 8;
+
+		expect(next.max_tokens).toBe(20000 - used - 3000);
+
+		const newConv = convs.get('conv-1')!;
+
+		expect(newConv.contextSettings).toEqual(own);
+
+		// one kept message after the summary note
+		const leaf = db.get(newConv.currNode!)!;
+		const beforeLeaf = db.get(leaf.parent!)!;
+
+		expect(leaf).toMatchObject({ content: 'answer two', role: 'assistant' });
+		expect(beforeLeaf.content).toContain('SUMMARY TEXT');
+	}, 60000);
+});
+
+describe('W1.1: per-conversation Context settings', () => {
+	const global = {
+		autoCompact: true,
+		compactKeepMessages: 4,
+		compactSummaryPrompt: 'GLOBAL',
+		contextReserveTokens: 6144
+	};
+
+	it('the global settings when the chat has none (older records)', () => {
+		expect(resolveContextReserveConfig(global, undefined)).toEqual({
+			autoCompact: true,
+			keepMessages: 4,
+			reserve: 6144,
+			summaryPrompt: 'GLOBAL'
+		});
+	});
+
+	it('each field of the chat overrides its global setting; others follow the global', () => {
+		expect(
+			resolveContextReserveConfig(global, { autoCompact: false, summaryPrompt: 'MINE' })
+		).toEqual({ autoCompact: false, keepMessages: 4, reserve: 6144, summaryPrompt: 'MINE' });
+		expect(resolveContextReserveConfig(global, { keepMessages: 0, reserve: 0 })).toMatchObject({
+			keepMessages: 0,
+			reserve: 0
+		});
+		// invalid values fall back
+		expect(resolveContextReserveConfig(global, { reserve: -5, summaryPrompt: '  ' })).toMatchObject(
+			{
+				reserve: 6144,
+				summaryPrompt: 'GLOBAL'
+			}
+		);
+	});
+
+	it('stored overrides drop unset fields; none at all = no record field', () => {
+		expect(normalizeContextOverrides({ autoCompact: undefined, reserve: 100 })).toEqual({
+			reserve: 100
+		});
+		expect(normalizeContextOverrides({ summaryPrompt: '' })).toBeUndefined();
+	});
+
+	it('the store resolves the active chat and listed chats; unknown ones use the global', () => {
+		settingsStore.config = { ...settingsStore.config, ...global };
+		conversationsStore.activeConversation = {
+			contextSettings: { reserve: 111 },
+			currNode: null,
+			id: 'act',
+			lastModified: 0,
+			name: 'a'
+		};
+		conversationsStore.conversations = [
+			{
+				contextSettings: { keepMessages: 9 },
+				currNode: null,
+				id: 'other',
+				lastModified: 0,
+				name: 'o'
+			}
+		];
+
+		expect(conversationsStore.getContextConfig('act').reserve).toBe(111);
+		expect(conversationsStore.getContextConfig('other')).toMatchObject({
+			keepMessages: 9,
+			reserve: 6144
+		});
+		expect(conversationsStore.getContextConfig('nope').reserve).toBe(6144);
+		conversationsStore.activeConversation = null;
+		conversationsStore.conversations = [];
+	});
 });
 
 describe('W1: later turns of an agentic flow', () => {

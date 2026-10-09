@@ -64,8 +64,8 @@ import {
 	normalizeModelName,
 	parseToolsSnapshot,
 	planSummaryRequest,
-	readContextReserveConfig,
 	replyTokenCap,
+	resolveContextReserveConfig,
 	selectTailMessages,
 	shouldCompact
 } from '$lib/utils';
@@ -350,7 +350,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		if (!nCtx) return fail('the context size is unknown (no /props yet)');
 
-		const cfg = readContextReserveConfig(settingsStore.config);
+		const cfg = resolveContextReserveConfig(settingsStore.config, conversation.contextSettings);
 		const reserve = cfg.reserve > 0 ? cfg.reserve : CONTEXT_RESERVE.DEFAULT_RESERVE_TOKENS;
 		const instructionTokens =
 			estimateTextTokens(buildSummaryInstruction(cfg.summaryPrompt, reserve)) +
@@ -720,7 +720,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 	/** W1: does sending this message to the conversation need a compaction first? */
 	needsCompaction(convId: string, content: string, extras?: DatabaseMessageExtra[]): boolean {
-		const cfg = readContextReserveConfig(settingsStore.config);
+		const cfg = conversationsStore.getContextConfig(convId);
 
 		if (!cfg.autoCompact || cfg.reserve <= 0) return false;
 
@@ -843,8 +843,12 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	}
 
 	/** W1: max_tokens of a reply to `messages`: the configured limit capped at free - reserve. */
-	replyMaxTokens(messages: readonly DatabaseMessage[], model?: string | null): number | undefined {
-		const cfg = readContextReserveConfig(settingsStore.config);
+	replyMaxTokens(
+		messages: readonly DatabaseMessage[],
+		model?: string | null,
+		convId?: string
+	): number | undefined {
+		const cfg = conversationsStore.getContextConfig(convId);
 		const configured = Number(settingsStore.config.max_tokens) || undefined;
 		const nCtx = this.contextSizeFor(model);
 
@@ -1377,7 +1381,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			disabledTools: conversationsStore.preferences.getDisabledTools()
 		};
 		// W1: the reply never uses the context reserve (the agentic loop re-caps each later turn)
-		const replyMaxTokens = this.replyMaxTokens(allMessages, effectiveModel);
+		const replyMaxTokens = this.replyMaxTokens(allMessages, effectiveModel, convId);
 		const replyCap = replyMaxTokens !== undefined ? { max_tokens: replyMaxTokens } : {};
 
 		{
@@ -1610,6 +1614,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			compactedConversationName(source.name),
 			{
 				compactedFromConversationId: source.id,
+				// per-chat Context settings (W1.1) carry over to the continuation
+				contextSettings: source.contextSettings,
 				cwd: source.cwd,
 				disabledToolCategories: source.disabledToolCategories,
 				disabledTools: source.disabledTools,

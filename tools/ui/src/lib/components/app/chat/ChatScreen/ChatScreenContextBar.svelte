@@ -1,16 +1,20 @@
 <script lang="ts">
-	import { ArrowLeft, ArrowRight, Loader2, Shrink, X } from '@lucide/svelte';
+	import ChatScreenContextSettingsDialog from './ChatScreenContextSettingsDialog.svelte';
+	import { ArrowLeft, ArrowRight, Loader2, Settings2, Shrink, X } from '@lucide/svelte';
 	import { goto } from '$app/navigation';
 	import { CONTEXT_RESERVE } from '$lib/constants';
 	import { RouterService } from '$lib/services/router.service';
-	import { chatStore, contextStatsStore, conversationsStore, settingsStore } from '$lib/stores';
-	import { formatTokenCount, measureContextUsage, readContextReserveConfig } from '$lib/utils';
+	import { chatStore, contextStatsStore, conversationsStore } from '$lib/stores';
+	import { formatTokenCount, measureContextUsage } from '$lib/utils';
 
 	// W1: context usage meter + "Compact now" for the open conversation
 
 	let conversation = $derived(conversationsStore.activeConversation);
 	let messages = $derived(conversationsStore.activeMessages as DatabaseMessage[]);
-	let cfg = $derived(readContextReserveConfig(settingsStore.config));
+	// this chat's overrides (W1.1), else the global settings
+	let cfg = $derived(conversationsStore.getContextConfig(conversation?.id));
+	let hasOverrides = $derived(!!conversation?.contextSettings);
+	let showSettings = $state(false);
 	let nCtx = $derived(contextStatsStore.contextTotal);
 	// the server's last measurement (+ an estimate of what followed), or the live count while a
 	// request runs
@@ -159,5 +163,26 @@
 				Compact now
 			</button>
 		{/if}
+
+		<button
+			aria-label="Context settings for this chat"
+			class={[
+				'flex items-center rounded p-0.5 hover:bg-muted hover:text-foreground',
+				hasOverrides ? 'text-foreground' : ''
+			]}
+			onclick={() => (showSettings = true)}
+			title={hasOverrides
+				? 'Context settings for this chat (overrides set)'
+				: 'Context settings for this chat (global defaults)'}
+			type="button"
+		>
+			<Settings2 class="h-3 w-3" />
+
+			{#if hasOverrides}
+				<span class="ml-0.5 h-1.5 w-1.5 rounded-full bg-primary"></span>
+			{/if}
+		</button>
 	</div>
+
+	<ChatScreenContextSettingsDialog bind:open={showSettings} convId={conversation.id} />
 {/if}

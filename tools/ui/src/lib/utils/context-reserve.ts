@@ -9,7 +9,12 @@
 
 import { CONTEXT_RESERVE } from '$lib/constants';
 import { MessageRole, MessageType } from '$lib/enums';
-import type { ApiChatMessageData, ChatMessageTimings, DatabaseMessage } from '$lib/types';
+import type {
+	ApiChatMessageData,
+	ChatMessageTimings,
+	ConversationContextSettings,
+	DatabaseMessage
+} from '$lib/types';
 
 export interface ContextReserveConfig {
 	reserve: number;
@@ -59,6 +64,51 @@ export function readContextReserveConfig(config: Record<string, unknown>): Conte
 		),
 		summaryPrompt: prompt.trim() ? prompt : CONTEXT_RESERVE.DEFAULT_SUMMARY_PROMPT
 	};
+}
+
+/**
+ * The Context settings that apply to a conversation: its own override per field (W1.1), else the
+ * global setting. Invalid override values (negative, non-finite, blank prompt) fall back too.
+ */
+export function resolveContextReserveConfig(
+	config: Record<string, unknown>,
+	overrides?: ConversationContextSettings | null
+): ContextReserveConfig {
+	const global = readContextReserveConfig(config);
+	const o = overrides ?? {};
+	const int = (v: unknown): number | undefined =>
+		typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : undefined;
+
+	return {
+		autoCompact: typeof o.autoCompact === 'boolean' ? o.autoCompact : global.autoCompact,
+		keepMessages: int(o.keepMessages) ?? global.keepMessages,
+		reserve: int(o.reserve) ?? global.reserve,
+		summaryPrompt:
+			typeof o.summaryPrompt === 'string' && o.summaryPrompt.trim()
+				? o.summaryPrompt
+				: global.summaryPrompt
+	};
+}
+
+/** Overrides without the fields that are unset (undefined = no override at all). */
+export function normalizeContextOverrides(
+	o: ConversationContextSettings | null | undefined
+): ConversationContextSettings | undefined {
+	if (!o) return undefined;
+
+	const out: ConversationContextSettings = {};
+
+	if (typeof o.autoCompact === 'boolean') out.autoCompact = o.autoCompact;
+
+	if (typeof o.keepMessages === 'number' && o.keepMessages >= 0) out.keepMessages = o.keepMessages;
+
+	if (typeof o.reserve === 'number' && o.reserve >= 0) out.reserve = o.reserve;
+
+	if (typeof o.summaryPrompt === 'string' && o.summaryPrompt.trim()) {
+		out.summaryPrompt = o.summaryPrompt;
+	}
+
+	return Object.keys(out).length > 0 ? out : undefined;
 }
 
 export function estimateTextTokens(text: string | undefined | null): number {

@@ -11,6 +11,13 @@ export interface McpServerOverride {
 	enabled: boolean;
 }
 
+export interface ConversationContextSettings {
+	reserve?: number;
+	autoCompact?: boolean;
+	keepMessages?: number;
+	summaryPrompt?: string;
+}
+
 export interface DatabaseConversation {
 	currNode: string | null;
 	id: string;
@@ -30,6 +37,11 @@ export interface DatabaseConversation {
 	compactedFromConversationId?: string;
 	/** the conversation this one was compacted into (W1) */
 	compactedIntoConversationId?: string;
+	/**
+	 * Per-conversation overrides of the Context settings (W1.1); a missing field (or a missing
+	 * object, as on older records) uses the global setting. A compacted continuation inherits them.
+	 */
+	contextSettings?: ConversationContextSettings;
 	/** JSON of the tool definitions this conversation sends (its first agentic request's list) */
 	toolsSnapshot?: string;
 	/** a tool change the user chose not to apply (ToolsChange.key) */

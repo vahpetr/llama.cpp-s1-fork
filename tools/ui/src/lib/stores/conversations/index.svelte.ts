@@ -22,7 +22,15 @@ import {
 } from '$lib/stores/conversations/preferences.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import { tabsStore } from '$lib/stores/tabs.svelte';
-import { filterByLeafNodeId, findLeafNode, generateConversationTitle } from '$lib/utils';
+import type { ConversationContextSettings } from '$lib/types';
+import type { ContextReserveConfig } from '$lib/utils';
+import {
+	filterByLeafNodeId,
+	findLeafNode,
+	generateConversationTitle,
+	normalizeContextOverrides,
+	resolveContextReserveConfig
+} from '$lib/utils';
 import { SvelteSet } from 'svelte/reactivity';
 import { toast } from 'svelte-sonner';
 
@@ -445,6 +453,21 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	}
 
 	/**
+	 * Updates the name of a conversation.
+	 * @param convId - The conversation ID to update
+	 * @param name - The new name for the conversation
+	 */
+	/** W1.1: the Context settings of a conversation (its overrides, else the global settings). */
+	getContextConfig(convId: string | null | undefined): ContextReserveConfig {
+		const conv =
+			convId && this.activeConversation?.id === convId
+				? this.activeConversation
+				: this.conversations.find((c) => c.id === convId);
+
+		return resolveContextReserveConfig(settingsStore.config, conv?.contextSettings);
+	}
+
+	/**
 	 * Gets all messages for a specific conversation
 	 * @param convId - The conversation ID
 	 * @returns Array of messages
@@ -630,6 +653,24 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		return undefined;
 	}
 
+	/** W1.1: store a conversation's Context overrides (empty = use the global settings). */
+	async setContextSettings(
+		convId: string,
+		overrides: ConversationContextSettings | null | undefined
+	): Promise<void> {
+		const contextSettings = normalizeContextOverrides(overrides);
+
+		await DatabaseService.updateConversation(convId, { contextSettings });
+
+		if (this.activeConversation?.id === convId) {
+			this.activeConversation = { ...this.activeConversation, contextSettings };
+		}
+
+		this.conversations = this.conversations.map((c) =>
+			c.id === convId ? { ...c, contextSettings } : c
+		);
+	}
+
 	/**
 	 * Removes messages from active messages starting at an index
 	 */
@@ -656,11 +697,6 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		}
 	}
 
-	/**
-	 * Updates the name of a conversation.
-	 * @param convId - The conversation ID to update
-	 * @param name - The new name for the conversation
-	 */
 	async updateConversationName(convId: string, name: string): Promise<void> {
 		try {
 			await DatabaseService.updateConversation(convId, { name });

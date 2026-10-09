@@ -80,7 +80,6 @@ import {
 	getAudioInputFormat,
 	isAbortError,
 	parseToolsSnapshot,
-	readContextReserveConfig,
 	timingsTotal
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
@@ -530,11 +529,16 @@ class AgenticStore {
 			let turnOptions = options;
 
 			if (capturedTimings) {
-				const cap = this.laterTurnMaxTokens(capturedTimings, sessionMessages, effectiveModel);
+				const cap = this.laterTurnMaxTokens(
+					capturedTimings,
+					sessionMessages,
+					effectiveModel,
+					conversationId
+				);
 
 				if (cap === 0) {
 					toast.info(
-						readContextReserveConfig(settingsStore.config).autoCompact
+						conversationsStore.getContextConfig(conversationId).autoCompact
 							? 'The context reserve is reached: the agent stopped. Your next message compacts the conversation.'
 							: 'The context reserve is reached: the agent stopped. Use "Compact now" to continue in a new conversation.'
 					);
@@ -1098,9 +1102,10 @@ class AgenticStore {
 	private laterTurnMaxTokens(
 		last: ChatMessageTimings,
 		sessionMessages: readonly AgenticMessage[],
-		model: string
+		model: string,
+		conversationId?: string
 	): number | undefined {
-		const { reserve } = readContextReserveConfig(settingsStore.config);
+		const { reserve } = conversationsStore.getContextConfig(conversationId);
 		const nCtx = model ? modelsStore.props.getModelContextSize(model) : null;
 		const max = Number(settingsStore.config.max_tokens);
 		// 0 / -1 / unset = no limit
