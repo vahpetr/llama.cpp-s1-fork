@@ -226,6 +226,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-mtp-catchup-homog-np2 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_HOMOGENEOUS=1;LLAMA_QSA_MIN_KV=64")
     llama_test(test-mtp-catchup NAME test-mtp-catchup-homog-np4 ARGS --homog 4 LABEL mtp)
     set_tests_properties(test-mtp-catchup-homog-np4 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_HOMOGENEOUS=1;LLAMA_QSA_MIN_KV=64")
+    # [TAG_MULTISLOT] stage 5.1 item 5b: the LLAMA_GTT_CONCURRENT_RESERVE_MIB operation-start gate (fake GTT usage file)
+    llama_test(test-mtp-catchup NAME test-mtp-catchup-adm-op ARGS --adm-op LABEL mtp)
     # [TAG_MTP_QSA_PHASE] LLAMA_MTP_QSA_PHASE=1: the sparse draft's block phase vs the reference selection (both selection
     # forms of the carrier), and the incremental census == the full one at phase 1
     llama_build_and_test(test-mtp-qsa-phase.cpp LABEL mtp)

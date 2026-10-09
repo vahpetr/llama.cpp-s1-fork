@@ -156,6 +156,35 @@ std::vector<std::vector<int32_t>> server_qsa_route_groups(const std::vector<serv
     return groups;
 }
 
+// [TAG_MULTISLOT] (stage 5.1 item 5b, see server-context.h) the operation-start gate
+const char * server_adm_op_name(server_adm_op op) {
+    switch (op) {
+        case SERVER_ADM_OP_DRAFT:        return "draft";
+        case SERVER_ADM_OP_RESTORE_RAM:  return "restore_ram";
+        case SERVER_ADM_OP_RESTORE_DISK: return "restore_disk";
+        case SERVER_ADM_OP_RESTORE_SLOT: return "restore_slot";
+        default:                         return "unknown";
+    }
+}
+
+server_adm_op_decision server_admission_op_check(bool enabled, double bar_mib, double reserve_mib, bool concurrent,
+                                                 const std::string & used_path) {
+    server_adm_op_decision d;
+    if (!enabled || reserve_mib <= 0.0 || !concurrent) {
+        return d;
+    }
+    std::ifstream f(used_path);
+    uint64_t used_b = 0;
+    if (!f || !(f >> used_b)) {
+        return d; // unreadable: start (the prompt admission disables itself on its next check and logs it)
+    }
+    d.gated         = true;
+    d.used_mib      = used_b / 1024.0 / 1024.0;
+    d.projected_mib = d.used_mib + reserve_mib;
+    d.start         = d.projected_mib <= bar_mib;
+    return d;
+}
+
 // Replay after a checkpoint restore (partial draft acceptance on a context that cannot seq_rm partially).
 //
 // The leading `n_committed` tokens of `draft` were already sampled AND accepted on this very sampler during the
@@ -2710,6 +2739,12 @@ private:
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
+            // [TAG_MULTISLOT] (item 5b) a RAM swap-in may follow: within the concurrent reserve only, else the task
+            //   waits in the queue (nothing saved or loaded yet; selection re-runs on the next pass)
+            if (update_cache && !admission_op_gate(*ret, SERVER_ADM_OP_RESTORE_RAM)) {
+                return nullptr;
+            }
+
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
@@ -2757,6 +2792,12 @@ private:
             const size_t margin   = 1024; // below this a load does not pay for itself
 
             const bool will_load = reuse && disk_cache->find(task.tokens, lcp_slot + margin, ret->n_ctx, nullptr) >= 0;
+
+            // [TAG_MULTISLOT] (item 5b) a disk load allocates: within the concurrent reserve only, else the task waits
+            //   in the queue before anything is saved or loaded
+            if (will_load && !admission_op_gate(*ret, SERVER_ADM_OP_RESTORE_DISK)) {
+                return nullptr;
+            }
 
             // [TAG_TURN_BOUNDARY] a late branch: a whole later user turn of the resident prompt is cut off and the
             //   lost tail is worth a load. Best-effort: needs the user-message starts (message_spans of a chat
@@ -3618,6 +3659,37 @@ private:
         return n;
     }
 
+    // [TAG_MULTISLOT] (stage 5.1 item 5b) the operation-start gate (server_admission_op_check) for slot `slot`: false =
+    //   defer the operation (counted per kind, logged at most every 10 s per kind)
+    int64_t adm_op_t_log_us[SERVER_ADM_OP_COUNT] = { 0 };
+
+    bool admission_op_gate(const server_slot & slot, server_adm_op op) {
+        if (!adm.enabled || adm.reserve_mib <= 0.0) {
+            return true; // the default: nothing read, today's behaviour
+        }
+        bool concurrent = false;
+        for (const auto & other : slots) {
+            concurrent |= other.id != slot.id && other.is_processing();
+        }
+        const auto d = server_admission_op_check(adm.enabled, adm.bar_mib, adm.reserve_mib, concurrent, adm.path);
+        if (!d.gated) {
+            return true;
+        }
+        metrics.admission_last_reserve_mib = adm.reserve_mib;
+        if (d.start) {
+            return true;
+        }
+        metrics.admission_op_deferred_total[op]++;
+        const int64_t t_now = ggml_time_us();
+        if (adm_op_t_log_us[op] == 0 || t_now - adm_op_t_log_us[op] > 10 * 1000 * 1000) {
+            adm_op_t_log_us[op] = t_now;
+            SRV_WRN("admission: deferred %s of slot %d (projected %.0f MiB > bar %.0f MiB: used %.0f + concurrent reserve %.0f; another slot is processing; %" PRIu64 " deferred so far)\n",
+                    server_adm_op_name(op), slot.id, d.projected_mib, adm.bar_mib, d.used_mib, adm.reserve_mib,
+                    metrics.admission_op_deferred_total[op]);
+        }
+        return false;
+    }
+
     // ADM_DEFER keeps the slot's prompt out of this batch (re-checked on the next iteration)
     admission_result admission_check(server_slot & slot, int32_t n_room) {
         const int64_t n_chunk = std::min<int64_t>((int64_t) slot.task->n_tokens() - slot.prompt.n_tokens(), n_room);
@@ -4117,6 +4189,12 @@ private:
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    // [TAG_MULTISLOT] (item 5b) the restore allocates: within the concurrent reserve only
+                    if (!admission_op_gate(*slot, SERVER_ADM_OP_RESTORE_SLOT)) {
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -5058,6 +5136,12 @@ private:
                                 spec_rt.n_rows_gen   += 1;
                                 return;
                             }
+                        }
+
+                        // [TAG_MULTISLOT] (item 5b) draft + speculative checkpoint work starts only within the
+                        //   concurrent reserve; deferred = a plain decode this round (no draft call, no checkpoint)
+                        if (!admission_op_gate(slot, SERVER_ADM_OP_DRAFT)) {
+                            return;
                         }
 
                         const int64_t t_ckpt0 = n_tput > 0 ? ggml_time_us() : 0; // [TAG_SPEC_DRAFT_POLICY] ckpt cost

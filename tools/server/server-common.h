@@ -570,6 +570,7 @@ struct server_metrics {
     uint64_t admission_reserve_deferred_total  = 0;   // zero-growth chunks deferred by the concurrent reserve
     double   admission_reserve_mib             = 0.0; // LLAMA_GTT_CONCURRENT_RESERVE_MIB
     double   admission_last_reserve_mib        = 0.0; // the reserve the last check charged (0 without concurrency)
+    uint64_t admission_op_deferred_total[4]    = { 0 }; // (item 5b) operation starts deferred by the reserve: draft, restore_ram, restore_disk, restore_slot
 
     void init() {
         t_start = ggml_time_us();

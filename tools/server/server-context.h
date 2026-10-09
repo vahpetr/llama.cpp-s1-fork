@@ -238,3 +238,26 @@ struct server_qsa_route_run {
 // (split_equal wants consecutive increasing sequence ids), runs of <= max_ub rows chunked at max_ub TOTAL rows
 // (LLAMA_MTP_QSA_MAX_UBATCH, 0 = no cap), larger runs only with larger runs; groups ordered by first_row
 std::vector<std::vector<int32_t>> server_qsa_route_groups(const std::vector<server_qsa_route_run> & runs, int64_t n_min, int64_t max_ub);
+
+// [TAG_MULTISLOT] (stage 5.1 item 5b, astra r2 Major 2) operation-start gate of LLAMA_GTT_CONCURRENT_RESERVE_MIB: before
+// a slot starts draft / speculative-checkpoint work (device GTT) or a restore allocation (RAM swap-in, disk load,
+// /slots restore) while ANOTHER slot is processing, the live GTT usage + the reserve must stay <= the admission bar;
+// otherwise the operation is deferred (never aborted): a draft round becomes a plain decode, a restore waits in the
+// task queue. Off (start = true, nothing read) with admission off, reserve 0 (the default) or no concurrency.
+enum server_adm_op {
+    SERVER_ADM_OP_DRAFT = 0,     // draft generation + its on-device speculative checkpoints (target / draft)
+    SERVER_ADM_OP_RESTORE_RAM,   // RAM prompt-cache swap-in on slot selection
+    SERVER_ADM_OP_RESTORE_DISK,  // disk prompt-cache load on slot selection
+    SERVER_ADM_OP_RESTORE_SLOT,  // /slots/{id}?action=restore
+    SERVER_ADM_OP_COUNT,
+};
+const char * server_adm_op_name(server_adm_op op);
+
+struct server_adm_op_decision {
+    bool   start         = true;  // false = defer
+    bool   gated         = false; // the gate was evaluated (enabled, reserve > 0, concurrent, usage readable)
+    double used_mib      = 0.0;
+    double projected_mib = 0.0;   // used + reserve
+};
+server_adm_op_decision server_admission_op_check(bool enabled, double bar_mib, double reserve_mib, bool concurrent,
+                                                 const std::string & used_path);

@@ -1668,6 +1668,22 @@ std::string server_task_result_metrics::to_metrics() {
             "GTT headroom admission: zero-growth prompt chunks deferred by the concurrent-operation reserve",
             (double) metrics.admission_reserve_deferred_total
         }, {
+            "admission_reserve_deferred_draft_total",
+            "GTT headroom admission: draft + speculative-checkpoint starts deferred by the concurrent reserve (plain decode instead)",
+            (double) metrics.admission_op_deferred_total[0]
+        }, {
+            "admission_reserve_deferred_restore_ram_total",
+            "GTT headroom admission: RAM prompt-cache swap-ins deferred by the concurrent reserve (task re-queued)",
+            (double) metrics.admission_op_deferred_total[1]
+        }, {
+            "admission_reserve_deferred_restore_disk_total",
+            "GTT headroom admission: disk prompt-cache loads deferred by the concurrent reserve (task re-queued)",
+            (double) metrics.admission_op_deferred_total[2]
+        }, {
+            "admission_reserve_deferred_restore_slot_total",
+            "GTT headroom admission: /slots restores deferred by the concurrent reserve (task re-queued)",
+            (double) metrics.admission_op_deferred_total[3]
+        }, {
             "disk_cache_saves_total", "Disk prompt cache: conversations written", (double) metrics.disk.n_saves
         }, {
             "disk_cache_loads_total", "Disk prompt cache: conversations loaded instead of re-processed", (double) metrics.disk.n_loads

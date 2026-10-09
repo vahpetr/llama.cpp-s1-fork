@@ -1406,10 +1406,97 @@ static int homog_parent(const char * self, uint32_t n_seq) {
 #endif
 }
 
+// [TAG_MULTISLOT] (stage 5.1 item 5b, astra r2 Major 2) the operation-start gate of LLAMA_GTT_CONCURRENT_RESERVE_MIB
+// (server_admission_op_check) against a fake LLAMA_GTT_USED_PATH file: N = 1 / 2, simultaneous starts, defer and
+// recovery, unreadable usage, the default reserve 0, and a scheduler round in which the active neighbour keeps
+// decoding (a deferred draft is a plain decode, a deferred restore waits) - no abort, no rejection
+static int adm_op_case() {
+    const std::string path = "test-mtp-catchup-adm-op.gtt_used";
+    const auto write_used = [&](double mib) {
+        FILE * f = fopen(path.c_str(), "w");
+        GGML_ASSERT(f != nullptr);
+        fprintf(f, "%llu\n", (unsigned long long) (mib * 1024.0 * 1024.0));
+        fclose(f);
+    };
+    const double bar = 1000.0, reserve = 200.0;
+
+    write_used(900.0);
+    // default reserve 0 / admission off / N = 1 (no other slot processing): start, nothing evaluated
+    auto d = server_admission_op_check(true, bar, 0.0, true, path);
+    check(d.start && !d.gated, "reserve 0 (default): start, gate not evaluated");
+    d = server_admission_op_check(false, bar, reserve, true, path);
+    check(d.start && !d.gated, "admission off: start, gate not evaluated");
+    d = server_admission_op_check(true, bar, reserve, false, path);
+    check(d.start && !d.gated, "N = 1 / no concurrent slot: start even at used 900 + reserve 200 > bar 1000");
+
+    // N = 2, another slot processing: used + reserve vs the bar
+    d = server_admission_op_check(true, bar, reserve, true, path);
+    check(!d.start && d.gated && d.projected_mib == 1100.0, "N = 2: used 900 + reserve 200 > bar 1000 -> defer (projected 1100)");
+    write_used(800.0);
+    d = server_admission_op_check(true, bar, reserve, true, path);
+    check(d.start && d.gated, "N = 2: used 800 + reserve 200 == bar -> start (equality admits)");
+    write_used(800.5);
+    d = server_admission_op_check(true, bar, reserve, true, path);
+    check(!d.start, "N = 2: used 800.5 + reserve 200 > bar -> defer");
+    check(server_admission_op_check(true, bar, reserve, true, path + ".missing").start, "unreadable usage: start (no abort)");
+
+    // a scheduler round, 2 slots (A generating = the active neighbour, B starting a restore), then pressure
+    // drops (recovery). Per round: every generating slot asks DRAFT, the starting slot asks RESTORE_*.
+    struct sim_slot { bool processing; int n_plain = 0, n_draft = 0, n_restore_wait = 0; bool restored = false; };
+    std::vector<sim_slot> sl = { { true }, { false } };
+    uint64_t deferred[SERVER_ADM_OP_COUNT] = { 0 };
+    const auto concurrent = [&](size_t me) {
+        bool c = false;
+        for (size_t o = 0; o < sl.size(); ++o) {
+            c |= o != me && sl[o].processing;
+        }
+        return c;
+    };
+    const auto round = [&](double used) {
+        write_used(used);
+        for (size_t k = 0; k < sl.size(); ++k) {
+            if (sl[k].processing) { // generating: draft or plain decode - always one step
+                const auto g = server_admission_op_check(true, bar, reserve, concurrent(k), path);
+                (g.start ? sl[k].n_draft : sl[k].n_plain)++;
+                deferred[SERVER_ADM_OP_DRAFT] += g.start ? 0 : 1;
+            } else if (!sl[k].restored) { // simultaneous: a restore start in the same round
+                const auto g = server_admission_op_check(true, bar, reserve, concurrent(k), path);
+                if (g.start) {
+                    sl[k].restored   = true;
+                    sl[k].processing = true;
+                } else {
+                    sl[k].n_restore_wait++;
+                    deferred[SERVER_ADM_OP_RESTORE_DISK]++;
+                }
+            }
+        }
+    };
+    // a waiting task is not "processing": A (the active neighbour) is not gated by B's pending restore
+    round(950.0); // pressure: A drafts on (no concurrent slot for A), B's restore waits
+    round(950.0);
+    check(sl[0].n_draft == 2 && sl[0].n_plain == 0, "pressure, B waiting: the active neighbour is untouched (2 drafted steps)");
+    check(sl[1].n_restore_wait == 2 && !sl[1].restored, "pressure: the restore start waits (deferred twice, not rejected)");
+    round(700.0); // recovery: A drafts, B restores (simultaneous starts in one round)
+    check(sl[0].n_draft == 3 && sl[1].restored, "recovery: the deferred restore starts beside the drafting neighbour");
+    round(950.0); // both processing under pressure: both drafts deferred -> plain decodes, both still advance
+    check(sl[0].n_plain == 1 && sl[1].n_plain == 1, "both processing, pressure: both drafts deferred, both decode plain");
+    round(700.0);
+    check(sl[0].n_draft == 4 && sl[1].n_draft == 1, "both processing, under the bar: both draft again");
+    check(deferred[SERVER_ADM_OP_DRAFT] == 2 && deferred[SERVER_ADM_OP_RESTORE_DISK] == 2, "deferrals counted per kind");
+    check(strcmp(server_adm_op_name(SERVER_ADM_OP_RESTORE_SLOT), "restore_slot") == 0, "kind names");
+    std::remove(path.c_str());
+    printf("test-mtp-catchup --adm-op: %s (%d checks ok)\n", n_fail ? "FAILED" : "OK", n_ok);
+    return n_fail ? 1 : 0;
+}
+
 int main(int argc, char ** argv) {
     llama_log_set(quiet_log, nullptr);
     common_log_set_verbosity_thold(-1);
     llama_backend_init();
+
+    if (argc >= 2 && strcmp(argv[1], "--adm-op") == 0) {
+        return adm_op_case(); // [TAG_MULTISLOT] item 5b, no model
+    }
 
     gguf_context_ptr meta = make_meta(4096);
 
