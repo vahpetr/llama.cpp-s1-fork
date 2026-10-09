@@ -123,3 +123,24 @@ PASS requirement yet. Measure per-stream startup / restore peaks against 102400 
   histories and grouping, composition differences localised + teacher-forced replay, missing coverage = PARTIAL) are
   the multi-slot gate contract; see the r2 review file for the verbatim list.
 - Still not covered here: server e2e (fixture `no_vocab`), the capacity-retry cut, real GTT calibration of the reserve.
+
+## Per-seq state portability across the stream count (np1 <-> np2)
+
+- Found by the multi-slot gate: an np1 slot / sequence state failed in an np2 per-stream server
+  (`llama_state_seq_load_file: error loading sequence state file: n_stream mismatch`). Format rule now: per-seq state
+  is stream-count agnostic — the writer is unchanged (`n_stream` + one cell block per writer stream; a per-seq save
+  fills only its own stream), `llama_kv_cache::state_read_sinfo` accepts any writer `n_stream` for `seq_id >= 0`, puts
+  the one non-empty block into the stream of `seq_id` (mirrored `sinfos_in/out` indexed by the process's streams, so
+  the hybrid-idx indexer still adopts the attention layout) and rejects a second non-empty block. Whole-context
+  (`seq_id == -1`) restores stay strict. The recurrent memory and the speculative carries (MTP "MPTH", eagle3
+  boundary) have no stream / slot field; the seq-data envelope's source seq id is ignored on the host path.
+- Disk prompt cache: the namespace key keeps n_parallel / n_seq_max / kv_unified (param digest, by design). Before,
+  the state descriptor (key component + per-entry envelope) printed n_seq_max / unified / kv n_stream / n_seq_max /
+  per-layer stream views / recurrent pool size, and the adopt structure used the TOTAL n_ctx — np2 could not adopt an
+  np1 namespace. After: the descriptor prints the single-slot values (1) for those (prod np1 `--kv-unified`
+  descriptor byte-identical, so its key does not move), and the structural fingerprint's ctx is the per-slot
+  `llama_n_ctx_seq` (= `llama_n_ctx` for np1 and unified; changes only for np>1 without `--kv-unified`). So an np2
+  per-stream (or unified) server with the same per-slot size adopts the np1 namespace via `--cache-disk-adopt`.
+  One-time consequence: an np>1 server's descriptor (e.g. balkon hands, `--kv-unified --parallel N`) changes, so its
+  own disk-cache namespace moves on the next deploy of this code (adopt the previous key to keep it).
+- Tests: `test-state-portable` / `-qsa`.
