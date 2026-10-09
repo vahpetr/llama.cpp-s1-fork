@@ -76,3 +76,50 @@ PASS requirement yet. Measure per-stream startup / restore peaks against 102400 
 - Tests: `test-mtp-catchup-homog-np2/-np4` (planner + range execution on the synthetic fixture, per-stream KV,
   N = 64) + negative child. Not covered: server e2e (fixture tokenizer `no_vocab`, the server's detokenization
   asserts on LLAMA_VOCAB_TYPE_NONE), the server's capacity-retry cut, an explicit unchanged-shape transition test.
+
+## Round 3 status (Codex astra review r2, piagent `docs/verification/2026-10-09-codex-astra-stage6-r2.md`)
+
+- **Major 1 — guard dedup (fixed).** `qwen4exp_qsa_routing_check()` validates EVERY invocation (no early return on
+  a remembered ubatch). Only the proof counters stay "once per ubatch, not per QSA layer", deduplicated by a word-wise
+  hash over (memory context, n_tokens, every row's pos / n_seq_id / seq ids); a collision can only under-count, never
+  skip validation. Cost of the undeduplicated pass on the fixture (`LLAMA_QSA_ROUTING_COST=1` →
+  `[qsa-routing-cost] calls=… rows=… ns=… ns_per_call=… ns_per_row=…`, a separate line; the `[qsa-routing]` proof line
+  is unchanged): ~85 ns per call, ~20 ns per row (np2: 200 calls / 808 rows; np4: 319 / 1394). Negative child
+  `--homog-neg-reuse`: one `llama_batch` decoded twice with the r2 key unchanged (first/last row seq 0/2 @ 80, n_tokens
+  3, first seq 0), interior seq 1 rewound 80 → 61 by checkpoint → must abort. Note: on this fixture the r2 guard ALSO
+  aborted (each ubatch's `pos` array is a fresh heap allocation, so the remembered pointer differed); the hole was
+  allocator-dependent, the test is a requirement test, not a reproduction.
+- **Major 2 — 5b operation-start gate (implemented).** `server_admission_op_check()` / `admission_op_gate()`: while
+  another slot is processing, live GTT used + `LLAMA_GTT_CONCURRENT_RESERVE_MIB` must be <= the bar before (a) draft
+  generation + its on-device speculative checkpoints (deferred = a plain decode this round), (b) a RAM prompt-cache
+  swap-in, (c) a disk prompt-cache load (deferred = the task stays queued, nothing saved/loaded yet), (d) a `/slots`
+  restore (re-queued). Never an abort, no timeout (the concurrency ends when the neighbour releases). /metrics
+  `admission_reserve_deferred_{draft,restore_ram,restore_disk,restore_slot}_total`; WARN at most every 10 s per kind.
+  Reserve 0 (default) / admission off: returns before reading anything. NOT gated: host prompt checkpoints (RSS
+  envelope, spec §5), checkpoint restores into existing cells (rollback after rejection: correctness, no new cells),
+  startup allocations. A waiting task is not "processing", so an active neighbour is never gated by a pending
+  restore. The RAM gate is conservative: every LRU replacement with a prompt cache may swap in.
+- **Minor — target row cap (relaxed).** `server_qsa_route_target_cap()`: target ranges are uncapped when the MTP
+  catch-up is attention-free (`LLAMA_MTP_CATCHUP_ATTN=0`, prod); capped at `LLAMA_MTP_QSA_MAX_UBATCH` with the
+  attention catch-up (unset / 1) or `LLAMA_QSA_HOMOGENEOUS_TARGET_CAP=1`. Draft groups always keep the cap. Startup
+  log `[qsa-route] row cap: target ranges N, draft groups M`.
+- **Major 3 — exactness standard (tests).** homog np2/np4 add an environment G running M's IDENTICAL schedule
+  (history construction, ranges, draft groups, restore/replay, cancellation) with `LLAMA_GRAPH_CACHE=8
+  LLAMA_GRAPH_CACHE_CHECK=3`; M is K = 0. Required byte equality: target logits per run, last draft logits per draft
+  group, proposals, per-sequence carry; positive K=8 target reuse. Fixture: np2 18/18, np4 31/31 byte equal. Grouped
+  vs solo is R81 composition: tolerance 1e-3 + equal proposals kept only there (different rows per decode → different
+  CPU accumulation), first divergence printed (row, pos, vocab; ~1e-8).
+- **Major 4 — provenance caveat (accepted, unchanged).** Server-side partial-history detection
+  (`draft_partial()` or rows not continuing `seq_pos_max + 1`) is conservative and cannot prove the absence of older
+  holes or a partial draft indexer history. The model's `qsa_history_complete()` (indexer minimum / count / maximum)
+  is the source of truth: a partial history the server misses routes that ubatch dense on the model side (one class,
+  no guard violation) — it costs one extra call / a dense neighbour, and a complete above-N neighbour sharing that
+  ubatch runs dense too (not its solo sparse semantics), so exactness evidence for restore / adoption / hole cases
+  must show isolation or equal coverage at the gate. The optional "singleton when the model reported partial last
+  round" was not added (needs a model → server channel).
+- **Gate contract.** Review r2 gate items 1–6 (shape/memory first at 102 400 MiB with a measured reserve; arms
+  R/B2/O2/C2/S4; server execution coverage; routing/cache proof incl. K=0/K=8 identical-history byte comparison and
+  CHECK=3 windows; admission/cache lifecycle incl. reserve defer/recovery; PASS rule — byte equality for identical
+  histories and grouping, composition differences localised + teacher-forced replay, missing coverage = PARTIAL) are
+  the multi-slot gate contract; see the r2 review file for the verbatim list.
+- Still not covered here: server e2e (fixture `no_vocab`), the capacity-retry cut, real GTT calibration of the reserve.
