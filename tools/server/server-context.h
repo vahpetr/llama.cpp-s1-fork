@@ -218,3 +218,23 @@ struct server_multislot_envelope {
     std::string proof;          // the [multislot-envelope] line ("" for n_parallel <= 1: unchanged, nothing printed)
 };
 server_multislot_envelope server_multislot_envelope_check(const char * knob, int n_parallel, bool has_mmproj, bool ctx_shift);
+
+// [TAG_MULTISLOT] (stage 5.1 item 4a) homogeneous routing-class planner (LLAMA_QSA_HOMOGENEOUS=1, np > 1).
+// class of a depth interval [d_lo, d_hi] (depth = pos + 1) against N = LLAMA_QSA_MIN_KV: 1 above (d_lo >= N, equality
+// is above), 0 below (d_hi < N), -1 straddles N (a singleton)
+int server_qsa_route_class(int64_t d_lo, int64_t d_hi, int64_t n_min);
+
+// one whole run (a slot's rows of one round, or a drafting slot with one row per draft step)
+struct server_qsa_route_run {
+    int32_t   id_slot;
+    int32_t   n_rows;
+    llama_pos p_lo;      // min row position
+    llama_pos p_hi;      // max row position
+    bool      partial;   // partial history: a singleton
+    int32_t   first_row; // original order key (the first row's batch index)
+};
+
+// groups of run indices: singletons for straddling / partial runs; same-class runs together, sorted by slot id
+// (split_equal wants consecutive increasing sequence ids), runs of <= max_ub rows chunked at max_ub TOTAL rows
+// (LLAMA_MTP_QSA_MAX_UBATCH, 0 = no cap), larger runs only with larger runs; groups ordered by first_row
+std::vector<std::vector<int32_t>> server_qsa_route_groups(const std::vector<server_qsa_route_run> & runs, int64_t n_min, int64_t max_ub);

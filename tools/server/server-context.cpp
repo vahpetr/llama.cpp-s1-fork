@@ -87,6 +87,75 @@ server_multislot_envelope server_multislot_envelope_check(const char * knob, int
     return r;
 }
 
+// [TAG_MULTISLOT] (stage 5.1 item 4a, see server-context.h) the routing-class planner of LLAMA_QSA_HOMOGENEOUS=1
+int server_qsa_route_class(int64_t d_lo, int64_t d_hi, int64_t n_min) {
+    if (d_lo >= n_min) {
+        return 1; // above (equality at N is above; N = 0: everything is above)
+    }
+    if (d_hi < n_min) {
+        return 0; // below
+    }
+    return -1;    // straddles N: a singleton
+}
+
+std::vector<std::vector<int32_t>> server_qsa_route_groups(const std::vector<server_qsa_route_run> & runs, int64_t n_min, int64_t max_ub) {
+    std::vector<int32_t> by_id(runs.size());
+    for (size_t r = 0; r < runs.size(); ++r) {
+        by_id[r] = (int32_t) r;
+    }
+    std::stable_sort(by_id.begin(), by_id.end(), [&](int32_t a, int32_t b) { return runs[a].id_slot < runs[b].id_slot; });
+
+    std::vector<int>  cls(runs.size());
+    std::vector<bool> big(runs.size());
+    for (size_t r = 0; r < runs.size(); ++r) {
+        cls[r] = runs[r].partial ? -1 : server_qsa_route_class((int64_t) runs[r].p_lo + 1, (int64_t) runs[r].p_hi + 1, n_min);
+        big[r] = max_ub > 0 && (int64_t) runs[r].n_rows > max_ub;
+    }
+
+    std::vector<std::pair<int32_t, std::vector<int32_t>>> tagged; // (first original row, runs)
+    for (int key = 0; key < 4; ++key) {
+        const int  c = key >> 1;
+        const bool b = key & 1;
+        std::vector<int32_t> cur;
+        int64_t cur_rows = 0;
+        auto flush = [&]() {
+            if (!cur.empty()) {
+                int32_t first = INT32_MAX;
+                for (const int32_t r : cur) {
+                    first = std::min(first, runs[r].first_row);
+                }
+                tagged.emplace_back(first, cur);
+                cur.clear();
+                cur_rows = 0;
+            }
+        };
+        for (const int32_t r : by_id) {
+            if (cls[r] != c || big[r] != b) {
+                continue;
+            }
+            const int64_t n = runs[r].n_rows;
+            if (!b && max_ub > 0 && cur_rows + n > max_ub) {
+                flush();
+            }
+            cur.push_back(r);
+            cur_rows += n;
+        }
+        flush();
+    }
+    for (size_t r = 0; r < runs.size(); ++r) {
+        if (cls[r] < 0) {
+            tagged.emplace_back(runs[r].first_row, std::vector<int32_t>{ (int32_t) r });
+        }
+    }
+    std::stable_sort(tagged.begin(), tagged.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+
+    std::vector<std::vector<int32_t>> groups;
+    for (auto & t : tagged) {
+        groups.push_back(std::move(t.second));
+    }
+    return groups;
+}
+
 // Replay after a checkpoint restore (partial draft acceptance on a context that cannot seq_rm partially).
 //
 // The leading `n_committed` tokens of `draft` were already sampled AND accepted on this very sampler during the
@@ -4504,16 +4573,8 @@ private:
         return v;
     }
 
-    // routing class of a depth interval [d_lo, d_hi] (depth = pos + 1); -1 = straddles N (singleton)
     static int qsa_route_class(int64_t d_lo, int64_t d_hi) {
-        const int64_t n = qsa_env_min_kv();
-        if (d_lo >= n) {
-            return 1; // above (also N = 0: every sequence is above)
-        }
-        if (d_hi < n) {
-            return 0; // below
-        }
-        return -1;
+        return server_qsa_route_class(d_lo, d_hi, qsa_env_min_kv());
     }
 
     uint64_t qsa_route_rounds   = 0; // rounds with >= 1 range
@@ -4526,8 +4587,7 @@ private:
         std::vector<int32_t> rows;
         llama_pos p_lo = 0;
         llama_pos p_hi = 0;
-        int cls = 0;       // 0 below, 1 above, -1 singleton
-        bool big = false;  // more rows than LLAMA_MTP_QSA_MAX_UBATCH
+        bool partial = false; // partial target history: a singleton
     };
 
     void qsa_route_partition() {
@@ -4557,66 +4617,20 @@ private:
         const int64_t max_ub = qsa_env_mtp_max_ubatch();
         llama_memory_t mem = llama_get_memory(ctx_tgt);
         for (auto & run : runs) {
-            run.cls = qsa_route_class((int64_t) run.p_lo + 1, (int64_t) run.p_hi + 1);
-            run.big = max_ub > 0 && (int64_t) run.rows.size() > max_ub;
-            // partial target history: not starting at 0, or not continuing the cached positions
-            const llama_pos c_min = llama_memory_seq_pos_min(mem, run.id_slot);
+            // partial history: a draft-partial prompt (target-only load / adoption, [TAG_DRAFT_PARTIAL]), or rows not
+            // continuing the cached positions (a hole). NOT llama_memory_seq_pos_min: on the hybrid memory it reports
+            // the recurrent part's single (latest) position, > 0 for every complete history.
             const llama_pos c_max = llama_memory_seq_pos_max(mem, run.id_slot);
-            if (c_min > 0 || (c_max >= 0 && run.p_lo != c_max + 1) || (c_max < 0 && run.p_lo != 0)) {
-                run.cls = -1;
+            if (slots[run.id_slot].prompt.draft_partial() || run.p_lo != c_max + 1) {
+                run.partial = true;
             }
         }
 
-        // groups: singletons alone; (class, big) groups sorted by slot id, small ones chunked at max_ub total rows;
-        // groups ordered by their first run's original position
-        std::vector<std::vector<int32_t>> groups;
-        {
-            std::vector<int32_t> by_id(runs.size());
-            for (size_t r = 0; r < runs.size(); ++r) {
-                by_id[r] = (int32_t) r;
-            }
-            std::stable_sort(by_id.begin(), by_id.end(), [&](int32_t a, int32_t b) { return runs[a].id_slot < runs[b].id_slot; });
-
-            std::vector<std::pair<int32_t, std::vector<int32_t>>> tagged; // (first original row, runs)
-            for (int key = 0; key < 4; ++key) {
-                const int  cls = key >> 1;
-                const bool big = key & 1;
-                std::vector<int32_t> cur;
-                int64_t cur_rows = 0;
-                auto flush = [&]() {
-                    if (!cur.empty()) {
-                        int32_t first = INT32_MAX;
-                        for (int32_t r : cur) {
-                            first = std::min(first, runs[r].rows.front());
-                        }
-                        tagged.emplace_back(first, cur);
-                        cur.clear();
-                        cur_rows = 0;
-                    }
-                };
-                for (int32_t r : by_id) {
-                    if (runs[r].cls != cls || runs[r].big != big) {
-                        continue;
-                    }
-                    const int64_t n = (int64_t) runs[r].rows.size();
-                    if (!big && max_ub > 0 && cur_rows + n > max_ub) {
-                        flush();
-                    }
-                    cur.push_back(r);
-                    cur_rows += n;
-                }
-                flush();
-            }
-            for (size_t r = 0; r < runs.size(); ++r) {
-                if (runs[r].cls < 0) {
-                    tagged.emplace_back(runs[r].rows.front(), std::vector<int32_t>{ (int32_t) r });
-                }
-            }
-            std::stable_sort(tagged.begin(), tagged.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
-            for (auto & t : tagged) {
-                groups.push_back(std::move(t.second));
-            }
+        std::vector<server_qsa_route_run> infos;
+        for (const auto & run : runs) {
+            infos.push_back({ run.id_slot, (int32_t) run.rows.size(), run.p_lo, run.p_hi, run.partial, run.rows.front() });
         }
+        const auto groups = server_qsa_route_groups(infos, qsa_env_min_kv(), max_ub);
 
         std::vector<int32_t> order;
         order.reserve(batch.size());
@@ -4629,15 +4643,23 @@ private:
                 batch.run_end.push_back((int32_t) order.size());
                 gd += string_format("%s%d:%d-%d", gd.empty() ? "" : ",", run.id_slot, (int) run.p_lo, (int) run.p_hi);
             }
-            const int cls = runs[g.front()].cls;
+            const auto & r0 = runs[g.front()];
+            const int cls = r0.partial ? -1 : qsa_route_class((int64_t) r0.p_lo + 1, (int64_t) r0.p_hi + 1);
             qsa_route_desc += string_format(" {%s %s}", cls < 0 ? "single" : cls ? "above" : "below", gd.c_str());
             batch.range_end.push_back((int32_t) order.size());
         }
         GGML_ASSERT((int32_t) order.size() == batch.size());
 
+        // i_batch is remapped only when it points at one of the slot's own rows of this batch (else it is stale / -1)
+        std::vector<bool> own_row(slots.size(), false);
+        for (size_t k = 0; k < slots.size(); ++k) {
+            const int32_t ib = slots[k].i_batch;
+            own_row[k] = ib >= 0 && ib < batch.size() && batch.tokens[ib].id_slot == slots[k].id;
+        }
         const auto map = batch.permute(order);
-        for (auto & slot : slots) {
-            if (slot.i_batch >= 0 && slot.i_batch < (int32_t) map.size()) {
+        for (size_t k = 0; k < slots.size(); ++k) {
+            auto & slot = slots[k];
+            if (own_row[k]) {
                 slot.i_batch = map[slot.i_batch];
             }
             for (auto & i : slot.spec_i_batch) {
@@ -4657,36 +4679,24 @@ private:
     //   partial target history, drafts alone; a group holds at most LLAMA_MTP_QSA_MAX_UBATCH slots (one row each per
     //   step, TOTAL tokens); sorted by slot id
     std::vector<std::vector<server_slot *>> qsa_route_draft_groups(const std::vector<server_slot *> & drafting) {
-        const int64_t max_ub = qsa_env_mtp_max_ubatch();
-        llama_memory_t mem = llama_get_memory(ctx_tgt);
-        std::vector<server_slot *> sorted(drafting);
-        std::stable_sort(sorted.begin(), sorted.end(), [](const server_slot * a, const server_slot * b) { return a->id < b->id; });
-
-        std::vector<std::vector<server_slot *>> res;
-        std::vector<server_slot *> cls_groups[2];
+        std::vector<server_qsa_route_run> infos;
         std::string desc;
-        for (server_slot * s : sorted) {
+        for (size_t k = 0; k < drafting.size(); ++k) {
+            const server_slot * s = drafting[k];
             const auto & dp = common_speculative_get_draft_params(spec.get(), s->id);
-            const int64_t n_max = dp.n_max > 0 ? dp.n_max : std::max(1, params_base.speculative.draft.n_max);
-            int cls = qsa_route_class((int64_t) dp.n_past + 1, (int64_t) dp.n_past + n_max);
-            if (llama_memory_seq_pos_min(mem, s->id) > 0) {
-                cls = -1;
-            }
+            const int32_t n_max = dp.n_max > 0 ? dp.n_max : std::max(1, params_base.speculative.draft.n_max);
+            const bool partial = s->prompt.draft_partial(); // see qsa_route_partition()
+            // one row per step: rows at n_past .. n_past + n_max - 1
+            infos.push_back({ s->id, 1, dp.n_past, dp.n_past + n_max - 1, partial, (int32_t) k });
+            const int cls = partial ? -1 : qsa_route_class((int64_t) dp.n_past + 1, (int64_t) dp.n_past + n_max);
             desc += string_format(" %d:%d+%d=%s", s->id, (int) dp.n_past, (int) n_max, cls < 0 ? "single" : cls ? "above" : "below");
-            if (cls < 0) {
-                res.push_back({ s });
-                continue;
-            }
-            auto & g = cls_groups[cls];
-            if (max_ub > 0 && (int64_t) g.size() >= max_ub) {
-                res.push_back(g);
-                g.clear();
-            }
-            g.push_back(s);
         }
-        for (auto & g : cls_groups) {
-            if (!g.empty()) {
-                res.push_back(g);
+        const auto groups = server_qsa_route_groups(infos, qsa_env_min_kv(), qsa_env_mtp_max_ubatch());
+        std::vector<std::vector<server_slot *>> res;
+        for (const auto & g : groups) {
+            res.emplace_back();
+            for (const int32_t r : g) {
+                res.back().push_back(drafting[r]);
             }
         }
         if (res.size() > 1 && (qsa_route_n_log < 64 || qsa_route_n_log % 256 == 0)) {
