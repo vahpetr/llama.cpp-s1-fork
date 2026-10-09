@@ -1089,6 +1089,7 @@ export class ChatService {
 			stream,
 			// Generation parameters
 			temperature,
+			thinkingBudgetCap,
 			timings_per_token,
 			// Tools for function calling
 			tools,
@@ -1196,6 +1197,14 @@ export class ChatService {
 
 		if (reasoningBudgetTokens >= 0) {
 			requestBody.thinking_budget_tokens = reasoningBudgetTokens;
+		}
+
+		// a sampler-side limit only: the prompt (and its cached prefix) stays the same
+		if (thinkingBudgetCap !== undefined && thinkingBudgetCap >= 0) {
+			requestBody.thinking_budget_tokens =
+				reasoningBudgetTokens >= 0
+					? Math.min(reasoningBudgetTokens, thinkingBudgetCap)
+					: thinkingBudgetCap;
 		}
 
 		// arms the budget sampler so reasoning can be ended at runtime via the control endpoint

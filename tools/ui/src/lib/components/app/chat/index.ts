@@ -699,6 +699,13 @@ export { default as ChatScreenForm } from './ChatScreen/ChatScreenForm.svelte';
 export { default as ChatScreenServerError } from './ChatScreen/ChatScreenServerError.svelte';
 
 /**
+ * Context bar (W1): context usage meter (used / n_ctx with the reserve marked), the
+ * compaction status, links between a compacted conversation and its continuation, and the
+ * "Compact now" button. Shown at the top of an open conversation.
+ */
+export { default as ChatScreenContextBar } from './ChatScreen/ChatScreenContextBar.svelte';
+
+/**
  * Stream resume status indicator. Shows a small "Reconnecting to the stream..."
  * banner with a spinner while `chatStore.streamConnectionState` is `resuming`,
  * i.e. after a dropped connection is reattaching to the live SSE replay buffer.

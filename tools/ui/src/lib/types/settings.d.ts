@@ -121,6 +121,8 @@ export interface SettingsChatServiceOptions {
 	timings_per_token?: boolean;
 	// Generation length; 0 = prompt processing only (pre-encode)
 	n_predict?: number;
+	// Upper bound of the thinking budget (thinking_budget_tokens), e.g. for a compaction summary
+	thinkingBudgetCap?: number;
 	// Continuation control (vLLM compat), opt in to the explicit continue final message flag
 	continueFinalMessage?: boolean;
 	// Callbacks

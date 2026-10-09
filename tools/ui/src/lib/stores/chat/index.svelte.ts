@@ -9,7 +9,9 @@
  * Uses ChatService for the API layer and conversationsStore for persistence.
  */
 
+import { goto } from '$app/navigation';
 import {
+	CONTEXT_RESERVE,
 	CWD_CLEARED_TEXT,
 	MESSAGE_EXTRA_STORAGE_VERSION,
 	SYSTEM_MESSAGE_PLACEHOLDER,
@@ -24,6 +26,7 @@ import {
 } from '$lib/enums';
 import { ChatService } from '$lib/services/chat.service';
 import { DatabaseService } from '$lib/services/database.service';
+import { RouterService } from '$lib/services/router.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { agenticStore } from '$lib/stores/agentic/index.svelte';
 import { chatActivityStore } from '$lib/stores/chat/activity.svelte';
@@ -47,15 +50,36 @@ import type {
 	ErrorDialogState
 } from '$lib/types';
 import {
+	buildSummaryInstruction,
+	compactedConversationName,
+	dropTrailingEmptyAssistants,
+	estimateMessageTokens,
+	estimateTextTokens,
 	filterByLeafNodeId,
 	findMessageById,
 	formatCwdMessage,
 	getConversationModel,
 	isAbortError,
+	measureContextUsage,
 	normalizeModelName,
-	parseToolsSnapshot
+	parseToolsSnapshot,
+	planSummaryRequest,
+	readContextReserveConfig,
+	replyTokenCap,
+	selectTailMessages,
+	shouldCompact
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
+import { toast } from 'svelte-sonner';
+
+/** A running context compaction (W1): the summary request of one conversation. */
+export interface CompactionState {
+	convId: string;
+	/** summary tokens generated so far */
+	tokens: number;
+}
+
+export type CompactionResult = { convId: string } | { cancelled: true } | { error: string };
 
 class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	chatReasoningStates = new SvelteMap<string, boolean>();
@@ -63,6 +87,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		string,
 		{ response: string; messageId: string; model?: string | null }
 	>();
+	/** the running context compaction (W1), null when none */
+	compaction = $state<CompactionState | null>(null);
 	currentResponse = $state('');
 	errorDialogState = $state<ErrorDialogState | null>(null);
 	// true while the active conversation has a local pipe (send, attach or resume-wait)
@@ -285,6 +311,152 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		this.currentResponse = '';
 	}
 
+	/**
+	 * W1: compact a conversation whose context is (nearly) full. A summary request reuses the cached
+	 * prompt (the conversation exactly as the chat sends it + an instruction message; when the
+	 * context is full or has no room for the summary, cut before the last reply at a measured
+	 * point, so the server rewinds to a checkpoint - never a full re-read). Then a new
+	 * conversation = system prompt + the summary (an assistant note) + the last messages, linked
+	 * to this one, which is kept. Opens the new conversation.
+	 */
+	async compactConversation(
+		convId: string,
+		opts: { auto?: boolean } = {}
+	): Promise<CompactionResult> {
+		if (this.compaction) return { error: 'A compaction is already running' };
+
+		if (this.isChatLoadingInternal(convId)) return { error: 'The conversation is busy' };
+
+		const fail = (error: string): CompactionResult => {
+			toast.error(`Compaction failed: ${error}`);
+
+			return { error };
+		};
+		const conversation = await DatabaseService.getConversation(convId);
+
+		if (!conversation?.currNode) return fail('the conversation is empty');
+
+		const path = dropTrailingEmptyAssistants(
+			filterByLeafNodeId(
+				await DatabaseService.getConversationMessages(convId),
+				conversation.currNode,
+				false
+			) as DatabaseMessage[]
+		).filter((m) => m.type !== MessageType.ROOT);
+		const model = serverStore.isRouterMode
+			? modelsStore.selectedModelName || getConversationModel(path)
+			: null;
+		const nCtx = this.contextSizeFor(model);
+
+		if (!nCtx) return fail('the context size is unknown (no /props yet)');
+
+		const cfg = readContextReserveConfig(settingsStore.config);
+		const reserve = cfg.reserve > 0 ? cfg.reserve : CONTEXT_RESERVE.DEFAULT_RESERVE_TOKENS;
+		const instructionTokens =
+			estimateTextTokens(buildSummaryInstruction(cfg.summaryPrompt, reserve)) +
+			CONTEXT_RESERVE.MESSAGE_OVERHEAD_TOKENS * 2;
+		const plan = planSummaryRequest({ instructionTokens, messages: path, nCtx, reserve });
+
+		if (!plan) return fail('no point of the conversation leaves room for a summary');
+
+		const instruction = buildSummaryInstruction(cfg.summaryPrompt, plan.maxTokens);
+		const instructionMessage = {
+			children: [],
+			content: instruction,
+			convId,
+			id: `compact-instruction-${convId}`,
+			parent: null,
+			role: MessageRole.USER,
+			timestamp: Date.now(),
+			toolCalls: '',
+			type: MessageType.TEXT
+		} as DatabaseMessage;
+		// the request of a real turn (options of this conversation, its frozen tool list), so the
+		// prompt is a pure extension of the cached one
+		const frozenTools = parseToolsSnapshot(conversation.toolsSnapshot);
+		const tools =
+			agenticStore.getConfig(settingsStore.config).enabled && frozenTools && frozenTools.length > 0
+				? frozenTools
+				: undefined;
+		const abortController = this.getOrCreateAbortController(convId);
+
+		let summary = '';
+		let summaryModel: string | null = null;
+
+		this.compaction = { convId, tokens: 0 };
+		this.setChatLoading(convId, true);
+
+		try {
+			await ChatService.sendMessage(
+				[...path.slice(0, plan.keep), instructionMessage],
+				{
+					...this.getApiOptions(conversation),
+					...(model ? { model } : {}),
+					max_tokens: plan.maxTokens,
+					onChunk: (chunk: string) => {
+						summary += chunk;
+					},
+					onError: () => {},
+					onModel: (name: string) => {
+						summaryModel = normalizeModelName(name) || summaryModel;
+					},
+					onTimings: (timings?: ChatMessageTimings) => {
+						if (this.compaction && timings?.predicted_n !== undefined) {
+							this.compaction = { ...this.compaction, tokens: timings.predicted_n };
+						}
+					},
+					stream: true,
+					// thinking may take at most a quarter of the summary budget
+					thinkingBudgetCap: Math.floor(plan.maxTokens / 4),
+					tools
+				},
+				undefined,
+				abortController.signal
+			);
+
+			if (abortController.signal.aborted) {
+				return { cancelled: true };
+			}
+
+			summary = summary.trim();
+
+			if (!summary) return fail('the model returned an empty summary');
+
+			const newConvId = await this.saveCompactedConversation(conversation, path, plan.cut, {
+				keepMessages: cfg.keepMessages,
+				model: summaryModel,
+				nCtx,
+				reserve,
+				summary
+			});
+
+			await conversationsStore.loadConversations();
+			await conversationsStore.loadConversation(newConvId);
+			await goto(RouterService.chat(newConvId));
+
+			if (!opts.auto) toast.success('Conversation compacted; the previous one is kept');
+
+			return { convId: newConvId };
+		} catch (error) {
+			if (isAbortError(error) || abortController.signal.aborted) return { cancelled: true };
+
+			return fail(error instanceof Error ? error.message : String(error));
+		} finally {
+			this.compaction = null;
+			this.abortRequest(convId);
+			this.setChatLoading(convId, false);
+			this.processing.setState(convId, null);
+
+			// a message queued while the summary ran goes to the conversation now active: right away
+			// after a manual compaction, after the triggering message's reply after an automatic one
+			const pending = this.consumePendingMessage(convId);
+			const activeId = conversationsStore.activeConversation?.id;
+
+			if (pending && !opts.auto) void this.sendMessage(pending.content, pending.extras);
+			else if (pending && activeId) this.pendingMessages.set(activeId, pending);
+		}
+	}
+
 	consumePendingDraft(): { message: string; files: ChatUploadedFile[] } | null {
 		if (!this.pendingDraftMessage && this.pendingDraftFiles.length === 0) return null;
 
@@ -306,6 +478,15 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		this.pendingMessages.delete(convId);
 
 		return msg;
+	}
+
+	/** n_ctx of the model a request goes to (per slot, from /props), null when unknown */
+	contextSizeFor(model?: string | null): number | null {
+		const id = model || modelsStore.activeModelId;
+		const nCtx = id ? modelsStore.props.getModelContextSize(id) : null;
+
+		// single-model mode: the server's own /props
+		return nCtx ?? (serverStore.isRouterMode ? null : serverStore.contextSize);
 	}
 
 	async continueAssistantMessage(messageId: string): Promise<void> {
@@ -537,6 +718,29 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		return this.chatStreamingStates.has(conversationsStore.activeConversation?.id ?? '');
 	}
 
+	/** W1: does sending this message to the conversation need a compaction first? */
+	needsCompaction(convId: string, content: string, extras?: DatabaseMessageExtra[]): boolean {
+		const cfg = readContextReserveConfig(settingsStore.config);
+
+		if (!cfg.autoCompact || cfg.reserve <= 0) return false;
+
+		if (conversationsStore.activeConversation?.id !== convId) return false;
+
+		const messages = conversationsStore.activeMessages as DatabaseMessage[];
+		const model = serverStore.isRouterMode
+			? modelsStore.selectedModelName || getConversationModel(messages)
+			: null;
+		const nCtx = this.contextSizeFor(model);
+		const usage = measureContextUsage(messages, nCtx);
+		const pending = estimateMessageTokens({
+			content,
+			extra: extras,
+			role: MessageRole.USER
+		} as DatabaseMessage);
+
+		return shouldCompact({ nCtx, pending, reserve: cfg.reserve, used: usage.used });
+	}
+
 	/**
 	 * Record a working-directory change into chat history as a synthetic
 	 * user message, so the model sees it on its next turn (the client
@@ -638,10 +842,25 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		}
 	}
 
+	/** W1: max_tokens of a reply to `messages`: the configured limit capped at free - reserve. */
+	replyMaxTokens(messages: readonly DatabaseMessage[], model?: string | null): number | undefined {
+		const cfg = readContextReserveConfig(settingsStore.config);
+		const configured = Number(settingsStore.config.max_tokens) || undefined;
+		const nCtx = this.contextSizeFor(model);
+
+		return replyTokenCap({
+			configured,
+			nCtx,
+			reserve: cfg.reserve,
+			used: measureContextUsage(messages, nCtx).used
+		});
+	}
+
 	savePendingDraft(message: string, files: ChatUploadedFile[]): void {
 		this.pendingDraftMessage = message;
 		this.pendingDraftFiles = [...files];
 	}
+
 	async sendMessage(content: string, extras?: DatabaseMessageExtra[]): Promise<void> {
 		if (!content.trim() && (!extras || extras.length === 0)) return;
 
@@ -663,6 +882,13 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		// Cancel any in-flight pre-encode request
 		this.cancelPreEncode();
+
+		// W1: a turn that would not leave the context reserve free compacts first; the message then
+		// goes to the new conversation. A failed or cancelled compaction sends it here (the typed
+		// message is never dropped; the server's context limit applies then)
+		if (activeConv && this.needsCompaction(activeConv.id, content, extras)) {
+			await this.compactConversation(activeConv.id, { auto: true });
+		}
 
 		// Consume MCP resource attachments - converts them to extras and clears the live store
 		const resourceExtras = mcpStore.consumeResourceAttachmentsAsExtras();
@@ -769,7 +995,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			});
 		}
 	}
-
 	setChatLoading(convId: string, loading: boolean): void {
 		if (loading) {
 			this.activity.markLocal(convId);
@@ -1151,6 +1376,9 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			disabledToolCategories: conversationsStore.preferences.getDisabledToolCategories(),
 			disabledTools: conversationsStore.preferences.getDisabledTools()
 		};
+		// W1: the reply never uses the context reserve (the agentic loop re-caps each later turn)
+		const replyMaxTokens = this.replyMaxTokens(allMessages, effectiveModel);
+		const replyCap = replyMaxTokens !== undefined ? { max_tokens: replyMaxTokens } : {};
 
 		{
 			const agenticResult = await agenticStore.runAgenticFlow({
@@ -1160,7 +1388,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				messages: allMessages,
 				options: {
 					...this.getApiOptions(),
-					...(effectiveModel ? { model: effectiveModel } : {})
+					...(effectiveModel ? { model: effectiveModel } : {}),
+					...replyCap
 				},
 				signal: abortController.signal,
 				toolPolicy
@@ -1188,6 +1417,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			{
 				...this.getApiOptions(),
 				...(effectiveModel ? { model: effectiveModel } : {}),
+				...replyCap,
 				onChunk: streamCallbacks.onChunk,
 				onComplete: async (
 					finalContent?: string,
@@ -1283,6 +1513,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	async updateMessage(messageId: string, newContent: string): Promise<void> {
 		return this.flows.updateMessage(messageId, newContent);
 	}
+
 	private abortRequest(convId?: string): void {
 		if (convId) {
 			const c = this.abortControllers.get(convId);
@@ -1296,7 +1527,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			this.abortControllers.clear();
 		}
 	}
-
 	private async generateTitleWithLLM(
 		userContent: string,
 		assistantContent: string,
@@ -1347,6 +1577,100 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		convId: string
 	): { response: string; messageId: string } | undefined {
 		return this.chatStreamingStates.get(convId);
+	}
+
+	/** W1: write the compacted conversation; returns its id. */
+	private async saveCompactedConversation(
+		source: DatabaseConversation,
+		path: readonly DatabaseMessage[],
+		cut: boolean,
+		p: {
+			keepMessages: number;
+			model: string | null;
+			nCtx: number;
+			reserve: number;
+			summary: string;
+		}
+	): Promise<string> {
+		const system = path.find(
+			(m) =>
+				m.role === MessageRole.SYSTEM &&
+				m.content.trim() &&
+				m.content.trim() !== SYSTEM_MESSAGE_PLACEHOLDER
+		);
+		const body = path.filter((m) => m.role !== MessageRole.SYSTEM && !m.isSynthetic);
+		const tail = selectTailMessages(
+			body,
+			p.keepMessages,
+			Math.max(p.reserve, Math.floor(p.nCtx * CONTEXT_RESERVE.TAIL_CONTEXT_SHARE))
+		);
+		// the working directory row the model last saw (the tail carries no synthetic rows)
+		const cwdRow = [...path].reverse().find((m) => m.isSynthetic && m.role === MessageRole.USER);
+		const newConv = await DatabaseService.createConversation(
+			compactedConversationName(source.name),
+			{
+				compactedFromConversationId: source.id,
+				cwd: source.cwd,
+				disabledToolCategories: source.disabledToolCategories,
+				disabledTools: source.disabledTools,
+				reasoningEffort: source.reasoningEffort,
+				thinkingEnabled: source.thinkingEnabled,
+				toolsDeclinedKey: source.toolsDeclinedKey,
+				toolsSnapshot: source.toolsSnapshot
+			}
+		);
+		const rootId = await DatabaseService.createRootMessage(newConv.id);
+
+		let parent = rootId;
+
+		if (system) {
+			parent = (await DatabaseService.createSystemMessage(newConv.id, system.content, rootId)).id;
+		}
+
+		const copy = async (m: Omit<DatabaseMessage, 'id' | 'convId' | 'parent' | 'children'>) => {
+			const created = await DatabaseService.createMessageBranch(
+				{ ...m, children: [], convId: newConv.id, parent } as Omit<DatabaseMessage, 'id'>,
+				parent
+			);
+
+			parent = created.id;
+		};
+
+		if (cwdRow) {
+			await copy({
+				content: cwdRow.content,
+				isSynthetic: true,
+				role: MessageRole.USER,
+				timestamp: Date.now(),
+				toolCalls: '',
+				type: MessageType.TEXT
+			});
+		}
+
+		const header = CONTEXT_RESERVE.SUMMARY_HEADER.replace('{{NAME}}', source.name);
+
+		await copy({
+			content: `${header}${cut ? ' (the end of the last turn did not fit in the summary request)' : ''}\n\n${p.summary}`,
+			model: p.model ?? undefined,
+			role: MessageRole.ASSISTANT,
+			timestamp: Date.now(),
+			toolCalls: '',
+			type: MessageType.TEXT
+		});
+
+		for (const m of tail) {
+			// measurements belong to the old context: the new one measures itself on its first reply
+			// eslint-disable-next-line @typescript-eslint/no-unused-vars
+			const { children, completionId, convId, id, parent: _p, timings, ...rest } = m;
+
+			await copy({ ...rest, timestamp: Date.now() });
+		}
+
+		await DatabaseService.updateConversation(source.id, {
+			compactedIntoConversationId: newConv.id
+		});
+
+		return newConv.id;
 	}
 
 	private async savePartialResponseIfNeeded(convId?: string): Promise<void> {

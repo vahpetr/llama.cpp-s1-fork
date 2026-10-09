@@ -362,3 +362,22 @@ export {
 	REPROCESS_WARN_TOKENS,
 	type ReprocessCost
 } from './system-prompt-cost';
+export {
+	buildSummaryInstruction,
+	compactedConversationName,
+	type ContextReserveConfig,
+	type ContextUsage,
+	dropTrailingEmptyAssistants,
+	estimateApiMessageTokens,
+	estimateMessageTokens,
+	estimateTextTokens,
+	formatTokenCount,
+	measureContextUsage,
+	planSummaryRequest,
+	readContextReserveConfig,
+	replyTokenCap,
+	selectTailMessages,
+	shouldCompact,
+	type SummaryPlan,
+	timingsTotal
+} from './context-reserve';

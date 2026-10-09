@@ -10,7 +10,7 @@
  * the permission/continue/steering gates owned by {@link AgenticGates}.
  */
 
-import { DEFAULT_AGENTIC_CONFIG, NEWLINE } from '$lib/constants';
+import { CONTEXT_RESERVE, DEFAULT_AGENTIC_CONFIG, NEWLINE } from '$lib/constants';
 import {
 	AUDIO_MIME_TO_EXTENSION,
 	DATA_URI_BASE64_REGEX,
@@ -74,13 +74,17 @@ import type {
 	DatabaseMessageExtraImageFile
 } from '$lib/types/database';
 import {
+	estimateApiMessageTokens,
 	executeBrowserInfoTool,
 	executeGetDatetimeTool,
 	getAudioInputFormat,
 	isAbortError,
-	parseToolsSnapshot
+	parseToolsSnapshot,
+	readContextReserveConfig,
+	timingsTotal
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
+import { toast } from 'svelte-sonner';
 
 function createDefaultSession(): AgenticSession {
 	return {
@@ -520,6 +524,28 @@ class AgenticStore {
 				return;
 			}
 
+			// W1: a later turn of the flow must leave the context reserve free as well: capped at
+			// free - reserve (the last turn's measurement + the tool results since); with no room left
+			// the flow ends here and the next message compacts the conversation
+			let turnOptions = options;
+
+			if (capturedTimings) {
+				const cap = this.laterTurnMaxTokens(capturedTimings, sessionMessages, effectiveModel);
+
+				if (cap === 0) {
+					toast.info(
+						readContextReserveConfig(settingsStore.config).autoCompact
+							? 'The context reserve is reached: the agent stopped. Your next message compacts the conversation.'
+							: 'The context reserve is reached: the agent stopped. Use "Compact now" to continue in a new conversation.'
+					);
+					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
+
+					return;
+				}
+
+				if (cap !== undefined) turnOptions = { ...options, max_tokens: cap };
+			}
+
 			// For turns > 0, create a new assistant message via callback
 			if (turn > 0 && createAssistantMessage) {
 				await createAssistantMessage();
@@ -543,7 +569,7 @@ class AgenticStore {
 				await ChatService.sendMessage(
 					sessionMessages as ApiChatMessageData[],
 					{
-						...options,
+						...turnOptions,
 						onChunk: (chunk: string) => {
 							turnContent += chunk;
 							onChunk?.(chunk);
@@ -1063,6 +1089,41 @@ class AgenticStore {
 		});
 
 		return { attachments, cleanedResult: cleanedLines.join(NEWLINE) };
+	}
+
+	/**
+	 * W1: max_tokens of a later turn of an agentic flow. Undefined = no cap (no context size,
+	 * reserve off, or the configured limit applies), 0 = no room above the reserve.
+	 */
+	private laterTurnMaxTokens(
+		last: ChatMessageTimings,
+		sessionMessages: readonly AgenticMessage[],
+		model: string
+	): number | undefined {
+		const { reserve } = readContextReserveConfig(settingsStore.config);
+		const nCtx = model ? modelsStore.props.getModelContextSize(model) : null;
+		const max = Number(settingsStore.config.max_tokens);
+		// 0 / -1 / unset = no limit
+		const configured = max > 0 ? max : undefined;
+
+		if (!nCtx || reserve <= 0) return configured;
+
+		// what the last request measured, plus what was appended after its reply (tool results)
+		let used = timingsTotal(last);
+
+		for (let i = sessionMessages.length - 1; i >= 0; i--) {
+			const m = sessionMessages[i] as ApiChatMessageData;
+
+			if (m.role === MessageRole.ASSISTANT) break;
+
+			used += estimateApiMessageTokens(m);
+		}
+
+		const room = nCtx - used - reserve;
+
+		if (room < CONTEXT_RESERVE.MIN_REPLY_TOKENS) return 0;
+
+		return configured ? Math.min(configured, room) : room;
 	}
 
 	private normalizeToolCalls(toolCalls: ApiChatCompletionToolCall[]): AgenticToolCallList {
