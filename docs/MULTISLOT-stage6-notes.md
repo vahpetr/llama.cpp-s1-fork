@@ -51,3 +51,28 @@ PASS requirement yet. Measure per-stream startup / restore peaks against 102400 
   `qsa_history_dense = on|off (reason)`. A hands process with mmproj therefore drops the fallback after its first
   image; a general multimodal-safe fix needs explicit partial-history provenance instead of positional contiguity.
 - `LLAMA_QSA_HOMOGENEOUS=1` keeps the coverage term on regardless (multi-slot qualification mode).
+
+## Item 4 + 5a status (implemented on `prod-v11-stage6`)
+
+- 4b model guard: `qwen4exp_qsa_routing_check()` inside `qwen4exp_qsa_dense()` (build + reuse), strict mode only;
+  per-sequence depth = max pos + 1 of its rows, `GGML_ABORT` on a below + at/above-N ubatch; proof
+  `[qsa-routing] checks=… multi_seq=… below=… above=… mixed=0` (every 1024 checks + exit).
+- 4a server: `qsa_route_partition()` after `pre_decode()` (one preparation pass), before `render()`; planner
+  `server_qsa_route_groups()` / `server_qsa_route_class()` (server-context.h, test-driven); views clamped per range,
+  capacity retries cut at whole-slot runs (a verification run that alone exceeds n_batch throws); post_decode skips
+  slots without verify rows in the view, a split run throws, samplers get `global - off`; drafts per group
+  (`qsa_route_draft_groups()`). Log: `[qsa-route] round=… ranges=… off=… n=… slots=[id@pos…] decode=ok|retry plan: {…}`.
+- Partial history server-side = `prompt.draft_partial()` or rows not continuing `seq_pos_max + 1`.
+  `llama_memory_seq_pos_min` is NOT usable: on the hybrid memory it is the recurrent part's latest position.
+  A partial indexer history inside complete target/draft metadata (rewind hole in the draft only) is not visible to
+  the server; the model-side dense fallback still routes that ubatch dense (one class, no guard violation).
+- MAX_UBATCH cap also on target ranges (as specified): runs of <= 8 rows group only up to 8 rows total, so two
+  4-row verify runs share a call but three do not. With `LLAMA_MTP_CATCHUP_ATTN=0` (prod) the catch-up has no
+  attention; the cap then only costs calls - candidate relaxation: cap the catch-up / draft only.
+- 5a: admission shape log (N, pool C, kv_unified, n_batch/n_ubatch, KV types, rollback depth, reserve, slope/once),
+  `LLAMA_GTT_CONCURRENT_RESERVE_MIB` (default 0) added while another slot is processing, also on zero-growth chunks;
+  /metrics `admission_n_slots`, `admission_reserve_mib`, `admission_last_reserve_mib`,
+  `admission_reserve_deferred_total`. Restore / verify / checkpoint starts are not admission-gated yet.
+- Tests: `test-mtp-catchup-homog-np2/-np4` (planner + range execution on the synthetic fixture, per-stream KV,
+  N = 64) + negative child. Not covered: server e2e (fixture tokenizer `no_vocab`, the server's detokenization
+  asserts on LLAMA_VOCAB_TYPE_NONE), the server's capacity-retry cut, an explicit unchanged-shape transition test.
