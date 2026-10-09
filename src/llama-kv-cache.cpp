@@ -3063,13 +3063,16 @@ static std::string llama_state_type_desc(const ggml_tensor * t) {
 }
 
 std::string llama_kv_cache::state_descriptor() const {
+    // [TAG_MULTISLOT] per-seq state is stream-count agnostic (state_read_sinfo): n_stream / n_seq_max / the per-layer
+    //   stream views print the single-stream values (1), so the descriptor names the per-sequence layout only;
+    //   size is the per-stream capacity (n_ctx_seq) and stays
     std::string res = format("kv{size=%u,n_stream=%u,n_seq_max=%u,v_trans=%d,n_swa=%u,swa_type=%d,rot_k=%d,rot_v=%d,"
-                                    "cell_ext=%s,layers=[", get_size(), n_stream, n_seq_max, (int) v_trans, n_swa,
+                                    "cell_ext=%s,layers=[", get_size(), 1u, 1u, (int) v_trans, n_swa,
                                     (int) swa_type, (int) attn_rot_k, (int) attn_rot_v,
                                     has_cell_ext() ? "xyt-i32-v1" : "none");
     for (const auto & layer : layers) {
         res += format("%u:k=%s:v=%s:ks=%zu;", layer.il, llama_state_type_desc(layer.k).c_str(),
-                             llama_state_type_desc(layer.v).c_str(), layer.k_stream.size());
+                             llama_state_type_desc(layer.v).c_str(), layer.k_stream.size() / std::max(1u, n_stream));
     }
     // shared / reused layers serialize through their owner: record the mapping (model layer -> cache layer)
     std::vector<std::pair<int32_t, int32_t>> ids(map_layer_ids.begin(), map_layer_ids.end());

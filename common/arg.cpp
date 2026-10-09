@@ -1752,7 +1752,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--cache-disk-adopt"}, "KEY[,KEY...]",
         "[TAG_DISK_ADOPT] open these foreign --cache-disk namespaces (the hash16 \"key\" another build shows in GET "
         "/disk-cache and logs as \"own key\") read-only as extra load sources, e.g. the previous image's after an exact "
-        "deploy. A source is eligible only if its model / draft / mmproj files, context size and KV types match; its "
+        "deploy. A source is eligible only if its model / draft / mmproj files, per-slot context size and KV types match "
+        "(n_parallel / --kv-unified may differ: per-sequence state is stream-count agnostic); its "
         "entries are verified at load (state envelope where present, full consumption) and the next save goes to the "
         "own namespace; the source is never written. A format 5 / 6 entry has no descriptor and is accepted on the "
         "operator's word: approve the adoption with a gate record naming the exact source and destination images and "

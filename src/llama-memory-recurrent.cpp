@@ -1382,7 +1382,9 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
 
 std::string llama_memory_recurrent::state_descriptor() const {
     // logical current row per sequence: R (n_embd_r), the PLE conv history P (ple_conv_state) when present, S (n_embd_s)
-    std::string res = format("recr{size=%u,n_seq_max=%u,n_embd_r=%u,n_embd_s=%u,ple=%u,layers=[", size, n_seq_max,
+    // [TAG_MULTISLOT] the per-seq stream holds one logical row per sequence and no cell index: the row pool size
+    //   (max(1, n_seq_max)) and n_seq_max print the single-slot values (1), like llama_kv_cache's descriptor
+    std::string res = format("recr{size=%u,n_seq_max=%u,n_embd_r=%u,n_embd_s=%u,ple=%u,layers=[", 1u, 1u,
                                     hparams.n_embd_r(), hparams.n_embd_s(), hparams.ple_conv_state());
     for (size_t il = 0; il < r_l.size(); il++) {
         const auto td = [](const ggml_tensor * t) {

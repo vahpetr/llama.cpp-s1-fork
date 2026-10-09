@@ -3881,7 +3881,7 @@ void server_disk_cache::open_adopt_sources() {
             //   descriptor (checked per entry at load), the draft stream never does (its descriptor names its KV types)
             const std::string src_tgt_struct = server_disk_cache_fingerprint_structure(a.fingerprint, nullptr, false);
             if (src_tgt_struct.empty() || src_tgt_struct != server_disk_cache_fingerprint_structure(fingerprint, nullptr, false)) {
-                DSK_WRN("adopt %s refused: its structural part (model / draft / mmproj files, n_ctx, KV types) differs: %s\n",
+                DSK_WRN("adopt %s refused: its structural part (model / draft / mmproj files, per-slot n_ctx, KV types) differs: %s\n",
                         key.c_str(), src_struct.c_str());
                 continue;
             }

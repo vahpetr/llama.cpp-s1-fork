@@ -1834,6 +1834,14 @@ private:
     std::string cache_meas_how;  // "memo hit" / "computed N ms" / "failed"
     std::string cache_memo_key_pending; // a fresh measurement to publish once the root lock is held ("": none)
 
+    // [TAG_MULTISLOT] the context size in the disk cache's structural fingerprint is the PER-SLOT one (n_ctx_seq): a
+    //   stored state is one sequence, and per-seq state is stream-count agnostic - so an np1 namespace is adoptable
+    //   by an np2 per-stream server of the same slot size. Equal to llama_n_ctx for np1 and for --kv-unified, so
+    //   those fingerprints (and keys) are unchanged; n_parallel / kv_unified stay in the parsed-param digest (key)
+    int32_t cache_n_ctx_seq() const {
+        return ctx_tgt ? (int32_t) llama_n_ctx_seq(ctx_tgt) : n_ctx;
+    }
+
     bool cache_disk_wanted() const {
         return params_base.lora_adapters.empty() && !params_base.cache_disk_path.empty() && params_base.cache_disk_gib > 0;
     }
@@ -1843,7 +1851,7 @@ private:
         cache_meas.clear();
         cache_meas_how.clear();
         cache_memo_key_pending.clear();
-        const std::string cheap = server_disk_cache_fingerprint(params_base, n_ctx);
+        const std::string cheap = server_disk_cache_fingerprint(params_base, cache_n_ctx_seq());
         const std::string memo = server_cache_memo_key(cheap, server_cache_runtime_identity(),
                                                        server_cache_placement_identity(params_base, ctx_tgt, ctx_dft));
         if (memo.empty()) {
@@ -2459,19 +2467,19 @@ private:
             disk_cache = std::make_unique<server_disk_cache>(
                 params_base.cache_disk_path, (uint64_t) params_base.cache_disk_gib << 30,
                 std::max(1, params_base.cache_disk_min_tokens), params_base.cache_disk_ttl_days,
-                server_disk_cache_fingerprint(params_base, n_ctx), mctx != nullptr,
+                server_disk_cache_fingerprint(params_base, cache_n_ctx_seq()), mctx != nullptr,
                 params_base.cache_disk_ckpt_ratio, params_base.checkpoint_min_step, params_base.cache_disk_ckpt_max);
             disk_cache->live_refs = [this]() { return live_deep_refs(); };
             disk_cache->adopt_keys = string_split<std::string>(params_base.cache_disk_adopt, ',');
             disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types) +
                                       "/" + common_speculative_state_schema(spec.get()));
-            disk_cache->set_fingerprint(cache_compat_key(server_disk_cache_fingerprint(params_base, n_ctx)));
+            disk_cache->set_fingerprint(cache_compat_key(server_disk_cache_fingerprint(params_base, cache_n_ctx_seq())));
             disk_cache->init();
             cache_compat_publish();
         } else if (disk_cache) {
             disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types) +
                                       "/" + common_speculative_state_schema(spec.get()));
-            disk_cache->revalidate(cache_compat_key(server_disk_cache_fingerprint(params_base, n_ctx)));
+            disk_cache->revalidate(cache_compat_key(server_disk_cache_fingerprint(params_base, cache_n_ctx_seq())));
             cache_compat_publish();
         }
 

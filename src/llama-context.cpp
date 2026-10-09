@@ -5573,10 +5573,14 @@ std::string llama_state_seq_descriptor(const llama_context * ctx) {
     const auto & hp = ctx->get_model().hparams;
     // stream flags: PARTIAL_ONLY skips the full-only sections (marked "(full-only)" below), ON_DEVICE is a snapshot
     //   location, never a disk stream
+    // [TAG_MULTISLOT] per-seq state is stream-count agnostic (llama_kv_cache::state_read_sinfo): the slot count and
+    //   the KV layout (n_seq_max, kv_unified, n_stream) do not change the per-sequence bytes, so they print the values
+    //   of a single-slot unified context (1 / 1 / 1) - the prod np1 --kv-unified descriptor stays byte-identical, and
+    //   np1 / np2 per-stream / np2 unified agree whenever the per-sequence capacity (n_ctx_seq, kv size) does
     std::string res = format("abi=%d;flags=partial-only:1;ctx_type=%d;other=%d;causal=%d;n_ctx_seq=%u;n_seq_max=%u;"
                                     "unified=%d;flash_attn=%d;", LLAMA_STATE_ABI_REV, (int) cp.ctx_type,
-                                    (int) (cp.ctx_other != nullptr), (int) cp.causal_attn, cp.n_ctx_seq, cp.n_seq_max,
-                                    (int) cp.kv_unified, (int) cp.flash_attn);
+                                    (int) (cp.ctx_other != nullptr), (int) cp.causal_attn, cp.n_ctx_seq, 1u,
+                                    1, (int) cp.flash_attn);
     res += format("rope{type=%d,sections=%d/%d/%d/%d,base=%a,scale=%a,orig=%u,ext=%a,attn=%a,beta=%a/%a,rot=[",
                          (int) hp.rope_type, hp.rope_sections[0], hp.rope_sections[1], hp.rope_sections[2],
                          hp.rope_sections[3], cp.rope_freq_base, cp.rope_freq_scale, cp.n_ctx_orig_yarn,

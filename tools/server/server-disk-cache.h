@@ -334,7 +334,10 @@ struct server_disk_cache {
 
 // identity of everything a stored state depends on: model + draft files, context size, KV types, the binary,
 // its command line and the LLAMA_* / GGML_* environment knobs. Since key v2 [TAG_CACHE_COMPAT2] this is the CHEAP
-// identity: it keys the measurement memo and carries the adopt structure; the namespace key is the v2 key below
+// identity: it keys the measurement memo and carries the adopt structure; the namespace key is the v2 key below.
+// [TAG_MULTISLOT] n_ctx is the PER-SLOT context (llama_n_ctx_seq; = llama_n_ctx for np1 and --kv-unified): a stored
+// state is one sequence and per-seq state is stream-count agnostic, so the adopt structure does not bind to the slot
+// count / KV layout (those stay in the parsed-param digest, i.e. in the namespace key)
 std::string server_disk_cache_fingerprint(const common_params & params, int32_t n_ctx);
 
 // [TAG_CACHE_COMPAT2] compatibility key v2 (R80.2 parts 2-3, spec series D4): namespace key = hash of
@@ -380,6 +383,9 @@ std::string server_disk_cache_model_identity(const common_params & params);
 //   Exact-qualified exclusions (do not change the state bytes a token sequence produces):
 //   - model / draft / mmproj paths, HF / URL sources: the content identity (model_id) is keyed instead
 //   - n_ctx, RoPE / YaRN, n_ctx_seq: the effective values are in the state descriptor (desc)
+//   [TAG_MULTISLOT] n_parallel / n_seq_max / unified KV are IN (the namespace key differs across them by design) but
+//     NOT in the state descriptor (llama_state_seq_descriptor prints the single-slot values): the per-seq bytes do
+//     not depend on them, so another slot count reaches an np1 namespace through --cache-disk-adopt
 //   - mmap / mlock / direct-io / check-tensors / fit-params*: loading method; fit's effects (GPU layers, tensor
 //     split, buffer overrides) are keyed through the effective placement of the loaded model
 //     (server_cache_model_placement, in the ctx canon), its n_ctx through the descriptor
