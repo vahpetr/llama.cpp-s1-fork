@@ -554,6 +554,7 @@ struct server_slot {
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
+    bool release_cancel = false; // [TAG_MULTISLOT] released by a SERVER_TASK_TYPE_CANCEL (logged as stop=cancel)
 
     stop_type stop;
 
@@ -826,6 +827,7 @@ struct server_slot {
         generated_text = "";
         has_new_line   = false;
         truncated      = false;
+        release_cancel = false;
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
@@ -1028,7 +1030,21 @@ struct server_slot {
         if (is_processing()) {
             GGML_ASSERT(task);
 
-            SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
+            // [TAG_MULTISLOT] one INFO line per finished generation with the stop type, so a cut reply can be
+            // classified from the INFO log (stable format for grep: stop=<eos|limit|word|cancel|none> n_gen= n_predict= truncated=)
+            const char * stop_str = "none";
+            if (release_cancel) {
+                stop_str = "cancel";
+            } else {
+                switch (stop) {
+                    case STOP_TYPE_EOS:   stop_str = "eos";   break;
+                    case STOP_TYPE_WORD:  stop_str = "word";  break;
+                    case STOP_TYPE_LIMIT: stop_str = "limit"; break;
+                    case STOP_TYPE_NONE:  stop_str = "none";  break;
+                }
+            }
+            SLT_INF(*this, "stop processing: n_tokens = %d, stop=%s n_gen=%d n_predict=%d truncated=%d\n",
+                    prompt.n_tokens(), stop_str, (int) stats.n_gen, (int) task->params.n_predict, truncated ? 1 : 0);
 
             t_last_used = ggml_time_us();
 
@@ -4066,6 +4082,7 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            slot.release_cancel = true;
                             slot.release();
                             break;
                         }
