@@ -6,7 +6,7 @@ from upstream PR #27742 and an MTP draft graph. Upstream back-ports are marked a
 
 Status column:
 - **deployed (vNN)**: in my builds from image vNN on (my production line), still in this tree.
-- **v55**: in this tree (HEAD = v55, going to production on 2026-10-10).
+- **v56**: in this tree (HEAD = v56, going to production on 2026-10-10).
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
 - **in tree, off**: compiled in, off unless you set its knob (docs/s1/KNOBS.md).
@@ -210,6 +210,8 @@ records and upstream status live in my private repo; ask if you want one.
 | 0212 | webui: compaction review fixes (round 1) | deployed (v54) |
 | 0213 | webui: compaction review fixes (round 2) | deployed (v54) |
 | 0214 | webui: timing chips, tool-call durations, turn line, context-bar speeds | deployed (v54) |
-| 0215 | webui: strip the server-echoed prefill when joining a continuation | v55 |
-| 0216 | webui: minimal permanent surface (context meter + popover, /compact, compaction hint, collapsed timing chips) | v55 |
-| 0217 | webui: review fixes (whitespace-normalised echo detection + echoMismatch mark, popover pin per chat, tool chip in the block header) | v55 |
+| 0215 | webui: strip the server-echoed prefill when joining a continuation | deployed (v55) |
+| 0216 | webui: minimal permanent surface (context meter + popover, /compact, compaction hint, collapsed timing chips) | deployed (v55) |
+| 0217 | webui: review fixes (whitespace-normalised echo detection + echoMismatch mark, popover pin per chat, tool chip in the block header) | deployed (v55) |
+| 0218 | webui: the upstream context ring is the single context trigger (hover card, click / Enter pins; card = upstream usage details + the fork rows: prefill / decode t/s, MTP accepted / drafted, cache share, compute, reserve breakdown, compaction state + Cancel, Compact now, settings); top-right meter removed | v56 |
+| 0219 | webui: review fixes (settings dialog state per conversation, dialog clicks keep the pinned card, popup cleared on ring teardown) | v56 |
