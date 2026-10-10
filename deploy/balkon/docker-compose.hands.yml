@@ -1,0 +1,163 @@
+# Hands server - AMD Ryzen 9 7940HS + Radeon 780M (RDNA3, gfx1103), 96 GB DDR5, Vulkan. Five slots for parallel coding agents.
+#
+# Model: Qwen3.8-Flash-Next GSQ-RCO abliterated (SC117) IQ3_S, with two local re-encodes made by tools/s1/gguf_hc_q8.py
+# (deploy/README.md has the exact steps):
+#   - the hyper-connection weights hc_* BF16 -> Q8_0 ("hc8"): the 780M has no bf16 math, Q8_0 is smaller and decodes 1-5 % faster;
+#   - output.weight + token_embd.weight replaced by the base model's Q8_0 bytes ("o8"): the low-bit head ended replies early
+#     (P(EOS) at a mid-code stop 0.021 on IQ3_S-hc8, 0.001 on IQ3_S-hc8-o8).
+# Context: one pool of 917 504 cells shared by 5 slots (--kv-unified), any single slot can grow to the whole pool;
+# YaRN x4 over 262 144 + QSA above 64k. GTT ~73 GiB of a 78 GiB limit (interpolated from measured 786k and 1M pools),
+# decode ~15-16 t/s, prefill ~140 t/s at 1.7k (measured).
+#
+#   deploy/balkon/setup-hands.sh        # downloads + checks the weights, pulls the image, starts this file, smoke-tests it
+#   or by hand: docker compose -f docker-compose.hands.yml up -d   (MODELS_DIR / SLOTS_DIR / LLAMA_S1_IMAGE override the defaults)
+#
+# Volumes: ./models holds the GGUFs, ./slots the saved slots and the disk prompt cache.
+name: llama-s1-hands
+services:
+  llama:
+    build:
+      context: ../..
+      dockerfile: .devops/vulkan.Dockerfile
+      target: server
+    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v54k}   # prebuilt; `docker compose build` builds the same thing from this tree
+    container_name: llama-s1-hands
+    restart: unless-stopped
+    stop_grace_period: 90s            # on SIGTERM the server writes its slots to the disk prompt cache
+    entrypoint: /app/llama-server
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 600s
+      retries: 3
+    ports: ["8000:8000"]
+    devices: ["/dev/dri:/dev/dri"]
+    group_add: ["44", "993"]          # video, render - check yours: getent group video render
+    environment:
+      # Same runtime knobs as the s1 brain (see deploy/s1/docker-compose.brain-1m.yml for what each does), without the GTT
+      # admission keys and without the sparse MTP draft / graph cache (not gated on this box yet).
+      - GGML_VK_SUBALLOCATION_BLOCK_SIZE=4294967296
+      - GGML_VK_FREE_WAIT_IDLE=1
+      - GGML_ALLOC_GROW_SLACK=10
+      - LLAMA_RESERVE_RUNTIME_SHAPE=1
+      - GGML_VK_DISABLE_MMQ_CM1=1       # int8 coopmat1 MMQ: no gain measured on the 780M either
+      - LLAMA_QSA_COMPACT_BIAS=1
+      - LLAMA_KQ_VIS=1
+      - LLAMA_KQ_VIS_MIN_TOKENS=64
+      - GGML_VK_FA_GQA_TOKENS=0
+      - GGML_VK_QSA_SCRATCH_PRESIZE=1
+      - GGML_VK_QSA_SCRATCH_PRESIZE_FA=1
+      - GGML_VK_QSA_FUSED_SELECT=1
+      - LLAMA_QSA_CHUNK=128
+      - LLAMA_QSA_POOLED_CACHE=1
+      - LLAMA_QSA_MIN_KV=65536          # dense below 64k; on the 780M QSA at 128k measured +48 % prefill / +68 % decode vs dense
+      - LLAMA_QSA_GATHER_MAX_WINDOWS=64
+      - LLAMA_QSA_PREFILL=indexed
+      - LLAMA_QSA_VIS=1
+      - LLAMA_QSA_CENSUS_INC=1
+      - LLAMA_QSA_INPUTS_INC=1
+      - LLAMA_QSA_RELU_INPLACE=1
+      - LLAMA_MTP_CATCHUP_ATTN=0
+    volumes:
+      - ${MODELS_DIR:-./models}:/models:ro
+      - ${SLOTS_DIR:-./slots}:/slots
+    command:
+      - "-m"
+      - "/models/IQ3_S-hc8-o8/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-hc8-o8-00001-of-00002.gguf"   # shard 2 (PLE) next to it
+      - "--mmproj"
+      - "/models/Qwen3.8-Flash-Next-Uncensored.mmproj-f16.gguf"
+      - "-ngl"
+      - "999"
+      - "-ot"
+      - "per_layer_token_embd=CPU"      # PLE table in host RAM via mmap
+      - "--load-mode"
+      - "mmap"
+      - "--tensor-read-lazy"
+      - "auto"
+      - "-fa"
+      - "on"
+      - "-b"
+      - "2048"
+      - "-ub"
+      - "2048"                          # -ub 4096 measured no gain here
+      - "-t"
+      - "8"                             # 8 physical cores; 16 threads (SMT) was slower
+      - "-tb"
+      - "8"
+      - "--fit"
+      - "off"
+      - "--parallel"
+      - "5"                             # five agent slots ...
+      - "--kv-unified"                  # ... sharing one KV pool
+      - "-c"
+      - "917504"                        # pool size: 4 568 MiB GTT per 262 144 cells on this quant; sized for ~5 GiB headroom under 78 GiB
+      - "-ctk"
+      - "q8_0"
+      - "-ctv"
+      - "q8_0"
+      - "--override-kv"
+      - "qwen4exp.context_length=int:1048576"
+      - "--rope-scaling"
+      - "yarn"
+      - "--rope-scale"
+      - "4"
+      - "--yarn-orig-ctx"
+      - "262144"
+      - "--qsa-ratio"
+      - "4"                             # always pass it explicitly: these GGUFs carry compress_ratios [0,0,0,4,...]
+      - "--kv-graph-span"
+      - "196608"                        # reserve compute buffers for a 192k span only; larger batches grow on demand
+      - "--ctx-checkpoints"
+      - "4"
+      - "--checkpoint-min-step"
+      - "4096"
+      - "--cache-ram"
+      - "0"
+      - "--slot-save-path"
+      - "/slots"
+      - "--cache-disk"
+      - "/slots/prompt-cache/hands"
+      - "--cache-disk-gib"
+      - "200"
+      - "--cache-disk-min-tokens"
+      - "4096"
+      - "--cache-disk-ttl-days"
+      - "14"
+      - "--slot-prompt-similarity"
+      - "0.5"
+      - "--cache-disk-ckpt-ratio"
+      - "0.125"
+      - "--cache-disk-ckpt-max"
+      - "32"
+      - "--no-context-shift"
+      - "--spec-type"
+      - "draft-mtp"
+      - "--model-draft"
+      - "/models/Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf"
+      - "--spec-draft-n-max"
+      - "5"
+      - "--spec-draft-p-min"
+      - "0.7"
+      - "--reasoning-format"
+      - "deepseek"
+      - "--reasoning"
+      - "off"                           # thinking on the hands measured +16-24 % wall time with no gain in solved tasks
+      - "--temp"
+      - "0.7"
+      - "--top-p"
+      - "0.8"
+      - "--top-k"
+      - "20"
+      - "--min-p"
+      - "0"
+      - "--presence-penalty"
+      - "1.5"
+      - "--repeat-penalty"
+      - "1.0"
+      - "--jinja"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--metrics"
