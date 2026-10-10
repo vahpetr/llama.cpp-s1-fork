@@ -7,6 +7,8 @@ from upstream PR #27742 and an MTP draft graph. Upstream back-ports are marked a
 Status column:
 - **deployed (vNN)**: in my builds from image vNN on (my production line), still in this tree.
 - **v54**: in this tree (HEAD = v54, going to production on 2026-10-10).
+- **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
+  re-checked that each of these reached production unchanged.
 - **in tree, off**: compiled in, off unless you set its knob (docs/s1/KNOBS.md).
 - **diagnostic / tool / test / comment / doc**: no effect on serving.
 - **not adopted**: measured and rejected; may or may not be in this tree, never on by default.
@@ -40,69 +42,69 @@ records and upstream status live in my private repo; ask if you want one.
 | 0021 | test-backend-ops: TOPK_QSA / TOP_K at the deployed shapes | test |
 | 0022 | qwen4exp: PLE get_rows as the first graph node (LLAMA_PLE_HOIST) | in tree, off (-3.5 % prefill) |
 | 0023 | qwen4exp: LLAMA_PLE_DUMP row-id dump (observation only) | diagnostic |
-| 0024 | Vulkan: seed flops_per_submit from the graph's own flops | deployed (v20), no speed effect |
-| 0025 | Vulkan: graph_optimize window as GGML_VK_OPT_WINDOW (default 20) | deployed (v20) |
+| 0024 | Vulkan: seed flops_per_submit from the graph's own flops | lab image v20, status unverified |
+| 0025 | Vulkan: graph_optimize window as GGML_VK_OPT_WINDOW (default 20) | lab image v20, status unverified |
 | 0026 | Vulkan: async readback takes the UMA memcpy shortcut | in tree, gated off |
-| 0027 | --kv-graph-span: cap the KV span of the worst-case reserve (GTT -5.1 GiB at 192k) | deployed (v21) |
-| 0028–0035 | review fixes for 0016-0027 (PLE prefetch alignment, UMA readback gate, knob parsing) | deployed (v21) |
-| 0036 | Vulkan: transposed CONCAT as copy + tiled copy_transpose (prefill +7.8 % at 8k) | deployed (v21) |
-| 0037 | qwen4exp MTP: eh_proj as one flat GEMM for >= 32 tokens (prefill +3.5 %) | deployed (v21) |
-| 0038 | Vulkan: flush deferred UMA host readbacks before the next compute | deployed (v22) |
-| 0039 | ggml-alloc: check reserve on the regrow path (segfault fix) | deployed (v22) |
-| 0040 | llama: indexer cache reserve honours --kv-graph-span | deployed (v22) |
-| 0041 | Vulkan: GGML_VK_OPT_WINDOW clamp, overflow-free bound | deployed (v22) |
-| 0042 | Vulkan: one ggml_vk_env_bool for boolean knobs | deployed (v22) |
-| 0043 | Vulkan: graph_optimize comment fix (bit-exactness claim) | deployed (v22) |
-| 0044 | Vulkan FA coopmat1: Br = 2 x MatBr query rows per workgroup | deployed (v23) |
-| 0045 | Vulkan FA coopmat1: Br=32 for prefill batches | deployed (v23) |
+| 0027 | --kv-graph-span: cap the KV span of the worst-case reserve (GTT -5.1 GiB at 192k) | lab image v21, status unverified |
+| 0028–0035 | review fixes for 0016-0027 (PLE prefetch alignment, UMA readback gate, knob parsing) | lab image v21, status unverified |
+| 0036 | Vulkan: transposed CONCAT as copy + tiled copy_transpose (prefill +7.8 % at 8k) | lab image v21, status unverified |
+| 0037 | qwen4exp MTP: eh_proj as one flat GEMM for >= 32 tokens (prefill +3.5 %) | lab image v21, status unverified |
+| 0038 | Vulkan: flush deferred UMA host readbacks before the next compute | lab image v22, status unverified |
+| 0039 | ggml-alloc: check reserve on the regrow path (segfault fix) | lab image v22, status unverified |
+| 0040 | llama: indexer cache reserve honours --kv-graph-span | lab image v22, status unverified |
+| 0041 | Vulkan: GGML_VK_OPT_WINDOW clamp, overflow-free bound | lab image v22, status unverified |
+| 0042 | Vulkan: one ggml_vk_env_bool for boolean knobs | lab image v22, status unverified |
+| 0043 | Vulkan: graph_optimize comment fix (bit-exactness claim) | lab image v22, status unverified |
+| 0044 | Vulkan FA coopmat1: Br = 2 x MatBr query rows per workgroup | lab image v23, status unverified |
+| 0045 | Vulkan FA coopmat1: Br=32 for prefill batches | lab image v23, status unverified |
 | 0046 | test-backend-ops: FLASH_ATTN_EXT at the Flash-Next prefill shape | test |
 | 0047 | Vulkan FA coopmat1: Br=32 only for n_rows >= 512 | not adopted |
-| 0048 | Vulkan FA coopmat1: padded QK^T scratch stride (fewer LDS bank conflicts) | deployed (v24) |
+| 0048 | Vulkan FA coopmat1: padded QK^T scratch stride (fewer LDS bank conflicts) | lab image v24, status unverified |
 | 0049 | Vulkan FA coopmat1: GGML_VK_FA_CM1_BC knob | in tree, off |
-| 0050 | qwen4exp: PLE gather as a graph input (no CPU node in the graph) | deployed (v25) |
+| 0050 | qwen4exp: PLE gather as a graph input (no CPU node in the graph) | lab image v25, status unverified |
 | 0051 | docs: why the input path already overlaps ubatches | doc |
-| 0052 | qwen4exp: PLE row-length / index-size asserts | deployed (v25) |
-| 0053 | Vulkan: mul_mat_id tile chosen from rows per expert | deployed (v25) |
-| 0054 | Vulkan: count_experts once per ids tensor per graph | deployed (v25) |
+| 0052 | qwen4exp: PLE row-length / index-size asserts | lab image v25, status unverified |
+| 0053 | Vulkan: mul_mat_id tile chosen from rows per expert | lab image v25, status unverified |
+| 0054 | Vulkan: count_experts once per ids tensor per graph | lab image v25, status unverified |
 | 0055 | comment: safe ways to bound mul_mat_id's empty workgroups | comment |
 | 0056 | server: adaptive draft length per slot (--spec-draft-n-max-adaptive) | in tree, off |
 | 0057 | server: depth-aware cost model for the adaptive draft rule | in tree, off |
 | 0058 | server: measured decode time calibrates the depth model | in tree, off |
-| 0059 | sampling: build only the reachable candidate window (greedy / top-k first) | deployed (v26) |
-| 0060 | server: per-slot opt-in to the sampling fast path | deployed (v26) |
-| 0061 | Vulkan: fuse GDN decay ADD -> SOFTPLUS -> MUL (-72 dispatches per graph) | deployed (v26) |
+| 0059 | sampling: build only the reachable candidate window (greedy / top-k first) | lab image v26, status unverified |
+| 0060 | server: per-slot opt-in to the sampling fast path | lab image v26, status unverified |
+| 0061 | Vulkan: fuse GDN decay ADD -> SOFTPLUS -> MUL (-72 dispatches per graph) | lab image v26, status unverified |
 | 0062 | test-backend-ops: ADD_SOFTPLUS_MUL fusion cases | test |
-| 0063 | Vulkan FA coopmat1: row_tiles = Br/MatBr generalisation | deployed (v26) |
+| 0063 | Vulkan FA coopmat1: row_tiles = Br/MatBr generalisation | lab image v26, status unverified |
 | 0064 | Vulkan FA coopmat1: (token, head) rows for the speculative verify batch | in tree, off (GGML_VK_FA_GQA_TOKENS=0 in my composes) |
 | 0065 | Vulkan: fold verify tokens x GQA heads into Br=32 tiles | in tree, off |
 | 0066 | test-backend-ops: token-folded verify FA cases | test |
 | 0067 | comment: why (token, head) packing is dense | comment |
-| 0068 | ggml-alloc: clear every alias before freeing on regrow (double-free fix) | deployed (v27) |
-| 0069 | Vulkan: flush pending host reads at event_record (multi-GPU, latent) | deployed (v27) |
-| 0070 | server: adaptive-draft acceptance update on every verified round | deployed (v27) |
-| 0071 | Vulkan FA: GQA_TOKENS moved to flags bit 128 | deployed (v27) |
-| 0072 | Vulkan FA: token-aligned packing (keeps the RDNA3 signed-zero containment) | deployed (v27) |
-| 0073 | Vulkan FA: split_k mirrored from the per-token geometry | deployed (v27) |
+| 0068 | ggml-alloc: clear every alias before freeing on regrow (double-free fix) | lab image v27, status unverified |
+| 0069 | Vulkan: flush pending host reads at event_record (multi-GPU, latent) | lab image v27, status unverified |
+| 0070 | server: adaptive-draft acceptance update on every verified round | lab image v27, status unverified |
+| 0071 | Vulkan FA: GQA_TOKENS moved to flags bit 128 | lab image v27, status unverified |
+| 0072 | Vulkan FA: token-aligned packing (keeps the RDNA3 signed-zero containment) | lab image v27, status unverified |
+| 0073 | Vulkan FA: split_k mirrored from the per-token geometry | lab image v27, status unverified |
 | 0074 | test-backend-ops: folded-verify FA cases with a 64-row mask | test |
 | 0075 | Vulkan: rows-per-workgroup knobs for dense mat-vec (GGML_VK_DMMV_RM_*) | in tree, defaults unchanged |
 | 0076 | test-backend-ops: MUL_MAT_VEC at the production shapes | test |
-| 0077 | speculative: MTP draft sampler on the candidate-window fast path | deployed (v28) |
-| 0078 | sampling: penalty-aware candidate window (FAST_TOPK_PEN) | deployed (v28) |
-| 0079 | ggml-cpu: get_rows in page order for large sources (bit-exact) | deployed (v28) |
+| 0077 | speculative: MTP draft sampler on the candidate-window fast path | lab image v28, status unverified |
+| 0078 | sampling: penalty-aware candidate window (FAST_TOPK_PEN) | lab image v28, status unverified |
+| 0079 | ggml-cpu: get_rows in page order for large sources (bit-exact) | lab image v28, status unverified |
 | 0080 | ggml-cpu: GGML_GET_ROWS_THREADS (multi-threaded gather) | in tree, off (neutral) |
 | 0081 | ggml-cpu: GGML_GET_ROWS_STATS census | diagnostic |
-| 0082 | Vulkan: count_experts also writes the per-expert tile prefix sum | deployed (v28) |
-| 0083 | Vulkan: flattened (expert, N-tile) grid for mul_mat_id | deployed (v28) |
+| 0082 | Vulkan: count_experts also writes the per-expert tile prefix sum | lab image v28, status unverified |
+| 0083 | Vulkan: flattened (expert, N-tile) grid for mul_mat_id | lab image v28, status unverified |
 | 0084 | test-backend-ops: MUL_MAT_ID flattened-grid cases | test |
 | 0085 | GGML_SCHED_PROFILE host-side scheduler timers | diagnostic |
 | 0086 | test-backend-ops: legal single-expert router case | test |
-| 0087 | --qsa-ratio N: force dense or a QSA ratio regardless of the GGUF | deployed (v29+) |
-| 0088 | QSA: dense fall-through when the selection covers every key | deployed |
-| 0089 | QSA: tail-cell bias fix (the query's own key) | deployed |
+| 0087 | --qsa-ratio N: force dense or a QSA ratio regardless of the GGUF | lab image v29, status unverified |
+| 0088 | QSA: dense fall-through when the selection covers every key | lab image v29, status unverified |
+| 0089 | QSA: tail-cell bias fix (the query's own key) | lab image v29, status unverified |
 | 0090 | test-backend-ops: TOPK_QSA initializer overrun fix (ASan) | test |
 | 0091 | Vulkan: GGML_VK_DISABLE_FUSION_PATTERNS / GGML_VK_FUSION_LIST | diagnostic |
 | 0092 | Vulkan: GGML_VK_FUSION_COUNT per-graph fusion counts | diagnostic |
-| 0093 | fused MoE router no longer vetoed by an allocation accident | deployed (v31) |
+| 0093 | fused MoE router no longer vetoed by an allocation accident | lab image v30, status unverified |
 | 0094 | ggml-alloc: KEEP_ALIVE flag on the MoE router logits (deterministic fusion) | deployed (v31) |
 | 0095–0099 | Vulkan: top-k QSA fusion gate and overlap-veto fixes | QSA line |
 | 0100–0103 | radix select: deterministic tie-break at the threshold | QSA line |
