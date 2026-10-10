@@ -394,3 +394,22 @@ export {
 	unfinishedTail,
 	timingsTotal
 } from './context-reserve';
+export {
+	cumulativeUsage,
+	formatBytes,
+	formatClock,
+	formatDuration,
+	formatPct,
+	formatTps,
+	llmTotals,
+	type SessionLine,
+	sessionLine,
+	type TimingChips,
+	timingChips,
+	type ToolChip,
+	toolChip,
+	toolRecordIndex,
+	type TurnSummary,
+	turnSummary,
+	utf8Bytes
+} from './timing-chips';

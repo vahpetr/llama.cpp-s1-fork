@@ -83,6 +83,8 @@ export interface AgenticSession {
 	 *  matching tool renderer flip into live-update mode while chunks
 	 *  arrive; cleared when the tool's terminal event lands. */
 	executingToolCallId: string | null;
+	/** W2: when the executing tool call started (epoch ms) - the tool chip's running clock */
+	executingToolStartedAt?: number | null;
 	/** Live LLM token totals of the running flow: completed turns plus the
 	 *  in-flight turn's streamed counts; null when idle. */
 	liveLlm: ChatMessageAgenticTimings['llm'] | null;

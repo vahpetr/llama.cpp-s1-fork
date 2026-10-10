@@ -19,6 +19,7 @@ import type {
 	ChatMessageTimings,
 	DatabaseMessage
 } from '$lib/types';
+import { cumulativeUsage } from '$lib/utils/timing-chips';
 
 interface LiveStats {
 	freshTokens: number;
@@ -89,13 +90,6 @@ class ContextStatsStore {
 	// The canonical resolution lives in modelsStore.activeModelId.
 	activeModelId = $derived(modelsStore.activeModelId);
 
-	// shared by currentRead/Fresh/Cache/Output and cumulative so a per-chunk
-	// churn of activeMessages triggers exactly one scan instead of one per
-	// derived
-	private assistantTimings = $derived.by(() =>
-		summarizeAssistantTimings(conversationsStore.activeMessages as DatabaseMessage[])
-	);
-
 	private cumulative = $derived.by(() => {
 		const convId = conversationsStore.activeConversation?.id;
 		// A running agentic flow stamps llm totals on messages only when it
@@ -115,24 +109,11 @@ class ContextStatsStore {
 			};
 		}
 
-		const { cacheTotal, lastAgenticLlm, output, outputMs, read } = this.assistantTimings;
-
-		// Agentic sessions stamp the same agentic.llm totals onto every
-		// assistant message; cache_n is never per-turn so cache_total stays 0.
-		if (lastAgenticLlm) {
-			const averageTokensPerSecond =
-				lastAgenticLlm.predicted_ms > 0 && lastAgenticLlm.predicted_n > 0
-					? (lastAgenticLlm.predicted_n / lastAgenticLlm.predicted_ms) * 1000
-					: null;
-
-			return {
-				averageTokensPerSecond,
-				cacheTotal: 0,
-				output: lastAgenticLlm.predicted_n ?? 0,
-				read: lastAgenticLlm.prompt_n ?? 0
-			};
-		}
-
+		// D4 (W2): across ALL turns - every agentic flow once (its totals incl. cache), every plain
+		// reply - instead of the last flow only with the cache forced to 0
+		const { cacheTotal, output, outputMs, read } = cumulativeUsage(
+			conversationsStore.activeMessages as DatabaseMessage[]
+		);
 		const averageTokensPerSecond = outputMs > 0 && output > 0 ? (output / outputMs) * 1000 : null;
 
 		return { averageTokensPerSecond, cacheTotal, output, read };
@@ -145,6 +126,13 @@ class ContextStatsStore {
 
 		return this.activeModelId ? modelsStore.props.getModelContextSize(this.activeModelId) : null;
 	});
+
+	// shared by currentRead/Fresh/Cache/Output and cumulative so a per-chunk
+	// churn of activeMessages triggers exactly one scan instead of one per
+	// derived
+	private assistantTimings = $derived.by(() =>
+		summarizeAssistantTimings(conversationsStore.activeMessages as DatabaseMessage[])
+	);
 
 	private liveStats = $derived(deriveLiveStats(chatStore.processing.activeState));
 

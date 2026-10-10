@@ -1,4 +1,5 @@
 <script lang="ts">
+	import ChatMessageTimingChips from './ChatMessageTimingChips.svelte';
 	import {
 		ChatMessageActionIcons,
 		ChatMessageAgenticContent,
@@ -181,6 +182,10 @@
 				/>
 			</div>
 		</div>
+	{/if}
+
+	{#if message.timings && !(chatStore.isLoading && isLastAssistantMessage)}
+		<ChatMessageTimingChips {message} />
 	{/if}
 
 	{#if message.timestamp && !editCtx.isEditing}

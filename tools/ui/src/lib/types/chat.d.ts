@@ -84,7 +84,29 @@ export interface ChatMessageTimings {
 	predicted_n?: number;
 	prompt_ms?: number;
 	prompt_n?: number;
+	/** speculative decoding (MTP): drafted / accepted tokens (server timings) */
+	draft_n?: number;
+	draft_n_accepted?: number;
+	/** W2: measured by the client - request start (epoch ms), time to first token, request wall */
+	client?: ChatMessageClientTimings;
 	agentic?: ChatMessageAgenticTimings;
+}
+
+export interface ChatMessageClientTimings {
+	t_start: number;
+	ttft_ms?: number;
+	wall_ms: number;
+}
+
+/** LLM totals of an agentic flow / turn (W2: + cache and draft sums) */
+export interface ChatMessageAgenticLlmTotals {
+	predicted_n: number;
+	predicted_ms: number;
+	prompt_n: number;
+	prompt_ms: number;
+	cache_n?: number;
+	draft_n?: number;
+	draft_n_accepted?: number;
 }
 
 export interface ChatMessageAgenticTimings {
@@ -93,22 +115,15 @@ export interface ChatMessageAgenticTimings {
 	toolsMs: number;
 	toolCalls?: ChatMessageToolCallTiming[];
 	perTurn?: ChatMessageAgenticTurnStats[];
-	llm: {
-		predicted_n: number;
-		predicted_ms: number;
-		prompt_n: number;
-		prompt_ms: number;
-	};
+	llm: ChatMessageAgenticLlmTotals;
+	/** W2: flow start / end (epoch ms) for the turn line */
+	t_start?: number;
+	t_end?: number;
 }
 
 export interface ChatMessageAgenticTurnStats {
 	turn: number;
-	llm: {
-		predicted_n: number;
-		predicted_ms: number;
-		prompt_n: number;
-		prompt_ms: number;
-	};
+	llm: ChatMessageAgenticLlmTotals;
 	toolCalls: ChatMessageToolCallTiming[];
 	toolsMs: number;
 }
@@ -117,6 +132,16 @@ export interface ChatMessageToolCallTiming {
 	name: string;
 	duration_ms: number;
 	success: boolean;
+	/** W2: the model-side tool call this record times (matches tool_calls[i].id) */
+	toolCallId?: string;
+	/** W2: start / end (epoch ms) */
+	t_start?: number;
+	t_end?: number;
+	/** W2: UTF-8 bytes of the arguments and of the result sent back */
+	args_bytes?: number;
+	result_bytes?: number;
+	/** W2: the error line of a failed call */
+	error?: string;
 }
 
 /**
