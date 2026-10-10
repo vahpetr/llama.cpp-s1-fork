@@ -7,7 +7,8 @@
 		gaugeCardEnter,
 		gaugeCardLeave,
 		gaugePopup,
-		gaugePopupClose
+		gaugePopupClose,
+		outsidePressDismisses
 	} from './gauge-popup.svelte';
 	import { Pin, Settings2 } from '@lucide/svelte';
 	import { ColorLevel } from '$lib/enums';
@@ -45,11 +46,14 @@
 
 			if (!(target instanceof Node)) return;
 
-			if (cardEl?.contains(target)) return;
+			const dismiss = outsidePressDismisses({
+				insideCard: !!cardEl?.contains(target),
+				onTrigger: target instanceof Element && !!target.closest('[data-context-gauge-trigger]'),
+				// the settings dialog is portalled outside the card: its clicks keep the card
+				settingsOpen: gaugePopup.settingsOpen
+			});
 
-			if (target instanceof Element && target.closest('[data-context-gauge-trigger]')) return;
-
-			gaugePopupClose();
+			if (dismiss) gaugePopupClose();
 		};
 
 		document.addEventListener('pointerdown', onPointerDown, true);

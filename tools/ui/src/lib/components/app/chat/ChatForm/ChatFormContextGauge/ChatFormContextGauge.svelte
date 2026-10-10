@@ -2,7 +2,7 @@
 	import ContextGaugeDial from './ContextGaugeDial.svelte';
 	import {
 		gaugePopup,
-		gaugePopupClose,
+		gaugePopupReset,
 		gaugeTriggerClick,
 		gaugeTriggerEnter,
 		gaugeTriggerKeydown,
@@ -15,7 +15,7 @@
 	import { useContextRing } from '$lib/hooks/use-context-ring.svelte';
 	import { chatStore, conversationsStore, settingsStore } from '$lib/stores';
 	import { legacyContextFields } from '$lib/utils';
-	import { untrack } from 'svelte';
+	import { onDestroy, untrack } from 'svelte';
 	import { toast } from 'svelte-sonner';
 
 	const gauge = useContextGauge();
@@ -29,7 +29,8 @@
 	} as const;
 	const LEGACY_NOTICE_KEY = 'llama-ui.w12-context-settings-notice';
 
-	// the pin belongs to the conversation it was set in: a switch closes the card
+	// the card's pin and the settings dialog belong to the conversation they were opened in: a
+	// switch resets them, and so does the ring's teardown (no card / dialog without its trigger)
 	let cardFor: string | undefined = undefined;
 
 	$effect(() => {
@@ -37,11 +38,11 @@
 
 		if (id !== cardFor) {
 			cardFor = id;
-			untrack(() => {
-				if (gaugePopup.open || gaugePopup.pinned) gaugePopupClose();
-			});
+			untrack(() => gaugePopupReset());
 		}
 	});
+
+	onDestroy(() => gaugePopupReset());
 
 	// W1.2: the W1/W1.1 reserve and "messages kept" settings are no longer read - say so once
 	$effect(() => {
@@ -132,8 +133,10 @@
 </div>
 
 {#if ring.conversation}
-	<ChatScreenContextSettingsDialog
-		bind:open={gaugePopup.settingsOpen}
-		convId={ring.conversation.id}
-	/>
+	{#key ring.conversation.id}
+		<ChatScreenContextSettingsDialog
+			bind:open={gaugePopup.settingsOpen}
+			convId={ring.conversation.id}
+		/>
+	{/key}
 {/if}

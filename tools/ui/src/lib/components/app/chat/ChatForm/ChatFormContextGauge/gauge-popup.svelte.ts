@@ -62,6 +62,29 @@ export function gaugePopupClose(): void {
 	gaugePopup.pinned = false;
 }
 
+/**
+ * W2.2: full reset - card closed and unpinned, the settings dialog closed. On a conversation
+ * switch and when the ring unmounts (the card and the dialog must not outlive their trigger or
+ * reopen for another conversation).
+ */
+export function gaugePopupReset(): void {
+	gaugePopupClose();
+	gaugePopup.detailsOpen = false;
+	gaugePopup.settingsOpen = false;
+}
+
+/**
+ * W2.2: does a press outside the card close it? Not on the ring (it toggles itself), not inside
+ * the card, and not while the settings dialog (portalled outside the card) is open.
+ */
+export function outsidePressDismisses(p: {
+	insideCard: boolean;
+	onTrigger: boolean;
+	settingsOpen: boolean;
+}): boolean {
+	return !p.insideCard && !p.onTrigger && !p.settingsOpen;
+}
+
 export function gaugeTriggerPointerDown(event: PointerEvent): void {
 	lastPointerType = event.pointerType;
 }

@@ -15,6 +15,11 @@ beforeAll(() => {
 	} as Storage;
 });
 
+import {
+	gaugePopup,
+	gaugePopupReset,
+	outsidePressDismisses
+} from '$lib/components/app/chat/ChatForm/ChatFormContextGauge/gauge-popup.svelte';
 import { ChatFormCommandAction, MessageRole, ToolPermissionDecision, ToolSource } from '$lib/enums';
 import { useChatFormPickers } from '$lib/hooks/use-chat-form-pickers.svelte';
 import { ChatService } from '$lib/services/chat.service';
@@ -586,5 +591,30 @@ describe('W2.1 collapsed chips, tool fragment, popover rows, hint, /compact', ()
 		pickers.handleCommandSelect(cmd);
 		expect(value).toBe('');
 		expect(calls).toEqual(['compactNow']);
+	});
+});
+
+describe('astra W2.2: context card state', () => {
+	it('reset closes and unpins the card and closes the settings dialog', () => {
+		gaugePopup.open = true;
+		gaugePopup.pinned = true;
+		gaugePopup.settingsOpen = true;
+		gaugePopup.detailsOpen = true;
+		gaugePopupReset();
+		expect(gaugePopup).toMatchObject({
+			detailsOpen: false,
+			open: false,
+			pinned: false,
+			settingsOpen: false
+		});
+	});
+
+	it('outside presses keep the card while the settings dialog is open', () => {
+		const out = { insideCard: false, onTrigger: false };
+
+		expect(outsidePressDismisses({ ...out, settingsOpen: false })).toBe(true);
+		expect(outsidePressDismisses({ ...out, settingsOpen: true })).toBe(false);
+		expect(outsidePressDismisses({ ...out, insideCard: true, settingsOpen: false })).toBe(false);
+		expect(outsidePressDismisses({ ...out, onTrigger: true, settingsOpen: false })).toBe(false);
 	});
 });
