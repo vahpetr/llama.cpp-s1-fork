@@ -9,8 +9,13 @@ export const SETTINGS_KEYS = {
 	ALWAYS_SHOW_SIDEBAR_ON_DESKTOP: 'alwaysShowSidebarOnDesktop',
 	ALWAYS_SHOW_TOOL_CALL_CONTENT: 'alwaysShowToolCallContent',
 	API_KEY: 'apiKey',
+	AUTO_COMPACT: 'autoCompact',
 	AUTO_MIC_ON_EMPTY: 'autoMicOnEmpty',
 	BACKEND_SAMPLING: 'backend_sampling',
+	// Context reserve + compaction (W1)
+	COMPACT_SUMMARY_PROMPT: 'compactSummaryPrompt',
+	COMPACT_SUMMARY_TOKENS: 'compactSummaryTokens',
+	COMPACT_TAIL_TOKENS: 'compactTailTokens',
 	CONVERSATION_TABS: 'conversationTabs',
 	COPY_TEXT_ATTACHMENTS_AS_PLAIN_TEXT: 'copyTextAttachmentsAsPlainText',
 	CUSTOM_CSS: 'customCss',

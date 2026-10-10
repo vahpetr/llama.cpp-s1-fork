@@ -419,6 +419,8 @@ export class DatabaseService {
 				});
 				const lastClonedMessage = clonedMessages[clonedMessages.length - 1];
 				const newConv: DatabaseConversation = {
+					// per-chat Context settings (W1.1)
+					contextSettings: sourceConv.contextSettings,
 					currNode: lastClonedMessage.id,
 					cwd: sourceConv.cwd,
 					// the inherited history keeps its prompt start: same tool list and tool choices

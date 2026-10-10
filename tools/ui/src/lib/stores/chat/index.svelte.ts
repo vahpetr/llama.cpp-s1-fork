@@ -9,7 +9,9 @@
  * Uses ChatService for the API layer and conversationsStore for persistence.
  */
 
+import { goto } from '$app/navigation';
 import {
+	CONTEXT_RESERVE,
 	CWD_CLEARED_TEXT,
 	MESSAGE_EXTRA_STORAGE_VERSION,
 	SYSTEM_MESSAGE_PLACEHOLDER,
@@ -24,9 +26,12 @@ import {
 } from '$lib/enums';
 import { ChatService } from '$lib/services/chat.service';
 import { DatabaseService } from '$lib/services/database.service';
+import { imEndTokenId } from '$lib/services/im-end-token';
+import { RouterService } from '$lib/services/router.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { agenticStore } from '$lib/stores/agentic/index.svelte';
 import { chatActivityStore } from '$lib/stores/chat/activity.svelte';
+import { draftMessagesStore } from '$lib/stores/chat/drafts.svelte';
 import { type ChatFlowsHost, ChatMessageFlows } from '$lib/stores/chat/flows.svelte';
 import { chatProcessingStore } from '$lib/stores/chat/processing.svelte';
 import { type ChatStreamHost, ChatStreamManager } from '$lib/stores/chat/streams.svelte';
@@ -46,16 +51,57 @@ import type {
 	DatabaseMessageExtra,
 	ErrorDialogState
 } from '$lib/types';
+import type { ContextBudget, ContextReserveConfig } from '$lib/utils';
 import {
+	buildSummaryInstruction,
+	cappedThinkingBudget,
+	compactedConversationName,
+	contextBudget,
+	dropTrailingEmptyAssistants,
+	estimateMessageTokens,
+	estimateTextTokens,
+	estimateToolsTokens,
 	filterByLeafNodeId,
 	findMessageById,
 	formatCwdMessage,
 	getConversationModel,
 	isAbortError,
+	joinWithOverlap,
+	measureContextUsage,
 	normalizeModelName,
-	parseToolsSnapshot
+	parseToolsSnapshot,
+	planSummaryRequest,
+	replyTokenCap,
+	resolveContextReserveConfig,
+	selectTailMessages,
+	shouldCompactBeforeTurn,
+	summaryLengthUsable,
+	summaryRejection,
+	tailTokenBudget,
+	unfinishedTail
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
+import { toast } from 'svelte-sonner';
+
+/** A running context compaction (W1): the summary request of one conversation. */
+export interface CompactionState {
+	convId: string;
+	/** owner token: cleanup releases only the compaction it started */
+	id: number;
+	/** summary tokens generated so far */
+	tokens: number;
+}
+
+export type CompactionResult =
+	| { convId: string; partialId?: string }
+	| { cancelled: true }
+	| { error: string };
+
+export interface CompactionOptions {
+	auto?: boolean;
+	/** rule 2: the last message is a reply cut by the reserve cap, carried into the new chat */
+	partialMessageId?: string;
+}
 
 class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	chatReasoningStates = new SvelteMap<string, boolean>();
@@ -63,6 +109,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		string,
 		{ response: string; messageId: string; model?: string | null }
 	>();
+	/** the running context compaction (W1), null when none */
+	compaction = $state<CompactionState | null>(null);
 	currentResponse = $state('');
 	errorDialogState = $state<ErrorDialogState | null>(null);
 	// true while the active conversation has a local pipe (send, attach or resume-wait)
@@ -77,6 +125,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	streamConnectionState = $state<StreamConnectionState>(StreamConnectionState.STREAMING);
 	private abortControllers = new SvelteMap<string, AbortController>();
 	private addFilesHandler: ((files: File[]) => void) | null = $state(null);
+	private compactionSeq = 0;
 	// message flows: edit, regenerate, continue, delete
 	private flows = new ChatMessageFlows(this);
 	private isEditModeActive = $state(false);
@@ -238,6 +287,38 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			console.error('Failed to add system prompt:', error);
 		}
 	}
+	/**
+	 * W1.2 rules 2 and 3 on a finished reply of the open conversation (as pi's compaction.ts and
+	 * reply-guard.ts). Rule 2: a reply that ended with `length` because the reserve cap set its
+	 * max_tokens is a PARTIAL - the history is compacted, the new chat carries the partial as its
+	 * last message, and the server continues it from the exact stop point (joined with an overlap
+	 * check); <= 2 such continuations, else the message is marked truncated. Rule 3: a reply that
+	 * stopped (`stop`, no tool calls) with an obviously unfinished tail gets <= 2 continuations
+	 * with a -2.0 bias on <|im_end|>; still unfinished = marked. Never on tool-call replies.
+	 */
+	async afterReply(
+		convId: string,
+		messageId: string,
+		info: { finish?: string; byReserve: boolean; toolCalls: boolean }
+	): Promise<void> {
+		if (info.toolCalls || conversationsStore.activeConversation?.id !== convId) return;
+
+		const target = { convId, messageId };
+
+		try {
+			await this.runReplyRules(target, info);
+		} finally {
+			// a mid-turn compaction moved this turn's queued input to the continuation: send it there
+			// exactly once, after the continuation finished (the original handler drains only the
+			// old, now empty queue)
+			if (target.convId !== convId) {
+				const pending = this.consumePendingMessage(target.convId);
+
+				if (pending) await this.deliverQueued(target.convId, pending);
+			}
+		}
+	}
+
 	cancelPreEncode(): void {
 		if (this.preEncodeAbortController) {
 			this.preEncodeAbortController.abort();
@@ -285,6 +366,60 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		this.currentResponse = '';
 	}
 
+	/**
+	 * W1: compact a conversation whose context is (nearly) full. A summary request reuses the cached
+	 * prompt where the server can (the conversation exactly as the chat sends it + an instruction
+	 * message; when the context is full or has no room for the summary, cut before the last reply
+	 * at a measured point so the server can rewind to a checkpoint - best effort: without a usable
+	 * checkpoint the server re-reads that prefix). Then a new conversation = system prompt + the
+	 * summary (an assistant note) + the last messages, linked to this one, which is kept. Opens
+	 * the new conversation.
+	 */
+	async compactConversation(
+		convId: string,
+		opts: CompactionOptions = {}
+	): Promise<CompactionResult> {
+		// ownership is claimed before the first await: no second compaction, send or agentic flow
+		// can start on this conversation in between, and cleanup releases only what this call owns
+		if (this.compaction) return { error: 'A compaction is already running' };
+
+		if (this.isChatLoadingInternal(convId)) return { error: 'The conversation is busy' };
+
+		const owner: CompactionState = { convId, id: ++this.compactionSeq, tokens: 0 };
+
+		this.compaction = owner;
+		this.setChatLoading(convId, true);
+
+		const abortController = this.getOrCreateAbortController(convId);
+		const fail = (error: string): CompactionResult => {
+			toast.error(`Compaction failed: ${error}`);
+
+			return { error };
+		};
+
+		let result: CompactionResult = { error: 'not started' };
+
+		try {
+			result = await this.runCompaction(convId, owner, abortController, fail, opts);
+
+			return result;
+		} catch (error) {
+			result =
+				isAbortError(error) || abortController.signal.aborted
+					? { cancelled: true }
+					: fail(error instanceof Error ? error.message : String(error));
+
+			return result;
+		} finally {
+			if (this.compaction?.id === owner.id) this.compaction = null;
+
+			this.abortRequest(convId);
+			this.setChatLoading(convId, false);
+			this.processing.setState(convId, null);
+			this.settleQueuedAfterCompaction(convId, result, !!opts.auto);
+		}
+	}
+
 	consumePendingDraft(): { message: string; files: ChatUploadedFile[] } | null {
 		if (!this.pendingDraftMessage && this.pendingDraftFiles.length === 0) return null;
 
@@ -306,6 +441,49 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		this.pendingMessages.delete(convId);
 
 		return msg;
+	}
+
+	/** n_ctx of the model a request goes to (per slot, from /props), null when unknown */
+	contextSizeFor(model?: string | null): number | null {
+		const id = model || modelsStore.activeModelId;
+		const nCtx = id ? modelsStore.props.getModelContextSize(id) : null;
+
+		// single-model mode: the server's own /props
+		return nCtx ?? (serverStore.isRouterMode ? null : serverStore.contextSize);
+	}
+
+	/**
+	 * W1.2: the derived budget of a conversation path (n_ctx, used, the resolved settings, reserve
+	 * and pre-turn minimum); null when the context size is unknown.
+	 */
+	contextState(
+		messages: readonly DatabaseMessage[],
+		model?: string | null,
+		convId?: string
+	): {
+		nCtx: number;
+		used: number;
+		cfg: ContextReserveConfig;
+		budget: ContextBudget;
+	} | null {
+		const nCtx = this.contextSizeFor(model);
+
+		if (!nCtx) return null;
+
+		const cfg = conversationsStore.getContextConfig(convId);
+		const used = this.usedTokens(messages, nCtx, convId);
+
+		return {
+			budget: contextBudget({
+				nCtx,
+				summaryPrompt: cfg.summaryPrompt,
+				summaryTokens: cfg.summaryTokens,
+				used
+			}),
+			cfg,
+			nCtx,
+			used
+		};
 	}
 
 	async continueAssistantMessage(messageId: string): Promise<void> {
@@ -638,10 +816,92 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		}
 	}
 
+	/**
+	 * W1.2: output limits of a reply to `messages`: max_tokens = min(configured, n_ctx - used -
+	 * reserve) (floor 1), enforced after the custom JSON, and a thinking budget of at most half of
+	 * it. `byReserve` = the reserve, not the configured limit, set the cap (rule 2 applies to a
+	 * `length` stop then). Empty when the context size is unknown.
+	 */
+	replyLimits(
+		messages: readonly DatabaseMessage[],
+		model?: string | null,
+		convId?: string
+	): {
+		max_tokens?: number;
+		maxTokensCeiling?: number;
+		thinkingBudgetCap?: number;
+		byReserve?: boolean;
+	} {
+		const st = this.contextState(messages, model, convId);
+
+		if (!st) return {};
+
+		const max = Number(settingsStore.config.max_tokens);
+		const configured = max > 0 ? max : undefined;
+		const cap = replyTokenCap({
+			configured,
+			nCtx: st.nCtx,
+			reserve: st.budget.reserve,
+			used: st.used
+		});
+
+		if (cap === undefined) return {};
+
+		return {
+			byReserve: configured === undefined || cap < configured,
+			max_tokens: cap,
+			maxTokensCeiling: cap,
+			thinkingBudgetCap: cappedThinkingBudget(cap)
+		};
+	}
+
 	savePendingDraft(message: string, files: ChatUploadedFile[]): void {
 		this.pendingDraftMessage = message;
 		this.pendingDraftFiles = [...files];
 	}
+
+	/**
+	 * W1.2 rule 1: what a send of this message to the (open) conversation must do first: nothing;
+	 * compact (it would start with less than the pre-turn minimum free; auto-compaction on); or
+	 * refuse (auto-compaction off and not even a minimal reply fits above the reserve).
+	 */
+	sendGate(
+		convId: string,
+		content: string,
+		extras?: DatabaseMessageExtra[]
+	): 'send' | 'compact' | 'blocked' {
+		if (conversationsStore.activeConversation?.id !== convId) return 'send';
+
+		const messages = conversationsStore.activeMessages as DatabaseMessage[];
+		const model = serverStore.isRouterMode
+			? modelsStore.selectedModelName || getConversationModel(messages)
+			: null;
+		const st = this.contextState(messages, model, convId);
+
+		if (!st) return 'send';
+
+		const pending = estimateMessageTokens({
+			content,
+			extra: extras,
+			role: MessageRole.USER
+		} as DatabaseMessage);
+
+		if (st.cfg.autoCompact) {
+			return shouldCompactBeforeTurn({
+				nCtx: st.nCtx,
+				pending,
+				preTurnMin: st.budget.preTurnMin,
+				used: st.used
+			})
+				? 'compact'
+				: 'send';
+		}
+
+		return st.nCtx - st.used - pending < st.budget.reserve + CONTEXT_RESERVE.MIN_REPLY_TOKENS
+			? 'blocked'
+			: 'send';
+	}
+
 	async sendMessage(content: string, extras?: DatabaseMessageExtra[]): Promise<void> {
 		if (!content.trim() && (!extras || extras.length === 0)) return;
 
@@ -663,6 +923,35 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		// Cancel any in-flight pre-encode request
 		this.cancelPreEncode();
+
+		// W1: a turn that would not leave the context reserve free compacts first and the message
+		// goes to the continuation. It is bound to its conversation: when the compaction fails or is
+		// cancelled, or the open conversation changed meanwhile, it is not sent anywhere else - it
+		// stays the input draft of its own conversation. (The chat screen runs this gate before it
+		// clears the input, so there a failed compaction just leaves the message in the box.)
+		if (activeConv) {
+			const gate = this.sendGate(activeConv.id, content, extras);
+
+			if (gate === 'blocked') {
+				toast.warning(
+					'The context reserve is reached and auto-compaction is off: use "Compact now" first.'
+				);
+				this.keepAsDraft(activeConv.id, content, extras);
+
+				return;
+			}
+
+			if (gate === 'compact') {
+				const result = await this.compactConversation(activeConv.id, { auto: true });
+				const target = 'convId' in result ? result.convId : activeConv.id;
+
+				if (!('convId' in result) || conversationsStore.activeConversation?.id !== target) {
+					this.keepAsDraft(target, content, extras);
+
+					return;
+				}
+			}
+		}
 
 		// Consume MCP resource attachments - converts them to extras and clears the live store
 		const resourceExtras = mcpStore.consumeResourceAttachmentsAsExtras();
@@ -1046,7 +1335,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					const pending = this.consumePendingMessage(convId);
 
 					if (pending) {
-						this.sendMessage(pending.content, pending.extras);
+						void this.deliverQueued(convId, pending);
 					}
 
 					return;
@@ -1151,6 +1440,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			disabledToolCategories: conversationsStore.preferences.getDisabledToolCategories(),
 			disabledTools: conversationsStore.preferences.getDisabledTools()
 		};
+		// W1: the reply never uses the context reserve (the agentic loop re-caps each later turn)
+		const replyCap = this.replyLimits(allMessages, effectiveModel, convId);
 
 		{
 			const agenticResult = await agenticStore.runAgenticFlow({
@@ -1160,13 +1451,25 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				messages: allMessages,
 				options: {
 					...this.getApiOptions(),
-					...(effectiveModel ? { model: effectiveModel } : {})
+					...(effectiveModel ? { model: effectiveModel } : {}),
+					...replyCap
 				},
 				signal: abortController.signal,
 				toolPolicy
 			});
 
 			if (agenticResult.handled) {
+				// W1.2 rules 2 / 3 on the flow's final reply
+				const lastTurn = agenticStore.takeLastTurn(convId);
+
+				if (lastTurn) {
+					await this.afterReply(convId, currentMessageId, {
+						byReserve: lastTurn.byReserve,
+						finish: lastTurn.finish,
+						toolCalls: false
+					});
+				}
+
 				// Generate LLM based title for new conversations after agentic flow completes
 				if (firstUserMessageContent) {
 					await this.generateTitleWithLLM(firstUserMessageContent, streamedContent, convId);
@@ -1175,9 +1478,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				// Check if there's a pending steering message to re-send
 				const pending = agenticStore.consumePendingSteeringMessage(convId);
 
-				if (pending) {
-					await this.sendMessage(pending.content, pending.extras);
-				}
+				if (pending) await this.deliverQueued(convId, pending);
 
 				return;
 			}
@@ -1188,12 +1489,14 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			{
 				...this.getApiOptions(),
 				...(effectiveModel ? { model: effectiveModel } : {}),
+				...replyCap,
 				onChunk: streamCallbacks.onChunk,
 				onComplete: async (
 					finalContent?: string,
 					reasoningContent?: string,
 					timings?: ChatMessageTimings,
-					toolCalls?: string
+					toolCalls?: string,
+					finishReason?: string
 				) => {
 					const content = streamedContent || finalContent || '';
 					const reasoning = streamedReasoningContent || reasoningContent;
@@ -1224,6 +1527,13 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 					if (onComplete) await onComplete(content);
 
+					// W1.2 rules 2 / 3
+					await this.afterReply(convId, currentMessageId, {
+						byReserve: replyCap.byReserve === true,
+						finish: finishReason,
+						toolCalls: !!toolCalls && toolCalls !== '[]'
+					});
+
 					if (serverStore.isRouterMode) modelsStore.fetchRouterModels().catch(console.error);
 
 					// Generate LLM based title for new conversations (avoids stale reference
@@ -1235,9 +1545,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					// Check if there's a pending message queued during streaming
 					const pending = this.consumePendingMessage(convId);
 
-					if (pending) {
-						await this.sendMessage(pending.content, pending.extras);
-					}
+					if (pending) await this.deliverQueued(convId, pending);
 				},
 				onCompletionId: streamCallbacks.onCompletionId,
 				onConnectionState: (state: StreamConnectionState) => {
@@ -1255,7 +1563,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			abortController.signal
 		);
 	}
-
 	syncLoadingStateForChat(convId: string): void {
 		const s = this.chatStreamingStates.get(convId);
 
@@ -1283,6 +1590,18 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	async updateMessage(messageId: string, newContent: string): Promise<void> {
 		return this.flows.updateMessage(messageId, newContent);
 	}
+
+	/**
+	 * Context in use for a path: the server's last measurement (it already counts the tool
+	 * definitions) plus estimates after it; with no measurement yet (a new chat, a continuation)
+	 * the estimate adds the tool definitions the request will carry.
+	 */
+	usedTokens(messages: readonly DatabaseMessage[], nCtx: number | null, convId?: string): number {
+		const usage = measureContextUsage(messages, nCtx);
+
+		return usage.measured > 0 ? usage.used : usage.used + this.toolsTokensFor(convId);
+	}
+
 	private abortRequest(convId?: string): void {
 		if (convId) {
 			const c = this.abortControllers.get(convId);
@@ -1294,6 +1613,171 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		} else {
 			for (const c of this.abortControllers.values()) c.abort();
 			this.abortControllers.clear();
+		}
+	}
+
+	/**
+	 * W1.2: continue an assistant reply from its exact stop point: the conversation up to it, sent
+	 * as a real turn with the reply as the final assistant message (continue_final_message), the
+	 * reserve cap, and the given bias; the continuation is joined with an overlap check. A
+	 * continuation that asks for a tool call keeps only its text (the call is not run).
+	 */
+	private async continueReply(
+		convId: string,
+		messageId: string,
+		o: { logitBias?: Record<string, number>; maxTokens?: number }
+	): Promise<{ finish?: string; byReserve: boolean } | { error: string }> {
+		if (this.isChatLoadingInternal(convId)) return { error: 'the conversation is busy' };
+
+		this.setChatLoading(convId, true);
+
+		const abortController = this.getOrCreateAbortController(convId);
+
+		try {
+			const conversation = await DatabaseService.getConversation(convId);
+
+			if (!conversation) return { error: 'no conversation' };
+
+			const path = (
+				filterByLeafNodeId(
+					await DatabaseService.getConversationMessages(convId),
+					messageId,
+					false
+				) as DatabaseMessage[]
+			).filter((m) => m.type !== MessageType.ROOT);
+			const msg = path[path.length - 1];
+
+			if (!msg || msg.id !== messageId || msg.role !== MessageRole.ASSISTANT) {
+				return { error: 'the reply is not the last message' };
+			}
+
+			const model = serverStore.isRouterMode
+				? modelsStore.selectedModelName || getConversationModel(path)
+				: null;
+			const limits = this.replyLimits(path, model, convId);
+			const maxTokens = Math.min(o.maxTokens ?? Infinity, limits.max_tokens ?? Infinity);
+			const capped = Number.isFinite(maxTokens) ? maxTokens : undefined;
+			const frozenTools = parseToolsSnapshot(conversation.toolsSnapshot);
+			const tools =
+				agenticStore.getConfig(settingsStore.config).enabled &&
+				frozenTools &&
+				frozenTools.length > 0
+					? frozenTools
+					: undefined;
+			const original = msg.content ?? '';
+			const originalReasoning = msg.reasoningContent ?? '';
+
+			let appended = '';
+			let appendedReasoning = '';
+			let done: { finish?: string; timings?: ChatMessageTimings } | null = null;
+
+			const show = () => {
+				this.setChatStreaming(convId, original + appended, messageId);
+
+				const idx = conversationsStore.findMessageIndex(messageId);
+
+				if (idx >= 0) {
+					conversationsStore.updateMessageAtIndex(idx, {
+						content: original + appended,
+						reasoningContent: originalReasoning + appendedReasoning || undefined
+					});
+				}
+			};
+
+			await ChatService.sendMessage(
+				path,
+				{
+					...this.getApiOptions(conversation),
+					...(model ? { model } : {}),
+					continueFinalMessage: true,
+					...(capped !== undefined
+						? {
+								max_tokens: capped,
+								maxTokensCeiling: capped,
+								thinkingBudgetCap: cappedThinkingBudget(capped)
+							}
+						: {}),
+					logitBias: o.logitBias,
+					onChunk: (chunk: string) => {
+						appended += chunk;
+						show();
+					},
+					onComplete: (
+						_c: string,
+						_r?: string,
+						timings?: ChatMessageTimings,
+						_tc?: string,
+						finish?: string
+					) => {
+						done = { finish, timings };
+					},
+					onError: () => {},
+					onReasoningChunk: (chunk: string) => {
+						appendedReasoning += chunk;
+						show();
+					},
+					stream: true,
+					tools
+				},
+				undefined,
+				abortController.signal
+			);
+
+			if (abortController.signal.aborted) return { error: 'cancelled' };
+
+			const end = done as { finish?: string; timings?: ChatMessageTimings } | null;
+
+			if (!end) return { error: 'the stream ended before completion' };
+
+			// continue_final_message: the server continues exactly after the partial, so the pieces
+			// are joined verbatim (a char-overlap strip would delete legitimately repeated text);
+			// the overlap join stays only as an explicit fallback for servers without prefill
+			const join = (a: string, b: string) =>
+				CONTEXT_RESERVE.JOIN_OVERLAP_FALLBACK ? joinWithOverlap(a, b).text : a + b;
+			const content = join(original, appended);
+			const reasoning = join(originalReasoning, appendedReasoning);
+			const update: Partial<DatabaseMessage> = {
+				content,
+				reasoningContent: reasoning || undefined,
+				replyNote: undefined,
+				timestamp: Date.now(),
+				...(end.timings ? { timings: end.timings } : {})
+			};
+
+			await DatabaseService.updateMessage(messageId, update);
+
+			const idx = conversationsStore.findMessageIndex(messageId);
+
+			if (idx >= 0) conversationsStore.updateMessageAtIndex(idx, update);
+
+			const max = Number(settingsStore.config.max_tokens);
+
+			return {
+				byReserve: capped !== undefined && !(max > 0 && capped >= max),
+				finish: end.finish
+			};
+		} catch (error) {
+			return { error: error instanceof Error ? error.message : String(error) };
+		} finally {
+			this.abortRequest(convId);
+			this.setChatLoading(convId, false);
+			this.clearChatStreaming(convId, messageId);
+		}
+	}
+
+	/**
+	 * A queued / steering message is bound to the conversation it was written in: sent when that
+	 * conversation is the open one (sendMessage builds its request from the open conversation),
+	 * else kept as that conversation's draft - never sent into whatever conversation is open.
+	 */
+	private async deliverQueued(
+		convId: string,
+		pending: { content: string; extras?: DatabaseMessageExtra[] }
+	): Promise<void> {
+		if (conversationsStore.activeConversation?.id === convId) {
+			await this.sendMessage(pending.content, pending.extras);
+		} else {
+			this.keepAsDraft(convId, pending.content, pending.extras);
 		}
 	}
 
@@ -1347,6 +1831,426 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		convId: string
 	): { response: string; messageId: string } | undefined {
 		return this.chatStreamingStates.get(convId);
+	}
+
+	/** W1: keep an unsent message as the input draft of its own conversation. */
+	private keepAsDraft(convId: string, content: string, extras?: DatabaseMessageExtra[]): void {
+		draftMessagesStore.saveDraftMessage(convId, content, []);
+		toast.info(
+			extras && extras.length > 0
+				? 'The message was not sent; its text is kept as the draft of its conversation (attachments must be added again).'
+				: 'The message was not sent; it is kept as the draft of its conversation.'
+		);
+	}
+
+	/** W1.2: note on a reply the rules could not finish (shown under the message). */
+	private async markReply(messageId: string, note: string): Promise<void> {
+		await DatabaseService.updateMessage(messageId, { replyNote: note });
+
+		const idx = conversationsStore.findMessageIndex(messageId);
+
+		if (idx >= 0) conversationsStore.updateMessageAtIndex(idx, { replyNote: note });
+	}
+
+	private async runCompaction(
+		convId: string,
+		owner: CompactionState,
+		abortController: AbortController,
+		fail: (error: string) => CompactionResult,
+		opts: CompactionOptions
+	): Promise<CompactionResult> {
+		const conversation = await DatabaseService.getConversation(convId);
+
+		if (!conversation?.currNode) return fail('the conversation is empty');
+
+		const path = dropTrailingEmptyAssistants(
+			filterByLeafNodeId(
+				await DatabaseService.getConversationMessages(convId),
+				conversation.currNode,
+				false
+			) as DatabaseMessage[]
+		).filter((m) => m.type !== MessageType.ROOT);
+		const model = serverStore.isRouterMode
+			? modelsStore.selectedModelName || getConversationModel(path)
+			: null;
+		const nCtx = this.contextSizeFor(model);
+
+		if (!nCtx) return fail('the context size is unknown (no /props yet)');
+
+		const cfg = resolveContextReserveConfig(settingsStore.config, conversation.contextSettings);
+		const budget = contextBudget({
+			nCtx,
+			summaryPrompt: cfg.summaryPrompt,
+			summaryTokens: cfg.summaryTokens,
+			used: this.usedTokens(path, nCtx, convId)
+		});
+
+		if (!summaryLengthUsable(budget.summaryTokens)) {
+			return fail(
+				`the summary length (${budget.summaryTokens}) is below the ` +
+					`${CONTEXT_RESERVE.MIN_SUMMARY_TOKENS}-token minimum; raise the summary length`
+			);
+		}
+
+		// rule 2: the partial reply (the last message) is not summarised; it is carried over as is
+		const partial = opts.partialMessageId
+			? path.find((m) => m.id === opts.partialMessageId && m === path[path.length - 1])
+			: undefined;
+
+		if (opts.partialMessageId && !partial) return fail('the cut reply is not the last message');
+
+		const plan = planSummaryRequest({
+			cutBeforeLast: !!partial,
+			instructionTokens: budget.instructionTokens,
+			messages: path,
+			nCtx,
+			summaryTokens: budget.summaryTokens
+		});
+
+		if (!plan) return fail('no point of the conversation leaves room for a summary');
+
+		const instruction = buildSummaryInstruction(cfg.summaryPrompt, plan.maxTokens);
+		const instructionMessage = {
+			children: [],
+			content: instruction,
+			convId,
+			id: `compact-instruction-${convId}`,
+			parent: null,
+			role: MessageRole.USER,
+			timestamp: Date.now(),
+			toolCalls: '',
+			type: MessageType.TEXT
+		} as DatabaseMessage;
+		// the request of a real turn (options of this conversation, its frozen tool list), so the
+		// prompt is a pure extension of the cached one
+		const frozenTools = parseToolsSnapshot(conversation.toolsSnapshot);
+		const tools =
+			agenticStore.getConfig(settingsStore.config).enabled && frozenTools && frozenTools.length > 0
+				? frozenTools
+				: undefined;
+
+		let summary = '';
+		let summaryModel: string | null = null;
+		let completion: { finishReason?: string; toolCalls?: string } | null = null;
+
+		await ChatService.sendMessage(
+			[...path.slice(0, plan.keep), instructionMessage],
+			{
+				...this.getApiOptions(conversation),
+				...(model ? { model } : {}),
+				max_tokens: plan.maxTokens,
+				// enforced after the custom JSON
+				maxTokensCeiling: plan.maxTokens,
+				onChunk: (chunk: string) => {
+					summary += chunk;
+				},
+				onComplete: (
+					_c: string,
+					_r?: string,
+					_t?: ChatMessageTimings,
+					toolCalls?: string,
+					finishReason?: string
+				) => {
+					completion = { finishReason, toolCalls };
+				},
+				onError: () => {},
+				onModel: (name: string) => {
+					summaryModel = normalizeModelName(name) || summaryModel;
+				},
+				onTimings: (timings?: ChatMessageTimings) => {
+					if (this.compaction?.id === owner.id && timings?.predicted_n !== undefined) {
+						this.compaction = { ...owner, tokens: timings.predicted_n };
+					}
+				},
+				stream: true,
+				// thinking may take at most a quarter of the summary budget
+				thinkingBudgetCap: Math.floor(plan.maxTokens / 4),
+				tools
+			},
+			undefined,
+			abortController.signal
+		);
+
+		if (abortController.signal.aborted) return { cancelled: true };
+
+		const done = completion as { finishReason?: string; toolCalls?: string } | null;
+		const rejection = summaryRejection({
+			completed: done !== null,
+			finishReason: done?.finishReason,
+			text: summary,
+			toolCalls: done?.toolCalls
+		});
+
+		if (rejection) return fail(rejection);
+
+		const saved = await this.saveCompactedConversation(
+			conversation,
+			partial ? path.slice(0, -1) : path,
+			plan.cut && !partial,
+			{
+				model: summaryModel,
+				nCtx,
+				partial,
+				summary: summary.trim(),
+				summaryPrompt: cfg.summaryPrompt,
+				summaryTokens: cfg.summaryTokens,
+				tailTokens: cfg.tailTokens
+			}
+		);
+		const newConvId = saved.convId;
+
+		await conversationsStore.loadConversations();
+
+		// open the continuation only when the compacted conversation is still the open one; the
+		// user may have moved on meanwhile - then it is only linked (sidebar, context bar). The
+		// continuation is read first and the open conversation switched only after a re-check with
+		// no await in between, so a switch during any await above wins.
+		const stillOpen = () => conversationsStore.activeConversation?.id === convId;
+		const next = stillOpen() ? await DatabaseService.getConversation(newConvId) : undefined;
+		const nextMessages =
+			next && stillOpen()
+				? (filterByLeafNodeId(
+						await DatabaseService.getConversationMessages(newConvId),
+						next.currNode ?? '',
+						false
+					) as DatabaseMessage[])
+				: undefined;
+
+		if (next && nextMessages && stillOpen()) {
+			conversationsStore.activeConversation = next;
+			conversationsStore.activeMessages = nextMessages;
+			await goto(RouterService.chat(newConvId));
+
+			if (!opts.auto) toast.success('Conversation compacted; the previous one is kept');
+		} else {
+			toast.info(`"${conversation.name}" was compacted; it continues in a new conversation.`);
+		}
+
+		return { convId: newConvId, partialId: saved.partialId };
+	}
+
+	/** Rules 2 and 3; `target` follows the reply into the continuation conversation. */
+	private async runReplyRules(
+		target: { convId: string; messageId: string },
+		info: { finish?: string; byReserve: boolean }
+	): Promise<void> {
+		let finish = info.finish;
+		let byReserve = info.byReserve;
+		let n = 0;
+
+		while (finish === 'length' && byReserve) {
+			if (n >= CONTEXT_RESERVE.MAX_CONTINUATIONS) {
+				await this.markReply(
+					target.messageId,
+					'reply truncated: still cut by the context reserve after 2 continuations'
+				);
+
+				return;
+			}
+
+			const compacted = await this.compactConversation(target.convId, {
+				auto: true,
+				partialMessageId: target.messageId
+			});
+
+			if (!('convId' in compacted) || !compacted.partialId) {
+				await this.markReply(
+					target.messageId,
+					`reply truncated: ${'error' in compacted ? `compaction failed (${compacted.error})` : 'compaction cancelled'}`
+				);
+
+				return;
+			}
+
+			target.convId = compacted.convId;
+			target.messageId = compacted.partialId;
+			n++;
+
+			const c = await this.continueReply(target.convId, target.messageId, {});
+
+			if ('error' in c) {
+				await this.markReply(
+					target.messageId,
+					`reply truncated: the continuation failed (${c.error})`
+				);
+
+				return;
+			}
+
+			finish = c.finish;
+			byReserve = c.byReserve;
+		}
+
+		if (finish !== 'stop') return;
+
+		for (let g = 0; ; g++) {
+			const msg = (await DatabaseService.getConversationMessages(target.convId)).find(
+				(m) => m.id === target.messageId
+			);
+
+			if (!msg || (msg.toolCalls && msg.toolCalls !== '[]')) return;
+
+			const why = unfinishedTail(msg.content ?? '');
+
+			if (!why) return;
+
+			if (g >= CONTEXT_RESERVE.MAX_CONTINUATIONS) {
+				await this.markReply(target.messageId, `reply looks unfinished: ${why}`);
+				toast.warning(`The reply looks unfinished (${why}); kept as is.`);
+
+				return;
+			}
+
+			const model = serverStore.isRouterMode ? modelsStore.selectedModelName : null;
+			const id = await imEndTokenId(model);
+			const c = await this.continueReply(target.convId, target.messageId, {
+				logitBias: id === null ? undefined : { [String(id)]: CONTEXT_RESERVE.GUARD_BIAS },
+				maxTokens: CONTEXT_RESERVE.GUARD_MAX_TOKENS
+			});
+
+			if ('error' in c || c.finish !== 'stop') {
+				await this.markReply(target.messageId, `reply looks unfinished: ${why}`);
+
+				return;
+			}
+		}
+	}
+	/** W1: write the compacted conversation; returns its id. */
+	private async saveCompactedConversation(
+		source: DatabaseConversation,
+		path: readonly DatabaseMessage[],
+		cut: boolean,
+		p: {
+			model: string | null;
+			nCtx: number;
+			partial?: DatabaseMessage;
+			summary: string;
+			summaryPrompt: string;
+			summaryTokens: number;
+			tailTokens: number;
+		}
+	): Promise<{ convId: string; partialId?: string }> {
+		const system = path.find(
+			(m) =>
+				m.role === MessageRole.SYSTEM &&
+				m.content.trim() &&
+				m.content.trim() !== SYSTEM_MESSAGE_PLACEHOLDER
+		);
+		const body = path.filter((m) => m.role !== MessageRole.SYSTEM && !m.isSynthetic);
+		// the working directory row the model last saw (the tail carries no synthetic rows)
+		const cwdRow = [...path].reverse().find((m) => m.isSynthetic && m.role === MessageRole.USER);
+		// whole newest messages within the tail setting, at most a quarter of the context and what
+		// the new chat has left after its derived reserve, the summary note, the head rows (and the
+		// partial reply of rule 2) and a minimal reply
+		const headTokens =
+			(system ? estimateMessageTokens(system) : 0) +
+			(cwdRow ? estimateMessageTokens(cwdRow) : 0) +
+			(p.partial ? estimateMessageTokens(p.partial) : 0);
+		const summaryNoteTokens = estimateTextTokens(p.summary) + 64;
+		const newBudget = contextBudget({
+			nCtx: p.nCtx,
+			summaryPrompt: p.summaryPrompt,
+			summaryTokens: p.summaryTokens,
+			used: headTokens + summaryNoteTokens
+		});
+		const tail = selectTailMessages(
+			body,
+			Math.min(
+				p.tailTokens,
+				tailTokenBudget({
+					headTokens,
+					nCtx: p.nCtx,
+					reserve: newBudget.reserve,
+					summaryTokens: summaryNoteTokens
+				})
+			)
+		);
+		const newConv = await DatabaseService.createConversation(
+			compactedConversationName(source.name),
+			{
+				compactedFromConversationId: source.id,
+				// per-chat Context settings (W1.1) carry over to the continuation
+				contextSettings: source.contextSettings,
+				cwd: source.cwd,
+				disabledToolCategories: source.disabledToolCategories,
+				disabledTools: source.disabledTools,
+				reasoningEffort: source.reasoningEffort,
+				thinkingEnabled: source.thinkingEnabled,
+				toolsDeclinedKey: source.toolsDeclinedKey,
+				toolsSnapshot: source.toolsSnapshot
+			}
+		);
+		const rootId = await DatabaseService.createRootMessage(newConv.id);
+
+		let parent = rootId;
+
+		if (system) {
+			parent = (await DatabaseService.createSystemMessage(newConv.id, system.content, rootId)).id;
+		}
+
+		const copy = async (m: Omit<DatabaseMessage, 'id' | 'convId' | 'parent' | 'children'>) => {
+			const created = await DatabaseService.createMessageBranch(
+				{ ...m, children: [], convId: newConv.id, parent } as Omit<DatabaseMessage, 'id'>,
+				parent
+			);
+
+			parent = created.id;
+		};
+
+		if (cwdRow) {
+			await copy({
+				content: cwdRow.content,
+				isSynthetic: true,
+				role: MessageRole.USER,
+				timestamp: Date.now(),
+				toolCalls: '',
+				type: MessageType.TEXT
+			});
+		}
+
+		const header = CONTEXT_RESERVE.SUMMARY_HEADER.replace('{{NAME}}', source.name);
+
+		await copy({
+			content:
+				`${header}${cut ? ' (the end of the last turn did not fit in the summary request)' : ''}` +
+				`\n\n${p.summary}${p.partial ? `\n\n${CONTEXT_RESERVE.PARTIAL_NOTE}` : ''}`,
+			model: p.model ?? undefined,
+			role: MessageRole.ASSISTANT,
+			timestamp: Date.now(),
+			toolCalls: '',
+			type: MessageType.TEXT
+		});
+
+		for (const m of tail) {
+			// measurements belong to the old context: the new one measures itself on its first reply
+			// eslint-disable-next-line @typescript-eslint/no-unused-vars
+			const { children, completionId, convId, id, parent: _p, timings, ...rest } = m;
+
+			await copy({ ...rest, timestamp: Date.now() });
+		}
+
+		// rule 2: the cut reply, to be continued from its exact stop point (no tool calls: a reply
+		// with tool calls cannot be continued)
+		let partialId: string | undefined;
+
+		if (p.partial) {
+			await copy({
+				content: p.partial.content,
+				model: p.partial.model,
+				reasoningContent: p.partial.reasoningContent,
+				role: MessageRole.ASSISTANT,
+				timestamp: Date.now(),
+				toolCalls: '',
+				type: MessageType.TEXT
+			});
+			partialId = parent;
+		}
+
+		await DatabaseService.updateConversation(source.id, {
+			compactedIntoConversationId: newConv.id
+		});
+
+		return { convId: newConv.id, partialId };
 	}
 
 	private async savePartialResponseIfNeeded(convId?: string): Promise<void> {
@@ -1422,6 +2326,57 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			lastMessage.content = partialContent;
 			lastMessage.toolCalls = '';
 			console.error('Failed to save partial response:', error);
+		}
+	}
+
+	/**
+	 * W1: a message queued (typed while the summary ran) belongs to the conversation it was typed
+	 * in: after a successful compaction it goes to the continuation (sent now after a manual
+	 * compaction when that conversation is open; after the triggering reply after an automatic
+	 * one); otherwise it is kept as the input draft of its conversation - never sent into
+	 * whatever conversation happens to be open.
+	 */
+	private settleQueuedAfterCompaction(
+		convId: string,
+		result: CompactionResult,
+		auto: boolean
+	): void {
+		const pending = this.consumePendingMessage(convId);
+
+		if (!pending) return;
+
+		const target = 'convId' in result ? result.convId : convId;
+		const active = conversationsStore.activeConversation?.id;
+
+		if ('convId' in result && active === target) {
+			if (auto) this.pendingMessages.set(target, pending);
+			else void this.deliverQueued(target, pending);
+
+			return;
+		}
+
+		this.keepAsDraft(target, pending.content, pending.extras);
+	}
+
+	/** Tool definitions an agentic request of the conversation sends: its frozen list, else the enabled tools. */
+	private toolsTokensFor(convId?: string): number {
+		try {
+			if (!agenticStore.getConfig(settingsStore.config).enabled) return 0;
+
+			const conv =
+				convId && conversationsStore.activeConversation?.id === convId
+					? conversationsStore.activeConversation
+					: conversationsStore.conversations.find((c) => c.id === convId);
+			const tools =
+				parseToolsSnapshot(conv?.toolsSnapshot) ??
+				toolsStore.getEnabledToolsForLLM(
+					new Set(conversationsStore.preferences.getDisabledTools()),
+					new Set(conversationsStore.preferences.getDisabledToolCategories())
+				);
+
+			return estimateToolsTokens(tools);
+		} catch {
+			return 0;
 		}
 	}
 

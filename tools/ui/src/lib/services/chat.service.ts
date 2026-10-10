@@ -44,6 +44,7 @@ import type {
 import { isAbortError } from '$lib/utils/abort';
 import { ApiError } from '$lib/utils/api-fetch';
 import { getAuthHeaders, getJsonHeaders } from '$lib/utils/api-headers';
+import { applyRequestCeilings } from '$lib/utils/context-reserve';
 import { formatAttachmentText } from '$lib/utils/formatters';
 import { streamIdentity } from '$lib/utils/stream-identity';
 
@@ -485,7 +486,8 @@ export class ChatService {
 			response: string,
 			reasoningContent?: string,
 			timings?: ChatMessageTimings,
-			toolCalls?: string
+			toolCalls?: string,
+			finishReason?: string
 		) => void,
 		onError?: (error: Error) => void,
 		onReasoningChunk?: (chunk: string) => void,
@@ -529,6 +531,7 @@ export class ChatService {
 		let fullReasoningContent = '';
 		let aggregatedToolCalls: ApiChatCompletionToolCall[] = [];
 		let lastTimings: ChatMessageTimings | undefined;
+		let finishReason: string | undefined;
 		let streamFinished = false;
 		let modelEmitted = false;
 		let idEmitted = false;
@@ -682,6 +685,9 @@ export class ChatService {
 								const reasoningContent = choice?.delta?.reasoning_content;
 								const toolCalls = choice?.delta?.tool_calls;
 								const timings = parsed.timings;
+
+								if (choice?.finish_reason) finishReason = choice.finish_reason;
+
 								const promptProgress = parsed.prompt_progress;
 								const chunkModel = ChatService.extractModelName(parsed);
 
@@ -806,7 +812,8 @@ export class ChatService {
 					aggregatedContent,
 					fullReasoningContent || undefined,
 					lastTimings,
-					finalToolCalls
+					finalToolCalls,
+					finishReason
 				);
 			}
 		} catch (error) {
@@ -1067,7 +1074,9 @@ export class ChatService {
 			enableThinking,
 			excludeReasoningFromContext,
 			frequency_penalty,
+			logitBias,
 			max_tokens,
+			maxTokensCeiling,
 			min_p,
 			n_predict,
 			onChunk,
@@ -1089,6 +1098,7 @@ export class ChatService {
 			stream,
 			// Generation parameters
 			temperature,
+			thinkingBudgetCap,
 			timings_per_token,
 			// Tools for function calling
 			tools,
@@ -1152,16 +1162,21 @@ export class ChatService {
 		}
 
 		const requestBody: ApiChatCompletionRequest = {
-			messages: normalizedMessages.map((msg: ApiChatMessageData) => {
+			messages: normalizedMessages.map((msg: ApiChatMessageData, i: number) => {
 				const mapped: ApiChatCompletionRequest['messages'][0] = {
 					content: msg.content,
 					role: msg.role,
 					tool_call_id: msg.tool_call_id,
 					tool_calls: msg.tool_calls
 				};
+				// Include reasoning_content from the dedicated field; the assistant message a continuation
+				// extends (the prefill) keeps it even when reasoning is excluded: it is being continued
+				const isPrefill =
+					!!continueFinalMessage &&
+					i === normalizedMessages.length - 1 &&
+					msg.role === MessageRole.ASSISTANT;
 
-				// Include reasoning_content from the dedicated field
-				if (!excludeReasoningFromContext && msg.reasoning_content) {
+				if ((!excludeReasoningFromContext || isPrefill) && msg.reasoning_content) {
 					mapped.reasoning_content = msg.reasoning_content;
 				}
 
@@ -1205,6 +1220,8 @@ export class ChatService {
 			requestBody.continue_final_message = true;
 			requestBody.add_generation_prompt = false;
 		}
+
+		const continuationMessages = requestBody.messages;
 
 		if (temperature !== undefined) requestBody.temperature = temperature;
 
@@ -1268,6 +1285,32 @@ export class ChatService {
 
 		// after the custom JSON: a pre-encode never generates
 		if (n_predict !== undefined) requestBody.n_predict = n_predict;
+
+		// a continuation's own fields win over the custom JSON: the messages (ending in the prefill)
+		// and the continuation flags, so a join can never concatenate an independent response
+		if (continueFinalMessage) {
+			requestBody.messages = continuationMessages;
+			requestBody.continue_final_message = true;
+			requestBody.add_generation_prompt = false;
+		}
+
+		// W1 ceilings last, so no custom JSON alias lifts them: the output limit (context reserve)
+		// and the thinking budget (sampler-side; the prompt and its cached prefix stay the same)
+		applyRequestCeilings(requestBody as unknown as Record<string, unknown>, {
+			maxTokens: maxTokensCeiling,
+			thinkingBudget: thinkingBudgetCap
+		});
+
+		// W1.2 rule 3: a bias on the end-of-turn token, merged into a custom object-form logit_bias
+		if (logitBias && Object.keys(logitBias).length > 0) {
+			const body = requestBody as unknown as Record<string, unknown>;
+			const prev = body.logit_bias;
+
+			body.logit_bias =
+				prev && typeof prev === 'object' && !Array.isArray(prev)
+					? { ...(prev as Record<string, number>), ...logitBias }
+					: { ...logitBias };
+		}
 
 		try {
 			const headers: Record<string, string> = { ...getJsonHeaders() };

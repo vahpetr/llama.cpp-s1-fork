@@ -11,6 +11,19 @@ export interface McpServerOverride {
 	enabled: boolean;
 }
 
+export interface ConversationContextSettings {
+	autoCompact?: boolean;
+	summaryPrompt?: string;
+	/** W1.2: summary length limit (tokens) */
+	summaryTokens?: number;
+	/** W1.2: tokens of whole recent messages kept verbatim */
+	tailTokens?: number;
+	/** @deprecated W1.1; ignored since W1.2 (the reserve is derived) - a one-time notice */
+	reserve?: number;
+	/** @deprecated W1.1; ignored since W1.2 (the tail is in tokens) - a one-time notice */
+	keepMessages?: number;
+}
+
 export interface DatabaseConversation {
 	currNode: string | null;
 	id: string;
@@ -26,6 +39,15 @@ export interface DatabaseConversation {
 	/** Tool categories disabled for this conversation */
 	disabledToolCategories?: ToolSource[];
 	forkedFromConversationId?: string;
+	/** the conversation this one continues after a context compaction (W1); that one is kept */
+	compactedFromConversationId?: string;
+	/** the conversation this one was compacted into (W1) */
+	compactedIntoConversationId?: string;
+	/**
+	 * Per-conversation overrides of the Context settings (W1.1); a missing field (or a missing
+	 * object, as on older records) uses the global setting. A compacted continuation inherits them.
+	 */
+	contextSettings?: ConversationContextSettings;
 	/** JSON of the tool definitions this conversation sends (its first agentic request's list) */
 	toolsSnapshot?: string;
 	/** a tool change the user chose not to apply (ToolsChange.key) */
@@ -144,6 +166,8 @@ export interface DatabaseMessage {
 	extraVersion?: number;
 	timings?: ChatMessageTimings;
 	model?: string;
+	/** W1.2: a reply the context rules could not finish ("reply truncated: ...", "looks unfinished: ...") */
+	replyNote?: string;
 }
 
 export type ExportedConversation = {

@@ -1,4 +1,5 @@
 import { CLI_FLAGS } from './cli-flags.constants';
+import { CONTEXT_RESERVE } from './context-reserve.constants';
 import { DEFAULT_MCP_CONFIG } from './mcp.constants';
 import { SETTINGS_KEYS } from './settings-keys.constants';
 import { TITLE_GENERATION } from './title-generation.constants';
@@ -7,6 +8,7 @@ import {
 	Code,
 	Database,
 	Funnel,
+	Gauge,
 	ListRestart,
 	Monitor,
 	Moon,
@@ -28,6 +30,7 @@ import type {
 /** Settings sections — slug is the routing identity, title is the display label. */
 export const SETTINGS_SECTIONS = {
 	AGENTIC: { slug: 'agentic', title: 'Agentic' },
+	CONTEXT: { slug: 'context', title: 'Context' },
 	DEVELOPER: { slug: 'developer', title: 'Developer' },
 	DISPLAY: { slug: 'display', title: 'Display' },
 	GENERAL: { slug: 'general', title: 'General' },
@@ -38,6 +41,7 @@ export const SETTINGS_SECTIONS = {
 
 export const SETTINGS_SECTION_SLUGS = {
 	AGENTIC: SETTINGS_SECTIONS.AGENTIC.slug,
+	CONTEXT: SETTINGS_SECTIONS.CONTEXT.slug,
 	DEVELOPER: SETTINGS_SECTIONS.DEVELOPER.slug,
 	DISPLAY: SETTINGS_SECTIONS.DISPLAY.slug,
 	GENERAL: SETTINGS_SECTIONS.GENERAL.slug,
@@ -48,6 +52,7 @@ export const SETTINGS_SECTION_SLUGS = {
 
 export const SETTINGS_SECTION_TITLES = {
 	AGENTIC: SETTINGS_SECTIONS.AGENTIC.title,
+	CONTEXT: SETTINGS_SECTIONS.CONTEXT.title,
 	DEVELOPER: SETTINGS_SECTIONS.DEVELOPER.title,
 	DISPLAY: SETTINGS_SECTIONS.DISPLAY.title,
 	GENERAL: SETTINGS_SECTIONS.GENERAL.title,
@@ -570,6 +575,44 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 		],
 		slug: SETTINGS_SECTION_SLUGS.SAMPLING_PENALTIES,
 		title: SETTINGS_SECTION_TITLES.SAMPLING_PENALTIES
+	},
+	// Context (W1: context reserve + auto-compaction)
+	{
+		icon: Gauge,
+		settings: [
+			{
+				defaultValue: true,
+				help: 'Compact before a message when the free context is below the pre-turn minimum (reserve + 32768 tokens; the reserve = summary length + instruction + 10 % of the context in use, at least 2048). A compaction asks the model for a summary on the conversation as it stands (reusing the server prompt cache where it can - without a usable cache checkpoint the server re-reads the conversation once), then continues in a new chat with the system prompt, the summary and the newest messages; the old chat is kept. Replies are always capped so the reserve stays free; a reply cut by that cap is continued after a compaction. Off: only "Compact now" in the context bar compacts.',
+				key: SETTINGS_KEYS.AUTO_COMPACT,
+				label: 'Auto-compact',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: CONTEXT_RESERVE.DEFAULT_SUMMARY_TOKENS,
+				help: 'Length limit of the summary (tokens; at most 1/8 of the context). Part of the derived reserve.',
+				isPositiveInteger: true,
+				key: SETTINGS_KEYS.COMPACT_SUMMARY_TOKENS,
+				label: 'Summary length (tokens)',
+				type: SettingsFieldType.INPUT
+			},
+			{
+				defaultValue: CONTEXT_RESERVE.DEFAULT_TAIL_TOKENS,
+				help: 'How many tokens of the newest messages the new chat keeps verbatim after the summary (whole messages; never starting with a tool result; at most 1/4 of the context). 0 keeps none.',
+				key: SETTINGS_KEYS.COMPACT_TAIL_TOKENS,
+				label: 'Kept tail (tokens)',
+				min: 0,
+				type: SettingsFieldType.INPUT
+			},
+			{
+				defaultValue: CONTEXT_RESERVE.DEFAULT_SUMMARY_PROMPT,
+				help: 'The instruction appended to the conversation to request the summary. {{MAX_TOKENS}} is replaced by the summary length.',
+				key: SETTINGS_KEYS.COMPACT_SUMMARY_PROMPT,
+				label: 'Summary instruction',
+				type: SettingsFieldType.TEXTAREA
+			}
+		],
+		slug: SETTINGS_SECTION_SLUGS.CONTEXT,
+		title: SETTINGS_SECTION_TITLES.CONTEXT
 	},
 	// Developer
 	{

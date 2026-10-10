@@ -121,6 +121,14 @@ export interface SettingsChatServiceOptions {
 	timings_per_token?: boolean;
 	// Generation length; 0 = prompt processing only (pre-encode)
 	n_predict?: number;
+	// W1 ceilings, applied after the custom JSON: the output limit (all n_predict aliases) and the
+	// thinking budget (thinking_budget_tokens / reasoning_budget_tokens)
+	maxTokensCeiling?: number;
+	thinkingBudgetCap?: number;
+	// W1.2: { "<token id>": bias } added to logit_bias (the unfinished-reply guard)
+	logitBias?: Record<string, number>;
+	// W1.2: the reserve (not the configured limit) set max_tokens - not sent to the server
+	byReserve?: boolean;
 	// Continuation control (vLLM compat), opt in to the explicit continue final message flag
 	continueFinalMessage?: boolean;
 	// Callbacks
@@ -135,7 +143,8 @@ export interface SettingsChatServiceOptions {
 		response: string,
 		reasoningContent?: string,
 		timings?: ChatMessageTimings,
-		toolCalls?: string
+		toolCalls?: string,
+		finishReason?: string
 	) => void;
 	onError?: (error: Error) => void;
 	onConnectionState?: (state: StreamConnectionState) => void;

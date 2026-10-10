@@ -10,7 +10,7 @@
  * the permission/continue/steering gates owned by {@link AgenticGates}.
  */
 
-import { DEFAULT_AGENTIC_CONFIG, NEWLINE } from '$lib/constants';
+import { CONTEXT_RESERVE, DEFAULT_AGENTIC_CONFIG, NEWLINE } from '$lib/constants';
 import {
 	AUDIO_MIME_TO_EXTENSION,
 	DATA_URI_BASE64_REGEX,
@@ -74,13 +74,18 @@ import type {
 	DatabaseMessageExtraImageFile
 } from '$lib/types/database';
 import {
+	cappedThinkingBudget,
+	contextBudget,
+	estimateApiMessageTokens,
 	executeBrowserInfoTool,
 	executeGetDatetimeTool,
 	getAudioInputFormat,
 	isAbortError,
-	parseToolsSnapshot
+	parseToolsSnapshot,
+	timingsTotal
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
+import { toast } from 'svelte-sonner';
 
 function createDefaultSession(): AgenticSession {
 	return {
@@ -145,6 +150,8 @@ function toAgenticMessages(messages: ApiChatMessageData[]): AgenticMessage[] {
 class AgenticStore {
 	// permission, continue and steering gates the loop waits on between turns
 	private gates = new AgenticGates();
+	/** W1.2: how the last turn of a conversation's flow ended (rules 2 / 3 after the flow) */
+	private lastTurns = new Map<string, { finish?: string; byReserve: boolean }>();
 	private sessions = new SvelteMap<string, AgenticSession>();
 
 	get isAnyRunning(): boolean {
@@ -427,6 +434,19 @@ class AgenticStore {
 		}
 	}
 
+	/**
+	 * W1: max_tokens of a later turn of an agentic flow. Undefined = no cap (no context size,
+	 * reserve off, or the configured limit applies), 0 = no room above the reserve.
+	 */
+	/** W1.2: how the last turn of the conversation's last flow ended, consumed once. */
+	takeLastTurn(conversationId: string): { finish?: string; byReserve: boolean } | undefined {
+		const t = this.lastTurns.get(conversationId);
+
+		this.lastTurns.delete(conversationId);
+
+		return t;
+	}
+
 	private buildAttachmentName(mimeType: string, index: number): string {
 		const extension = mimeType.startsWith(MimeTypePrefix.AUDIO)
 			? (AUDIO_MIME_TO_EXTENSION[mimeType] ?? DEFAULT_AUDIO_EXTENSION)
@@ -520,6 +540,40 @@ class AgenticStore {
 				return;
 			}
 
+			// W1: a later turn of the flow must leave the context reserve free as well: capped at
+			// free - reserve (the last turn's measurement + the tool results since); with no room left
+			// the flow ends here and the next message compacts the conversation
+			let turnOptions = options;
+
+			if (capturedTimings) {
+				const cap = this.laterTurnMaxTokens(
+					capturedTimings,
+					sessionMessages,
+					effectiveModel,
+					conversationId
+				);
+
+				if (cap === 0) {
+					toast.info(
+						conversationsStore.getContextConfig(conversationId).autoCompact
+							? 'The context reserve is reached: the agent stopped. Your next message compacts the conversation.'
+							: 'The context reserve is reached: the agent stopped. Use "Compact now" to continue in a new conversation.'
+					);
+					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
+
+					return;
+				}
+
+				if (cap !== undefined) {
+					turnOptions = {
+						...options,
+						max_tokens: cap,
+						maxTokensCeiling: cap,
+						thinkingBudgetCap: cappedThinkingBudget(cap)
+					};
+				}
+			}
+
 			// For turns > 0, create a new assistant message via callback
 			if (turn > 0 && createAssistantMessage) {
 				await createAssistantMessage();
@@ -531,6 +585,7 @@ class AgenticStore {
 			let lastStreamingToolCallName = '';
 			let lastStreamingToolCallArgsLength = 0;
 			let turnTimings: ChatMessageTimings | undefined;
+			let turnFinish: string | undefined;
 
 			const turnStats: ChatMessageAgenticTurnStats = {
 				llm: { predicted_ms: 0, predicted_n: 0, prompt_ms: 0, prompt_n: 0 },
@@ -543,13 +598,20 @@ class AgenticStore {
 				await ChatService.sendMessage(
 					sessionMessages as ApiChatMessageData[],
 					{
-						...options,
+						...turnOptions,
 						onChunk: (chunk: string) => {
 							turnContent += chunk;
 							onChunk?.(chunk);
 						},
-						onComplete: () => {
-							/* Completion handled after sendMessage resolves */
+						onComplete: (
+							_c: string,
+							_r?: string,
+							_t?: ChatMessageTimings,
+							_tc?: string,
+							finish?: string
+						) => {
+							// the rest is handled after sendMessage resolves
+							turnFinish = finish;
 						},
 						onCompletionId,
 						onError: (error: Error) => {
@@ -684,6 +746,17 @@ class AgenticStore {
 
 			// No tool calls = final turn, save and complete
 			if (turnToolCalls.length === 0) {
+				// W1.2: rules 2 / 3 look at how it ended once the flow is done
+				const sent = Number((turnOptions as { max_tokens?: number }).max_tokens);
+				const max = Number(settingsStore.config.max_tokens);
+
+				this.lastTurns.set(conversationId, {
+					byReserve:
+						(turnOptions as { byReserve?: boolean }).byReserve === true ||
+						(turnOptions !== options && sent > 0 && !(max > 0 && sent >= max)),
+					finish: turnFinish
+				});
+
 				agenticTimings.perTurn!.push(turnStats);
 
 				const finalTimings = this.buildFinalTimings(capturedTimings, agenticTimings);
@@ -1063,6 +1136,45 @@ class AgenticStore {
 		});
 
 		return { attachments, cleanedResult: cleanedLines.join(NEWLINE) };
+	}
+
+	private laterTurnMaxTokens(
+		last: ChatMessageTimings,
+		sessionMessages: readonly AgenticMessage[],
+		model: string,
+		conversationId?: string
+	): number | undefined {
+		const cfg = conversationsStore.getContextConfig(conversationId);
+		const nCtx = model ? modelsStore.props.getModelContextSize(model) : null;
+		const max = Number(settingsStore.config.max_tokens);
+		// 0 / -1 / unset = no limit
+		const configured = max > 0 ? max : undefined;
+
+		if (!nCtx) return configured;
+
+		// what the last request measured, plus what was appended after its reply (tool results)
+		let used = timingsTotal(last);
+
+		for (let i = sessionMessages.length - 1; i >= 0; i--) {
+			const m = sessionMessages[i] as ApiChatMessageData;
+
+			if (m.role === MessageRole.ASSISTANT) break;
+
+			used += estimateApiMessageTokens(m);
+		}
+
+		// the derived reserve (W1.2): summary + instruction + slack
+		const { reserve } = contextBudget({
+			nCtx,
+			summaryPrompt: cfg.summaryPrompt,
+			summaryTokens: cfg.summaryTokens,
+			used
+		});
+		const room = nCtx - used - reserve;
+
+		if (room < CONTEXT_RESERVE.MIN_REPLY_TOKENS) return 0;
+
+		return configured ? Math.min(configured, room) : room;
 	}
 
 	private normalizeToolCalls(toolCalls: ApiChatCompletionToolCall[]): AgenticToolCallList {
