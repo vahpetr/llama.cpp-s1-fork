@@ -6,7 +6,7 @@ from upstream PR #27742 and an MTP draft graph. Upstream back-ports are marked a
 
 Status column:
 - **deployed (vNN)**: in my builds from image vNN on (my production line), still in this tree.
-- **v54**: in this tree (HEAD = v54, going to production on 2026-10-10).
+- **v55**: in this tree (HEAD = v55, going to production on 2026-10-10).
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
 - **in tree, off**: compiled in, off unless you set its knob (docs/s1/KNOBS.md).
@@ -198,15 +198,18 @@ records and upstream status live in my private repo; ask if you want one.
 | 0200 | homogeneous QSA routing classes + concurrent admission reserve | deployed (v53) |
 | 0201 | multi-slot review round 3: routing guard, operation-start gate | deployed (v53) |
 | 0202 | per-sequence state portable across the stream count (np1 <-> np2) | deployed (v53) |
-| 0203 | disk cache: count adopt drops | v54 |
-| 0204 | qsa_history_dense proof line at server INFO | v54 |
-| 0205 | expert-occupancy telemetry for mul_mat_id (GGML_VK_EXPERT_OCCUPANCY) | v54, off |
-| 0206 | webui: context-reserve auto-compaction | v54 |
-| 0207 | webui: per-conversation context / compaction settings | v54 |
-| 0208 | webui: compaction hardening (review fixes) | v54 |
-| 0209 | webui: compaction rules shared with my agent harness (mid-turn continue, unfinished-reply guard) | v54 |
-| 0210 | stop type at INFO in the slot release line | v54 |
-| 0211 | disk cache: learned target-only descriptor per adopt source | v54 |
-| 0212 | webui: compaction review fixes (round 1) | v54 |
-| 0213 | webui: compaction review fixes (round 2) | v54 |
-| 0214 | webui: timing chips, tool-call durations, turn line, context-bar speeds | v54 |
+| 0203 | disk cache: count adopt drops | deployed (v54) |
+| 0204 | qsa_history_dense proof line at server INFO | deployed (v54) |
+| 0205 | expert-occupancy telemetry for mul_mat_id (GGML_VK_EXPERT_OCCUPANCY) | deployed (v54), off |
+| 0206 | webui: context-reserve auto-compaction | deployed (v54) |
+| 0207 | webui: per-conversation context / compaction settings | deployed (v54) |
+| 0208 | webui: compaction hardening (review fixes) | deployed (v54) |
+| 0209 | webui: compaction rules shared with my agent harness (mid-turn continue, unfinished-reply guard) | deployed (v54) |
+| 0210 | stop type at INFO in the slot release line | deployed (v54) |
+| 0211 | disk cache: learned target-only descriptor per adopt source | deployed (v54) |
+| 0212 | webui: compaction review fixes (round 1) | deployed (v54) |
+| 0213 | webui: compaction review fixes (round 2) | deployed (v54) |
+| 0214 | webui: timing chips, tool-call durations, turn line, context-bar speeds | deployed (v54) |
+| 0215 | webui: strip the server-echoed prefill when joining a continuation | v55 |
+| 0216 | webui: minimal permanent surface (context meter + popover, /compact, compaction hint, collapsed timing chips) | v55 |
+| 0217 | webui: review fixes (whitespace-normalised echo detection + echoMismatch mark, popover pin per chat, tool chip in the block header) | v55 |
