@@ -84,6 +84,10 @@ checks their sha256; (hands only) re-encodes the BF16 hyper-connection weights a
 `tools/s1/gguf_hc_q8.py`; pulls the image (or builds it with `BUILD=1`); starts the compose file and smoke-tests it.
 `--dry-run` shows every step first. Which weights and why: [docs/s1/WEIGHTS.md](docs/s1/WEIGHTS.md). I redistribute no weights;
 they come from their authors' Hugging Face repos.
+The published images (`vahpetr/llama-cpp-s1-fork:v54`, `:v54k`) are built from my `prod-v11-stage7` revision (v54 =
+`176ddded9`); this `s1-public` branch only adds docs and deploy files on top. My production draft head is a vocabulary-pruned
+variant built from my own traffic, so the public setup uses dzannotti's full-vocabulary head, and the decode numbers above are
+an upper bound for it.
 
 First start on s1: GTT after load ~105 000 MiB (1M) or ~94 500 MiB (524k), flat afterwards; the first long prompt fills at
 ~550 t/s falling to ~190 t/s near 1M.
