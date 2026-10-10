@@ -1,0 +1,192 @@
+# Brain, 1M context, one slot - AMD Ryzen AI Max+ 395 (Strix Halo, Radeon 8060S / gfx1151), 128 GB, Vulkan.
+# This is the profile I run as my main model since 2026-10-10.
+#
+# Model: Qwen3.8-Flash-Next-Uncensored i1-Q4_K_M (mradermacher) + the MTP draft head + the vision projector.
+# Context: 1 048 576 tokens in one slot = static YaRN x4 over the native 262 144 + QSA sparse attention above 64k.
+# Measured (prod v52/v53 numerics, 2026-10-09): GTT 102.7 GiB flat at every depth, decode 35.5 t/s at 1M and 44.7 t/s at 524k,
+# cold fill 0 -> 1M in 1.09 h. Needs the 110 GiB GTT host setting (docs/s1/HOST-TUNING.md); with less GTT use the 524k file.
+#
+#   deploy/s1/setup-brain.sh        # downloads + checks the weights, pulls the image, starts this file, smoke-tests it
+#   or by hand: docker compose -f docker-compose.brain-1m.yml up -d   (MODELS_DIR / SLOTS_DIR / LLAMA_S1_IMAGE override the defaults)
+#
+# Volumes: ./models holds the GGUFs (see deploy/README.md for the download commands), ./slots holds saved slots and the disk
+# prompt cache. Run only ONE server on the GPU at a time: a second model load next to this one runs the box out of memory.
+name: llama-s1-brain-1m
+services:
+  llama:
+    build:
+      context: ../..
+      dockerfile: .devops/vulkan.Dockerfile
+      target: server
+    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v54}   # prebuilt; `docker compose build` builds the same thing from this tree
+    container_name: llama-s1-brain-1m
+    restart: unless-stopped
+    stop_grace_period: 90s            # on SIGTERM the server writes its slot to the disk prompt cache (a few seconds at 1M)
+    entrypoint: /app/llama-server
+    # After start: wait for /health, drop the page-cache copy of the weights the GPU already holds, then pre-read the PLE
+    # table's byte range so the first prompts do not fault it in 4 KiB at a time. skip/count (in MiB) are the PLE range of
+    # THIS exact file (Qwen3.8-Flash-Next-Uncensored.i1-Q4_K_M.gguf); for another GGUF remove the second dd or recompute it.
+    # `$$` is a literal `$` for compose.
+    post_start:
+      - command:
+          - sh
+          - -c
+          - >-
+            i=0; while [ $$i -lt 150 ]; do
+            curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1 && break; i=$$((i+1)); sleep 2; done;
+            M=/models/Qwen3.8-Flash-Next-Uncensored.i1-Q4_K_M.gguf;
+            dd if=$$M iflag=nocache count=0 status=none;
+            dd if=$$M bs=1M skip=511 count=33571 of=/dev/null status=none;
+            echo "post_start: stale weight pages dropped, PLE range warmed"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 300s
+      retries: 3
+    ports: ["8000:8000"]
+    devices: ["/dev/dri:/dev/dri"]
+    group_add: ["44", "992"]          # video, render - check yours: getent group video render
+    environment:
+      # --- Vulkan backend ---
+      - GGML_VK_DISABLE_MMQ_CM1=1       # keep the int8 coopmat1 MMQ path off: it lowered MTP draft acceptance at depth on my box
+      - GGML_VK_FREE_WAIT_IDLE=1        # wait for the queues to go idle before freeing a >= 256 MiB buffer (smooths GTT spikes at a regrow)
+      - GGML_VK_FA_GQA_TOKENS=0         # per-token flash-attention dispatch for the verify batch (the folded variant gave nothing here)
+      - GGML_VK_SUBALLOCATION_BLOCK_SIZE=4294967296   # 4 GiB suballocation blocks: works around the 1 GiB-per-tensor cap on RADV
+      - GGML_ALLOC_GROW_SLACK=10        # grow compute buffers with 10 % slack, fewer reallocations during long fills
+      - LLAMA_RESERVE_RUNTIME_SHAPE=1   # reserve the max of the worst-case and the real run-time graph shape (no regrow mid-fill)
+      # --- KQ mask from metadata (no [n_kv x n_ubatch] mask plane in memory) ---
+      - LLAMA_KQ_VIS=1                  # attention reads cell/token metadata instead of a materialised mask
+      - LLAMA_KQ_VIS_MIN_TOKENS=64      # below 64 tokens per batch the classic mask plane is used (cheaper for decode)
+      # --- QSA: Qwen sparse attention on the 12 full-attention layers ---
+      - LLAMA_QSA_MIN_KV=65536          # below 64k of context the QSA layers run dense attention (outputs unchanged there)
+      - LLAMA_QSA_POOLED_CACHE=1        # keep the indexer's pooled block keys in a persistent store, re-pool only changed blocks
+      - LLAMA_QSA_COMPACT_BIAS=1        # selection bias as compact per-block tables instead of a [n_blocks x n_tokens] plane
+      - LLAMA_QSA_GATHER_Q8=1           # gather selected K/V rows in q8_0 (same bytes as the cache, no conversion)
+      - LLAMA_QSA_GATHER_MAX_WINDOWS=64 # cap on contiguous windows per gather
+      - LLAMA_QSA_CHUNK=128             # split the QSA half of a layer into chunks of <= 128 queries (exact; -0.5 GiB GTT, fill -2.8 %)
+      - LLAMA_QSA_PREFILL=indexed       # prefill: flash attention over the selected ids instead of a masked scan
+      - LLAMA_QSA_VIS=1                 # QSA selection / indexed FA read the metadata too (no mask plane; at 1M it would be 4 GiB)
+      - LLAMA_QSA_CENSUS_INC=1          # incremental block census: re-plan only cells past the last plan (exact)
+      - LLAMA_QSA_INPUTS_INC=1          # incremental QSA graph inputs, device-resident mirrors (exact)
+      - LLAMA_QSA_RELU_INPLACE=1        # in-place ReLU on the score path (exact; -0.25 GiB)
+      - GGML_VK_QSA_SCRATCH_PRESIZE=1   # presize the QSA selection scratch at load
+      - GGML_VK_QSA_SCRATCH_PRESIZE_FA=1 # ... and the indexed-FA staging, so no buffer grows mid-fill
+      - GGML_VK_QSA_FUSED_SELECT=1      # score + block map + mask -> top-k ids in one fused op
+      # --- MTP draft ---
+      - LLAMA_MTP_CATCHUP_ATTN=0        # attention-free draft catch-up on prefill (exact; fill -29.6 % at 524k)
+      - LLAMA_MTP_QSA=1                 # sparse MTP draft: the draft block uses its own indexer (target exact; decode at 524k -18 %)
+      # --- graph + allocation-plan cache ---
+      - LLAMA_GRAPH_CACHE=8             # keep up to 8 built graphs and their allocation plans, reuse on an exact shape match (decode -5.8 %)
+      # --- GTT admission: a prefill chunk waits instead of pushing GTT over the bar (scheduling only, never changes outputs) ---
+      - LLAMA_GTT_ADMISSION_MIB=${LLAMA_GTT_ADMISSION_MIB:-109216}  # bar = GTT size - 3 424 MiB (112 640 - 3 424 here); setup-brain.sh computes it
+      - LLAMA_GTT_SLOPE_B_PER_CELL=256  # expected GTT growth per new KV cell (planeless layout)
+      - LLAMA_GTT_STAGING_B_PER_CELL=0  # no geometric staging step (the presize covers every graph)
+      - LLAMA_GTT_ONCE_MIB=1200         # one-time first-use growth allowed before the slope applies
+      - LLAMA_GTT_SLACK_PCT=0
+      - LLAMA_GTT_ADMISSION_MAX_WAIT_S=300   # after 300 s of waiting the request gets HTTP 503
+      - LLAMA_GTT_USED_PATH=${LLAMA_GTT_USED_PATH:-/sys/class/drm/card1/device/mem_info_gtt_used}   # card index may differ
+    volumes:
+      - ${MODELS_DIR:-./models}:/models:ro
+      - ${SLOTS_DIR:-./slots}:/slots
+    command:
+      - -m
+      - /models/Qwen3.8-Flash-Next-Uncensored.i1-Q4_K_M.gguf
+      - --mmproj
+      - /models/Qwen3.8-Flash-Next-Uncensored.mmproj-f16.gguf   # vision; works together with MTP. Drop both lines for text only (-0.9 GiB)
+      - -ngl
+      - "999"
+      - -ot
+      - per_layer_token_embd=CPU        # the 33 GiB PLE n-gram table stays in host RAM (page cache via mmap), rows fetched per token
+      - --load-mode
+      - mmap
+      - --tensor-read-lazy
+      - auto
+      - -fa
+      - "on"
+      - -b
+      - "2048"
+      - -ub
+      - "2048"
+      - -t
+      - "16"                            # 16 physical cores
+      - -tb
+      - "16"
+      - --fit
+      - "off"                           # never let auto-fit shrink -c
+      - --parallel
+      - "1"                             # one slot: two slots give no extra total throughput on this box (docs/s1/BENCHMARKS.md)
+      - --kv-unified
+      - -c
+      - "1048576"
+      - -ctk
+      - q8_0
+      - -ctv
+      - q8_0
+      - --override-kv
+      - qwen4exp.context_length=int:1048576   # lift the GGUF's 262 144 cap for the target and the draft
+      - --rope-scaling
+      - yarn                            # static YaRN x4 ...
+      - --rope-scale
+      - "4"
+      - --yarn-orig-ctx
+      - "262144"                        # ... over the native 262 144 (explicit, the override would change it)
+      - -lv
+      - "4"                             # verbose enough to print the load proofs (n_ctx, freq_scale, QSA, graph cache)
+      - --qsa-ratio
+      - "4"                             # force QSA ratio 4 on the full-attention layers (this GGUF ships ratio 0 = dense)
+      - --kv-graph-span
+      - "0"                             # 0 = reserve compute buffers for the full KV span at load: memory is flat from the start
+      - --ctx-checkpoints
+      - "4"                             # recurrent-state checkpoints per slot (the model has Gated-DeltaNet layers)
+      - --checkpoint-min-step
+      - "4096"
+      - --cache-ram
+      - "0"                             # no RAM prompt cache: host RAM is needed for the PLE page cache
+      - --slot-save-path
+      - /slots
+      - --cache-disk
+      - /slots/prompt-cache/brain-1m    # disk prompt cache: an evicted conversation is written here and loaded back (~15 KB/token)
+      - --cache-disk-gib
+      - "200"                           # quota; over it the entry with the lowest re-prefill-seconds per GiB goes first
+      - --cache-disk-min-tokens
+      - "4096"                          # shorter prompts re-prefill in seconds, not worth a disk entry
+      - --cache-disk-ttl-days
+      - "14"
+      - --cache-disk-ckpt-ratio
+      - "0.125"                         # deep checkpoints: dense near the end of a conversation, logarithmic in depth
+      - --cache-disk-ckpt-max
+      - "32"                            # per conversation (113 MiB each for this model)
+      - --slot-prompt-similarity
+      - "0.5"
+      - --no-context-shift              # the recurrent layers cannot shift; the client must compact before the window is full
+      - --spec-type
+      - draft-mtp
+      - --model-draft
+      - /models/Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf   # MTP head; see deploy/README.md for which file
+      - --spec-draft-n-max
+      - "5"
+      - --spec-draft-p-min
+      - "0.7"                           # stop drafting when the head is unsure
+      - --reasoning-format
+      - deepseek
+      - --reasoning
+      - "off"                           # thinking off by default; a client can turn it on per request
+      - --temp
+      - "0.7"
+      - --top-p
+      - "0.8"
+      - --top-k
+      - "20"
+      - --min-p
+      - "0"
+      - --presence-penalty
+      - "1.5"
+      - --repeat-penalty
+      - "1.0"
+      - --jinja
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --metrics                       # Prometheus /metrics incl. disk_cache_* counters
