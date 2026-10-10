@@ -66,7 +66,9 @@ import {
 	formatCwdMessage,
 	getConversationModel,
 	isAbortError,
+	joinContinuation,
 	joinWithOverlap,
+	liveContinuation,
 	measureContextUsage,
 	normalizeModelName,
 	parseToolsSnapshot,
@@ -1672,14 +1674,16 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			let done: { finish?: string; timings?: ChatMessageTimings } | null = null;
 
 			const show = () => {
-				this.setChatStreaming(convId, original + appended, messageId);
+				const shown = liveContinuation(original, appended);
+
+				this.setChatStreaming(convId, shown, messageId);
 
 				const idx = conversationsStore.findMessageIndex(messageId);
 
 				if (idx >= 0) {
 					conversationsStore.updateMessageAtIndex(idx, {
-						content: original + appended,
-						reasoningContent: originalReasoning + appendedReasoning || undefined
+						content: shown,
+						reasoningContent: liveContinuation(originalReasoning, appendedReasoning) || undefined
 					});
 				}
 			};
@@ -1729,11 +1733,13 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 			if (!end) return { error: 'the stream ended before completion' };
 
-			// continue_final_message: the server continues exactly after the partial, so the pieces
-			// are joined verbatim (a char-overlap strip would delete legitimately repeated text);
-			// the overlap join stays only as an explicit fallback for servers without prefill
+			// continue_final_message: the server continues exactly after the partial, but it streams
+			// the prefilled message back first (v54 live smoke F4) - an exact echo of the partial at
+			// the start is dropped (reasoning and content separately), then the pieces are joined
+			// verbatim (a char-overlap strip would delete legitimately repeated text); the overlap
+			// join stays only as an explicit fallback for servers without prefill
 			const join = (a: string, b: string) =>
-				CONTEXT_RESERVE.JOIN_OVERLAP_FALLBACK ? joinWithOverlap(a, b).text : a + b;
+				CONTEXT_RESERVE.JOIN_OVERLAP_FALLBACK ? joinWithOverlap(a, b).text : joinContinuation(a, b);
 			const content = join(original, appended);
 			const reasoning = join(originalReasoning, appendedReasoning);
 			const update: Partial<DatabaseMessage> = {

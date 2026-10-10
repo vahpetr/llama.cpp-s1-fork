@@ -42,8 +42,10 @@ import {
 	compactedConversationName,
 	contextBudget,
 	estimateMessageTokens,
+	joinContinuation,
 	joinWithOverlap,
 	legacyContextFields,
+	liveContinuation,
 	measureContextUsage,
 	normalizeContextOverrides,
 	planSummaryRequest,
@@ -1319,5 +1321,114 @@ describe('W1.2 round 2 (astra re-verification)', () => {
 		await chatStore.afterReply('c1', 'a2', { byReserve: true, finish: 'length', toolCalls: false });
 
 		expect(h.pathOf('conv-1').at(-1)!.content).toBe(PART + MORE);
+	}, 60000);
+});
+
+describe('v54 live smoke F4: the server echoes the prefill before the continuation', () => {
+	afterEach(cleanup);
+
+	function echoStream(parts: { reasoning?: string; content?: string }[]): Response {
+		const chunks = parts.map(
+			(p) =>
+				`data: ${JSON.stringify({
+					choices: [
+						{
+							delta: {
+								...(p.reasoning ? { reasoning_content: p.reasoning } : {}),
+								...(p.content ? { content: p.content } : {})
+							}
+						}
+					]
+				})}\n\n`
+		);
+
+		chunks.push(
+			`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], timings: t(5, 600, 9) })}\n\n`
+		);
+		chunks.push('data: [DONE]\n\n');
+
+		return new Response(chunks.join(''), { headers: { 'Content-Type': 'text/event-stream' } });
+	}
+
+	it('joinContinuation drops an exact echo of the partial; no or partial echo = joined as is', () => {
+		expect(joinContinuation('abc', 'abcdef')).toBe('abcdef');
+		expect(joinContinuation('abc', 'def')).toBe('abcdef');
+		expect(joinContinuation('abc', 'ab')).toBe('abcab');
+		expect(joinContinuation('', 'x')).toBe('x');
+		// while the echo streams, the partial alone is shown
+		expect(liveContinuation('abcdef', 'abc')).toBe('abcdef');
+		expect(liveContinuation('abc', 'abcde')).toBe('abcde');
+	});
+
+	it('rule 2: reasoning and content echoed, then new text -> each appears once', async () => {
+		setConfig();
+
+		const THINK = 'I need to list all the steps carefully. ';
+		const PART = 'Step 1 is done. Now the long part continues and';
+		const h = harness(
+			20000,
+			[
+				{ ...msg(MessageRole.SYSTEM, 'be brief'), id: 'sys', parent: 'root' },
+				{ ...msg(MessageRole.USER, 'question one'), id: 'u1', parent: 'sys' },
+				{
+					...msg(MessageRole.ASSISTANT, 'answer one', { timings: t(30, 0, 970) }),
+					id: 'a1',
+					parent: 'u1'
+				},
+				{ ...msg(MessageRole.USER, 'write it all'), id: 'u2', parent: 'a1' },
+				{
+					...msg(MessageRole.ASSISTANT, PART, {
+						reasoningContent: THINK,
+						timings: t(20, 1000, 15000)
+					}),
+					id: 'a2',
+					parent: 'u2'
+				}
+			],
+			{ currNode: 'a2', id: 'c1', lastModified: 0, name: 'L' } as DatabaseConversation,
+			(_b, n) =>
+				n === 1
+					? sse(SUMMARY)
+					: echoStream([
+							{ reasoning: THINK.slice(0, 10) },
+							{ reasoning: THINK.slice(10) },
+							{ content: PART.slice(0, 20) },
+							{ content: PART.slice(20) },
+							{ content: ' finishes.' }
+						])
+		);
+
+		await chatStore.afterReply('c1', 'a2', { byReserve: true, finish: 'length', toolCalls: false });
+
+		const last = h.pathOf('conv-1').at(-1)!;
+
+		expect(last.content).toBe(PART + ' finishes.');
+		expect(last.reasoningContent).toBe(THINK);
+	}, 60000);
+
+	it('rule 3 guard: the echoed reply is not repeated', async () => {
+		setConfig();
+
+		const REPLY = 'Here are the three primary colors:';
+		const h = harness(
+			100000,
+			[
+				{ ...msg(MessageRole.USER, 'colors?'), id: 'u1', parent: 'root' },
+				{
+					...msg(MessageRole.ASSISTANT, REPLY, { timings: t(10, 100, 12) }),
+					id: 'a1',
+					parent: 'u1'
+				}
+			],
+			{ currNode: 'a1', id: 'c1', lastModified: 0, name: 'G' } as DatabaseConversation,
+			(_b, _n, url) =>
+				url.includes('tokenize')
+					? new Response(JSON.stringify({ tokens: [248046] }))
+					: echoStream([{ content: REPLY }, { content: '\n\n1. red\n2. green\n3. blue' }])
+		);
+
+		await chatStore.afterReply('c1', 'a1', { byReserve: true, finish: 'stop', toolCalls: false });
+
+		expect(h.db.get('a1')!.content).toBe(REPLY + '\n\n1. red\n2. green\n3. blue');
 	}, 60000);
 });

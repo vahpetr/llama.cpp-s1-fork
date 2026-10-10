@@ -377,6 +377,8 @@ export {
 	estimateToolsTokens,
 	estimateTextTokens,
 	formatTokenCount,
+	joinContinuation,
+	liveContinuation,
 	joinWithOverlap,
 	legacyContextFields,
 	measureContextUsage,

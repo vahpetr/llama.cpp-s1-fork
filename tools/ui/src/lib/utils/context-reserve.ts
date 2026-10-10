@@ -548,6 +548,25 @@ export function selectTailMessages(
 
 // ── rules 2 / 3: continuing a reply from its exact stop point (as pi's lib/reply-continue.ts) ──
 
+/**
+ * Join a partial reply and its continuation (continue_final_message). llama-server streams the
+ * prefilled assistant text back before the new tokens (v54 live smoke F4): when the continuation
+ * starts with the whole partial, that echo is dropped; otherwise (no or partial echo) the pieces
+ * are joined as they are.
+ */
+export function joinContinuation(partial: string, continuation: string): string {
+	if (partial && continuation.startsWith(partial)) return continuation;
+
+	return partial + continuation;
+}
+
+/** What to show while a continuation streams: an echo still in progress shows the partial only. */
+export function liveContinuation(partial: string, continuation: string): string {
+	if (partial && partial.startsWith(continuation)) return partial;
+
+	return joinContinuation(partial, continuation);
+}
+
 /** Join two pieces of one stream; when `b` starts by repeating >= minOverlap chars of `a`'s end, the repeat is dropped. */
 export function joinWithOverlap(
 	a: string,
