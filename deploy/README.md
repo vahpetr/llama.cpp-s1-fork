@@ -26,6 +26,8 @@ Both are idempotent and resumable (re-run after an interrupted download; finishe
    the profile needs and sets the admission bar to GTT - 3 424 MiB), the Vulkan device on the host and inside the image.
 2. **Download and verify** each file with `hf download <repo> <file> --local-dir models/`, then sha256 against the values
    embedded in the script (as of 2026-10-10; equal to the HF LFS ids). A verified file is not re-hashed unless it changes.
+   - The MTP draft head is dzannotti's full-vocabulary export. My production draft head is a vocabulary-pruned variant built
+     from my own traffic (not published), so the README decode numbers are an upper bound for the public setup.
    - Brain: mradermacher's i1-Q4_K_M comes as three 40 GB parts. The script downloads one part, appends it, deletes it, then the
      next, so the peak is the 119 GB file + one part (~160 GB free needed in total). Plus the vision projector (0.9 GB) and the
      MTP draft head (2.6 GB).
