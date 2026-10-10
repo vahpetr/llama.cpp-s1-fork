@@ -505,6 +505,91 @@ int main() {
         fs::remove_all(base, ec);
     }
 
+    // (R92, sol review) two LEGACY (flat) adopt sources share <root>/ckpt: a dropped deep checkpoint is charged to the
+    //   source whose key its header names, once — not to every source whose ckpt/ directory matches. Sources A
+    //   (descriptor X) and C (descriptor Z) each store one checkpoint; their files are laid out flat in B's root; B
+    //   (descriptor Y) adopts both and reads A's checkpoint, then C's
+    {
+        const fs::path base = fs::temp_directory_path() / ("cache-compat-r92-flat-" + std::to_string(getpid()));
+        const fs::path ra = base / "a", rc = base / "c", rb = base / "b";
+        std::error_code ec;
+        fs::remove_all(base, ec);
+        server_cache_key_parts px = parts(), py = parts(), pz = parts();
+        py.desc_h = "cccccccccccccccc";
+        pz.desc_h = "dddddddddddddddd";
+        const std::string fpa = server_disk_cache_fingerprint_v2(cheap_a, px);
+        const std::string fpb = server_disk_cache_fingerprint_v2(cheap_a, py);
+        const std::string fpc = server_disk_cache_fingerprint_v2(cheap_a, pz);
+        const std::string ka = fpa.substr(0, 16), kc = fpc.substr(0, 16);
+        CHECK(ka != kc && ka != fpb.substr(0, 16) && kc != fpb.substr(0, 16));
+        const auto put_one = [&](const fs::path & root, const std::string & fp, const char * carry, int seed) {
+            server_disk_cache s(root.string(), 1ull << 30, 8, 30, fp, false, 0.5f, 8, 8);
+            s.set_descriptor(nullptr, nullptr, carry);
+            s.init();
+            llama_tokens toks;
+            for (int i = 0; i < 64; i++) {
+                toks.push_back(seed + i);
+            }
+            server_prompt pr;
+            pr.tokens = server_tokens(toks, false);
+            common_prompt_checkpoint c;
+            c.n_tokens = 32;
+            c.pos_min  = 0;
+            c.pos_max  = 31;
+            c.data_tgt.assign(64, (uint8_t) seed);
+            s.deep_put(pr, c, server_deep_ref::DEEP_KIND_ANCHOR);
+            CHECK(pr.deep.size() == 1);
+            return pr.deep.empty() ? std::string() : pr.deep[0].key;
+        };
+        const std::string ck_a = put_one(ra, fpa, "carry-x", 3);
+        const std::string ck_c = put_one(rc, fpc, "carry-z", 5);
+        CHECK(!ck_a.empty() && !ck_c.empty() && ck_a != ck_c);
+        // the flat (legacy) layout: <rb>/<id>.meta of each key + both checkpoints in <rb>/ckpt
+        fs::create_directories(rb / "ckpt", ec);
+        fs::copy_file(ra / ("ns-" + ka) / "ckpt" / (ck_a + ".ck"), rb / "ckpt" / (ck_a + ".ck"), ec);
+        CHECK(!ec);
+        fs::copy_file(rc / ("ns-" + kc) / "ckpt" / (ck_c + ".ck"), rb / "ckpt" / (ck_c + ".ck"), ec);
+        CHECK(!ec);
+        {
+            std::ofstream m(rb / "17081d812d27c40a.meta");
+            m << "{\"fingerprint\":\"" << fpa << "\"}";
+            std::ofstream n(rb / "27081d812d27c40b.meta");
+            n << "{\"fingerprint\":\"" << fpc << "\"}";
+        }
+        server_disk_cache b(rb.string(), 1ull << 30, 8, 30, fpb, false, 0.5f, 8, 8);
+        b.set_descriptor(nullptr, nullptr, "carry-y");
+        b.adopt_keys = { ka, kc };
+        b.init();
+        const auto src = [&](const std::string & k) {
+            const json st = b.status();
+            if (st.contains("adopt")) {
+                for (const auto & a : st["adopt"]) {
+                    if (a.value("key", std::string()) == k) {
+                        return a;
+                    }
+                }
+            }
+            return json();
+        };
+        CHECK(src(ka).value("legacy", false) && src(kc).value("legacy", false));
+        CHECK(b.n_deep_ckpts() == 2);
+        const uint64_t da0 = src(ka).value("dropped", (uint64_t) 0), dc0 = src(kc).value("dropped", (uint64_t) 0);
+        common_prompt_checkpoint out;
+        bool io = false;
+        CHECK(!b.deep_get(ck_a, out, &io) && !io);
+        CHECK(src(ka).value("dropped_ckpts", (uint64_t) 0) == 1 && src(ka).value("dropped", (uint64_t) 0) == da0 + 1);
+        CHECK(src(kc).value("dropped_ckpts", (uint64_t) 99) == 0 && src(kc).value("dropped", (uint64_t) 0) == dc0);
+        CHECK(!b.deep_get(ck_c, out, &io) && !io);
+        CHECK(src(ka).value("dropped_ckpts", (uint64_t) 0) == 1 && src(kc).value("dropped_ckpts", (uint64_t) 0) == 1);
+        CHECK(src(kc).value("dropped", (uint64_t) 0) == dc0 + 1);
+        CHECK(b.n_deep_ckpts() == 0);
+        printf("R92 flat two-source drop: A dropped_ckpts %llu, C dropped_ckpts %llu\n",
+               (unsigned long long) src(ka).value("dropped_ckpts", (uint64_t) 0),
+               (unsigned long long) src(kc).value("dropped_ckpts", (uint64_t) 0));
+        CHECK(fs::exists(rb / "ckpt" / (ck_a + ".ck")) && fs::exists(rb / "ckpt" / (ck_c + ".ck")));
+        fs::remove_all(base, ec);
+    }
+
     if (n_fail) {
         fprintf(stderr, "%d failure(s)\n", n_fail);
         return 1;

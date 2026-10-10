@@ -85,6 +85,8 @@ struct server_deep_ckpt_meta {
     int32_t     hits     = 0;
     std::string src_dir; // [TAG_DISK_ADOPT] the adopt source's ckpt/ (read-only); empty: the own namespace
     uint32_t    src_version = 0; // [TAG_CACHE_COMPAT2] the adopt source's payload format (its fingerprint's v<N>)
+    std::string src_key; // (R92, sol review) the adopt source key written in the checkpoint's header: its owner (two legacy
+                         //   sources share <root>/ckpt, so src_dir does not identify one)
 };
 
 // the structural identity of a disk-cache fingerprint (named, length-delimited fields; shard identity arrays) for
@@ -237,12 +239,11 @@ struct server_disk_cache {
         uint64_t    dropped = 0; // entries whose load failed invalid: no longer eligible (files kept); (R92) plus
                                  //   its deep checkpoints dropped at a read (descriptor mismatch, damage, no restore)
         uint64_t    dropped_ckpts = 0; // (R92) the deep-checkpoint part of `dropped`
-        std::string ck_dir; // (R92) its ckpt/ directory (server_deep_ckpt_meta::src_dir of its checkpoints)
         uint64_t    target_only = 0; // [TAG_ADOPT_TARGET_ONLY] hits that loaded the target stream only
         bool        draft_kv_differs = false; // its draft KV types differ: its entries can only load target-only
     };
     std::vector<adopt_src> adopted;
-    void count_src_ckpt_drop(const std::string & src_dir); // (R92) charge a dropped adopted checkpoint to its source
+    void count_src_ckpt_drop(const server_deep_ckpt_meta & m); // (R92) charge a dropped adopted checkpoint to its owning source
     std::map<std::string, std::string> src_dir_of; // adopt entry id -> its directory
     // [TAG_ADOPT_TARGET_ONLY] adopt source checkpoint directory -> its writer's combined state descriptor, learned from the prompt
     //   checkpoints of an entry whose target stream matched this target (target_only()): its checkpoints and deep

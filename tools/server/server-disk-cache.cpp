@@ -2768,7 +2768,7 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         if (it->second.src_dir.empty()) {
             fs::remove(ckpt_path(key), ec);
         }
-        count_src_ckpt_drop(it->second.src_dir); // (R92) e.g. a state descriptor mismatch of an adopted checkpoint
+        count_src_ckpt_drop(it->second); // (R92) e.g. a state descriptor mismatch of an adopted checkpoint
         ckpts.erase(it);
         refresh_status();
         return false;
@@ -2782,14 +2782,16 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
     return true;
 }
 
-void server_disk_cache::count_src_ckpt_drop(const std::string & src_dir) {
-    if (src_dir.empty()) {
+void server_disk_cache::count_src_ckpt_drop(const server_deep_ckpt_meta & m) {
+    if (m.src_dir.empty()) {
         return; // an own checkpoint
     }
+    // (sol review) the owner only, once: legacy sources share <root>/ckpt, a src_dir match would charge all of them
     for (auto & a : adopted) {
-        if (a.ck_dir == src_dir) {
+        if (a.key == m.src_key) {
             a.dropped++;
             a.dropped_ckpts++;
+            return;
         }
     }
 }
@@ -2804,7 +2806,7 @@ void server_disk_cache::deep_drop(const std::string & key, const char * why) {
         std::error_code ec;
         fs::remove(ckpt_path(key), ec);
     }
-    count_src_ckpt_drop(it->second.src_dir); // (R92)
+    count_src_ckpt_drop(it->second); // (R92)
     ckpts.erase(it);
     n_ckpt_dropped++;
     refresh_status();
@@ -3838,7 +3840,6 @@ void server_disk_cache::open_adopt_sources() {
             ckdir  = fs::path(root) / "ckpt";
             a.legacy = true;
         }
-        a.ck_dir = ckdir.string(); // (R92) as server_deep_ckpt_meta::src_dir below
         // [TAG_DISK_READ_STATUS] (Hermes gate Major 1) both listings first: a source that cannot be listed now is
         //   not opened this run (its files are never written either way)
         std::vector<fs::directory_entry> ls_base, ls_ck;
@@ -3951,6 +3952,7 @@ void server_disk_cache::open_adopt_sources() {
                 m.t_used  = mtime_s(de.path());
                 m.src_dir = ckdir.string();
                 m.src_version = a.version;
+                m.src_key = key; // (R92) its header names this source (fp == key above)
                 ckpts[m.key] = m;
                 n_ck++;
             }
