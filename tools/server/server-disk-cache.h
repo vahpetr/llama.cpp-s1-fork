@@ -245,7 +245,8 @@ struct server_disk_cache {
     std::vector<adopt_src> adopted;
     void count_src_ckpt_drop(const server_deep_ckpt_meta & m); // (R92) charge a dropped adopted checkpoint to its owning source
     std::map<std::string, std::string> src_dir_of; // adopt entry id -> its directory
-    // [TAG_ADOPT_TARGET_ONLY] adopt source checkpoint directory -> its writer's combined state descriptor, learned from the prompt
+    // [TAG_ADOPT_TARGET_ONLY] adopt source key (server_deep_ckpt_meta::src_key; not its directory: legacy sources share
+    //   <root>/ckpt) -> its writer's combined state descriptor, learned from the prompt
     //   checkpoints of an entry whose target stream matched this target (target_only()): its checkpoints and deep
     //   checkpoints carry that descriptor and load target-only
     std::map<std::string, std::string> tgt_compat_dh;

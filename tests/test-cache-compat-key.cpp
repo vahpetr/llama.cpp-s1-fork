@@ -587,6 +587,32 @@ int main() {
                (unsigned long long) src(ka).value("dropped_ckpts", (uint64_t) 0),
                (unsigned long long) src(kc).value("dropped_ckpts", (uint64_t) 0));
         CHECK(fs::exists(rb / "ckpt" / (ck_a + ".ck")) && fs::exists(rb / "ckpt" / (ck_c + ".ck")));
+        // (sol review) the learned target-compatible descriptor ([TAG_ADOPT_TARGET_ONLY] tgt_compat_dh) is per source,
+        //   not per <root>/ckpt: a fresh B learns A's descriptor X from A's checkpoint, then C's Z from C's; keyed by the
+        //   shared directory, C's learn found A's X and C's checkpoint was dropped as a descriptor mismatch. B2 gets its
+        //   own root with the same flat layout (B still holds <rb>/.lock)
+        {
+            const fs::path rb2 = base / "b2";
+            fs::create_directories(rb2 / "ckpt", ec);
+            for (const std::string & f : { "ckpt/" + ck_a + ".ck", "ckpt/" + ck_c + ".ck",
+                                           std::string("17081d812d27c40a.meta"), std::string("27081d812d27c40b.meta") }) {
+                fs::copy_file(rb / f, rb2 / f, ec);
+                CHECK(!ec);
+            }
+            server_disk_cache b2(rb2.string(), 1ull << 30, 8, 30, fpb, false, 0.5f, 8, 8);
+            b2.set_descriptor(nullptr, nullptr, "carry-y");
+            b2.adopt_keys = { ka, kc };
+            b2.init();
+            CHECK(b2.n_deep_ckpts() == 2);
+            CHECK(b2.n_ckpt_target_only == 0);
+            common_prompt_checkpoint oa, oc;
+            bool io2 = false;
+            CHECK(b2.deep_get(ck_a, oa, &io2, true) && !io2 && oa.n_tokens == 32 && oa.data_dft.empty());
+            CHECK(b2.deep_get(ck_c, oc, &io2, true) && !io2 && oc.n_tokens == 32 && oc.data_dft.empty());
+            CHECK(b2.n_ckpt_target_only == 2 && b2.n_deep_ckpts() == 2);
+            printf("R92 flat two-source learn: %llu target-only checkpoint loads, %zu deep checkpoints kept\n",
+                   (unsigned long long) b2.n_ckpt_target_only, b2.n_deep_ckpts());
+        }
         fs::remove_all(base, ec);
     }
 

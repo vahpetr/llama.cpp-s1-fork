@@ -2719,11 +2719,12 @@ bool server_disk_cache::deep_get(const std::string & key, common_prompt_checkpoi
         bool tgt_only = false;
         if (ok && !env_ok && from_src && magic == CKPT_ENV_MAGIC && (env_ver == ENVELOPE_VERSION || (env_ver == 1 && v1_src))) {
             const std::string vdh = "v" + std::to_string(env_ver) + ":" + dh;
-            auto lt = tgt_compat_dh.find(it->second.src_dir);
+            // (sol review) keyed by the owning source, not its directory: legacy sources share <root>/ckpt
+            auto lt = tgt_compat_dh.find(it->second.src_key);
             if (lt == tgt_compat_dh.end() && learn) {
-                lt = tgt_compat_dh.emplace(it->second.src_dir, vdh).first;
-                DSK_INF("adopt source %s: combined descriptor %s is target-compatible (learned from a target-only load)\n",
-                        it->second.src_dir.c_str(), vdh.c_str());
+                lt = tgt_compat_dh.emplace(it->second.src_key, vdh).first;
+                DSK_INF("adopt source %s (%s): combined descriptor %s is target-compatible (learned from a target-only load)\n",
+                        it->second.src_key.c_str(), it->second.src_dir.c_str(), vdh.c_str());
             }
             tgt_only = lt != tgt_compat_dh.end() && lt->second == vdh;
         }
