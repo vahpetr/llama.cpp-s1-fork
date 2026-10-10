@@ -30,7 +30,7 @@ case "$BRAIN_CTX" in
 esac
 export MODELS_DIR="${MODELS_DIR:-$HERE/models}"
 export SLOTS_DIR="${SLOTS_DIR:-$HERE/slots}"
-export LLAMA_S1_IMAGE="${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v55}"
+export LLAMA_S1_IMAGE="${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v56}"
 PORT=8000
 
 # ---- weights, sha256 as published on Hugging Face (LFS oid) and checked against my local files, as of 2026-10-10 ----------

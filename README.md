@@ -14,7 +14,7 @@ Everything here was measured on my two boxes. Numbers, dates and image versions:
 
 Same box, one conversation, one slot for the fork's current column (the fork columns use the i1-Q4_K_M weights):
 
-| | stock llama.cpp (Aug 2026) | this fork, dense (Sep 9) | this fork now (v53-v55) |
+| | stock llama.cpp (Aug 2026) | this fork, dense (Sep 9) | this fork now (v53-v56) |
 |---|---|---|---|
 | decode, empty context | 24-27 t/s | 49.6 t/s (Sep 6) | **61 t/s** |
 | decode at 107k / 213k | - | 41.8 / 29.4 t/s | **51.6 / 59.9 t/s** |
@@ -44,12 +44,14 @@ What does that:
   one. Measured: 72.5k-token branch resumed in 0.6 s (re-prefill: 209 s), identical answer.
 - **webui for long agent sessions.** Context-reserve auto-compaction (summarise and continue before the window is full, continue a
   reply that hit the cap from its exact stop point, a guard against unfinished replies), per-chat context settings, a frozen tool
-  list per conversation (tool changes do not invalidate the cache). The permanent surface is a thin `used / n_ctx` meter that
-  tints and offers "compact?" from 80 % full (setting); its popover (hover, click pins) holds prefill / decode t/s, cache share,
-  MTP %, the chat's compute time, the reserve, links to the previous / next compacted chat, "Compact now" and the settings;
-  `/compact` in the composer. Timing chips collapse to one muted line per reply (details on hover; "Show timing chips" hides
-  them). A continuation drops the prefill the server echoes back (whitespace-normalised match; a diverging echo is joined
-  verbatim and the message marked `echoMismatch`).
+  list per conversation (tool changes do not invalidate the cache). The one context element is upstream's ring by the send
+  button: amber and a "compact?" link from 80 % full (setting), red below the pre-turn minimum, pulsing while it compacts.
+  Hover opens its card, click or Enter pins it: upstream's usage details plus last-request prefill / decode t/s, MTP % with
+  accepted / drafted, cache share, the chat's compute time, the reserve with its breakdown, the compaction state with Cancel,
+  links to the previous / next compacted chat, "Compact now" and the settings; `/compact` in the composer. Timing chips
+  collapse to one muted line per reply (details on hover; "Show timing chips" hides them). A continuation drops the prefill
+  the server echoes back (whitespace-normalised match; a diverging echo is joined verbatim and the message marked
+  `echoMismatch`).
 - **Telemetry.** The stop type of every reply at INFO (`stop=eos|limit|word|cancel`), per-round speculative timings, `kqvis-prof`
   lines, expert-occupancy stats, `disk_cache_*` in `/metrics`, `GET /disk-cache`.
 
@@ -88,8 +90,8 @@ checks their sha256; (hands only) re-encodes the BF16 hyper-connection weights a
 `tools/s1/gguf_hc_q8.py`; pulls the image (or builds it with `BUILD=1`); starts the compose file and smoke-tests it.
 `--dry-run` shows every step first. Which weights and why: [docs/s1/WEIGHTS.md](docs/s1/WEIGHTS.md). I redistribute no weights;
 they come from their authors' Hugging Face repos.
-The published images (`vahpetr/llama-cpp-s1-fork:v55` = `:latest`, `:v55k`) are built from my `prod-v11-stage7` revision
-(v55 = `af7485f3c`; `:v54` / `:v54k` stay as the rollback); this `s1-public` branch only adds docs and deploy files on top.
+The published images (`vahpetr/llama-cpp-s1-fork:v56` = `:latest`, `:v56k`) are built from my `prod-v11-stage7` revision
+(v56 = `25bfffd27`; `:v55` / `:v55k` stay as the rollback); this `s1-public` branch only adds docs and deploy files on top.
 My production draft head is a vocabulary-pruned variant built from my own traffic, so the public setup uses dzannotti's
 full-vocabulary head, and the decode numbers above are an upper bound for it.
 
