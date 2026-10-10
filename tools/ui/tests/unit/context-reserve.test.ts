@@ -738,10 +738,7 @@ describe('W1.2 rule 2: a reply cut by the reserve cap is compacted and continued
 		setConfig();
 
 		const h = harness(N_CTX, rows(), conv, (_b, n) =>
-			n === 1
-				? sse(SUMMARY)
-				: // the continuation repeats the partial's last 30 chars, then goes on
-					sse(PARTIAL.slice(-30) + ' finishes the answer.', { timings: t(5, 600, 9) })
+			n === 1 ? sse(SUMMARY) : sse(' finishes the answer.', { timings: t(5, 600, 9) })
 		);
 
 		await chatStore.afterReply('c1', 'a2', { byReserve: true, finish: 'length', toolCalls: false });
@@ -758,6 +755,7 @@ describe('W1.2 rule 2: a reply cut by the reserve cap is compacted and continued
 		expect(path[1].content).toContain(CONTEXT_RESERVE.PARTIAL_NOTE);
 		expect(path.at(-2)).toMatchObject({ content: 'write it all', role: 'user' });
 		expect(path.at(-1)).toMatchObject({
+			// joined verbatim: the server continued exactly after the partial
 			content: PARTIAL + ' finishes the answer.',
 			role: 'assistant'
 		});
@@ -1253,4 +1251,73 @@ describe('W1.2 fixes (astra verification)', () => {
 		);
 		expect(chatStore.usedTokens(measured, 20000, 'c1')).toBe(10020);
 	});
+});
+
+describe('W1.2 round 2 (astra re-verification)', () => {
+	afterEach(cleanup);
+
+	const N_CTX = 20000;
+	const conv = { currNode: 'a2', id: 'c1', lastModified: 0, name: 'Plan' } as DatabaseConversation;
+
+	function rows(last: string, timings: ReturnType<typeof t>): DatabaseMessage[] {
+		return [
+			{ ...msg(MessageRole.SYSTEM, 'be brief'), id: 'sys', parent: 'root' },
+			{ ...msg(MessageRole.USER, 'question one'), id: 'u1', parent: 'sys' },
+			{
+				...msg(MessageRole.ASSISTANT, 'answer one', { timings: t(30, 0, 970) }),
+				id: 'a1',
+				parent: 'u1'
+			},
+			{ ...msg(MessageRole.USER, 'question two'), id: 'u2', parent: 'a1' },
+			{ ...msg(MessageRole.ASSISTANT, last, { timings }), id: 'a2', parent: 'u2' }
+		];
+	}
+
+	it('#1: a switch to B during the awaited read of the continuation keeps B open (no navigation)', async () => {
+		setConfig();
+
+		const h = harness(N_CTX, rows('answer two', t(20, 1000, 9000)), conv, () => sse(SUMMARY));
+		const read = vi.mocked(DatabaseService.getConversationMessages).getMockImplementation()!;
+
+		vi.mocked(DatabaseService.getConversationMessages).mockImplementation(async (id) => {
+			if (id !== 'c1') {
+				// the user opens B while the continuation is being read
+				conversationsStore.activeConversation = {
+					currNode: null,
+					id: 'b',
+					lastModified: 0,
+					name: 'B'
+				};
+				conversationsStore.activeMessages = [];
+			}
+
+			return read(id);
+		});
+
+		const { goto } = await import('$app/navigation');
+
+		vi.mocked(goto).mockClear();
+
+		expect(await chatStore.compactConversation('c1')).toMatchObject({ convId: 'conv-1' });
+		expect(conversationsStore.activeConversation?.id).toBe('b');
+		expect(goto).not.toHaveBeenCalled();
+		expect(h.convs.get('c1')).toMatchObject({ compactedIntoConversationId: 'conv-1' });
+	});
+
+	it('#2: a continuation is joined verbatim - repeated rows and code survive', async () => {
+		setConfig();
+
+		const PART = '| row | 1 |\n| row | 1 |\n| row | 1 |\nconst a = 1;\nconst a = 1;\n';
+		// the continuation legitimately starts with the same rows / lines again (>= 24 chars)
+		const MORE = '| row | 1 |\n| row | 1 |\nconst a = 1;\nconst a = 1;\nend';
+		const h = harness(N_CTX, rows(PART, t(20, 1000, 15000)), conv, (_b, n) =>
+			n === 1 ? sse(SUMMARY) : sse(MORE, { timings: t(5, 600, 9) })
+		);
+
+		expect(joinWithOverlap(PART, MORE).overlap).toBeGreaterThanOrEqual(24);
+
+		await chatStore.afterReply('c1', 'a2', { byReserve: true, finish: 'length', toolCalls: false });
+
+		expect(h.pathOf('conv-1').at(-1)!.content).toBe(PART + MORE);
+	}, 60000);
 });

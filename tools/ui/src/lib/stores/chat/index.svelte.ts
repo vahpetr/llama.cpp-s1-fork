@@ -1729,8 +1729,13 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 			if (!end) return { error: 'the stream ended before completion' };
 
-			const content = joinWithOverlap(original, appended).text;
-			const reasoning = joinWithOverlap(originalReasoning, appendedReasoning).text;
+			// continue_final_message: the server continues exactly after the partial, so the pieces
+			// are joined verbatim (a char-overlap strip would delete legitimately repeated text);
+			// the overlap join stays only as an explicit fallback for servers without prefill
+			const join = (a: string, b: string) =>
+				CONTEXT_RESERVE.JOIN_OVERLAP_FALLBACK ? joinWithOverlap(a, b).text : a + b;
+			const content = join(original, appended);
+			const reasoning = join(originalReasoning, appendedReasoning);
 			const update: Partial<DatabaseMessage> = {
 				content,
 				reasoningContent: reasoning || undefined,
@@ -1997,9 +2002,23 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		await conversationsStore.loadConversations();
 
 		// open the continuation only when the compacted conversation is still the open one; the
-		// user may have moved on meanwhile - then it is only linked (sidebar, context bar)
-		if (conversationsStore.activeConversation?.id === convId) {
-			await conversationsStore.loadConversation(newConvId);
+		// user may have moved on meanwhile - then it is only linked (sidebar, context bar). The
+		// continuation is read first and the open conversation switched only after a re-check with
+		// no await in between, so a switch during any await above wins.
+		const stillOpen = () => conversationsStore.activeConversation?.id === convId;
+		const next = stillOpen() ? await DatabaseService.getConversation(newConvId) : undefined;
+		const nextMessages =
+			next && stillOpen()
+				? (filterByLeafNodeId(
+						await DatabaseService.getConversationMessages(newConvId),
+						next.currNode ?? '',
+						false
+					) as DatabaseMessage[])
+				: undefined;
+
+		if (next && nextMessages && stillOpen()) {
+			conversationsStore.activeConversation = next;
+			conversationsStore.activeMessages = nextMessages;
 			await goto(RouterService.chat(newConvId));
 
 			if (!opts.auto) toast.success('Conversation compacted; the previous one is kept');

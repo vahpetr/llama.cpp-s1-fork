@@ -17,6 +17,9 @@ export const CONTEXT_RESERVE = {
 	// rule 3: bias on <|im_end|> for an unfinished-reply continuation; max tokens of one
 	GUARD_BIAS: -2.0,
 	GUARD_MAX_TOKENS: 16384,
+	// continuations are joined verbatim (continue_final_message); the 24-char overlap strip is a
+	// fallback for servers without assistant prefill only - off
+	JOIN_OVERLAP_FALLBACK: false,
 	// rules 2 / 3: continuations per turn
 	MAX_CONTINUATIONS: 2,
 	// rough token cost of an image / audio / video attachment
