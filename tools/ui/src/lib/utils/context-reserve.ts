@@ -548,21 +548,70 @@ export function selectTailMessages(
 
 // ── rules 2 / 3: continuing a reply from its exact stop point (as pi's lib/reply-continue.ts) ──
 
+const ECHO_MIN_DIVERGENCE_CHARS = 16;
+const normalizeWs = (t: string): string => t.replace(/\s+/g, ' ');
+
+/** Raw index in `text` after which its whitespace-normalised form has `n` characters. */
+function rawIndexForNormalized(text: string, n: number): number {
+	let count = 0;
+	let prevSpace = false;
+
+	for (let i = 0; i < text.length; i++) {
+		if (count >= n) return i;
+
+		const space = /\s/.test(text[i]);
+
+		if (!(space && prevSpace)) count++;
+
+		prevSpace = space;
+	}
+
+	return text.length;
+}
+
 /**
  * Join a partial reply and its continuation (continue_final_message). llama-server streams the
- * prefilled assistant text back before the new tokens (v54 live smoke F4): when the continuation
- * starts with the whole partial, that echo is dropped; otherwise (no or partial echo) the pieces
- * are joined as they are.
+ * prefilled assistant text back before the new tokens (v54 live smoke F4), possibly with the
+ * template's whitespace normalised. The comparison is on whitespace-normalised text (runs
+ * collapsed, the partial's trailing whitespace trimmed): when the continuation starts with the
+ * whole partial, the raw echo prefix is dropped and the partial's own text kept; when the two
+ * agree for a while and then diverge inside the prefill region, it is NOT treated as an echo -
+ * joined verbatim and reported as `mismatch`; otherwise (no echo) joined as they are.
  */
-export function joinContinuation(partial: string, continuation: string): string {
-	if (partial && continuation.startsWith(partial)) return continuation;
+export function joinContinuationChecked(
+	partial: string,
+	continuation: string
+): { text: string; mismatch: boolean } {
+	const np = normalizeWs(partial).trimEnd();
 
-	return partial + continuation;
+	if (!np) return { mismatch: false, text: partial + continuation };
+
+	const nc = normalizeWs(continuation);
+
+	if (nc.startsWith(np)) {
+		return {
+			mismatch: false,
+			text: partial.trimEnd() + continuation.slice(rawIndexForNormalized(continuation, np.length))
+		};
+	}
+
+	let common = 0;
+
+	while (common < np.length && common < nc.length && np[common] === nc[common]) common++;
+
+	return {
+		mismatch: common >= Math.min(np.length, ECHO_MIN_DIVERGENCE_CHARS),
+		text: partial + continuation
+	};
+}
+
+export function joinContinuation(partial: string, continuation: string): string {
+	return joinContinuationChecked(partial, continuation).text;
 }
 
 /** What to show while a continuation streams: an echo still in progress shows the partial only. */
 export function liveContinuation(partial: string, continuation: string): string {
-	if (partial && partial.startsWith(continuation)) return partial;
+	if (partial && normalizeWs(partial).startsWith(normalizeWs(continuation))) return partial;
 
 	return joinContinuation(partial, continuation);
 }

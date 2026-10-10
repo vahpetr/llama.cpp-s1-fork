@@ -1,6 +1,6 @@
 <script lang="ts">
 	// W2.1: a muted "duration · size" fragment on a tool block's header (a running clock while the
-	// call executes); the error only when it failed
+	// call executes); the header gives it the space the title leaves, it truncates with an ellipsis; the error only when it failed
 	import type { AgenticSection, ChatMessageToolCallTiming } from '$lib/types';
 	import { formatBytes, toolChip, toolFragment } from '$lib/utils';
 	import { onDestroy } from 'svelte';
@@ -48,14 +48,14 @@
 
 {#if fragment || chip.error}
 	<span
-		class="pointer-events-auto flex max-w-[50%] items-center gap-1 truncate text-xs text-muted-foreground/70 tabular-nums"
+		class="block max-w-[24ch] min-w-0 truncate text-xs whitespace-nowrap text-muted-foreground/70 tabular-nums"
 		data-tool-chip
 		{title}
 	>
 		{fragment}
 
 		{#if chip.error}
-			<span class="truncate text-red-500/80">· {chip.error}</span>
+			<span class="text-red-500/80">· {chip.error}</span>
 		{/if}
 	</span>
 {/if}

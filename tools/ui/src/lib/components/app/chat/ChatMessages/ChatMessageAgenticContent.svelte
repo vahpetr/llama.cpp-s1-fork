@@ -1,6 +1,6 @@
 <script lang="ts">
 	import ChatMessageToolCallBlock from './ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlock.svelte';
-	import ChatMessageToolCallChip from './ChatMessage/ChatMessageToolCall/ChatMessageToolCallChip.svelte';
+	import ToolChipScope from './ChatMessage/ChatMessageToolCall/ToolChipScope.svelte';
 	import ChatMessageReasoningBlock from './ChatMessageReasoningBlock.svelte';
 	import {
 		ChatMessageActionCardContinueRequest,
@@ -200,7 +200,14 @@
 			{section}
 		/>
 	{:else if section.type === AgenticSectionType.TOOL_CALL || section.type === AgenticSectionType.TOOL_CALL_PENDING || section.type === AgenticSectionType.TOOL_CALL_STREAMING}
-		<div class="relative">
+		<ToolChipScope
+			executingSince={section.toolCallId !== undefined &&
+			section.toolCallId === currentlyExecutingToolCallId
+				? executingStartedAt
+				: null}
+			record={section.toolCallId ? toolRecords.get(section.toolCallId) : undefined}
+			visible={showTimingChips}
+		>
 			<ChatMessageToolCallBlock
 				attachments={message?.extra}
 				isExecuting={section.toolCallId !== undefined &&
@@ -210,21 +217,7 @@
 				open={isExpanded(index, section)}
 				{section}
 			/>
-
-			{#if showTimingChips}
-				<!-- W2.1: the fragment sits on the block's header row, right side -->
-				<div class="pointer-events-none absolute top-2 right-10 flex h-8 items-center">
-					<ChatMessageToolCallChip
-						executingSince={section.toolCallId !== undefined &&
-						section.toolCallId === currentlyExecutingToolCallId
-							? executingStartedAt
-							: null}
-						record={section.toolCallId ? toolRecords.get(section.toolCallId) : undefined}
-						{section}
-					/>
-				</div>
-			{/if}
-		</div>
+		</ToolChipScope>
 	{/if}
 {/snippet}
 

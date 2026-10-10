@@ -31,6 +31,18 @@
 	let hovered = $state(false);
 	let pinned = $state(false);
 	let open = $derived(hovered || pinned);
+	// the pin belongs to the conversation it was set in: a switch closes the popover
+	let pinnedFor: string | undefined = undefined;
+
+	$effect(() => {
+		const id = conversation?.id;
+
+		if (id !== pinnedFor) {
+			pinnedFor = id;
+			pinned = false;
+			hovered = false;
+		}
+	});
 	let nCtx = $derived(contextStatsStore.contextTotal);
 	// the server's last measurement (+ an estimate of what followed), or the live count while a
 	// request runs

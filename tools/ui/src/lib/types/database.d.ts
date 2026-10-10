@@ -168,6 +168,8 @@ export interface DatabaseMessage {
 	model?: string;
 	/** W1.2: a reply the context rules could not finish ("reply truncated: ...", "looks unfinished: ...") */
 	replyNote?: string;
+	/** the server's echo of a continued prefill diverged from the partial (joined verbatim) */
+	echoMismatch?: boolean;
 }
 
 export type ExportedConversation = {

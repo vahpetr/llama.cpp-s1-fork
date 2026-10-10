@@ -43,6 +43,7 @@ import {
 	contextBudget,
 	estimateMessageTokens,
 	joinContinuation,
+	joinContinuationChecked,
 	joinWithOverlap,
 	legacyContextFields,
 	liveContinuation,
@@ -1430,5 +1431,73 @@ describe('v54 live smoke F4: the server echoes the prefill before the continuati
 		await chatStore.afterReply('c1', 'a1', { byReserve: true, finish: 'stop', toolCalls: false });
 
 		expect(h.db.get('a1')!.content).toBe(REPLY + '\n\n1. red\n2. green\n3. blue');
+	}, 60000);
+});
+
+describe('astra v55: whitespace-normalised echo detection', () => {
+	afterEach(cleanup);
+
+	it('exact echo: dropped', () => {
+		expect(joinContinuationChecked('Hello world', 'Hello world!')).toEqual({
+			mismatch: false,
+			text: 'Hello world!'
+		});
+	});
+
+	it('template whitespace normalisation: still an echo, the partial text kept', () => {
+		expect(joinContinuationChecked('Hello  world', 'Hello world!')).toEqual({
+			mismatch: false,
+			text: 'Hello  world!'
+		});
+		expect(
+			joinContinuationChecked('line one\n\n  line two  ', 'line one\nline two and more')
+		).toEqual({ mismatch: false, text: 'line one\n\n  line two and more' });
+	});
+
+	it('an echo that diverges inside the prefill region: joined verbatim and reported', () => {
+		const partial = 'The quick brown fox jumps over the lazy dog';
+		const r = joinContinuationChecked(partial, 'The quick brown fox leaps over the lazy cat. Then');
+
+		expect(r.mismatch).toBe(true);
+		expect(r.text).toBe(partial + 'The quick brown fox leaps over the lazy cat. Then');
+	});
+
+	it('no echo: joined as is, not reported', () => {
+		expect(joinContinuationChecked('Step 1 done and', ' step 2 follows.')).toEqual({
+			mismatch: false,
+			text: 'Step 1 done and step 2 follows.'
+		});
+		expect(joinContinuationChecked('', 'x')).toEqual({ mismatch: false, text: 'x' });
+	});
+
+	it('a diverging echo marks the continued message (echoMismatch) and joins verbatim', async () => {
+		setConfig();
+
+		const REPLY = 'Here are the three primary colors of light:';
+		const h = harness(
+			100000,
+			[
+				{ ...msg(MessageRole.USER, 'colors?'), id: 'u1', parent: 'root' },
+				{
+					...msg(MessageRole.ASSISTANT, REPLY, { timings: t(10, 100, 12) }),
+					id: 'a1',
+					parent: 'u1'
+				}
+			],
+			{ currNode: 'a1', id: 'c1', lastModified: 0, name: 'G' } as DatabaseConversation,
+			(_b, _n, url) =>
+				url.includes('tokenize')
+					? new Response(JSON.stringify({ tokens: [248046] }))
+					: sse('Here are the three primary colours of paint: red, yellow, blue.')
+		);
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+		await chatStore.afterReply('c1', 'a1', { byReserve: true, finish: 'stop', toolCalls: false });
+
+		expect(h.db.get('a1')!.echoMismatch).toBe(true);
+		expect(h.db.get('a1')!.content).toBe(
+			REPLY + 'Here are the three primary colours of paint: red, yellow, blue.'
+		);
+		expect(warn).toHaveBeenCalled();
 	}, 60000);
 });

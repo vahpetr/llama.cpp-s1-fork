@@ -15,12 +15,15 @@
 		title?: string;
 		titleSnippet?: Snippet;
 		subtitle?: string;
+		/** right side of the header row (shrinks to nothing before it covers the title) */
+		aside?: Snippet;
 		shimmerTitle?: boolean;
 		onToggle?: () => void;
 		children: Snippet;
 	}
 
 	let {
+		aside,
 		children,
 		class: className = '',
 		icon: IconComponent,
@@ -54,7 +57,7 @@
 			'px-3 py-2'
 		)}
 	>
-		<div class="flex min-w-0 items-start gap-2 text-muted-foreground">
+		<div class="flex min-w-0 flex-1 items-start gap-2 text-muted-foreground">
 			{#if iconUrl}
 				<img
 					alt=""
@@ -76,6 +79,12 @@
 
 			{#if subtitle}
 				<span class="text-xs italic text-muted-foreground/70">{subtitle}</span>
+			{/if}
+
+			{#if aside}
+				<span class="ml-auto flex min-w-0 shrink-[999] justify-end overflow-hidden">
+					{@render aside()}
+				</span>
 			{/if}
 		</div>
 

@@ -378,6 +378,7 @@ export {
 	estimateTextTokens,
 	formatTokenCount,
 	joinContinuation,
+	joinContinuationChecked,
 	liveContinuation,
 	joinWithOverlap,
 	legacyContextFields,
