@@ -26,6 +26,13 @@ export function getChatCommands(options: ChatCommandsOptions): ChatFormCommand[]
 			name: 'cwd'
 		},
 		{
+			action: ChatFormCommandAction.COMPACT,
+			description: 'Summarize this conversation and continue in a new one',
+			disabled: !(options.canCompact?.() ?? false),
+			keywords: ['summary', 'context'],
+			name: 'compact'
+		},
+		{
 			action: ChatFormCommandAction.MODEL,
 			description: 'Select model',
 			disabled: !options.showModelSelector,

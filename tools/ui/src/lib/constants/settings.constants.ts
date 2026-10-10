@@ -203,6 +203,13 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				type: SettingsFieldType.CHECKBOX
 			},
 			{
+				defaultValue: true,
+				help: 'One muted timing line per assistant message (total, decode speed, MTP acceptance; details on hover / click) and a duration / size fragment on each tool call.',
+				key: SETTINGS_KEYS.SHOW_TIMING_CHIPS,
+				label: 'Show timing chips',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
 				defaultValue: false,
 				dependsOn: SETTINGS_KEYS.SHOW_MESSAGE_STATS,
 				help: 'Display per-turn statistics (tokens, duration) under each turn in agentic responses. Shown only when "Show message generation statistics" is enabled.',
@@ -601,6 +608,15 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				key: SETTINGS_KEYS.COMPACT_TAIL_TOKENS,
 				label: 'Kept tail (tokens)',
 				min: 0,
+				type: SettingsFieldType.INPUT
+			},
+			{
+				defaultValue: CONTEXT_RESERVE.DEFAULT_COMPACT_HINT_PERCENT,
+				help: 'From this context fill (%) the meter in the context bar tints and offers "compact?". Below it nothing extra is shown.',
+				key: SETTINGS_KEYS.COMPACT_HINT_PERCENT,
+				label: 'Suggest compaction from (% full)',
+				max: 100,
+				min: 1,
 				type: SettingsFieldType.INPUT
 			},
 			{

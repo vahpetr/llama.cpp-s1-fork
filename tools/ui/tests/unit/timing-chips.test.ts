@@ -15,19 +15,26 @@ beforeAll(() => {
 	} as Storage;
 });
 
-import { MessageRole, ToolPermissionDecision, ToolSource } from '$lib/enums';
+import { ChatFormCommandAction, MessageRole, ToolPermissionDecision, ToolSource } from '$lib/enums';
+import { useChatFormPickers } from '$lib/hooks/use-chat-form-pickers.svelte';
 import { ChatService } from '$lib/services/chat.service';
 import { agenticStore } from '$lib/stores/agentic/index.svelte';
 import { mcpStore } from '$lib/stores/mcp/index.svelte';
 import { modelsStore } from '$lib/stores/models/index.svelte';
 import { toolsStore } from '$lib/stores/tools.svelte';
 import type { ChatMessageTimings, DatabaseMessage } from '$lib/types';
+import { getChatCommands } from '$lib/utils/chat-commands';
 import {
+	chipDetails,
+	chipLine,
+	compactHint,
 	cumulativeUsage,
 	formatClock,
+	popoverRows,
 	sessionLine,
 	timingChips,
 	toolChip,
+	toolFragment,
 	toolRecordIndex,
 	turnSummary
 } from '$lib/utils/timing-chips';
@@ -376,5 +383,154 @@ describe('W2 D4 + context-bar line', () => {
 		expect(line.sessionMs).toBe(60000);
 		expect(formatClock(65_000)).toBe('1:05');
 		expect(formatClock(3_725_000)).toBe('1:02:05');
+	});
+});
+
+// ── W2.1: the minimal surface ──────────────────────────────────────────────────────────────────
+
+describe('W2.1 collapsed chips, tool fragment, popover rows, hint, /compact', () => {
+	const plain: ChatMessageTimings = {
+		cache_n: 9000,
+		client: { t_start: 0, ttft_ms: 700, wall_ms: 12300 },
+		draft_n: 100,
+		draft_n_accepted: 81,
+		predicted_ms: 10000,
+		predicted_n: 480,
+		prompt_ms: 500,
+		prompt_n: 1000
+	};
+
+	it('one muted line per message: total · decode t/s · MTP %', () => {
+		expect(chipLine(plain)).toBe('12.3 s · 48 t/s · MTP 81 %');
+		expect(chipLine({ predicted_ms: 1000, predicted_n: 5, prompt_ms: 1, prompt_n: 1 })).toBe(
+			'5.0 t/s'
+		);
+		expect(chipLine(undefined)).toBeNull();
+	});
+
+	it('details: TTFT, prefill + cache share, decode, MTP; the turn line only for agentic turns', () => {
+		const d = chipDetails(plain);
+
+		expect(d[0]).toBe('total 12.3 s · TTFT 700 ms');
+		expect(d[1]).toMatch(/^prefill 1,000 fresh \+ 9,000 cached \(90 %\)/);
+		expect(d.some((l) => l.startsWith('turn '))).toBe(false);
+
+		const agentic = chipDetails({
+			agentic: {
+				llm: { predicted_ms: 3000, predicted_n: 10, prompt_ms: 1000, prompt_n: 10 },
+				t_end: 10000,
+				t_start: 0,
+				toolCallsCount: 2,
+				toolsMs: 5000,
+				turns: 3
+			}
+		});
+
+		expect(agentic.at(-1)).toBe(
+			'turn 10.0 s = model 4.00 s + tools 5.00 s + other 1.00 s · 3 LLM calls · 2 tools'
+		);
+	});
+
+	it('tool fragment "duration · size"; running clock; error kept out of the fragment', () => {
+		expect(
+			toolFragment({ argsBytes: 86, durationMs: 12400, resultBytes: 18200, running: false })
+		).toBe('12.4 s · 18.2 kB');
+		expect(toolFragment({ argsBytes: 1, durationMs: 4100, running: true })).toBe('⏳ 4.10 s');
+		expect(
+			toolFragment({
+				argsBytes: 1,
+				durationMs: 30,
+				error: 'boom',
+				ok: false,
+				resultBytes: 64,
+				running: false
+			})
+		).toBe('30 ms · 64 B');
+	});
+
+	it('the meter hint appears from the threshold only', () => {
+		expect(compactHint(79.9, 80)).toBe(false);
+		expect(compactHint(80, 80)).toBe(true);
+		expect(compactHint(50, 0)).toBe(true);
+		expect(compactHint(99, 120)).toBe(false);
+	});
+
+	it('popover rows: speed, cache share, MTP, compute with the wall sub-line, reserve / threshold', () => {
+		const rows = popoverRows({
+			autoCompact: true,
+			preTurnMin: 94208,
+			reserve: 61440,
+			speed: {
+				cacheShare: 0.997,
+				decodeTps: 41.2,
+				modelMs: 2_232_000,
+				mtp: 0.71,
+				prefillTps: 1852,
+				sessionMs: 8_040_000,
+				toolsMs: 1_120_000
+			}
+		});
+
+		expect(rows.map((r) => r.label)).toEqual([
+			'Last request',
+			'Cache share',
+			'MTP acceptance',
+			'Compute',
+			'Reserve'
+		]);
+		expect(rows[0].value).toBe('prefill 1852 t/s · decode 41 t/s');
+		expect(rows[3]).toEqual({
+			label: 'Compute',
+			sub: 'wall 2h14m since the first message',
+			value: 'model 37:12 · tools 18:40'
+		});
+		expect(rows[4].value).toBe('61,440 tok · compacts below 94,208 free');
+		expect(
+			popoverRows({
+				autoCompact: false,
+				preTurnMin: 1,
+				reserve: 2,
+				speed: { modelMs: 0, toolsMs: 0 }
+			}).at(-1)!.value
+		).toBe('2 tok · auto-compaction off');
+	});
+
+	it('/compact is a slash command, disabled without an open conversation to compact', () => {
+		const opts = { hasCwdTools: () => true, hasPrompts: () => true, showModelSelector: true };
+		const on = getChatCommands({ ...opts, canCompact: () => true }).find(
+			(c) => c.name === 'compact'
+		);
+
+		expect(on).toMatchObject({ action: ChatFormCommandAction.COMPACT, disabled: false });
+		expect(getChatCommands(opts).find((c) => c.name === 'compact')?.disabled).toBe(true);
+	});
+
+	it('/compact dispatch clears the buffer and runs the compaction', () => {
+		let value = '/compact';
+
+		const calls: string[] = [];
+		const pickers = useChatFormPickers({
+			canCompact: () => true,
+			compactNow: () => calls.push('compactNow'),
+			focusInput: () => {},
+			getCaretOffset: () => value.length,
+			getCwd: () => null,
+			getPickersRef: () => undefined,
+			getServerHome: () => null,
+			getShowModelSelector: () => true,
+			getValue: () => value,
+			hasCwdTools: () => true,
+			hasPrompts: () => true,
+			openModelSelector: () => {},
+			setCaretOffset: () => {},
+			setValue: (v) => {
+				value = v;
+			}
+		});
+		const cmd = pickers.availableCommands.find((c) => c.name === 'compact')!;
+
+		pickers.handleCommandSelect(cmd);
+		expect(value).toBe('');
+		expect(calls).toEqual(['compactNow']);
 	});
 });

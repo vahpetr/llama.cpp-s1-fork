@@ -3,6 +3,8 @@ export const CONTEXT_RESERVE = {
 	// ~3 characters per token for prose; tool results (JSON, logs, numbers, non-Latin text)
 	// tokenize denser: 2.5. Every estimate carries a +10 % margin on top.
 	CHARS_PER_TOKEN: 3,
+	// W2.1: the meter suggests "compact?" from this fill (%)
+	DEFAULT_COMPACT_HINT_PERCENT: 80,
 	DEFAULT_SUMMARY_PROMPT:
 		'Stop here and do not continue the task. The context window is nearly full: this conversation ' +
 		'will continue in a fresh context that holds only the system prompt, the summary you write now ' +

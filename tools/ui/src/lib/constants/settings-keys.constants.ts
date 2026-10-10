@@ -13,6 +13,7 @@ export const SETTINGS_KEYS = {
 	AUTO_MIC_ON_EMPTY: 'autoMicOnEmpty',
 	BACKEND_SAMPLING: 'backend_sampling',
 	// Context reserve + compaction (W1)
+	COMPACT_HINT_PERCENT: 'compactHintPercent',
 	COMPACT_SUMMARY_PROMPT: 'compactSummaryPrompt',
 	COMPACT_SUMMARY_TOKENS: 'compactSummaryTokens',
 	COMPACT_TAIL_TOKENS: 'compactTailTokens',
@@ -66,6 +67,7 @@ export const SETTINGS_KEYS = {
 	SHOW_RAW_OUTPUT_SWITCH: 'showRawOutputSwitch',
 	SHOW_SYSTEM_MESSAGE: 'showSystemMessage',
 	SHOW_THOUGHT_IN_PROGRESS: 'showThoughtInProgress',
+	SHOW_TIMING_CHIPS: 'showTimingChips',
 	SYMBOLIC_MATH_ENABLED: 'symbolicMathEnabled',
 	SYSTEM_MESSAGE: 'systemMessage',
 	// Sampling

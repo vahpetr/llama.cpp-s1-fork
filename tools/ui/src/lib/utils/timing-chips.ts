@@ -207,6 +207,8 @@ export function toolChip(p: {
 /** Context-bar line: the last request's prefill / decode speed and MTP %, the chat's compute (model + tools); the wall since the first message for the details. */
 export interface SessionLine {
 	prefillTps?: number;
+	/** cache share of the last request's prompt */
+	cacheShare?: number;
 	decodeTps?: number;
 	mtp?: number;
 	/** compute of this chat: Σ prompt_ms + predicted_ms over all requests */
@@ -230,6 +232,11 @@ export function sessionLine(messages: readonly DatabaseMessage[], now: number): 
 
 		// the last request of the message (its own fields, not the flow totals)
 		out.prefillTps = tps(t.prompt_n ?? 0, t.prompt_ms ?? 0);
+
+		const all = (t.prompt_n ?? 0) + (t.cache_n ?? 0);
+
+		if (all > 0) out.cacheShare = (t.cache_n ?? 0) / all;
+
 		out.decodeTps = tps(t.predicted_n ?? 0, t.predicted_ms ?? 0);
 
 		if ((t.draft_n ?? 0) > 0) out.mtp = (t.draft_n_accepted ?? 0) / (t.draft_n as number);
@@ -343,9 +350,135 @@ export function formatBytes(n: number | undefined): string {
 }
 
 export function formatTps(v: number | undefined): string {
-	return v === undefined ? '–' : `${v >= 100 ? Math.round(v) : v.toFixed(1)} t/s`;
+	return v === undefined ? '–' : `${v >= 10 ? Math.round(v) : v.toFixed(1)} t/s`;
 }
 
 export function formatPct(v: number | undefined): string {
 	return v === undefined ? '–' : `${Math.round(v * 100)} %`;
+}
+
+// ── W2.1: the collapsed surface ────────────────────────────────────────────────────────────────
+
+/** The one muted chip line of a message: "12.3 s · 48 t/s · MTP 81 %" (parts it has). */
+export function chipLine(t: ChatMessageTimings | undefined): string | null {
+	const c = timingChips(t);
+
+	if (!c) return null;
+
+	const parts = [
+		c.totalMs !== undefined ? formatDuration(c.totalMs) : '',
+		c.decode?.tps !== undefined ? formatTps(c.decode.tps) : '',
+		c.mtp !== undefined ? `MTP ${formatPct(c.mtp)}` : ''
+	].filter(Boolean);
+
+	return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+/** The hover / expanded details of a message's chip line, incl. the turn summary. */
+export function chipDetails(t: ChatMessageTimings | undefined): string[] {
+	const c = timingChips(t);
+
+	if (!c) return [];
+
+	const k = (n: number) => n.toLocaleString();
+	const lines: string[] = [];
+
+	if (c.totalMs !== undefined || c.ttftMs !== undefined) {
+		lines.push(`total ${formatDuration(c.totalMs)} · TTFT ${formatDuration(c.ttftMs)}`);
+	}
+
+	if (c.prefill) {
+		lines.push(
+			`prefill ${k(c.prefill.fresh)} fresh + ${k(c.prefill.cached)} cached (${formatPct(c.prefill.cacheShare)}) · ` +
+				`${formatDuration(c.prefill.ms)} · ${formatTps(c.prefill.tps)}`
+		);
+	}
+
+	if (c.decode) {
+		lines.push(
+			`decode ${k(c.decode.n)} tok · ${formatDuration(c.decode.ms)} · ${formatTps(c.decode.tps)}`
+		);
+	}
+
+	if (c.mtp !== undefined) {
+		const llm = llmTotals(t);
+
+		lines.push(
+			`MTP ${formatPct(c.mtp)} (${llm?.draft_n_accepted ?? 0} / ${llm?.draft_n ?? 0} drafted)`
+		);
+	}
+
+	const turn = turnSummary(t);
+
+	if (turn && t?.agentic) {
+		lines.push(
+			`turn ${formatDuration(turn.wallMs)} = model ${formatDuration(turn.modelMs)} + tools ` +
+				`${formatDuration(turn.toolsMs)} + other ${formatDuration(turn.otherMs)} · ` +
+				`${turn.llmCalls} LLM calls · ${turn.toolCalls} tools`
+		);
+	}
+
+	return lines;
+}
+
+/** A tool block header fragment: "12.4 s · 18.2 kB" ("⏳ 4.1 s" while running). */
+export function toolFragment(chip: ToolChip): string {
+	if (chip.running) return `⏳ ${formatDuration(chip.durationMs)}`;
+
+	return [
+		chip.durationMs !== undefined ? formatDuration(chip.durationMs) : '',
+		chip.resultBytes !== undefined ? formatBytes(chip.resultBytes) : ''
+	]
+		.filter(Boolean)
+		.join(' · ');
+}
+
+/** The meter's "compact?" hint: from the fill threshold (%), else nothing. */
+export function compactHint(usedPct: number, thresholdPct: number): boolean {
+	return usedPct >= Math.min(100, Math.max(1, thresholdPct));
+}
+
+/** The context-bar popover rows (speed, cache, MTP, compute with the wall as a sub-line, reserve). */
+export function popoverRows(p: {
+	speed: SessionLine;
+	reserve?: number;
+	preTurnMin?: number;
+	autoCompact: boolean;
+}): { label: string; value: string; sub?: string }[] {
+	const rows: { label: string; value: string; sub?: string }[] = [];
+	const s = p.speed;
+
+	if (s.prefillTps !== undefined || s.decodeTps !== undefined) {
+		rows.push({
+			label: 'Last request',
+			value: `prefill ${formatTps(s.prefillTps)} · decode ${formatTps(s.decodeTps)}`
+		});
+	}
+
+	if (s.cacheShare !== undefined)
+		rows.push({ label: 'Cache share', value: formatPct(s.cacheShare) });
+
+	if (s.mtp !== undefined) rows.push({ label: 'MTP acceptance', value: formatPct(s.mtp) });
+
+	rows.push({
+		label: 'Compute',
+		sub:
+			s.sessionMs !== undefined
+				? `wall ${formatDuration(s.sessionMs)} since the first message`
+				: undefined,
+		value: `model ${formatClock(s.modelMs)} · tools ${formatClock(s.toolsMs)}`
+	});
+
+	if (p.reserve !== undefined && p.preTurnMin !== undefined) {
+		rows.push({
+			label: 'Reserve',
+			value:
+				`${p.reserve.toLocaleString()} tok · ` +
+				(p.autoCompact
+					? `compacts below ${p.preTurnMin.toLocaleString()} free`
+					: 'auto-compaction off')
+		});
+	}
+
+	return rows;
 }

@@ -397,6 +397,9 @@ export {
 	timingsTotal
 } from './context-reserve';
 export {
+	chipDetails,
+	chipLine,
+	compactHint,
 	cumulativeUsage,
 	formatBytes,
 	formatClock,
@@ -404,12 +407,14 @@ export {
 	formatPct,
 	formatTps,
 	llmTotals,
+	popoverRows,
 	type SessionLine,
 	sessionLine,
 	type TimingChips,
 	timingChips,
 	type ToolChip,
 	toolChip,
+	toolFragment,
 	toolRecordIndex,
 	type TurnSummary,
 	turnSummary,

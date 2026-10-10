@@ -244,6 +244,8 @@ export interface ChatCommandsOptions {
 	hasPrompts: () => boolean;
 	/** Gates `/cwd`. */
 	hasCwdTools: () => boolean;
+	/** Gates `/compact` (an open conversation that is not busy). */
+	canCompact?: () => boolean;
 }
 
 /** Protocol-level verbs accepted by the realtime inference control endpoint. Mirrors `CONTROL_ACTION`. */
