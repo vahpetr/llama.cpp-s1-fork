@@ -9,9 +9,11 @@
 	// Components supply only their `meta`, a title snippet, and a body
 	// snippet - everything around them is this single source of truth.
 
+	import ChatMessageToolCallChip from './ChatMessageToolCallChip.svelte';
 	import { Loader2, Wrench } from '@lucide/svelte';
 	import { CollapsibleContentBlock } from '$lib/components/app';
 	import { ICON_CLASS_DEFAULT, ICON_CLASS_SPIN } from '$lib/constants';
+	import { getToolChipContext } from '$lib/contexts/tool-chip.context';
 	import { AgenticSectionType } from '$lib/enums';
 	import { mcpStore } from '$lib/stores';
 	import type { AgenticSection, ToolUiEntry } from '$lib/types';
@@ -111,9 +113,19 @@
 	}
 
 	const subtitle = $derived(subtitleFor(meta?.errorMessage));
+	// W2.1: the "duration · size" fragment on the header (set by the agentic content)
+	const chipCtx = getToolChipContext();
+	const chip = $derived(chipCtx?.());
 </script>
 
+{#snippet chipAside()}
+	{#if chip}
+		<ChatMessageToolCallChip executingSince={chip.executingSince} record={chip.record} {section} />
+	{/if}
+{/snippet}
+
 <Wrapper
+	aside={chip?.visible ? chipAside : undefined}
 	class="my-2"
 	icon={toolIcon}
 	iconClass={toolIconClass}

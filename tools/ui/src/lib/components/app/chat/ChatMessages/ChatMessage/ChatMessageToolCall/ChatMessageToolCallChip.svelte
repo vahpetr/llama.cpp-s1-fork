@@ -1,8 +1,8 @@
 <script lang="ts">
-	// W2: a tool call's chip - duration (running clock while it executes), args / result size,
-	// status / error
+	// W2.1: a muted "duration · size" fragment on a tool block's header (a running clock while the
+	// call executes); the header gives it the space the title leaves, it truncates with an ellipsis; the error only when it failed
 	import type { AgenticSection, ChatMessageToolCallTiming } from '$lib/types';
-	import { formatBytes, formatDuration, toolChip } from '$lib/utils';
+	import { formatBytes, toolChip, toolFragment } from '$lib/utils';
 	import { onDestroy } from 'svelte';
 
 	interface Props {
@@ -38,27 +38,24 @@
 			result: section.toolResult
 		})
 	);
+	let fragment = $derived(toolFragment(chip));
+	let title = $derived(
+		`args ${formatBytes(chip.argsBytes)}` +
+			(chip.resultBytes !== undefined ? ` · result ${formatBytes(chip.resultBytes)}` : '') +
+			(chip.error ? ` · ${chip.error}` : '')
+	);
 </script>
 
-<div
-	class="-mt-1 mb-1 flex flex-wrap gap-x-2 pl-1 text-xs text-muted-foreground tabular-nums"
-	data-tool-chip
->
-	{#if chip.running}
-		<span>⏳ {formatDuration(chip.durationMs)}</span>
-	{:else if chip.ok === false}
-		<span class="text-red-500">✗ {formatDuration(chip.durationMs)}</span>
-	{:else if chip.durationMs !== undefined}
-		<span>✓ {formatDuration(chip.durationMs)}</span>
-	{/if}
+{#if fragment || chip.error}
+	<span
+		class="block max-w-[24ch] min-w-0 truncate text-xs whitespace-nowrap text-muted-foreground/70 tabular-nums"
+		data-tool-chip
+		{title}
+	>
+		{fragment}
 
-	<span>· args {formatBytes(chip.argsBytes)}</span>
-
-	{#if chip.resultBytes !== undefined}
-		<span>· result {formatBytes(chip.resultBytes)}</span>
-	{/if}
-
-	{#if chip.error}
-		<span class="max-w-full truncate text-red-500" title={chip.error}>· {chip.error}</span>
-	{/if}
-</div>
+		{#if chip.error}
+			<span class="text-red-500/80">· {chip.error}</span>
+		{/if}
+	</span>
+{/if}

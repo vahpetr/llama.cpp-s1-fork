@@ -80,6 +80,8 @@ export enum PdfViewMode {
 }
 
 export enum ChatFormCommandAction {
+	/** W2.1: summarize the conversation and continue in a new one */
+	COMPACT = 'compact',
 	CWD = 'cwd',
 	MODEL = 'model',
 	PROMPT = 'prompt'

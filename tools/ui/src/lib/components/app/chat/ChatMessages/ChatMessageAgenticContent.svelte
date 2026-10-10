@@ -1,6 +1,6 @@
 <script lang="ts">
 	import ChatMessageToolCallBlock from './ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlock.svelte';
-	import ChatMessageToolCallChip from './ChatMessage/ChatMessageToolCall/ChatMessageToolCallChip.svelte';
+	import ToolChipScope from './ChatMessage/ChatMessageToolCall/ToolChipScope.svelte';
 	import ChatMessageReasoningBlock from './ChatMessageReasoningBlock.svelte';
 	import {
 		ChatMessageActionCardContinueRequest,
@@ -39,6 +39,7 @@
 		Boolean(settingsStore.config.alwaysShowToolCallContent)
 	);
 	const showMessageStats = $derived(Boolean(settingsStore.config.showMessageStats));
+	const showTimingChips = $derived(settingsStore.config.showTimingChips !== false);
 	const showAgenticTurnStats = $derived(
 		showMessageStats && Boolean(settingsStore.config.showAgenticTurnStats)
 	);
@@ -199,24 +200,24 @@
 			{section}
 		/>
 	{:else if section.type === AgenticSectionType.TOOL_CALL || section.type === AgenticSectionType.TOOL_CALL_PENDING || section.type === AgenticSectionType.TOOL_CALL_STREAMING}
-		<ChatMessageToolCallBlock
-			attachments={message?.extra}
-			isExecuting={section.toolCallId !== undefined &&
-				section.toolCallId === currentlyExecutingToolCallId}
-			{isStreaming}
-			onToggle={() => toggleExpanded(index, section)}
-			open={isExpanded(index, section)}
-			{section}
-		/>
-
-		<ChatMessageToolCallChip
+		<ToolChipScope
 			executingSince={section.toolCallId !== undefined &&
 			section.toolCallId === currentlyExecutingToolCallId
 				? executingStartedAt
 				: null}
 			record={section.toolCallId ? toolRecords.get(section.toolCallId) : undefined}
-			{section}
-		/>
+			visible={showTimingChips}
+		>
+			<ChatMessageToolCallBlock
+				attachments={message?.extra}
+				isExecuting={section.toolCallId !== undefined &&
+					section.toolCallId === currentlyExecutingToolCallId}
+				{isStreaming}
+				onToggle={() => toggleExpanded(index, section)}
+				open={isExpanded(index, section)}
+				{section}
+			/>
+		</ToolChipScope>
 	{/if}
 {/snippet}
 

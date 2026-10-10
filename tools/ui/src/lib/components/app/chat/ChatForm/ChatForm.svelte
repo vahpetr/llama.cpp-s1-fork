@@ -144,6 +144,22 @@
 	);
 
 	const pickers = useChatFormPickers({
+		// W2.1: `/compact` - the open conversation, when it has a user turn and nothing runs
+		canCompact: () => {
+			const conv = conversationsStore.activeConversation;
+
+			return (
+				!!conv &&
+				!chatStore.isLoading &&
+				chatStore.compaction === null &&
+				conversationsStore.activeMessages.some((m) => m.role === 'user' && !m.isSynthetic)
+			);
+		},
+		compactNow: () => {
+			const conv = conversationsStore.activeConversation;
+
+			if (conv) void chatStore.compactConversation(conv.id);
+		},
 		focusInput: refocusInput,
 		getCaretOffset: () => inputRef?.getCaretOffset(),
 		getCwd: () => cwd,

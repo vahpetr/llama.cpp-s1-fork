@@ -184,7 +184,7 @@
 		</div>
 	{/if}
 
-	{#if message.timings && !(chatStore.isLoading && isLastAssistantMessage)}
+	{#if currentConfig.showTimingChips !== false && message.timings && !(chatStore.isLoading && isLastAssistantMessage)}
 		<ChatMessageTimingChips {message} />
 	{/if}
 
