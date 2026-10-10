@@ -581,31 +581,31 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 		icon: Gauge,
 		settings: [
 			{
-				defaultValue: CONTEXT_RESERVE.DEFAULT_RESERVE_TOKENS,
-				help: 'Tokens kept free at the end of the context for a summary. Replies are capped so they do not use them (thinking gets at most half of a capped reply); when fewer are free, the conversation is compacted before the next message (a summary request that reuses the server prompt cache where it can - without a usable cache checkpoint the server re-reads the conversation once - then a new chat with the system prompt, the summary and the last messages; the old chat is kept). 0 turns the reserve and auto-compaction off.',
-				key: SETTINGS_KEYS.CONTEXT_RESERVE_TOKENS,
-				label: 'Context reserve (tokens)',
-				min: 0,
-				type: SettingsFieldType.INPUT
-			},
-			{
 				defaultValue: true,
-				help: 'Compact automatically before the next message when the free context is below the reserve. Off: only the "Compact now" button in the context bar compacts (replies still leave the reserve free).',
+				help: 'Compact before a message when the free context is below the pre-turn minimum (reserve + 32768 tokens; the reserve = summary length + instruction + 10 % of the context in use, at least 2048). A compaction asks the model for a summary on the conversation as it stands (reusing the server prompt cache where it can - without a usable cache checkpoint the server re-reads the conversation once), then continues in a new chat with the system prompt, the summary and the newest messages; the old chat is kept. Replies are always capped so the reserve stays free; a reply cut by that cap is continued after a compaction. Off: only "Compact now" in the context bar compacts.',
 				key: SETTINGS_KEYS.AUTO_COMPACT,
 				label: 'Auto-compact',
 				type: SettingsFieldType.CHECKBOX
 			},
 			{
-				defaultValue: CONTEXT_RESERVE.DEFAULT_KEEP_MESSAGES,
-				help: 'How many of the last messages the new chat keeps verbatim after the summary (a tool result always keeps its call; a long tail is shortened from the front to a quarter of the context).',
-				key: SETTINGS_KEYS.COMPACT_KEEP_MESSAGES,
-				label: 'Messages kept after compaction',
+				defaultValue: CONTEXT_RESERVE.DEFAULT_SUMMARY_TOKENS,
+				help: 'Length limit of the summary (tokens; at most 1/8 of the context). Part of the derived reserve.',
+				isPositiveInteger: true,
+				key: SETTINGS_KEYS.COMPACT_SUMMARY_TOKENS,
+				label: 'Summary length (tokens)',
+				type: SettingsFieldType.INPUT
+			},
+			{
+				defaultValue: CONTEXT_RESERVE.DEFAULT_TAIL_TOKENS,
+				help: 'How many tokens of the newest messages the new chat keeps verbatim after the summary (whole messages; never starting with a tool result; at most 1/4 of the context). 0 keeps none.',
+				key: SETTINGS_KEYS.COMPACT_TAIL_TOKENS,
+				label: 'Kept tail (tokens)',
 				min: 0,
 				type: SettingsFieldType.INPUT
 			},
 			{
 				defaultValue: CONTEXT_RESERVE.DEFAULT_SUMMARY_PROMPT,
-				help: 'The instruction appended to the conversation to request the summary. {{MAX_TOKENS}} is replaced by the summary length limit.',
+				help: 'The instruction appended to the conversation to request the summary. {{MAX_TOKENS}} is replaced by the summary length.',
 				key: SETTINGS_KEYS.COMPACT_SUMMARY_PROMPT,
 				label: 'Summary instruction',
 				type: SettingsFieldType.TEXTAREA

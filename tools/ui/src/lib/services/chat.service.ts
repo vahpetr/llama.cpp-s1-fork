@@ -1074,6 +1074,7 @@ export class ChatService {
 			enableThinking,
 			excludeReasoningFromContext,
 			frequency_penalty,
+			logitBias,
 			max_tokens,
 			maxTokensCeiling,
 			min_p,
@@ -1284,6 +1285,17 @@ export class ChatService {
 			maxTokens: maxTokensCeiling,
 			thinkingBudget: thinkingBudgetCap
 		});
+
+		// W1.2 rule 3: a bias on the end-of-turn token, merged into a custom object-form logit_bias
+		if (logitBias && Object.keys(logitBias).length > 0) {
+			const body = requestBody as unknown as Record<string, unknown>;
+			const prev = body.logit_bias;
+
+			body.logit_bias =
+				prev && typeof prev === 'object' && !Array.isArray(prev)
+					? { ...(prev as Record<string, number>), ...logitBias }
+					: { ...logitBias };
+		}
 
 		try {
 			const headers: Record<string, string> = { ...getJsonHeaders() };

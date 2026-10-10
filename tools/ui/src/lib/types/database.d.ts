@@ -12,10 +12,16 @@ export interface McpServerOverride {
 }
 
 export interface ConversationContextSettings {
-	reserve?: number;
 	autoCompact?: boolean;
-	keepMessages?: number;
 	summaryPrompt?: string;
+	/** W1.2: summary length limit (tokens) */
+	summaryTokens?: number;
+	/** W1.2: tokens of whole recent messages kept verbatim */
+	tailTokens?: number;
+	/** @deprecated W1.1; ignored since W1.2 (the reserve is derived) - a one-time notice */
+	reserve?: number;
+	/** @deprecated W1.1; ignored since W1.2 (the tail is in tokens) - a one-time notice */
+	keepMessages?: number;
 }
 
 export interface DatabaseConversation {
@@ -160,6 +166,8 @@ export interface DatabaseMessage {
 	extraVersion?: number;
 	timings?: ChatMessageTimings;
 	model?: string;
+	/** W1.2: a reply the context rules could not finish ("reply truncated: ...", "looks unfinished: ...") */
+	replyNote?: string;
 }
 
 export type ExportedConversation = {

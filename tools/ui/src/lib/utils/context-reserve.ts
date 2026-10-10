@@ -1,10 +1,12 @@
 /**
- * Context reserve + auto-compaction (W1): pure arithmetic over a conversation path.
+ * Context reserve + auto-compaction (W1, W1.2 = the pi brain rules): pure arithmetic over a
+ * conversation path.
  *
  * The context in use is the server's own count where one exists (the last reply's
  * prompt_n + cache_n + predicted_n), plus a character estimate for what came after it.
- * A fixed token RESERVE stays free for the summary request: normal replies are capped at
- * free - reserve, and a turn that would not leave the reserve free compacts first.
+ * The RESERVE is derived (contextBudget): normal replies are capped at free - reserve, a user turn
+ * with less than reserve + 32768 free compacts first, a reply cut by that cap is continued after
+ * a compaction, and a reply that stopped with an obviously unfinished tail gets one more go.
  */
 
 import { CONTEXT_RESERVE } from '$lib/constants';
@@ -17,10 +19,12 @@ import type {
 } from '$lib/types';
 
 export interface ContextReserveConfig {
-	reserve: number;
 	autoCompact: boolean;
-	keepMessages: number;
 	summaryPrompt: string;
+	/** summary length limit (tokens) */
+	summaryTokens: number;
+	/** tokens of whole recent messages the continuation keeps verbatim */
+	tailTokens: number;
 }
 
 export interface ContextUsage {
@@ -43,32 +47,48 @@ export interface SummaryPlan {
 	cut: boolean;
 }
 
+/** W1.2: the budget derived from the context length and the compaction prompt (as in pi). */
+export interface ContextBudget {
+	/** summary length actually used (the setting, at most n_ctx / 8) */
+	summaryTokens: number;
+	/** the instruction message with {{MAX_TOKENS}} filled in */
+	instructionTokens: number;
+	/** estimate slack: 10 % of the context in use, at least 2048 (n_ctx / 16 on small contexts) */
+	slackTokens: number;
+	/** kept free after every reply: summary + instruction + slack */
+	reserve: number;
+	/** a user turn starts only with at least this much free: reserve + 32768 (n_ctx / 4 if smaller) */
+	preTurnMin: number;
+}
+
 function num(value: unknown, fallback: number): number {
 	const n = Number(value);
 
 	return Number.isFinite(n) && value !== '' && value !== null && value !== undefined ? n : fallback;
 }
 
+const positiveInt = (v: unknown): number | undefined =>
+	typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.floor(v) : undefined;
+
 export function readContextReserveConfig(config: Record<string, unknown>): ContextReserveConfig {
 	const prompt = typeof config.compactSummaryPrompt === 'string' ? config.compactSummaryPrompt : '';
+	const summary = Math.floor(
+		num(config.compactSummaryTokens, CONTEXT_RESERVE.DEFAULT_SUMMARY_TOKENS)
+	);
+	const tail = Math.floor(num(config.compactTailTokens, CONTEXT_RESERVE.DEFAULT_TAIL_TOKENS));
 
 	return {
 		autoCompact: config.autoCompact !== false,
-		keepMessages: Math.max(
-			0,
-			Math.floor(num(config.compactKeepMessages, CONTEXT_RESERVE.DEFAULT_KEEP_MESSAGES))
-		),
-		reserve: Math.max(
-			0,
-			Math.floor(num(config.contextReserveTokens, CONTEXT_RESERVE.DEFAULT_RESERVE_TOKENS))
-		),
-		summaryPrompt: prompt.trim() ? prompt : CONTEXT_RESERVE.DEFAULT_SUMMARY_PROMPT
+		summaryPrompt: prompt.trim() ? prompt : CONTEXT_RESERVE.DEFAULT_SUMMARY_PROMPT,
+		summaryTokens: summary > 0 ? summary : CONTEXT_RESERVE.DEFAULT_SUMMARY_TOKENS,
+		tailTokens: tail >= 0 ? tail : CONTEXT_RESERVE.DEFAULT_TAIL_TOKENS
 	};
 }
 
 /**
  * The Context settings that apply to a conversation: its own override per field (W1.1), else the
- * global setting. Invalid override values (negative, non-finite, blank prompt) fall back too.
+ * global setting. Invalid override values (non-positive, non-finite, blank prompt) fall back too;
+ * the W1/W1.1 fields `reserve` / `keepMessages` are no longer read (see legacyContextFields).
  */
 export function resolveContextReserveConfig(
 	config: Record<string, unknown>,
@@ -76,21 +96,43 @@ export function resolveContextReserveConfig(
 ): ContextReserveConfig {
 	const global = readContextReserveConfig(config);
 	const o = overrides ?? {};
-	const int = (v: unknown): number | undefined =>
-		typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : undefined;
+	const tail =
+		typeof o.tailTokens === 'number' && Number.isFinite(o.tailTokens) && o.tailTokens >= 0
+			? Math.floor(o.tailTokens)
+			: undefined;
 
 	return {
 		autoCompact: typeof o.autoCompact === 'boolean' ? o.autoCompact : global.autoCompact,
-		keepMessages: int(o.keepMessages) ?? global.keepMessages,
-		reserve: int(o.reserve) ?? global.reserve,
 		summaryPrompt:
 			typeof o.summaryPrompt === 'string' && o.summaryPrompt.trim()
 				? o.summaryPrompt
-				: global.summaryPrompt
+				: global.summaryPrompt,
+		summaryTokens: positiveInt(o.summaryTokens) ?? global.summaryTokens,
+		tailTokens: tail ?? global.tailTokens
 	};
 }
 
-/** Overrides without the fields that are unset (undefined = no override at all). */
+/**
+ * Settings of W1/W1.1 that W1.2 no longer reads (the user-facing reserve and "messages kept"),
+ * in the global config or a chat's overrides; they are ignored with a one-time notice.
+ */
+export function legacyContextFields(
+	config: Record<string, unknown>,
+	overrides?: ConversationContextSettings | null
+): string[] {
+	const out: string[] = [];
+	const o = (overrides ?? {}) as Record<string, unknown>;
+
+	if (config.contextReserveTokens !== undefined || o.reserve !== undefined) out.push('reserve');
+
+	if (config.compactKeepMessages !== undefined || o.keepMessages !== undefined) {
+		out.push('messages kept');
+	}
+
+	return out;
+}
+
+/** Overrides without the fields that are unset (undefined = no override at all); legacy fields dropped. */
 export function normalizeContextOverrides(
 	o: ConversationContextSettings | null | undefined
 ): ConversationContextSettings | undefined {
@@ -100,15 +142,60 @@ export function normalizeContextOverrides(
 
 	if (typeof o.autoCompact === 'boolean') out.autoCompact = o.autoCompact;
 
-	if (typeof o.keepMessages === 'number' && o.keepMessages >= 0) out.keepMessages = o.keepMessages;
+	if (positiveInt(o.summaryTokens) !== undefined) out.summaryTokens = positiveInt(o.summaryTokens);
 
-	if (typeof o.reserve === 'number' && o.reserve >= 0) out.reserve = o.reserve;
+	if (typeof o.tailTokens === 'number' && Number.isFinite(o.tailTokens) && o.tailTokens >= 0) {
+		out.tailTokens = Math.floor(o.tailTokens);
+	}
 
 	if (typeof o.summaryPrompt === 'string' && o.summaryPrompt.trim()) {
 		out.summaryPrompt = o.summaryPrompt;
 	}
 
 	return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * W1.2 (the pi brain rules): reserve = summary + instruction + slack (10 % of used, min 2048);
+ * reply cap = min(configured, n_ctx - used - reserve); a user turn needs reserve + 32768 free
+ * (pre-turn minimum), else it compacts first. On small contexts the summary is at most n_ctx/8,
+ * the slack floor n_ctx/16 and the pre-turn reply room n_ctx/4.
+ */
+export function contextBudget(p: {
+	nCtx: number;
+	used: number;
+	summaryTokens: number;
+	summaryPrompt: string;
+}): ContextBudget {
+	const summaryTokens = Math.max(1, Math.min(p.summaryTokens, Math.floor(p.nCtx / 8)));
+	const instructionTokens =
+		estimateTextTokens(buildSummaryInstruction(p.summaryPrompt, summaryTokens)) +
+		CONTEXT_RESERVE.MESSAGE_OVERHEAD_TOKENS * 2;
+	const slackTokens = Math.max(
+		Math.min(CONTEXT_RESERVE.SLACK_MIN_TOKENS, Math.floor(p.nCtx / 16)),
+		Math.ceil(Math.max(0, p.used) * CONTEXT_RESERVE.SLACK_SHARE)
+	);
+	const reserve = summaryTokens + instructionTokens + slackTokens;
+
+	return {
+		instructionTokens,
+		preTurnMin: reserve + Math.min(CONTEXT_RESERVE.PRE_TURN_REPLY_TOKENS, Math.floor(p.nCtx / 4)),
+		reserve,
+		slackTokens,
+		summaryTokens
+	};
+}
+
+/** Rule 1: a user turn of `pending` new tokens would start with less than the pre-turn minimum free. */
+export function shouldCompactBeforeTurn(p: {
+	nCtx: number | null;
+	used: number;
+	pending?: number;
+	preTurnMin: number;
+}): boolean {
+	if (!p.nCtx || p.used <= 0) return false;
+
+	return p.nCtx - p.used - (p.pending ?? 0) < p.preTurnMin;
 }
 
 export function estimateTextTokens(
@@ -244,9 +331,9 @@ export function cappedThinkingBudget(cap: number | undefined): number | undefine
 	return cap < 2 * CONTEXT_RESERVE.MIN_ANSWER_TOKENS ? 0 : Math.floor(cap / 2);
 }
 
-/** reserve - instruction must hold a minimal summary; else the reserve is too small to compact. */
-export function reserveHoldsSummary(reserve: number, instructionTokens: number): boolean {
-	return reserve - instructionTokens >= CONTEXT_RESERVE.MIN_SUMMARY_TOKENS;
+/** The summary length must allow a minimal summary. */
+export function summaryLengthUsable(summaryTokens: number): boolean {
+	return summaryTokens >= CONTEXT_RESERVE.MIN_SUMMARY_TOKENS;
 }
 
 /**
@@ -305,7 +392,7 @@ export function summaryRejection(r: {
 	if (r.toolCalls && r.toolCalls !== '[]') return 'the model answered with a tool call';
 
 	if (r.finishReason === 'length') {
-		return 'the summary hit its length limit (raise the context reserve)';
+		return 'the summary hit its length limit (raise the summary length)';
 	}
 
 	if (r.finishReason !== 'stop') return `the summary did not finish (${r.finishReason ?? 'none'})`;
@@ -333,18 +420,6 @@ export function tailTokenBudget(p: {
 			p.nCtx - p.reserve - p.summaryTokens - p.headTokens - CONTEXT_RESERVE.MIN_REPLY_TOKENS
 		)
 	);
-}
-
-/** A turn of `pending` new tokens would leave less than the reserve (+ a minimal reply) free. */
-export function shouldCompact(p: {
-	nCtx: number | null;
-	used: number;
-	reserve: number;
-	pending?: number;
-}): boolean {
-	if (!p.nCtx || p.reserve <= 0 || p.used <= 0) return false;
-
-	return p.nCtx - p.used - (p.pending ?? 0) < p.reserve + CONTEXT_RESERVE.MIN_REPLY_TOKENS;
 }
 
 /** Trailing assistant rows with nothing in them (a failed or cancelled request) are not sent. */
@@ -378,23 +453,27 @@ export function dropTrailingEmptyAssistants(
  * a point whose token count the server measured (that reply's prompt_n + cache_n), so the
  * server can rewind to a checkpoint. Reuse is best effort: with no usable checkpoint at or
  * before that point the server re-reads the prefix (the summary request's timings show it).
- * Null also when reserve - instruction cannot hold a minimal summary.
+ * Null also when the summary length is below the minimum.
  */
 export function planSummaryRequest(p: {
 	messages: readonly DatabaseMessage[];
 	nCtx: number;
-	reserve: number;
+	summaryTokens: number;
 	instructionTokens: number;
+	/** rule 2: the last reply is a partial continued later - never part of the summary request */
+	cutBeforeLast?: boolean;
 }): SummaryPlan | null {
 	const { instructionTokens, messages, nCtx } = p;
-	const desired = p.reserve - instructionTokens;
+	const desired = p.summaryTokens;
 
 	if (desired < CONTEXT_RESERVE.MIN_SUMMARY_TOKENS) return null;
 
 	const usage = measureContextUsage(messages, nCtx);
 	const candidates: { keep: number; tokens: number; cut: boolean }[] = [];
 
-	if (!usage.full) candidates.push({ cut: false, keep: messages.length, tokens: usage.used });
+	if (!usage.full && !p.cutBeforeLast) {
+		candidates.push({ cut: false, keep: messages.length, tokens: usage.used });
+	}
 
 	// cut points: before an assistant reply, at its measured prompt size. A count that is not
 	// below a later one is not a prefix measurement (an agentic flow stamps its last turn's
@@ -433,37 +512,77 @@ export function planSummaryRequest(p: {
 }
 
 /**
- * The last `keep` messages of the conversation body (system / cwd rows excluded) for the new
- * chat. Never starts with a tool result (its call goes along), and stays within `budget`
- * estimated tokens by dropping from the front.
+ * W1.2: the newest whole messages of the conversation body (system / cwd rows excluded) whose
+ * estimated tokens fit `budget`, for the new chat. Never starts with a tool result (its call is
+ * not there any more), so leading tool results are dropped.
  */
 export function selectTailMessages(
 	body: readonly DatabaseMessage[],
-	keep: number,
 	budget: number
 ): DatabaseMessage[] {
-	if (keep <= 0 || body.length === 0) return [];
+	let start = body.length;
+	let total = 0;
 
-	let start = Math.max(0, body.length - keep);
+	while (start > 0) {
+		const cost = estimateMessageTokens(body[start - 1]);
 
-	while (start > 0 && body[start].role === MessageRole.TOOL) start--;
+		if (total + cost > budget) break;
 
-	const cost = body.map(estimateMessageTokens);
-
-	let total = cost.slice(start).reduce((a, b) => a + b, 0);
-
-	const advance = () => {
-		total -= cost[start];
-		start++;
-	};
-
-	while (start < body.length && total > budget) {
-		advance();
-
-		while (start < body.length && body[start].role === MessageRole.TOOL) advance();
+		total += cost;
+		start--;
 	}
 
+	while (start < body.length && body[start].role === MessageRole.TOOL) start++;
+
 	return body.slice(start);
+}
+
+// ── rules 2 / 3: continuing a reply from its exact stop point (as pi's lib/reply-continue.ts) ──
+
+/** Join two pieces of one stream; when `b` starts by repeating >= minOverlap chars of `a`'s end, the repeat is dropped. */
+export function joinWithOverlap(
+	a: string,
+	b: string,
+	minOverlap = 24,
+	maxScan = 4000
+): { text: string; overlap: number } {
+	const lim = Math.min(a.length, b.length, maxScan);
+
+	for (let k = lim; k >= minOverlap; k--) {
+		if (a.endsWith(b.slice(0, k))) return { overlap: k, text: a + b.slice(k) };
+	}
+
+	return { overlap: 0, text: a + b };
+}
+
+/**
+ * Rule 3: why a reply that stopped on end-of-turn looks unfinished, or null. An odd number of ```
+ * fence lines always counts; a tail ending in ':' / '—' / '–', an open table row or an empty list
+ * item counts only when the visible reply is SHORT (< 60 tokens at 4 chars/token) - a long answer
+ * ending in a colon is a legitimate prose ending.
+ */
+export function unfinishedTail(text: string): string | null {
+	const fences = (text.match(/^[ \t]*```/gm) ?? []).length;
+
+	if (fences % 2 === 1) return 'unclosed code fence';
+
+	const t = text.trimEnd();
+
+	if (!t) return null;
+
+	if (Math.ceil(t.length / 4) >= CONTEXT_RESERVE.UNFINISHED_SHORT_TOKENS) return null;
+
+	const last = t.slice(t.lastIndexOf('\n') + 1);
+
+	if (/[:：]$/.test(t)) return "short reply ending in ':'";
+
+	if (/[—–]$/.test(t)) return 'short reply ending in a dash';
+
+	if (/^\s*\|/.test(last) && !/\|\s*$/.test(last)) return 'short reply ending in an open table row';
+
+	if (/^\s*(?:[-*+]|\d+[.)])\s*$/.test(last)) return 'short reply ending in an empty list item';
+
+	return null;
 }
 
 export function buildSummaryInstruction(template: string, maxTokens: number): string {

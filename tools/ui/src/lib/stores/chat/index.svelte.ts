@@ -26,6 +26,7 @@ import {
 } from '$lib/enums';
 import { ChatService } from '$lib/services/chat.service';
 import { DatabaseService } from '$lib/services/database.service';
+import { imEndTokenId } from '$lib/services/im-end-token';
 import { RouterService } from '$lib/services/router.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { agenticStore } from '$lib/stores/agentic/index.svelte';
@@ -50,10 +51,12 @@ import type {
 	DatabaseMessageExtra,
 	ErrorDialogState
 } from '$lib/types';
+import type { ContextBudget, ContextReserveConfig } from '$lib/utils';
 import {
 	buildSummaryInstruction,
 	cappedThinkingBudget,
 	compactedConversationName,
+	contextBudget,
 	dropTrailingEmptyAssistants,
 	estimateMessageTokens,
 	estimateTextTokens,
@@ -62,18 +65,19 @@ import {
 	formatCwdMessage,
 	getConversationModel,
 	isAbortError,
+	joinWithOverlap,
 	measureContextUsage,
 	normalizeModelName,
 	parseToolsSnapshot,
 	planSummaryRequest,
 	replyTokenCap,
-	reserveHoldsSummary,
 	resolveContextReserveConfig,
 	selectTailMessages,
-	shouldCompact,
+	shouldCompactBeforeTurn,
+	summaryLengthUsable,
 	summaryRejection,
-	tailTokenBudget
-} from '$lib/utils';
+	tailTokenBudget,
+	unfinishedTail} from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
 import { toast } from 'svelte-sonner';
 
@@ -86,7 +90,16 @@ export interface CompactionState {
 	tokens: number;
 }
 
-export type CompactionResult = { convId: string } | { cancelled: true } | { error: string };
+export type CompactionResult =
+	| { convId: string; partialId?: string }
+	| { cancelled: true }
+	| { error: string };
+
+export interface CompactionOptions {
+	auto?: boolean;
+	/** rule 2: the last message is a reply cut by the reserve cap, carried into the new chat */
+	partialMessageId?: string;
+}
 
 class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	chatReasoningStates = new SvelteMap<string, boolean>();
@@ -272,13 +285,108 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			console.error('Failed to add system prompt:', error);
 		}
 	}
+	/**
+	 * W1.2 rules 2 and 3 on a finished reply of the open conversation (as pi's compaction.ts and
+	 * reply-guard.ts). Rule 2: a reply that ended with `length` because the reserve cap set its
+	 * max_tokens is a PARTIAL - the history is compacted, the new chat carries the partial as its
+	 * last message, and the server continues it from the exact stop point (joined with an overlap
+	 * check); <= 2 such continuations, else the message is marked truncated. Rule 3: a reply that
+	 * stopped (`stop`, no tool calls) with an obviously unfinished tail gets <= 2 continuations
+	 * with a -2.0 bias on <|im_end|>; still unfinished = marked. Never on tool-call replies.
+	 */
+	async afterReply(
+		convId: string,
+		messageId: string,
+		info: { finish?: string; byReserve: boolean; toolCalls: boolean }
+	): Promise<void> {
+		if (info.toolCalls || conversationsStore.activeConversation?.id !== convId) return;
+
+		let target = { convId, messageId };
+		let finish = info.finish;
+		let byReserve = info.byReserve;
+		let n = 0;
+
+		while (finish === 'length' && byReserve) {
+			if (n >= CONTEXT_RESERVE.MAX_CONTINUATIONS) {
+				await this.markReply(
+					target.messageId,
+					'reply truncated: still cut by the context reserve after 2 continuations'
+				);
+
+				return;
+			}
+
+			const compacted = await this.compactConversation(target.convId, {
+				auto: true,
+				partialMessageId: target.messageId
+			});
+
+			if (!('convId' in compacted) || !compacted.partialId) {
+				await this.markReply(
+					target.messageId,
+					`reply truncated: ${'error' in compacted ? `compaction failed (${compacted.error})` : 'compaction cancelled'}`
+				);
+
+				return;
+			}
+
+			target = { convId: compacted.convId, messageId: compacted.partialId };
+			n++;
+
+			const c = await this.continueReply(target.convId, target.messageId, {});
+
+			if ('error' in c) {
+				await this.markReply(
+					target.messageId,
+					`reply truncated: the continuation failed (${c.error})`
+				);
+
+				return;
+			}
+
+			finish = c.finish;
+			byReserve = c.byReserve;
+		}
+
+		if (finish !== 'stop') return;
+
+		for (let g = 0; ; g++) {
+			const msg = conversationsStore.activeMessages.find((m) => m.id === target.messageId);
+
+			if (!msg || (msg.toolCalls && msg.toolCalls !== '[]')) return;
+
+			const why = unfinishedTail(msg.content ?? '');
+
+			if (!why) return;
+
+			if (g >= CONTEXT_RESERVE.MAX_CONTINUATIONS) {
+				await this.markReply(target.messageId, `reply looks unfinished: ${why}`);
+				toast.warning(`The reply looks unfinished (${why}); kept as is.`);
+
+				return;
+			}
+
+			const model = serverStore.isRouterMode ? modelsStore.selectedModelName : null;
+			const id = await imEndTokenId(model);
+			const c = await this.continueReply(target.convId, target.messageId, {
+				logitBias: id === null ? undefined : { [String(id)]: CONTEXT_RESERVE.GUARD_BIAS },
+				maxTokens: CONTEXT_RESERVE.GUARD_MAX_TOKENS
+			});
+
+			if ('error' in c || c.finish !== 'stop') {
+				await this.markReply(target.messageId, `reply looks unfinished: ${why}`);
+
+				return;
+			}
+		}
+	}
+
 	cancelPreEncode(): void {
 		if (this.preEncodeAbortController) {
 			this.preEncodeAbortController.abort();
 			this.preEncodeAbortController = null;
 		}
 	}
-
 	/**
 	 * Resets the loading, streaming and processing state for a conversation
 	 * after a generation ends or errors. Shared by the flows' exit paths.
@@ -301,6 +409,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		if (convId === conversationsStore.activeConversation?.id) this.currentResponse = '';
 	}
+
 	clearEditMode(): void {
 		this.isEditModeActive = false;
 		this.addFilesHandler = null;
@@ -330,7 +439,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	 */
 	async compactConversation(
 		convId: string,
-		opts: { auto?: boolean } = {}
+		opts: CompactionOptions = {}
 	): Promise<CompactionResult> {
 		// ownership is claimed before the first await: no second compaction, send or agentic flow
 		// can start on this conversation in between, and cleanup releases only what this call owns
@@ -403,6 +512,40 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		// single-model mode: the server's own /props
 		return nCtx ?? (serverStore.isRouterMode ? null : serverStore.contextSize);
+	}
+
+	/**
+	 * W1.2: the derived budget of a conversation path (n_ctx, used, the resolved settings, reserve
+	 * and pre-turn minimum); null when the context size is unknown.
+	 */
+	contextState(
+		messages: readonly DatabaseMessage[],
+		model?: string | null,
+		convId?: string
+	): {
+		nCtx: number;
+		used: number;
+		cfg: ContextReserveConfig;
+		budget: ContextBudget;
+	} | null {
+		const nCtx = this.contextSizeFor(model);
+
+		if (!nCtx) return null;
+
+		const cfg = conversationsStore.getContextConfig(convId);
+		const used = measureContextUsage(messages, nCtx).used;
+
+		return {
+			budget: contextBudget({
+				nCtx,
+				summaryPrompt: cfg.summaryPrompt,
+				summaryTokens: cfg.summaryTokens,
+				used
+			}),
+			cfg,
+			nCtx,
+			used
+		};
 	}
 
 	async continueAssistantMessage(messageId: string): Promise<void> {
@@ -736,54 +879,42 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	}
 
 	/**
-	 * W1: output limits of a reply to `messages`: max_tokens = the configured limit capped at
-	 * free - reserve (floor 1), enforced after the custom JSON, and a thinking budget of at most
-	 * half of it. Empty when the reserve does not apply (off, or no context size).
+	 * W1.2: output limits of a reply to `messages`: max_tokens = min(configured, n_ctx - used -
+	 * reserve) (floor 1), enforced after the custom JSON, and a thinking budget of at most half of
+	 * it. `byReserve` = the reserve, not the configured limit, set the cap (rule 2 applies to a
+	 * `length` stop then). Empty when the context size is unknown.
 	 */
 	replyLimits(
 		messages: readonly DatabaseMessage[],
 		model?: string | null,
 		convId?: string
-	): { max_tokens?: number; maxTokensCeiling?: number; thinkingBudgetCap?: number } {
-		const cfg = conversationsStore.getContextConfig(convId);
-		const nCtx = this.contextSizeFor(model);
+	): {
+		max_tokens?: number;
+		maxTokensCeiling?: number;
+		thinkingBudgetCap?: number;
+		byReserve?: boolean;
+	} {
+		const st = this.contextState(messages, model, convId);
 
-		if (!nCtx || cfg.reserve <= 0) return {};
+		if (!st) return {};
 
 		const max = Number(settingsStore.config.max_tokens);
+		const configured = max > 0 ? max : undefined;
 		const cap = replyTokenCap({
-			configured: max > 0 ? max : undefined,
-			nCtx,
-			reserve: cfg.reserve,
-			used: measureContextUsage(messages, nCtx).used
+			configured,
+			nCtx: st.nCtx,
+			reserve: st.budget.reserve,
+			used: st.used
 		});
 
 		if (cap === undefined) return {};
 
-		return { max_tokens: cap, maxTokensCeiling: cap, thinkingBudgetCap: cappedThinkingBudget(cap) };
-	}
-
-	/** W1: does sending this message leave less than the reserve (+ a minimal reply) free? */
-	reserveReached(convId: string, content: string, extras?: DatabaseMessageExtra[]): boolean {
-		const cfg = conversationsStore.getContextConfig(convId);
-
-		if (cfg.reserve <= 0) return false;
-
-		if (conversationsStore.activeConversation?.id !== convId) return false;
-
-		const messages = conversationsStore.activeMessages as DatabaseMessage[];
-		const model = serverStore.isRouterMode
-			? modelsStore.selectedModelName || getConversationModel(messages)
-			: null;
-		const nCtx = this.contextSizeFor(model);
-		const usage = measureContextUsage(messages, nCtx);
-		const pending = estimateMessageTokens({
-			content,
-			extra: extras,
-			role: MessageRole.USER
-		} as DatabaseMessage);
-
-		return shouldCompact({ nCtx, pending, reserve: cfg.reserve, used: usage.used });
+		return {
+			byReserve: configured === undefined || cap < configured,
+			max_tokens: cap,
+			maxTokensCeiling: cap,
+			thinkingBudgetCap: cappedThinkingBudget(cap)
+		};
 	}
 
 	savePendingDraft(message: string, files: ChatUploadedFile[]): void {
@@ -792,18 +923,45 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	}
 
 	/**
-	 * W1: what a send of this message to the (open) conversation must do first: nothing, compact
-	 * (the reserve would not stay free; auto-compaction on) or refuse (auto-compaction off - the
-	 * reply could only eat into the reserve).
+	 * W1.2 rule 1: what a send of this message to the (open) conversation must do first: nothing;
+	 * compact (it would start with less than the pre-turn minimum free; auto-compaction on); or
+	 * refuse (auto-compaction off and not even a minimal reply fits above the reserve).
 	 */
 	sendGate(
 		convId: string,
 		content: string,
 		extras?: DatabaseMessageExtra[]
 	): 'send' | 'compact' | 'blocked' {
-		if (!this.reserveReached(convId, content, extras)) return 'send';
+		if (conversationsStore.activeConversation?.id !== convId) return 'send';
 
-		return conversationsStore.getContextConfig(convId).autoCompact ? 'compact' : 'blocked';
+		const messages = conversationsStore.activeMessages as DatabaseMessage[];
+		const model = serverStore.isRouterMode
+			? modelsStore.selectedModelName || getConversationModel(messages)
+			: null;
+		const st = this.contextState(messages, model, convId);
+
+		if (!st) return 'send';
+
+		const pending = estimateMessageTokens({
+			content,
+			extra: extras,
+			role: MessageRole.USER
+		} as DatabaseMessage);
+
+		if (st.cfg.autoCompact) {
+			return shouldCompactBeforeTurn({
+				nCtx: st.nCtx,
+				pending,
+				preTurnMin: st.budget.preTurnMin,
+				used: st.used
+			})
+				? 'compact'
+				: 'send';
+		}
+
+		return st.nCtx - st.used - pending < st.budget.reserve + CONTEXT_RESERVE.MIN_REPLY_TOKENS
+			? 'blocked'
+			: 'send';
 	}
 
 	async sendMessage(content: string, extras?: DatabaseMessageExtra[]): Promise<void> {
@@ -991,6 +1149,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		if (convId === conversationsStore.activeConversation?.id) this.currentResponse = response;
 	}
+
 	setEditModeActive(handler: (files: File[]) => void): void {
 		this.isEditModeActive = true;
 		this.addFilesHandler = handler;
@@ -999,7 +1158,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	showErrorDialog(state: ErrorDialogState | null): void {
 		this.errorDialogState = state;
 	}
-
 	async stopGeneration(): Promise<void> {
 		const activeConv = conversationsStore.activeConversation;
 
@@ -1362,6 +1520,17 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			});
 
 			if (agenticResult.handled) {
+				// W1.2 rules 2 / 3 on the flow's final reply
+				const lastTurn = agenticStore.takeLastTurn(convId);
+
+				if (lastTurn) {
+					await this.afterReply(convId, currentMessageId, {
+						byReserve: lastTurn.byReserve,
+						finish: lastTurn.finish,
+						toolCalls: false
+					});
+				}
+
 				// Generate LLM based title for new conversations after agentic flow completes
 				if (firstUserMessageContent) {
 					await this.generateTitleWithLLM(firstUserMessageContent, streamedContent, convId);
@@ -1389,7 +1558,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					finalContent?: string,
 					reasoningContent?: string,
 					timings?: ChatMessageTimings,
-					toolCalls?: string
+					toolCalls?: string,
+					finishReason?: string
 				) => {
 					const content = streamedContent || finalContent || '';
 					const reasoning = streamedReasoningContent || reasoningContent;
@@ -1419,6 +1589,13 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					cleanupStreamingState();
 
 					if (onComplete) await onComplete(content);
+
+					// W1.2 rules 2 / 3
+					await this.afterReply(convId, currentMessageId, {
+						byReserve: replyCap.byReserve === true,
+						finish: finishReason,
+						toolCalls: !!toolCalls && toolCalls !== '[]'
+					});
 
 					if (serverStore.isRouterMode) modelsStore.fetchRouterModels().catch(console.error);
 
@@ -1494,6 +1671,150 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		}
 	}
 
+	/**
+	 * W1.2: continue an assistant reply from its exact stop point: the conversation up to it, sent
+	 * as a real turn with the reply as the final assistant message (continue_final_message), the
+	 * reserve cap, and the given bias; the continuation is joined with an overlap check. A
+	 * continuation that asks for a tool call keeps only its text (the call is not run).
+	 */
+	private async continueReply(
+		convId: string,
+		messageId: string,
+		o: { logitBias?: Record<string, number>; maxTokens?: number }
+	): Promise<{ finish?: string; byReserve: boolean } | { error: string }> {
+		if (this.isChatLoadingInternal(convId)) return { error: 'the conversation is busy' };
+
+		this.setChatLoading(convId, true);
+
+		const abortController = this.getOrCreateAbortController(convId);
+
+		try {
+			const conversation = await DatabaseService.getConversation(convId);
+
+			if (!conversation) return { error: 'no conversation' };
+
+			const path = (
+				filterByLeafNodeId(
+					await DatabaseService.getConversationMessages(convId),
+					messageId,
+					false
+				) as DatabaseMessage[]
+			).filter((m) => m.type !== MessageType.ROOT);
+			const msg = path[path.length - 1];
+
+			if (!msg || msg.id !== messageId || msg.role !== MessageRole.ASSISTANT) {
+				return { error: 'the reply is not the last message' };
+			}
+
+			const model = serverStore.isRouterMode
+				? modelsStore.selectedModelName || getConversationModel(path)
+				: null;
+			const limits = this.replyLimits(path, model, convId);
+			const maxTokens = Math.min(o.maxTokens ?? Infinity, limits.max_tokens ?? Infinity);
+			const capped = Number.isFinite(maxTokens) ? maxTokens : undefined;
+			const frozenTools = parseToolsSnapshot(conversation.toolsSnapshot);
+			const tools =
+				agenticStore.getConfig(settingsStore.config).enabled &&
+				frozenTools &&
+				frozenTools.length > 0
+					? frozenTools
+					: undefined;
+			const original = msg.content ?? '';
+			const originalReasoning = msg.reasoningContent ?? '';
+
+			let appended = '';
+			let appendedReasoning = '';
+			let done: { finish?: string; timings?: ChatMessageTimings } | null = null;
+
+			const show = () => {
+				this.setChatStreaming(convId, original + appended, messageId);
+
+				const idx = conversationsStore.findMessageIndex(messageId);
+
+				if (idx >= 0) {
+					conversationsStore.updateMessageAtIndex(idx, {
+						content: original + appended,
+						reasoningContent: originalReasoning + appendedReasoning || undefined
+					});
+				}
+			};
+
+			await ChatService.sendMessage(
+				path,
+				{
+					...this.getApiOptions(conversation),
+					...(model ? { model } : {}),
+					continueFinalMessage: true,
+					...(capped !== undefined
+						? {
+								max_tokens: capped,
+								maxTokensCeiling: capped,
+								thinkingBudgetCap: cappedThinkingBudget(capped)
+							}
+						: {}),
+					logitBias: o.logitBias,
+					onChunk: (chunk: string) => {
+						appended += chunk;
+						show();
+					},
+					onComplete: (
+						_c: string,
+						_r?: string,
+						timings?: ChatMessageTimings,
+						_tc?: string,
+						finish?: string
+					) => {
+						done = { finish, timings };
+					},
+					onError: () => {},
+					onReasoningChunk: (chunk: string) => {
+						appendedReasoning += chunk;
+						show();
+					},
+					stream: true,
+					tools
+				},
+				undefined,
+				abortController.signal
+			);
+
+			if (abortController.signal.aborted) return { error: 'cancelled' };
+
+			const end = done as { finish?: string; timings?: ChatMessageTimings } | null;
+
+			if (!end) return { error: 'the stream ended before completion' };
+
+			const content = joinWithOverlap(original, appended).text;
+			const reasoning = joinWithOverlap(originalReasoning, appendedReasoning).text;
+			const update: Partial<DatabaseMessage> = {
+				content,
+				reasoningContent: reasoning || undefined,
+				replyNote: undefined,
+				timestamp: Date.now(),
+				...(end.timings ? { timings: end.timings } : {})
+			};
+
+			await DatabaseService.updateMessage(messageId, update);
+
+			const idx = conversationsStore.findMessageIndex(messageId);
+
+			if (idx >= 0) conversationsStore.updateMessageAtIndex(idx, update);
+
+			const max = Number(settingsStore.config.max_tokens);
+
+			return {
+				byReserve: capped !== undefined && !(max > 0 && capped >= max),
+				finish: end.finish
+			};
+		} catch (error) {
+			return { error: error instanceof Error ? error.message : String(error) };
+		} finally {
+			this.abortRequest(convId);
+			this.setChatLoading(convId, false);
+			this.clearChatStreaming(convId, messageId);
+		}
+	}
+
 	private async generateTitleWithLLM(
 		userContent: string,
 		assistantContent: string,
@@ -1555,12 +1876,21 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				: 'The message was not sent; it is kept as the draft of its conversation.'
 		);
 	}
+
+	/** W1.2: note on a reply the rules could not finish (shown under the message). */
+	private async markReply(messageId: string, note: string): Promise<void> {
+		await DatabaseService.updateMessage(messageId, { replyNote: note });
+
+		const idx = conversationsStore.findMessageIndex(messageId);
+
+		if (idx >= 0) conversationsStore.updateMessageAtIndex(idx, { replyNote: note });
+	}
 	private async runCompaction(
 		convId: string,
 		owner: CompactionState,
 		abortController: AbortController,
 		fail: (error: string) => CompactionResult,
-		opts: { auto?: boolean }
+		opts: CompactionOptions
 	): Promise<CompactionResult> {
 		const conversation = await DatabaseService.getConversation(convId);
 
@@ -1581,19 +1911,34 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		if (!nCtx) return fail('the context size is unknown (no /props yet)');
 
 		const cfg = resolveContextReserveConfig(settingsStore.config, conversation.contextSettings);
-		const reserve = cfg.reserve > 0 ? cfg.reserve : CONTEXT_RESERVE.DEFAULT_RESERVE_TOKENS;
-		const instructionTokens =
-			estimateTextTokens(buildSummaryInstruction(cfg.summaryPrompt, reserve)) +
-			CONTEXT_RESERVE.MESSAGE_OVERHEAD_TOKENS * 2;
+		const budget = contextBudget({
+			nCtx,
+			summaryPrompt: cfg.summaryPrompt,
+			summaryTokens: cfg.summaryTokens,
+			used: measureContextUsage(path, nCtx).used
+		});
 
-		if (!reserveHoldsSummary(reserve, instructionTokens)) {
+		if (!summaryLengthUsable(budget.summaryTokens)) {
 			return fail(
-				`the context reserve (${reserve}) minus the instruction (~${instructionTokens}) is below ` +
-					`the ${CONTEXT_RESERVE.MIN_SUMMARY_TOKENS}-token minimum summary; raise the reserve`
+				`the summary length (${budget.summaryTokens}) is below the ` +
+					`${CONTEXT_RESERVE.MIN_SUMMARY_TOKENS}-token minimum; raise the summary length`
 			);
 		}
 
-		const plan = planSummaryRequest({ instructionTokens, messages: path, nCtx, reserve });
+		// rule 2: the partial reply (the last message) is not summarised; it is carried over as is
+		const partial = opts.partialMessageId
+			? path.find((m) => m.id === opts.partialMessageId && m === path[path.length - 1])
+			: undefined;
+
+		if (opts.partialMessageId && !partial) return fail('the cut reply is not the last message');
+
+		const plan = planSummaryRequest({
+			cutBeforeLast: !!partial,
+			instructionTokens: budget.instructionTokens,
+			messages: path,
+			nCtx,
+			summaryTokens: budget.summaryTokens
+		});
 
 		if (!plan) return fail('no point of the conversation leaves room for a summary');
 
@@ -1671,13 +2016,21 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		if (rejection) return fail(rejection);
 
-		const newConvId = await this.saveCompactedConversation(conversation, path, plan.cut, {
-			keepMessages: cfg.keepMessages,
-			model: summaryModel,
-			nCtx,
-			reserve,
-			summary: summary.trim()
-		});
+		const saved = await this.saveCompactedConversation(
+			conversation,
+			partial ? path.slice(0, -1) : path,
+			plan.cut && !partial,
+			{
+				model: summaryModel,
+				nCtx,
+				partial,
+				summary: summary.trim(),
+				summaryPrompt: cfg.summaryPrompt,
+				summaryTokens: cfg.summaryTokens,
+				tailTokens: cfg.tailTokens
+			}
+		);
+		const newConvId = saved.convId;
 
 		await conversationsStore.loadConversations();
 		await conversationsStore.loadConversation(newConvId);
@@ -1685,7 +2038,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		if (!opts.auto) toast.success('Conversation compacted; the previous one is kept');
 
-		return { convId: newConvId };
+		return { convId: newConvId, partialId: saved.partialId };
 	}
 
 	/** W1: write the compacted conversation; returns its id. */
@@ -1694,13 +2047,15 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		path: readonly DatabaseMessage[],
 		cut: boolean,
 		p: {
-			keepMessages: number;
 			model: string | null;
 			nCtx: number;
-			reserve: number;
+			partial?: DatabaseMessage;
 			summary: string;
+			summaryPrompt: string;
+			summaryTokens: number;
+			tailTokens: number;
 		}
-	): Promise<string> {
+	): Promise<{ convId: string; partialId?: string }> {
 		const system = path.find(
 			(m) =>
 				m.role === MessageRole.SYSTEM &&
@@ -1710,19 +2065,31 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		const body = path.filter((m) => m.role !== MessageRole.SYSTEM && !m.isSynthetic);
 		// the working directory row the model last saw (the tail carries no synthetic rows)
 		const cwdRow = [...path].reverse().find((m) => m.isSynthetic && m.role === MessageRole.USER);
-		// at most a quarter of the context, and what the new chat has left after the reserve, the
-		// summary note, the head rows and a minimal reply
+		// whole newest messages within the tail setting, at most a quarter of the context and what
+		// the new chat has left after its derived reserve, the summary note, the head rows (and the
+		// partial reply of rule 2) and a minimal reply
+		const headTokens =
+			(system ? estimateMessageTokens(system) : 0) +
+			(cwdRow ? estimateMessageTokens(cwdRow) : 0) +
+			(p.partial ? estimateMessageTokens(p.partial) : 0);
+		const summaryNoteTokens = estimateTextTokens(p.summary) + 64;
+		const newBudget = contextBudget({
+			nCtx: p.nCtx,
+			summaryPrompt: p.summaryPrompt,
+			summaryTokens: p.summaryTokens,
+			used: headTokens + summaryNoteTokens
+		});
 		const tail = selectTailMessages(
 			body,
-			p.keepMessages,
-			tailTokenBudget({
-				headTokens:
-					(system ? estimateMessageTokens(system) : 0) +
-					(cwdRow ? estimateMessageTokens(cwdRow) : 0),
-				nCtx: p.nCtx,
-				reserve: p.reserve,
-				summaryTokens: estimateTextTokens(p.summary) + 64
-			})
+			Math.min(
+				p.tailTokens,
+				tailTokenBudget({
+					headTokens,
+					nCtx: p.nCtx,
+					reserve: newBudget.reserve,
+					summaryTokens: summaryNoteTokens
+				})
+			)
 		);
 		const newConv = await DatabaseService.createConversation(
 			compactedConversationName(source.name),
@@ -1770,7 +2137,9 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		const header = CONTEXT_RESERVE.SUMMARY_HEADER.replace('{{NAME}}', source.name);
 
 		await copy({
-			content: `${header}${cut ? ' (the end of the last turn did not fit in the summary request)' : ''}\n\n${p.summary}`,
+			content:
+				`${header}${cut ? ' (the end of the last turn did not fit in the summary request)' : ''}` +
+				`\n\n${p.summary}${p.partial ? `\n\n${CONTEXT_RESERVE.PARTIAL_NOTE}` : ''}`,
 			model: p.model ?? undefined,
 			role: MessageRole.ASSISTANT,
 			timestamp: Date.now(),
@@ -1786,11 +2155,28 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			await copy({ ...rest, timestamp: Date.now() });
 		}
 
+		// rule 2: the cut reply, to be continued from its exact stop point (no tool calls: a reply
+		// with tool calls cannot be continued)
+		let partialId: string | undefined;
+
+		if (p.partial) {
+			await copy({
+				content: p.partial.content,
+				model: p.partial.model,
+				reasoningContent: p.partial.reasoningContent,
+				role: MessageRole.ASSISTANT,
+				timestamp: Date.now(),
+				toolCalls: '',
+				type: MessageType.TEXT
+			});
+			partialId = parent;
+		}
+
 		await DatabaseService.updateConversation(source.id, {
 			compactedIntoConversationId: newConv.id
 		});
 
-		return newConv.id;
+		return { convId: newConv.id, partialId };
 	}
 
 	private async savePartialResponseIfNeeded(convId?: string): Promise<void> {

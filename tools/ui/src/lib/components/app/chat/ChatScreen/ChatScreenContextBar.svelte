@@ -4,10 +4,18 @@
 	import { goto } from '$app/navigation';
 	import { CONTEXT_RESERVE } from '$lib/constants';
 	import { RouterService } from '$lib/services/router.service';
-	import { chatStore, contextStatsStore, conversationsStore } from '$lib/stores';
-	import { formatTokenCount, measureContextUsage } from '$lib/utils';
+	import { chatStore, contextStatsStore, conversationsStore, settingsStore } from '$lib/stores';
+	import {
+		contextBudget,
+		formatTokenCount,
+		legacyContextFields,
+		measureContextUsage
+	} from '$lib/utils';
+	import { toast } from 'svelte-sonner';
 
-	// W1: context usage meter + "Compact now" for the open conversation
+	// W1: context usage meter + "Compact now" for the open conversation; W1.2: the reserve and the
+	// pre-turn minimum are derived from the context length and the compaction prompt
+	const LEGACY_NOTICE_KEY = 'llama-ui.w12-context-settings-notice';
 
 	let conversation = $derived(conversationsStore.activeConversation);
 	let messages = $derived(conversationsStore.activeMessages as DatabaseMessage[]);
@@ -23,12 +31,42 @@
 	);
 	let free = $derived(nCtx !== null ? Math.max(0, nCtx - used) : null);
 	let usedPct = $derived(nCtx ? Math.min(100, (used / nCtx) * 100) : 0);
-	let reservePct = $derived(
-		nCtx && cfg.reserve > 0 ? Math.min(100, (cfg.reserve / nCtx) * 100) : 0
+	let budget = $derived(
+		nCtx
+			? contextBudget({
+					nCtx,
+					summaryPrompt: cfg.summaryPrompt,
+					summaryTokens: cfg.summaryTokens,
+					used
+				})
+			: null
 	);
-	let atReserve = $derived(
-		free !== null && cfg.reserve > 0 && free < cfg.reserve + CONTEXT_RESERVE.MIN_REPLY_TOKENS
+	let reservePct = $derived(nCtx && budget ? Math.min(100, (budget.reserve / nCtx) * 100) : 0);
+	// rule 1: below the pre-turn minimum the next message compacts first
+	let atReserve = $derived(free !== null && budget !== null && free < budget.preTurnMin);
+	let reserveExhausted = $derived(
+		free !== null && budget !== null && free < budget.reserve + CONTEXT_RESERVE.MIN_REPLY_TOKENS
 	);
+
+	// W1.2: the W1/W1.1 reserve and "messages kept" settings are no longer read - say so once
+	$effect(() => {
+		const legacy = legacyContextFields(settingsStore.config, conversation?.contextSettings);
+
+		if (legacy.length === 0) return;
+
+		try {
+			if (localStorage.getItem(LEGACY_NOTICE_KEY)) return;
+
+			localStorage.setItem(LEGACY_NOTICE_KEY, '1');
+		} catch {
+			return;
+		}
+
+		toast.info(
+			`Context settings changed: the ${legacy.join(' and ')} setting is no longer used. The reserve is ` +
+				'now derived from the summary length; the kept tail is set in tokens.'
+		);
+	});
 	let compacting = $derived(
 		chatStore.compaction !== null && chatStore.compaction.convId === conversation?.id
 	);
@@ -56,8 +94,10 @@
 		nCtx === null
 			? 'Context size unknown'
 			: `Context: ${used.toLocaleString()} of ${nCtx.toLocaleString()} tokens used, ` +
-					`${(free ?? 0).toLocaleString()} free; reserve ${cfg.reserve.toLocaleString()} ` +
-					`(kept for the summary${cfg.autoCompact ? ', auto-compaction on' : ''})`
+					`${(free ?? 0).toLocaleString()} free; reserve ${(budget?.reserve ?? 0).toLocaleString()} ` +
+					`(summary ${budget?.summaryTokens ?? 0} + instruction ${budget?.instructionTokens ?? 0} + ` +
+					`slack ${budget?.slackTokens ?? 0}), compacts below ${(budget?.preTurnMin ?? 0).toLocaleString()} ` +
+					`free${cfg.autoCompact ? '' : ' (auto-compaction off)'}`
 	);
 
 	function compactNow() {
@@ -134,7 +174,11 @@
 			</button>
 		{:else if atReserve && !intoConv}
 			<span class="text-amber-600 dark:text-amber-400">
-				{cfg.autoCompact ? 'Reserve reached: the next message compacts' : 'Reserve reached'}
+				{cfg.autoCompact
+					? 'Context nearly full: the next message compacts'
+					: reserveExhausted
+						? 'Reserve reached: compact to go on'
+						: 'Context nearly full'}
 			</span>
 		{/if}
 

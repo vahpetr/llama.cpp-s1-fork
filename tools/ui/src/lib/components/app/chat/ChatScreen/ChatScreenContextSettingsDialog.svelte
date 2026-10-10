@@ -20,13 +20,13 @@
 
 	let global = $derived(readContextReserveConfig(settingsStore.config));
 
-	let useGlobalReserve = $state(true);
+	let useGlobalSummary = $state(true);
 	let useGlobalAuto = $state(true);
-	let useGlobalKeep = $state(true);
+	let useGlobalTail = $state(true);
 	let useGlobalPrompt = $state(true);
-	let reserve = $state('');
+	let summaryTokens = $state('');
 	let autoCompact = $state(true);
-	let keep = $state('');
+	let tailTokens = $state('');
 	let prompt = $state('');
 
 	// load the stored overrides each time the dialog opens
@@ -39,13 +39,14 @@
 				: conversationsStore.conversations.find((c) => c.id === convId);
 		const o: ConversationContextSettings = conv?.contextSettings ?? {};
 
-		useGlobalReserve = o.reserve === undefined;
+		// W1.1's reserve / keepMessages overrides are not shown; saving drops them
+		useGlobalSummary = o.summaryTokens === undefined;
 		useGlobalAuto = o.autoCompact === undefined;
-		useGlobalKeep = o.keepMessages === undefined;
+		useGlobalTail = o.tailTokens === undefined;
 		useGlobalPrompt = o.summaryPrompt === undefined;
-		reserve = String(o.reserve ?? global.reserve);
+		summaryTokens = String(o.summaryTokens ?? global.summaryTokens);
 		autoCompact = o.autoCompact ?? global.autoCompact;
-		keep = String(o.keepMessages ?? global.keepMessages);
+		tailTokens = String(o.tailTokens ?? global.tailTokens);
 		prompt = o.summaryPrompt ?? global.summaryPrompt;
 	});
 
@@ -58,9 +59,9 @@
 	async function save() {
 		await conversationsStore.setContextSettings(convId, {
 			autoCompact: useGlobalAuto ? undefined : autoCompact,
-			keepMessages: useGlobalKeep ? undefined : toInt(keep),
-			reserve: useGlobalReserve ? undefined : toInt(reserve),
-			summaryPrompt: useGlobalPrompt ? undefined : prompt
+			summaryPrompt: useGlobalPrompt ? undefined : prompt,
+			summaryTokens: useGlobalSummary ? undefined : toInt(summaryTokens),
+			tailTokens: useGlobalTail ? undefined : toInt(tailTokens)
 		});
 		open = false;
 	}
@@ -73,28 +74,30 @@
 
 			<Dialog.Description>
 				Overrides of the global Context settings, for this conversation and its compacted
-				continuations.
+				continuations. The reserve is derived: summary length + instruction + 10 % of the context in
+				use (at least 2048); the conversation compacts before a message when less than the reserve +
+				32768 tokens are free.
 			</Dialog.Description>
 		</Dialog.Header>
 
 		<div class="space-y-4 text-sm">
 			<div class="space-y-1">
 				<div class="flex items-center justify-between gap-2">
-					<label class="font-medium" for="ctx-reserve">Context reserve (tokens)</label>
+					<label class="font-medium" for="ctx-summary">Summary length (tokens)</label>
 
 					<label class="flex items-center gap-1.5 text-xs text-muted-foreground">
 						<Checkbox
-							checked={useGlobalReserve}
-							onCheckedChange={(v) => (useGlobalReserve = v === true)}
+							checked={useGlobalSummary}
+							onCheckedChange={(v) => (useGlobalSummary = v === true)}
 						/>
-						use global default ({global.reserve})
+						use global default ({global.summaryTokens})
 					</label>
 				</div>
 
 				<Input
-					bind:value={reserve}
-					disabled={useGlobalReserve}
-					id="ctx-reserve"
+					bind:value={summaryTokens}
+					disabled={useGlobalSummary}
+					id="ctx-summary"
 					min="0"
 					type="number"
 				/>
@@ -118,18 +121,24 @@
 
 			<div class="space-y-1">
 				<div class="flex items-center justify-between gap-2">
-					<label class="font-medium" for="ctx-keep">Messages kept after compaction</label>
+					<label class="font-medium" for="ctx-tail">Kept tail (tokens)</label>
 
 					<label class="flex items-center gap-1.5 text-xs text-muted-foreground">
 						<Checkbox
-							checked={useGlobalKeep}
-							onCheckedChange={(v) => (useGlobalKeep = v === true)}
+							checked={useGlobalTail}
+							onCheckedChange={(v) => (useGlobalTail = v === true)}
 						/>
-						use global default ({global.keepMessages})
+						use global default ({global.tailTokens})
 					</label>
 				</div>
 
-				<Input bind:value={keep} disabled={useGlobalKeep} id="ctx-keep" min="0" type="number" />
+				<Input
+					bind:value={tailTokens}
+					disabled={useGlobalTail}
+					id="ctx-tail"
+					min="0"
+					type="number"
+				/>
 			</div>
 
 			<div class="space-y-1">
@@ -153,7 +162,7 @@
 				/>
 
 				<p class="text-xs text-muted-foreground">
-					{'{{MAX_TOKENS}}'} is replaced by the summary length limit.
+					{'{{MAX_TOKENS}}'} is replaced by the summary length.
 				</p>
 			</div>
 		</div>

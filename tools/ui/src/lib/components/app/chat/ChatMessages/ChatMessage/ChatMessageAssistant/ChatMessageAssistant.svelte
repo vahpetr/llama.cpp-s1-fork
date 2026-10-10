@@ -157,6 +157,12 @@
 		<ChatMessageAssistantProcessingInfo {modelLoadingText} position="bottom" {processingState} />
 	{/if}
 
+	{#if message.replyNote}
+		<p class="mt-2 text-xs text-amber-600 dark:text-amber-400" data-reply-note>
+			[{message.replyNote}]
+		</p>
+	{/if}
+
 	{#if displayedModel}
 		<div class="info my-6 grid gap-4 tabular-nums">
 			<div class="inline-flex flex-wrap items-start gap-2 text-xs text-muted-foreground">
