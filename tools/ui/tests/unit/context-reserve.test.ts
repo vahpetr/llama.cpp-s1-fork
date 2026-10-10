@@ -24,25 +24,34 @@ beforeAll(() => {
 });
 
 import { MessageRole } from '$lib/enums';
+import { ChatService } from '$lib/services/chat.service';
 import { DatabaseService } from '$lib/services/database.service';
 import { agenticStore } from '$lib/stores/agentic/index.svelte';
+import { draftMessagesStore } from '$lib/stores/chat/drafts.svelte';
 import { chatStore } from '$lib/stores/chat/index.svelte';
 import { conversationsStore } from '$lib/stores/conversations/index.svelte';
 import { modelsStore } from '$lib/stores/models/index.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import type { DatabaseConversation, DatabaseMessage } from '$lib/types/database';
 import {
+	applyRequestCeilings,
+	cappedThinkingBudget,
 	compactedConversationName,
+	estimateMessageTokens,
 	measureContextUsage,
 	normalizeContextOverrides,
 	planSummaryRequest,
 	replyTokenCap,
+	reserveHoldsSummary,
 	resolveContextReserveConfig,
 	selectTailMessages,
-	shouldCompact
-} from '$lib/utils/context-reserve';
+	shouldCompact,
+	summaryRejection,
+	tailTokenBudget} from '$lib/utils/context-reserve';
 
 let seq = 0;
+
+const SUMMARY = 'SUMMARY TEXT: ' + 'the state of the work and the next steps. '.repeat(4);
 
 function msg(role: MessageRole, content: string, extra: Partial<DatabaseMessage> = {}) {
 	return {
@@ -69,10 +78,12 @@ describe('context reserve arithmetic', () => {
 	it('caps a reply at free - reserve and keeps a smaller configured limit', () => {
 		expect(replyTokenCap({ nCtx: 10000, reserve: 2000, used: 5000 })).toBe(3000);
 		expect(replyTokenCap({ configured: 1000, nCtx: 10000, reserve: 2000, used: 5000 })).toBe(1000);
-		// reserve off, context unknown or the reserve already used up: the configured value as is
+		// reserve off or context unknown: the configured value as is
 		expect(replyTokenCap({ configured: 500, nCtx: 10000, reserve: 0, used: 5000 })).toBe(500);
 		expect(replyTokenCap({ nCtx: null, reserve: 2000, used: 5000 })).toBeUndefined();
-		expect(replyTokenCap({ nCtx: 10000, reserve: 2000, used: 9000 })).toBeUndefined();
+		// sol #5: the reserve used up keeps its protection - floor 1, never "unlimited"
+		expect(replyTokenCap({ nCtx: 10000, reserve: 2000, used: 9000 })).toBe(1);
+		expect(replyTokenCap({ configured: 500, nCtx: 10000, reserve: 2000, used: 9000 })).toBe(1);
 	});
 
 	it('compacts when the turn would leave less than the reserve (+ a minimal reply) free', () => {
@@ -88,7 +99,7 @@ describe('context reserve arithmetic', () => {
 		const u = msg(MessageRole.USER, 'y'.repeat(300));
 
 		expect(measureContextUsage([a], 2000)).toEqual({ full: false, measured: 1050, used: 1050 });
-		expect(measureContextUsage([a, u], 2000).used).toBe(1050 + 100 + 8);
+		expect(measureContextUsage([a, u], 2000).used).toBe(1050 + Math.ceil((100 + 8) * 1.1));
 		// a reply that ran into the end of the context
 		expect(measureContextUsage([a], 1051).full).toBe(true);
 	});
@@ -196,11 +207,22 @@ describe('W1: compaction against the cached prompt', () => {
 		chatStore.setChatLoading('c1', false);
 	});
 
-	function sse(content: string, timings?: object): Response {
+	function sse(
+		content: string,
+		timings?: object,
+		finish: string | null = 'stop',
+		done = true,
+		toolCall = false
+	): Response {
 		const chunks = [
 			`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`,
-			timings ? `data: ${JSON.stringify({ choices: [{ delta: {} }], timings })}\n\n` : '',
-			'data: [DONE]\n\n'
+			toolCall
+				? `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ function: { arguments: '{}', name: 'x' }, id: 'c', index: 0, type: 'function' }] } }] })}\n\n`
+				: '',
+			timings || finish
+				? `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: finish }], timings })}\n\n`
+				: '',
+			done ? 'data: [DONE]\n\n' : ''
 		];
 
 		return new Response(chunks.join(''), { headers: { 'Content-Type': 'text/event-stream' } });
@@ -208,7 +230,13 @@ describe('W1: compaction against the cached prompt', () => {
 
 	async function scenario(
 		full: boolean,
-		contextSettings?: DatabaseConversation['contextSettings']
+		contextSettings?: DatabaseConversation['contextSettings'],
+		opts: {
+			summary?: () => Response;
+			expectOk?: boolean;
+			customJson?: string;
+			reserve?: number;
+		} = {}
 	) {
 		const N_CTX = 20000;
 		const conv = {
@@ -301,20 +329,24 @@ describe('W1: compaction against the cached prompt', () => {
 			vi.fn(async (_url: string, init?: RequestInit) => {
 				bodies.push(JSON.parse(String(init?.body)));
 
-				return sse(bodies.length === 1 ? 'SUMMARY TEXT' : 'reply', { predicted_n: 3 });
+				if (bodies.length === 1 && opts.summary) return opts.summary();
+
+				return sse(bodies.length === 1 ? SUMMARY : 'reply', { predicted_n: 3 });
 			})
 		);
 
 		settingsStore.config = {
 			...settingsStore.config,
 			compactKeepMessages: 2,
-			contextReserveTokens: 2000,
-			customJson: '{"tag":"w1"}'
+			contextReserveTokens: opts.reserve ?? 2000,
+			customJson: opts.customJson ?? '{"tag":"w1"}'
 		};
 		conversationsStore.activeConversation = structuredClone(conv);
 		conversationsStore.activeMessages = rows.map((m) => structuredClone(m));
 
 		const result = await chatStore.compactConversation('c1');
+
+		if (opts.expectOk === false) return { bodies, convs, db, result };
 
 		expect(result).toEqual({ convId: 'conv-1' });
 
@@ -324,7 +356,7 @@ describe('W1: compaction against the cached prompt', () => {
 
 		await chatStore.streamChatCompletion([...rows, userNew], assistantNew);
 
-		return { bodies, convs, db };
+		return { bodies, convs, db, result };
 	}
 
 	it('the summary request = the next turn with an instruction instead of the user message', async () => {
@@ -338,6 +370,7 @@ describe('W1: compaction against the cached prompt', () => {
 			delete r.messages;
 			delete r.max_tokens;
 			delete r.thinking_budget_tokens;
+			delete r.reasoning_budget_tokens;
 
 			return r;
 		};
@@ -351,9 +384,11 @@ describe('W1: compaction against the cached prompt', () => {
 		expect(summary.max_tokens as number).toBeLessThanOrEqual(2000);
 		expect(summary.thinking_budget_tokens).toBe(Math.floor((summary.max_tokens as number) / 4));
 		// the normal reply is capped at free - reserve
-		const used = 1000 + 9000 + 20 + Math.ceil('question three'.length / 3) + 8;
+		const used = 1000 + 9000 + 20 + Math.ceil((Math.ceil('question three'.length / 3) + 8) * 1.1);
 
 		expect(next.max_tokens).toBe(20000 - used - 2000);
+		// sol #7: a capped reply's thinking gets at most half of the cap
+		expect(next.thinking_budget_tokens).toBe(Math.floor((next.max_tokens as number) / 2));
 
 		// the new conversation: system, summary note, last 2 messages; linked, the old one kept
 		const newConv = convs.get('conv-1')!;
@@ -407,7 +442,7 @@ describe('W1: compaction against the cached prompt', () => {
 		// reserve 3000 - instruction, not the global 2000
 		expect(summary.max_tokens as number).toBeGreaterThan(2000);
 
-		const used = 1000 + 9000 + 20 + Math.ceil('question three'.length / 3) + 8;
+		const used = 1000 + 9000 + 20 + Math.ceil((Math.ceil('question three'.length / 3) + 8) * 1.1);
 
 		expect(next.max_tokens).toBe(20000 - used - 3000);
 
@@ -421,6 +456,50 @@ describe('W1: compaction against the cached prompt', () => {
 
 		expect(leaf).toMatchObject({ content: 'answer two', role: 'assistant' });
 		expect(beforeLeaf.content).toContain('SUMMARY TEXT');
+	}, 60000);
+
+	it('sol #3: custom JSON cannot lift the summary ceilings (all aliases)', async () => {
+		const { bodies } = await scenario(false, undefined, {
+			customJson:
+				'{"max_tokens":-1,"n_predict":99999,"max_completion_tokens":50000,"reasoning_budget_tokens":8192}'
+		});
+		const summary = bodies[0];
+
+		expect(summary.max_tokens as number).toBeLessThanOrEqual(2000);
+		expect(summary.n_predict).toBeUndefined();
+		expect(summary.max_completion_tokens).toBeUndefined();
+		expect(summary.reasoning_budget_tokens).toBe(Math.floor((summary.max_tokens as number) / 4));
+		expect(summary.thinking_budget_tokens).toBe(summary.reasoning_budget_tokens);
+		// and the normal reply's reserve cap holds the same way
+		expect(bodies[1].max_tokens as number).toBeGreaterThan(0);
+		expect(bodies[1].n_predict).toBeUndefined();
+	}, 60000);
+
+	it('sol #4: a tool-call answer, a length-truncated or an unfinished stream is no summary', async () => {
+		const cases: [() => Response, RegExp][] = [
+			[() => sse(SUMMARY, undefined, 'tool_calls', true, true), /tool call/],
+			[() => sse(SUMMARY, undefined, 'length'), /length limit/],
+			[() => sse(SUMMARY, undefined, null, false), /before completion/],
+			[() => sse('ok', undefined, 'stop'), /too short/]
+		];
+
+		for (const [summary, why] of cases) {
+			const { convs, result } = await scenario(false, undefined, { expectOk: false, summary });
+
+			expect(result).toMatchObject({ error: expect.stringMatching(why) });
+			// nothing created, the conversation not linked
+			expect(convs.size).toBe(1);
+			expect(convs.get('c1')!.compactedIntoConversationId).toBeUndefined();
+			vi.restoreAllMocks();
+			vi.unstubAllGlobals();
+		}
+	}, 60000);
+
+	it('sol #5: a reserve that cannot hold a minimal summary is refused before any request', async () => {
+		const { bodies, result } = await scenario(false, undefined, { expectOk: false, reserve: 600 });
+
+		expect(result).toMatchObject({ error: expect.stringMatching(/raise the reserve/) });
+		expect(bodies).toHaveLength(0);
 	}, 60000);
 });
 
@@ -514,9 +593,226 @@ describe('W1: later turns of an agentic flow', () => {
 		];
 
 		// 5000 measured + ~108 for the tool result
-		expect(cap(t(100, 4800, 100), turn, 'm')).toBe(10000 - 5000 - 108 - 2000);
+		// tool result at 2.5 chars/token + 10 %: ceil((120 + 8) * 1.1) = 141
+		expect(cap(t(100, 4800, 100), turn, 'm')).toBe(10000 - 5000 - 141 - 2000);
 		expect(cap(t(100, 7500, 100), turn, 'm')).toBe(0);
 		settingsStore.config = { ...settingsStore.config, contextReserveTokens: 0 };
 		expect(cap(t(100, 7500, 100), turn, 'm')).toBeUndefined();
+	});
+});
+
+describe('W1 hardening (sol review)', () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+		vi.unstubAllGlobals();
+		conversationsStore.activeConversation = null;
+		conversationsStore.activeMessages = [];
+		chatStore.setChatLoading('c1', false);
+	});
+
+	function setupFullChat() {
+		const conv = { currNode: 'a1', id: 'c1', lastModified: 0, name: 'A' } as DatabaseConversation;
+		const rows = [
+			{ ...msg(MessageRole.USER, 'q1'), id: 'u1', parent: null },
+			{
+				...msg(MessageRole.ASSISTANT, 'r1', { timings: t(10, 5000, 3000) }),
+				id: 'a1',
+				parent: 'u1'
+			}
+		] as DatabaseMessage[];
+
+		vi.spyOn(DatabaseService, 'getConversation').mockResolvedValue(structuredClone(conv));
+		vi.spyOn(DatabaseService, 'getConversationMessages').mockResolvedValue(
+			rows.map((m) => structuredClone(m))
+		);
+		vi.spyOn(modelsStore.props, 'getModelContextSize').mockReturnValue(10000);
+		vi.spyOn(modelsStore, 'activeModelId', 'get').mockReturnValue('m');
+		vi.spyOn(agenticStore, 'getConfig').mockReturnValue({ enabled: false } as never);
+		settingsStore.config = {
+			...settingsStore.config,
+			autoCompact: true,
+			contextReserveTokens: 2000,
+			customJson: ''
+		};
+		conversationsStore.activeConversation = structuredClone(conv);
+		conversationsStore.activeMessages = rows.map((m) => structuredClone(m));
+
+		return { conv, rows };
+	}
+
+	it('#1: a failed auto-compaction after switching to B sends nothing into B; A keeps the draft', async () => {
+		setupFullChat();
+
+		const created = vi.spyOn(DatabaseService, 'createMessageBranch');
+		const bodies: unknown[] = [];
+
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (_u: string, init?: RequestInit) => {
+				bodies.push(JSON.parse(String(init?.body)));
+				// the user opens B while the summary runs; the model answers with a tool call
+				conversationsStore.activeConversation = {
+					currNode: null,
+					id: 'b',
+					lastModified: 0,
+					name: 'B'
+				};
+				conversationsStore.activeMessages = [];
+
+				return new Response(
+					`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ function: { arguments: '{}', name: 'x' }, id: 'c', index: 0, type: 'function' }] }, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`,
+					{ headers: { 'Content-Type': 'text/event-stream' } }
+				);
+			})
+		);
+
+		expect(chatStore.sendGate('c1', 'my question')).toBe('compact');
+		await chatStore.sendMessage('my question');
+
+		expect(bodies).toHaveLength(1);
+		expect(created).not.toHaveBeenCalled();
+		expect(draftMessagesStore.getDraftMessage('c1').message).toBe('my question');
+		expect(draftMessagesStore.getDraftMessage('b').message).toBe('');
+		draftMessagesStore.clearDraftMessage('c1');
+	});
+
+	it('#2: ownership is taken synchronously: a second compaction or send cannot slip in', async () => {
+		setupFullChat();
+
+		let release: () => void = () => {};
+
+		const gate = new Promise<void>((r) => (release = r));
+
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async () => {
+				await gate;
+
+				return new Response('data: [DONE]\n\n', {
+					headers: { 'Content-Type': 'text/event-stream' }
+				});
+			})
+		);
+
+		const first = chatStore.compactConversation('c1');
+
+		// before any await resolved
+		expect(chatStore.compaction).toMatchObject({ convId: 'c1' });
+		expect(chatStore.isChatLoadingInternal('c1')).toBe(true);
+		expect(await chatStore.compactConversation('c1')).toEqual({
+			error: 'A compaction is already running'
+		});
+		release();
+		expect(await first).toMatchObject({ error: expect.any(String) });
+		expect(chatStore.compaction).toBeNull();
+		expect(chatStore.isChatLoadingInternal('c1')).toBe(false);
+	});
+
+	it('#5: auto-compaction off + reserve reached = the send is refused (gate "blocked")', () => {
+		setupFullChat();
+		settingsStore.config = { ...settingsStore.config, autoCompact: false };
+
+		expect(chatStore.sendGate('c1', 'more')).toBe('blocked');
+		settingsStore.config = { ...settingsStore.config, contextReserveTokens: 0 };
+		expect(chatStore.sendGate('c1', 'more')).toBe('send');
+		settingsStore.config = { ...settingsStore.config, autoCompact: true };
+	});
+
+	it('#3: request ceilings apply after the custom JSON over every alias', () => {
+		const body: Record<string, unknown> = {
+			max_completion_tokens: 900,
+			max_tokens: -1,
+			n_predict: 5000,
+			reasoning_budget_tokens: 8192
+		};
+
+		applyRequestCeilings(body, { maxTokens: 1000, thinkingBudget: 250 });
+		expect(body).toEqual({
+			max_tokens: 900,
+			reasoning_budget_tokens: 250,
+			thinking_budget_tokens: 250
+		});
+
+		const plain: Record<string, unknown> = {};
+
+		applyRequestCeilings(plain, {});
+		expect(plain).toEqual({});
+	});
+
+	it('#3: the real request builder keeps the ceilings against custom JSON', async () => {
+		const bodies: Record<string, unknown>[] = [];
+
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (_u: string, init?: RequestInit) => {
+				bodies.push(JSON.parse(String(init?.body)));
+
+				return new Response('{}', { status: 500 });
+			})
+		);
+		await ChatService.sendMessage([{ content: 'x', role: 'user' }], {
+			custom: '{"max_tokens":-1,"thinking_budget_tokens":8192}',
+			maxTokensCeiling: 300,
+			stream: false,
+			thinkingBudgetCap: 150
+		} as never).catch(() => {});
+
+		expect(bodies[0]).toMatchObject({ max_tokens: 300, thinking_budget_tokens: 150 });
+	});
+
+	it('#4: summary validation', () => {
+		const ok = { completed: true, finishReason: 'stop', text: SUMMARY };
+
+		expect(summaryRejection(ok)).toBeNull();
+		expect(summaryRejection({ ...ok, completed: false })).toMatch(/before completion/);
+		expect(summaryRejection({ ...ok, toolCalls: '[{"id":"1"}]' })).toMatch(/tool call/);
+		expect(summaryRejection({ ...ok, finishReason: 'length' })).toMatch(/length limit/);
+		expect(summaryRejection({ ...ok, finishReason: undefined })).toMatch(/did not finish/);
+		expect(summaryRejection({ ...ok, text: 'short' })).toMatch(/too short/);
+	});
+
+	it('#5: reserve - instruction must hold the 512-token minimum summary', () => {
+		expect(reserveHoldsSummary(6144, 300)).toBe(true);
+		expect(reserveHoldsSummary(800, 300)).toBe(false);
+		expect(
+			planSummaryRequest({
+				instructionTokens: 300,
+				messages: [
+					msg(MessageRole.USER, 'q'),
+					msg(MessageRole.ASSISTANT, 'r', { timings: t(1, 0, 1) })
+				],
+				nCtx: 100000,
+				reserve: 800
+			})
+		).toBeNull();
+	});
+
+	it('#6: the kept tail stays within a quarter of the context and the room left', () => {
+		// 8192 context, 6144 reserve: a quarter is 2048, the room left after reserve + summary + head
+		// + minimal reply is less
+		expect(
+			tailTokenBudget({ headTokens: 100, nCtx: 8192, reserve: 6144, summaryTokens: 1000 })
+		).toBe(8192 - 6144 - 1000 - 100 - 256);
+		expect(
+			tailTokenBudget({ headTokens: 0, nCtx: 100000, reserve: 6144, summaryTokens: 2000 })
+		).toBe(25000);
+		expect(tailTokenBudget({ headTokens: 0, nCtx: 4000, reserve: 3900, summaryTokens: 500 })).toBe(
+			0
+		);
+	});
+
+	it('#7: thinking of a capped reply is at most half the cap; none for a tiny cap', () => {
+		expect(cappedThinkingBudget(undefined)).toBeUndefined();
+		expect(cappedThinkingBudget(256)).toBe(128);
+		expect(cappedThinkingBudget(255)).toBe(0);
+		expect(cappedThinkingBudget(1)).toBe(0);
+		expect(cappedThinkingBudget(10001)).toBe(5000);
+	});
+
+	it('#8: tool results are estimated at 2.5 chars/token, every estimate +10 %', () => {
+		const text = 'z'.repeat(250);
+
+		expect(estimateMessageTokens(msg(MessageRole.TOOL, text))).toBe(Math.ceil((100 + 8) * 1.1));
+		expect(estimateMessageTokens(msg(MessageRole.USER, text))).toBe(Math.ceil((84 + 8) * 1.1));
 	});
 });

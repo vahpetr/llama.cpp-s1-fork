@@ -582,7 +582,7 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 		settings: [
 			{
 				defaultValue: CONTEXT_RESERVE.DEFAULT_RESERVE_TOKENS,
-				help: 'Tokens kept free at the end of the context for a summary. Replies are capped so they never use them; when fewer are free, the conversation is compacted before the next message (a summary request on the cached conversation, then a new chat with the system prompt, the summary and the last messages; the old chat is kept). 0 turns the reserve and auto-compaction off.',
+				help: 'Tokens kept free at the end of the context for a summary. Replies are capped so they do not use them (thinking gets at most half of a capped reply); when fewer are free, the conversation is compacted before the next message (a summary request that reuses the server prompt cache where it can - without a usable cache checkpoint the server re-reads the conversation once - then a new chat with the system prompt, the summary and the last messages; the old chat is kept). 0 turns the reserve and auto-compaction off.',
 				key: SETTINGS_KEYS.CONTEXT_RESERVE_TOKENS,
 				label: 'Context reserve (tokens)',
 				min: 0,

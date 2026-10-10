@@ -41,6 +41,7 @@
 	} from '$lib/utils';
 	import { parseFilesToMessageExtras } from '$lib/utils/browser-only';
 	import { onDestroy, onMount, tick } from 'svelte';
+	import { toast } from 'svelte-sonner';
 
 	let { showCenteredEmpty = false } = $props();
 
@@ -224,6 +225,34 @@
 			draftMessagesStore.saveDraftMessage(originId, message, files ?? []);
 
 			return true;
+		}
+
+		// W1: compact first when the reserve would not stay free. The message stays bound to the
+		// conversation it was written in: a failed / cancelled compaction leaves it in the input
+		// box (or the draft of that conversation when another one is open now)
+		if (originId) {
+			const gate = chatStore.sendGate(originId, message, result?.extras);
+
+			if (gate === 'blocked') {
+				toast.warning(
+					'The context reserve is reached and auto-compaction is off: use "Compact now" first.'
+				);
+
+				return false;
+			}
+
+			if (gate === 'compact') {
+				const compacted = await chatStore.compactConversation(originId, { auto: true });
+				const target = 'convId' in compacted ? compacted.convId : originId;
+
+				if (conversationsStore.activeConversation?.id !== target) {
+					draftMessagesStore.saveDraftMessage(target, message, files ?? []);
+
+					return true;
+				}
+
+				if (!('convId' in compacted)) return false;
+			}
 		}
 
 		handleSendLikeScroll();

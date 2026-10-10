@@ -363,7 +363,9 @@ export {
 	type ReprocessCost
 } from './system-prompt-cost';
 export {
+	applyRequestCeilings,
 	buildSummaryInstruction,
+	cappedThinkingBudget,
 	compactedConversationName,
 	type ContextReserveConfig,
 	type ContextUsage,
@@ -377,9 +379,12 @@ export {
 	planSummaryRequest,
 	readContextReserveConfig,
 	replyTokenCap,
+	reserveHoldsSummary,
 	resolveContextReserveConfig,
 	selectTailMessages,
 	shouldCompact,
 	type SummaryPlan,
+	summaryRejection,
+	tailTokenBudget,
 	timingsTotal
 } from './context-reserve';

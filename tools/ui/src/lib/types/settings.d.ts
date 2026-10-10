@@ -121,7 +121,9 @@ export interface SettingsChatServiceOptions {
 	timings_per_token?: boolean;
 	// Generation length; 0 = prompt processing only (pre-encode)
 	n_predict?: number;
-	// Upper bound of the thinking budget (thinking_budget_tokens), e.g. for a compaction summary
+	// W1 ceilings, applied after the custom JSON: the output limit (all n_predict aliases) and the
+	// thinking budget (thinking_budget_tokens / reasoning_budget_tokens)
+	maxTokensCeiling?: number;
 	thinkingBudgetCap?: number;
 	// Continuation control (vLLM compat), opt in to the explicit continue final message flag
 	continueFinalMessage?: boolean;
@@ -137,7 +139,8 @@ export interface SettingsChatServiceOptions {
 		response: string,
 		reasoningContent?: string,
 		timings?: ChatMessageTimings,
-		toolCalls?: string
+		toolCalls?: string,
+		finishReason?: string
 	) => void;
 	onError?: (error: Error) => void;
 	onConnectionState?: (state: StreamConnectionState) => void;

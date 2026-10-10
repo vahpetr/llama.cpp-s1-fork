@@ -44,6 +44,7 @@ import type {
 import { isAbortError } from '$lib/utils/abort';
 import { ApiError } from '$lib/utils/api-fetch';
 import { getAuthHeaders, getJsonHeaders } from '$lib/utils/api-headers';
+import { applyRequestCeilings } from '$lib/utils/context-reserve';
 import { formatAttachmentText } from '$lib/utils/formatters';
 import { streamIdentity } from '$lib/utils/stream-identity';
 
@@ -485,7 +486,8 @@ export class ChatService {
 			response: string,
 			reasoningContent?: string,
 			timings?: ChatMessageTimings,
-			toolCalls?: string
+			toolCalls?: string,
+			finishReason?: string
 		) => void,
 		onError?: (error: Error) => void,
 		onReasoningChunk?: (chunk: string) => void,
@@ -529,6 +531,7 @@ export class ChatService {
 		let fullReasoningContent = '';
 		let aggregatedToolCalls: ApiChatCompletionToolCall[] = [];
 		let lastTimings: ChatMessageTimings | undefined;
+		let finishReason: string | undefined;
 		let streamFinished = false;
 		let modelEmitted = false;
 		let idEmitted = false;
@@ -682,6 +685,9 @@ export class ChatService {
 								const reasoningContent = choice?.delta?.reasoning_content;
 								const toolCalls = choice?.delta?.tool_calls;
 								const timings = parsed.timings;
+
+								if (choice?.finish_reason) finishReason = choice.finish_reason;
+
 								const promptProgress = parsed.prompt_progress;
 								const chunkModel = ChatService.extractModelName(parsed);
 
@@ -806,7 +812,8 @@ export class ChatService {
 					aggregatedContent,
 					fullReasoningContent || undefined,
 					lastTimings,
-					finalToolCalls
+					finalToolCalls,
+					finishReason
 				);
 			}
 		} catch (error) {
@@ -1068,6 +1075,7 @@ export class ChatService {
 			excludeReasoningFromContext,
 			frequency_penalty,
 			max_tokens,
+			maxTokensCeiling,
 			min_p,
 			n_predict,
 			onChunk,
@@ -1199,14 +1207,6 @@ export class ChatService {
 			requestBody.thinking_budget_tokens = reasoningBudgetTokens;
 		}
 
-		// a sampler-side limit only: the prompt (and its cached prefix) stays the same
-		if (thinkingBudgetCap !== undefined && thinkingBudgetCap >= 0) {
-			requestBody.thinking_budget_tokens =
-				reasoningBudgetTokens >= 0
-					? Math.min(reasoningBudgetTokens, thinkingBudgetCap)
-					: thinkingBudgetCap;
-		}
-
 		// arms the budget sampler so reasoning can be ended at runtime via the control endpoint
 		requestBody.reasoning_control = true;
 
@@ -1277,6 +1277,13 @@ export class ChatService {
 
 		// after the custom JSON: a pre-encode never generates
 		if (n_predict !== undefined) requestBody.n_predict = n_predict;
+
+		// W1 ceilings last, so no custom JSON alias lifts them: the output limit (context reserve)
+		// and the thinking budget (sampler-side; the prompt and its cached prefix stay the same)
+		applyRequestCeilings(requestBody as unknown as Record<string, unknown>, {
+			maxTokens: maxTokensCeiling,
+			thinkingBudget: thinkingBudgetCap
+		});
 
 		try {
 			const headers: Record<string, string> = { ...getJsonHeaders() };

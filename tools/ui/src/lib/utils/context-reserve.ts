@@ -111,44 +111,64 @@ export function normalizeContextOverrides(
 	return Object.keys(out).length > 0 ? out : undefined;
 }
 
-export function estimateTextTokens(text: string | undefined | null): number {
-	return text ? Math.ceil(text.length / CONTEXT_RESERVE.CHARS_PER_TOKEN) : 0;
+export function estimateTextTokens(
+	text: string | undefined | null,
+	charsPerToken: number = CONTEXT_RESERVE.CHARS_PER_TOKEN
+): number {
+	return text ? Math.ceil(text.length / charsPerToken) : 0;
 }
 
+const withMargin = (tokens: number): number => Math.ceil(tokens * CONTEXT_RESERVE.ESTIMATE_MARGIN);
+const charsPerTokenFor = (role: string): number =>
+	role === MessageRole.TOOL
+		? CONTEXT_RESERVE.TOOL_CHARS_PER_TOKEN
+		: CONTEXT_RESERVE.CHARS_PER_TOKEN;
+
+/** Estimated tokens of a stored message (+10 % margin; tool results at 2.5 chars/token). */
 export function estimateMessageTokens(m: DatabaseMessage): number {
+	const cpt = charsPerTokenFor(m.role);
+
 	let tokens =
 		CONTEXT_RESERVE.MESSAGE_OVERHEAD_TOKENS +
-		estimateTextTokens(m.content) +
+		estimateTextTokens(m.content, cpt) +
 		estimateTextTokens(m.reasoningContent) +
-		estimateTextTokens(m.toolCalls);
+		estimateTextTokens(m.toolCalls, CONTEXT_RESERVE.TOOL_CHARS_PER_TOKEN);
 
 	for (const extra of m.extra ?? []) {
 		const content = (extra as { content?: unknown }).content;
 
 		tokens +=
-			typeof content === 'string' ? estimateTextTokens(content) : CONTEXT_RESERVE.MEDIA_TOKENS;
+			typeof content === 'string' ? estimateTextTokens(content, cpt) : CONTEXT_RESERVE.MEDIA_TOKENS;
 	}
 
-	return tokens;
+	return withMargin(tokens);
 }
 
+/** Estimated tokens of a request message (+10 % margin; tool results at 2.5 chars/token). */
 export function estimateApiMessageTokens(m: ApiChatMessageData): number {
+	const cpt = charsPerTokenFor(m.role);
+
 	let tokens = CONTEXT_RESERVE.MESSAGE_OVERHEAD_TOKENS + estimateTextTokens(m.reasoning_content);
 
 	if (typeof m.content === 'string') {
-		tokens += estimateTextTokens(m.content);
+		tokens += estimateTextTokens(m.content, cpt);
 	} else {
 		for (const part of m.content ?? []) {
 			tokens +=
 				part.type === 'text'
-					? estimateTextTokens((part as { text?: string }).text)
+					? estimateTextTokens((part as { text?: string }).text, cpt)
 					: CONTEXT_RESERVE.MEDIA_TOKENS;
 		}
 	}
 
-	if (m.tool_calls?.length) tokens += estimateTextTokens(JSON.stringify(m.tool_calls));
+	if (m.tool_calls?.length) {
+		tokens += estimateTextTokens(
+			JSON.stringify(m.tool_calls),
+			CONTEXT_RESERVE.TOOL_CHARS_PER_TOKEN
+		);
+	}
 
-	return tokens;
+	return withMargin(tokens);
 }
 
 /** prompt + cached + generated tokens of one reply */
@@ -193,9 +213,9 @@ export function measureContextUsage(
 }
 
 /**
- * max_tokens for a normal reply: the configured limit, capped at free - reserve. Undefined =
- * send the configured value unchanged (no context size, reserve off, or the reserve is already
- * used up - compaction was disabled or failed, the server's context limit applies then).
+ * max_tokens for a normal reply: the configured limit, capped at free - reserve, never below 1
+ * (with the reserve used up a reply cannot eat into it; the send path compacts or refuses
+ * before that). Undefined = the configured value as is (no context size, or the reserve is off).
  */
 export function replyTokenCap(p: {
 	nCtx: number | null;
@@ -209,9 +229,110 @@ export function replyTokenCap(p: {
 
 	const room = p.nCtx - p.used - p.reserve;
 
-	if (room < 1) return configured;
+	if (room < 1) return 1;
 
 	return configured ? Math.min(configured, room) : room;
+}
+
+/**
+ * Thinking budget of a reply whose output is capped by the reserve: at most half the cap, none
+ * below 2 x MIN_ANSWER_TOKENS, so thinking cannot use up the room the answer needs.
+ */
+export function cappedThinkingBudget(cap: number | undefined): number | undefined {
+	if (cap === undefined) return undefined;
+
+	return cap < 2 * CONTEXT_RESERVE.MIN_ANSWER_TOKENS ? 0 : Math.floor(cap / 2);
+}
+
+/** reserve - instruction must hold a minimal summary; else the reserve is too small to compact. */
+export function reserveHoldsSummary(reserve: number, instructionTokens: number): boolean {
+	return reserve - instructionTokens >= CONTEXT_RESERVE.MIN_SUMMARY_TOKENS;
+}
+
+/**
+ * The W1 ceilings on a finished request body, after the custom JSON: the output limit over every
+ * alias the server reads (max_tokens / max_completion_tokens / n_predict; -1 or absent = none)
+ * and the thinking budget (thinking_budget_tokens / reasoning_budget_tokens).
+ */
+export function applyRequestCeilings(
+	body: Record<string, unknown>,
+	c: { maxTokens?: number; thinkingBudget?: number }
+): void {
+	const lowest = (keys: string[], ceiling: number): number => {
+		let v = ceiling;
+
+		for (const k of keys) {
+			const n = Number(body[k]);
+
+			if (body[k] !== undefined && body[k] !== null && Number.isFinite(n) && n >= 0) {
+				v = Math.min(v, n);
+			}
+		}
+
+		return v;
+	};
+
+	if (c.maxTokens !== undefined && c.maxTokens >= 0) {
+		const keys = ['max_tokens', 'max_completion_tokens', 'n_predict'];
+		const v = lowest(keys, c.maxTokens);
+
+		delete body.max_completion_tokens;
+		delete body.n_predict;
+		body.max_tokens = v;
+	}
+
+	if (c.thinkingBudget !== undefined && c.thinkingBudget >= 0) {
+		const keys = ['thinking_budget_tokens', 'reasoning_budget_tokens'];
+		const v = lowest(keys, c.thinkingBudget);
+
+		body.thinking_budget_tokens = v;
+		body.reasoning_budget_tokens = v;
+	}
+}
+
+/**
+ * Why a summary response cannot be used, or null: it must be a complete text answer - the stream
+ * ended ([DONE]) with finish_reason "stop", no tool calls, and at least MIN_SUMMARY_CHARS.
+ */
+export function summaryRejection(r: {
+	completed: boolean;
+	finishReason?: string;
+	toolCalls?: string;
+	text: string;
+}): string | null {
+	if (!r.completed) return 'the summary stream ended before completion';
+
+	if (r.toolCalls && r.toolCalls !== '[]') return 'the model answered with a tool call';
+
+	if (r.finishReason === 'length') {
+		return 'the summary hit its length limit (raise the context reserve)';
+	}
+
+	if (r.finishReason !== 'stop') return `the summary did not finish (${r.finishReason ?? 'none'})`;
+
+	if (r.text.trim().length < CONTEXT_RESERVE.MIN_SUMMARY_CHARS) return 'the summary is too short';
+
+	return null;
+}
+
+/**
+ * Estimated-token budget of the tail copied into the new chat: a quarter of the context at most,
+ * and never more than what is left after the reserve, the summary note, the head (system + cwd
+ * rows) and a minimal reply.
+ */
+export function tailTokenBudget(p: {
+	nCtx: number;
+	reserve: number;
+	summaryTokens: number;
+	headTokens: number;
+}): number {
+	return Math.max(
+		0,
+		Math.min(
+			Math.floor(p.nCtx * CONTEXT_RESERVE.TAIL_CONTEXT_SHARE),
+			p.nCtx - p.reserve - p.summaryTokens - p.headTokens - CONTEXT_RESERVE.MIN_REPLY_TOKENS
+		)
+	);
 }
 
 /** A turn of `pending` new tokens would leave less than the reserve (+ a minimal reply) free. */
@@ -255,7 +376,9 @@ export function dropTrailingEmptyAssistants(
  * prompt) when it leaves room for the summary; otherwise - the context is full (a truncated
  * reply) or nearly so - the path is cut before the last assistant reply(s) that do not fit, at
  * a point whose token count the server measured (that reply's prompt_n + cache_n), so the
- * server rewinds to a checkpoint instead of re-reading the conversation.
+ * server can rewind to a checkpoint. Reuse is best effort: with no usable checkpoint at or
+ * before that point the server re-reads the prefix (the summary request's timings show it).
+ * Null also when reserve - instruction cannot hold a minimal summary.
  */
 export function planSummaryRequest(p: {
 	messages: readonly DatabaseMessage[];
@@ -264,7 +387,10 @@ export function planSummaryRequest(p: {
 	instructionTokens: number;
 }): SummaryPlan | null {
 	const { instructionTokens, messages, nCtx } = p;
-	const desired = Math.max(CONTEXT_RESERVE.MIN_SUMMARY_TOKENS, p.reserve - instructionTokens);
+	const desired = p.reserve - instructionTokens;
+
+	if (desired < CONTEXT_RESERVE.MIN_SUMMARY_TOKENS) return null;
+
 	const usage = measureContextUsage(messages, nCtx);
 	const candidates: { keep: number; tokens: number; cut: boolean }[] = [];
 

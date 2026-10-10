@@ -74,6 +74,7 @@ import type {
 	DatabaseMessageExtraImageFile
 } from '$lib/types/database';
 import {
+	cappedThinkingBudget,
 	estimateApiMessageTokens,
 	executeBrowserInfoTool,
 	executeGetDatetimeTool,
@@ -547,7 +548,14 @@ class AgenticStore {
 					return;
 				}
 
-				if (cap !== undefined) turnOptions = { ...options, max_tokens: cap };
+				if (cap !== undefined) {
+					turnOptions = {
+						...options,
+						max_tokens: cap,
+						maxTokensCeiling: cap,
+						thinkingBudgetCap: cappedThinkingBudget(cap)
+					};
+				}
 			}
 
 			// For turns > 0, create a new assistant message via callback

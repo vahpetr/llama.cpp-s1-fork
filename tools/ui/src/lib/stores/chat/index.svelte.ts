@@ -30,6 +30,7 @@ import { RouterService } from '$lib/services/router.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { agenticStore } from '$lib/stores/agentic/index.svelte';
 import { chatActivityStore } from '$lib/stores/chat/activity.svelte';
+import { draftMessagesStore } from '$lib/stores/chat/drafts.svelte';
 import { type ChatFlowsHost, ChatMessageFlows } from '$lib/stores/chat/flows.svelte';
 import { chatProcessingStore } from '$lib/stores/chat/processing.svelte';
 import { type ChatStreamHost, ChatStreamManager } from '$lib/stores/chat/streams.svelte';
@@ -51,6 +52,7 @@ import type {
 } from '$lib/types';
 import {
 	buildSummaryInstruction,
+	cappedThinkingBudget,
 	compactedConversationName,
 	dropTrailingEmptyAssistants,
 	estimateMessageTokens,
@@ -65,9 +67,12 @@ import {
 	parseToolsSnapshot,
 	planSummaryRequest,
 	replyTokenCap,
+	reserveHoldsSummary,
 	resolveContextReserveConfig,
 	selectTailMessages,
-	shouldCompact
+	shouldCompact,
+	summaryRejection,
+	tailTokenBudget
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
 import { toast } from 'svelte-sonner';
@@ -75,6 +80,8 @@ import { toast } from 'svelte-sonner';
 /** A running context compaction (W1): the summary request of one conversation. */
 export interface CompactionState {
 	convId: string;
+	/** owner token: cleanup releases only the compaction it started */
+	id: number;
 	/** summary tokens generated so far */
 	tokens: number;
 }
@@ -103,6 +110,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	streamConnectionState = $state<StreamConnectionState>(StreamConnectionState.STREAMING);
 	private abortControllers = new SvelteMap<string, AbortController>();
 	private addFilesHandler: ((files: File[]) => void) | null = $state(null);
+	private compactionSeq = 0;
 	// message flows: edit, regenerate, continue, delete
 	private flows = new ChatMessageFlows(this);
 	private isEditModeActive = $state(false);
@@ -313,147 +321,55 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 	/**
 	 * W1: compact a conversation whose context is (nearly) full. A summary request reuses the cached
-	 * prompt (the conversation exactly as the chat sends it + an instruction message; when the
-	 * context is full or has no room for the summary, cut before the last reply at a measured
-	 * point, so the server rewinds to a checkpoint - never a full re-read). Then a new
-	 * conversation = system prompt + the summary (an assistant note) + the last messages, linked
-	 * to this one, which is kept. Opens the new conversation.
+	 * prompt where the server can (the conversation exactly as the chat sends it + an instruction
+	 * message; when the context is full or has no room for the summary, cut before the last reply
+	 * at a measured point so the server can rewind to a checkpoint - best effort: without a usable
+	 * checkpoint the server re-reads that prefix). Then a new conversation = system prompt + the
+	 * summary (an assistant note) + the last messages, linked to this one, which is kept. Opens
+	 * the new conversation.
 	 */
 	async compactConversation(
 		convId: string,
 		opts: { auto?: boolean } = {}
 	): Promise<CompactionResult> {
+		// ownership is claimed before the first await: no second compaction, send or agentic flow
+		// can start on this conversation in between, and cleanup releases only what this call owns
 		if (this.compaction) return { error: 'A compaction is already running' };
 
 		if (this.isChatLoadingInternal(convId)) return { error: 'The conversation is busy' };
 
+		const owner: CompactionState = { convId, id: ++this.compactionSeq, tokens: 0 };
+
+		this.compaction = owner;
+		this.setChatLoading(convId, true);
+
+		const abortController = this.getOrCreateAbortController(convId);
 		const fail = (error: string): CompactionResult => {
 			toast.error(`Compaction failed: ${error}`);
 
 			return { error };
 		};
-		const conversation = await DatabaseService.getConversation(convId);
 
-		if (!conversation?.currNode) return fail('the conversation is empty');
-
-		const path = dropTrailingEmptyAssistants(
-			filterByLeafNodeId(
-				await DatabaseService.getConversationMessages(convId),
-				conversation.currNode,
-				false
-			) as DatabaseMessage[]
-		).filter((m) => m.type !== MessageType.ROOT);
-		const model = serverStore.isRouterMode
-			? modelsStore.selectedModelName || getConversationModel(path)
-			: null;
-		const nCtx = this.contextSizeFor(model);
-
-		if (!nCtx) return fail('the context size is unknown (no /props yet)');
-
-		const cfg = resolveContextReserveConfig(settingsStore.config, conversation.contextSettings);
-		const reserve = cfg.reserve > 0 ? cfg.reserve : CONTEXT_RESERVE.DEFAULT_RESERVE_TOKENS;
-		const instructionTokens =
-			estimateTextTokens(buildSummaryInstruction(cfg.summaryPrompt, reserve)) +
-			CONTEXT_RESERVE.MESSAGE_OVERHEAD_TOKENS * 2;
-		const plan = planSummaryRequest({ instructionTokens, messages: path, nCtx, reserve });
-
-		if (!plan) return fail('no point of the conversation leaves room for a summary');
-
-		const instruction = buildSummaryInstruction(cfg.summaryPrompt, plan.maxTokens);
-		const instructionMessage = {
-			children: [],
-			content: instruction,
-			convId,
-			id: `compact-instruction-${convId}`,
-			parent: null,
-			role: MessageRole.USER,
-			timestamp: Date.now(),
-			toolCalls: '',
-			type: MessageType.TEXT
-		} as DatabaseMessage;
-		// the request of a real turn (options of this conversation, its frozen tool list), so the
-		// prompt is a pure extension of the cached one
-		const frozenTools = parseToolsSnapshot(conversation.toolsSnapshot);
-		const tools =
-			agenticStore.getConfig(settingsStore.config).enabled && frozenTools && frozenTools.length > 0
-				? frozenTools
-				: undefined;
-		const abortController = this.getOrCreateAbortController(convId);
-
-		let summary = '';
-		let summaryModel: string | null = null;
-
-		this.compaction = { convId, tokens: 0 };
-		this.setChatLoading(convId, true);
+		let result: CompactionResult = { error: 'not started' };
 
 		try {
-			await ChatService.sendMessage(
-				[...path.slice(0, plan.keep), instructionMessage],
-				{
-					...this.getApiOptions(conversation),
-					...(model ? { model } : {}),
-					max_tokens: plan.maxTokens,
-					onChunk: (chunk: string) => {
-						summary += chunk;
-					},
-					onError: () => {},
-					onModel: (name: string) => {
-						summaryModel = normalizeModelName(name) || summaryModel;
-					},
-					onTimings: (timings?: ChatMessageTimings) => {
-						if (this.compaction && timings?.predicted_n !== undefined) {
-							this.compaction = { ...this.compaction, tokens: timings.predicted_n };
-						}
-					},
-					stream: true,
-					// thinking may take at most a quarter of the summary budget
-					thinkingBudgetCap: Math.floor(plan.maxTokens / 4),
-					tools
-				},
-				undefined,
-				abortController.signal
-			);
+			result = await this.runCompaction(convId, owner, abortController, fail, opts);
 
-			if (abortController.signal.aborted) {
-				return { cancelled: true };
-			}
-
-			summary = summary.trim();
-
-			if (!summary) return fail('the model returned an empty summary');
-
-			const newConvId = await this.saveCompactedConversation(conversation, path, plan.cut, {
-				keepMessages: cfg.keepMessages,
-				model: summaryModel,
-				nCtx,
-				reserve,
-				summary
-			});
-
-			await conversationsStore.loadConversations();
-			await conversationsStore.loadConversation(newConvId);
-			await goto(RouterService.chat(newConvId));
-
-			if (!opts.auto) toast.success('Conversation compacted; the previous one is kept');
-
-			return { convId: newConvId };
+			return result;
 		} catch (error) {
-			if (isAbortError(error) || abortController.signal.aborted) return { cancelled: true };
+			result =
+				isAbortError(error) || abortController.signal.aborted
+					? { cancelled: true }
+					: fail(error instanceof Error ? error.message : String(error));
 
-			return fail(error instanceof Error ? error.message : String(error));
+			return result;
 		} finally {
-			this.compaction = null;
+			if (this.compaction?.id === owner.id) this.compaction = null;
+
 			this.abortRequest(convId);
 			this.setChatLoading(convId, false);
 			this.processing.setState(convId, null);
-
-			// a message queued while the summary ran goes to the conversation now active: right away
-			// after a manual compaction, after the triggering message's reply after an automatic one
-			const pending = this.consumePendingMessage(convId);
-			const activeId = conversationsStore.activeConversation?.id;
-
-			if (pending && !opts.auto) void this.sendMessage(pending.content, pending.extras);
-			else if (pending && activeId) this.pendingMessages.set(activeId, pending);
+			this.settleQueuedAfterCompaction(convId, result, !!opts.auto);
 		}
 	}
 
@@ -718,29 +634,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		return this.chatStreamingStates.has(conversationsStore.activeConversation?.id ?? '');
 	}
 
-	/** W1: does sending this message to the conversation need a compaction first? */
-	needsCompaction(convId: string, content: string, extras?: DatabaseMessageExtra[]): boolean {
-		const cfg = conversationsStore.getContextConfig(convId);
-
-		if (!cfg.autoCompact || cfg.reserve <= 0) return false;
-
-		if (conversationsStore.activeConversation?.id !== convId) return false;
-
-		const messages = conversationsStore.activeMessages as DatabaseMessage[];
-		const model = serverStore.isRouterMode
-			? modelsStore.selectedModelName || getConversationModel(messages)
-			: null;
-		const nCtx = this.contextSizeFor(model);
-		const usage = measureContextUsage(messages, nCtx);
-		const pending = estimateMessageTokens({
-			content,
-			extra: extras,
-			role: MessageRole.USER
-		} as DatabaseMessage);
-
-		return shouldCompact({ nCtx, pending, reserve: cfg.reserve, used: usage.used });
-	}
-
 	/**
 	 * Record a working-directory change into chat history as a synthetic
 	 * user message, so the model sees it on its next turn (the client
@@ -842,27 +735,75 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		}
 	}
 
-	/** W1: max_tokens of a reply to `messages`: the configured limit capped at free - reserve. */
-	replyMaxTokens(
+	/**
+	 * W1: output limits of a reply to `messages`: max_tokens = the configured limit capped at
+	 * free - reserve (floor 1), enforced after the custom JSON, and a thinking budget of at most
+	 * half of it. Empty when the reserve does not apply (off, or no context size).
+	 */
+	replyLimits(
 		messages: readonly DatabaseMessage[],
 		model?: string | null,
 		convId?: string
-	): number | undefined {
+	): { max_tokens?: number; maxTokensCeiling?: number; thinkingBudgetCap?: number } {
 		const cfg = conversationsStore.getContextConfig(convId);
-		const configured = Number(settingsStore.config.max_tokens) || undefined;
 		const nCtx = this.contextSizeFor(model);
 
-		return replyTokenCap({
-			configured,
+		if (!nCtx || cfg.reserve <= 0) return {};
+
+		const max = Number(settingsStore.config.max_tokens);
+		const cap = replyTokenCap({
+			configured: max > 0 ? max : undefined,
 			nCtx,
 			reserve: cfg.reserve,
 			used: measureContextUsage(messages, nCtx).used
 		});
+
+		if (cap === undefined) return {};
+
+		return { max_tokens: cap, maxTokensCeiling: cap, thinkingBudgetCap: cappedThinkingBudget(cap) };
+	}
+
+	/** W1: does sending this message leave less than the reserve (+ a minimal reply) free? */
+	reserveReached(convId: string, content: string, extras?: DatabaseMessageExtra[]): boolean {
+		const cfg = conversationsStore.getContextConfig(convId);
+
+		if (cfg.reserve <= 0) return false;
+
+		if (conversationsStore.activeConversation?.id !== convId) return false;
+
+		const messages = conversationsStore.activeMessages as DatabaseMessage[];
+		const model = serverStore.isRouterMode
+			? modelsStore.selectedModelName || getConversationModel(messages)
+			: null;
+		const nCtx = this.contextSizeFor(model);
+		const usage = measureContextUsage(messages, nCtx);
+		const pending = estimateMessageTokens({
+			content,
+			extra: extras,
+			role: MessageRole.USER
+		} as DatabaseMessage);
+
+		return shouldCompact({ nCtx, pending, reserve: cfg.reserve, used: usage.used });
 	}
 
 	savePendingDraft(message: string, files: ChatUploadedFile[]): void {
 		this.pendingDraftMessage = message;
 		this.pendingDraftFiles = [...files];
+	}
+
+	/**
+	 * W1: what a send of this message to the (open) conversation must do first: nothing, compact
+	 * (the reserve would not stay free; auto-compaction on) or refuse (auto-compaction off - the
+	 * reply could only eat into the reserve).
+	 */
+	sendGate(
+		convId: string,
+		content: string,
+		extras?: DatabaseMessageExtra[]
+	): 'send' | 'compact' | 'blocked' {
+		if (!this.reserveReached(convId, content, extras)) return 'send';
+
+		return conversationsStore.getContextConfig(convId).autoCompact ? 'compact' : 'blocked';
 	}
 
 	async sendMessage(content: string, extras?: DatabaseMessageExtra[]): Promise<void> {
@@ -887,11 +828,33 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		// Cancel any in-flight pre-encode request
 		this.cancelPreEncode();
 
-		// W1: a turn that would not leave the context reserve free compacts first; the message then
-		// goes to the new conversation. A failed or cancelled compaction sends it here (the typed
-		// message is never dropped; the server's context limit applies then)
-		if (activeConv && this.needsCompaction(activeConv.id, content, extras)) {
-			await this.compactConversation(activeConv.id, { auto: true });
+		// W1: a turn that would not leave the context reserve free compacts first and the message
+		// goes to the continuation. It is bound to its conversation: when the compaction fails or is
+		// cancelled, or the open conversation changed meanwhile, it is not sent anywhere else - it
+		// stays the input draft of its own conversation. (The chat screen runs this gate before it
+		// clears the input, so there a failed compaction just leaves the message in the box.)
+		if (activeConv) {
+			const gate = this.sendGate(activeConv.id, content, extras);
+
+			if (gate === 'blocked') {
+				toast.warning(
+					'The context reserve is reached and auto-compaction is off: use "Compact now" first.'
+				);
+				this.keepAsDraft(activeConv.id, content, extras);
+
+				return;
+			}
+
+			if (gate === 'compact') {
+				const result = await this.compactConversation(activeConv.id, { auto: true });
+				const target = 'convId' in result ? result.convId : activeConv.id;
+
+				if (!('convId' in result) || conversationsStore.activeConversation?.id !== target) {
+					this.keepAsDraft(target, content, extras);
+
+					return;
+				}
+			}
 		}
 
 		// Consume MCP resource attachments - converts them to extras and clears the live store
@@ -999,6 +962,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			});
 		}
 	}
+
 	setChatLoading(convId: string, loading: boolean): void {
 		if (loading) {
 			this.activity.markLocal(convId);
@@ -1027,7 +991,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		if (convId === conversationsStore.activeConversation?.id) this.currentResponse = response;
 	}
-
 	setEditModeActive(handler: (files: File[]) => void): void {
 		this.isEditModeActive = true;
 		this.addFilesHandler = handler;
@@ -1381,8 +1344,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			disabledTools: conversationsStore.preferences.getDisabledTools()
 		};
 		// W1: the reply never uses the context reserve (the agentic loop re-caps each later turn)
-		const replyMaxTokens = this.replyMaxTokens(allMessages, effectiveModel, convId);
-		const replyCap = replyMaxTokens !== undefined ? { max_tokens: replyMaxTokens } : {};
+		const replyCap = this.replyLimits(allMessages, effectiveModel, convId);
 
 		{
 			const agenticResult = await agenticStore.runAgenticFlow({
@@ -1531,6 +1493,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			this.abortControllers.clear();
 		}
 	}
+
 	private async generateTitleWithLLM(
 		userContent: string,
 		assistantContent: string,
@@ -1583,6 +1546,148 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		return this.chatStreamingStates.get(convId);
 	}
 
+	/** W1: keep an unsent message as the input draft of its own conversation. */
+	private keepAsDraft(convId: string, content: string, extras?: DatabaseMessageExtra[]): void {
+		draftMessagesStore.saveDraftMessage(convId, content, []);
+		toast.info(
+			extras && extras.length > 0
+				? 'The message was not sent; its text is kept as the draft of its conversation (attachments must be added again).'
+				: 'The message was not sent; it is kept as the draft of its conversation.'
+		);
+	}
+	private async runCompaction(
+		convId: string,
+		owner: CompactionState,
+		abortController: AbortController,
+		fail: (error: string) => CompactionResult,
+		opts: { auto?: boolean }
+	): Promise<CompactionResult> {
+		const conversation = await DatabaseService.getConversation(convId);
+
+		if (!conversation?.currNode) return fail('the conversation is empty');
+
+		const path = dropTrailingEmptyAssistants(
+			filterByLeafNodeId(
+				await DatabaseService.getConversationMessages(convId),
+				conversation.currNode,
+				false
+			) as DatabaseMessage[]
+		).filter((m) => m.type !== MessageType.ROOT);
+		const model = serverStore.isRouterMode
+			? modelsStore.selectedModelName || getConversationModel(path)
+			: null;
+		const nCtx = this.contextSizeFor(model);
+
+		if (!nCtx) return fail('the context size is unknown (no /props yet)');
+
+		const cfg = resolveContextReserveConfig(settingsStore.config, conversation.contextSettings);
+		const reserve = cfg.reserve > 0 ? cfg.reserve : CONTEXT_RESERVE.DEFAULT_RESERVE_TOKENS;
+		const instructionTokens =
+			estimateTextTokens(buildSummaryInstruction(cfg.summaryPrompt, reserve)) +
+			CONTEXT_RESERVE.MESSAGE_OVERHEAD_TOKENS * 2;
+
+		if (!reserveHoldsSummary(reserve, instructionTokens)) {
+			return fail(
+				`the context reserve (${reserve}) minus the instruction (~${instructionTokens}) is below ` +
+					`the ${CONTEXT_RESERVE.MIN_SUMMARY_TOKENS}-token minimum summary; raise the reserve`
+			);
+		}
+
+		const plan = planSummaryRequest({ instructionTokens, messages: path, nCtx, reserve });
+
+		if (!plan) return fail('no point of the conversation leaves room for a summary');
+
+		const instruction = buildSummaryInstruction(cfg.summaryPrompt, plan.maxTokens);
+		const instructionMessage = {
+			children: [],
+			content: instruction,
+			convId,
+			id: `compact-instruction-${convId}`,
+			parent: null,
+			role: MessageRole.USER,
+			timestamp: Date.now(),
+			toolCalls: '',
+			type: MessageType.TEXT
+		} as DatabaseMessage;
+		// the request of a real turn (options of this conversation, its frozen tool list), so the
+		// prompt is a pure extension of the cached one
+		const frozenTools = parseToolsSnapshot(conversation.toolsSnapshot);
+		const tools =
+			agenticStore.getConfig(settingsStore.config).enabled && frozenTools && frozenTools.length > 0
+				? frozenTools
+				: undefined;
+
+		let summary = '';
+		let summaryModel: string | null = null;
+		let completion: { finishReason?: string; toolCalls?: string } | null = null;
+
+		await ChatService.sendMessage(
+			[...path.slice(0, plan.keep), instructionMessage],
+			{
+				...this.getApiOptions(conversation),
+				...(model ? { model } : {}),
+				max_tokens: plan.maxTokens,
+				// enforced after the custom JSON
+				maxTokensCeiling: plan.maxTokens,
+				onChunk: (chunk: string) => {
+					summary += chunk;
+				},
+				onComplete: (
+					_c: string,
+					_r?: string,
+					_t?: ChatMessageTimings,
+					toolCalls?: string,
+					finishReason?: string
+				) => {
+					completion = { finishReason, toolCalls };
+				},
+				onError: () => {},
+				onModel: (name: string) => {
+					summaryModel = normalizeModelName(name) || summaryModel;
+				},
+				onTimings: (timings?: ChatMessageTimings) => {
+					if (this.compaction?.id === owner.id && timings?.predicted_n !== undefined) {
+						this.compaction = { ...owner, tokens: timings.predicted_n };
+					}
+				},
+				stream: true,
+				// thinking may take at most a quarter of the summary budget
+				thinkingBudgetCap: Math.floor(plan.maxTokens / 4),
+				tools
+			},
+			undefined,
+			abortController.signal
+		);
+
+		if (abortController.signal.aborted) return { cancelled: true };
+
+		const done = completion as { finishReason?: string; toolCalls?: string } | null;
+		const rejection = summaryRejection({
+			completed: done !== null,
+			finishReason: done?.finishReason,
+			text: summary,
+			toolCalls: done?.toolCalls
+		});
+
+		if (rejection) return fail(rejection);
+
+		const newConvId = await this.saveCompactedConversation(conversation, path, plan.cut, {
+			keepMessages: cfg.keepMessages,
+			model: summaryModel,
+			nCtx,
+			reserve,
+			summary: summary.trim()
+		});
+
+		await conversationsStore.loadConversations();
+		await conversationsStore.loadConversation(newConvId);
+		await goto(RouterService.chat(newConvId));
+
+		if (!opts.auto) toast.success('Conversation compacted; the previous one is kept');
+
+		return { convId: newConvId };
+	}
+
 	/** W1: write the compacted conversation; returns its id. */
 	private async saveCompactedConversation(
 		source: DatabaseConversation,
@@ -1603,13 +1708,22 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				m.content.trim() !== SYSTEM_MESSAGE_PLACEHOLDER
 		);
 		const body = path.filter((m) => m.role !== MessageRole.SYSTEM && !m.isSynthetic);
+		// the working directory row the model last saw (the tail carries no synthetic rows)
+		const cwdRow = [...path].reverse().find((m) => m.isSynthetic && m.role === MessageRole.USER);
+		// at most a quarter of the context, and what the new chat has left after the reserve, the
+		// summary note, the head rows and a minimal reply
 		const tail = selectTailMessages(
 			body,
 			p.keepMessages,
-			Math.max(p.reserve, Math.floor(p.nCtx * CONTEXT_RESERVE.TAIL_CONTEXT_SHARE))
+			tailTokenBudget({
+				headTokens:
+					(system ? estimateMessageTokens(system) : 0) +
+					(cwdRow ? estimateMessageTokens(cwdRow) : 0),
+				nCtx: p.nCtx,
+				reserve: p.reserve,
+				summaryTokens: estimateTextTokens(p.summary) + 64
+			})
 		);
-		// the working directory row the model last saw (the tail carries no synthetic rows)
-		const cwdRow = [...path].reverse().find((m) => m.isSynthetic && m.role === MessageRole.USER);
 		const newConv = await DatabaseService.createConversation(
 			compactedConversationName(source.name),
 			{
@@ -1753,6 +1867,35 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			lastMessage.toolCalls = '';
 			console.error('Failed to save partial response:', error);
 		}
+	}
+
+	/**
+	 * W1: a message queued (typed while the summary ran) belongs to the conversation it was typed
+	 * in: after a successful compaction it goes to the continuation (sent now after a manual
+	 * compaction when that conversation is open; after the triggering reply after an automatic
+	 * one); otherwise it is kept as the input draft of its conversation - never sent into
+	 * whatever conversation happens to be open.
+	 */
+	private settleQueuedAfterCompaction(
+		convId: string,
+		result: CompactionResult,
+		auto: boolean
+	): void {
+		const pending = this.consumePendingMessage(convId);
+
+		if (!pending) return;
+
+		const target = 'convId' in result ? result.convId : convId;
+		const active = conversationsStore.activeConversation?.id;
+
+		if ('convId' in result && active === target) {
+			if (auto) this.pendingMessages.set(target, pending);
+			else void this.sendMessage(pending.content, pending.extras);
+
+			return;
+		}
+
+		this.keepAsDraft(target, pending.content, pending.extras);
 	}
 
 	private async triggerPreEncode(convId: string, model?: string | null): Promise<void> {
