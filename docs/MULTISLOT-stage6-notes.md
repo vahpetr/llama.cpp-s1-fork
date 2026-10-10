@@ -1,7 +1,7 @@
 # Multi-slot stage 6 — notes for item 4 (per-stream KV) [TAG_MULTISLOT]
 
-Source: Codex gpt-6-astra review r1 of items 1–3 (piagent `docs/verification/2026-10-09-codex-astra-stage6-r1.md`),
-spec piagent `docs/superpowers/specs/2026-10-09-multislot-pregate-spec.md`. State at this note: items 1–3 + round 2
+Source: an external code review (round 1) of items 1–3 and my multi-slot pre-gate spec (private notes; summary in
+docs/s1/PATCHES.md rows 0197–0202 and docs/s1/BENCHMARKS.md section 5). State at this note: items 1–3 + round 2
 (`LLAMA_QSA_HISTORY_DENSE`, tests) on `prod-v11-stage6`.
 
 ## Design points item 4 must honour under per-stream KV (`kv_unified = false`, `n_stream = n_seq_max`)
@@ -77,7 +77,7 @@ PASS requirement yet. Measure per-stream startup / restore peaks against 102400 
   N = 64) + negative child. Not covered: server e2e (fixture tokenizer `no_vocab`, the server's detokenization
   asserts on LLAMA_VOCAB_TYPE_NONE), the server's capacity-retry cut, an explicit unchanged-shape transition test.
 
-## Round 3 status (Codex astra review r2, piagent `docs/verification/2026-10-09-codex-astra-stage6-r2.md`)
+## Round 3 status (external code review, round 2)
 
 - **Major 1 — guard dedup (fixed).** `qwen4exp_qsa_routing_check()` validates EVERY invocation (no early return on
   a remembered ubatch). Only the proof counters stay "once per ubatch, not per QSA layer", deduplicated by a word-wise
@@ -169,7 +169,7 @@ consume it on the GPU and it was never read back.
   tile_n=<BN = pipeline wg_denoms[1]> n_as= topk= routed=<sum = rows * topk> pipeline=<chosen pipeline name>`.
   `tile_n` is the BN of the size class `ggml_vk_guess_matmul_id_pipeline` picked (L/M/S, see the warptile tables).
 - The extra barrier perturbs timing: never combine the knob with a speed measurement.
-- Check (balkon, Vulkan build `vkbuild`-style in llama-dev:vulkan, hands running, 2026-10-10; the knob run under `flock -n ~/piagent-tuning/.gpu.lock`):
+- Check (balkon, Vulkan build `vkbuild`-style in llama-dev:vulkan, hands running, 2026-10-10; the knob run under a host-wide GPU lock):
   `vkrun.sh stage7 -- -o MUL_MAT_ID` OK without the knob; with `GGML_VK_EXPERT_OCCUPANCY=1
   GGML_VK_EXPERT_OCCUPANCY_EVERY=1` also OK (2/2 backends), 151 lines, `routed == rows * topk` on all 151;
   e.g. the n_as 512 / topk 10 / 2048-token case: `experts_used=512 mean=40.0 p10=32 p50=40 p90=48 max=59
