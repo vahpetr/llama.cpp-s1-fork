@@ -1089,7 +1089,7 @@ static bool qwen4exp_qsa_prefill_indexed() {
     return indexed;
 }
 
-// [TAG_QSA_INDEXED_SORT] (frozen-M6 isolation, ~/claude-tmp/codex/m6-frozen.sh) LLAMA_QSA_INDEXED_SORT=1 (default 0 = node for
+// [TAG_QSA_INDEXED_SORT] (frozen-M6 isolation, see docs/s1/PATCHES.md row 0152) LLAMA_QSA_INDEXED_SORT=1 (default 0 = node for
 // node as before): the indexed flash attention reads each row's QSA_TOP_K ids SORTED ASCENDING, i.e. walks the selected
 // cells in KV order as the scan does, so an indexed-vs-scan difference that the order explains disappears with it (the
 // radix select emits winners, then ties, each run ascending). The ids are < 2^24, so cast to F32, argsort ascending,

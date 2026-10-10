@@ -1,5 +1,5 @@
 // [TAG_QSA_FROZEN] llama-qsa-frozen core: the capture format, the capture eval callback and the frozen-tensor replay
-// (frozen-M6 isolation, ~/claude-tmp/codex/m6-frozen.sh). Header-only, ggml + ggml-backend + nlohmann::json only, so
+// (frozen-M6 isolation, see docs/s1/PATCHES.md row 0152). Header-only, ggml + ggml-backend + nlohmann::json only, so
 // tests/test-qsa-frozen.cpp drives exactly the code the tool runs.
 //
 // Capture layout, one directory per (depth, layer): <capture-dir>/cap-<d>-il<il>/
