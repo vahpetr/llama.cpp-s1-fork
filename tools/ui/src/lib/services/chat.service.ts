@@ -1162,16 +1162,21 @@ export class ChatService {
 		}
 
 		const requestBody: ApiChatCompletionRequest = {
-			messages: normalizedMessages.map((msg: ApiChatMessageData) => {
+			messages: normalizedMessages.map((msg: ApiChatMessageData, i: number) => {
 				const mapped: ApiChatCompletionRequest['messages'][0] = {
 					content: msg.content,
 					role: msg.role,
 					tool_call_id: msg.tool_call_id,
 					tool_calls: msg.tool_calls
 				};
+				// Include reasoning_content from the dedicated field; the assistant message a continuation
+				// extends (the prefill) keeps it even when reasoning is excluded: it is being continued
+				const isPrefill =
+					!!continueFinalMessage &&
+					i === normalizedMessages.length - 1 &&
+					msg.role === MessageRole.ASSISTANT;
 
-				// Include reasoning_content from the dedicated field
-				if (!excludeReasoningFromContext && msg.reasoning_content) {
+				if ((!excludeReasoningFromContext || isPrefill) && msg.reasoning_content) {
 					mapped.reasoning_content = msg.reasoning_content;
 				}
 
@@ -1215,6 +1220,8 @@ export class ChatService {
 			requestBody.continue_final_message = true;
 			requestBody.add_generation_prompt = false;
 		}
+
+		const continuationMessages = requestBody.messages;
 
 		if (temperature !== undefined) requestBody.temperature = temperature;
 
@@ -1278,6 +1285,14 @@ export class ChatService {
 
 		// after the custom JSON: a pre-encode never generates
 		if (n_predict !== undefined) requestBody.n_predict = n_predict;
+
+		// a continuation's own fields win over the custom JSON: the messages (ending in the prefill)
+		// and the continuation flags, so a join can never concatenate an independent response
+		if (continueFinalMessage) {
+			requestBody.messages = continuationMessages;
+			requestBody.continue_final_message = true;
+			requestBody.add_generation_prompt = false;
+		}
 
 		// W1 ceilings last, so no custom JSON alias lifts them: the output limit (context reserve)
 		// and the thinking budget (sampler-side; the prompt and its cached prefix stay the same)

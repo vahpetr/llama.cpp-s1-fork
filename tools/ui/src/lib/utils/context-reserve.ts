@@ -258,6 +258,15 @@ export function estimateApiMessageTokens(m: ApiChatMessageData): number {
 	return withMargin(tokens);
 }
 
+/** Estimated tokens of the tool definitions a request carries (rendered into the prompt). */
+export function estimateToolsTokens(tools: readonly unknown[] | null | undefined): number {
+	if (!tools || tools.length === 0) return 0;
+
+	return withMargin(
+		estimateTextTokens(JSON.stringify(tools), CONTEXT_RESERVE.TOOL_CHARS_PER_TOKEN)
+	);
+}
+
 /** prompt + cached + generated tokens of one reply */
 export function timingsTotal(t: ChatMessageTimings | undefined): number {
 	return t ? (t.prompt_n ?? 0) + (t.cache_n ?? 0) + (t.predicted_n ?? 0) : 0;

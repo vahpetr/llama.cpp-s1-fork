@@ -60,6 +60,7 @@ import {
 	dropTrailingEmptyAssistants,
 	estimateMessageTokens,
 	estimateTextTokens,
+	estimateToolsTokens,
 	filterByLeafNodeId,
 	findMessageById,
 	formatCwdMessage,
@@ -77,7 +78,8 @@ import {
 	summaryLengthUsable,
 	summaryRejection,
 	tailTokenBudget,
-	unfinishedTail} from '$lib/utils';
+	unfinishedTail
+} from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
 import { toast } from 'svelte-sonner';
 
@@ -301,82 +303,18 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	): Promise<void> {
 		if (info.toolCalls || conversationsStore.activeConversation?.id !== convId) return;
 
-		let target = { convId, messageId };
-		let finish = info.finish;
-		let byReserve = info.byReserve;
-		let n = 0;
+		const target = { convId, messageId };
 
-		while (finish === 'length' && byReserve) {
-			if (n >= CONTEXT_RESERVE.MAX_CONTINUATIONS) {
-				await this.markReply(
-					target.messageId,
-					'reply truncated: still cut by the context reserve after 2 continuations'
-				);
+		try {
+			await this.runReplyRules(target, info);
+		} finally {
+			// a mid-turn compaction moved this turn's queued input to the continuation: send it there
+			// exactly once, after the continuation finished (the original handler drains only the
+			// old, now empty queue)
+			if (target.convId !== convId) {
+				const pending = this.consumePendingMessage(target.convId);
 
-				return;
-			}
-
-			const compacted = await this.compactConversation(target.convId, {
-				auto: true,
-				partialMessageId: target.messageId
-			});
-
-			if (!('convId' in compacted) || !compacted.partialId) {
-				await this.markReply(
-					target.messageId,
-					`reply truncated: ${'error' in compacted ? `compaction failed (${compacted.error})` : 'compaction cancelled'}`
-				);
-
-				return;
-			}
-
-			target = { convId: compacted.convId, messageId: compacted.partialId };
-			n++;
-
-			const c = await this.continueReply(target.convId, target.messageId, {});
-
-			if ('error' in c) {
-				await this.markReply(
-					target.messageId,
-					`reply truncated: the continuation failed (${c.error})`
-				);
-
-				return;
-			}
-
-			finish = c.finish;
-			byReserve = c.byReserve;
-		}
-
-		if (finish !== 'stop') return;
-
-		for (let g = 0; ; g++) {
-			const msg = conversationsStore.activeMessages.find((m) => m.id === target.messageId);
-
-			if (!msg || (msg.toolCalls && msg.toolCalls !== '[]')) return;
-
-			const why = unfinishedTail(msg.content ?? '');
-
-			if (!why) return;
-
-			if (g >= CONTEXT_RESERVE.MAX_CONTINUATIONS) {
-				await this.markReply(target.messageId, `reply looks unfinished: ${why}`);
-				toast.warning(`The reply looks unfinished (${why}); kept as is.`);
-
-				return;
-			}
-
-			const model = serverStore.isRouterMode ? modelsStore.selectedModelName : null;
-			const id = await imEndTokenId(model);
-			const c = await this.continueReply(target.convId, target.messageId, {
-				logitBias: id === null ? undefined : { [String(id)]: CONTEXT_RESERVE.GUARD_BIAS },
-				maxTokens: CONTEXT_RESERVE.GUARD_MAX_TOKENS
-			});
-
-			if ('error' in c || c.finish !== 'stop') {
-				await this.markReply(target.messageId, `reply looks unfinished: ${why}`);
-
-				return;
+				if (pending) await this.deliverQueued(target.convId, pending);
 			}
 		}
 	}
@@ -387,6 +325,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			this.preEncodeAbortController = null;
 		}
 	}
+
 	/**
 	 * Resets the loading, streaming and processing state for a conversation
 	 * after a generation ends or errors. Shared by the flows' exit paths.
@@ -409,7 +348,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		if (convId === conversationsStore.activeConversation?.id) this.currentResponse = '';
 	}
-
 	clearEditMode(): void {
 		this.isEditModeActive = false;
 		this.addFilesHandler = null;
@@ -533,7 +471,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		if (!nCtx) return null;
 
 		const cfg = conversationsStore.getContextConfig(convId);
-		const used = measureContextUsage(messages, nCtx).used;
+		const used = this.usedTokens(messages, nCtx, convId);
 
 		return {
 			budget: contextBudget({
@@ -1158,6 +1096,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	showErrorDialog(state: ErrorDialogState | null): void {
 		this.errorDialogState = state;
 	}
+
 	async stopGeneration(): Promise<void> {
 		const activeConv = conversationsStore.activeConversation;
 
@@ -1396,7 +1335,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					const pending = this.consumePendingMessage(convId);
 
 					if (pending) {
-						this.sendMessage(pending.content, pending.extras);
+						void this.deliverQueued(convId, pending);
 					}
 
 					return;
@@ -1539,9 +1478,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				// Check if there's a pending steering message to re-send
 				const pending = agenticStore.consumePendingSteeringMessage(convId);
 
-				if (pending) {
-					await this.sendMessage(pending.content, pending.extras);
-				}
+				if (pending) await this.deliverQueued(convId, pending);
 
 				return;
 			}
@@ -1608,9 +1545,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					// Check if there's a pending message queued during streaming
 					const pending = this.consumePendingMessage(convId);
 
-					if (pending) {
-						await this.sendMessage(pending.content, pending.extras);
-					}
+					if (pending) await this.deliverQueued(convId, pending);
 				},
 				onCompletionId: streamCallbacks.onCompletionId,
 				onConnectionState: (state: StreamConnectionState) => {
@@ -1628,7 +1563,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			abortController.signal
 		);
 	}
-
 	syncLoadingStateForChat(convId: string): void {
 		const s = this.chatStreamingStates.get(convId);
 
@@ -1655,6 +1589,17 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	 */
 	async updateMessage(messageId: string, newContent: string): Promise<void> {
 		return this.flows.updateMessage(messageId, newContent);
+	}
+
+	/**
+	 * Context in use for a path: the server's last measurement (it already counts the tool
+	 * definitions) plus estimates after it; with no measurement yet (a new chat, a continuation)
+	 * the estimate adds the tool definitions the request will carry.
+	 */
+	usedTokens(messages: readonly DatabaseMessage[], nCtx: number | null, convId?: string): number {
+		const usage = measureContextUsage(messages, nCtx);
+
+		return usage.measured > 0 ? usage.used : usage.used + this.toolsTokensFor(convId);
 	}
 
 	private abortRequest(convId?: string): void {
@@ -1815,6 +1760,22 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		}
 	}
 
+	/**
+	 * A queued / steering message is bound to the conversation it was written in: sent when that
+	 * conversation is the open one (sendMessage builds its request from the open conversation),
+	 * else kept as that conversation's draft - never sent into whatever conversation is open.
+	 */
+	private async deliverQueued(
+		convId: string,
+		pending: { content: string; extras?: DatabaseMessageExtra[] }
+	): Promise<void> {
+		if (conversationsStore.activeConversation?.id === convId) {
+			await this.sendMessage(pending.content, pending.extras);
+		} else {
+			this.keepAsDraft(convId, pending.content, pending.extras);
+		}
+	}
+
 	private async generateTitleWithLLM(
 		userContent: string,
 		assistantContent: string,
@@ -1885,6 +1846,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		if (idx >= 0) conversationsStore.updateMessageAtIndex(idx, { replyNote: note });
 	}
+
 	private async runCompaction(
 		convId: string,
 		owner: CompactionState,
@@ -1915,7 +1877,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			nCtx,
 			summaryPrompt: cfg.summaryPrompt,
 			summaryTokens: cfg.summaryTokens,
-			used: measureContextUsage(path, nCtx).used
+			used: this.usedTokens(path, nCtx, convId)
 		});
 
 		if (!summaryLengthUsable(budget.summaryTokens)) {
@@ -2033,14 +1995,107 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		const newConvId = saved.convId;
 
 		await conversationsStore.loadConversations();
-		await conversationsStore.loadConversation(newConvId);
-		await goto(RouterService.chat(newConvId));
 
-		if (!opts.auto) toast.success('Conversation compacted; the previous one is kept');
+		// open the continuation only when the compacted conversation is still the open one; the
+		// user may have moved on meanwhile - then it is only linked (sidebar, context bar)
+		if (conversationsStore.activeConversation?.id === convId) {
+			await conversationsStore.loadConversation(newConvId);
+			await goto(RouterService.chat(newConvId));
+
+			if (!opts.auto) toast.success('Conversation compacted; the previous one is kept');
+		} else {
+			toast.info(`"${conversation.name}" was compacted; it continues in a new conversation.`);
+		}
 
 		return { convId: newConvId, partialId: saved.partialId };
 	}
 
+	/** Rules 2 and 3; `target` follows the reply into the continuation conversation. */
+	private async runReplyRules(
+		target: { convId: string; messageId: string },
+		info: { finish?: string; byReserve: boolean }
+	): Promise<void> {
+		let finish = info.finish;
+		let byReserve = info.byReserve;
+		let n = 0;
+
+		while (finish === 'length' && byReserve) {
+			if (n >= CONTEXT_RESERVE.MAX_CONTINUATIONS) {
+				await this.markReply(
+					target.messageId,
+					'reply truncated: still cut by the context reserve after 2 continuations'
+				);
+
+				return;
+			}
+
+			const compacted = await this.compactConversation(target.convId, {
+				auto: true,
+				partialMessageId: target.messageId
+			});
+
+			if (!('convId' in compacted) || !compacted.partialId) {
+				await this.markReply(
+					target.messageId,
+					`reply truncated: ${'error' in compacted ? `compaction failed (${compacted.error})` : 'compaction cancelled'}`
+				);
+
+				return;
+			}
+
+			target.convId = compacted.convId;
+			target.messageId = compacted.partialId;
+			n++;
+
+			const c = await this.continueReply(target.convId, target.messageId, {});
+
+			if ('error' in c) {
+				await this.markReply(
+					target.messageId,
+					`reply truncated: the continuation failed (${c.error})`
+				);
+
+				return;
+			}
+
+			finish = c.finish;
+			byReserve = c.byReserve;
+		}
+
+		if (finish !== 'stop') return;
+
+		for (let g = 0; ; g++) {
+			const msg = (await DatabaseService.getConversationMessages(target.convId)).find(
+				(m) => m.id === target.messageId
+			);
+
+			if (!msg || (msg.toolCalls && msg.toolCalls !== '[]')) return;
+
+			const why = unfinishedTail(msg.content ?? '');
+
+			if (!why) return;
+
+			if (g >= CONTEXT_RESERVE.MAX_CONTINUATIONS) {
+				await this.markReply(target.messageId, `reply looks unfinished: ${why}`);
+				toast.warning(`The reply looks unfinished (${why}); kept as is.`);
+
+				return;
+			}
+
+			const model = serverStore.isRouterMode ? modelsStore.selectedModelName : null;
+			const id = await imEndTokenId(model);
+			const c = await this.continueReply(target.convId, target.messageId, {
+				logitBias: id === null ? undefined : { [String(id)]: CONTEXT_RESERVE.GUARD_BIAS },
+				maxTokens: CONTEXT_RESERVE.GUARD_MAX_TOKENS
+			});
+
+			if ('error' in c || c.finish !== 'stop') {
+				await this.markReply(target.messageId, `reply looks unfinished: ${why}`);
+
+				return;
+			}
+		}
+	}
 	/** W1: write the compacted conversation; returns its id. */
 	private async saveCompactedConversation(
 		source: DatabaseConversation,
@@ -2276,12 +2331,34 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		if ('convId' in result && active === target) {
 			if (auto) this.pendingMessages.set(target, pending);
-			else void this.sendMessage(pending.content, pending.extras);
+			else void this.deliverQueued(target, pending);
 
 			return;
 		}
 
 		this.keepAsDraft(target, pending.content, pending.extras);
+	}
+
+	/** Tool definitions an agentic request of the conversation sends: its frozen list, else the enabled tools. */
+	private toolsTokensFor(convId?: string): number {
+		try {
+			if (!agenticStore.getConfig(settingsStore.config).enabled) return 0;
+
+			const conv =
+				convId && conversationsStore.activeConversation?.id === convId
+					? conversationsStore.activeConversation
+					: conversationsStore.conversations.find((c) => c.id === convId);
+			const tools =
+				parseToolsSnapshot(conv?.toolsSnapshot) ??
+				toolsStore.getEnabledToolsForLLM(
+					new Set(conversationsStore.preferences.getDisabledTools()),
+					new Set(conversationsStore.preferences.getDisabledToolCategories())
+				);
+
+			return estimateToolsTokens(tools);
+		} catch {
+			return 0;
+		}
 	}
 
 	private async triggerPreEncode(convId: string, model?: string | null): Promise<void> {

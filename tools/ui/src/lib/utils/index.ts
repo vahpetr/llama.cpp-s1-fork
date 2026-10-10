@@ -374,6 +374,7 @@ export {
 	dropTrailingEmptyAssistants,
 	estimateApiMessageTokens,
 	estimateMessageTokens,
+	estimateToolsTokens,
 	estimateTextTokens,
 	formatTokenCount,
 	joinWithOverlap,

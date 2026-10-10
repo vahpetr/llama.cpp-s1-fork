@@ -225,6 +225,7 @@ function cleanup() {
 	conversationsStore.activeMessages = [];
 	conversationsStore.conversations = [];
 	chatStore.setChatLoading('c1', false);
+	chatStore.clearChatStreaming('c1');
 	clearImEndCacheForTest();
 }
 
@@ -1047,5 +1048,209 @@ describe('W1: later turns of an agentic flow', () => {
 
 		expect(cap(t(100, 4800, 100), turn, 'm')).toBe(20000 - used - reserve);
 		expect(cap(t(100, 17000, 100), turn, 'm')).toBe(0);
+	});
+});
+
+// ── astra verification of W1.2 ─────────────────────────────────────────────────────────────────
+
+describe('W1.2 fixes (astra verification)', () => {
+	afterEach(cleanup);
+
+	const N_CTX = 20000;
+	const conv = { currNode: 'a2', id: 'c1', lastModified: 0, name: 'Plan' } as DatabaseConversation;
+	const PARTIAL = 'Step 1 is done. Now the long part of the answer continues here and';
+
+	function rows(last = 'answer two', timings = t(20, 1000, 9000)): DatabaseMessage[] {
+		return [
+			{ ...msg(MessageRole.SYSTEM, 'be brief'), id: 'sys', parent: 'root' },
+			{ ...msg(MessageRole.USER, 'question one'), id: 'u1', parent: 'sys' },
+			{
+				...msg(MessageRole.ASSISTANT, 'answer one', { timings: t(30, 0, 970) }),
+				id: 'a1',
+				parent: 'u1'
+			},
+			{ ...msg(MessageRole.USER, 'question two'), id: 'u2', parent: 'a1' },
+			{ ...msg(MessageRole.ASSISTANT, last, { timings }), id: 'a2', parent: 'u2' }
+		];
+	}
+
+	const B = { currNode: null, id: 'b', lastModified: 0, name: 'B' } as DatabaseConversation;
+
+	it('#1: a compaction finishing after the user moved to B links the continuation, B stays open', async () => {
+		setConfig();
+		harness(N_CTX, rows(), conv, () => {
+			conversationsStore.activeConversation = structuredClone(B);
+			conversationsStore.activeMessages = [];
+
+			return sse(SUMMARY);
+		});
+
+		const { goto } = await import('$app/navigation');
+
+		vi.mocked(goto).mockClear();
+
+		const result = await chatStore.compactConversation('c1');
+
+		expect(result).toMatchObject({ convId: 'conv-1' });
+		expect(conversationsStore.activeConversation?.id).toBe('b');
+		expect(goto).not.toHaveBeenCalled();
+		expect(conversationsStore.loadConversation).not.toHaveBeenCalled();
+	});
+
+	it("#2: A's queued message is never sent into B (plain reply drain)", async () => {
+		setConfig({ customJson: '' });
+
+		const h = harness(N_CTX, rows(), conv, () => {
+			conversationsStore.activeConversation = structuredClone(B);
+			conversationsStore.activeMessages = [];
+
+			return sse('reply');
+		});
+		const rs = rows();
+		const userNew = { ...msg(MessageRole.USER, 'q3'), id: 'u3', parent: 'a2' };
+		const assistantNew = { ...msg(MessageRole.ASSISTANT, ''), id: 'a3', parent: 'u3' };
+
+		chatStore.injectPendingMessage('c1', 'queued in A');
+		await chatStore.streamChatCompletion([...rs, userNew], assistantNew);
+
+		for (let i = 0; i < 50 && !draftMessagesStore.getDraftMessage('c1').message; i++) {
+			await new Promise((r) => setTimeout(r, 5));
+		}
+
+		expect(h.bodies).toHaveLength(1);
+		expect(draftMessagesStore.getDraftMessage('c1').message).toBe('queued in A');
+		expect(draftMessagesStore.getDraftMessage('b').message).toBe('');
+		draftMessagesStore.clearDraftMessage('c1');
+	});
+
+	it("#2: A's steering message after an agentic flow is never sent into B", async () => {
+		setConfig({ customJson: '' });
+
+		const h = harness(N_CTX, rows(), conv, () => sse('x'));
+
+		vi.mocked(agenticStore.runAgenticFlow).mockImplementation(async () => {
+			conversationsStore.activeConversation = structuredClone(B);
+			conversationsStore.activeMessages = [];
+
+			return { handled: true };
+		});
+		vi.spyOn(agenticStore, 'consumePendingSteeringMessage').mockReturnValue({
+			content: 'steer A'
+		} as never);
+
+		const assistantNew = { ...msg(MessageRole.ASSISTANT, ''), id: 'a3', parent: 'a2' };
+
+		await chatStore.streamChatCompletion(rows(), assistantNew);
+
+		expect(h.bodies).toHaveLength(0);
+		expect(draftMessagesStore.getDraftMessage('c1').message).toBe('steer A');
+		draftMessagesStore.clearDraftMessage('c1');
+	});
+
+	it('#3: input queued during a mid-turn compaction is sent once, in the new chat, after the continuation', async () => {
+		setConfig({ customJson: '' });
+
+		const h = harness(N_CTX, rows(PARTIAL, t(20, 1000, 15000)), conv, (b, n) => {
+			if (n === 1) return sse(SUMMARY);
+
+			if (b.continue_final_message) return sse(' finishes.', { timings: t(5, 600, 9) });
+
+			return sse('follow-up answer');
+		});
+
+		chatStore.injectPendingMessage('c1', 'follow-up');
+		await chatStore.afterReply('c1', 'a2', { byReserve: true, finish: 'length', toolCalls: false });
+
+		for (let i = 0; i < 100 && h.bodies.length < 3; i++) await new Promise((r) => setTimeout(r, 5));
+
+		expect(h.bodies).toHaveLength(3);
+		expect(h.bodies[1].continue_final_message).toBe(true);
+
+		const third = h.bodies[2].messages as Record<string, unknown>[];
+
+		expect(third.at(-1)).toMatchObject({ content: 'follow-up', role: 'user' });
+		// the continued reply precedes it, in the new chat
+		expect(third.at(-2)).toMatchObject({ content: PARTIAL + ' finishes.', role: 'assistant' });
+		expect(chatStore.consumePendingMessage('c1')).toBeNull();
+		expect(chatStore.consumePendingMessage('conv-1')).toBeNull();
+	}, 60000);
+
+	it('#4: excluded reasoning stays on the prefill being continued, not on earlier messages', async () => {
+		const bodies: Record<string, unknown>[] = [];
+
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (_u: string, init?: RequestInit) => {
+				bodies.push(JSON.parse(String(init?.body)));
+
+				return new Response('{}', { status: 500 });
+			})
+		);
+		await ChatService.sendMessage(
+			[
+				{ content: 'q', role: 'user' },
+				{ content: 'a', reasoning_content: 'old thought', role: 'assistant' },
+				{ content: 'q2', role: 'user' },
+				{ content: '', reasoning_content: 'thinking so far', role: 'assistant' }
+			],
+			{ continueFinalMessage: true, excludeReasoningFromContext: true, stream: false } as never
+		).catch(() => {});
+
+		const m = bodies[0].messages as Record<string, unknown>[];
+
+		expect(m[1].reasoning_content).toBeUndefined();
+		expect(m[3]).toMatchObject({ reasoning_content: 'thinking so far', role: 'assistant' });
+	});
+
+	it('#5: custom JSON cannot replace the continuation messages or flags', async () => {
+		const bodies: Record<string, unknown>[] = [];
+
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (_u: string, init?: RequestInit) => {
+				bodies.push(JSON.parse(String(init?.body)));
+
+				return new Response('{}', { status: 500 });
+			})
+		);
+		await ChatService.sendMessage(
+			[
+				{ content: 'q', role: 'user' },
+				{ content: 'partial', role: 'assistant' }
+			],
+			{
+				continueFinalMessage: true,
+				custom:
+					'{"continue_final_message":false,"add_generation_prompt":true,"messages":[{"role":"user","content":"x"}]}',
+				stream: false
+			} as never
+		).catch(() => {});
+
+		expect(bodies[0]).toMatchObject({ add_generation_prompt: false, continue_final_message: true });
+		expect((bodies[0].messages as Record<string, unknown>[]).at(-1)).toMatchObject({
+			content: 'partial',
+			role: 'assistant'
+		});
+	});
+
+	it('#6: with no measurement yet, the tool definitions count; a measured prompt already has them', () => {
+		setConfig();
+		vi.spyOn(agenticStore, 'getConfig').mockReturnValue({ enabled: true } as never);
+
+		const tools = [{ function: { description: 'd'.repeat(5000), name: 'big' }, type: 'function' }];
+
+		conversationsStore.activeConversation = {
+			...conv,
+			toolsSnapshot: JSON.stringify(tools)
+		} as DatabaseConversation;
+
+		const fresh = [msg(MessageRole.USER, 'hi')];
+		const measured = rows();
+		const toolsTokens = Math.ceil(Math.ceil(JSON.stringify(tools).length / 2.5) * 1.1);
+
+		expect(chatStore.usedTokens(fresh, 20000, 'c1')).toBe(
+			estimateMessageTokens(fresh[0]) + toolsTokens
+		);
+		expect(chatStore.usedTokens(measured, 20000, 'c1')).toBe(10020);
 	});
 });
