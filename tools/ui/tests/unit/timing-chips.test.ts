@@ -15,6 +15,11 @@ beforeAll(() => {
 	} as Storage;
 });
 
+import {
+	gaugePopup,
+	gaugePopupReset,
+	outsidePressDismisses
+} from '$lib/components/app/chat/ChatForm/ChatFormContextGauge/gauge-popup.svelte';
 import { ChatFormCommandAction, MessageRole, ToolPermissionDecision, ToolSource } from '$lib/enums';
 import { useChatFormPickers } from '$lib/hooks/use-chat-form-pickers.svelte';
 import { ChatService } from '$lib/services/chat.service';
@@ -28,9 +33,11 @@ import {
 	chipDetails,
 	chipLine,
 	compactHint,
+	contextStatus,
 	cumulativeUsage,
 	formatClock,
 	popoverRows,
+	ringLevel,
 	sessionLine,
 	timingChips,
 	toolChip,
@@ -426,8 +433,9 @@ describe('W2.1 collapsed chips, tool fragment, popover rows, hint, /compact', ()
 			}
 		});
 
+		// W2.2: v54 wording with the prefill / decode split
 		expect(agentic.at(-1)).toBe(
-			'turn 10.0 s = model 4.00 s + tools 5.00 s + other 1.00 s · 3 LLM calls · 2 tools'
+			'turn 10.0 s = model 4.00 s (prefill 1.00 s + decode 3.00 s) + tools 5.00 s + other 1.00 s · 3 LLM calls · 2 tools'
 		);
 	});
 
@@ -455,16 +463,19 @@ describe('W2.1 collapsed chips, tool fragment, popover rows, hint, /compact', ()
 		expect(compactHint(99, 120)).toBe(false);
 	});
 
-	it('popover rows: speed, cache share, MTP, compute with the wall sub-line, reserve / threshold', () => {
+	it('W2.2 card rows: speed, cache share, MTP accepted/drafted, compute + wall, reserve breakdown', () => {
 		const rows = popoverRows({
 			autoCompact: true,
+			breakdown: { instruction: 300, slack: 52948, summary: 8192 },
 			preTurnMin: 94208,
 			reserve: 61440,
 			speed: {
 				cacheShare: 0.997,
 				decodeTps: 41.2,
+				draftAccepted: 512,
+				draftN: 721,
 				modelMs: 2_232_000,
-				mtp: 0.71,
+				mtp: 512 / 721,
 				prefillTps: 1852,
 				sessionMs: 8_040_000,
 				toolsMs: 1_120_000
@@ -474,17 +485,23 @@ describe('W2.1 collapsed chips, tool fragment, popover rows, hint, /compact', ()
 		expect(rows.map((r) => r.label)).toEqual([
 			'Last request',
 			'Cache share',
-			'MTP acceptance',
+			'MTP',
 			'Compute',
 			'Reserve'
 		]);
 		expect(rows[0].value).toBe('prefill 1852 t/s · decode 41 t/s');
+		expect(rows[1].value).toBe('100 %');
+		expect(rows[2].value).toBe('71 % (512 / 721 accepted)');
 		expect(rows[3]).toEqual({
 			label: 'Compute',
 			sub: 'wall 2h14m since the first message',
 			value: 'model 37:12 · tools 18:40'
 		});
-		expect(rows[4].value).toBe('61,440 tok · compacts below 94,208 free');
+		expect(rows[4]).toEqual({
+			label: 'Reserve',
+			sub: 'summary 8,192 + instruction 300 + slack 52,948',
+			value: '61,440 tok · compacts below 94,208 free'
+		});
 		expect(
 			popoverRows({
 				autoCompact: false,
@@ -493,6 +510,48 @@ describe('W2.1 collapsed chips, tool fragment, popover rows, hint, /compact', ()
 				speed: { modelMs: 0, toolsMs: 0 }
 			}).at(-1)!.value
 		).toBe('2 tok · auto-compaction off');
+	});
+
+	it('W2.2 ring colour: red below the pre-turn minimum, amber from the hint %, else normal', () => {
+		expect(ringLevel({ free: 50_000, hintPct: 80, preTurnMin: 40_000, usedPct: 79.9 })).toBe('ok');
+		expect(ringLevel({ free: 50_000, hintPct: 80, preTurnMin: 40_000, usedPct: 80 })).toBe(
+			'warning'
+		);
+		expect(ringLevel({ free: 39_999, hintPct: 80, preTurnMin: 40_000, usedPct: 60 })).toBe(
+			'critical'
+		);
+		expect(ringLevel({ free: null, hintPct: 80, usedPct: 10 })).toBe('ok');
+	});
+
+	it('W2.2 card status: the v54 texts', () => {
+		const base = { free: 30_000, minReply: 256, preTurnMin: 40_000, reserve: 20_000 };
+
+		expect(contextStatus({ ...base, autoCompact: true })).toBe(
+			'Context nearly full: the next message compacts'
+		);
+		expect(contextStatus({ ...base, autoCompact: false })).toBe('Context nearly full');
+		expect(contextStatus({ ...base, autoCompact: false, free: 20_100 })).toBe(
+			'Reserve reached: compact to go on'
+		);
+		expect(contextStatus({ ...base, autoCompact: true, free: 50_000 })).toBeNull();
+	});
+
+	it('W2.2 the bar line keeps the last request draft counts for the card', () => {
+		const line = sessionLine(
+			[
+				msg(MessageRole.ASSISTANT, {
+					draft_n: 10,
+					draft_n_accepted: 7,
+					predicted_ms: 1,
+					predicted_n: 1,
+					prompt_ms: 1,
+					prompt_n: 1
+				})
+			],
+			0
+		);
+
+		expect(line).toMatchObject({ draftAccepted: 7, draftN: 10 });
 	});
 
 	it('/compact is a slash command, disabled without an open conversation to compact', () => {
@@ -532,5 +591,30 @@ describe('W2.1 collapsed chips, tool fragment, popover rows, hint, /compact', ()
 		pickers.handleCommandSelect(cmd);
 		expect(value).toBe('');
 		expect(calls).toEqual(['compactNow']);
+	});
+});
+
+describe('astra W2.2: context card state', () => {
+	it('reset closes and unpins the card and closes the settings dialog', () => {
+		gaugePopup.open = true;
+		gaugePopup.pinned = true;
+		gaugePopup.settingsOpen = true;
+		gaugePopup.detailsOpen = true;
+		gaugePopupReset();
+		expect(gaugePopup).toMatchObject({
+			detailsOpen: false,
+			open: false,
+			pinned: false,
+			settingsOpen: false
+		});
+	});
+
+	it('outside presses keep the card while the settings dialog is open', () => {
+		const out = { insideCard: false, onTrigger: false };
+
+		expect(outsidePressDismisses({ ...out, settingsOpen: false })).toBe(true);
+		expect(outsidePressDismisses({ ...out, settingsOpen: true })).toBe(false);
+		expect(outsidePressDismisses({ ...out, insideCard: true, settingsOpen: false })).toBe(false);
+		expect(outsidePressDismisses({ ...out, onTrigger: true, settingsOpen: false })).toBe(false);
 	});
 });

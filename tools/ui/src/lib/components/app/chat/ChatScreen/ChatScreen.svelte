@@ -6,7 +6,6 @@
 	import { page } from '$app/state';
 	import {
 		ChatMessages,
-		ChatScreenContextBar,
 		ChatScreenDragOverlay,
 		ChatScreenForm,
 		ChatScreenServerError,
@@ -434,10 +433,6 @@
 		ondrop={dragAndDrop.dragHandlers.drop}
 		role="main"
 	>
-		{#if page.params.id && !isEmpty}
-			<ChatScreenContextBar />
-		{/if}
-
 		{#if !isEmpty}
 			<ChatMessages
 				messages={conversationsStore.activeMessages}
