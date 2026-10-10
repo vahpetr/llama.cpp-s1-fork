@@ -5,7 +5,9 @@
 // the card share that positioning frame, so the values stay exact for the
 // whole time the card is open.
 // Mouse pointers open on hover with a short grace delay to travel from
-// dial to card; touch pointers toggle on tap.
+// dial to card. W2.2: a click / tap / Enter PINS the card (it stays open so its
+// controls are usable) and a second one unpins and closes it; a pinned card
+// ignores the hover close and closes on an outside press or a conversation switch.
 import {
 	CONTEXT_GAUGE_CARD_HALF_WIDTH_PX,
 	CONTEXT_GAUGE_CLOSE_GRACE_MS,
@@ -16,7 +18,15 @@ import {
 let closeTimer: ReturnType<typeof setTimeout> | undefined;
 let lastPointerType = '';
 
-export const gaugePopup = $state({ bottom: 0, centerX: 0, detailsOpen: false, open: false });
+export const gaugePopup = $state({
+	bottom: 0,
+	centerX: 0,
+	detailsOpen: false,
+	open: false,
+	pinned: false,
+	/** W2.2: the compaction settings dialog (mounted with the ring, opened from the card's gear) */
+	settingsOpen: false
+});
 
 function openFrom(trigger: HTMLElement): void {
 	clearTimeout(closeTimer);
@@ -36,18 +46,20 @@ function openFrom(trigger: HTMLElement): void {
 	gaugePopup.open = true;
 }
 
-function toggleFrom(trigger: HTMLElement): void {
-	if (gaugePopup.open) {
-		clearTimeout(closeTimer);
-		gaugePopup.open = false;
+/** Pin toggle: pin (and open) an unpinned card, unpin and close a pinned one. */
+function togglePin(trigger: HTMLElement): void {
+	if (gaugePopup.pinned) {
+		gaugePopupClose();
 	} else {
 		openFrom(trigger);
+		gaugePopup.pinned = true;
 	}
 }
 
 export function gaugePopupClose(): void {
 	clearTimeout(closeTimer);
 	gaugePopup.open = false;
+	gaugePopup.pinned = false;
 }
 
 export function gaugeTriggerPointerDown(event: PointerEvent): void {
@@ -55,16 +67,15 @@ export function gaugeTriggerPointerDown(event: PointerEvent): void {
 }
 
 export function gaugeTriggerClick(event: MouseEvent): void {
-	if (lastPointerType !== 'touch') return;
-
-	toggleFrom(event.currentTarget as HTMLElement);
+	void lastPointerType;
+	togglePin(event.currentTarget as HTMLElement);
 }
 
 export function gaugeTriggerKeydown(event: KeyboardEvent): void {
 	if (event.key !== 'Enter' && event.key !== ' ') return;
 
 	event.preventDefault();
-	toggleFrom(event.currentTarget as HTMLElement);
+	togglePin(event.currentTarget as HTMLElement);
 }
 
 export function gaugeTriggerEnter(event: PointerEvent): void {
@@ -93,7 +104,10 @@ export function gaugeCardLeave(event: PointerEvent): void {
 
 function scheduleClose(): void {
 	clearTimeout(closeTimer);
+
+	if (gaugePopup.pinned) return;
+
 	closeTimer = setTimeout(() => {
-		gaugePopup.open = false;
+		if (!gaugePopup.pinned) gaugePopup.open = false;
 	}, CONTEXT_GAUGE_CLOSE_GRACE_MS);
 }

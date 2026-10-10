@@ -11,9 +11,9 @@
 	import { Button } from '$lib/components/ui/button';
 	import { ICON_CLASS_DEFAULT } from '$lib/constants';
 	import { setChatFormActionsContext } from '$lib/contexts';
-	import { FileTypeCategory, MessageRole } from '$lib/enums';
+	import { FileTypeCategory } from '$lib/enums';
 	import { ChatService } from '$lib/services';
-	import { chatStore, conversationsStore, settingsStore } from '$lib/stores';
+	import { conversationsStore, settingsStore } from '$lib/stores';
 	import { getFileTypeCategory } from '$lib/utils';
 
 	interface Props {
@@ -79,46 +79,6 @@
 		conversationsStore.activeMessages[conversationsStore.activeMessages.length - 1]
 	);
 
-	let hasProcessedTokens = $derived.by(() => {
-		if (!page.params.id) return false;
-
-		const messages = conversationsStore.activeMessages as DatabaseMessage[];
-
-		let totalHistoricalTokens = 0;
-
-		for (const m of messages) {
-			if (m.role !== MessageRole.ASSISTANT) continue;
-
-			const timings = m.timings;
-
-			if (!timings) continue;
-
-			const agenticLlm = timings.agentic?.llm;
-
-			if (agenticLlm?.prompt_n != null || agenticLlm?.predicted_n != null) {
-				totalHistoricalTokens += (agenticLlm?.prompt_n ?? 0) + (agenticLlm?.predicted_n ?? 0);
-			} else {
-				totalHistoricalTokens += (timings.prompt_n ?? 0) + (timings.predicted_n ?? 0);
-			}
-		}
-
-		if (totalHistoricalTokens > 0) return true;
-
-		if (!chatStore.isLoading && !chatStore.isStreaming()) return false;
-
-		const processingState = chatStore.processing.activeState;
-
-		if (!processingState) return false;
-
-		const livePromptTokens = Math.max(
-			processingState.promptTokens ?? 0,
-			processingState.promptProgress?.processed ?? 0
-		);
-		const liveOutputTokens = processingState.outputTokensUsed ?? 0;
-
-		return livePromptTokens > 0 || liveOutputTokens > 0;
-	});
-
 	setChatFormActionsContext({
 		get disabled() {
 			return disabled;
@@ -155,7 +115,8 @@
 	{/if}
 
 	<div class="flex items-center gap-1.5">
-		{#if hasProcessedTokens}
+		<!-- W2.2: the ring is THE context trigger - shown whenever a conversation is open -->
+		{#if page.params.id && conversationsStore.activeConversation}
 			<ChatFormContextGauge />
 		{/if}
 

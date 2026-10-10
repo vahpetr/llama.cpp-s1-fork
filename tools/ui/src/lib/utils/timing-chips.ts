@@ -209,6 +209,9 @@ export interface SessionLine {
 	prefillTps?: number;
 	/** cache share of the last request's prompt */
 	cacheShare?: number;
+	/** MTP tokens drafted / accepted in the last request */
+	draftN?: number;
+	draftAccepted?: number;
 	decodeTps?: number;
 	mtp?: number;
 	/** compute of this chat: Σ prompt_ms + predicted_ms over all requests */
@@ -239,7 +242,11 @@ export function sessionLine(messages: readonly DatabaseMessage[], now: number): 
 
 		out.decodeTps = tps(t.predicted_n ?? 0, t.predicted_ms ?? 0);
 
-		if ((t.draft_n ?? 0) > 0) out.mtp = (t.draft_n_accepted ?? 0) / (t.draft_n as number);
+		if ((t.draft_n ?? 0) > 0) {
+			out.mtp = (t.draft_n_accepted ?? 0) / (t.draft_n as number);
+			out.draftN = t.draft_n;
+			out.draftAccepted = t.draft_n_accepted ?? 0;
+		}
 
 		break;
 	}
@@ -412,9 +419,10 @@ export function chipDetails(t: ChatMessageTimings | undefined): string[] {
 
 	if (turn && t?.agentic) {
 		lines.push(
-			`turn ${formatDuration(turn.wallMs)} = model ${formatDuration(turn.modelMs)} + tools ` +
+			`turn ${formatDuration(turn.wallMs)} = model ${formatDuration(turn.modelMs)} (prefill ` +
+				`${formatDuration(turn.prefillMs)} + decode ${formatDuration(turn.decodeMs)}) + tools ` +
 				`${formatDuration(turn.toolsMs)} + other ${formatDuration(turn.otherMs)} · ` +
-				`${turn.llmCalls} LLM calls · ${turn.toolCalls} tools`
+				`${turn.llmCalls} LLM ${turn.llmCalls === 1 ? 'call' : 'calls'} · ${turn.toolCalls} tools`
 		);
 	}
 
@@ -438,11 +446,12 @@ export function compactHint(usedPct: number, thresholdPct: number): boolean {
 	return usedPct >= Math.min(100, Math.max(1, thresholdPct));
 }
 
-/** The context-bar popover rows (speed, cache, MTP, compute with the wall as a sub-line, reserve). */
+/** W2.2: the fork rows of the context card (nothing dropped vs v54). */
 export function popoverRows(p: {
 	speed: SessionLine;
 	reserve?: number;
 	preTurnMin?: number;
+	breakdown?: { summary: number; instruction: number; slack: number };
 	autoCompact: boolean;
 }): { label: string; value: string; sub?: string }[] {
 	const rows: { label: string; value: string; sub?: string }[] = [];
@@ -458,7 +467,14 @@ export function popoverRows(p: {
 	if (s.cacheShare !== undefined)
 		rows.push({ label: 'Cache share', value: formatPct(s.cacheShare) });
 
-	if (s.mtp !== undefined) rows.push({ label: 'MTP acceptance', value: formatPct(s.mtp) });
+	if (s.mtp !== undefined) {
+		rows.push({
+			label: 'MTP',
+			value:
+				`${formatPct(s.mtp)}` +
+				(s.draftN !== undefined ? ` (${s.draftAccepted ?? 0} / ${s.draftN} accepted)` : '')
+		});
+	}
 
 	rows.push({
 		label: 'Compute',
@@ -472,6 +488,10 @@ export function popoverRows(p: {
 	if (p.reserve !== undefined && p.preTurnMin !== undefined) {
 		rows.push({
 			label: 'Reserve',
+			sub: p.breakdown
+				? `summary ${p.breakdown.summary.toLocaleString()} + instruction ` +
+					`${p.breakdown.instruction.toLocaleString()} + slack ${p.breakdown.slack.toLocaleString()}`
+				: undefined,
 			value:
 				`${p.reserve.toLocaleString()} tok · ` +
 				(p.autoCompact
@@ -481,4 +501,40 @@ export function popoverRows(p: {
 	}
 
 	return rows;
+}
+
+export type RingLevel = 'ok' | 'warning' | 'critical';
+
+/**
+ * W2.2: the ring's colour - red when the free context is below the pre-turn minimum (the next
+ * message compacts / the reply is capped), amber from the "compact?" hint %, else normal.
+ */
+export function ringLevel(p: {
+	usedPct: number;
+	hintPct: number;
+	free: number | null;
+	preTurnMin?: number;
+}): RingLevel {
+	if (p.free !== null && p.preTurnMin !== undefined && p.free < p.preTurnMin) return 'critical';
+
+	return compactHint(p.usedPct, p.hintPct) ? 'warning' : 'ok';
+}
+
+/** W2.2: the v54 status line of the card, or null. */
+export function contextStatus(p: {
+	free: number | null;
+	preTurnMin?: number;
+	reserve?: number;
+	autoCompact: boolean;
+	minReply: number;
+}): string | null {
+	if (p.free === null || p.preTurnMin === undefined || p.reserve === undefined) return null;
+
+	if (p.free >= p.preTurnMin) return null;
+
+	if (p.autoCompact) return 'Context nearly full: the next message compacts';
+
+	return p.free < p.reserve + p.minReply
+		? 'Reserve reached: compact to go on'
+		: 'Context nearly full';
 }
