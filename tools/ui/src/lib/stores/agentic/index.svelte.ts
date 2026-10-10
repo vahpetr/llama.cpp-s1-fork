@@ -82,10 +82,18 @@ import {
 	getAudioInputFormat,
 	isAbortError,
 	parseToolsSnapshot,
-	timingsTotal
+	timingsTotal,
+	utf8Bytes
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
 import { toast } from 'svelte-sonner';
+
+/** the first line of a failed tool's result (the chip's error text) */
+function firstErrorLine(result: string): string {
+	const line = result.split('\n').find((l) => /error|denied|not available/i.test(l)) ?? result;
+
+	return line.trim().slice(0, 200);
+}
 
 function createDefaultSession(): AgenticSession {
 	return {
@@ -229,6 +237,11 @@ class AgenticStore {
 
 	getExecutingToolCallId(conversationId: string): string | null {
 		return this.sessions.get(conversationId)?.executingToolCallId ?? null;
+	}
+
+	/** W2: when the executing tool call started (epoch ms), null when none runs */
+	getExecutingToolStartedAt(conversationId: string): number | null {
+		return this.sessions.get(conversationId)?.executingToolStartedAt ?? null;
 	}
 
 	// read-only: safe to call from derivations, unlike getSession
@@ -461,9 +474,15 @@ class AgenticStore {
 	): ChatMessageTimings | undefined {
 		if (agenticTimings.toolCallsCount === 0) return capturedTimings;
 
+		// D3 (W2): the draft (MTP) and client fields travel too; t_end = now (the flow's last stamp)
+		agenticTimings.t_end = Date.now();
+
 		return {
 			agentic: agenticTimings,
 			cache_n: capturedTimings?.cache_n,
+			client: capturedTimings?.client,
+			draft_n: capturedTimings?.draft_n,
+			draft_n_accepted: capturedTimings?.draft_n_accepted,
 			predicted_ms: capturedTimings?.predicted_ms,
 			predicted_n: capturedTimings?.predicted_n,
 			prompt_ms: capturedTimings?.prompt_ms,
@@ -501,8 +520,17 @@ class AgenticStore {
 		let totalToolCallCount = 0;
 
 		const agenticTimings: ChatMessageAgenticTimings = {
-			llm: { predicted_ms: 0, predicted_n: 0, prompt_ms: 0, prompt_n: 0 },
+			llm: {
+				cache_n: 0,
+				draft_n: 0,
+				draft_n_accepted: 0,
+				predicted_ms: 0,
+				predicted_n: 0,
+				prompt_ms: 0,
+				prompt_n: 0
+			},
 			perTurn: [],
+			t_start: Date.now(),
 			toolCalls: [],
 			toolCallsCount: 0,
 			toolsMs: 0,
@@ -680,10 +708,20 @@ class AgenticStore {
 					agenticTimings.llm.predicted_ms += turnTimings.predicted_ms || 0;
 					agenticTimings.llm.prompt_n += turnTimings.prompt_n || 0;
 					agenticTimings.llm.prompt_ms += turnTimings.prompt_ms || 0;
+					// D3 (W2): cache and draft sums
+					agenticTimings.llm.cache_n =
+						(agenticTimings.llm.cache_n ?? 0) + (turnTimings.cache_n || 0);
+					agenticTimings.llm.draft_n =
+						(agenticTimings.llm.draft_n ?? 0) + (turnTimings.draft_n || 0);
+					agenticTimings.llm.draft_n_accepted =
+						(agenticTimings.llm.draft_n_accepted ?? 0) + (turnTimings.draft_n_accepted || 0);
 					turnStats.llm.predicted_n = turnTimings.predicted_n || 0;
 					turnStats.llm.predicted_ms = turnTimings.predicted_ms || 0;
 					turnStats.llm.prompt_n = turnTimings.prompt_n || 0;
 					turnStats.llm.prompt_ms = turnTimings.prompt_ms || 0;
+					turnStats.llm.cache_n = turnTimings.cache_n || 0;
+					turnStats.llm.draft_n = turnTimings.draft_n || 0;
+					turnStats.llm.draft_n_accepted = turnTimings.draft_n_accepted || 0;
 				}
 			} catch (error) {
 				if (signal?.aborted) {
@@ -862,6 +900,7 @@ class AgenticStore {
 				}
 
 				const toolStartTime = performance.now();
+				const toolStartedAt = Date.now();
 				const toolSource = toolsStore.getToolSource(toolName);
 
 				let result = '';
@@ -871,7 +910,10 @@ class AgenticStore {
 				// Streaming tools (currently only exec_shell_command): mark
 				// the session so the matching renderer can switch to live mode.
 				// Cleared unconditionally below.
-				this.updateSession(conversationId, { executingToolCallId: toolCall.id });
+				this.updateSession(conversationId, {
+					executingToolCallId: toolCall.id,
+					executingToolStartedAt: toolStartedAt
+				});
 
 				if (unavailable) {
 					result = `Error: the tool "${toolName}" is not available right now (its server is not connected).`;
@@ -959,7 +1001,10 @@ class AgenticStore {
 						}
 					} catch (error) {
 						if (isAbortError(error)) {
-							this.updateSession(conversationId, { executingToolCallId: null });
+							this.updateSession(conversationId, {
+								executingToolCallId: null,
+								executingToolStartedAt: null
+							});
 							onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
 
 							return;
@@ -978,13 +1023,23 @@ class AgenticStore {
 					}
 				}
 
-				this.updateSession(conversationId, { executingToolCallId: null });
+				this.updateSession(conversationId, {
+					executingToolCallId: null,
+					executingToolStartedAt: null
+				});
 
 				const toolDurationMs = performance.now() - toolStartTime;
+				// W2: bound to its call (id, start / end, sizes, error) for the tool chip
 				const toolTiming: ChatMessageToolCallTiming = {
+					args_bytes: utf8Bytes(toolCall.function.arguments),
 					duration_ms: Math.round(toolDurationMs),
 					name: toolCall.function.name,
-					success: toolSuccess
+					result_bytes: utf8Bytes(result),
+					success: toolSuccess,
+					t_end: toolStartedAt + Math.round(toolDurationMs),
+					t_start: toolStartedAt,
+					toolCallId: toolCall.id,
+					...(toolSuccess ? {} : { error: firstErrorLine(result) })
 				};
 
 				agenticTimings.toolCalls!.push(toolTiming);

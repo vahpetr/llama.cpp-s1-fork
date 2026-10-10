@@ -1,5 +1,6 @@
 <script lang="ts">
 	import ChatMessageToolCallBlock from './ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlock.svelte';
+	import ChatMessageToolCallChip from './ChatMessage/ChatMessageToolCall/ChatMessageToolCallChip.svelte';
 	import ChatMessageReasoningBlock from './ChatMessageReasoningBlock.svelte';
 	import {
 		ChatMessageActionCardContinueRequest,
@@ -15,7 +16,7 @@
 		ChatMessageAgenticTurnStats,
 		DatabaseMessage
 	} from '$lib/types';
-	import { deriveAgenticSections } from '$lib/utils';
+	import { deriveAgenticSections, toolRecordIndex } from '$lib/utils';
 
 	interface Props {
 		message: DatabaseMessage;
@@ -98,6 +99,11 @@
 
 	const currentlyExecutingToolCallId = $derived(
 		isStreaming ? agenticStore.getExecutingToolCallId(message.convId) : null
+	);
+	// W2: tool-call records (duration, sizes, status) by call id; the start of the executing call
+	const toolRecords = $derived(toolRecordIndex([message, ...toolMessages]));
+	const executingStartedAt = $derived(
+		isStreaming ? agenticStore.getExecutingToolStartedAt(message.convId) : null
 	);
 
 	type TurnGroup = {
@@ -200,6 +206,15 @@
 			{isStreaming}
 			onToggle={() => toggleExpanded(index, section)}
 			open={isExpanded(index, section)}
+			{section}
+		/>
+
+		<ChatMessageToolCallChip
+			executingSince={section.toolCallId !== undefined &&
+			section.toolCallId === currentlyExecutingToolCallId
+				? executingStartedAt
+				: null}
+			record={section.toolCallId ? toolRecords.get(section.toolCallId) : undefined}
 			{section}
 		/>
 	{/if}

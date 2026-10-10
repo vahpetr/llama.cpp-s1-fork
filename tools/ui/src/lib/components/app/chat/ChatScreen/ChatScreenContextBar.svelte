@@ -7,9 +7,14 @@
 	import { chatStore, contextStatsStore, conversationsStore, settingsStore } from '$lib/stores';
 	import {
 		contextBudget,
+		formatClock,
+		formatDuration,
+		formatPct,
 		formatTokenCount,
+		formatTps,
 		legacyContextFields,
-		measureContextUsage
+		measureContextUsage,
+		sessionLine
 	} from '$lib/utils';
 	import { toast } from 'svelte-sonner';
 
@@ -30,6 +35,23 @@
 		Math.max(measureContextUsage(messages, nCtx).used, contextStatsStore.contextUsed)
 	);
 	let free = $derived(nCtx !== null ? Math.max(0, nCtx - used) : null);
+	// W2: last request speed, MTP, this chat's compute (model + tools); wall time only in the title
+	let clock = $state(Date.now());
+
+	$effect(() => {
+		const id = setInterval(() => (clock = Date.now()), 30_000);
+
+		return () => clearInterval(id);
+	});
+
+	let speed = $derived(sessionLine(messages, clock));
+	let speedTitle = $derived(
+		`Last request: prefill ${formatTps(speed.prefillTps)}, decode ${formatTps(speed.decodeTps)}` +
+			`${speed.mtp !== undefined ? `, MTP acceptance ${formatPct(speed.mtp)}` : ''}. ` +
+			`Compute of this chat: model ${formatClock(speed.modelMs)} (Σ prefill + decode of all ` +
+			`requests), tools ${formatClock(speed.toolsMs)}. Wall since the first message: ` +
+			`${formatDuration(speed.sessionMs)}.`
+	);
 	let usedPct = $derived(nCtx ? Math.min(100, (used / nCtx) * 100) : 0);
 	let budget = $derived(
 		nCtx
@@ -156,6 +178,17 @@
 				</span>
 			{/if}
 		</div>
+
+		{#if speed.prefillTps !== undefined || speed.decodeTps !== undefined || speed.modelMs > 0}
+			<span class="tabular-nums" data-speed-line title={speedTitle}>
+				{#if speed.prefillTps !== undefined}prefill {formatTps(speed.prefillTps)} ·{/if}
+
+				{#if speed.decodeTps !== undefined}decode {formatTps(speed.decodeTps)} ·{/if}
+
+				{#if speed.mtp !== undefined}MTP {formatPct(speed.mtp)} ·{/if}
+				compute: model {formatClock(speed.modelMs)} · tools {formatClock(speed.toolsMs)}
+			</span>
+		{/if}
 
 		{#if compacting}
 			<span class="flex items-center gap-1 text-foreground">

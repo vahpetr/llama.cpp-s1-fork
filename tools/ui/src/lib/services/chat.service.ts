@@ -1325,6 +1325,48 @@ export class ChatService {
 				ChatService.saveStreamState(conversationId, 0, options.model ?? null);
 			}
 
+			// W2: client timings - request start, time to the first streamed token, request wall
+			const tStart = Date.now();
+			const t0 = performance.now();
+
+			let ttft: number | undefined;
+
+			const first = () => {
+				if (ttft === undefined) ttft = Math.round(performance.now() - t0);
+			};
+			const withClient = (t?: ChatMessageTimings): ChatMessageTimings | undefined =>
+				t
+					? {
+							...t,
+							client: {
+								t_start: tStart,
+								ttft_ms: ttft,
+								wall_ms: Math.round(performance.now() - t0)
+							}
+						}
+					: t;
+			// always set: the first streamed token marks the TTFT even without a listener
+			const cOnChunk = (c: string) => {
+				first();
+				onChunk?.(c);
+			};
+			// always set: the first streamed token marks the TTFT even without a listener
+			const cOnReasoningChunk = (c: string) => {
+				first();
+				onReasoningChunk?.(c);
+			};
+			// always set: the first streamed token marks the TTFT even without a listener
+			const cOnToolCallChunk = (c: string) => {
+				first();
+				onToolCallChunk?.(c);
+			};
+			const cOnTimings = onTimings
+				? (t?: ChatMessageTimings, p?: ChatMessagePromptProgress) => onTimings(withClient(t), p)
+				: undefined;
+			const cOnComplete = onComplete
+				? (r: string, rc?: string, t?: ChatMessageTimings, tc?: string, finish?: string) =>
+						onComplete(r, rc, withClient(t), tc, finish)
+				: undefined;
 			const response = await fetch(API_CHAT.COMPLETIONS, {
 				body: JSON.stringify(requestBody),
 				headers,
@@ -1351,14 +1393,14 @@ export class ChatService {
 			if (stream) {
 				await ChatService.handleStreamResponse(
 					response,
-					onChunk,
-					onComplete,
+					cOnChunk,
+					cOnComplete,
 					onError,
-					onReasoningChunk,
-					onToolCallChunk,
+					cOnReasoningChunk,
+					cOnToolCallChunk,
 					onModel,
 					onCompletionId,
-					onTimings,
+					cOnTimings,
 					conversationId,
 					signal,
 					onConnectionState,
@@ -1369,7 +1411,7 @@ export class ChatService {
 			} else {
 				return ChatService.handleNonStreamResponse(
 					response,
-					onComplete,
+					cOnComplete,
 					onError,
 					onToolCallChunk,
 					onModel
