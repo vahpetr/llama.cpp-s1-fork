@@ -6,7 +6,7 @@ from upstream PR #27742 and an MTP draft graph. Upstream back-ports are marked a
 
 Status column:
 - **deployed (vNN)**: in my builds from image vNN on (my production line), still in this tree.
-- **v57**: in this tree (HEAD = v57, in production since 2026-10-11).
+- **v58**: in this tree (HEAD = v58, in production since 2026-10-11).
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
 - **in tree, off**: compiled in, off unless you set its knob (docs/s1/KNOBS.md).
@@ -215,5 +215,8 @@ records and upstream status live in my private repo; ask if you want one.
 | 0217 | webui: review fixes (whitespace-normalised echo detection + echoMismatch mark, popover pin per chat, tool chip in the block header) | deployed (v55) |
 | 0218 | webui: the upstream context ring is the single context trigger (hover card, click / Enter pins; card = upstream usage details + the fork rows: prefill / decode t/s, MTP accepted / drafted, cache share, compute, reserve breakdown, compaction state + Cancel, Compact now, settings); top-right meter removed | deployed (v56) |
 | 0219 | webui: review fixes (settings dialog state per conversation, dialog clicks keep the pinned card, popup cleared on ring teardown) | deployed (v56) |
-| 0220 | webui: reasoning level picker in single-model mode ("+" menu -> Reasoning: Default / Off / Low / Medium / High / Max); native `reasoning_effort` low / medium / xhigh when the template supports it (High and Max differ by the thinking budget); sampling presets by thinking state (thinking T 1.0 / top_p 0.95 / top_k 20 / min_p 0 / presence 0; instruct 0.7 / 0.8 / 20 / 0 / 1.5), only for parameters the user left unset; a 400 naming the reasoning effort is retried once without it | v57 |
-| 0221 | webui: review fixes (Default inherits the server's sampling, durable user overrides, per-turn template-option snapshot reused by continuations, narrow effort fallback) | v57 |
+| 0220 | webui: reasoning level picker in single-model mode ("+" menu -> Reasoning: Default / Off / Low / Medium / High / Max); native `reasoning_effort` low / medium / xhigh when the template supports it (High and Max differ by the thinking budget); sampling presets by thinking state (thinking T 1.0 / top_p 0.95 / top_k 20 / min_p 0 / presence 0; instruct 0.7 / 0.8 / 20 / 0 / 1.5), only for parameters the user left unset; a 400 naming the reasoning effort is retried once without it | deployed (v57) |
+| 0221 | webui: review fixes (Default inherits the server's sampling, durable user overrides, per-turn template-option snapshot reused by continuations, narrow effort fallback) | deployed (v57) |
+| 0222 | webui: the reasoning-effort fallback also accepts the server's HTTP 500 template refusal (llama-server answers the Jinja "Unexpected reasoning effort" exception with 500, not 400); a 400 or 500 matching the same narrow classifier is retried once without `reasoning_effort` and remembered per model; other errors unchanged | v58 |
+| 0223 | webui: editable sampling presets by reasoning state (Settings -> Sampling & Penalties -> "Presets by reasoning state"): Thinking and Instruct presets (temperature / top_p / top_k / min_p / presence / repeat penalty; defaults = the model card, "Reset to model card"), "Active in this chat" line, collapsed per-level overrides for Low / Medium / High / Max (empty = inherit Thinking); precedence user Sampling values > level override > preset, Default sends nothing; the lightbulb title shows the preset source (card / custom / level override) | v58 |
+| 0224 | webui: review fixes (presets follow Settings Save / Cancel, included in export / import, cleared by both reset paths; integer top_k; "Active in this chat" follows the picker's capability derivation; stricter reasoning-effort classifier; no NaN / blank sampling sent) | v58 |
