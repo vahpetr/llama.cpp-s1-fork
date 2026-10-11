@@ -15,6 +15,11 @@ import { FileTypeCategory, ModelModality } from '$lib/enums';
 import { PropsService } from '$lib/services/props.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { serverStore } from '$lib/stores/server.svelte';
+import {
+	type BackendSamplingProps,
+	type BackendSamplingState,
+	backendSamplingState
+} from '$lib/utils/backend-sampling';
 // deep imports, not the '$lib/utils' barrel: it re-exports modules that reach back
 // into the stores, and going through it here would read a half-built module
 import { TTLCache } from '$lib/utils/cache-ttl';
@@ -35,8 +40,11 @@ export interface ModelPropsHost {
 }
 
 export class ModelPropsManager {
+	/** Servers that refused backend sampling (same keying / /props binding as the effort memory). */
+	backendSamplingRejected = new SvelteMap<string, unknown>();
 	/** Version counter for the cache - bumped on writes so $derived consumers recompute. */
 	cacheVersion = $state(0);
+
 	/**
 	 * Models whose server refused `reasoning_effort` (400): not sent to them again. Keyed by the
 	 * model id (single mode: the server's model alias / path), and bound to the /props object
@@ -71,6 +79,17 @@ export class ModelPropsManager {
 		const props = this.getModelProps(modelId);
 
 		return detectThinkingSupport(props?.chat_template ?? '');
+	}
+
+	/** Backend sampling availability for the model a request goes to (props + rejection memory). */
+	backendSampling(modelId?: string | null): BackendSamplingState {
+		void this.cacheVersion;
+
+		const { key, props } = this.effortKey(modelId);
+		const rejected =
+			this.backendSamplingRejected.has(key) && this.backendSamplingRejected.get(key) === props;
+
+		return backendSamplingState(props as BackendSamplingProps | undefined, rejected);
 	}
 
 	/** Map the router modalities, the only source available while a model is not loaded. */
@@ -228,6 +247,12 @@ export class ModelPropsManager {
 
 	isModelPropsFetching(modelId: string): boolean {
 		return this.fetching.has(modelId);
+	}
+
+	markBackendSamplingUnsupported(modelId?: string | null): void {
+		const { key, props } = this.effortKey(modelId);
+
+		this.backendSamplingRejected.set(key, props);
 	}
 
 	markReasoningEffortUnsupported(modelId?: string | null): void {

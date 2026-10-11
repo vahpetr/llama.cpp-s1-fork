@@ -45,9 +45,11 @@ import type {
 import { isAbortError } from '$lib/utils/abort';
 import { ApiError } from '$lib/utils/api-fetch';
 import { getAuthHeaders, getJsonHeaders } from '$lib/utils/api-headers';
+import { isBackendSamplingRejection } from '$lib/utils/backend-sampling';
 import { applyRequestCeilings } from '$lib/utils/context-reserve';
 import { formatAttachmentText } from '$lib/utils/formatters';
 import { streamIdentity } from '$lib/utils/stream-identity';
+import { toast } from 'svelte-sonner';
 
 interface ResumableStreamState {
 	bytesReceived: number;
@@ -1406,6 +1408,24 @@ export class ChatService {
 						conversationId,
 						signal
 					);
+				}
+
+				// 0225: the server refused backend sampling (0226's 400, or an older server's 500
+				// "Invalid input batch."): switch the setting off and remember it for this server
+				if (
+					isBackendSamplingRejection(
+						response.status,
+						error.message,
+						requestBody.backend_sampling === true
+					)
+				) {
+					modelsStore.props.markBackendSamplingUnsupported(options.model);
+
+					if (settingsStore.config.backend_sampling) {
+						settingsStore.updateConfig('backend_sampling', false);
+					}
+
+					toast.warning('Backend sampling disabled: not supported on this server');
 				}
 
 				// a rejected request (including one cancelled by a stop during the model load)
