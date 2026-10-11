@@ -373,4 +373,50 @@ describe('reasoning_effort fallback (narrow, per model)', () => {
 		expect(modelsStore.props.supportsReasoningEffort()).toBe(true);
 		serverStore.props = null;
 	});
+
+	it("llama-server's HTTP 500 template refusal (Jinja exception) also retries once without it; other 500s do not", async () => {
+		vi.spyOn(conversationsStore.preferences, 'getReasoningEffort').mockReturnValue(
+			ReasoningEffort.LOW
+		);
+		vi.spyOn(modelsStore.props, 'modelSupportsThinking').mockReturnValue(true);
+		vi.spyOn(modelsStore.props, 'supportsReasoningEffort').mockReturnValue(true);
+
+		const bodies: Record<string, unknown>[] = [];
+
+		let message =
+			'Jinja Exception: Unexpected reasoning effort low. Supported types are xhigh (default), medium, and low.';
+
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (_u: string, init?: RequestInit) => {
+				const body = JSON.parse(String(init?.body));
+
+				bodies.push(body);
+
+				return body.reasoning_effort
+					? new Response(JSON.stringify({ error: { code: 500, message } }), { status: 500 })
+					: new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }));
+			})
+		);
+
+		await ChatService.sendMessage([{ content: 'x', role: 'user' }], {
+			...chatStore.getApiOptions(),
+			stream: false
+		} as never);
+
+		expect(bodies.map((b) => b.reasoning_effort)).toEqual(['low', undefined]);
+		expect(modelsStore.props.reasoningEffortRejected.size).toBe(1);
+
+		// a 500 that is not the template's refusal: no retry
+		modelsStore.props.reasoningEffortRejected.clear();
+		bodies.length = 0;
+		message = 'Internal server error: slot unavailable';
+		await ChatService.sendMessage([{ content: 'x', role: 'user' }], {
+			...chatStore.getApiOptions(),
+			stream: false
+		} as never).catch(() => {});
+
+		expect(bodies.map((b) => b.reasoning_effort)).toEqual(['low']);
+		expect(modelsStore.props.reasoningEffortRejected.size).toBe(0);
+	});
 });

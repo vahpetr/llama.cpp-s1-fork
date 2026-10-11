@@ -1388,10 +1388,11 @@ export class ChatService {
 			if (!response.ok) {
 				const error = await ChatService.parseErrorResponse(response);
 
-				// a template that refuses the native reasoning_effort (400 naming it): retry once
+				// a template that refuses the native reasoning_effort (400 / 500 naming it): retry once
 				// without it, and never send it to this model again
 				if (
-					response.status === 400 &&
+					// llama-server answers a chat-template refusal with 500 (Jinja exception), others 400
+					(response.status === 400 || response.status === 500) &&
 					requestBody.reasoning_effort !== undefined &&
 					!options.dropReasoningEffort &&
 					isReasoningEffortRejection(error.message)
