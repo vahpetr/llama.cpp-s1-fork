@@ -259,6 +259,8 @@ export interface ApiLlamaCppServerProps {
 	/** capabilities of the chat template (e.g. supports_reasoning_effort) */
 	chat_template_caps?: Record<string, boolean>;
 	model_alias?: string;
+	/** 0226: can the server run samplers on the backend (false with speculative decoding / tensor split) */
+	backend_sampling_supported?: boolean;
 	bos_token: string;
 	eos_token: string;
 	build_info: string;

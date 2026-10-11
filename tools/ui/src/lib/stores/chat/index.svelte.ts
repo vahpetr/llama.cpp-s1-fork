@@ -663,8 +663,15 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		if (currentConfig.samplers) apiOptions.samplers = currentConfig.samplers;
 
-		if (hasValue(currentConfig.backend_sampling))
+		// 0225: never sent to a server that reports it unsupported (or refused it before)
+		if (
+			hasValue(currentConfig.backend_sampling) &&
+			modelsStore.props.backendSampling(
+				typeof apiOptions.model === 'string' ? apiOptions.model : null
+			).supported !== false
+		) {
 			apiOptions.backend_sampling = currentConfig.backend_sampling;
+		}
 
 		if (currentConfig.customJson) apiOptions.custom = currentConfig.customJson;
 

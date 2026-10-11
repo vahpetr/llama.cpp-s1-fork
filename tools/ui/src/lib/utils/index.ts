@@ -429,3 +429,11 @@ export {
 	SNAPSHOT_SAMPLING_KEYS,
 	snapshotRequestOptions
 } from './request-snapshot';
+export {
+	BACKEND_SAMPLING_OLD_SERVER_NOTE,
+	backendSamplingHelp,
+	backendSamplingHint,
+	type BackendSamplingState,
+	backendSamplingState,
+	isBackendSamplingRejection
+} from './backend-sampling';

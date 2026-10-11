@@ -10,6 +10,7 @@
 	import { ICON_CLASS_DEFAULT, SETTING_CONFIG_INFO, SETTINGS_KEYS } from '$lib/constants';
 	import { SettingsFieldType } from '$lib/enums/settings.enums';
 	import { modelsStore, serverStore, settingsStore } from '$lib/stores';
+	import { backendSamplingHelp, backendSamplingHint } from '$lib/utils/backend-sampling';
 	import { normalizeFloatingPoint } from '$lib/utils/precision';
 	import type { Component } from 'svelte';
 
@@ -21,6 +22,13 @@
 	}
 
 	let { fields, localConfig, onConfigChange, onThemeChange }: Props = $props();
+
+	// 0225: backend sampling availability on this server (props + an earlier rejection)
+	const backendSampling = $derived(
+		modelsStore.props.backendSampling(
+			serverStore.isRouterMode ? modelsStore.selectedModelName : null
+		)
+	);
 
 	let currentModelParams = $derived.by(() => {
 		void modelsStore.props.cacheVersion;
@@ -297,10 +305,16 @@
 					</p>
 				{/if}
 			{:else if field.type === SettingsFieldType.CHECKBOX}
+				{@const locked =
+					field.key === SETTINGS_KEYS.BACKEND_SAMPLING
+						? backendSamplingHint(backendSampling)
+						: null}
+
 				<div class="flex items-start space-x-3">
 					<Checkbox
-						checked={Boolean(localConfig[field.key])}
+						checked={locked ? false : Boolean(localConfig[field.key])}
 						class="mt-1"
+						disabled={!!locked}
 						id={field.key}
 						onCheckedChange={(checked) => onConfigChange(field.key, checked)}
 					/>
@@ -319,7 +333,18 @@
 
 						{#if field.help || SETTING_CONFIG_INFO[field.key]}
 							<p class="text-xs text-muted-foreground">
-								{field.help || SETTING_CONFIG_INFO[field.key]}
+								{field.key === SETTINGS_KEYS.BACKEND_SAMPLING
+									? backendSamplingHelp(
+											field.help || SETTING_CONFIG_INFO[field.key],
+											backendSampling
+										)
+									: field.help || SETTING_CONFIG_INFO[field.key]}
+							</p>
+						{/if}
+
+						{#if locked}
+							<p class="text-xs text-amber-600 dark:text-amber-400" data-backend-sampling-locked>
+								{locked}
 							</p>
 						{/if}
 					</div>
