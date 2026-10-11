@@ -967,6 +967,8 @@ By default, it is read-only. To make POST request to change global properties, y
 - `chat_template_caps` - capabilities of the chat template (see `common/jinja/caps.h` for more info)
 - `modalities` - the list of supported modalities
 - `is_sleeping` - sleeping status, see [Sleeping on idle](#sleeping-on-idle)
+- `backend_sampling_supported` - whether a request may set `backend_sampling: true`. False when the loaded speculative decoding verifies more than one output per sequence (every type except `draft-dflash`/`draft-dspark` with draft backend sampling) or the model is tensor-split; such a request is then rejected with HTTP 400 (`invalid_request_error`) before any slot is used, and a server started with `--backend-sampling` logs a `[bs-guard] --backend-sampling forced off` warning and runs with it off.
+- `speculative` - the loaded speculative decoding: `type` (the `--spec-type` name(s), `none` without one) and `n_max` (the drafter's maximum draft length, 0 without one)
 
 ### POST `/props`: Change server global properties.
 

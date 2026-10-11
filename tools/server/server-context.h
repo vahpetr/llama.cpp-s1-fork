@@ -52,6 +52,12 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+
+    // [TAG_BS_GUARD] backend sampling support + loaded speculation state (/props, request validation)
+    bool        backend_sampling_supported;
+    std::string backend_sampling_error;
+    std::string spec_type;
+    int32_t     spec_n_max;
 };
 
 enum server_state {
@@ -218,6 +224,19 @@ struct server_multislot_envelope {
     std::string proof;          // the [multislot-envelope] line ("" for n_parallel <= 1: unchanged, nothing printed)
 };
 server_multislot_envelope server_multislot_envelope_check(const char * knob, int n_parallel, bool has_mmproj, bool ctx_shift);
+
+// [TAG_BS_GUARD] 0226: can this server honour a request's `backend_sampling: true`? Decided once from the loaded
+//   configuration (the CLI params, before the context is created). llama_decode() rejects a batch in which a sequence with
+//   a backend sampler has more outputs than n_outputs_max_per_seq; a speculative verify round has n_draft + 1 outputs per
+//   sequence, and only dflash/dspark with draft backend sampling raise the limit for it. Tensor split never offloads
+//   samplers. Unsupported -> requests asking for it get a 400 (error) before any slot is touched, and a server started
+//   with --backend-sampling has it forced off at startup (warning). (defined in server-context.cpp; tests/test-backend-sampling-guard)
+struct server_backend_sampling_support {
+    bool        supported = true;
+    std::string spec_type = "none"; // loaded speculation: canonical --spec-type name(s), "none" without speculation
+    std::string error;              // the 400 text when !supported
+};
+server_backend_sampling_support server_backend_sampling_check(const common_params & params);
 
 // [TAG_MULTISLOT] (stage 5.1 item 4a) homogeneous routing-class planner (LLAMA_QSA_HOMOGENEOUS=1, np > 1).
 // class of a depth interval [d_lo, d_hi] (depth = pos + 1) against N = LLAMA_QSA_MIN_KV: 1 above (d_lo >= N, equality

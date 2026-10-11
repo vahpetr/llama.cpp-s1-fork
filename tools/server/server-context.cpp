@@ -87,6 +87,43 @@ server_multislot_envelope server_multislot_envelope_check(const char * knob, int
     return r;
 }
 
+// [TAG_BS_GUARD] 0226 (see server-context.h)
+server_backend_sampling_support server_backend_sampling_check(const common_params & params) {
+    server_backend_sampling_support r;
+
+    std::vector<common_speculative_type> types;
+    for (const auto t : params.speculative.types) {
+        if (t != COMMON_SPECULATIVE_TYPE_NONE) {
+            types.push_back(t);
+        }
+    }
+    if (types.empty() && params.speculative.has_dft()) {
+        types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE); // a draft model without --spec-type
+    }
+    if (!types.empty()) {
+        r.spec_type = common_speculative_type_name_str(types);
+    }
+
+    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        r.supported = false;
+        r.error     = "backend_sampling is not supported on this server: tensor split";
+        return r;
+    }
+
+    // dflash/dspark raise n_outputs_max_per_seq to n_max + 1 only with draft backend sampling
+    // (common_base_params_to_speculative); every other speculation verifies n_draft + 1 outputs against a limit of 1
+    const bool block_draft_only = std::all_of(types.begin(), types.end(), [](common_speculative_type t) {
+        return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+    });
+    if (!types.empty() && !(block_draft_only && params.speculative.draft.backend_sampling)) {
+        r.supported = false;
+        r.error     = "backend_sampling is not supported on this server: speculative decoding (" + r.spec_type +
+                      ") verifies more than one output per sequence";
+    }
+
+    return r;
+}
+
 // [TAG_MULTISLOT] (stage 5.1 item 4a, see server-context.h) the routing-class planner of LLAMA_QSA_HOMOGENEOUS=1
 int server_qsa_route_class(int64_t d_lo, int64_t d_hi, int64_t n_min) {
     if (d_lo >= n_min) {
@@ -1722,6 +1759,10 @@ private:
 
     common_speculative_ptr spec;
 
+    // [TAG_BS_GUARD] decided in load_model from the loaded configuration
+    server_backend_sampling_support bs_support;
+    int32_t spec_n_max = 0; // loaded speculation's n_max (after the implementation's clamping), 0 without speculation
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -2069,6 +2110,18 @@ private:
 
         const bool is_resume = sleeping;
 
+        // [TAG_BS_GUARD] decide backend sampling support before the context is created: a server started with
+        //   --backend-sampling attaches backend samplers at context creation (common_init_from_params), which the
+        //   loaded speculation / tensor split cannot serve - force the default off (params is also the routes'
+        //   request default, so requests without the field stay unaffected)
+        bs_support = server_backend_sampling_check(params);
+        if (!bs_support.supported && params.sampling.backend_sampling) {
+            SRV_WRN("[bs-guard] --backend-sampling forced off: %s\n", bs_support.error.c_str());
+            params.sampling.backend_sampling = false;
+        }
+        SRV_INF("[bs-guard] backend_sampling_supported=%d spec_type=%s\n", bs_support.supported ? 1 : 0,
+                bs_support.spec_type.c_str());
+
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
@@ -2366,6 +2419,18 @@ private:
                     return false;
                 }
             }
+        }
+
+        // [TAG_BS_GUARD] the loaded speculation state for /props: n_max after the implementation's clamping; a
+        //   speculation that failed to initialize runs without one, so report (and judge) the server as such
+        spec_n_max = spec ? common_speculative_n_max(spec.get()) : 0;
+        if (!spec && bs_support.spec_type != "none") {
+            common_params params_nospec = params;
+            params_nospec.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+            params_nospec.speculative.draft.mparams = {};
+            bs_support = server_backend_sampling_check(params_nospec);
+            SRV_INF("[bs-guard] speculation not loaded: backend_sampling_supported=%d spec_type=none\n",
+                    bs_support.supported ? 1 : 0);
         }
 
         if (ctx_dft) {
@@ -6979,6 +7044,11 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params         */ llama_model_n_params(impl->model_tgt),
         /* model_size             */ llama_model_size(impl->model_tgt),
         /* model_ftype            */ ftype_name,
+
+        /* backend_sampling_supported */ impl->bs_support.supported,
+        /* backend_sampling_error     */ impl->bs_support.error,
+        /* spec_type                  */ impl->bs_support.spec_type,
+        /* spec_n_max                 */ impl->spec_n_max,
     };
 }
 
@@ -7075,6 +7145,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
+
+            // [TAG_BS_GUARD] reject here (400, nothing posted, no slot touched) instead of letting llama_decode fail
+            //   the verify batch (500 + the slot's prompt cache cleared)
+            if (task.params.sampling.backend_sampling && !meta->backend_sampling_supported) {
+                throw std::invalid_argument(meta->backend_sampling_error);
+            }
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
@@ -7391,6 +7467,12 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "build_info",                  meta.build_info },
         { "is_sleeping",                 is_sleeping },
         { "cors_proxy_enabled",          params.ui_mcp_proxy },
+        // [TAG_BS_GUARD] whether a request may set backend_sampling: true, and the loaded speculation
+        { "backend_sampling_supported",  meta.backend_sampling_supported },
+        { "speculative",                 json {
+            {"type",  meta.spec_type},
+            {"n_max", meta.spec_n_max},
+        } },
     };
     if (params.use_jinja) {
         if (!tmpl_tools.empty()) {
