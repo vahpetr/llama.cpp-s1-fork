@@ -26,6 +26,7 @@ against the code for this table.
 | `--spec-draft-n-max-adaptive` | off | adapt the draft length per slot from the running acceptance | output-preserving | - |
 | `--spec-draft-n-max-adaptive-cost a,b[,c,d]` | built-in | depth-aware cost model for the rule above | - | - |
 | `--spec-draft-n-max-adaptive-measure` | on | prefer measured round times over the cost model | - | - |
+| `--backend-sampling` | off | upstream flag; on this fork it works with draft-mtp but bypasses the graph cache and the CPU fast path (slower decode) and is not bit-exact at temperature > 0, so keep it off for speed. Where the target context cannot hold a verify round (1 + n_max outputs per sequence) or under tensor split it is forced off at start (WRN `[bs-guard] --backend-sampling forced off: <reason>`; INF `[bs-guard] backend_sampling_supported=<0\|1> spec_type=<type> n_max=<N> outputs_per_seq=<M>` always) and a request with `backend_sampling: true` gets a 400; `/props` reports `backend_sampling_supported` and `speculative {type, n_max}` | LOSSY at temperature > 0 (sampling route) | off |
 | `--spec-draft-policy off\|tput` | off | tput = pick the draft length that maximises committed tokens per ms (gate: no gain here) | output-preserving | off |
 
 ## Sparse attention (QSA) - `LLAMA_QSA_*`, `GGML_VK_QSA_*`
