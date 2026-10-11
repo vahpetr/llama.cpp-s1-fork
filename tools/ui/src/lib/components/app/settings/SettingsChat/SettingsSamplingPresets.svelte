@@ -1,7 +1,8 @@
 <script lang="ts">
 	// Settings -> Sampling & Penalties: the sampling presets by reasoning state (Thinking for an
-	// explicit level, Instruct for Off) and optional per-level overrides of Thinking. Saved at once
-	// (their own storage); the user's own Sampling fields above always win; Default sends none.
+	// explicit level, Instruct for Off) and optional per-level overrides of Thinking. Edits go to the
+	// panel's draft (`presets`), persisted with Save and dropped by Cancel / close; the user's own
+	// Sampling fields above always win; Default sends none.
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import {
@@ -9,9 +10,22 @@
 		PRESET_FIELDS,
 		type PresetField,
 		presetValues,
-		SAMPLING_PRESETS
+		SAMPLING_PRESETS,
+		type SamplingPresetSettings,
+		sanitizePresetValue,
+		withoutPreset,
+		withPresetField
 	} from '$lib/constants';
-	import { conversationsStore, modelsStore, settingsStore } from '$lib/stores';
+	import { useReasoningMenu } from '$lib/hooks/use-reasoning-menu.svelte';
+
+	interface Props {
+		presets: SamplingPresetSettings;
+	}
+
+	let { presets = $bindable() }: Props = $props();
+
+	// the same capability / level derivation as the picker (tracks the props cache version)
+	const reasoning = useReasoningMenu();
 
 	const FIELD_LABELS: Record<PresetField, string> = {
 		min_p: 'Min P',
@@ -33,18 +47,33 @@
 	] as const;
 
 	let active = $derived(
-		activePresetLine(
-			conversationsStore.preferences.getReasoningEffort(),
-			modelsStore.props.modelSupportsThinking(),
-			settingsStore.samplingPresets
-		)
+		activePresetLine(reasoning.currentEffort, reasoning.modelSupportsThinking, presets)
 	);
-	let thinkingValues = $derived(presetValues('thinking', settingsStore.samplingPresets).values);
+	let thinkingValues = $derived(presetValues('thinking', presets).values);
 
-	function parse(value: string): number | undefined {
-		const n = Number(value);
+	type Target = 'thinking' | 'instruct' | 'low' | 'medium' | 'high' | 'max';
 
-		return value.trim() !== '' && Number.isFinite(n) ? n : undefined;
+	/** Apply an edit to the draft; an invalid value (e.g. a non-integer top_k) is not taken. */
+	function edit(target: Target, field: PresetField, input: HTMLInputElement) {
+		const raw = input.value.trim();
+
+		if (raw === '') {
+			presets = withPresetField(presets, target, field, undefined);
+
+			return;
+		}
+
+		const v = sanitizePresetValue(field, Number(raw));
+
+		if (v === undefined) {
+			input.setCustomValidity(field === 'top_k' ? 'Top K must be a whole number' : 'Not a number');
+			input.reportValidity();
+
+			return;
+		}
+
+		input.setCustomValidity('');
+		presets = withPresetField(presets, target, field, v);
 	}
 </script>
 
@@ -62,7 +91,7 @@
 	</div>
 
 	{#each PRESETS as preset (preset.key)}
-		{@const p = presetValues(preset.key, settingsStore.samplingPresets)}
+		{@const p = presetValues(preset.key, presets)}
 
 		<div class="space-y-2">
 			<div class="flex items-center justify-between gap-2">
@@ -75,7 +104,7 @@
 
 				<Button
 					disabled={!p.custom}
-					onclick={() => settingsStore.resetPreset(preset.key)}
+					onclick={() => (presets = withoutPreset(presets, preset.key))}
 					size="sm"
 					variant="outline"
 				>
@@ -90,8 +119,7 @@
 
 						<Input
 							inputmode="decimal"
-							onchange={(e) =>
-								settingsStore.setPresetField(preset.key, field, parse(e.currentTarget.value))}
+							onchange={(e) => edit(preset.key, field, e.currentTarget)}
 							placeholder={String(SAMPLING_PRESETS[preset.key][field])}
 							value={String(p.values[field])}
 						/>
@@ -110,7 +138,7 @@
 		</p>
 
 		{#each LEVELS as level (level.key)}
-			{@const o = settingsStore.samplingPresets.levels?.[level.key] ?? {}}
+			{@const o = presets.levels?.[level.key] ?? {}}
 
 			<div class="mt-3 space-y-1">
 				<span class="text-xs font-medium">{level.label}</span>
@@ -122,8 +150,7 @@
 
 							<Input
 								inputmode="decimal"
-								onchange={(e) =>
-									settingsStore.setPresetField(level.key, field, parse(e.currentTarget.value))}
+								onchange={(e) => edit(level.key, field, e.currentTarget)}
 								placeholder={String(thinkingValues[field])}
 								value={o[field] !== undefined ? String(o[field]) : ''}
 							/>

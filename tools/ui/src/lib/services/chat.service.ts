@@ -1241,7 +1241,8 @@ export class ChatService {
 
 		if (dynatemp_exponent !== undefined) requestBody.dynatemp_exponent = dynatemp_exponent;
 
-		if (top_k !== undefined) requestBody.top_k = top_k;
+		// top_k is an integer on the server: a fractional value (an old setting) is rounded
+		if (top_k !== undefined && Number.isFinite(top_k)) requestBody.top_k = Math.round(top_k);
 
 		if (top_p !== undefined) requestBody.top_p = top_p;
 

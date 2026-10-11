@@ -85,19 +85,107 @@ export interface SamplingPresetSettings {
 
 export type SamplingPresetSource = 'card' | 'custom' | 'level';
 
-/** Only finite numbers of the six fields. */
+/** A valid value of a preset field: a finite number, an integer for top_k; else undefined. */
+export function sanitizePresetValue(field: PresetField, v: unknown): number | undefined {
+	if (typeof v !== 'number' || !Number.isFinite(v)) return undefined;
+
+	if (field === 'top_k' && !Number.isInteger(v)) return undefined;
+
+	return v;
+}
+
+/** Only valid values of the six fields. */
 export function cleanPresetOverrides(o: unknown): SamplingPresetOverrides {
 	const out: SamplingPresetOverrides = {};
 
 	if (!o || typeof o !== 'object') return out;
 
 	for (const k of PRESET_FIELDS) {
-		const v = (o as Record<string, unknown>)[k];
+		const v = sanitizePresetValue(k, (o as Record<string, unknown>)[k]);
 
-		if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+		if (v !== undefined) out[k] = v;
 	}
 
 	return out;
+}
+
+const PRESET_LEVELS = ['low', 'medium', 'high', 'max'] as const;
+
+/** Stored / imported preset settings with every invalid part dropped. */
+export function cleanPresetSettings(o: unknown): SamplingPresetSettings {
+	const out: SamplingPresetSettings = {};
+
+	if (!o || typeof o !== 'object' || Array.isArray(o)) return out;
+
+	const src = o as Record<string, unknown>;
+
+	for (const state of ['thinking', 'instruct'] as const) {
+		const c = cleanPresetOverrides(src[state]);
+
+		if (Object.keys(c).length > 0) out[state] = c;
+	}
+
+	const levels: NonNullable<SamplingPresetSettings['levels']> = {};
+
+	for (const level of PRESET_LEVELS) {
+		const c = cleanPresetOverrides((src.levels as Record<string, unknown> | undefined)?.[level]);
+
+		if (Object.keys(c).length > 0) levels[level] = c;
+	}
+
+	if (Object.keys(levels).length > 0) out.levels = levels;
+
+	return out;
+}
+
+/**
+ * The presets a settings file brings: cleaned, or null when the file has none (an older export) -
+ * then the presets here stay as they are.
+ */
+export function importedPresets(
+	data: { samplingPresets?: unknown } | null | undefined
+): SamplingPresetSettings | null {
+	const p = data?.samplingPresets;
+
+	return p && typeof p === 'object' && !Array.isArray(p) ? cleanPresetSettings(p) : null;
+}
+
+/**
+ * A copy of preset settings with one field of a preset (`thinking` / `instruct`) or of a level's
+ * overrides set - or cleared (undefined / invalid: the card value / the Thinking preset applies).
+ */
+export function withPresetField(
+	settings: SamplingPresetSettings,
+	target: 'thinking' | 'instruct' | 'low' | 'medium' | 'high' | 'max',
+	field: PresetField,
+	value: number | undefined
+): SamplingPresetSettings {
+	const isLevel = target !== 'thinking' && target !== 'instruct';
+	const current: SamplingPresetOverrides = {
+		...(isLevel
+			? settings.levels?.[target as (typeof PRESET_LEVELS)[number]]
+			: settings[target as 'thinking' | 'instruct'])
+	};
+	const v = sanitizePresetValue(field, value);
+
+	if (v === undefined) delete current[field];
+	else current[field] = v;
+
+	return isLevel
+		? { ...settings, levels: { ...settings.levels, [target]: current } }
+		: { ...settings, [target]: current };
+}
+
+/** A copy of preset settings with a preset back to the model card (the level overrides stay). */
+export function withoutPreset(
+	settings: SamplingPresetSettings,
+	state: 'thinking' | 'instruct'
+): SamplingPresetSettings {
+	const next = { ...settings };
+
+	delete next[state];
+
+	return next;
 }
 
 /** A preset's values: the model card with the user's edits (fields that differ from the card). */
@@ -169,7 +257,12 @@ export function samplingPresetLabel(p: {
  * reasoning effort ... Supported types are xhigh (default), medium, and low."), nothing broader.
  */
 export function isReasoningEffortRejection(message: string): boolean {
-	return /unexpected reasoning effort|supported (types|levels)[^.]*xhigh/i.test(message);
+	if (/unexpected reasoning effort/i.test(message)) return true;
+
+	// the "supported ... xhigh" form counts only when the message is about the reasoning effort
+	return (
+		/\b(reasoning|effort)\b/i.test(message) && /supported (types|levels)[^.]*xhigh/i.test(message)
+	);
 }
 
 /** The native `reasoning_effort` for a level, or undefined (Default, Off, or not supported). */

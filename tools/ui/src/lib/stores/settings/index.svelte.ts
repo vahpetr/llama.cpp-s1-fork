@@ -9,10 +9,13 @@
 
 import { browser } from '$app/environment';
 import { SETTING_CONFIG_DEFAULT, SETTINGS_KEYS } from '$lib/constants';
-import type {
-	PresetField,
-	SamplingPresetOverrides,
-	SamplingPresetSettings
+import {
+	cleanPresetSettings,
+	importedPresets,
+	type PresetField,
+	type SamplingPresetSettings,
+	withoutPreset,
+	withPresetField
 } from '$lib/constants/reasoning-effort.constants';
 import { ColorMode } from '$lib/enums';
 import { ParameterSyncService } from '$lib/services/parameter-sync.service';
@@ -94,6 +97,7 @@ class SettingsStore {
 
 		return {
 			config: configToExport,
+			samplingPresets: cleanPresetSettings(this.samplingPresets) as Record<string, unknown>,
 			timestamp: Date.now(),
 			userOverrides: Array.from(this.userOverrides),
 			version: 1
@@ -145,6 +149,8 @@ class SettingsStore {
 		}
 
 		this.forgetUserSampling();
+		// the visible "Reset to default": the presets and level overrides go back to the card too
+		this.setSamplingPresets({});
 		this.saveConfig();
 	}
 
@@ -201,12 +207,18 @@ class SettingsStore {
 	 * Restores config (including theme) and user overrides.
 	 * @param data - The exported settings object
 	 */
-	importSettings(data: SettingsExportType): void {
-		if (!browser) return;
+	importSettings(data: SettingsExportType): { samplingPresets: boolean } {
+		if (!browser) return { samplingPresets: false };
 
 		if (!data || !data.config) {
 			throw new Error('Invalid settings data: missing config');
 		}
+
+		// the sampling presets: replaced only when the file has them (older files keep the ones here)
+		const presets = importedPresets(data);
+		const hasPresets = presets !== null;
+
+		if (presets) this.setSamplingPresets(presets);
 
 		// Restore config (theme is included in config)
 		this.config = {
@@ -224,6 +236,8 @@ class SettingsStore {
 		setMode(this.config[SETTINGS_KEYS.THEME] as ColorMode);
 
 		console.log('Settings imported successfully');
+
+		return { samplingPresets: hasPresets };
 	}
 
 	/**
@@ -259,8 +273,7 @@ class SettingsStore {
 	resetConfig() {
 		this.config = { ...SETTING_CONFIG_DEFAULT };
 		this.forgetUserSampling();
-		this.samplingPresets = {};
-		SettingsService.saveSamplingPresets({});
+		this.setSamplingPresets({});
 
 		this.saveConfig();
 	}
@@ -289,11 +302,7 @@ class SettingsStore {
 
 	/** Reset a preset to the model card (drops its edits; the level overrides stay). */
 	resetPreset(state: 'thinking' | 'instruct'): void {
-		const next = { ...this.samplingPresets };
-
-		delete next[state];
-		this.samplingPresets = next;
-		SettingsService.saveSamplingPresets(this.samplingPresets as Record<string, unknown>);
+		this.setSamplingPresets(withoutPreset(this.samplingPresets, state));
 	}
 
 	/**
@@ -315,22 +324,15 @@ class SettingsStore {
 		field: PresetField,
 		value: number | undefined
 	): void {
-		const isLevel = target !== 'thinking' && target !== 'instruct';
-		const current: SamplingPresetOverrides = {
-			...(isLevel
-				? this.samplingPresets.levels?.[target as 'low' | 'medium' | 'high' | 'max']
-				: this.samplingPresets[target as 'thinking' | 'instruct'])
-		};
+		this.setSamplingPresets(withPresetField(this.samplingPresets, target, field, value));
+	}
 
-		if (value === undefined || !Number.isFinite(value)) delete current[field];
-		else current[field] = value;
-
-		this.samplingPresets = isLevel
-			? {
-					...this.samplingPresets,
-					levels: { ...this.samplingPresets.levels, [target]: current }
-				}
-			: { ...this.samplingPresets, [target]: current };
+	/**
+	 * Replace the preset settings (the Settings panel's draft on Save, an import) and persist them;
+	 * invalid parts are dropped.
+	 */
+	setSamplingPresets(value: SamplingPresetSettings): void {
+		this.samplingPresets = cleanPresetSettings(value);
 		SettingsService.saveSamplingPresets(this.samplingPresets as Record<string, unknown>);
 	}
 
@@ -529,7 +531,7 @@ class SettingsStore {
 		// Load user overrides
 		this.userOverrides = new Set(savedOverrides);
 		this.userSampling = SettingsService.loadUserSampling();
-		this.samplingPresets = SettingsService.loadSamplingPresets() as SamplingPresetSettings;
+		this.samplingPresets = cleanPresetSettings(SettingsService.loadSamplingPresets());
 	}
 
 	/**

@@ -572,7 +572,10 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	getApiOptions(conversation?: DatabaseConversation | null): Record<string, unknown> {
 		const currentConfig = settingsStore.config;
 		const hasValue = (value: unknown): boolean =>
-			value !== undefined && value !== null && value !== '';
+			value !== undefined &&
+			value !== null &&
+			!(typeof value === 'string' && value.trim() === '') &&
+			!(typeof value === 'number' && Number.isNaN(value));
 		const apiOptions: Record<string, unknown> = { stream: true, timings_per_token: true };
 
 		if (serverStore.isRouterMode) {

@@ -17,12 +17,17 @@ beforeAll(() => {
 
 import {
 	activePresetLine,
+	cleanPresetSettings,
+	importedPresets,
 	isReasoningEffortRejection,
 	nativeReasoningEffort,
 	REASONING_EFFORT_TOKENS,
 	resolveSamplingPreset,
 	SAMPLING_PRESETS,
-	samplingPresetLabel
+	samplingPresetLabel,
+	sanitizePresetValue,
+	withoutPreset,
+	withPresetField
 } from '$lib/constants';
 import { ReasoningEffort } from '$lib/enums';
 import { ChatService } from '$lib/services/chat.service';
@@ -313,7 +318,14 @@ describe('reasoning_effort fallback (narrow, per model)', () => {
 				'Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low.'
 			)
 		).toBe(true);
-		expect(isReasoningEffortRejection('Supported levels: xhigh, medium, low')).toBe(true);
+		expect(
+			isReasoningEffortRejection('Reasoning effort: supported levels are xhigh, medium, low')
+		).toBe(true);
+		// the "supported ... xhigh" form without a reasoning / effort reference does not count
+		expect(isReasoningEffortRejection('Supported levels: xhigh, medium, low')).toBe(false);
+		expect(
+			isReasoningEffortRejection('Supported types are xhigh (default), medium, and low.')
+		).toBe(false);
 		expect(isReasoningEffortRejection('invalid reasoning_effort type')).toBe(false);
 		expect(isReasoningEffortRejection('the prompt is too long for the reasoning effort')).toBe(
 			false
@@ -516,5 +528,79 @@ describe('editable presets by reasoning state + per-level overrides', () => {
 				instruct: { temperature: 'hot' as never, top_p: Number.NaN }
 			})?.values
 		).toEqual(SAMPLING_PRESETS.instruct);
+	});
+});
+
+describe('astra 0223 review: draft, export/import, reset, integer top_k, hasValue', () => {
+	it('top_k must be an integer (sanitizer, draft edits, stored / imported settings)', () => {
+		expect(sanitizePresetValue('top_k', 20.5)).toBeUndefined();
+		expect(sanitizePresetValue('top_k', 40)).toBe(40);
+		expect(sanitizePresetValue('temperature', 0.55)).toBe(0.55);
+		expect(withPresetField({}, 'thinking', 'top_k', 20.5)).toEqual({ thinking: {} });
+		expect(
+			cleanPresetSettings({ levels: { low: { top_k: 3.2, top_p: 0.9 } }, thinking: { top_k: 'x' } })
+		).toEqual({ levels: { low: { top_p: 0.9 } } });
+	});
+
+	it('draft helpers never touch the stored presets (Save persists, Cancel drops)', () => {
+		settingsStore.setSamplingPresets({ thinking: { temperature: 0.9 } });
+
+		const draft = withPresetField(
+			withoutPreset(settingsStore.samplingPresets, 'thinking'),
+			'medium',
+			'top_p',
+			0.8
+		);
+
+		expect(draft).toEqual({ levels: { medium: { top_p: 0.8 } } });
+		// nothing persisted until Save
+		expect(settingsStore.samplingPresets).toEqual({ thinking: { temperature: 0.9 } });
+		settingsStore.setSamplingPresets(draft);
+		expect(settingsStore.samplingPresets).toEqual({ levels: { medium: { top_p: 0.8 } } });
+	});
+
+	it('export carries the presets; import replaces them only when the file has them', () => {
+		settingsStore.setSamplingPresets({ instruct: { temperature: 0.6 } });
+
+		const exported = settingsStore.exportSettings();
+
+		expect(exported.samplingPresets).toEqual({ instruct: { temperature: 0.6 } });
+		// an older file without presets: none imported (the presets here stay)
+		expect(importedPresets({})).toBeNull();
+		expect(importedPresets({ samplingPresets: [] })).toBeNull();
+		// a file with presets: cleaned (a fractional top_k dropped)
+		expect(
+			importedPresets({ samplingPresets: { instruct: { temperature: 0.65, top_k: 1.5 } } })
+		).toEqual({ instruct: { temperature: 0.65 } });
+	});
+
+	it('"Reset to default" (forceSyncWithServerDefaults) and resetConfig clear the presets', () => {
+		settingsStore.setSamplingPresets({
+			levels: { max: { temperature: 1.2 } },
+			thinking: { top_p: 0.9 }
+		});
+		settingsStore.forceSyncWithServerDefaults();
+		expect(settingsStore.samplingPresets).toEqual({});
+		settingsStore.setSamplingPresets({ instruct: { top_p: 0.7 } });
+		settingsStore.resetConfig();
+		expect(settingsStore.samplingPresets).toEqual({});
+	});
+
+	it('hasValue ignores whitespace-only strings and NaN (no NaN / blank sampling sent)', async () => {
+		settingsStore.config = { ...settingsStore.config, temperature: '   ', top_p: Number.NaN };
+
+		const body = await bodyFor(ReasoningEffort.OFF, true);
+
+		// both fall back to the instruct preset instead of NaN / blank
+		expect(body.temperature).toBe(0.7);
+		expect(body.top_p).toBe(0.8);
+	});
+
+	it('a fractional top_k from an old setting is sent as an integer', async () => {
+		settingsStore.config = { ...settingsStore.config, top_k: 20.6 };
+
+		const body = await bodyFor(ReasoningEffort.DEFAULT, true);
+
+		expect(body.top_k).toBe(21);
 	});
 });

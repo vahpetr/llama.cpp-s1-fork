@@ -10,6 +10,7 @@
 		SettingsFooter
 	} from '$lib/components/app/settings';
 	import { Button } from '$lib/components/ui/button';
+	import type { SamplingPresetSettings } from '$lib/constants';
 	import {
 		NUMERIC_FIELDS,
 		POSITIVE_INTEGER_FIELDS,
@@ -47,6 +48,10 @@
 	);
 
 	let localConfig: SettingsConfigType = $state({ ...settingsStore.config });
+	// the sampling presets are edited as a draft too: persisted on Save, dropped on close / Cancel
+	let localPresets: SamplingPresetSettings = $state(
+		structuredClone($state.snapshot(settingsStore.samplingPresets))
+	);
 
 	let mobileHeader: { updateCarousel: () => void } | undefined;
 
@@ -75,6 +80,7 @@
 
 	function handleReset() {
 		localConfig = { ...settingsStore.config };
+		localPresets = structuredClone($state.snapshot(settingsStore.samplingPresets));
 		setMode(localConfig.theme as ColorMode);
 		mobileHeader?.updateCarousel();
 	}
@@ -122,11 +128,13 @@
 		}
 
 		settingsStore.updateMultipleConfig(processedConfig);
+		settingsStore.setSamplingPresets($state.snapshot(localPresets));
 		onClose?.();
 	}
 
 	export function reset() {
 		localConfig = { ...settingsStore.config };
+		localPresets = structuredClone($state.snapshot(settingsStore.samplingPresets));
 	}
 </script>
 
@@ -162,7 +170,7 @@
 							/>
 
 							{#if currentSection.slug === SETTINGS_SECTION_SLUGS.SAMPLING_PENALTIES}
-								<SettingsSamplingPresets />
+								<SettingsSamplingPresets bind:presets={localPresets} />
 							{/if}
 
 							{#if currentSection.slug === SETTINGS_SECTION_SLUGS.GENERAL}
