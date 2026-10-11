@@ -14,7 +14,7 @@ Everything here was measured on my two boxes. Numbers, dates and image versions:
 
 Same box, one conversation, one slot for the fork's current column (the fork columns use the i1-Q4_K_M weights):
 
-| | stock llama.cpp (Aug 2026) | this fork, dense (Sep 9) | this fork now (v53-v57) |
+| | stock llama.cpp (Aug 2026) | this fork, dense (Sep 9) | this fork now (v53-v58) |
 |---|---|---|---|
 | decode, empty context | 24-27 t/s | 49.6 t/s (Sep 6) | **61 t/s** |
 | decode at 107k / 213k | - | 41.8 / 29.4 t/s | **51.6 / 59.9 t/s** |
@@ -55,7 +55,10 @@ What does that:
   supports it (Qwen3.8-Flash-Next), Low / Medium / High / Max also send the native `reasoning_effort` low / medium / xhigh /
   xhigh. An explicit level gets the model card's thinking sampling, Off the instruct sampling, but only for parameters you
   have not set yourself; Default sends neither and follows the server. Both servers here run `--reasoning off`, so Default
-  means no thinking.
+  means no thinking. Settings -> Sampling & Penalties -> "Presets by reasoning state" makes both presets editable (Thinking
+  and Instruct, model-card defaults, "Reset to model card") with optional per-level overrides for Low / Medium / High / Max;
+  precedence: your own Sampling values > level override > preset. The presets follow Save / Cancel and are included in
+  settings export / import.
 - **Telemetry.** The stop type of every reply at INFO (`stop=eos|limit|word|cancel`), per-round speculative timings, `kqvis-prof`
   lines, expert-occupancy stats, `disk_cache_*` in `/metrics`, `GET /disk-cache`.
 
@@ -94,8 +97,8 @@ checks their sha256; (hands only) re-encodes the BF16 hyper-connection weights a
 `tools/s1/gguf_hc_q8.py`; pulls the image (or builds it with `BUILD=1`); starts the compose file and smoke-tests it.
 `--dry-run` shows every step first. Which weights and why: [docs/s1/WEIGHTS.md](docs/s1/WEIGHTS.md). I redistribute no weights;
 they come from their authors' Hugging Face repos.
-The published images (`vahpetr/llama-cpp-s1-fork:v57` = `:latest`, `:v57k`) are built from my `prod-v11-stage7` revision
-(v57 = `11ba71ca4`; `:v56` / `:v56k` stay as the rollback); this `s1-public` branch only adds docs and deploy files on top.
+The published images (`vahpetr/llama-cpp-s1-fork:v58` = `:latest`, `:v58k`) are built from my `prod-v11-stage7` revision
+(v58 = `0aec4819b`; `:v57` / `:v57k` stay as the rollback); this `s1-public` branch only adds docs and deploy files on top.
 My production draft head is a vocabulary-pruned variant built from my own traffic, so the public setup uses dzannotti's
 full-vocabulary head, and the decode numbers above are an upper bound for it.
 
