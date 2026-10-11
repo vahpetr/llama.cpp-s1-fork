@@ -47,7 +47,7 @@ describe('backend sampling availability from /props', () => {
 		);
 
 		expect(backendSamplingHint(mtp)).toBe(
-			'Not available on this server: speculative decoding (draft-mtp)'
+			'Not available on this server: a speculative verify round needs 1+4 outputs per sequence, more than the context allows'
 		);
 		expect(
 			backendSamplingHint(

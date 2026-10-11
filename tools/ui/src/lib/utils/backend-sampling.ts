@@ -14,7 +14,7 @@ export interface BackendSamplingProps {
 export interface BackendSamplingState {
 	/** true / false as the server reports it (or as a rejection taught us); undefined = not reported */
 	supported: boolean | undefined;
-	/** why it is unavailable: "speculative decoding (draft-mtp)" / "tensor split" / ... */
+	/** why it is unavailable: "a speculative verify round needs 1+N outputs ..." / "tensor split" / ... */
 	reason?: string;
 	/** the server's speculative decoding type ("draft-mtp", ...; undefined / "none" = none) */
 	speculativeType?: string;
@@ -32,7 +32,13 @@ export function backendSamplingState(
 ): BackendSamplingState {
 	const spec = props?.speculative;
 	const type = spec && typeof spec === 'object' ? spec.type : undefined;
-	const reason = type && type !== 'none' ? `speculative decoding (${type})` : 'tensor split';
+	const nMax = spec && typeof spec === 'object' ? spec.n_max : undefined;
+	// the server's limit reason (0226b): a verify round needs 1 + n_max outputs per sequence, more
+	// than the target context allows; without speculative decoding it is a tensor split
+	const reason =
+		type && type !== 'none'
+			? `a speculative verify round needs 1+${nMax ?? 'N'} outputs per sequence, more than the context allows`
+			: 'tensor split';
 
 	if (props?.backend_sampling_supported === false) return { reason, supported: false };
 
