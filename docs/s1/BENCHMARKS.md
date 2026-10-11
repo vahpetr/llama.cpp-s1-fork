@@ -2,8 +2,9 @@
 
 All numbers are measured on my two boxes, single runs unless a range is given. "vNN" is my image version (one image per fork
 build; v53 = fork `prod-v11-stage6` @ f0fa8ddf1, v54 = v53 + webui and logging changes, v55 = v54 + webui
-changes only, v56 = v55 + webui changes only, v57 = v56 + webui changes only, v58 = this tree's HEAD = v57 + webui
-changes only; same numerics).
+changes only, v56 = v55 + webui changes only, v57 = v56 + webui changes only, v58 = v57 + webui
+changes only, v59 = this tree's HEAD = v58 + a server backend-sampling guard and webui changes; same numerics, gated: G6
+same-key, bit-identical to v58).
 Run-to-run noise on the speed track is about ±1.5 %.
 
 Brain model everywhere below: Qwen3.8-Flash-Next-Uncensored i1-Q4_K_M + MTP draft head (vocab-pruned, see deploy/README.md),
