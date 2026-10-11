@@ -1090,6 +1090,7 @@ export class ChatService {
 			onToolCallChunk,
 			presence_penalty,
 			reasoningEffort,
+			reasoningEffortNative,
 			// Penalty parameters
 			repeat_last_n,
 			repeat_penalty,
@@ -1211,6 +1212,11 @@ export class ChatService {
 
 		if (reasoningBudgetTokens >= 0) {
 			requestBody.thinking_budget_tokens = reasoningBudgetTokens;
+		}
+
+		// the template's own effort knob, only when /props says the template takes it
+		if (enableThinking && reasoningEffortNative) {
+			(requestBody as unknown as Record<string, unknown>).reasoning_effort = reasoningEffortNative;
 		}
 
 		// arms the budget sampler so reasoning can be ended at runtime via the control endpoint
@@ -1375,13 +1381,30 @@ export class ChatService {
 			});
 
 			if (!response.ok) {
+				const error = await ChatService.parseErrorResponse(response);
+
+				// a template that refuses the native reasoning_effort (400 naming it): retry once
+				// without it, and never send it to this model again
+				if (
+					response.status === 400 &&
+					reasoningEffortNative &&
+					/reasoning.?effort/i.test(error.message)
+				) {
+					modelsStore.props.markReasoningEffortUnsupported(options.model);
+
+					return ChatService.sendMessage(
+						messages,
+						{ ...options, reasoningEffortNative: undefined },
+						conversationId,
+						signal
+					);
+				}
+
 				// a rejected request (including one cancelled by a stop during the model load)
 				// leaves nothing to resume
 				if (conversationId) {
 					ChatService.clearStreamState(conversationId);
 				}
-
-				const error = await ChatService.parseErrorResponse(response);
 
 				if (onError) {
 					onError(error);

@@ -1,6 +1,10 @@
 <script lang="ts">
 	import { File, Image, MessageSquare, Mic, Plus, Video } from '@lucide/svelte';
-	import { ChatFormActionAddToolsSubmenu, McpLogo } from '$lib/components/app';
+	import {
+		ChatFormActionAddReasoningSubmenu,
+		ChatFormActionAddToolsSubmenu,
+		McpLogo
+	} from '$lib/components/app';
 	import { buttonVariants } from '$lib/components/ui/button';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 	import * as Tooltip from '$lib/components/ui/tooltip';
@@ -13,6 +17,8 @@
 	import { getChatFormActionsContext } from '$lib/contexts';
 	import { AttachmentAction, AttachmentItemEnabledWhen } from '$lib/enums';
 	import { useAttachmentMenu } from '$lib/hooks/use-attachment-menu.svelte';
+	import { useReasoningMenu } from '$lib/hooks/use-reasoning-menu.svelte';
+	import { serverStore } from '$lib/stores';
 
 	interface Props {
 		class?: string;
@@ -21,6 +27,9 @@
 	let { class: className = '' }: Props = $props();
 
 	const chatFormActions = getChatFormActionsContext();
+	// single-model mode: the reasoning level lives in this menu (router mode keeps it in the
+	// model selector dropdown)
+	const reasoning = useReasoningMenu();
 
 	let dropdownOpen = $state(false);
 	// The system message action moves focus to the message editor, so the menu
@@ -130,6 +139,10 @@
 
 				<span>System Message</span>
 			</DropdownMenu.Item>
+
+			{#if !serverStore.isRouterMode && reasoning.modelSupportsThinking}
+				<ChatFormActionAddReasoningSubmenu />
+			{/if}
 
 			<ChatFormActionAddToolsSubmenu />
 

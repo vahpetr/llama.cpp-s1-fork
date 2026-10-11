@@ -13,7 +13,10 @@ import { goto } from '$app/navigation';
 import {
 	CONTEXT_RESERVE,
 	CWD_CLEARED_TEXT,
+	effectiveThinking,
 	MESSAGE_EXTRA_STORAGE_VERSION,
+	nativeReasoningEffort,
+	SAMPLING_PRESETS,
 	SYSTEM_MESSAGE_PLACEHOLDER,
 	TITLE_GENERATION
 } from '$lib/constants';
@@ -590,7 +593,19 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		if (effort !== ReasoningEffort.DEFAULT) {
 			apiOptions.enableThinking = effort !== ReasoningEffort.OFF;
 
-			if (effort !== ReasoningEffort.OFF) apiOptions.reasoningEffort = effort;
+			if (effort !== ReasoningEffort.OFF) {
+				apiOptions.reasoningEffort = effort;
+
+				// the native field too, when the template supports it (Low..Max -> low..xhigh)
+				const native = nativeReasoningEffort(
+					effort,
+					modelsStore.props.supportsReasoningEffort(
+						typeof apiOptions.model === 'string' ? apiOptions.model : null
+					)
+				);
+
+				if (native) apiOptions.reasoningEffortNative = native;
+			}
 		}
 
 		if (hasValue(currentConfig.temperature))
@@ -648,6 +663,16 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			apiOptions.backend_sampling = currentConfig.backend_sampling;
 
 		if (currentConfig.customJson) apiOptions.custom = currentConfig.customJson;
+
+		// sampling preset of the thinking state, for the parameters the user left unset
+		const preset =
+			SAMPLING_PRESETS[
+				effectiveThinking(effort, modelsStore.props.serverDefaultThinking) ? 'thinking' : 'instruct'
+			];
+
+		for (const [key, value] of Object.entries(preset)) {
+			if (!hasValue(currentConfig[key])) apiOptions[key] = value;
+		}
 
 		return apiOptions;
 	}

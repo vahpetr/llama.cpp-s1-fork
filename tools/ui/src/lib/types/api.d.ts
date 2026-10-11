@@ -256,6 +256,8 @@ export interface ApiLlamaCppServerProps {
 		video: boolean;
 	};
 	chat_template: string;
+	/** capabilities of the chat template (e.g. supports_reasoning_effort) */
+	chat_template_caps?: Record<string, boolean>;
 	bos_token: string;
 	eos_token: string;
 	build_info: string;

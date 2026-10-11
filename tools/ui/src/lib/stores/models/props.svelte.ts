@@ -37,6 +37,8 @@ export interface ModelPropsHost {
 export class ModelPropsManager {
 	/** Version counter for the cache - bumped on writes so $derived consumers recompute. */
 	cacheVersion = $state(0);
+	/** Models whose server refused `reasoning_effort` (400): never sent to them again. */
+	reasoningEffortRejected = new SvelteSet<string>();
 	/**
 	 * Model-specific props cache with TTL.
 	 * Key: modelId, Value: props data including modalities.
@@ -45,17 +47,26 @@ export class ModelPropsManager {
 		maxEntries: MODEL_PROPS_CACHE.MAX_ENTRIES,
 		ttlMs: MODEL_PROPS_CACHE.TTL_MS
 	});
+
 	private fetching = new SvelteSet<string>();
 
 	/**
-	 * Whether the selected model's chat template supports thinking/reasoning.
-	 * Uses heuristic detection on the model's chat_template from /props.
-	 *
-	 * - MODEL mode: the global /props already describes the single loaded model,
-	 *   so its chat_template is used directly and no per-model cache is involved
-	 * - ROUTER mode: fetches /props?model=<id> for the selected model (cached),
-	 *   triggering an async fetch if not yet cached
+	 * Whether the server thinks by default (Default level): its /props default generation
+	 * settings carry enable_thinking = true; false otherwise (our composes run `--reasoning off`).
 	 */
+	get serverDefaultThinking(): boolean {
+		const dgs = serverStore.props?.default_generation_settings as
+			| {
+					enable_thinking?: unknown;
+					params?: { chat_template_kwargs?: { enable_thinking?: unknown } };
+			  }
+			| undefined;
+
+		return (
+			dgs?.enable_thinking === true || dgs?.params?.chat_template_kwargs?.enable_thinking === true
+		);
+	}
+
 	get supportsThinking(): boolean {
 		if (!serverStore.isRouterMode) {
 			return detectThinkingSupport(serverStore.props?.chat_template ?? '');
@@ -231,6 +242,10 @@ export class ModelPropsManager {
 		return this.fetching.has(modelId);
 	}
 
+	markReasoningEffortUnsupported(modelId?: string | null): void {
+		this.reasoningEffortRejected.add(serverStore.isRouterMode ? (modelId ?? '') : '');
+	}
+
 	modelSupportsAudio(modelId: string): boolean {
 		return this.getModelModalities(modelId)?.audio ?? false;
 	}
@@ -241,6 +256,37 @@ export class ModelPropsManager {
 
 	modelSupportsVision(modelId: string): boolean {
 		return this.getModelModalities(modelId)?.vision ?? false;
+	}
+
+	/**
+	 * Whether the selected model's chat template supports thinking/reasoning.
+	 * Uses heuristic detection on the model's chat_template from /props.
+	 *
+	 * - MODEL mode: the global /props already describes the single loaded model,
+	 *   so its chat_template is used directly and no per-model cache is involved
+	 * - ROUTER mode: fetches /props?model=<id> for the selected model (cached),
+	 *   triggering an async fetch if not yet cached
+	 */
+	/**
+	 * Whether the chat template takes the native `reasoning_effort` (from /props
+	 * chat_template_caps.supports_reasoning_effort): the global /props in MODEL mode, the
+	 * model's cached /props in ROUTER mode (false until it is cached).
+	 */
+	supportsReasoningEffort(modelId?: string | null): boolean {
+		void this.cacheVersion;
+
+		if (!serverStore.isRouterMode) {
+			return (
+				!this.reasoningEffortRejected.has('') &&
+				serverStore.props?.chat_template_caps?.supports_reasoning_effort === true
+			);
+		}
+
+		const id = modelId || this.host.selectedModelName;
+
+		if (!id || this.reasoningEffortRejected.has(id)) return false;
+
+		return this.getModelProps(id)?.chat_template_caps?.supports_reasoning_effort === true;
 	}
 
 	/**
