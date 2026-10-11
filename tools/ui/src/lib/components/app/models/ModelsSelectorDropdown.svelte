@@ -16,8 +16,7 @@
 		MODEL_SELECTOR_ICON,
 		nativeReasoningEffort,
 		REASONING_EFFORT_LABELS,
-		SAMPLING_PRESETS,
-		samplingPresetFor,
+		resolveSamplingPreset,
 		samplingPresetLabel,
 		SETTINGS_KEYS
 	} from '$lib/constants';
@@ -73,15 +72,19 @@
 	});
 
 	const reasoning = useReasoningMenu();
-	// the lightbulb's title names the current level and the active sampling preset
+	// the lightbulb's title names the current level, the active sampling preset and its source
 	const reasoningLabel = $derived.by(() => {
 		const effort = reasoning.currentEffort;
 		const level = REASONING_EFFORT_LABELS[effort] ?? effort;
-		const preset = samplingPresetFor(effort, reasoning.modelSupportsThinking);
+		const preset = resolveSamplingPreset(
+			effort,
+			reasoning.modelSupportsThinking,
+			settingsStore.samplingPresets
+		);
 
 		if (!preset) return `${level} · server sampling`;
 
-		const thinking = preset === SAMPLING_PRESETS.thinking;
+		const thinking = preset.state === 'thinking';
 		const userT = Number(settingsStore.config.temperature);
 		const ownT = settingsStore.userSampling?.temperature;
 		const temperature =
@@ -89,7 +92,7 @@
 			settingsStore.config.temperature !== '' &&
 			Number.isFinite(userT)
 				? userT
-				: (ownT ?? preset.temperature);
+				: (ownT ?? preset.values.temperature);
 
 		return (
 			`${level} · ` +
@@ -97,6 +100,7 @@
 				native: thinking
 					? nativeReasoningEffort(effort, modelsStore.props.supportsReasoningEffort())
 					: undefined,
+				source: preset.source,
 				temperature,
 				thinking
 			})

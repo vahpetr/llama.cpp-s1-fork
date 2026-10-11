@@ -15,7 +15,7 @@ import {
 	CWD_CLEARED_TEXT,
 	MESSAGE_EXTRA_STORAGE_VERSION,
 	nativeReasoningEffort,
-	samplingPresetFor,
+	resolveSamplingPreset,
 	SYSTEM_MESSAGE_PLACEHOLDER,
 	TITLE_GENERATION
 } from '$lib/constants';
@@ -675,12 +675,14 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		// sampling preset of an EXPLICIT level (thinking) or Off (instruct) on a thinking model, for
 		// the parameters the user did not set; Default inherits the server's sampling
-		const preset = samplingPresetFor(
+		// (the presets as edited in Settings; a level's own overrides on top of Thinking)
+		const preset = resolveSamplingPreset(
 			effort,
 			modelsStore.props.modelSupportsThinking(
 				typeof apiOptions.model === 'string' ? apiOptions.model : null
-			)
-		);
+			),
+			settingsStore.samplingPresets
+		)?.values;
 
 		if (preset) {
 			for (const [key, value] of Object.entries(preset)) {

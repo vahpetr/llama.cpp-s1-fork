@@ -1,6 +1,7 @@
 import { browser } from '$app/environment';
 import {
 	CONFIG_LOCALSTORAGE_KEY,
+	SAMPLING_PRESETS_LOCALSTORAGE_KEY,
 	USER_OVERRIDES_LOCALSTORAGE_KEY,
 	USER_SAMPLING_LOCALSTORAGE_KEY
 } from '$lib/constants';
@@ -43,6 +44,19 @@ export class SettingsService {
 			console.warn('Failed to parse config from localStorage, using defaults:', error);
 
 			return { config: {}, isFirstVisit: false, userOverrides: [] };
+		}
+	}
+
+	/** The user's edits of the sampling presets (a separate key; missing = the model card). */
+	static loadSamplingPresets(): Record<string, unknown> {
+		if (!browser) return {};
+
+		try {
+			const raw = JSON.parse(localStorage.getItem(SAMPLING_PRESETS_LOCALSTORAGE_KEY) || '{}');
+
+			return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+		} catch {
+			return {};
 		}
 	}
 
@@ -90,6 +104,16 @@ export class SettingsService {
 			localStorage.setItem(USER_OVERRIDES_LOCALSTORAGE_KEY, JSON.stringify(userOverrides));
 		} catch (error) {
 			console.error('Failed to save config to localStorage:', error);
+		}
+	}
+
+	static saveSamplingPresets(values: Record<string, unknown>): void {
+		if (!browser) return;
+
+		try {
+			localStorage.setItem(SAMPLING_PRESETS_LOCALSTORAGE_KEY, JSON.stringify(values));
+		} catch {
+			// storage full or blocked: the presets live in memory for this session
 		}
 	}
 

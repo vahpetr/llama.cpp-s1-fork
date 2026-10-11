@@ -1,4 +1,5 @@
 <script lang="ts">
+	import SettingsSamplingPresets from './SettingsSamplingPresets.svelte';
 	import { RefreshCw } from '@lucide/svelte';
 	import {
 		SettingsChatDesktopSidebar,
@@ -159,6 +160,10 @@
 								onConfigChange={handleConfigChange}
 								onThemeChange={handleThemeChange}
 							/>
+
+							{#if currentSection.slug === SETTINGS_SECTION_SLUGS.SAMPLING_PENALTIES}
+								<SettingsSamplingPresets />
+							{/if}
 
 							{#if currentSection.slug === SETTINGS_SECTION_SLUGS.GENERAL}
 								<div class="flex justify-end">

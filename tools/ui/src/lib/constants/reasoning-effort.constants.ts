@@ -59,30 +59,106 @@ export const SAMPLING_PRESETS = {
 	}
 } as const;
 
-/**
- * The sampling preset a request gets: only for an explicit choice on a model that supports
- * thinking - a level -> thinking, Off -> instruct; Default (and non-thinking models) -> none, the
- * server's own sampling applies (/props carries no thinking-activation signal).
- */
-export function samplingPresetFor(
-	effort: string,
-	modelSupportsThinking: boolean
-): (typeof SAMPLING_PRESETS)['thinking'] | (typeof SAMPLING_PRESETS)['instruct'] | null {
-	if (!modelSupportsThinking || effort === ReasoningEffort.DEFAULT) return null;
+/** The six sampling fields a preset sets. */
+export const PRESET_FIELDS = [
+	'temperature',
+	'top_p',
+	'top_k',
+	'min_p',
+	'presence_penalty',
+	'repeat_penalty'
+] as const;
 
-	return effort === ReasoningEffort.OFF ? SAMPLING_PRESETS.instruct : SAMPLING_PRESETS.thinking;
+export type PresetField = (typeof PRESET_FIELDS)[number];
+export type SamplingPresetValues = Record<PresetField, number>;
+export type SamplingPresetOverrides = Partial<Record<PresetField, number>>;
+
+/**
+ * The user's edits of the presets (Settings -> Sampling & Penalties): the Thinking and Instruct
+ * presets (a missing preset = the model card) and optional per-level overrides of Thinking.
+ */
+export interface SamplingPresetSettings {
+	thinking?: SamplingPresetOverrides;
+	instruct?: SamplingPresetOverrides;
+	levels?: Partial<Record<'low' | 'medium' | 'high' | 'max', SamplingPresetOverrides>>;
 }
 
-/** The lightbulb title: "thinking · xhigh · T 1.0" / "instruct · T 0.7". */
+export type SamplingPresetSource = 'card' | 'custom' | 'level';
+
+/** Only finite numbers of the six fields. */
+export function cleanPresetOverrides(o: unknown): SamplingPresetOverrides {
+	const out: SamplingPresetOverrides = {};
+
+	if (!o || typeof o !== 'object') return out;
+
+	for (const k of PRESET_FIELDS) {
+		const v = (o as Record<string, unknown>)[k];
+
+		if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+	}
+
+	return out;
+}
+
+/** A preset's values: the model card with the user's edits (fields that differ from the card). */
+export function presetValues(
+	state: 'thinking' | 'instruct',
+	settings: SamplingPresetSettings | undefined
+): { values: SamplingPresetValues; custom: boolean } {
+	const card = SAMPLING_PRESETS[state];
+	const edits = cleanPresetOverrides(settings?.[state]);
+	const values = { ...card, ...edits } as SamplingPresetValues;
+
+	return { custom: PRESET_FIELDS.some((k) => values[k] !== card[k]), values };
+}
+
+/**
+ * The sampling a request gets from the presets (before the user's own Sampling values, which win):
+ * none for Default or a model without thinking; Off -> the Instruct preset; a level -> the
+ * Thinking preset with that level's overrides on top. `source` = card / custom / level.
+ */
+export function resolveSamplingPreset(
+	effort: string,
+	modelSupportsThinking: boolean,
+	settings?: SamplingPresetSettings
+): {
+	values: SamplingPresetValues;
+	source: SamplingPresetSource;
+	state: 'thinking' | 'instruct';
+} | null {
+	if (!modelSupportsThinking || effort === ReasoningEffort.DEFAULT) return null;
+
+	if (effort === ReasoningEffort.OFF) {
+		const p = presetValues('instruct', settings);
+
+		return { source: p.custom ? 'custom' : 'card', state: 'instruct', values: p.values };
+	}
+
+	const p = presetValues('thinking', settings);
+	const level = cleanPresetOverrides(
+		settings?.levels?.[effort as 'low' | 'medium' | 'high' | 'max']
+	);
+	const hasLevel = Object.keys(level).length > 0;
+
+	return {
+		source: hasLevel ? 'level' : p.custom ? 'custom' : 'card',
+		state: 'thinking',
+		values: { ...p.values, ...level }
+	};
+}
+
+/** The lightbulb title: "thinking · xhigh · T 1.0 · preset: card" / "instruct · T 0.7". */
 export function samplingPresetLabel(p: {
 	thinking: boolean;
 	native?: string;
 	temperature?: number;
+	source?: SamplingPresetSource;
 }): string {
 	return [
 		p.thinking ? 'thinking' : 'instruct',
 		p.native,
-		p.temperature !== undefined ? `T ${p.temperature.toFixed(1)}` : ''
+		p.temperature !== undefined ? `T ${p.temperature.toFixed(1)}` : '',
+		p.source === 'level' ? 'level override' : p.source ? `preset: ${p.source}` : ''
 	]
 		.filter(Boolean)
 		.join(' · ');
@@ -111,3 +187,22 @@ export const REASONING_EFFORT_TOKENS: Record<string, number> = {
 	[ReasoningEffort.MAX]: -1, // unlimited
 	[ReasoningEffort.MEDIUM]: 2048
 };
+
+/** Settings: which preset the current chat uses ("Active in this chat: ..."). */
+export function activePresetLine(
+	effort: string,
+	modelSupportsThinking: boolean,
+	settings?: SamplingPresetSettings
+): string {
+	if (!modelSupportsThinking) return 'none — the model does not support thinking';
+
+	const p = resolveSamplingPreset(effort, modelSupportsThinking, settings);
+
+	if (!p) return 'none — Default inherits the server';
+
+	if (p.state === 'instruct') return 'Instruct';
+
+	const level = REASONING_EFFORT_LABELS[effort] ?? effort;
+
+	return `Thinking (level ${level}${p.source === 'level' ? ', with its overrides' : ''})`;
+}

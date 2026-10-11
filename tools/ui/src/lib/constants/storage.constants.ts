@@ -29,6 +29,8 @@ export const CONVERSATION_TABS_LOCALSTORAGE_KEY = `${STORAGE_APP_NAME}.conversat
 export const USER_OVERRIDES_LOCALSTORAGE_KEY = `${STORAGE_APP_NAME}.userOverrides`;
 /** the sampling values the user set (durable provenance for the reasoning presets) */
 export const USER_SAMPLING_LOCALSTORAGE_KEY = `${STORAGE_APP_NAME}.userSampling`;
+/** the user's edits of the sampling presets by reasoning state (missing = the model card) */
+export const SAMPLING_PRESETS_LOCALSTORAGE_KEY = `${STORAGE_APP_NAME}.samplingPresets`;
 export const DISMISSED_RECOMMENDED_MCP_SERVERS_LOCALSTORAGE_KEY = `${STORAGE_APP_NAME}.dismissedRecommendedMcpServers`;
 
 /** Key prefix for per-conversation resumable stream state, conversationId is appended */

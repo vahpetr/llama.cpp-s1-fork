@@ -16,11 +16,12 @@ beforeAll(() => {
 });
 
 import {
+	activePresetLine,
 	isReasoningEffortRejection,
 	nativeReasoningEffort,
 	REASONING_EFFORT_TOKENS,
+	resolveSamplingPreset,
 	SAMPLING_PRESETS,
-	samplingPresetFor,
 	samplingPresetLabel
 } from '$lib/constants';
 import { ReasoningEffort } from '$lib/enums';
@@ -46,6 +47,7 @@ afterEach(() => {
 	vi.unstubAllGlobals();
 	settingsStore.config = { ...settingsStore.config, ...UNSET, customJson: '' };
 	settingsStore.userSampling = {};
+	settingsStore.samplingPresets = {};
 	modelsStore.props.reasoningEffortRejected.clear();
 });
 
@@ -202,10 +204,14 @@ describe('sampling presets (astra: Default inherits the server, durable user val
 	});
 
 	it('preset rule and the lightbulb label', () => {
-		expect(samplingPresetFor(ReasoningEffort.DEFAULT, true)).toBeNull();
-		expect(samplingPresetFor(ReasoningEffort.HIGH, false)).toBeNull();
-		expect(samplingPresetFor(ReasoningEffort.OFF, true)).toBe(SAMPLING_PRESETS.instruct);
-		expect(samplingPresetFor(ReasoningEffort.MAX, true)).toBe(SAMPLING_PRESETS.thinking);
+		expect(resolveSamplingPreset(ReasoningEffort.DEFAULT, true)).toBeNull();
+		expect(resolveSamplingPreset(ReasoningEffort.HIGH, false)).toBeNull();
+		expect(resolveSamplingPreset(ReasoningEffort.OFF, true)?.values).toEqual(
+			SAMPLING_PRESETS.instruct
+		);
+		expect(resolveSamplingPreset(ReasoningEffort.MAX, true)?.values).toEqual(
+			SAMPLING_PRESETS.thinking
+		);
 		expect(samplingPresetLabel({ native: 'xhigh', temperature: 1, thinking: true })).toBe(
 			'thinking · xhigh · T 1.0'
 		);
@@ -418,5 +424,97 @@ describe('reasoning_effort fallback (narrow, per model)', () => {
 
 		expect(bodies.map((b) => b.reasoning_effort)).toEqual(['low']);
 		expect(modelsStore.props.reasoningEffortRejected.size).toBe(0);
+	});
+});
+
+describe('editable presets by reasoning state + per-level overrides', () => {
+	it('precedence: user value > level override > edited preset; Default sends nothing', async () => {
+		settingsStore.setPresetField('thinking', 'temperature', 0.9);
+		settingsStore.setPresetField('thinking', 'top_p', 0.9);
+		settingsStore.setPresetField('medium', 'top_p', 0.85);
+		settingsStore.setPresetField('medium', 'min_p', 0.05);
+		settingsStore.config = { ...settingsStore.config, min_p: 0.02 };
+
+		const medium = await bodyFor(ReasoningEffort.MEDIUM, false);
+
+		expect(medium).toMatchObject({
+			min_p: 0.02, // the user's own Sampling value wins over the level override
+			presence_penalty: 0,
+			temperature: 0.9, // the edited Thinking preset
+			top_k: 20,
+			top_p: 0.85 // the Medium override
+		});
+		vi.restoreAllMocks();
+
+		const high = await bodyFor(ReasoningEffort.HIGH, false);
+
+		expect(high).toMatchObject({ temperature: 0.9, top_p: 0.9 }); // no High override
+		vi.restoreAllMocks();
+
+		const def = await bodyFor(ReasoningEffort.DEFAULT, false);
+
+		expect(def.temperature).toBeUndefined();
+		expect(def.top_p).toBeUndefined();
+	});
+
+	it('the source: card, custom, level; reset to the model card', () => {
+		expect(resolveSamplingPreset(ReasoningEffort.LOW, true, {})?.source).toBe('card');
+		settingsStore.setPresetField('thinking', 'temperature', 0.8);
+		expect(
+			resolveSamplingPreset(ReasoningEffort.LOW, true, settingsStore.samplingPresets)?.source
+		).toBe('custom');
+		settingsStore.setPresetField('low', 'top_k', 40);
+		expect(
+			resolveSamplingPreset(ReasoningEffort.LOW, true, settingsStore.samplingPresets)?.source
+		).toBe('level');
+		// an edit equal to the card is not "custom"
+		settingsStore.setPresetField('instruct', 'temperature', 0.7);
+		expect(
+			resolveSamplingPreset(ReasoningEffort.OFF, true, settingsStore.samplingPresets)?.source
+		).toBe('card');
+
+		settingsStore.resetPreset('thinking');
+		expect(settingsStore.samplingPresets.thinking).toBeUndefined();
+		expect(
+			resolveSamplingPreset(ReasoningEffort.MEDIUM, true, settingsStore.samplingPresets)
+		).toEqual({
+			source: 'card',
+			state: 'thinking',
+			values: SAMPLING_PRESETS.thinking
+		});
+		// clearing a level field inherits again
+		settingsStore.setPresetField('low', 'top_k', undefined);
+		expect(
+			resolveSamplingPreset(ReasoningEffort.LOW, true, settingsStore.samplingPresets)?.source
+		).toBe('card');
+	});
+
+	it('the lightbulb title names the source; the settings line names the active preset', () => {
+		expect(
+			samplingPresetLabel({ native: 'medium', source: 'card', temperature: 1, thinking: true })
+		).toBe('thinking · medium · T 1.0 · preset: card');
+		expect(samplingPresetLabel({ source: 'custom', temperature: 0.6, thinking: false })).toBe(
+			'instruct · T 0.6 · preset: custom'
+		);
+		expect(samplingPresetLabel({ source: 'level', temperature: 1, thinking: true })).toBe(
+			'thinking · T 1.0 · level override'
+		);
+
+		expect(activePresetLine(ReasoningEffort.MEDIUM, true, {})).toBe('Thinking (level Medium)');
+		expect(activePresetLine(ReasoningEffort.OFF, true, {})).toBe('Instruct');
+		expect(activePresetLine(ReasoningEffort.DEFAULT, true, {})).toBe(
+			'none — Default inherits the server'
+		);
+		expect(
+			activePresetLine(ReasoningEffort.HIGH, true, { levels: { high: { temperature: 0.5 } } })
+		).toBe('Thinking (level High, with its overrides)');
+	});
+
+	it('stored presets are cleaned: junk and missing fields fall back to the card', () => {
+		expect(
+			resolveSamplingPreset(ReasoningEffort.OFF, true, {
+				instruct: { temperature: 'hot' as never, top_p: Number.NaN }
+			})?.values
+		).toEqual(SAMPLING_PRESETS.instruct);
 	});
 });

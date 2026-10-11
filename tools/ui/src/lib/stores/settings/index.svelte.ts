@@ -9,6 +9,11 @@
 
 import { browser } from '$app/environment';
 import { SETTING_CONFIG_DEFAULT, SETTINGS_KEYS } from '$lib/constants';
+import type {
+	PresetField,
+	SamplingPresetOverrides,
+	SamplingPresetSettings
+} from '$lib/constants/reasoning-effort.constants';
 import { ColorMode } from '$lib/enums';
 import { ParameterSyncService } from '$lib/services/parameter-sync.service';
 import { SettingsService } from '$lib/services/settings.service';
@@ -28,6 +33,8 @@ import { setMode } from 'mode-watcher';
 class SettingsStore {
 	config = $state<SettingsConfigType>({ ...SETTING_CONFIG_DEFAULT });
 	isInitialized = $state(false);
+	/** The user's edits of the sampling presets by reasoning state (missing = the model card). */
+	samplingPresets = $state<SamplingPresetSettings>({});
 	userOverrides = $state<Set<string>>(new Set());
 	/**
 	 * Durable provenance of the sampling values the USER set (key -> value), kept even when the
@@ -252,6 +259,8 @@ class SettingsStore {
 	resetConfig() {
 		this.config = { ...SETTING_CONFIG_DEFAULT };
 		this.forgetUserSampling();
+		this.samplingPresets = {};
+		SettingsService.saveSamplingPresets({});
 
 		this.saveConfig();
 	}
@@ -278,6 +287,15 @@ class SettingsStore {
 		this.saveConfig();
 	}
 
+	/** Reset a preset to the model card (drops its edits; the level overrides stay). */
+	resetPreset(state: 'thinking' | 'instruct'): void {
+		const next = { ...this.samplingPresets };
+
+		delete next[state];
+		this.samplingPresets = next;
+		SettingsService.saveSamplingPresets(this.samplingPresets as Record<string, unknown>);
+	}
+
 	/**
 	 * Reset theme to default value.
 	 * Theme is now stored inside the config object.
@@ -287,6 +305,42 @@ class SettingsStore {
 
 		setMode(SETTING_CONFIG_DEFAULT[SETTINGS_KEYS.THEME] as ColorMode);
 	}
+
+	/**
+	 * Edit one field of a preset (`thinking` / `instruct`) or of a level's overrides (`low` ...
+	 * `max`); undefined clears it (the card value / the Thinking preset applies again).
+	 */
+	setPresetField(
+		target: 'thinking' | 'instruct' | 'low' | 'medium' | 'high' | 'max',
+		field: PresetField,
+		value: number | undefined
+	): void {
+		const isLevel = target !== 'thinking' && target !== 'instruct';
+		const current: SamplingPresetOverrides = {
+			...(isLevel
+				? this.samplingPresets.levels?.[target as 'low' | 'medium' | 'high' | 'max']
+				: this.samplingPresets[target as 'thinking' | 'instruct'])
+		};
+
+		if (value === undefined || !Number.isFinite(value)) delete current[field];
+		else current[field] = value;
+
+		this.samplingPresets = isLevel
+			? {
+					...this.samplingPresets,
+					levels: { ...this.samplingPresets.levels, [target]: current }
+				}
+			: { ...this.samplingPresets, [target]: current };
+		SettingsService.saveSamplingPresets(this.samplingPresets as Record<string, unknown>);
+	}
+
+	/**
+	 *
+	 *
+	 * Import / Export
+	 *
+	 *
+	 */
 
 	/**
 	 * Initialize settings with props defaults when server properties are first loaded
@@ -375,7 +429,7 @@ class SettingsStore {
 	/**
 	 *
 	 *
-	 * Import / Export
+	 * Utilities (private helpers)
 	 *
 	 *
 	 */
@@ -422,14 +476,6 @@ class SettingsStore {
 
 		setMode(newTheme as ColorMode);
 	}
-
-	/**
-	 *
-	 *
-	 * Utilities (private helpers)
-	 *
-	 *
-	 */
 
 	private forgetUserSampling(key?: string): void {
 		if (key === undefined) {
@@ -483,6 +529,7 @@ class SettingsStore {
 		// Load user overrides
 		this.userOverrides = new Set(savedOverrides);
 		this.userSampling = SettingsService.loadUserSampling();
+		this.samplingPresets = SettingsService.loadSamplingPresets() as SamplingPresetSettings;
 	}
 
 	/**
