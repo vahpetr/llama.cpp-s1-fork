@@ -27,6 +27,7 @@ import type {
 	ErrorDialogState
 } from '$lib/types';
 import {
+	applyRequestSnapshot,
 	classifyContinueIntent,
 	filterByLeafNodeId,
 	findDescendantMessages,
@@ -141,7 +142,8 @@ export class ChatMessageFlows {
 			await ChatService.sendMessage(
 				contextWithContinue,
 				{
-					...this.host.getApiOptions(),
+					// the template options + sampling of the request that produced the reply
+					...applyRequestSnapshot(this.host.getApiOptions(), dbMessage.requestOptions),
 					...(frozenTools && frozenTools.length > 0 ? { tools: frozenTools } : {}),
 					continueFinalMessage: true,
 					onChunk: (chunk: string) => {

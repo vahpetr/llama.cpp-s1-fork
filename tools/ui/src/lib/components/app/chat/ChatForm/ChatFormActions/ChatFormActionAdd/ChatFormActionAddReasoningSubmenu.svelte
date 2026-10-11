@@ -71,5 +71,12 @@
 				{/if}
 			</DropdownMenu.Item>
 		{/each}
+
+		<p
+			class="px-2 pt-1.5 pb-0.5 text-[11px] leading-snug text-muted-foreground"
+			data-reasoning-hint
+		>
+			Changing the level re-processes the conversation prompt (xhigh/low/medium).
+		</p>
 	</DropdownMenu.SubContent>
 </DropdownMenu.Sub>

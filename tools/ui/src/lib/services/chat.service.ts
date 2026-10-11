@@ -14,6 +14,7 @@ import {
 	API_STREAM,
 	CONTROL_ACTION,
 	HEADERS,
+	isReasoningEffortRejection,
 	REASONING_EFFORT_TOKENS,
 	SETTINGS_KEYS,
 	SSE_DATA_PREFIX,
@@ -1090,6 +1091,7 @@ export class ChatService {
 			onToolCallChunk,
 			presence_penalty,
 			reasoningEffort,
+			reasoningEffortNative,
 			// Penalty parameters
 			repeat_last_n,
 			repeat_penalty,
@@ -1213,6 +1215,11 @@ export class ChatService {
 			requestBody.thinking_budget_tokens = reasoningBudgetTokens;
 		}
 
+		// the template's own effort knob, only when /props says the template takes it
+		if (enableThinking && reasoningEffortNative) {
+			requestBody.reasoning_effort = reasoningEffortNative;
+		}
+
 		// arms the budget sampler so reasoning can be ended at runtime via the control endpoint
 		requestBody.reasoning_control = true;
 
@@ -1301,6 +1308,10 @@ export class ChatService {
 			thinkingBudget: thinkingBudgetCap
 		});
 
+		// a retry after the template refused the native effort: the field goes, also when the custom
+		// JSON re-added it
+		if (options.dropReasoningEffort) delete requestBody.reasoning_effort;
+
 		// W1.2 rule 3: a bias on the end-of-turn token, merged into a custom object-form logit_bias
 		if (logitBias && Object.keys(logitBias).length > 0) {
 			const body = requestBody as unknown as Record<string, unknown>;
@@ -1375,13 +1386,31 @@ export class ChatService {
 			});
 
 			if (!response.ok) {
+				const error = await ChatService.parseErrorResponse(response);
+
+				// a template that refuses the native reasoning_effort (400 naming it): retry once
+				// without it, and never send it to this model again
+				if (
+					response.status === 400 &&
+					requestBody.reasoning_effort !== undefined &&
+					!options.dropReasoningEffort &&
+					isReasoningEffortRejection(error.message)
+				) {
+					modelsStore.props.markReasoningEffortUnsupported(options.model);
+
+					return ChatService.sendMessage(
+						messages,
+						{ ...options, dropReasoningEffort: true, reasoningEffortNative: undefined },
+						conversationId,
+						signal
+					);
+				}
+
 				// a rejected request (including one cancelled by a stop during the model load)
 				// leaves nothing to resume
 				if (conversationId) {
 					ChatService.clearStreamState(conversationId);
 				}
-
-				const error = await ChatService.parseErrorResponse(response);
 
 				if (onError) {
 					onError(error);

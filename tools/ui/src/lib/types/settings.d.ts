@@ -91,6 +91,11 @@ export interface SettingsChatServiceOptions {
 	enableThinking?: boolean;
 	// Reasoning effort level (low/medium/high/max) for thinking models
 	reasoningEffort?: ReasoningEffort;
+	// the native OAI `reasoning_effort` (low/medium/xhigh) when the template supports it
+	reasoningEffortNative?: string;
+	// a retry after the template refused the native effort: never send the field (not even from
+	// the custom JSON)
+	dropReasoningEffort?: boolean;
 	tools?: OpenAIToolDefinition[];
 	// Generation parameters
 	temperature?: number;

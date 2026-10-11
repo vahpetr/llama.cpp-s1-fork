@@ -170,6 +170,19 @@ export interface DatabaseMessage {
 	replyNote?: string;
 	/** the server's echo of a continued prefill diverged from the partial (joined verbatim) */
 	echoMismatch?: boolean;
+	/**
+	 * The template options + sampling of the request that produced this reply (reasoning level,
+	 * enable_thinking, native effort, sampling): its continuations reuse them verbatim, so a
+	 * level change since cannot re-process the prompt prefix mid-reply.
+	 */
+	requestOptions?: RequestTemplateSnapshot;
+}
+
+export interface RequestTemplateSnapshot {
+	enableThinking?: boolean;
+	reasoningEffort?: string;
+	reasoningEffortNative?: string;
+	sampling: Record<string, number>;
 }
 
 export type ExportedConversation = {

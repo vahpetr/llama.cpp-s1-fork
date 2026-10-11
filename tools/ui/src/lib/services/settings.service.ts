@@ -1,5 +1,9 @@
 import { browser } from '$app/environment';
-import { CONFIG_LOCALSTORAGE_KEY, USER_OVERRIDES_LOCALSTORAGE_KEY } from '$lib/constants';
+import {
+	CONFIG_LOCALSTORAGE_KEY,
+	USER_OVERRIDES_LOCALSTORAGE_KEY,
+	USER_SAMPLING_LOCALSTORAGE_KEY
+} from '$lib/constants';
 
 /**
  * SettingsService - localStorage persistence layer for settings
@@ -43,6 +47,24 @@ export class SettingsService {
 	}
 
 	/**
+	 * Persist the config and user overrides to localStorage.
+	 */
+	/** The sampling values the user set (durable provenance; a separate key). */
+	static loadUserSampling(): Record<string, number> {
+		if (!browser) return {};
+
+		try {
+			const raw = JSON.parse(localStorage.getItem(USER_SAMPLING_LOCALSTORAGE_KEY) || '{}');
+
+			return raw && typeof raw === 'object' && !Array.isArray(raw)
+				? (raw as Record<string, number>)
+				: {};
+		} catch {
+			return {};
+		}
+	}
+
+	/**
 	 * Migrate the legacy un-namespaced "theme" localStorage key.
 	 * Returns the legacy theme value (and removes the key) when present, else null.
 	 */
@@ -60,9 +82,6 @@ export class SettingsService {
 		return null;
 	}
 
-	/**
-	 * Persist the config and user overrides to localStorage.
-	 */
 	static saveConfig(config: Record<string, unknown>, userOverrides: string[]): void {
 		if (!browser) return;
 
@@ -71,6 +90,16 @@ export class SettingsService {
 			localStorage.setItem(USER_OVERRIDES_LOCALSTORAGE_KEY, JSON.stringify(userOverrides));
 		} catch (error) {
 			console.error('Failed to save config to localStorage:', error);
+		}
+	}
+
+	static saveUserSampling(values: Record<string, number>): void {
+		if (!browser) return;
+
+		try {
+			localStorage.setItem(USER_SAMPLING_LOCALSTORAGE_KEY, JSON.stringify(values));
+		} catch {
+			// storage full or blocked: the provenance lives in memory for this session
 		}
 	}
 }

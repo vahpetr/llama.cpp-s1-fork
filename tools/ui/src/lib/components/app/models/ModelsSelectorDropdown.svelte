@@ -12,7 +12,15 @@
 	} from '$lib/components/app';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 	import * as Tooltip from '$lib/components/ui/tooltip';
-	import { MODEL_SELECTOR_ICON, SETTINGS_KEYS } from '$lib/constants';
+	import {
+		MODEL_SELECTOR_ICON,
+		nativeReasoningEffort,
+		REASONING_EFFORT_LABELS,
+		SAMPLING_PRESETS,
+		samplingPresetFor,
+		samplingPresetLabel,
+		SETTINGS_KEYS
+	} from '$lib/constants';
 	import { KeyboardKey, ServerModelStatus } from '$lib/enums';
 	import { useModelsSelector } from '$lib/hooks/use-models-selector.svelte';
 	import { useReasoningMenu } from '$lib/hooks/use-reasoning-menu.svelte';
@@ -65,6 +73,35 @@
 	});
 
 	const reasoning = useReasoningMenu();
+	// the lightbulb's title names the current level and the active sampling preset
+	const reasoningLabel = $derived.by(() => {
+		const effort = reasoning.currentEffort;
+		const level = REASONING_EFFORT_LABELS[effort] ?? effort;
+		const preset = samplingPresetFor(effort, reasoning.modelSupportsThinking);
+
+		if (!preset) return `${level} · server sampling`;
+
+		const thinking = preset === SAMPLING_PRESETS.thinking;
+		const userT = Number(settingsStore.config.temperature);
+		const ownT = settingsStore.userSampling?.temperature;
+		const temperature =
+			settingsStore.config.temperature !== undefined &&
+			settingsStore.config.temperature !== '' &&
+			Number.isFinite(userT)
+				? userT
+				: (ownT ?? preset.temperature);
+
+		return (
+			`${level} · ` +
+			samplingPresetLabel({
+				native: thinking
+					? nativeReasoningEffort(effort, modelsStore.props.supportsReasoningEffort())
+					: undefined,
+				temperature,
+				thinking
+			})
+		);
+	});
 
 	const showOrgNameInTrigger = $derived(
 		settingsStore.config[SETTINGS_KEYS.SHOW_MODEL_ORG_NAME_IN_TRIGGER] ?? false
@@ -238,7 +275,9 @@
 									{/if}
 
 									{#if reasoning.isReasoningActive}
-										<Lightbulb class="h-3.5 w-3.5 shrink-0 text-amber-400" />
+										<span class="flex shrink-0" title="Reasoning: {reasoningLabel}">
+											<Lightbulb class="h-3.5 w-3.5 shrink-0 text-amber-400" />
+										</span>
 									{/if}
 								</span>
 
@@ -388,7 +427,9 @@
 							{/if}
 
 							{#if reasoning.isReasoningActive}
-								<Lightbulb class="h-3.5 w-3.5 shrink-0 text-amber-400" />
+								<span class="flex shrink-0" title="Reasoning: {reasoningLabel}">
+									<Lightbulb class="h-3.5 w-3.5 shrink-0 text-amber-400" />
+								</span>
 							{/if}
 
 							{#if ms.updating}

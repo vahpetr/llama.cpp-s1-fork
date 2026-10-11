@@ -22,12 +22,19 @@ import {
 	normalizeFloatingPoint,
 	setConfigValue
 } from '$lib/utils';
+import { SNAPSHOT_SAMPLING_KEYS } from '$lib/utils/request-snapshot';
 import { setMode } from 'mode-watcher';
 
 class SettingsStore {
 	config = $state<SettingsConfigType>({ ...SETTING_CONFIG_DEFAULT });
 	isInitialized = $state(false);
 	userOverrides = $state<Set<string>>(new Set());
+	/**
+	 * Durable provenance of the sampling values the USER set (key -> value), kept even when the
+	 * server-default sync clears a value equal to the server default: the reasoning presets
+	 * never override these (astra 0220 review, Major 2).
+	 */
+	userSampling = $state<Record<string, number>>({});
 
 	// True until a config exists in localStorage; gates the one-time
 	// application of server ui_settings defaults for new users.
@@ -41,6 +48,7 @@ class SettingsStore {
 	 */
 	clearAllUserOverrides(): void {
 		this.userOverrides.clear();
+		this.forgetUserSampling();
 		this.saveConfig();
 		console.log('Cleared all user overrides');
 	}
@@ -129,6 +137,7 @@ class SettingsStore {
 			this.userOverrides.delete(key);
 		}
 
+		this.forgetUserSampling();
 		this.saveConfig();
 	}
 
@@ -242,6 +251,7 @@ class SettingsStore {
 	 */
 	resetConfig() {
 		this.config = { ...SETTING_CONFIG_DEFAULT };
+		this.forgetUserSampling();
 
 		this.saveConfig();
 	}
@@ -264,6 +274,7 @@ class SettingsStore {
 		}
 
 		this.userOverrides.delete(key);
+		this.forgetUserSampling(key);
 		this.saveConfig();
 	}
 
@@ -339,6 +350,7 @@ class SettingsStore {
 	 * @param value - The new value for the configuration key
 	 */
 	updateConfig<K extends keyof SettingsConfigType>(key: K, value: SettingsConfigType[K]): void {
+		this.recordUserSampling(key as string, this.config[key], value);
 		this.config[key] = value;
 
 		if (ParameterSyncService.canSyncParameter(key as string)) {
@@ -373,6 +385,10 @@ class SettingsStore {
 	 * @param updates - Object containing the configuration updates
 	 */
 	updateMultipleConfig(updates: Partial<SettingsConfigType>) {
+		for (const [key, value] of Object.entries(updates)) {
+			this.recordUserSampling(key, this.config[key], value);
+		}
+
 		Object.assign(this.config, updates);
 
 		const propsDefaults = this.getServerDefaults();
@@ -415,6 +431,17 @@ class SettingsStore {
 	 *
 	 */
 
+	private forgetUserSampling(key?: string): void {
+		if (key === undefined) {
+			this.userSampling = {};
+		} else if (key in this.userSampling) {
+			const next = { ...this.userSampling };
+
+			delete next[key];
+			this.userSampling = next;
+		}
+	}
+
 	/**
 	 * Helper method to get server defaults with null safety
 	 * Centralizes the pattern of getting and extracting server defaults
@@ -455,6 +482,7 @@ class SettingsStore {
 
 		// Load user overrides
 		this.userOverrides = new Set(savedOverrides);
+		this.userSampling = SettingsService.loadUserSampling();
 	}
 
 	/**
@@ -476,12 +504,30 @@ class SettingsStore {
 	}
 
 	/**
+	 * Record a user edit of a preset sampling key: a set value is the user's (also when it equals
+	 * the server default); clearing a value that was set removes it. An empty value that was empty
+	 * before (a settings save of an untouched field) changes nothing.
+	 */
+	private recordUserSampling(key: string, prev: unknown, next: unknown): void {
+		if (!(SNAPSHOT_SAMPLING_KEYS as readonly string[]).includes(key)) return;
+
+		const set = (v: unknown) => v !== undefined && v !== null && v !== '';
+
+		if (set(next) && Number.isFinite(Number(next))) {
+			this.userSampling = { ...this.userSampling, [key]: Number(next) };
+		} else if (set(prev) && !set(next)) {
+			this.forgetUserSampling(key);
+		}
+	}
+
+	/**
 	 * Save the current configuration to localStorage via the persistence service.
 	 */
 	private saveConfig() {
 		if (!browser) return;
 
 		SettingsService.saveConfig(this.config, Array.from(this.userOverrides));
+		SettingsService.saveUserSampling(this.userSampling);
 	}
 }
 
