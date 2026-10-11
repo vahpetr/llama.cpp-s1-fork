@@ -97,12 +97,18 @@ server_backend_sampling_support server_backend_sampling_check(const common_param
             types.push_back(t);
         }
     }
-    if (types.empty() && params.speculative.has_dft()) {
-        types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE); // a draft model without --spec-type
-    }
     if (!types.empty()) {
         r.spec_type = common_speculative_type_name_str(types);
+        // the same ceiling server_output_limits sizes the target with: MTP / draft-simple / eagle3 report at least 1
+        // (they append a token before testing n_max), dflash / dspark / ngram their configured maximum
+        r.n_max = common_speculative_n_max(&params.speculative);
     }
+
+    // the target context's per-sequence output limit as llama_context resolves it from these params
+    // (n_outputs_max 0 = n_batch; n_outputs_max_per_seq 0 = n_outputs_max, else capped by it)
+    const auto lim = server_output_limits(params);
+    const int32_t total = lim.total > 0 ? lim.total : params.n_batch;
+    r.per_seq_max = lim.per_seq > 0 ? std::min(lim.per_seq, total) : total;
 
     if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         r.supported = false;
@@ -110,15 +116,11 @@ server_backend_sampling_support server_backend_sampling_check(const common_param
         return r;
     }
 
-    // dflash/dspark raise n_outputs_max_per_seq to n_max + 1 only with draft backend sampling
-    // (common_base_params_to_speculative); every other speculation verifies n_draft + 1 outputs against a limit of 1
-    const bool block_draft_only = std::all_of(types.begin(), types.end(), [](common_speculative_type t) {
-        return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-    });
-    if (!types.empty() && !(block_draft_only && params.speculative.draft.backend_sampling)) {
+    const int32_t need = 1 + r.n_max; // one verify round: the sampled token + the drafts, all in one sequence
+    if (r.per_seq_max < need) {
         r.supported = false;
-        r.error     = "backend_sampling is not supported on this server: speculative decoding (" + r.spec_type +
-                      ") verifies more than one output per sequence";
+        r.error     = string_format("backend_sampling is not supported on this server: speculative verify needs 1+%d "
+                                    "outputs per sequence but the context allows %d", r.n_max, r.per_seq_max);
     }
 
     return r;
@@ -1761,7 +1763,6 @@ private:
 
     // [TAG_BS_GUARD] decided in load_model from the loaded configuration
     server_backend_sampling_support bs_support;
-    int32_t spec_n_max = 0; // loaded speculation's n_max (after the implementation's clamping), 0 without speculation
 
     bool add_bos_token = true;
 
@@ -2119,8 +2120,8 @@ private:
             SRV_WRN("[bs-guard] --backend-sampling forced off: %s\n", bs_support.error.c_str());
             params.sampling.backend_sampling = false;
         }
-        SRV_INF("[bs-guard] backend_sampling_supported=%d spec_type=%s\n", bs_support.supported ? 1 : 0,
-                bs_support.spec_type.c_str());
+        SRV_INF("[bs-guard] backend_sampling_supported=%d spec_type=%s n_max=%d outputs_per_seq=%d\n",
+                bs_support.supported ? 1 : 0, bs_support.spec_type.c_str(), bs_support.n_max, bs_support.per_seq_max);
 
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
@@ -2421,13 +2422,10 @@ private:
             }
         }
 
-        // [TAG_BS_GUARD] the loaded speculation state for /props: n_max after the implementation's clamping; a
-        //   speculation that failed to initialize runs without one, so report (and judge) the server as such
-        spec_n_max = spec ? common_speculative_n_max(spec.get()) : 0;
+        // [TAG_BS_GUARD] a speculation that failed to initialize runs without one: report (and judge) the server as such
         if (!spec && bs_support.spec_type != "none") {
-            common_params params_nospec = params;
+            common_params params_nospec = params_base;
             params_nospec.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
-            params_nospec.speculative.draft.mparams = {};
             bs_support = server_backend_sampling_check(params_nospec);
             SRV_INF("[bs-guard] speculation not loaded: backend_sampling_supported=%d spec_type=none\n",
                     bs_support.supported ? 1 : 0);
@@ -7048,7 +7046,7 @@ server_context_meta server_context::get_meta() const {
         /* backend_sampling_supported */ impl->bs_support.supported,
         /* backend_sampling_error     */ impl->bs_support.error,
         /* spec_type                  */ impl->bs_support.spec_type,
-        /* spec_n_max                 */ impl->spec_n_max,
+        /* spec_n_max                 */ impl->bs_support.n_max,
     };
 }
 

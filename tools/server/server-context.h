@@ -57,7 +57,7 @@ struct server_context_meta {
     bool        backend_sampling_supported;
     std::string backend_sampling_error;
     std::string spec_type;
-    int32_t     spec_n_max;
+    int32_t     spec_n_max; // effective drafter ceiling (as sized for the target's output limit)
 };
 
 enum server_state {
@@ -226,15 +226,19 @@ struct server_multislot_envelope {
 server_multislot_envelope server_multislot_envelope_check(const char * knob, int n_parallel, bool has_mmproj, bool ctx_shift);
 
 // [TAG_BS_GUARD] 0226: can this server honour a request's `backend_sampling: true`? Decided once from the loaded
-//   configuration (the CLI params, before the context is created). llama_decode() rejects a batch in which a sequence with
-//   a backend sampler has more outputs than n_outputs_max_per_seq; a speculative verify round has n_draft + 1 outputs per
-//   sequence, and only dflash/dspark with draft backend sampling raise the limit for it. Tensor split never offloads
-//   samplers. Unsupported -> requests asking for it get a 400 (error) before any slot is touched, and a server started
-//   with --backend-sampling has it forced off at startup (warning). (defined in server-context.cpp; tests/test-backend-sampling-guard)
+//   configuration. llama_decode() rejects a batch in which a sequence with a backend sampler has more outputs than the
+//   TARGET context's n_outputs_max_per_seq; a speculative verify round asks for 1 + n_draft outputs per sequence. The
+//   target limit is sized by server_output_limits (min(n_batch, 1 + n_max)), so speculation is supported whenever that
+//   limit covers 1 + the drafter's ceiling (the draft context's own limits are separate and not looked at). Tensor split
+//   never offloads samplers. Unsupported -> requests asking for it get a 400 (error) before any slot is touched, and a
+//   server started with --backend-sampling has it forced off at startup (warning).
+//   (defined in server-context.cpp; tests/test-backend-sampling-guard)
 struct server_backend_sampling_support {
-    bool        supported = true;
-    std::string spec_type = "none"; // loaded speculation: canonical --spec-type name(s), "none" without speculation
-    std::string error;              // the 400 text when !supported
+    bool        supported   = true;
+    std::string spec_type   = "none"; // loaded speculation: canonical --spec-type name(s), "none" without speculation
+    int32_t     n_max       = 0;      // the drafter's effective ceiling used for the output limit (0 = none)
+    int32_t     per_seq_max = 1;      // the target context's resolved n_outputs_max_per_seq
+    std::string error;                // the 400 text when !supported
 };
 server_backend_sampling_support server_backend_sampling_check(const common_params & params);
 
