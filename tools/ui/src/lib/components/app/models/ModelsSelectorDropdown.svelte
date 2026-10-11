@@ -13,11 +13,11 @@
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 	import * as Tooltip from '$lib/components/ui/tooltip';
 	import {
-		effectiveThinking,
 		MODEL_SELECTOR_ICON,
 		nativeReasoningEffort,
 		REASONING_EFFORT_LABELS,
 		SAMPLING_PRESETS,
+		samplingPresetFor,
 		samplingPresetLabel,
 		SETTINGS_KEYS
 	} from '$lib/constants';
@@ -76,18 +76,23 @@
 	// the lightbulb's title names the current level and the active sampling preset
 	const reasoningLabel = $derived.by(() => {
 		const effort = reasoning.currentEffort;
-		const thinking = effectiveThinking(effort, modelsStore.props.serverDefaultThinking);
-		const preset = SAMPLING_PRESETS[thinking ? 'thinking' : 'instruct'];
+		const level = REASONING_EFFORT_LABELS[effort] ?? effort;
+		const preset = samplingPresetFor(effort, reasoning.modelSupportsThinking);
+
+		if (!preset) return `${level} · server sampling`;
+
+		const thinking = preset === SAMPLING_PRESETS.thinking;
 		const userT = Number(settingsStore.config.temperature);
+		const ownT = settingsStore.userSampling?.temperature;
 		const temperature =
 			settingsStore.config.temperature !== undefined &&
 			settingsStore.config.temperature !== '' &&
 			Number.isFinite(userT)
 				? userT
-				: preset.temperature;
+				: (ownT ?? preset.temperature);
 
 		return (
-			`${REASONING_EFFORT_LABELS[effort] ?? effort} · ` +
+			`${level} · ` +
 			samplingPresetLabel({
 				native: thinking
 					? nativeReasoningEffort(effort, modelsStore.props.supportsReasoningEffort())

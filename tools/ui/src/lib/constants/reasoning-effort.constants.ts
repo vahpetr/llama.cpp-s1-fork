@@ -59,13 +59,18 @@ export const SAMPLING_PRESETS = {
 	}
 } as const;
 
-/** Is thinking on for a level? Default follows the server's default (off under `--reasoning off`). */
-export function effectiveThinking(effort: string, serverDefaultThinking: boolean): boolean {
-	if (effort === ReasoningEffort.OFF) return false;
+/**
+ * The sampling preset a request gets: only for an explicit choice on a model that supports
+ * thinking - a level -> thinking, Off -> instruct; Default (and non-thinking models) -> none, the
+ * server's own sampling applies (/props carries no thinking-activation signal).
+ */
+export function samplingPresetFor(
+	effort: string,
+	modelSupportsThinking: boolean
+): (typeof SAMPLING_PRESETS)['thinking'] | (typeof SAMPLING_PRESETS)['instruct'] | null {
+	if (!modelSupportsThinking || effort === ReasoningEffort.DEFAULT) return null;
 
-	if (effort === ReasoningEffort.DEFAULT) return serverDefaultThinking;
-
-	return true;
+	return effort === ReasoningEffort.OFF ? SAMPLING_PRESETS.instruct : SAMPLING_PRESETS.thinking;
 }
 
 /** The lightbulb title: "thinking · xhigh · T 1.0" / "instruct · T 0.7". */
@@ -81,6 +86,14 @@ export function samplingPresetLabel(p: {
 	]
 		.filter(Boolean)
 		.join(' · ');
+}
+
+/**
+ * Is a 400 error the template refusing the native effort? Only its own message ("Unexpected
+ * reasoning effort ... Supported types are xhigh (default), medium, and low."), nothing broader.
+ */
+export function isReasoningEffortRejection(message: string): boolean {
+	return /unexpected reasoning effort|supported (types|levels)[^.]*xhigh/i.test(message);
 }
 
 /** The native `reasoning_effort` for a level, or undefined (Default, Off, or not supported). */

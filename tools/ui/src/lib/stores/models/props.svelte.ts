@@ -19,7 +19,7 @@ import { serverStore } from '$lib/stores/server.svelte';
 // into the stores, and going through it here would read a half-built module
 import { TTLCache } from '$lib/utils/cache-ttl';
 import { detectThinkingSupport } from '$lib/utils/chat-template-thinking-detector';
-import { SvelteSet } from 'svelte/reactivity';
+import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 /**
  * The slice of modelsStore the manager reads. Kept narrow on purpose so it
@@ -37,8 +37,13 @@ export interface ModelPropsHost {
 export class ModelPropsManager {
 	/** Version counter for the cache - bumped on writes so $derived consumers recompute. */
 	cacheVersion = $state(0);
-	/** Models whose server refused `reasoning_effort` (400): never sent to them again. */
-	reasoningEffortRejected = new SvelteSet<string>();
+	/**
+	 * Models whose server refused `reasoning_effort` (400): not sent to them again. Keyed by the
+	 * model id (single mode: the server's model alias / path), and bound to the /props object
+	 * that was current then - a refreshed /props (a new model or template) clears the entry.
+	 */
+	reasoningEffortRejected = new SvelteMap<string, unknown>();
+
 	/**
 	 * Model-specific props cache with TTL.
 	 * Key: modelId, Value: props data including modalities.
@@ -49,23 +54,6 @@ export class ModelPropsManager {
 	});
 
 	private fetching = new SvelteSet<string>();
-
-	/**
-	 * Whether the server thinks by default (Default level): its /props default generation
-	 * settings carry enable_thinking = true; false otherwise (our composes run `--reasoning off`).
-	 */
-	get serverDefaultThinking(): boolean {
-		const dgs = serverStore.props?.default_generation_settings as
-			| {
-					enable_thinking?: unknown;
-					params?: { chat_template_kwargs?: { enable_thinking?: unknown } };
-			  }
-			| undefined;
-
-		return (
-			dgs?.enable_thinking === true || dgs?.params?.chat_template_kwargs?.enable_thinking === true
-		);
-	}
 
 	get supportsThinking(): boolean {
 		if (!serverStore.isRouterMode) {
@@ -243,11 +231,22 @@ export class ModelPropsManager {
 	}
 
 	markReasoningEffortUnsupported(modelId?: string | null): void {
-		this.reasoningEffortRejected.add(serverStore.isRouterMode ? (modelId ?? '') : '');
+		const { key, props } = this.effortKey(modelId);
+
+		this.reasoningEffortRejected.set(key, props);
 	}
 
 	modelSupportsAudio(modelId: string): boolean {
 		return this.getModelModalities(modelId)?.audio ?? false;
+	}
+
+	/** Does the model the request goes to support thinking (single: /props, router: its props)? */
+	modelSupportsThinking(modelId?: string | null): boolean {
+		if (!serverStore.isRouterMode) return this.supportsThinking;
+
+		const id = modelId || this.host.selectedModelName;
+
+		return id ? this.checkModelSupportsThinking(id) : false;
 	}
 
 	modelSupportsVideo(modelId: string): boolean {
@@ -275,18 +274,17 @@ export class ModelPropsManager {
 	supportsReasoningEffort(modelId?: string | null): boolean {
 		void this.cacheVersion;
 
+		if (this.effortRejected(modelId)) return false;
+
 		if (!serverStore.isRouterMode) {
-			return (
-				!this.reasoningEffortRejected.has('') &&
-				serverStore.props?.chat_template_caps?.supports_reasoning_effort === true
-			);
+			return serverStore.props?.chat_template_caps?.supports_reasoning_effort === true;
 		}
 
 		const id = modelId || this.host.selectedModelName;
 
-		if (!id || this.reasoningEffortRejected.has(id)) return false;
-
-		return this.getModelProps(id)?.chat_template_caps?.supports_reasoning_effort === true;
+		return id
+			? this.getModelProps(id)?.chat_template_caps?.supports_reasoning_effort === true
+			: false;
 	}
 
 	/**
@@ -315,5 +313,26 @@ export class ModelPropsManager {
 			video: modalities.video ?? false,
 			vision: modalities.vision ?? false
 		};
+	}
+
+	/** The rejection key and the /props object a model's caps come from. */
+	private effortKey(modelId?: string | null): { key: string; props: unknown } {
+		if (!serverStore.isRouterMode) {
+			const p = serverStore.props;
+
+			return { key: p?.model_alias || p?.model_path || 'single-model', props: p };
+		}
+
+		const id = modelId || this.host.selectedModelName || '';
+
+		return { key: id, props: id ? this.getModelProps(id) : undefined };
+	}
+
+	private effortRejected(modelId?: string | null): boolean {
+		const { key, props } = this.effortKey(modelId);
+
+		if (!this.reasoningEffortRejected.has(key)) return false;
+
+		return this.reasoningEffortRejected.get(key) === props;
 	}
 }

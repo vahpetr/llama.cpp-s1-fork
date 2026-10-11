@@ -14,6 +14,7 @@ import {
 	API_STREAM,
 	CONTROL_ACTION,
 	HEADERS,
+	isReasoningEffortRejection,
 	REASONING_EFFORT_TOKENS,
 	SETTINGS_KEYS,
 	SSE_DATA_PREFIX,
@@ -1216,7 +1217,7 @@ export class ChatService {
 
 		// the template's own effort knob, only when /props says the template takes it
 		if (enableThinking && reasoningEffortNative) {
-			(requestBody as unknown as Record<string, unknown>).reasoning_effort = reasoningEffortNative;
+			requestBody.reasoning_effort = reasoningEffortNative;
 		}
 
 		// arms the budget sampler so reasoning can be ended at runtime via the control endpoint
@@ -1307,6 +1308,10 @@ export class ChatService {
 			thinkingBudget: thinkingBudgetCap
 		});
 
+		// a retry after the template refused the native effort: the field goes, also when the custom
+		// JSON re-added it
+		if (options.dropReasoningEffort) delete requestBody.reasoning_effort;
+
 		// W1.2 rule 3: a bias on the end-of-turn token, merged into a custom object-form logit_bias
 		if (logitBias && Object.keys(logitBias).length > 0) {
 			const body = requestBody as unknown as Record<string, unknown>;
@@ -1387,14 +1392,15 @@ export class ChatService {
 				// without it, and never send it to this model again
 				if (
 					response.status === 400 &&
-					reasoningEffortNative &&
-					/reasoning.?effort/i.test(error.message)
+					requestBody.reasoning_effort !== undefined &&
+					!options.dropReasoningEffort &&
+					isReasoningEffortRejection(error.message)
 				) {
 					modelsStore.props.markReasoningEffortUnsupported(options.model);
 
 					return ChatService.sendMessage(
 						messages,
-						{ ...options, reasoningEffortNative: undefined },
+						{ ...options, dropReasoningEffort: true, reasoningEffortNative: undefined },
 						conversationId,
 						signal
 					);

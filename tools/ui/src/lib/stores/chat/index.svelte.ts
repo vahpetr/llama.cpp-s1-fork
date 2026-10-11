@@ -13,10 +13,9 @@ import { goto } from '$app/navigation';
 import {
 	CONTEXT_RESERVE,
 	CWD_CLEARED_TEXT,
-	effectiveThinking,
 	MESSAGE_EXTRA_STORAGE_VERSION,
 	nativeReasoningEffort,
-	SAMPLING_PRESETS,
+	samplingPresetFor,
 	SYSTEM_MESSAGE_PLACEHOLDER,
 	TITLE_GENERATION
 } from '$lib/constants';
@@ -56,6 +55,7 @@ import type {
 } from '$lib/types';
 import type { ContextBudget, ContextReserveConfig } from '$lib/utils';
 import {
+	applyRequestSnapshot,
 	buildSummaryInstruction,
 	cappedThinkingBudget,
 	compactedConversationName,
@@ -80,6 +80,7 @@ import {
 	resolveContextReserveConfig,
 	selectTailMessages,
 	shouldCompactBeforeTurn,
+	snapshotRequestOptions,
 	summaryLengthUsable,
 	summaryRejection,
 	tailTokenBudget,
@@ -664,14 +665,27 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		if (currentConfig.customJson) apiOptions.custom = currentConfig.customJson;
 
-		// sampling preset of the thinking state, for the parameters the user left unset
-		const preset =
-			SAMPLING_PRESETS[
-				effectiveThinking(effort, modelsStore.props.serverDefaultThinking) ? 'thinking' : 'instruct'
-			];
+		// the user's own sampling values are durable: one equal to the server default (cleared from
+		// the config by the server sync) is still sent, and no preset overrides it
+		const userSampling = settingsStore.userSampling ?? {};
 
-		for (const [key, value] of Object.entries(preset)) {
+		for (const [key, value] of Object.entries(userSampling)) {
 			if (!hasValue(currentConfig[key])) apiOptions[key] = value;
+		}
+
+		// sampling preset of an EXPLICIT level (thinking) or Off (instruct) on a thinking model, for
+		// the parameters the user did not set; Default inherits the server's sampling
+		const preset = samplingPresetFor(
+			effort,
+			modelsStore.props.modelSupportsThinking(
+				typeof apiOptions.model === 'string' ? apiOptions.model : null
+			)
+		);
+
+		if (preset) {
+			for (const [key, value] of Object.entries(preset)) {
+				if (!hasValue(currentConfig[key]) && !(key in userSampling)) apiOptions[key] = value;
+			}
 		}
 
 		return apiOptions;
@@ -1175,6 +1189,14 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				await modelsStore.props.fetchModelProps(effectiveModel);
 		}
 
+		// the request options of this turn, snapshotted on its replies: their continuations reuse
+		// the template options + sampling verbatim (a level change since does not touch them)
+		const turnApiOptions = this.getApiOptions();
+		const requestSnapshot = snapshotRequestOptions({
+			...turnApiOptions,
+			...(effectiveModel ? { model: effectiveModel } : {})
+		});
+
 		// Mutable state for the current message being streamed
 		let currentMessageId = assistantMessage.id;
 		let streamedContent = '';
@@ -1321,6 +1343,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				const updateData: Record<string, unknown> = {
 					content,
 					reasoningContent: reasoningContent || undefined,
+					requestOptions: requestSnapshot,
 					timings,
 					toolCalls: toolCalls ? JSON.stringify(toolCalls) : ''
 				};
@@ -1332,6 +1355,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				const uiUpdate: Partial<DatabaseMessage> = {
 					content,
 					reasoningContent: reasoningContent || undefined,
+					requestOptions: requestSnapshot,
 					toolCalls: toolCalls ? JSON.stringify(toolCalls) : ''
 				};
 
@@ -1477,7 +1501,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				flowRootMessageId: assistantMessage.id,
 				messages: allMessages,
 				options: {
-					...this.getApiOptions(),
+					...turnApiOptions,
 					...(effectiveModel ? { model: effectiveModel } : {}),
 					...replyCap
 				},
@@ -1514,7 +1538,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		await ChatService.sendMessage(
 			allMessages,
 			{
-				...this.getApiOptions(),
+				...turnApiOptions,
 				...(effectiveModel ? { model: effectiveModel } : {}),
 				...replyCap,
 				onChunk: streamCallbacks.onChunk,
@@ -1530,6 +1554,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					const updateData: Record<string, unknown> = {
 						content,
 						reasoningContent: reasoning || undefined,
+						requestOptions: requestSnapshot,
 						timings,
 						toolCalls: toolCalls || ''
 					};
@@ -1541,6 +1566,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					const uiUpdate: Partial<DatabaseMessage> = {
 						content,
 						reasoningContent: reasoning || undefined,
+						requestOptions: requestSnapshot,
 						toolCalls: toolCalls || ''
 					};
 
@@ -1716,8 +1742,10 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			await ChatService.sendMessage(
 				path,
 				{
-					...this.getApiOptions(conversation),
-					...(model ? { model } : {}),
+					...applyRequestSnapshot(
+						{ ...this.getApiOptions(conversation), ...(model ? { model } : {}) },
+						msg.requestOptions
+					),
 					continueFinalMessage: true,
 					...(capped !== undefined
 						? {
@@ -2287,6 +2315,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				content: p.partial.content,
 				model: p.partial.model,
 				reasoningContent: p.partial.reasoningContent,
+				requestOptions: p.partial.requestOptions,
 				role: MessageRole.ASSISTANT,
 				timestamp: Date.now(),
 				toolCalls: '',

@@ -424,3 +424,8 @@ export {
 	turnSummary,
 	utf8Bytes
 } from './timing-chips';
+export {
+	applyRequestSnapshot,
+	SNAPSHOT_SAMPLING_KEYS,
+	snapshotRequestOptions
+} from './request-snapshot';

@@ -258,6 +258,7 @@ export interface ApiLlamaCppServerProps {
 	chat_template: string;
 	/** capabilities of the chat template (e.g. supports_reasoning_effort) */
 	chat_template_caps?: Record<string, boolean>;
+	model_alias?: string;
 	bos_token: string;
 	eos_token: string;
 	build_info: string;
@@ -268,6 +269,8 @@ export interface ApiLlamaCppServerProps {
 }
 
 export interface ApiChatCompletionRequest {
+	/** the template's native effort knob (sent only when /props says the template takes it) */
+	reasoning_effort?: string;
 	messages: Array<{
 		role: ChatRole;
 		content: string | ApiChatMessageContentPart[];
