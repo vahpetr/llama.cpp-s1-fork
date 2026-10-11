@@ -37,7 +37,7 @@ Both are idempotent and resumable (re-run after an interrupted download; finishe
 3. **Re-encode (hands only, CPU, a few minutes):** `tools/s1/gguf_hc_q8.py` turns the 290 BF16 `hc_*` tensors into Q8_0 and
    copies `output.weight` + `token_embd.weight` from the Q8_0 head, in one pass. The script checks that exactly those 292
    tensors changed type, compares the result with my file's sha256, and hardlinks the untouched PLE shard (no 29 GB copy).
-4. **Image:** `docker pull vahpetr/llama-cpp-s1-fork:v58` (s1) or `:v58k` (balkon). `BUILD=1` builds it from this tree instead.
+4. **Image:** `docker pull vahpetr/llama-cpp-s1-fork:v59` (s1) or `:v59k` (balkon). `BUILD=1` builds it from this tree instead.
 5. **Start** the compose file, wait for `/health` (up to 15-20 min; the brain's first start pre-reads the 33 GiB PLE range),
    print the expected GTT and fill times, and smoke-test: `/props` n_ctx, one short completion, `/disk-cache` own key and entries.
 
@@ -51,12 +51,12 @@ production images:
 
 ```sh
 git archive <rev> | docker build -f .devops/vulkan.Dockerfile --build-arg APP_REVISION=<rev> --label llama.rev=<rev> \
-  --target server -t vahpetr/llama-cpp-s1-fork:v58 -
+  --target server -t vahpetr/llama-cpp-s1-fork:v59 -
 ```
 
-v58 = rev `0aec4819b` (the `prod-v11-stage7` head; this branch only adds docs and deploy files on top). `:v58k` is the same rev
-built on the 780M box; `:latest` = v58. Rollback: `:v57` / `:v57k` (rev `11ba71ca4`, same numerics, older webui) stay
-published; set `LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v57` (or `:v57k`). Build with no model loaded on the GPU: on the
+v59 = rev `a1b6c324e` (the `prod-v11-stage7` head; this branch only adds docs and deploy files on top). `:v59k` is the same rev
+built on the 780M box; `:latest` = v59. Rollback: `:v58` / `:v58k` (rev `0aec4819b`, same numerics, no backend-sampling guard)
+stay published; set `LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v58` (or `:v58k`). Build with no model loaded on the GPU: on the
 128 GB box a build next to a loaded model has run it out of memory. `docker compose -f <file> build` does the same from a checkout.
 
 ## By hand
