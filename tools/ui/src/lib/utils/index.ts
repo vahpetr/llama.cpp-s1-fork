@@ -431,9 +431,12 @@ export {
 } from './request-snapshot';
 export {
 	BACKEND_SAMPLING_OLD_SERVER_NOTE,
+	BACKEND_SAMPLING_SPECULATIVE_NOTE,
+	backendSamplingNote,
 	backendSamplingHelp,
 	backendSamplingHint,
 	type BackendSamplingState,
 	backendSamplingState,
+	exportWithBackendSamplingLock,
 	isBackendSamplingRejection
 } from './backend-sampling';

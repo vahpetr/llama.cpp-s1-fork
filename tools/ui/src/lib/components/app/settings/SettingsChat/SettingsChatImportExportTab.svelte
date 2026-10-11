@@ -9,8 +9,8 @@
 	import SettingsGroup from '$lib/components/app/settings/SettingsGroup.svelte';
 	import { ConversationSelectionMode, FileExtensionText, HtmlInputType } from '$lib/enums';
 	import { ConversationTransferService } from '$lib/services';
-	import { conversationsStore, settingsStore } from '$lib/stores';
-	import { createMessageCountMap } from '$lib/utils';
+	import { conversationsStore, modelsStore, serverStore, settingsStore } from '$lib/stores';
+	import { createMessageCountMap, exportWithBackendSamplingLock } from '$lib/utils';
 	import { fade } from 'svelte/transition';
 	import { toast } from 'svelte-sonner';
 
@@ -45,7 +45,13 @@
 		showSettingsExportDialog = false;
 
 		try {
-			const data = settingsStore.exportSettings(includeSensitiveData);
+			// a locked backend sampling is exported as false (0225b)
+			const data = exportWithBackendSamplingLock(
+				settingsStore.exportSettings(includeSensitiveData),
+				modelsStore.props.backendSampling(
+					serverStore.isRouterMode ? modelsStore.selectedModelName : null
+				)
+			);
 			const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
 			const url = URL.createObjectURL(blob);
 			const a = document.createElement('a');

@@ -10,7 +10,11 @@
 	import { ICON_CLASS_DEFAULT, SETTING_CONFIG_INFO, SETTINGS_KEYS } from '$lib/constants';
 	import { SettingsFieldType } from '$lib/enums/settings.enums';
 	import { modelsStore, serverStore, settingsStore } from '$lib/stores';
-	import { backendSamplingHelp, backendSamplingHint } from '$lib/utils/backend-sampling';
+	import {
+		backendSamplingHelp,
+		backendSamplingHint,
+		backendSamplingNote
+	} from '$lib/utils/backend-sampling';
 	import { normalizeFloatingPoint } from '$lib/utils/precision';
 	import type { Component } from 'svelte';
 
@@ -345,6 +349,10 @@
 						{#if locked}
 							<p class="text-xs text-amber-600 dark:text-amber-400" data-backend-sampling-locked>
 								{locked}
+							</p>
+						{:else if field.key === SETTINGS_KEYS.BACKEND_SAMPLING && backendSamplingNote(backendSampling)}
+							<p class="text-xs text-muted-foreground" data-backend-sampling-note>
+								{backendSamplingNote(backendSampling)}
 							</p>
 						{/if}
 					</div>

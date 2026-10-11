@@ -480,6 +480,26 @@ export class ChatService {
 	}
 
 	/**
+	 * 0225b: the server refused backend sampling (its sampling-specific error, from a 400 or an
+	 * error event in the stream): switch the setting off, remember the server, say so once.
+	 */
+	static guardBackendSampling(
+		message: string,
+		requestBody: { backend_sampling?: boolean },
+		model?: string | null
+	): void {
+		if (!isBackendSamplingRejection(message, requestBody.backend_sampling === true)) return;
+
+		modelsStore.props.markBackendSamplingUnsupported(model);
+
+		if (settingsStore.config.backend_sampling) {
+			settingsStore.updateConfig('backend_sampling', false);
+		}
+
+		toast.warning('Backend sampling disabled: not supported on this server');
+	}
+
+	/**
 	 * Handles streaming response from the chat completion API.
 	 */
 	static async handleStreamResponse(
@@ -501,7 +521,8 @@ export class ChatService {
 		conversationId?: string,
 		abortSignal?: AbortSignal,
 		onConnectionState?: (state: StreamConnectionState) => void,
-		streamModel?: string | null
+		streamModel?: string | null,
+		onStreamError?: (message: string) => void
 	): Promise<void> {
 		let reader = response.body?.getReader();
 
@@ -683,6 +704,18 @@ export class ChatService {
 
 							try {
 								const parsed: ApiChatCompletionStreamChunk = JSON.parse(data);
+								// a structured error event inside the stream (the server rejected the
+								// request after the headers went out)
+								const streamError = (parsed as { error?: { message?: unknown } }).error;
+
+								if (streamError) {
+									onStreamError?.(
+										typeof streamError.message === 'string'
+											? streamError.message
+											: JSON.stringify(streamError)
+									);
+								}
+
 								const choice = parsed.choices?.[0];
 								const content = choice?.delta?.content;
 								const reasoningContent = choice?.delta?.reasoning_content;
@@ -1296,6 +1329,14 @@ export class ChatService {
 		// after the custom JSON: a pre-encode never generates
 		if (n_predict !== undefined) requestBody.n_predict = n_predict;
 
+		// 0225b: the capability is enforced on the final body (also against the custom JSON)
+		if (
+			requestBody.backend_sampling &&
+			modelsStore.props.backendSampling(options.model).supported === false
+		) {
+			delete requestBody.backend_sampling;
+		}
+
 		// a continuation's own fields win over the custom JSON: the messages (ending in the prefill)
 		// and the continuation flags, so a join can never concatenate an independent response
 		if (continueFinalMessage) {
@@ -1410,23 +1451,8 @@ export class ChatService {
 					);
 				}
 
-				// 0225: the server refused backend sampling (0226's 400, or an older server's 500
-				// "Invalid input batch."): switch the setting off and remember it for this server
-				if (
-					isBackendSamplingRejection(
-						response.status,
-						error.message,
-						requestBody.backend_sampling === true
-					)
-				) {
-					modelsStore.props.markBackendSamplingUnsupported(options.model);
-
-					if (settingsStore.config.backend_sampling) {
-						settingsStore.updateConfig('backend_sampling', false);
-					}
-
-					toast.warning('Backend sampling disabled: not supported on this server');
-				}
+				// 0225b: the server refused backend sampling (its sampling-specific 400)
+				ChatService.guardBackendSampling(error.message, requestBody, options.model);
 
 				// a rejected request (including one cancelled by a stop during the model load)
 				// leaves nothing to resume
@@ -1455,7 +1481,8 @@ export class ChatService {
 					conversationId,
 					signal,
 					onConnectionState,
-					options.model
+					options.model,
+					(message: string) => ChatService.guardBackendSampling(message, requestBody, options.model)
 				);
 
 				return;
