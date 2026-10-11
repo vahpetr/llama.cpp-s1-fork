@@ -6,7 +6,7 @@ from upstream PR #27742 and an MTP draft graph. Upstream back-ports are marked a
 
 Status column:
 - **deployed (vNN)**: in my builds from image vNN on (my production line), still in this tree.
-- **v56**: in this tree (HEAD = v56, going to production on 2026-10-10).
+- **v57**: in this tree (HEAD = v57, in production since 2026-10-11).
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
 - **in tree, off**: compiled in, off unless you set its knob (docs/s1/KNOBS.md).
@@ -213,5 +213,7 @@ records and upstream status live in my private repo; ask if you want one.
 | 0215 | webui: strip the server-echoed prefill when joining a continuation | deployed (v55) |
 | 0216 | webui: minimal permanent surface (context meter + popover, /compact, compaction hint, collapsed timing chips) | deployed (v55) |
 | 0217 | webui: review fixes (whitespace-normalised echo detection + echoMismatch mark, popover pin per chat, tool chip in the block header) | deployed (v55) |
-| 0218 | webui: the upstream context ring is the single context trigger (hover card, click / Enter pins; card = upstream usage details + the fork rows: prefill / decode t/s, MTP accepted / drafted, cache share, compute, reserve breakdown, compaction state + Cancel, Compact now, settings); top-right meter removed | v56 |
-| 0219 | webui: review fixes (settings dialog state per conversation, dialog clicks keep the pinned card, popup cleared on ring teardown) | v56 |
+| 0218 | webui: the upstream context ring is the single context trigger (hover card, click / Enter pins; card = upstream usage details + the fork rows: prefill / decode t/s, MTP accepted / drafted, cache share, compute, reserve breakdown, compaction state + Cancel, Compact now, settings); top-right meter removed | deployed (v56) |
+| 0219 | webui: review fixes (settings dialog state per conversation, dialog clicks keep the pinned card, popup cleared on ring teardown) | deployed (v56) |
+| 0220 | webui: reasoning level picker in single-model mode ("+" menu -> Reasoning: Default / Off / Low / Medium / High / Max); native `reasoning_effort` low / medium / xhigh when the template supports it (High and Max differ by the thinking budget); sampling presets by thinking state (thinking T 1.0 / top_p 0.95 / top_k 20 / min_p 0 / presence 0; instruct 0.7 / 0.8 / 20 / 0 / 1.5), only for parameters the user left unset; a 400 naming the reasoning effort is retried once without it | v57 |
+| 0221 | webui: review fixes (Default inherits the server's sampling, durable user overrides, per-turn template-option snapshot reused by continuations, narrow effort fallback) | v57 |
