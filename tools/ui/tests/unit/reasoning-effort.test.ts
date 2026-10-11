@@ -16,12 +16,18 @@ beforeAll(() => {
 });
 
 import {
+	activePresetLine,
+	cleanPresetSettings,
+	importedPresets,
 	isReasoningEffortRejection,
 	nativeReasoningEffort,
 	REASONING_EFFORT_TOKENS,
+	resolveSamplingPreset,
 	SAMPLING_PRESETS,
-	samplingPresetFor,
-	samplingPresetLabel
+	samplingPresetLabel,
+	sanitizePresetValue,
+	withoutPreset,
+	withPresetField
 } from '$lib/constants';
 import { ReasoningEffort } from '$lib/enums';
 import { ChatService } from '$lib/services/chat.service';
@@ -46,6 +52,7 @@ afterEach(() => {
 	vi.unstubAllGlobals();
 	settingsStore.config = { ...settingsStore.config, ...UNSET, customJson: '' };
 	settingsStore.userSampling = {};
+	settingsStore.samplingPresets = {};
 	modelsStore.props.reasoningEffortRejected.clear();
 });
 
@@ -202,10 +209,14 @@ describe('sampling presets (astra: Default inherits the server, durable user val
 	});
 
 	it('preset rule and the lightbulb label', () => {
-		expect(samplingPresetFor(ReasoningEffort.DEFAULT, true)).toBeNull();
-		expect(samplingPresetFor(ReasoningEffort.HIGH, false)).toBeNull();
-		expect(samplingPresetFor(ReasoningEffort.OFF, true)).toBe(SAMPLING_PRESETS.instruct);
-		expect(samplingPresetFor(ReasoningEffort.MAX, true)).toBe(SAMPLING_PRESETS.thinking);
+		expect(resolveSamplingPreset(ReasoningEffort.DEFAULT, true)).toBeNull();
+		expect(resolveSamplingPreset(ReasoningEffort.HIGH, false)).toBeNull();
+		expect(resolveSamplingPreset(ReasoningEffort.OFF, true)?.values).toEqual(
+			SAMPLING_PRESETS.instruct
+		);
+		expect(resolveSamplingPreset(ReasoningEffort.MAX, true)?.values).toEqual(
+			SAMPLING_PRESETS.thinking
+		);
 		expect(samplingPresetLabel({ native: 'xhigh', temperature: 1, thinking: true })).toBe(
 			'thinking · xhigh · T 1.0'
 		);
@@ -307,7 +318,14 @@ describe('reasoning_effort fallback (narrow, per model)', () => {
 				'Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low.'
 			)
 		).toBe(true);
-		expect(isReasoningEffortRejection('Supported levels: xhigh, medium, low')).toBe(true);
+		expect(
+			isReasoningEffortRejection('Reasoning effort: supported levels are xhigh, medium, low')
+		).toBe(true);
+		// the "supported ... xhigh" form without a reasoning / effort reference does not count
+		expect(isReasoningEffortRejection('Supported levels: xhigh, medium, low')).toBe(false);
+		expect(
+			isReasoningEffortRejection('Supported types are xhigh (default), medium, and low.')
+		).toBe(false);
 		expect(isReasoningEffortRejection('invalid reasoning_effort type')).toBe(false);
 		expect(isReasoningEffortRejection('the prompt is too long for the reasoning effort')).toBe(
 			false
@@ -372,5 +390,217 @@ describe('reasoning_effort fallback (narrow, per model)', () => {
 		serverStore.props = { ...propsA } as never;
 		expect(modelsStore.props.supportsReasoningEffort()).toBe(true);
 		serverStore.props = null;
+	});
+
+	it("llama-server's HTTP 500 template refusal (Jinja exception) also retries once without it; other 500s do not", async () => {
+		vi.spyOn(conversationsStore.preferences, 'getReasoningEffort').mockReturnValue(
+			ReasoningEffort.LOW
+		);
+		vi.spyOn(modelsStore.props, 'modelSupportsThinking').mockReturnValue(true);
+		vi.spyOn(modelsStore.props, 'supportsReasoningEffort').mockReturnValue(true);
+
+		const bodies: Record<string, unknown>[] = [];
+
+		let message =
+			'Jinja Exception: Unexpected reasoning effort low. Supported types are xhigh (default), medium, and low.';
+
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (_u: string, init?: RequestInit) => {
+				const body = JSON.parse(String(init?.body));
+
+				bodies.push(body);
+
+				return body.reasoning_effort
+					? new Response(JSON.stringify({ error: { code: 500, message } }), { status: 500 })
+					: new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }));
+			})
+		);
+
+		await ChatService.sendMessage([{ content: 'x', role: 'user' }], {
+			...chatStore.getApiOptions(),
+			stream: false
+		} as never);
+
+		expect(bodies.map((b) => b.reasoning_effort)).toEqual(['low', undefined]);
+		expect(modelsStore.props.reasoningEffortRejected.size).toBe(1);
+
+		// a 500 that is not the template's refusal: no retry
+		modelsStore.props.reasoningEffortRejected.clear();
+		bodies.length = 0;
+		message = 'Internal server error: slot unavailable';
+		await ChatService.sendMessage([{ content: 'x', role: 'user' }], {
+			...chatStore.getApiOptions(),
+			stream: false
+		} as never).catch(() => {});
+
+		expect(bodies.map((b) => b.reasoning_effort)).toEqual(['low']);
+		expect(modelsStore.props.reasoningEffortRejected.size).toBe(0);
+	});
+});
+
+describe('editable presets by reasoning state + per-level overrides', () => {
+	it('precedence: user value > level override > edited preset; Default sends nothing', async () => {
+		settingsStore.setPresetField('thinking', 'temperature', 0.9);
+		settingsStore.setPresetField('thinking', 'top_p', 0.9);
+		settingsStore.setPresetField('medium', 'top_p', 0.85);
+		settingsStore.setPresetField('medium', 'min_p', 0.05);
+		settingsStore.config = { ...settingsStore.config, min_p: 0.02 };
+
+		const medium = await bodyFor(ReasoningEffort.MEDIUM, false);
+
+		expect(medium).toMatchObject({
+			min_p: 0.02, // the user's own Sampling value wins over the level override
+			presence_penalty: 0,
+			temperature: 0.9, // the edited Thinking preset
+			top_k: 20,
+			top_p: 0.85 // the Medium override
+		});
+		vi.restoreAllMocks();
+
+		const high = await bodyFor(ReasoningEffort.HIGH, false);
+
+		expect(high).toMatchObject({ temperature: 0.9, top_p: 0.9 }); // no High override
+		vi.restoreAllMocks();
+
+		const def = await bodyFor(ReasoningEffort.DEFAULT, false);
+
+		expect(def.temperature).toBeUndefined();
+		expect(def.top_p).toBeUndefined();
+	});
+
+	it('the source: card, custom, level; reset to the model card', () => {
+		expect(resolveSamplingPreset(ReasoningEffort.LOW, true, {})?.source).toBe('card');
+		settingsStore.setPresetField('thinking', 'temperature', 0.8);
+		expect(
+			resolveSamplingPreset(ReasoningEffort.LOW, true, settingsStore.samplingPresets)?.source
+		).toBe('custom');
+		settingsStore.setPresetField('low', 'top_k', 40);
+		expect(
+			resolveSamplingPreset(ReasoningEffort.LOW, true, settingsStore.samplingPresets)?.source
+		).toBe('level');
+		// an edit equal to the card is not "custom"
+		settingsStore.setPresetField('instruct', 'temperature', 0.7);
+		expect(
+			resolveSamplingPreset(ReasoningEffort.OFF, true, settingsStore.samplingPresets)?.source
+		).toBe('card');
+
+		settingsStore.resetPreset('thinking');
+		expect(settingsStore.samplingPresets.thinking).toBeUndefined();
+		expect(
+			resolveSamplingPreset(ReasoningEffort.MEDIUM, true, settingsStore.samplingPresets)
+		).toEqual({
+			source: 'card',
+			state: 'thinking',
+			values: SAMPLING_PRESETS.thinking
+		});
+		// clearing a level field inherits again
+		settingsStore.setPresetField('low', 'top_k', undefined);
+		expect(
+			resolveSamplingPreset(ReasoningEffort.LOW, true, settingsStore.samplingPresets)?.source
+		).toBe('card');
+	});
+
+	it('the lightbulb title names the source; the settings line names the active preset', () => {
+		expect(
+			samplingPresetLabel({ native: 'medium', source: 'card', temperature: 1, thinking: true })
+		).toBe('thinking · medium · T 1.0 · preset: card');
+		expect(samplingPresetLabel({ source: 'custom', temperature: 0.6, thinking: false })).toBe(
+			'instruct · T 0.6 · preset: custom'
+		);
+		expect(samplingPresetLabel({ source: 'level', temperature: 1, thinking: true })).toBe(
+			'thinking · T 1.0 · level override'
+		);
+
+		expect(activePresetLine(ReasoningEffort.MEDIUM, true, {})).toBe('Thinking (level Medium)');
+		expect(activePresetLine(ReasoningEffort.OFF, true, {})).toBe('Instruct');
+		expect(activePresetLine(ReasoningEffort.DEFAULT, true, {})).toBe(
+			'none — Default inherits the server'
+		);
+		expect(
+			activePresetLine(ReasoningEffort.HIGH, true, { levels: { high: { temperature: 0.5 } } })
+		).toBe('Thinking (level High, with its overrides)');
+	});
+
+	it('stored presets are cleaned: junk and missing fields fall back to the card', () => {
+		expect(
+			resolveSamplingPreset(ReasoningEffort.OFF, true, {
+				instruct: { temperature: 'hot' as never, top_p: Number.NaN }
+			})?.values
+		).toEqual(SAMPLING_PRESETS.instruct);
+	});
+});
+
+describe('astra 0223 review: draft, export/import, reset, integer top_k, hasValue', () => {
+	it('top_k must be an integer (sanitizer, draft edits, stored / imported settings)', () => {
+		expect(sanitizePresetValue('top_k', 20.5)).toBeUndefined();
+		expect(sanitizePresetValue('top_k', 40)).toBe(40);
+		expect(sanitizePresetValue('temperature', 0.55)).toBe(0.55);
+		expect(withPresetField({}, 'thinking', 'top_k', 20.5)).toEqual({ thinking: {} });
+		expect(
+			cleanPresetSettings({ levels: { low: { top_k: 3.2, top_p: 0.9 } }, thinking: { top_k: 'x' } })
+		).toEqual({ levels: { low: { top_p: 0.9 } } });
+	});
+
+	it('draft helpers never touch the stored presets (Save persists, Cancel drops)', () => {
+		settingsStore.setSamplingPresets({ thinking: { temperature: 0.9 } });
+
+		const draft = withPresetField(
+			withoutPreset(settingsStore.samplingPresets, 'thinking'),
+			'medium',
+			'top_p',
+			0.8
+		);
+
+		expect(draft).toEqual({ levels: { medium: { top_p: 0.8 } } });
+		// nothing persisted until Save
+		expect(settingsStore.samplingPresets).toEqual({ thinking: { temperature: 0.9 } });
+		settingsStore.setSamplingPresets(draft);
+		expect(settingsStore.samplingPresets).toEqual({ levels: { medium: { top_p: 0.8 } } });
+	});
+
+	it('export carries the presets; import replaces them only when the file has them', () => {
+		settingsStore.setSamplingPresets({ instruct: { temperature: 0.6 } });
+
+		const exported = settingsStore.exportSettings();
+
+		expect(exported.samplingPresets).toEqual({ instruct: { temperature: 0.6 } });
+		// an older file without presets: none imported (the presets here stay)
+		expect(importedPresets({})).toBeNull();
+		expect(importedPresets({ samplingPresets: [] })).toBeNull();
+		// a file with presets: cleaned (a fractional top_k dropped)
+		expect(
+			importedPresets({ samplingPresets: { instruct: { temperature: 0.65, top_k: 1.5 } } })
+		).toEqual({ instruct: { temperature: 0.65 } });
+	});
+
+	it('"Reset to default" (forceSyncWithServerDefaults) and resetConfig clear the presets', () => {
+		settingsStore.setSamplingPresets({
+			levels: { max: { temperature: 1.2 } },
+			thinking: { top_p: 0.9 }
+		});
+		settingsStore.forceSyncWithServerDefaults();
+		expect(settingsStore.samplingPresets).toEqual({});
+		settingsStore.setSamplingPresets({ instruct: { top_p: 0.7 } });
+		settingsStore.resetConfig();
+		expect(settingsStore.samplingPresets).toEqual({});
+	});
+
+	it('hasValue ignores whitespace-only strings and NaN (no NaN / blank sampling sent)', async () => {
+		settingsStore.config = { ...settingsStore.config, temperature: '   ', top_p: Number.NaN };
+
+		const body = await bodyFor(ReasoningEffort.OFF, true);
+
+		// both fall back to the instruct preset instead of NaN / blank
+		expect(body.temperature).toBe(0.7);
+		expect(body.top_p).toBe(0.8);
+	});
+
+	it('a fractional top_k from an old setting is sent as an integer', async () => {
+		settingsStore.config = { ...settingsStore.config, top_k: 20.6 };
+
+		const body = await bodyFor(ReasoningEffort.DEFAULT, true);
+
+		expect(body.top_k).toBe(21);
 	});
 });

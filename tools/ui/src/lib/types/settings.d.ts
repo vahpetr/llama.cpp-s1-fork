@@ -193,4 +193,6 @@ export interface SettingsExportType {
 	config: SettingsConfigType;
 	/** Keys that differ from server defaults (derived, but persisted for fidelity) */
 	userOverrides: string[];
+	/** The sampling presets by reasoning state (optional: older files have none) */
+	samplingPresets?: Record<string, unknown>;
 }

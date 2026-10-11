@@ -92,11 +92,15 @@
 						return;
 					}
 
-					settingsStore.importSettings(data);
+					const imported = settingsStore.importSettings(data);
 
 					showSettingsImportSummary = true;
 					showSettingsExportSummary = false;
-					toast.success('Settings imported successfully');
+					toast.success(
+						imported.samplingPresets
+							? 'Settings imported successfully (incl. the sampling presets)'
+							: 'Settings imported successfully (the file has no sampling presets; yours are unchanged)'
+					);
 				} catch (err) {
 					console.error('Failed to import settings:', err);
 					toast.error('Failed to import settings');

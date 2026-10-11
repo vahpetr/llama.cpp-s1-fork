@@ -9,6 +9,14 @@
 
 import { browser } from '$app/environment';
 import { SETTING_CONFIG_DEFAULT, SETTINGS_KEYS } from '$lib/constants';
+import {
+	cleanPresetSettings,
+	importedPresets,
+	type PresetField,
+	type SamplingPresetSettings,
+	withoutPreset,
+	withPresetField
+} from '$lib/constants/reasoning-effort.constants';
 import { ColorMode } from '$lib/enums';
 import { ParameterSyncService } from '$lib/services/parameter-sync.service';
 import { SettingsService } from '$lib/services/settings.service';
@@ -28,6 +36,8 @@ import { setMode } from 'mode-watcher';
 class SettingsStore {
 	config = $state<SettingsConfigType>({ ...SETTING_CONFIG_DEFAULT });
 	isInitialized = $state(false);
+	/** The user's edits of the sampling presets by reasoning state (missing = the model card). */
+	samplingPresets = $state<SamplingPresetSettings>({});
 	userOverrides = $state<Set<string>>(new Set());
 	/**
 	 * Durable provenance of the sampling values the USER set (key -> value), kept even when the
@@ -87,6 +97,7 @@ class SettingsStore {
 
 		return {
 			config: configToExport,
+			samplingPresets: cleanPresetSettings(this.samplingPresets) as Record<string, unknown>,
 			timestamp: Date.now(),
 			userOverrides: Array.from(this.userOverrides),
 			version: 1
@@ -138,6 +149,8 @@ class SettingsStore {
 		}
 
 		this.forgetUserSampling();
+		// the visible "Reset to default": the presets and level overrides go back to the card too
+		this.setSamplingPresets({});
 		this.saveConfig();
 	}
 
@@ -194,12 +207,18 @@ class SettingsStore {
 	 * Restores config (including theme) and user overrides.
 	 * @param data - The exported settings object
 	 */
-	importSettings(data: SettingsExportType): void {
-		if (!browser) return;
+	importSettings(data: SettingsExportType): { samplingPresets: boolean } {
+		if (!browser) return { samplingPresets: false };
 
 		if (!data || !data.config) {
 			throw new Error('Invalid settings data: missing config');
 		}
+
+		// the sampling presets: replaced only when the file has them (older files keep the ones here)
+		const presets = importedPresets(data);
+		const hasPresets = presets !== null;
+
+		if (presets) this.setSamplingPresets(presets);
 
 		// Restore config (theme is included in config)
 		this.config = {
@@ -217,6 +236,8 @@ class SettingsStore {
 		setMode(this.config[SETTINGS_KEYS.THEME] as ColorMode);
 
 		console.log('Settings imported successfully');
+
+		return { samplingPresets: hasPresets };
 	}
 
 	/**
@@ -252,6 +273,7 @@ class SettingsStore {
 	resetConfig() {
 		this.config = { ...SETTING_CONFIG_DEFAULT };
 		this.forgetUserSampling();
+		this.setSamplingPresets({});
 
 		this.saveConfig();
 	}
@@ -278,6 +300,11 @@ class SettingsStore {
 		this.saveConfig();
 	}
 
+	/** Reset a preset to the model card (drops its edits; the level overrides stay). */
+	resetPreset(state: 'thinking' | 'instruct'): void {
+		this.setSamplingPresets(withoutPreset(this.samplingPresets, state));
+	}
+
 	/**
 	 * Reset theme to default value.
 	 * Theme is now stored inside the config object.
@@ -287,6 +314,35 @@ class SettingsStore {
 
 		setMode(SETTING_CONFIG_DEFAULT[SETTINGS_KEYS.THEME] as ColorMode);
 	}
+
+	/**
+	 * Edit one field of a preset (`thinking` / `instruct`) or of a level's overrides (`low` ...
+	 * `max`); undefined clears it (the card value / the Thinking preset applies again).
+	 */
+	setPresetField(
+		target: 'thinking' | 'instruct' | 'low' | 'medium' | 'high' | 'max',
+		field: PresetField,
+		value: number | undefined
+	): void {
+		this.setSamplingPresets(withPresetField(this.samplingPresets, target, field, value));
+	}
+
+	/**
+	 * Replace the preset settings (the Settings panel's draft on Save, an import) and persist them;
+	 * invalid parts are dropped.
+	 */
+	setSamplingPresets(value: SamplingPresetSettings): void {
+		this.samplingPresets = cleanPresetSettings(value);
+		SettingsService.saveSamplingPresets(this.samplingPresets as Record<string, unknown>);
+	}
+
+	/**
+	 *
+	 *
+	 * Import / Export
+	 *
+	 *
+	 */
 
 	/**
 	 * Initialize settings with props defaults when server properties are first loaded
@@ -375,7 +431,7 @@ class SettingsStore {
 	/**
 	 *
 	 *
-	 * Import / Export
+	 * Utilities (private helpers)
 	 *
 	 *
 	 */
@@ -422,14 +478,6 @@ class SettingsStore {
 
 		setMode(newTheme as ColorMode);
 	}
-
-	/**
-	 *
-	 *
-	 * Utilities (private helpers)
-	 *
-	 *
-	 */
 
 	private forgetUserSampling(key?: string): void {
 		if (key === undefined) {
@@ -483,6 +531,7 @@ class SettingsStore {
 		// Load user overrides
 		this.userOverrides = new Set(savedOverrides);
 		this.userSampling = SettingsService.loadUserSampling();
+		this.samplingPresets = cleanPresetSettings(SettingsService.loadSamplingPresets());
 	}
 
 	/**
