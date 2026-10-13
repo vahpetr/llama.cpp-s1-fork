@@ -1079,6 +1079,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_get_rows_flat[GGML_TYPE_COUNT];       // GGML_VK_GET_ROWS_FLAT: narrow rows, one thread per element
+    vk_pipeline pipeline_get_rows_flat_f32[GGML_TYPE_COUNT];   //   (f32 / f16 / bf16 / i32 sources)
     vk_pipeline pipeline_get_rows_back_f32;
     vk_pipeline pipeline_acc_f32;
     vk_pipeline pipeline_set_f32;
@@ -3100,6 +3102,13 @@ static size_t ggml_vk_buffer_align(const vk_device & device) {
     return align_env > dev && (align_env & (align_env - 1)) == 0 ? align_env : dev;
 }
 
+// [TAG_VK_GET_ROWS_FLAT] GGML_VK_GET_ROWS_FLAT=N (default 32, <= 0 = off): the widest GET_ROWS row that takes the flat
+// pipeline. Shared by ggml_vk_get_rows_flat_ok and the startup proof line.
+static int64_t ggml_vk_get_rows_flat_knob() {
+    static const int64_t max_ne00 = [] { const char * e = getenv("GGML_VK_GET_ROWS_FLAT"); return e ? (int64_t) atoll(e) : (int64_t) 32; }();
+    return max_ne00;
+}
+
 static bool ggml_vk_fusion_count_enabled() {
     static const bool enabled = ggml_vk_env_bool("GGML_VK_FUSION_COUNT", false);
     return enabled;
@@ -3384,6 +3393,7 @@ class vk_perf_logger {
 };
 
 struct ggml_backend_vk_context {
+    bool get_rows_flat {};   // the GET_ROWS being recorded uses the flat pipeline (ggml_vk_get_rows -> op_get_pipeline / ggml_vk_op_f32 elements)
     std::string name;
 
     vk_device device;
@@ -3487,6 +3497,8 @@ struct ggml_backend_vk_context {
     bool fused_concat_ssm_conv {};
     // GGML_VK_FUSION_COUNT: add_rms fusions of the current graph (decided inside ggml_vk_build_graph)
     int fusion_count_add_rms {};
+    // GGML_VK_FUSION_COUNT: GET_ROWS of the current graph that took the GGML_VK_GET_ROWS_FLAT pipeline (engagement, not a fusion)
+    int fusion_count_get_rows_flat {};
     // GGML_VK_FUSION_COUNT: running numerics signature of the current graph. Fed once per node
     // (op, fused pattern, applied misalignment) and once per dispatch (pipeline name + workgroup
     // counts, which is where the shader and the split_k/rows-per-wg choice show up).
@@ -7208,6 +7220,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_MXFP4],   "get_rows_mxfp4",   get_rows_mxfp4_len,   get_rows_mxfp4_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_NVFP4],   "get_rows_nvfp4",   get_rows_nvfp4_len,   get_rows_nvfp4_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_I32],     "get_rows_i32",     get_rows_i32_len,     get_rows_i32_data,     "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+    // flat variants (constant_id 1 = flat_rows): the same shaders, one thread per element
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat[GGML_TYPE_F32 ], "get_rows_flat_f32",  get_rows_f32_len,  get_rows_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat[GGML_TYPE_F16 ], "get_rows_flat_f16",  get_rows_f16_len,  get_rows_f16_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat[GGML_TYPE_BF16], "get_rows_flat_bf16", get_rows_bf16_len, get_rows_bf16_data, "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat[GGML_TYPE_I32 ], "get_rows_flat_i32",  get_rows_i32_len,  get_rows_i32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat_f32[GGML_TYPE_F32 ], "get_rows_flat_f32_f32",  get_rows_f32_f32_len,  get_rows_f32_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat_f32[GGML_TYPE_F16 ], "get_rows_flat_f16_f32",  get_rows_f16_f32_len,  get_rows_f16_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat_f32[GGML_TYPE_BF16], "get_rows_flat_bf16_f32", get_rows_bf16_f32_len, get_rows_bf16_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {0, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_F32 ], "get_rows_f32_f32",  get_rows_f32_f32_len,  get_rows_f32_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_F16 ], "get_rows_f16_f32",  get_rows_f16_f32_len,  get_rows_f16_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
@@ -9045,6 +9065,15 @@ static vk_device ggml_vk_get_device(size_t idx) {
         //   HOST_CACHED mapping or for <= 64 KiB; bulk reads of write-combined memory take the device copy path (no knob)
         GGML_LOG_WARN("ggml_vulkan: %s uma_bulk_read: %s\n", device->name.c_str(), device->uma ?
                       "copy path (direct CPU read only from HOST_CACHED mappings or for <= 64 KiB; no knob)" : "n/a (not a UMA device)");
+
+        // [TAG_VK_GET_ROWS_FLAT] the proof line
+        if (ggml_vk_get_rows_flat_knob() > 0) {
+            GGML_LOG_WARN("ggml_vulkan: %s get_rows_flat: on (rows <= %lld elements from f32 / f16 / bf16 / i32 sources, one thread per "
+                          "element; GGML_VK_GET_ROWS_FLAT)\n", device->name.c_str(), (long long) ggml_vk_get_rows_flat_knob());
+        } else {
+            GGML_LOG_WARN("ggml_vulkan: %s get_rows_flat: off (GGML_VK_GET_ROWS_FLAT=%lld; the row-per-workgroup GET_ROWS stays)\n",
+                          device->name.c_str(), (long long) ggml_vk_get_rows_flat_knob());
+        }
 
         // [TAG_QSA_SCORE_KREUSE] the proof line
         if (device->coopmat_support && !device->coopmat2) {
@@ -14332,6 +14361,10 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
     switch (op) {
     case GGML_OP_GET_ROWS:
+        if (ctx->get_rows_flat) {
+            return src0->type == GGML_TYPE_I32 || dst->type == GGML_TYPE_F16 ? ctx->device->pipeline_get_rows_flat[src0->type]
+                                                                              : ctx->device->pipeline_get_rows_flat_f32[src0->type];
+        }
         GGML_ASSERT(src1->type == GGML_TYPE_I32);
         if (src0->type == GGML_TYPE_I32) {
             // i32 src only supports i32 result
@@ -15313,6 +15346,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
         } break;
     case GGML_OP_GET_ROWS:
+        if (ctx->get_rows_flat) {
+            // one thread per element, grid-stride past the workgroup-count limit
+            const uint64_t total = (uint64_t) ne00 * ne10 * ne11 * ne12;
+            elements = { (uint32_t) std::min<uint64_t>(total, (uint64_t) 512 * ctx->device->properties.limits.maxComputeWorkGroupCount[0]), 1, 1 };
+            break;
+        }
         elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
         elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
         elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
@@ -15588,6 +15627,27 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     }
 }
 
+// GGML_VK_GET_ROWS_FLAT=N (default 32, 0 = off): GET_ROWS with rows of at most N elements (f32 / f16 / bf16 / i32 sources) runs
+// one thread per element instead of one 512-thread workgroup per row. The QSA block-selection gathers have 1- and 4-wide rows:
+// GET_ROWS(1, 512, 2048) launched 1M workgroups with one active lane each, 2.9 ms on gfx1151 (85 ms per 32k Flash-Next
+// ubatch on v0.7.8.1, fn-unfused-ops 10-13). Port of halo-box hi3/wave7 0e33a9dbe.
+static bool ggml_vk_get_rows_flat_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    const int64_t max_ne00 = ggml_vk_get_rows_flat_knob();
+    if (max_ne00 <= 0 || src0->ne[0] > max_ne00 || src1->type != GGML_TYPE_I32 ||
+        (uint64_t) src0->ne[0] * src1->ne[0] * src1->ne[1] * src1->ne[2] >= (1ull << 31)) {
+        return false;
+    }
+    const ggml_type t = src0->type;
+    if (t == GGML_TYPE_I32) {
+        return dst->type == GGML_TYPE_I32 && ctx->device->pipeline_get_rows_flat[t] != nullptr;
+    }
+    if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 && t != GGML_TYPE_BF16) {
+        return false;
+    }
+    return dst->type == GGML_TYPE_F16 ? ctx->device->pipeline_get_rows_flat[t] != nullptr :
+           dst->type == GGML_TYPE_F32 ? ctx->device->pipeline_get_rows_flat_f32[t] != nullptr : false;
+}
+
 static void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = ggml_type_size(src1->type);
@@ -15616,6 +15676,10 @@ static void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, 
         return;
     }
 
+    ctx->get_rows_flat = ggml_vk_get_rows_flat_ok(ctx, src0, src1, dst);
+    if (ctx->get_rows_flat && ggml_vk_fusion_count_enabled()) {
+        ctx->fusion_count_get_rows_flat++;   // engagement read (not a fusion): GET_ROWS that took the flat pipeline
+    }
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GET_ROWS, {
         (uint32_t)ggml_nelements(src0),
         (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],(uint32_t)src0->ne[3], (uint32_t)src0->nb[0] / src0_type_size, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
@@ -15624,6 +15688,7 @@ static void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, 
         0,
         0.0f, 0.0f, 0,
     });
+    ctx->get_rows_flat = false;
 }
 
 static void ggml_vk_get_rows_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -21991,6 +22056,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     const bool fusion_count = ggml_vk_fusion_count_enabled();
     std::map<std::string, int> fusion_counts;
     ctx->fusion_count_add_rms = 0;
+    ctx->fusion_count_get_rows_flat = 0;
     ctx->fusion_sig = vk_fnv1a_seed;
     ctx->fusion_count_disabled.clear();
 
@@ -22536,6 +22602,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     if (fusion_count) {
         if (ctx->fusion_count_add_rms) {
             fusion_counts["add_rms"] = ctx->fusion_count_add_rms;
+        }
+        if (ctx->fusion_count_get_rows_flat) {
+            fusion_counts["get_rows_flat"] = ctx->fusion_count_get_rows_flat;
         }
         // disabled:<name>=<count>: matches GGML_VK_DISABLE_FUSION_PATTERNS turned back into
         // unfused ops, so a bisect arm shows in the tally that the knob really acted

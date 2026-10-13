@@ -2441,12 +2441,13 @@ struct test_get_rows : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
-                // rows
-                std::vector<int> data(r*be1*be2);
-                for (int i = 0; i < r*be1*be2; i++) {
+                // rows, and an i32 source: sized by the tensor itself (an i32 source smaller than the row ids, e.g.
+                // (4, 8704) gathered by 1M ids, was written out of bounds when both were filled with r*be1*be2 ids)
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
                     data[i] = rand() % m;
                 }
-                ggml_backend_tensor_set(t, data.data(), 0, r * be1 * be2 * sizeof(int));
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
             } else {
                 init_tensor_uniform(t);
             }
@@ -11413,6 +11414,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 256, 5, 4, b, 1, v));
         }
     }
+    // the QSA block-selection gathers (qwen4exp_select_complete_blocks): 1-wide score / block-id rows per query and 4-wide
+    // block-cell rows (GET_ROWS(1, 512, 2048) and (4, 1048576) at a 2048-token ubatch), plus bf16 and odd widths
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8704, 512, 2048, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 1, 512, 512, 2048, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 4, 8704, 1048576, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_BF16, 4, 300, 777, 3, 2, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 5, 300, 777, 3, 2, true));
 
     // [TAG_QSA_GATHER_Q8] type-preserving gathers (ggml_get_rows_type): q8_0 -> q8_0 and f16 -> f16
     for (int b : {1, 7}) {
