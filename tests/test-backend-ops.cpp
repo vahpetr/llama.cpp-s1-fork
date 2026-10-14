@@ -11870,6 +11870,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1700000,  3, 2592, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1700000,  1, 2592, {1, 1}, {1, 1}));
 
+    // [TAG_MMID_TILE_B1] [TAG_MMID_PRECAST_B] the qwen4exp expert GEMMs vs the CPU, uniform and skewed routing, decode to prefill widths
+    for (int router : { MMID_ROUTER_UNIFORM, MMID_ROUTER_SKEWED }) {
+        for (int64_t n : { 8, 65, 128, 2044 }) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, n, 2560, router));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640, router));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640, router));
+        }
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 2, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
@@ -13319,6 +13327,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // [TAG_MMID_TILE_B1] [TAG_MMID_PRECAST_B] B1: the production expert GEMMs (qwen4exp gate/up q4_K 640 x 2560, 512 experts,
+    // 10 used, broadcast B; down q5_0 / q8_0 2560 x 640) at prefill widths; GGML_VK_MMID_PRECAST_B / _TILE_BM128 = 0 / 1 A/B
+    for (int64_t n : { 128, 512, 2044, 2048 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, n, 2560, MMID_ROUTER_SKEWED));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640, MMID_ROUTER_SKEWED));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640, MMID_ROUTER_SKEWED));
+    }
 
     // [TAG_HC_INJECT_GEMM] B4 item 3: the qwen4exp hc_mix GEMMs of one prefill ubatch (n = 2048 tokens,
     // k = hc_dim = 10240) at the brain's hc weight types - the m = 4 inject projection (the N-parallel
