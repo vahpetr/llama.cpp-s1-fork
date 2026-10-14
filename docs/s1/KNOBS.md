@@ -110,11 +110,13 @@ against the code for this table.
 | `GGML_VK_DISABLE_HOIST_ROW_IDS=1` | 0 | per-workgroup ids scan instead of the hoisted table | EXACT | - |
 | `GGML_VK_CONCAT_TRANSPOSE=0`, `GGML_VK_FUSE_HC_COMBINE=0`, `GGML_VK_FUSE_SIGMOID_MUL=0`, `GGML_VK_FUSE_GDN_PRE=0` | on | disable one fork kernel / fusion (A/B) | EXACT | - |
 | `GGML_VK_FUSE_MULTI_ADD_SCALE=0`, `GGML_VK_FUSE_SCALE_SILU=0` | on | disable one hc_mix tail fusion (patch 0227: multi_add + trailing SCALE - qwen4exp hc_mix stream mean and QSA pooled-key mean - and SCALE + SILU; pattern names `multi_add_scale`, `scale_silu`; no node-order change) (B3 arm, not in a release yet) | EXACT | - |
+| `GGML_VK_FUSE_CONCAT_SSM_CONV=0` | on | read the GDN conv window from state | x instead of writing the concat (patch 0228; patterns `concat_ssm_conv`, `_silu`, `_bias_silu`; prefill ubatches only); =0 also restores the graph_optimize order (B4 arm, not in a release yet) | EXACT | - |
 | `GGML_VK_FA_DEADV_LDS=1`, `GGML_VK_FA_NO_ZERO_DEAD_V=1` | 0 | FA dead-column variants (A/B; the second reopens an RDNA3 signed-zero hazard) | DIAG | - |
 | `GGML_VK_OPT_WINDOW=N` | 20 | graph_optimize independence window | COMPOSITION | - |
 | `GGML_VK_DMMV_RM_{KQ,STDQ,KQ_INT,STDQ_INT,F32}` | built-in | rows per workgroup for dense mat-vec | EXACT | - |
 | `GGML_VK_ASYNC_READ_UMA=1`, `GGML_VK_ASYNC_READ_COPYBUF=1`, `GGML_VK_FLOPS_SEED_LEGACY=1`, `GGML_VK_DISABLE_DESCRIPTOR_REUSE=1` | 0 | readback / submit / descriptor variants (A/B) | EXACT | - |
 | `GGML_VK_DISABLE_FUSION_PATTERNS=a,b`, `GGML_VK_FUSION_LIST=1`, `GGML_VK_FUSION_COUNT=1`, `GGML_VK_FUSION_DIAG=1`, `GGML_VK_SUBMIT_LOG=1` | - | fusion / submit diagnostics | DIAG | - |
+| `GGML_VK_DISPATCH_LOG=1` | 0 | one `[vk-dispatch]` line per MUL_MAT / MUL_MAT_VEC / MUL_MAT_ID dispatch: path, types, m/n/k, n_as/n_used, pipeline, split_k, mmvq/mmq (patch 0230, not in a release yet) | DIAG (no barrier) | - |
 | `GGML_SCHED_PROFILE=1`, `GGML_GET_ROWS_STATS=1\|2` | 0 | host-side scheduler timers, get_rows census | DIAG | - |
 
 ## Test / debug only
