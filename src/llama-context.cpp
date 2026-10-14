@@ -168,30 +168,169 @@ void llama_context::kqvis_prof_flush(const char * reason) const {
 // [TAG_QSA_POOLED_CACHE] (M3) the same callback also hashes every "indexer_k-<il>" - the pooled block keys the
 // selection scores - as one `[qsa-pooled]` line per (graph, layer) (see dump_pooled), so the pooled-key cache
 // (LLAMA_QSA_POOLED_CACHE=1) and the recompute can be compared value for value, not only by the ids they select.
-static bool llama_qsa_dump_ids_enabled() {
-    static const bool enabled = [] {
+// [TAG_QSA_DUMP_IDS] (S0.1 oracle, contrib 0229) records for the EXACT oracle (scripts/bench/probe/oracle_probe.cpp):
+//   - every selection tensor computed (one per chunk with LLAMA_QSA_CHUNK) also gets an identity record keyed by its
+//     semantic position, not by the graph counter:
+//       [qsa-ids-chunk] ctx=<main|mtp> g=<graph> il=<il> chunk=<k> n_past=<pos of the ubatch's first token>
+//                       row0=<first row in the ubatch> rows=<ne1> width=<ne0> n_stream=<ne3> count=<i32 elements>
+//                       sha256=<sha256 of the ordered i32 id bytes>
+//     and the per-layer `[qsa-ids]` line keeps its fields (fnv = the old diagnostic, same value as before) and appends
+//       n_past=<p> chunks=<k> count=<elements of all chunks> sha256=<sha256 of the whole ordered stream>
+//   - fail-closed: a selection / pooled / score tensor that cannot be read (not contiguous, wrong type) prints its
+//     record with error=<reason> instead of a warning, so an inventory sees the hole
+//   - LLAMA_QSA_DUMP_IDS=2: also the raw ordered ids, little-endian i32, one file per chunk record:
+//       <LLAMA_QSA_DUMP_DIR>/qsa-ids-<ctx>-g<graph>-p<n_past>-il<il>-c<chunk>.i32 (the graph counter keeps two ubatches
+//       at the same n_past - a re-prefill after a reset - apart)
+//     LLAMA_QSA_DUMP_DIR is required at level 2 (unset: a warning, lines only); LLAMA_QSA_DUMP_G=<lo>:<hi>
+//     (optional, inclusive graph-counter range) limits the files (a 1M fill writes ~16 MiB per layer per ubatch)
+//   - LLAMA_QSA_DUMP_SCORE=1 (default off, independent of DUMP_IDS): every "indexer_score-<il>" - the head-summed
+//     ReLU block score the selection reads, before the per-block bias, [n_blocks, rows (chunk, padded rows included),
+//     n_stream] f32 - as
+//       [qsa-score] ctx=<main|mtp> g=<graph> il=<il> chunk=<k> n_past=<p> n_blocks=<n> n_tps=<rows> n_stream=<ns>
+//                   fnv=<FNV-1a 64 of the f32 bytes>
+//     chunk = the k-th score plane of this layer in this graph. Observing the score ends a scheduler sub-range too.
+// Everything is off by default; level 1 without the new knobs prints the same records as before plus the new fields.
+static int llama_qsa_dump_ids_level() {
+    static const int level = [] {
         const char * s = getenv("LLAMA_QSA_DUMP_IDS");
+        return s != nullptr ? atoi(s) : 0;
+    }();
+
+    return level;
+}
+
+static bool llama_qsa_dump_ids_enabled() {
+    return llama_qsa_dump_ids_level() != 0;
+}
+
+static bool llama_qsa_dump_score_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_DUMP_SCORE");
         return s != nullptr && atoi(s) != 0;
     }();
 
     return enabled;
 }
 
+// [TAG_QSA_DUMP_IDS] (contrib 0229) a self-contained SHA-256 for the identity records (debug path only)
+struct llama_qsa_sha256 {
+    uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    uint64_t len  = 0;
+    uint8_t  buf[64];
+    size_t   n    = 0;
+
+    static uint32_t ror(uint32_t x, int r) { return (x >> r) | (x << (32 - r)); }
+
+    void block(const uint8_t * p) {
+        static const uint32_t k[64] = {
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (uint32_t) p[4*i] << 24 | (uint32_t) p[4*i + 1] << 16 | (uint32_t) p[4*i + 2] << 8 | p[4*i + 3];
+        }
+        for (int i = 16; i < 64; ++i) {
+            const uint32_t s0 = ror(w[i - 15], 7) ^ ror(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const uint32_t s1 = ror(w[i - 2], 17) ^ ror(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (int i = 0; i < 64; ++i) {
+            const uint32_t t1 = hh + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + k[i] + w[i];
+            const uint32_t t2 = (ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+
+    void update(const uint8_t * p, size_t sz) {
+        len += sz;
+        while (sz > 0) {
+            if (n == 0 && sz >= 64) {
+                block(p); p += 64; sz -= 64;
+                continue;
+            }
+            const size_t c = std::min(sz, (size_t) 64 - n);
+            memcpy(buf + n, p, c); n += c; p += c; sz -= c;
+            if (n == 64) {
+                block(buf); n = 0;
+            }
+        }
+    }
+
+    std::string hex() const {
+        llama_qsa_sha256 s = *this; // finalize a copy
+        const uint64_t bits = s.len * 8;
+        const uint8_t one = 0x80, zero = 0;
+        s.update(&one, 1);
+        while (s.n != 56) {
+            s.update(&zero, 1);
+        }
+        uint8_t lb[8];
+        for (int i = 0; i < 8; ++i) {
+            lb[i] = (uint8_t) (bits >> (56 - 8*i));
+        }
+        s.update(lb, 8);
+        char out[65];
+        for (int i = 0; i < 8; ++i) {
+            snprintf(out + 8*i, 9, "%08x", s.h[i]);
+        }
+        return std::string(out, 64);
+    }
+};
+
+static bool llama_qsa_dump_name_is(const ggml_tensor * t, const char * prefix) {
+    const size_t np = strlen(prefix);
+    if (strncmp(t->name, prefix, np) != 0) {
+        return false;
+    }
+    const char * p = t->name + np;
+    if (*p == '\0') {
+        return false;
+    }
+    for (; *p; ++p) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
 struct llama_qsa_ids_dump {
     const char * ctx_name = "main";
     uint64_t graph = 0;          // graphs computed by this context so far
+    int64_t  n_past = -1;        // position of the current ubatch's first token (set by process_ubatch)
     bool     open  = false;      // a layer is being accumulated
     int      il    = -1;
     int64_t  width = 0;
     int64_t  n_tps = 0;
     int32_t  first = 0;
     uint64_t fnv   = 0;
+    int      chunks = 0;
+    int64_t  count  = 0;
+    llama_qsa_sha256 sha;        // the whole layer stream
     std::vector<uint8_t> buf;
+
+    // contrib 0229
+    bool        ids   = false;   // hash the selections (LLAMA_QSA_DUMP_IDS != 0)
+    bool        score = false;   // hash the score planes (LLAMA_QSA_DUMP_SCORE=1)
+    std::string dir;             // level 2: where the ordered-id files go ("" = no files)
+    uint64_t    g_lo  = 0;       // level 2: graph-counter range of the files
+    uint64_t    g_hi  = UINT64_MAX;
+    int         score_il    = -1; // layer of the last score plane of this graph
+    int         score_chunk = 0;  // its chunk index within (graph, layer)
 
     void flush() {
         if (open) {
-            fprintf(stderr, "[qsa-ids] ctx=%s g=%llu il=%d n_tps=%lld width=%lld fnv=%016llx first=%d\n", ctx_name,
-                    (unsigned long long) graph, il, (long long) n_tps, (long long) width, (unsigned long long) fnv, first);
+            fprintf(stderr, "[qsa-ids] ctx=%s g=%llu il=%d n_tps=%lld width=%lld fnv=%016llx first=%d n_past=%lld chunks=%d count=%lld sha256=%s\n",
+                    ctx_name, (unsigned long long) graph, il, (long long) n_tps, (long long) width, (unsigned long long) fnv,
+                    first, (long long) n_past, chunks, (long long) count, sha.hex().c_str());
             open = false;
         }
     }
@@ -199,49 +338,16 @@ struct llama_qsa_ids_dump {
     void end_graph() {
         flush();
         graph++;
-    }
-
-    // exactly "indexer_top_k-<il>": the views the attention takes of it are auto-named "... (view)" and must not be
-    // hashed a second time
-    static bool is_selection(const ggml_tensor * t) {
-        if (strncmp(t->name, "indexer_top_k-", 14) != 0) {
-            return false;
-        }
-        const char * p = t->name + 14;
-        if (*p == '\0') {
-            return false;
-        }
-        for (; *p; ++p) {
-            if (*p < '0' || *p > '9') {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    // [TAG_QSA_POOLED_CACHE] exactly "indexer_k-<il>": the pooled block keys the selection scores against,
-    // [idx_dim, n_blocks, n_stream] f32 - the recompute's rope output, or the pooled-key cache's remap of its store
-    static bool is_pooled(const ggml_tensor * t) {
-        if (strncmp(t->name, "indexer_k-", 10) != 0) {
-            return false;
-        }
-        const char * p = t->name + 10;
-        if (*p == '\0') {
-            return false;
-        }
-        for (; *p; ++p) {
-            if (*p < '0' || *p > '9') {
-                return false;
-            }
-        }
-        return true;
+        score_il    = -1;
+        score_chunk = 0;
     }
 
     //   [qsa-pooled] ctx=<main|mtp> g=<graph> il=<il> n_blocks=<n> n_stream=<ns> fnv=<FNV-1a 64 of the f32 bytes>
     // one line per (graph, layer), printed when the tensor is computed, i.e. before that layer's selection line
     void dump_pooled(ggml_tensor * t) {
         if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
-            LLAMA_LOG_WARN("%s: %s is not a contiguous f32 tensor - not hashed\n", __func__, t->name);
+            fprintf(stderr, "[qsa-pooled] ctx=%s g=%llu il=%d n_blocks=%lld n_stream=%lld error=not-contiguous-f32 n_past=%lld\n", ctx_name,
+                    (unsigned long long) graph, atoi(t->name + 10), (long long) t->ne[1], (long long) t->ne[2], (long long) n_past);
             return;
         }
         const size_t nb = ggml_nbytes(t);
@@ -251,51 +357,116 @@ struct llama_qsa_ids_dump {
         for (size_t i = 0; i < nb; ++i) {
             h = (h ^ pb[i]) * 0x100000001b3ull;
         }
-        fprintf(stderr, "[qsa-pooled] ctx=%s g=%llu il=%d n_blocks=%lld n_stream=%lld fnv=%016llx\n", ctx_name,
+        fprintf(stderr, "[qsa-pooled] ctx=%s g=%llu il=%d n_blocks=%lld n_stream=%lld fnv=%016llx n_past=%lld\n", ctx_name,
                 (unsigned long long) graph, atoi(t->name + 10), (long long) t->ne[1], (long long) t->ne[2],
-                (unsigned long long) h);
+                (unsigned long long) h, (long long) n_past);
+    }
+
+    // [TAG_QSA_DUMP_SCORE] (contrib 0229) "indexer_score-<il>" (build_qsa_select: the head-summed score, one per chunk)
+    void dump_score(ggml_tensor * t) {
+        const int t_il = atoi(t->name + 14);
+        score_chunk = t_il == score_il ? score_chunk + 1 : 0;
+        score_il    = t_il;
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            fprintf(stderr, "[qsa-score] ctx=%s g=%llu il=%d chunk=%d n_past=%lld error=not-contiguous-f32\n",
+                    ctx_name, (unsigned long long) graph, t_il, score_chunk, (long long) n_past);
+            return;
+        }
+        const size_t nb = ggml_nbytes(t);
+        std::vector<uint8_t> sb(nb);
+        ggml_backend_tensor_get(t, sb.data(), 0, nb);
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (size_t i = 0; i < nb; ++i) {
+            h = (h ^ sb[i]) * 0x100000001b3ull;
+        }
+        fprintf(stderr, "[qsa-score] ctx=%s g=%llu il=%d chunk=%d n_past=%lld n_blocks=%lld n_tps=%lld n_stream=%lld fnv=%016llx\n",
+                ctx_name, (unsigned long long) graph, t_il, score_chunk, (long long) n_past, (long long) t->ne[0],
+                (long long) t->ne[1], (long long) t->ne[2], (unsigned long long) h);
+    }
+
+    void dump_selection(ggml_tensor * t) {
+        const int t_il = atoi(t->name + 14);
+        if (open && t_il != il) {
+            flush();
+        }
+        if (!open) {
+            open   = true;
+            il     = t_il;
+            width  = t->ne[0];
+            n_tps  = 0;
+            chunks = 0;
+            count  = 0;
+            first  = 0;
+            fnv    = 0xcbf29ce484222325ull; // FNV-1a 64 offset basis
+            sha    = llama_qsa_sha256();
+        }
+        const int64_t row0  = n_tps;
+        const int     chunk = chunks++;
+        if (t->type != GGML_TYPE_I32 || !ggml_is_contiguous(t)) {
+            fprintf(stderr, "[qsa-ids-chunk] ctx=%s g=%llu il=%d chunk=%d n_past=%lld row0=%lld rows=%lld width=%lld n_stream=%lld error=not-contiguous-i32\n",
+                    ctx_name, (unsigned long long) graph, t_il, chunk, (long long) n_past, (long long) row0, (long long) t->ne[1],
+                    (long long) t->ne[0], (long long) t->ne[3]);
+            n_tps += t->ne[1]*t->ne[3];
+            return;
+        }
+        const size_t nb = ggml_nbytes(t);
+        buf.resize(nb);
+        ggml_backend_tensor_get(t, buf.data(), 0, nb);
+        if (row0 == 0) {
+            memcpy(&first, buf.data(), sizeof(int32_t));
+        }
+        for (size_t i = 0; i < nb; ++i) {
+            fnv = (fnv ^ buf[i]) * 0x100000001b3ull;
+        }
+        sha.update(buf.data(), nb);
+        llama_qsa_sha256 cs;
+        cs.update(buf.data(), nb);
+        fprintf(stderr, "[qsa-ids-chunk] ctx=%s g=%llu il=%d chunk=%d n_past=%lld row0=%lld rows=%lld width=%lld n_stream=%lld count=%lld sha256=%s\n",
+                ctx_name, (unsigned long long) graph, t_il, chunk, (long long) n_past, (long long) row0, (long long) t->ne[1],
+                (long long) t->ne[0], (long long) t->ne[3], (long long) (nb / sizeof(int32_t)), cs.hex().c_str());
+        if (!dir.empty() && graph >= g_lo && graph <= g_hi) {
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/qsa-ids-%s-g%llu-p%lld-il%d-c%d.i32", dir.c_str(), ctx_name, (unsigned long long) graph,
+                     (long long) n_past, t_il, chunk);
+            FILE * f = fopen(path, "wb");
+            if (f == nullptr || fwrite(buf.data(), 1, nb, f) != nb) {
+                fprintf(stderr, "[qsa-ids-chunk] ctx=%s g=%llu il=%d chunk=%d n_past=%lld error=file-write %s\n",
+                        ctx_name, (unsigned long long) graph, t_il, chunk, (long long) n_past, path);
+            }
+            if (f != nullptr) {
+                fclose(f);
+            }
+        }
+        count += (int64_t) (nb / sizeof(int32_t));
+        n_tps += t->ne[1]*t->ne[3]; // queries x streams
     }
 
     static bool eval(ggml_tensor * t, bool ask, void * user_data) {
-        if (is_pooled(t)) {
+        auto * self = (llama_qsa_ids_dump *) user_data;
+        // exactly "<name>-<il>": the views the graph takes of these are auto-named "... (view)" and must not be
+        // hashed a second time
+        if (self->score && llama_qsa_dump_name_is(t, "indexer_score-")) {
             if (!ask) {
-                ((llama_qsa_ids_dump *) user_data)->dump_pooled(t);
+                self->dump_score(t);
             }
             return true;
         }
-        if (!is_selection(t)) {
-            return !ask; // ask: not needed; never reached with ask == false for a tensor we did not ask for
-        }
-        if (ask) {
+        if (self->ids && llama_qsa_dump_name_is(t, "indexer_k-")) {
+            // [TAG_QSA_POOLED_CACHE] the pooled block keys the selection scores against, [idx_dim, n_blocks, n_stream]
+            // f32 - the recompute's rope output, or the pooled-key cache's remap of its store
+            if (!ask) {
+                self->dump_pooled(t);
+            }
             return true;
         }
-        auto * d = (llama_qsa_ids_dump *) user_data;
-        const int t_il = atoi(t->name + 14);
-        if (d->open && t_il != d->il) {
-            d->flush();
+        if (self->ids && llama_qsa_dump_name_is(t, "indexer_top_k-")) {
+            // the QSA_TOP_K output, or the reshape of the unfused chain's top-k, [width, n_tps, 1, n_stream] i32
+            if (!ask) {
+                self->dump_selection(t);
+            }
+            return true; // keep computing the split
         }
-        if (t->type != GGML_TYPE_I32 || !ggml_is_contiguous(t)) {
-            LLAMA_LOG_WARN("%s: %s is not a contiguous i32 tensor - not hashed\n", __func__, t->name);
-            return true;
-        }
-        if (!d->open) {
-            d->open  = true;
-            d->il    = t_il;
-            d->width = t->ne[0];
-            d->n_tps = 0;
-            d->fnv   = 0xcbf29ce484222325ull; // FNV-1a 64 offset basis
-        }
-        const size_t nb = ggml_nbytes(t);
-        d->buf.resize(nb);
-        ggml_backend_tensor_get(t, d->buf.data(), 0, nb);
-        if (d->n_tps == 0) {
-            memcpy(&d->first, d->buf.data(), sizeof(int32_t));
-        }
-        for (size_t i = 0; i < nb; ++i) {
-            d->fnv = (d->fnv ^ d->buf[i]) * 0x100000001b3ull;
-        }
-        d->n_tps += t->ne[1]*t->ne[3]; // queries x streams
-        return true; // keep computing the split
+        return !ask; // ask: not needed; never reached with ask == false for a tensor we did not ask for
     }
 };
 
@@ -451,16 +622,45 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     // [TAG_QSA_DUMP_IDS]
-    if (llama_qsa_dump_ids_enabled()) {
+    if (llama_qsa_dump_ids_enabled() || llama_qsa_dump_score_enabled()) {
         if (cparams.cb_eval == nullptr) {
             qsa_ids_dump = std::make_shared<llama_qsa_ids_dump>();
             qsa_ids_dump->ctx_name    = sched_prof_ctx_name(params.ctx_type);
+            qsa_ids_dump->ids         = llama_qsa_dump_ids_enabled();
+            qsa_ids_dump->score       = llama_qsa_dump_score_enabled();
             cparams.cb_eval           = llama_qsa_ids_dump::eval;
             cparams.cb_eval_user_data = qsa_ids_dump.get();
-            LLAMA_LOG_WARN("%s: LLAMA_QSA_DUMP_IDS=1: dumping the QSA selection hashes of the %s context to stderr\n",
-                    __func__, qsa_ids_dump->ctx_name);
+            if (qsa_ids_dump->ids) {
+                LLAMA_LOG_WARN("%s: LLAMA_QSA_DUMP_IDS=%d: dumping the QSA selection hashes of the %s context to stderr\n",
+                        __func__, llama_qsa_dump_ids_level(), qsa_ids_dump->ctx_name);
+            }
+            if (qsa_ids_dump->ids && llama_qsa_dump_ids_level() >= 2) {
+                // [TAG_QSA_DUMP_IDS] level 2 (contrib 0229): the ordered ids as files
+                const char * d = getenv("LLAMA_QSA_DUMP_DIR");
+                if (d != nullptr && *d != '\0') {
+                    qsa_ids_dump->dir = d;
+                    if (const char * g = getenv("LLAMA_QSA_DUMP_G")) {
+                        unsigned long long lo = 0, hi = 0;
+                        if (sscanf(g, "%llu:%llu", &lo, &hi) == 2 && lo <= hi) {
+                            qsa_ids_dump->g_lo = lo;
+                            qsa_ids_dump->g_hi = hi;
+                        } else {
+                            LLAMA_LOG_WARN("%s: LLAMA_QSA_DUMP_G='%s' is not <lo>:<hi> - every graph is written\n", __func__, g);
+                        }
+                    }
+                    LLAMA_LOG_WARN("%s: LLAMA_QSA_DUMP_IDS=2: ordered ids of the %s context -> %s/qsa-ids-%s-g<g>-p<n_past>-il<il>-c<chunk>.i32 (graphs %llu..%llu)\n",
+                            __func__, qsa_ids_dump->ctx_name, d, qsa_ids_dump->ctx_name,
+                            (unsigned long long) qsa_ids_dump->g_lo, (unsigned long long) qsa_ids_dump->g_hi);
+                } else {
+                    LLAMA_LOG_WARN("%s: LLAMA_QSA_DUMP_IDS=2 without LLAMA_QSA_DUMP_DIR: hash lines only\n", __func__);
+                }
+            }
+            if (qsa_ids_dump->score) {
+                LLAMA_LOG_WARN("%s: LLAMA_QSA_DUMP_SCORE=1: dumping the QSA score-plane hashes of the %s context to stderr\n",
+                        __func__, qsa_ids_dump->ctx_name);
+            }
         } else {
-            LLAMA_LOG_WARN("%s: LLAMA_QSA_DUMP_IDS=1 ignored: the caller installed its own eval callback\n", __func__);
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_DUMP_IDS / LLAMA_QSA_DUMP_SCORE ignored: the caller installed its own eval callback\n", __func__);
         }
     }
 
@@ -2430,6 +2630,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool gc_exec = use_graph_cache && kq_reused && graph_cache_check >= 2;
     if (gc_exec) {
         graph_cache_check_exec_pre(res, ubatch, gtype, mctx);
+    }
+
+    // [TAG_QSA_DUMP_IDS] (contrib 0229) the semantic key of the dump records: the ubatch's first position
+    if (qsa_ids_dump) {
+        qsa_ids_dump->n_past = ubatch.pos != nullptr && ubatch.n_tokens > 0 ? (int64_t) ubatch.pos[0] : -1;
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
