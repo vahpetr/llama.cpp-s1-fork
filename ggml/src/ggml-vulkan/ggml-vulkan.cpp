@@ -49,6 +49,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <cinttypes>
 #include <cctype>
 #include <cerrno>
 #include <climits>
@@ -1256,6 +1257,8 @@ struct vk_device_struct {
     bool fuse_scale_silu;
     // [TAG_CONV_INPUT_SPLIT] GGML_VK_FUSE_CONCAT_SSM_CONV
     bool fuse_concat_ssm_conv;
+    // [TAG_VK_DISPATCH_LOG] GGML_VK_DISPATCH_LOG=1: one [vk-dispatch] line per MUL_MAT / MUL_MAT_VEC / MUL_MAT_ID dispatch
+    bool dispatch_log;
     // split a dim-0 concat with a transposed src1 into copy + tiled transpose-copy
     // (default on, GGML_VK_CONCAT_TRANSPOSE=0 turns it off)
     bool concat_transpose;
@@ -2549,6 +2552,11 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // GGML_VK_FUSION_COUNT can report it as disabled:<name>=<count>. Every ggml_vk_can_fuse*/
 // ggml_vk_fuse_multi_add predicate is side-effect free (none of them writes ctx->), so evaluating
 // the predicate before the gate changes nothing but the cost of a run that sets the knob.
+//
+// [TAG_VK_DISPATCH_LOG] GGML_VK_DISPATCH_LOG=1 (default off, read once at device init) prints one stderr line
+// "[vk-dispatch] op=... path=mm|mmv|mmv_p021|mmv_nc|mm_id|mmv_id src0= src1= m= n= k= batch= [n_as= n_used=]
+// pipeline= split_k= mmvq= mmq= fused= node=" per MUL_MAT / MUL_MAT_VEC / MUL_MAT_ID / MUL_MAT_ROWS dispatch, from
+// the decision point (see ggml_vk_dispatch_log); no barrier, no numeric effect.
 //
 // GGML_VK_FUSION_LIST=1 prints one stderr line "[vk-fusion] name: OP1+OP2+..." the first time
 // each distinct (pattern name, fused op names) tuple fires - after the src/dst overlap veto, so
@@ -8243,6 +8251,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->fuse_scale_silu      = fuse_enabled("GGML_VK_FUSE_SCALE_SILU");
         // [TAG_CONV_INPUT_SPLIT] the GDN conv input: ssm_conv reads concat(state, x^T) from its two sources
         device->fuse_concat_ssm_conv = fuse_enabled("GGML_VK_FUSE_CONCAT_SSM_CONV");
+        // [TAG_VK_DISPATCH_LOG] read once here; off = one bool test per matmul dispatch, nothing else
+        device->dispatch_log = ggml_vk_env_bool("GGML_VK_DISPATCH_LOG", false);
 
         // Same "default on, =0 disables" convention for the concat transpose split. Like the
         // fusions above, both arms are bit-identical, so this is an A/B knob and not a fallback.
@@ -10522,6 +10532,29 @@ static vk_pipeline ggml_vk_matmul_f32_rows_twin(const vk_device & device, const 
 // row_ids != nullptr [TAG_QSA_POOL_REMAP]: src0 describes the get_rows copy ([K, M, n_b], contiguous) whose buffer
 // position is the store's, row_ids_a_bytes the store's size; every decision below is made for that src0, exactly as
 // for the plain MUL_MAT, and only the chosen pipeline is swapped for its row-id twin
+// [TAG_VK_DISPATCH_LOG] GGML_VK_DISPATCH_LOG=1 (read once at device init, default off): one stderr line per matmul
+// dispatch decision, printed where the pipeline has been chosen and before anything is recorded - no barrier, no
+// timing path, no effect on what runs:
+//   [vk-dispatch] op=MUL_MAT|MUL_MAT_VEC|MUL_MAT_ID|MUL_MAT_ROWS path=mm|mmv|mmv_p021|mmv_nc|mm_id|mmv_id
+//                 src0=<type> src1=<type> m=<rows of A> n=<cols of B> k=<K> batch=<B batches> [n_as=<experts>
+//                 n_used=<experts per token>] pipeline=<name> split_k=<n> mmvq=<0|1> mmq=<0|1> fused=<extra nodes>
+//                 node=<dst name>
+// mmq = the matmul quantized B to q8_1 (integer-dot / MMQ kernel); mmvq = the same for the mat-vec.
+static void ggml_vk_dispatch_log(const ggml_backend_vk_context * ctx, const char * path, const ggml_tensor * src0,
+                                 const ggml_tensor * src1, const ggml_tensor * dst, uint64_t m, uint64_t n, uint64_t k,
+                                 uint64_t batch, int64_t n_as, int64_t n_used, const vk_pipeline & pipeline,
+                                 uint32_t split_k, bool mmvq, bool mmq) {
+    char ids[64] = "";
+    if (n_as >= 0) {
+        snprintf(ids, sizeof(ids), " n_as=%" PRId64 " n_used=%" PRId64, n_as, n_used);
+    }
+    fprintf(stderr, "[vk-dispatch] op=%s path=%s src0=%s src1=%s m=%" PRIu64 " n=%" PRIu64 " k=%" PRIu64 " batch=%" PRIu64
+            "%s pipeline=%s split_k=%u mmvq=%d mmq=%d fused=%d node=%s\n",
+            ggml_op_name(dst->op), path, ggml_type_name(src0->type), ggml_type_name(src1->type), m, n, k, batch, ids,
+            pipeline ? pipeline->name.c_str() : "?", split_k, (int) mmvq, (int) mmq, ctx->num_additional_fused_ops,
+            dst->name);
+}
+
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k,
                                   const ggml_tensor * row_ids = nullptr, uint64_t row_ids_a_bytes = 0) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
@@ -10793,6 +10826,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     vk_subbuffer d_ids {};
     if (row_ids) {
         d_ids = ggml_vk_tensor_subbuffer(ctx, row_ids);
+    }
+
+    if (ctx->device->dispatch_log) {
+        ggml_vk_dispatch_log(ctx, "mm", src0, src1, dst, ne01, ne11, ne10, ne12*ne13, -1, -1, pipeline, split_k, false, quantize_y);
     }
 
     // compute
@@ -11106,6 +11143,10 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
     }
 
+    if (ctx->device->dispatch_log) {
+        ggml_vk_dispatch_log(ctx, "mmv", src0, src1, dst, ne01, ne11, ne10, ne12*ne13, -1, -1, dmmv, 1, quantize_y, false);
+    }
+
     ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
 
     uint32_t base_work_group_y = 0;
@@ -11220,6 +11261,10 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
         workgroups_z /= gqa_ratio;
     }
 
+    if (ctx->device->dispatch_log) {
+        ggml_vk_dispatch_log(ctx, "mmv_p021", src0, src1, dst, src0->ne[1], src1->ne[1], src0->ne[0], src1->ne[2]*src1->ne[3], -1, -1, pipeline, 1, false, false);
+    }
+
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {
             d_Qx,
@@ -11313,6 +11358,10 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
     };
 
     init_pushconst_tensor_offsets(ctx, pc, src0, src1, nullptr, nullptr, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+
+    if (ctx->device->dispatch_log) {
+        ggml_vk_dispatch_log(ctx, "mmv_nc", src0, src1, dst, src0->ne[1], src1->ne[1], src0->ne[0], src1->ne[2]*src1->ne[3], -1, -1, pipeline, 1, false, false);
+    }
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {
@@ -12065,6 +12114,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
+    if (ctx->device->dispatch_log) {
+        ggml_vk_dispatch_log(ctx, "mm_id", src0, src1, dst, ne01, nei1, ne10, 1, (int64_t) n_as, (int64_t) nei0, pipeline, 1, false, quantize_y);
+    }
+
     // compute
     ggml_vk_matmul_id(
         ctx, subctx, pipeline,
@@ -12291,6 +12344,10 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
         d_F1 = ggml_vk_tensor_subbuffer(ctx, scale);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
+    }
+
+    if (ctx->device->dispatch_log) {
+        ggml_vk_dispatch_log(ctx, "mmv_id", src0, src1, dst, ne01, nei1, ne10, 1, src0->ne[2], (int64_t) nei0, dmmv, 1, quantize_y, false);
     }
 
     // Loop over the batch dimension
