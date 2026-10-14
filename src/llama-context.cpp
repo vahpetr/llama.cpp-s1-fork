@@ -342,24 +342,86 @@ struct llama_qsa_ids_dump {
         score_chunk = 0;
     }
 
-    //   [qsa-pooled] ctx=<main|mtp> g=<graph> il=<il> n_blocks=<n> n_stream=<ns> fnv=<FNV-1a 64 of the f32 bytes>
-    // one line per (graph, layer), printed when the tensor is computed, i.e. before that layer's selection line
-    void dump_pooled(ggml_tensor * t) {
+    static uint64_t fnv_bytes(const uint8_t * p, size_t n, uint64_t h = 0xcbf29ce484222325ull) {
+        for (size_t i = 0; i < n; ++i) {
+            h = (h ^ p[i]) * 0x100000001b3ull;
+        }
+        return h;
+    }
+
+    //   [qsa-pooled] ctx=<main|mtp> g=<graph> il=<il> src=<pooled|dirty|remap|matmul> n_blocks=<n> n_stream=<ns> fnv=<FNV-1a 64> n_past=<p>
+    // [TAG_QSA_POOLED_CACHE] / contrib 0229 fix round 1 (review I4): the pooled keys the selection scores, per (graph, layer):
+    //   src=pooled  "indexer_k-<il>" - the recompute's output, or the FULL pool's contiguous store read (cap == n_blocks)
+    //   src=dirty   "indexer_k_dirty-<il>" - the dirty-list pooling the pooled-key cache stores this graph (prod: pooled cache
+    //               + the indexed remap, where no "indexer_k" exists); over a history these rows are every pooled key written
+    //   (score pass, LLAMA_QSA_DUMP_SCORE=1) src=remap: the exact plane the score GEMM reads, rows remap[b] of the store,
+    //               gathered on the host from the MUL_MAT_ROWS operands; src=matmul: the MUL_MAT's pooled operand; neither
+    //               found -> src=none error=not-materialised (never silence)
+    void dump_pooled(ggml_tensor * t, const char * src, int t_il) {
         if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
-            fprintf(stderr, "[qsa-pooled] ctx=%s g=%llu il=%d n_blocks=%lld n_stream=%lld error=not-contiguous-f32 n_past=%lld\n", ctx_name,
-                    (unsigned long long) graph, atoi(t->name + 10), (long long) t->ne[1], (long long) t->ne[2], (long long) n_past);
+            fprintf(stderr, "[qsa-pooled] ctx=%s g=%llu il=%d src=%s n_blocks=%lld n_stream=%lld error=not-contiguous-f32 n_past=%lld\n", ctx_name,
+                    (unsigned long long) graph, t_il, src, (long long) t->ne[1], (long long) t->ne[2], (long long) n_past);
             return;
         }
         const size_t nb = ggml_nbytes(t);
         std::vector<uint8_t> pb(nb);
         ggml_backend_tensor_get(t, pb.data(), 0, nb);
-        uint64_t h = 0xcbf29ce484222325ull;
-        for (size_t i = 0; i < nb; ++i) {
-            h = (h ^ pb[i]) * 0x100000001b3ull;
+        fprintf(stderr, "[qsa-pooled] ctx=%s g=%llu il=%d src=%s n_blocks=%lld n_stream=%lld fnv=%016llx n_past=%lld\n", ctx_name,
+                (unsigned long long) graph, t_il, src, (long long) t->ne[1], (long long) t->ne[2],
+                (unsigned long long) fnv_bytes(pb.data(), nb), (long long) n_past);
+    }
+
+    // score pass: the pooled plane the score reads, found through the score's sources (head-sum adds -> views -> relu ->
+    // reshape -> MUL_MAT_ROWS(store, q, remap) or MUL_MAT(pooled, q))
+    void dump_score_operand(ggml_tensor * score, int t_il) {
+        std::vector<ggml_tensor *> todo = { score };
+        ggml_tensor * mm = nullptr;
+        for (size_t k = 0; k < todo.size() && k < 256 && mm == nullptr; ++k) {
+            ggml_tensor * x = todo[k];
+            if (x->op == GGML_OP_MUL_MAT_ROWS || (x->op == GGML_OP_MUL_MAT && x->src[0] && x->src[0]->type == GGML_TYPE_F32)) {
+                mm = x;
+                break;
+            }
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (x->src[j]) {
+                    todo.push_back(x->src[j]);
+                }
+            }
         }
-        fprintf(stderr, "[qsa-pooled] ctx=%s g=%llu il=%d n_blocks=%lld n_stream=%lld fnv=%016llx n_past=%lld\n", ctx_name,
-                (unsigned long long) graph, atoi(t->name + 10), (long long) t->ne[1], (long long) t->ne[2],
-                (unsigned long long) h, (long long) n_past);
+        if (mm == nullptr) {
+            fprintf(stderr, "[qsa-pooled] ctx=%s g=%llu il=%d src=none error=not-materialised n_past=%lld\n", ctx_name,
+                    (unsigned long long) graph, t_il, (long long) n_past);
+            return;
+        }
+        if (mm->op == GGML_OP_MUL_MAT) {
+            dump_pooled(mm->src[0], "matmul", t_il);
+            return;
+        }
+        ggml_tensor * store = mm->src[0];
+        ggml_tensor * rows  = mm->src[2];
+        if (store->type != GGML_TYPE_F32 || !ggml_is_contiguous(store) || rows->type != GGML_TYPE_I32 || !ggml_is_contiguous(rows)) {
+            fprintf(stderr, "[qsa-pooled] ctx=%s g=%llu il=%d src=remap error=operand-layout n_past=%lld\n", ctx_name,
+                    (unsigned long long) graph, t_il, (long long) n_past);
+            return;
+        }
+        std::vector<uint8_t> sb(ggml_nbytes(store));
+        std::vector<int32_t> rb(ggml_nelements(rows));
+        ggml_backend_tensor_get(store, sb.data(), 0, sb.size());
+        ggml_backend_tensor_get(rows, rb.data(), 0, rb.size() * sizeof(int32_t));
+        const size_t row_bytes = store->nb[1];
+        const int64_t n_rows = store->ne[1];
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (int32_t r : rb) {
+            if (r < 0 || r >= n_rows) {
+                fprintf(stderr, "[qsa-pooled] ctx=%s g=%llu il=%d src=remap error=row-out-of-range n_past=%lld\n", ctx_name,
+                        (unsigned long long) graph, t_il, (long long) n_past);
+                return;
+            }
+            h = fnv_bytes(sb.data() + (size_t) r * row_bytes, row_bytes, h);
+        }
+        fprintf(stderr, "[qsa-pooled] ctx=%s g=%llu il=%d src=remap n_blocks=%lld n_stream=%lld fnv=%016llx n_past=%lld\n", ctx_name,
+                (unsigned long long) graph, t_il, (long long) rows->ne[0], (long long) rows->ne[1], (unsigned long long) h,
+                (long long) n_past);
     }
 
     // [TAG_QSA_DUMP_SCORE] (contrib 0229) "indexer_score-<il>" (build_qsa_select: the head-summed score, one per chunk)
@@ -367,6 +429,9 @@ struct llama_qsa_ids_dump {
         const int t_il = atoi(t->name + 14);
         score_chunk = t_il == score_il ? score_chunk + 1 : 0;
         score_il    = t_il;
+        if (score_chunk == 0) {
+            dump_score_operand(t, t_il);   // once per (graph, layer): every chunk reads the same pooled plane
+        }
         if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
             fprintf(stderr, "[qsa-score] ctx=%s g=%llu il=%d chunk=%d n_past=%lld error=not-contiguous-f32\n",
                     ctx_name, (unsigned long long) graph, t_il, score_chunk, (long long) n_past);
@@ -375,13 +440,9 @@ struct llama_qsa_ids_dump {
         const size_t nb = ggml_nbytes(t);
         std::vector<uint8_t> sb(nb);
         ggml_backend_tensor_get(t, sb.data(), 0, nb);
-        uint64_t h = 0xcbf29ce484222325ull;
-        for (size_t i = 0; i < nb; ++i) {
-            h = (h ^ sb[i]) * 0x100000001b3ull;
-        }
         fprintf(stderr, "[qsa-score] ctx=%s g=%llu il=%d chunk=%d n_past=%lld n_blocks=%lld n_tps=%lld n_stream=%lld fnv=%016llx\n",
                 ctx_name, (unsigned long long) graph, t_il, score_chunk, (long long) n_past, (long long) t->ne[0],
-                (long long) t->ne[1], (long long) t->ne[2], (unsigned long long) h);
+                (long long) t->ne[1], (long long) t->ne[2], (unsigned long long) fnv_bytes(sb.data(), nb));
     }
 
     void dump_selection(ggml_tensor * t) {
@@ -453,9 +514,16 @@ struct llama_qsa_ids_dump {
         }
         if (self->ids && llama_qsa_dump_name_is(t, "indexer_k-")) {
             // [TAG_QSA_POOLED_CACHE] the pooled block keys the selection scores against, [idx_dim, n_blocks, n_stream]
-            // f32 - the recompute's rope output, or the pooled-key cache's remap of its store
+            // f32 - the recompute's rope output, or the full pool's store read
             if (!ask) {
-                self->dump_pooled(t);
+                self->dump_pooled(t, "pooled", atoi(t->name + 10));
+            }
+            return true;
+        }
+        if (self->ids && llama_qsa_dump_name_is(t, "indexer_k_dirty-")) {
+            // [TAG_QSA_POOLED_CACHE] the dirty-list pooling the cache stores (prod: pooled cache + indexed remap)
+            if (!ask) {
+                self->dump_pooled(t, "dirty", atoi(t->name + 16));
             }
             return true;
         }
@@ -2630,6 +2698,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool gc_exec = use_graph_cache && kq_reused && graph_cache_check >= 2;
     if (gc_exec) {
         graph_cache_check_exec_pre(res, ubatch, gtype, mctx);
+    }
+
+    // [TAG_GRAPH_CACHE] (contrib 0229 fix round 1, S0.1 control C6) LLAMA_GRAPH_CACHE_TRACE=1 (default off, a log line only):
+    //   [graph-cache] ctx=<main|mtp> n_past=<pos of the first token> n_tokens=<n> cache=<0|1> reused=<0|1> inval=<n>
+    // per computed ubatch - whether this graph came from the graph cache (or the previous-graph reuse) or was built fresh
+    {
+        static const bool gc_trace = [] {
+            const char * v = getenv("LLAMA_GRAPH_CACHE_TRACE");
+            return v != nullptr && atoi(v) != 0;
+        }();
+        if (gc_trace) {
+            fprintf(stderr, "[graph-cache] ctx=%s n_past=%lld n_tokens=%u cache=%d reused=%d inval=%lld\n",
+                    sched_prof_ctx_name(cparams.ctx_type), ubatch.pos != nullptr && ubatch.n_tokens > 0 ? (long long) ubatch.pos[0] : -1LL,
+                    ubatch.n_tokens, use_graph_cache ? 1 : 0, kq_reused ? 1 : 0, (long long) kq_gc_inval);
+        }
     }
 
     // [TAG_QSA_DUMP_IDS] (contrib 0229) the semantic key of the dump records: the ubatch's first position
