@@ -21624,6 +21624,28 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                    ggml_node_get_use_count(graph, start) == 1;
         };
 
+        // [TAG_CONV_INPUT_SPLIT] B4 fix round 2: a node reading the x of a not-yet-emitted fusable CONCAT -> SSM_CONV -> SILU
+        // (the history tails, expanded after the conv by the model) must not be hoisted above it: ggml-alloc frees x after
+        // its last consumer in this order, so a tail placed before the conv lets the conv's output take x's block, and the
+        // overlap veto then undoes concat_ssm_conv (and the hoist perturbs the rest of the set, see the B4 fix 2 report).
+        auto const &reads_pending_conv_x = [&](int j) -> bool {
+            const ggml_tensor * node = graph->nodes[j];
+            for (int c = first_unused; c < j; ++c) {
+                if (used[c] || graph->nodes[c]->op != GGML_OP_CONCAT || !is_concat_conv_silu(c)) {
+                    continue;
+                }
+                const ggml_tensor * x  = graph->nodes[c]->src[1];
+                const ggml_tensor * xb = x->view_src ? x->view_src : x;
+                for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+                    const ggml_tensor * src = node->src[s];
+                    if (src && (src->view_src ? src->view_src : src) == xb) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (match_pattern(pattern, first_unused)) {
                 for (size_t j = 0; j < pattern.size(); ++j) {
@@ -21727,7 +21749,8 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(snake_pattern, j) ||
                 inside_pattern(hc_combine_pattern, j) ||
                 inside_pattern(topk_qsa_pattern, j) ||
-                is_concat_conv_silu(j)) {
+                is_concat_conv_silu(j) ||
+                reads_pending_conv_x(j)) {
                 continue;
             }
             bool ok = true;
