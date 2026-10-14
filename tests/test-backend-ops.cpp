@@ -4420,6 +4420,108 @@ struct test_qsa_pool_mean_fuse : public test_case {
     }
 };
 
+// [TAG_CONV_INPUT_SPLIT] the qwen4exp GDN conv input: concat(state, transpose(x), dim 0) -> ssm_conv (-> + bias)
+// (-> silu), with x [nr, n_t, n_s] as the qkv projection leaves it. The Vulkan backend reads the conv window from
+// state | x without writing the concat (concat_ssm_conv*). exact: arm A as the model emits it, arm B with the
+// concat flagged as an output (the concat is written and the conv reads it: the v59 dispatches), concat(A - B,
+// B - A) compared bitwise (max 0), +/-0 inputs; otherwise arm A against the CPU (NMSE).
+struct test_concat_ssm_conv_fuse : public test_case {
+    const int64_t nr;
+    const int64_t n_t;
+    const int64_t n_s;
+    const int     extra;   // 0: conv only, 1: + silu, 2: + bias + silu
+    const bool    exact;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return exact ? "CONCAT_SSM_CONV_EXACT" : "CONCAT_SSM_CONV_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(nr, n_t, n_s, extra);
+    }
+
+    double max_nmse_err() override { return exact ? 0.0 : 1e-7; }
+    double max_err() override { return exact ? 0.0 : max_nmse_err(); }
+    double max_err(ggml_backend_t backend) override { GGML_UNUSED(backend); return max_err(); }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!exact) {
+            return nmse(a, b, n);
+        }
+        size_t bad = 0;
+        for (size_t i = 0; i < n; i++) {
+            bad += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        }
+        return (double) bad;
+    }
+
+    test_concat_ssm_conv_fuse(int64_t nr = 10240, int64_t n_t = 5, int64_t n_s = 1, int extra = 1, bool exact = true)
+        : nr(nr), n_t(n_t), n_s(n_s), extra(extra), exact(exact) {}
+
+    ggml_tensor * arm(ggml_context * ctx, ggml_tensor * state, ggml_tensor * x, ggml_tensor * w, ggml_tensor * bias, bool mark) {
+        ggml_tensor * ci = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+        if (mark) {
+            ggml_set_output(ci);
+        }
+        ggml_tensor * y = ggml_ssm_conv(ctx, ci, w);
+        if (extra == 2) {
+            y = ggml_add(ctx, y, bias);
+        }
+        if (extra >= 1) {
+            y = ggml_silu(ctx, y);
+        }
+        if (gf && mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, y);
+        }
+        return y;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, nr, n_s);
+        ggml_set_name(state, "state");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, n_t, n_s);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, nr);
+        ggml_set_name(w, "w");
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nr);
+        ggml_set_name(bias, "bias");
+
+        ggml_tensor * a = arm(ctx, state, x, w, bias, false);
+        if (!exact) {
+            ggml_set_name(a, "out");
+            return a;
+        }
+        ggml_tensor * b = arm(ctx, state, x, w, bias, true);
+        ggml_tensor * d0 = ggml_sub(ctx, a, b);
+        ggml_tensor * d1 = ggml_sub(ctx, b, a);
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_1d(ctx, d0, ggml_nelements(d0)),
+                                             ggml_reshape_1d(ctx, d1, ggml_nelements(d1)), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0x68e31da4u ^ (uint32_t) (nr*31 + n_t*131 + n_s*17 + extra*7 + exact));
+        std::uniform_real_distribution<float> u(-2.0f, 2.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->type != GGML_TYPE_F32) {
+                continue;
+            }
+            std::vector<float> v(ggml_nelements(t));
+            for (auto & e : v) {
+                e = u(rng);
+                if (exact && (rng() & 31) == 0) {
+                    e = (rng() & 1) ? -0.0f : 0.0f;
+                }
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
+        }
+    }
+};
+
 // Fused Gated-DeltaNet decay pre-chain (qwen4exp build_layer_attn_linear):
 //   ADD(alpha, ssm_dt) -> UNARY(SOFTPLUS) -> MUL(., ssm_a)
 // Production geometry is nh = num_v_heads = 48 over the draft-length token range.
@@ -10812,6 +10914,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_pool_mean_fuse(128, 2, 512, 1));
     test_cases.emplace_back(new test_qsa_pool_mean_fuse(128, 8, 333, 1));
 
+    // [TAG_CONV_INPUT_SPLIT] the GDN conv input without the concat (qwen4exp: 10240 channels, kernel 4) at
+    // decode-verify / prefill-ubatch token counts, 2 sequences, the three conv tails, odd channel counts
+    for (bool exact : { true, false }) {
+        for (int extra : { 0, 1, 2 }) {
+            for (int64_t n_t : { 1, 3, 5, 2048 }) {
+                test_cases.emplace_back(new test_concat_ssm_conv_fuse(10240, n_t, 1, extra, exact));
+            }
+            test_cases.emplace_back(new test_concat_ssm_conv_fuse(10240, 64, 2, extra, exact));
+            test_cases.emplace_back(new test_concat_ssm_conv_fuse(1027, 17, 3, extra, exact));
+        }
+    }
+
     // qwen4exp Gated-DeltaNet decay pre-chain fusion, at the production geometry
     // (num_v_heads 48) over the draft-length range, plus off-geometry shapes and the
     // veto case where the softplus has a second consumer
@@ -13095,6 +13209,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // [TAG_HC_INJECT_GEMM] B4 item 3: the qwen4exp hc_mix GEMMs of one prefill ubatch (n = 2048 tokens,
+    // k = hc_dim = 10240) at the brain's hc weight types - the m = 4 inject projection (the N-parallel
+    // question) next to the m = 320 down projection and the m = 10240 up projection (k = 320) for scale
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,     4, 2048, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,   320, 2048, 10240, {1, 1}, {1, 1}));
+        if (type_a == GGML_TYPE_Q5_0 || type_a == GGML_TYPE_Q8_0 || type_a == GGML_TYPE_F32) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, 2048,   320, {1, 1}, {1, 1}));
+        }
+    }
+    // [TAG_B4_CONCAT_COST] B4 sizing: the GDN conv-input concat (state | x^T) and its ssm_conv at a 2048-token
+    // ubatch (10240 channels, kernel 4), and the QSA chunk concat chain (left-deep, 9 chunks of ~228 rows of a
+    // 4096-wide attention output; the k-th concat copies k+1 chunks)
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, 2048, 0, 16));
+    test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {2051, 10240, 1, 1}, {4, 10240, 1, 1}));
+    // [TAG_CONV_INPUT_SPLIT] the whole GDN conv input + conv + silu: GGML_VK_FUSE_CONCAT_SSM_CONV=1 (default) vs 0
+    test_cases.emplace_back(new test_concat_ssm_conv_fuse(10240, 2048, 1, 1, false));
+    for (int64_t k = 1; k <= 8; ++k) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {4096, 228*k, 1, 1}, 228, 1, 0));
+    }
 
     // [TAG_QSA_TOPK_V2] the QSA selection (GGML_OP_QSA_TOP_K, width 2051) at decode (1) / verify (6) depths,
     // deployed data layout, plus random data and prefill-chunk query batches: GGML_VK_QSA_TOPK=v1|v2 A/B

@@ -2473,7 +2473,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
-                            int   il);
+                            int   il,
+         std::vector<ggml_tensor *> * deferred_tails = nullptr);   // [TAG_CONV_INPUT_SPLIT]
 
         ggml_tensor * build_ple(
              llm_graph_input_rs * inp,

@@ -687,6 +687,10 @@ static constexpr std::initializer_list<ggml_op> topk_moe_late_softmax      { GGM
 
 // Snake activation: y = x + sin(a*x)^2 * inv_b. Used by the optimize_graph reorder
 // pass so it keeps the chain contiguous and by the dispatcher to detect the fusion.
+// [TAG_CONV_INPUT_SPLIT] the qwen4exp GDN conv: concat(state, x^T) -> ssm_conv -> silu (graph_optimize keeps it whole)
+static constexpr std::initializer_list<ggml_op> concat_conv_silu_pattern   { GGML_OP_CONCAT,   GGML_OP_SSM_CONV,
+                                                                             GGML_OP_UNARY };
+
 static constexpr std::initializer_list<ggml_op> snake_pattern              { GGML_OP_MUL,      GGML_OP_SIN,
                                                                              GGML_OP_SQR,      GGML_OP_MUL,
                                                                              GGML_OP_ADD };
@@ -1200,6 +1204,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    // [TAG_CONV_INPUT_SPLIT] CONCAT(state, x) + SSM_CONV (+ SILU / + ADD + SILU), by the number of fused ops after the conv
+    vk_pipeline pipeline_ssm_conv_split_f32[3];
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1248,6 +1254,8 @@ struct vk_device_struct {
     // [TAG_HC_MIX_TAIL] GGML_VK_FUSE_MULTI_ADD_SCALE / GGML_VK_FUSE_SCALE_SILU
     bool fuse_multi_add_scale;
     bool fuse_scale_silu;
+    // [TAG_CONV_INPUT_SPLIT] GGML_VK_FUSE_CONCAT_SSM_CONV
+    bool fuse_concat_ssm_conv;
     // split a dim-0 concat with a transposed src1 into copy + tiled transpose-copy
     // (default on, GGML_VK_CONCAT_TRANSPOSE=0 turns it off)
     bool concat_transpose;
@@ -2141,6 +2149,13 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
 };
+// [TAG_CONV_INPUT_SPLIT] ssm_conv.comp under TWO_SRC: the conv window read from concat(state, x) without the concat
+struct vk_op_ssm_conv_split_push_constants {
+    vk_op_ssm_conv_push_constants base;
+    uint32_t sc;                 // state columns (the concat's split point)
+    uint32_t nbx0, nbx1, nbx2;   // the concat's second operand, element strides: token, channel, sequence
+};
+static_assert(offsetof(vk_op_ssm_conv_split_push_constants, sc) == sizeof(vk_op_ssm_conv_push_constants));
 
 struct vk_op_conv2d_push_constants {
     uint32_t Cout;
@@ -2496,6 +2511,10 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 //   rms_norm_mul_rope_view_set_rows  RMS_NORM+MUL+ROPE+VIEW+SET_ROWS
 //   rms_norm_mul_rope                RMS_NORM+MUL+ROPE
 //   rms_norm_mul                     RMS_NORM+MUL
+//   concat_ssm_conv_bias_silu        CONCAT+SSM_CONV+ADD+SILU             (qwen4exp GDN conv input read from state | x,
+//   concat_ssm_conv_silu             CONCAT+SSM_CONV+SILU                  the concat never written; prefill only - see
+//   concat_ssm_conv                  CONCAT+SSM_CONV                       ggml_vk_can_fuse_concat_ssm_conv;
+//                                                                          GGML_VK_FUSE_CONCAT_SSM_CONV=0 turns all three off)
 //   ssm_conv_bias_silu               SSM_CONV+ADD+SILU
 //   ssm_conv_silu                    SSM_CONV+SILU
 //   rope_view_set_rows               ROPE+VIEW+SET_ROWS
@@ -2520,6 +2539,10 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // moved independent nodes and cost the QSA pool mean its multi_add), so the node order is the v59 order with
 // the knobs on or off (GGML_VK_FUSE_MULTI_ADD_SCALE=0 / GGML_VK_FUSE_SCALE_SILU=0, default on); the fusions
 // fire wherever v59's order already has the pair adjacent.
+// [TAG_CONV_INPUT_SPLIT] Exception: concat_ssm_conv_silu's keep_pattern (CONCAT -> SSM_CONV -> SILU, edges checked)
+// and the guard that stops graph_optimize hoisting that CONCAT ARE gated, by GGML_VK_FUSE_CONCAT_SSM_CONV (default
+// on; =0, or GGML_VK_DISABLE_FUSION, gives the v59 order). Without them the CONCAT is hoisted into an earlier set
+// and the pattern never forms. Disabling the concat_ssm_conv* patterns by name keeps the knob-on order.
 //
 // Port note vs the source commit: the gate is the *last* term of each match condition instead of
 // the first, so a veto is only recorded for a pattern that really matched at this node and
@@ -2537,6 +2560,7 @@ static const char * const vk_fusion_pattern_names[] = {
     "topk_moe_early_softmax_norm", "topk_moe_sigmoid_norm_bias", "topk_moe_sqrt_softplus_norm_bias",
     "topk_moe_early_softmax", "topk_moe_late_softmax", "topk_moe_scale", "add_softplus_mul",
     "sigmoid_mul", "add_rms", "multi_add_scale", "scale_silu",
+    "concat_ssm_conv_bias_silu", "concat_ssm_conv_silu", "concat_ssm_conv",
 };
 static bool vk_fusion_patterns_disabled_any = false;
 static std::vector<std::string> vk_fusion_patterns_disabled; // lower-case; trailing '*' = prefix match
@@ -3023,6 +3047,8 @@ struct ggml_backend_vk_context {
     // then counts the adds AND the scale), and SCALE + SILU dispatched off the SCALE node
     bool fused_multi_add_scale {};
     bool fused_scale_silu {};
+    // [TAG_CONV_INPUT_SPLIT] CONCAT + SSM_CONV (+ ...) dispatched off the CONCAT node
+    bool fused_concat_ssm_conv {};
     // GGML_VK_FUSION_COUNT: add_rms fusions of the current graph (decided inside ggml_vk_build_graph)
     int fusion_count_add_rms {};
     // GGML_VK_FUSION_COUNT: running numerics signature of the current graph. Fed once per node
@@ -6931,6 +6957,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32[0], "ssm_conv_split_f32",           ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 5, sizeof(vk_op_ssm_conv_split_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32[1], "ssm_conv_split_silu_f32",      ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 5, sizeof(vk_op_ssm_conv_split_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32[2], "ssm_conv_split_bias_silu_f32", ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 5, sizeof(vk_op_ssm_conv_split_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -8212,6 +8241,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->fuse_multi_add_scale = fuse_enabled("GGML_VK_FUSE_MULTI_ADD_SCALE") && device->multi_add &&
                                        device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_scale_push_constants);
         device->fuse_scale_silu      = fuse_enabled("GGML_VK_FUSE_SCALE_SILU");
+        // [TAG_CONV_INPUT_SPLIT] the GDN conv input: ssm_conv reads concat(state, x^T) from its two sources
+        device->fuse_concat_ssm_conv = fuse_enabled("GGML_VK_FUSE_CONCAT_SSM_CONV");
 
         // Same "default on, =0 disables" convention for the concat transpose split. Like the
         // fusions above, both arms are bit-identical, so this is an A/B knob and not a fallback.
@@ -13585,6 +13616,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_SSM_CONV:
+        if (ctx->fused_concat_ssm_conv) {
+            // [TAG_CONV_INPUT_SPLIT] num_additional_fused_ops counts the conv itself (fused onto the CONCAT)
+            const int extra = ctx->num_additional_fused_ops - 1;
+            return extra >= 0 && extra <= 2 ? ctx->device->pipeline_ssm_conv_split_f32[extra] : nullptr;
+        }
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             switch (ctx->num_additional_fused_ops) {
                 case 0:  return ctx->device->pipeline_ssm_conv_f32;
@@ -14885,6 +14921,47 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
         (uint32_t)dst->ne[1],
         (uint32_t)dst->ne[2],
     });
+}
+
+// [TAG_CONV_INPUT_SPLIT] CONCAT(state, x) at node_idx, SSM_CONV(concat, c) at node_idx + 1, optionally + SILU or
+// + ADD(bias) + SILU. Validated by ggml_vk_can_fuse_concat_ssm_conv. The conv window element j is state[j] for
+// j < sc and x[j - sc] otherwise - the float the concat would have stored there.
+static void ggml_vk_ssm_conv_split(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * concat = cgraph->nodes[node_idx];
+    ggml_tensor * conv = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * state = concat->src[0];
+    const ggml_tensor * x     = concat->src[1];
+    const ggml_tensor * w     = conv->src[1];
+
+    const int extra = ctx->num_additional_fused_ops - 1;
+    ggml_tensor * dst = conv;
+    const ggml_tensor * bias = nullptr;
+    if (extra == 1) {
+        dst = cgraph->nodes[node_idx + 2]; // silu
+    } else if (extra == 2) {
+        ggml_tensor * add = cgraph->nodes[node_idx + 2];
+        bias = (add->src[0] == conv) ? add->src[1] : add->src[0];
+        dst = cgraph->nodes[node_idx + 3]; // silu
+    }
+    const ggml_tensor * src2 = bias ? bias : state;
+
+    vk_op_ssm_conv_split_push_constants pc {};
+    pc.base = {
+        (uint32_t)state->nb[1], (uint32_t)state->nb[2],
+        (uint32_t)w->nb[1],
+        (uint32_t)dst->nb[0], (uint32_t)dst->nb[1], (uint32_t)dst->nb[2],
+        (uint32_t)w->ne[0],
+        (uint32_t)concat->ne[0],
+        (uint32_t)state->ne[1],
+        (uint32_t)dst->ne[1],
+        (uint32_t)dst->ne[2],
+    };
+    pc.sc   = (uint32_t)state->ne[0];
+    pc.nbx0 = (uint32_t)(x->nb[0] / sizeof(float));
+    pc.nbx1 = (uint32_t)(x->nb[1] / sizeof(float));
+    pc.nbx2 = (uint32_t)(x->nb[2] / sizeof(float));
+
+    ggml_vk_op_f32<vk_op_ssm_conv_split_push_constants>(ctx, subctx, state, w, src2, x, dst, GGML_OP_SSM_CONV, std::move(pc));
 }
 
 static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
@@ -18181,7 +18258,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_CONCAT:
-        ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
+        if (ctx->fused_concat_ssm_conv) {
+            ggml_vk_ssm_conv_split(ctx, compute_ctx, cgraph, node_idx);   // [TAG_CONV_INPUT_SPLIT]
+        } else {
+            ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
+        }
 
         break;
     case GGML_OP_UPSCALE:
@@ -19611,6 +19692,77 @@ static bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const
     return true;
 }
 
+// [TAG_CONV_INPUT_SPLIT] CONCAT(state, x, dim 0) + SSM_CONV(concat, c) (+ SILU, or + ADD(bias) + SILU when
+// num_extra = 1 / 2): the qwen4exp GDN conv input (build_conv_state_at, state = the conv history row, x = the
+// transposed qkv_mixed). The concat is not written; the conv reads each window element from its source, the
+// same float the concat would have copied there, so the dot product sees the same operands (bit-exact). The
+// concat must feed only the conv: build_conv_state_at takes the rollback tails from x when the ubatch is long
+// enough (prefill), so this matches prefill graphs; with a tail still reading the concat (decode) it does not.
+static bool ggml_vk_can_fuse_concat_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                             int node_idx, int num_extra) {
+    if (!ctx->device->fuse_concat_ssm_conv || num_extra < 0 || num_extra > 2) {
+        return false;
+    }
+    if (node_idx + 1 + num_extra >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * concat = cgraph->nodes[node_idx];
+    const ggml_tensor * conv   = cgraph->nodes[node_idx + 1];
+    if (concat->op != GGML_OP_CONCAT || conv->op != GGML_OP_SSM_CONV || conv->src[0] != concat) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(concat, 0) != 0) {
+        return false;
+    }
+    // the concat (and the chain's intermediates) are used inside the pattern only
+    bool uses_ok = false;
+    switch (num_extra) {
+        case 0: uses_ok = ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_CONCAT, GGML_OP_SSM_CONV }, { node_idx + 1 }); break;
+        case 1: uses_ok = ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_CONCAT, GGML_OP_SSM_CONV, GGML_OP_UNARY }, { node_idx + 2 }); break;
+        case 2: uses_ok = ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_CONCAT, GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { node_idx + 3 }); break;
+    }
+    if (!uses_ok) {
+        return false;
+    }
+    // the conv tail (silu / bias + silu) under the same rules as the plain ssm_conv fusions
+    if (num_extra > 0 && !ggml_vk_can_fuse_ssm_conv(ctx, cgraph, node_idx + 1, num_extra)) {
+        return false;
+    }
+
+    const ggml_tensor * state = concat->src[0];
+    const ggml_tensor * x     = concat->src[1];
+    const ggml_tensor * w     = conv->src[1];
+    const ggml_tensor * dst   = cgraph->nodes[node_idx + 1 + num_extra];
+
+    for (const ggml_tensor * t : { concat, state, x, conv, w, dst }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const int64_t nc = w->ne[0];
+    const int64_t nr = w->ne[1];
+    const int64_t n_t = conv->ne[1];
+    const int64_t n_s = conv->ne[2];
+    // state [nc - 1, nr, n_s] with unit element stride (the shader indexes its columns directly)
+    if (state->ne[0] != nc - 1 || state->ne[1] != nr || state->ne[2] != n_s || state->ne[3] != 1 ||
+        state->nb[0] != sizeof(float) || state->nb[1] % sizeof(float) || state->nb[2] % sizeof(float)) {
+        return false;
+    }
+    // x [n_t, nr, n_s], any strides in whole elements
+    if (x->ne[0] != n_t || x->ne[1] != nr || x->ne[2] != n_s || x->ne[3] != 1 ||
+        x->nb[0] % sizeof(float) || x->nb[1] % sizeof(float) || x->nb[2] % sizeof(float)) {
+        return false;
+    }
+    if (concat->ne[0] != nc - 1 + n_t || concat->ne[3] != 1) {
+        return false;
+    }
+    // no per-tensor offsets in the push constants
+    if (get_misalign_bytes(ctx, state) || get_misalign_bytes(ctx, x) || get_misalign_bytes(ctx, w) || get_misalign_bytes(ctx, dst)) {
+        return false;
+    }
+    return true;
+}
+
 static bool ggml_vk_can_fuse_topk_moe(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, topk_moe_mode mode) {
 
@@ -20586,6 +20738,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_multi_add_scale = false;
         ctx->fused_scale_silu = false;
+        ctx->fused_concat_ssm_conv = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -20666,6 +20819,31 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // they are overwritten, and one workgroup per row. So close enough.
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_concat_ssm_conv(ctx, cgraph, i, 2) &&
+                       !vk_fusion_veto(ctx, "concat_ssm_conv_bias_silu")) {
+                // [TAG_CONV_INPUT_SPLIT] the concat is never written; state / x are read with a window, not elementwise
+                ctx->num_additional_fused_ops = 3;
+                ctx->fused_concat_ssm_conv = true;
+                fusion_string = "CONCAT_SSM_CONV_BIAS_SILU";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
+                op_srcs_fused_elementwise[2] = true;
+                op_srcs_fused_elementwise[3] = true;
+            } else if (ggml_vk_can_fuse_concat_ssm_conv(ctx, cgraph, i, 1) &&
+                       !vk_fusion_veto(ctx, "concat_ssm_conv_silu")) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_concat_ssm_conv = true;
+                fusion_string = "CONCAT_SSM_CONV_SILU";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
+                op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse_concat_ssm_conv(ctx, cgraph, i, 0) &&
+                       !vk_fusion_veto(ctx, "concat_ssm_conv")) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_concat_ssm_conv = true;
+                fusion_string = "CONCAT_SSM_CONV";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
             } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2) &&
                        !vk_fusion_veto(ctx, "ssm_conv_bias_silu")) {
                 ctx->num_additional_fused_ops = 2;
@@ -20890,6 +21068,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_multi_add_scale = false;
                 ctx->fused_scale_silu = false;
+                ctx->fused_concat_ssm_conv = false;
             }
         }
 
@@ -21258,6 +21437,17 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
             return false;
         };
 
+        // [TAG_CONV_INPUT_SPLIT] the op sequence AND the edges, so no unrelated CONCAT/SSM_CONV/UNARY run is caught
+        auto const &is_concat_conv_silu = [&](int start) -> bool {
+            if (ctx->device->disable_fusion || !ctx->device->fuse_concat_ssm_conv || !match_pattern(concat_conv_silu_pattern, start)) {
+                return false;
+            }
+            const ggml_tensor * concat = graph->nodes[start];
+            const ggml_tensor * conv   = graph->nodes[start + 1];
+            const ggml_tensor * silu   = graph->nodes[start + 2];
+            return conv->src[0] == concat && silu->src[0] == conv && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU;
+        };
+
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (match_pattern(pattern, first_unused)) {
                 for (size_t j = 0; j < pattern.size(); ++j) {
@@ -21295,6 +21485,12 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
             continue;
         }
         if (keep_pattern(topk_qsa_pattern)) {
+            continue;
+        }
+        // [TAG_CONV_INPUT_SPLIT] CONCAT -> SSM_CONV(concat) -> SILU stays one consecutive run when it reaches the
+        // front, and its CONCAT is never hoisted into an earlier set (the guard below), so concat_ssm_conv_silu
+        // can match. Gated by GGML_VK_FUSE_CONCAT_SSM_CONV (=0: the v59 order).
+        if (is_concat_conv_silu(first_unused) && keep_pattern(concat_conv_silu_pattern)) {
             continue;
         }
 
@@ -21354,7 +21550,8 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(topk_moe_late_softmax, j) ||
                 match_pattern(snake_pattern, j) ||
                 inside_pattern(hc_combine_pattern, j) ||
-                inside_pattern(topk_qsa_pattern, j)) {
+                inside_pattern(topk_qsa_pattern, j) ||
+                is_concat_conv_silu(j)) {
                 continue;
             }
             bool ok = true;

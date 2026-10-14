@@ -14,14 +14,33 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
 layout(binding = 0) readonly buffer Src0 { float src0[]; };
 layout(binding = 1) readonly buffer Src1 { float src1[]; };
 layout(binding = 2) readonly buffer Bias { float bias[]; };
+#ifdef TWO_SRC
+// [TAG_CONV_INPUT_SPLIT] the conv window is concat(state, x^T) along dim 0, read from its two sources:
+// src0 = the state [sc, nr, n_s] (element stride 1), srcx = the concat's second operand (any strides,
+// in elements: token nbx0, channel nbx1, sequence nbx2); the concat itself is never written
+layout(binding = 3) readonly buffer SrcX { float srcx[]; };
+layout(binding = 4) buffer Dst { float dst[]; };
+#else
 layout(binding = 3) buffer Dst { float dst[]; };
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint nb01; uint nb02;
     uint nb11;
     uint dst_nb0; uint dst_nb1; uint dst_nb2;
     uint nc; uint ncs; uint nr; uint n_t; uint n_s;
+#ifdef TWO_SRC
+    uint sc; uint nbx0; uint nbx1; uint nbx2;
+#endif
 };
+
+#ifdef TWO_SRC
+// element j of the concat row (i1, i3): exactly the float the concat would have stored there
+float win(uint i3, uint i1, uint j) {
+    return j < sc ? src0[i3 * (nb02 / 4) + i1 * (nb01 / 4) + j]
+                  : srcx[i3 * nbx2 + i1 * nbx1 + (j - sc) * nbx0];
+}
+#endif
 
 void main() {
     const uint i1 = gl_GlobalInvocationID.x;
@@ -32,11 +51,26 @@ void main() {
         return;
     }
 
+#ifndef TWO_SRC
     const uint src0_base = i3 * (nb02 / 4) + i2 + i1 * (nb01 / 4);
+#endif
     const uint src1_base = i1 * (nb11 / 4);
 
     float sum = 0.0;
 
+#ifdef TWO_SRC
+    // the same operands in the same expressions as the single-source form below
+    if (nc == 4) {
+        sum = dot(
+            vec4(win(i3, i1, i2), win(i3, i1, i2 + 1), win(i3, i1, i2 + 2), win(i3, i1, i2 + 3)),
+            vec4(src1[src1_base], src1[src1_base + 1], src1[src1_base + 2], src1[src1_base + 3])
+        );
+    } else {
+        [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
+            sum += win(i3, i1, i2 + i0) * src1[src1_base + i0];
+        }
+    }
+#else
     if (nc == 4) {
         sum = dot(
             vec4(src0[src0_base], src0[src0_base + 1], src0[src0_base + 2], src0[src0_base + 3]),
@@ -47,6 +81,7 @@ void main() {
             sum += src0[src0_base + i0] * src1[src1_base + i0];
         }
     }
+#endif
 
     if (APPLY_BIAS) {
         sum += bias[i1];

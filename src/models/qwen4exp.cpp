@@ -3043,8 +3043,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // the channels must match how load_arch_tensors sizes wqkv, not ssm_d_inner
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
+    std::vector<ggml_tensor *> conv_tails; // [TAG_CONV_INPUT_SPLIT] expanded after the conv, see build_conv_state_at
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, il);
+            conv_kernel_size - 1, conv_channels, il, &conv_tails);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -3055,6 +3056,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
     cb(conv_output_silu, "conv_output_silu", il);
+
+    if (!conv_tails.empty()) {
+        ggml_build_forward_expand(gf, conv_output_silu);
+        for (ggml_tensor * t : conv_tails) {
+            ggml_build_forward_expand(gf, t);
+        }
+    }
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 
@@ -3453,7 +3461,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
-        int                  il) {
+        int                  il,
+        std::vector<ggml_tensor *> * deferred_tails) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
@@ -3473,25 +3482,49 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
+    ggml_tensor * x_t        = ggml_transpose(ctx0, x);
+    ggml_tensor * conv_input = ggml_concat(ctx0, state, x_t, 0);
 
     // keep the last state_cols columns for the next ubatch
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
     const auto   mem_size = mctx_cur->get_size();
 
+    // [TAG_CONV_INPUT_SPLIT] the tails are the last state_cols (+ slot) columns of the concat. When the ubatch
+    // has at least state_cols + K_write - 1 tokens they all lie in its x half, so they are taken from x^T
+    // directly: the same floats (the concat is a bit copy), and the concat is left with the conv as its only
+    // consumer, which lets the Vulkan backend read the conv window from state | x without writing the concat
+    // (concat_ssm_conv). Shorter ubatches (decode, short verify) keep the concat views, as before.
+    const int64_t n_seq_t   = x_t->ne[0];
+    const int64_t k_tails   = cparams.n_rs_seq == 0 ? 1 :
+        std::min<int64_t>(ubatch.n_seq_tokens, (int64_t) ubatch.rs_rollback_depth + 1);
+    const bool    tails_x   = n_seq_t >= state_cols + k_tails - 1;
+    ggml_tensor * tail_base = tails_x ? x_t : conv_input;
+    const int64_t tail_cols = tails_x ? n_seq_t : conv_input->ne[0];   // ne[0] of the view base
+    // A caller that reads the concat with a conv takes the x-tail copies and expands them AFTER the conv:
+    // that keeps x alive across the conv, so ggml-alloc cannot hand the conv's output the block x frees -
+    // which would make the conv read x while it is being overwritten (the backend's overlap veto would
+    // then undo concat_ssm_conv). Pure ordering: the history row is read by build_rs's gather before.
+    auto const & emit_tail = [&](ggml_tensor * cpy) {
+        if (tails_x && deferred_tails) {
+            deferred_tails->push_back(cpy);
+        } else {
+            ggml_build_forward_expand(gf, cpy);
+        }
+    };
+
     if (cparams.n_rs_seq == 0) {
         // no rollback capacity: a single slot-0 write, unchanged from before [TAG_RECURRENT_ROLLBACK_SPLITS]
-        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+        ggml_tensor * tail = ggml_view_3d(ctx0, tail_base,
                 state_cols, channels, n_seqs,
-                conv_input->nb[1], conv_input->nb[2],
-                ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols));
+                tail_base->nb[1], tail_base->nb[2],
+                (tail_cols - state_cols) * tail_base->nb[0]);
 
         ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
                 state_cols * channels, n_seqs,
                 conv_states_all->nb[1],
                 kv_head * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        emit_tail(ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
     } else {
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
         // slot 0 is the final state, slot s the state s tokens back, as llm_build_delta_net_base::build_conv_state
@@ -3503,17 +3536,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         const int64_t K_write = std::min<int64_t>(ubatch.n_seq_tokens, (int64_t) ubatch.rs_rollback_depth + 1);
 
         for (int64_t slot = 0; slot < K_write; ++slot) {
-            ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+            ggml_tensor * tail = ggml_view_3d(ctx0, tail_base,
                     state_cols, channels, n_seqs,
-                    conv_input->nb[1], conv_input->nb[2],
-                    ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols - slot));
+                    tail_base->nb[1], tail_base->nb[2],
+                    (tail_cols - state_cols - slot) * tail_base->nb[0]);
 
             ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
                     state_cols * channels, n_seqs,
                     conv_states_all->nb[1],
                     ((size_t) slot * mem_size + kv_head) * row_size);
 
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+            emit_tail(ggml_cpy(ctx0, tail, dst));
         }
     }
 

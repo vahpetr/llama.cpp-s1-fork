@@ -5,7 +5,9 @@
 // there. This program builds a qwen4exp-shaped graph in the model's own expansion order - two layers of
 // build_hc_mix (+ the early forward-expand of the mixed stream), a block, build_hc_combine (inject expanded
 // first), the ffn mix and combine, plus the QSA pooled-key mean (get_rows -> r CONT slices -> ADD chain ->
-// SCALE(1/r) -> RMS_NORM) - and computes it with ggml_backend_sched (GPU + CPU), i.e. with graph_optimize.
+// SCALE(1/r) -> RMS_NORM) and, in layer 0, the GDN conv input (concat(history, x^T) -> ssm_conv -> silu, the
+// history tail copied from x^T after the conv, [TAG_CONV_INPUT_SPLIT]) - and computes it with
+// ggml_backend_sched (GPU + CPU), i.e. with graph_optimize. The conv history row is hashed too (conv_state=).
 //
 // Output (stdout): one line per run
 //   [order-test] nt=<n> rounds=<k> out=0x<fnv1a of the final stream> pool=0x<fnv1a of the pool output>
@@ -36,6 +38,7 @@ static const int64_t IDX_DIM = 128;
 static const int64_t POOL_R  = 4;
 static const int64_t N_ROWS  = 512;   // pooled blocks
 static const int     N_LAYER = 2;
+static const int64_t CONV_CH = 2048;  // GDN conv channels (qwen4exp: 10240), kernel 4
 
 static uint64_t fnv1a(const void * p, size_t n) {
     uint64_t h = 0xcbf29ce484222325ull;
@@ -48,12 +51,34 @@ static uint64_t fnv1a(const void * p, size_t n) {
 struct layer_w {
     ggml_tensor * norm[2], * down[2], * up[2], * inject[2];
     ggml_tensor * g_attn, * w_attn, * g_ffn, * w_ffn1, * w_ffn2;
+    ggml_tensor * w_qkv, * conv_w, * w_out;   // the GDN-shaped layer 0
 };
 
 struct model_t {
     layer_w       l[N_LAYER];
-    ggml_tensor * k_all;   // [IDX_DIM, n_cells] f32
+    ggml_tensor * k_all;       // [IDX_DIM, n_cells] f32
+    ggml_tensor * conv_store;  // [3*CONV_CH] f32: the conv history row (read, then the tail written back)
 };
+
+// build_conv_state_at + the GDN conv (n_rs_seq == 0, prefill): concat(state, x^T) -> ssm_conv -> silu, the tail
+// copied from x^T into the history row (the [TAG_CONV_INPUT_SPLIT] form; with a v59 source the tail form is the
+// same code here, so both binaries run the same graph)
+static ggml_tensor * gdn_conv(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * store, ggml_tensor * x, ggml_tensor * w) {
+    const int64_t nt = x->ne[1];
+    // the history is read (build_rs's gather) before the tail overwrites it
+    ggml_tensor * state = ggml_reshape_3d(ctx, ggml_cont(ctx, store), 3, CONV_CH, 1);
+    ggml_build_forward_expand(gf, state);
+    ggml_tensor * x_t = ggml_transpose(ctx, x);
+    ggml_tensor * ci  = ggml_concat(ctx, state, x_t, 0);
+    ggml_tensor * y   = ggml_silu(ctx, ggml_ssm_conv(ctx, ci, w));
+    if (nt >= 3) {
+        // the tail after the conv, as qwen4exp's GDN layer expands it ([TAG_CONV_INPUT_SPLIT] deferred tails)
+        ggml_build_forward_expand(gf, y);
+        ggml_tensor * tail = ggml_view_3d(ctx, x_t, 3, CONV_CH, 1, x_t->nb[1], x_t->nb[2], (nt - 3)*x_t->nb[0]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cont(ctx, tail), ggml_view_1d(ctx, store, 3*CONV_CH, 0)));
+    }
+    return y;
+}
 
 // build_hc_mix, node for node (src/models/qwen4exp.cpp)
 static ggml_tensor * hc_mix(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w_norm, ggml_tensor * w_down,
@@ -139,7 +164,7 @@ int main(int argc, char ** argv) {
     }
 
     // weights in a GPU buffer
-    ggml_init_params wp = { ggml_tensor_overhead()*64, nullptr, true };
+    ggml_init_params wp = { ggml_tensor_overhead()*96, nullptr, true };
     ggml_context * ctx_w = ggml_init(wp);
     model_t m;
     for (int il = 0; il < N_LAYER; ++il) {
@@ -155,7 +180,11 @@ int main(int argc, char ** argv) {
         L.g_ffn  = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, N_EMBD);
         L.w_ffn1 = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, N_EMBD, 1024);
         L.w_ffn2 = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, 1024, N_EMBD);
+        L.w_qkv  = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, N_EMBD, CONV_CH);
+        L.conv_w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, 4, CONV_CH);
+        L.w_out  = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, CONV_CH, N_EMBD);
     }
+    m.conv_store = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, 3*CONV_CH);
     const int64_t n_cells = POOL_R*N_ROWS;
     m.k_all = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, IDX_DIM, n_cells);
     ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors(ctx_w, gpu);
@@ -192,7 +221,15 @@ int main(int argc, char ** argv) {
             pool = pool_mean(ctx, m.k_all, cells);
             ggml_build_forward_expand(gf, pool);
         }
-        cur = ggml_mul_mat(ctx, L.w_attn, ggml_mul(ctx, ggml_rms_norm(ctx, cur, 1e-6f), L.g_attn));
+        if (il == 0) {
+            // the GDN layer: qkv projection -> conv over the history | x -> out projection
+            ggml_tensor * qkv = ggml_mul_mat(ctx, L.w_qkv, ggml_mul(ctx, ggml_rms_norm(ctx, cur, 1e-6f), L.g_attn));
+            qkv = ggml_reshape_3d(ctx, qkv, CONV_CH, nt, 1);
+            ggml_tensor * conv = gdn_conv(ctx, gf, m.conv_store, qkv, L.conv_w);
+            cur = ggml_mul_mat(ctx, L.w_out, ggml_reshape_2d(ctx, conv, CONV_CH, nt));
+        } else {
+            cur = ggml_mul_mat(ctx, L.w_attn, ggml_mul(ctx, ggml_rms_norm(ctx, cur, 1e-6f), L.g_attn));
+        }
         res = hc_combine(ctx, gf, res, cur, inject);
 
         cur = hc_mix(ctx, res, L.norm[1], L.down[1], L.up[1], L.inject[1], &inject);
@@ -207,7 +244,7 @@ int main(int argc, char ** argv) {
     ggml_backend_t backends[2] = { gpu, cpu };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, graph_size, false, true);
 
-    uint64_t h_out = 0, h_pool = 0;
+    uint64_t h_out = 0, h_pool = 0, h_conv = 0;
     for (int r = 0; r < rounds; ++r) {
         ggml_backend_sched_reset(sched);
         if (!ggml_backend_sched_alloc_graph(sched, gf)) {
@@ -215,6 +252,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
         fill(x, 1000, 1.0f);
+        fill(m.conv_store, 2000, 1.0f);
         {
             std::vector<int32_t> c(n_cells);
             uint32_t s = 7;
@@ -228,10 +266,12 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "compute failed\n");
             return 1;
         }
-        std::vector<uint8_t> o(ggml_nbytes(res)), p(ggml_nbytes(pool));
+        std::vector<uint8_t> o(ggml_nbytes(res)), p(ggml_nbytes(pool)), cs(ggml_nbytes(m.conv_store));
         ggml_backend_tensor_get(res,  o.data(), 0, o.size());
         ggml_backend_tensor_get(pool, p.data(), 0, p.size());
+        ggml_backend_tensor_get(m.conv_store, cs.data(), 0, cs.size());
         const uint64_t ho = fnv1a(o.data(), o.size()), hp = fnv1a(p.data(), p.size());
+        h_conv = fnv1a(cs.data(), cs.size());
         if (r > 0 && (ho != h_out || hp != h_pool)) {
             fprintf(stderr, "run-to-run mismatch\n");
             return 1;
@@ -239,8 +279,8 @@ int main(int argc, char ** argv) {
         h_out = ho;
         h_pool = hp;
     }
-    printf("[order-test] nt=%" PRId64 " rounds=%d nodes=%d out=0x%016" PRIx64 " pool=0x%016" PRIx64 "\n",
-           nt, rounds, ggml_graph_n_nodes(gf), h_out, h_pool);
+    printf("[order-test] nt=%" PRId64 " rounds=%d nodes=%d out=0x%016" PRIx64 " pool=0x%016" PRIx64 " conv_state=0x%016" PRIx64 "\n",
+           nt, rounds, ggml_graph_n_nodes(gf), h_out, h_pool, h_conv);
 
     ggml_backend_sched_free(sched);
     ggml_free(ctx);
