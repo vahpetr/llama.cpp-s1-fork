@@ -11872,8 +11872,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // [TAG_MMID_TILE_B1] [TAG_MMID_PRECAST_B] the qwen4exp expert GEMMs vs the CPU, uniform and skewed routing, decode to prefill widths
     for (int router : { MMID_ROUTER_UNIFORM, MMID_ROUTER_SKEWED }) {
-        for (int64_t n : { 8, 65, 128, 2044 }) {
+        for (int64_t n : { 8, 64, 65, 128, 2044, 2048 }) {   // review B1 M7: + 64 and 2048
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, n, 2560, router));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 512, 10, true, 640, n, 2560, router));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 512, 10, true, 640, n, 2560, router));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640, router));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640, router));
         }

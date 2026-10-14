@@ -2505,6 +2505,13 @@ static bool ggml_vk_mmid_tile_b1(const vk_device & device) {
            device->driver_id != vk::DriverId::eAmdProprietary;
 }
 
+// [TAG_MMID_TILE_B1] [TAG_MMID_PRECAST_B] the quantized expert types the B1 byte classifier covers (balkon 780M, vs a v59
+// binary): q4_K (brain gate/up), q5_0 / q8_0 (brain down), q6_K, iq3_s (balkon hands experts). Both B1 changes apply to
+// these only.
+static bool ggml_vk_b1_classified_type(ggml_type t) {
+    return t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q6_K || t == GGML_TYPE_IQ3_S;
+}
+
 // GGML_VK_DISABLE_FUSION_PATTERNS=name1,name2,... disables individual graph-fusion patterns by
 // name, so a fusion-caused divergence can be bisected pattern by pattern (GGML_VK_DISABLE_FUSION
 // still turns every fusion off at once). Comma-separated, case-insensitive; a trailing '*' matches
@@ -2574,9 +2581,15 @@ static bool ggml_vk_mmid_tile_b1(const vk_device & device) {
 // [TAG_MMID_PRECAST_B] GGML_VK_MMID_PRECAST_B (default on; =0 off): coopmat1 quantized-A mul_mat_id converts the f32 B once
 // to f16 (the y staging cpy, shared by gate / up) and runs the f16-B twin of the same shader instead of converting per tile.
 // Staging cost: prealloc_y holds the f16 B - gate/up 2 560 x 2 048 = 10 MiB, the down projection 640 x 10 x 2 048 = 25 MiB at
-// n = 2 048 (grows prealloc_y to the largest). Exactness of both: byte-identical on the balkon 780M classifier (production
-// expert shapes, n 1..2048, uniform / skewed / hot / partial-tile routing, vs a v59 binary); the gfx1151 production-graph byte
-// comparison, the gate/up staging reuse, repeated execution and the GTT effect are measured by the s1 gate.
+// n = 2 048 (grows prealloc_y to the largest); the conversion pass itself reads 4 B and writes 2 B per B element (≈ 5 GB
+// per 2 048 ubatch over 48 layers), so the pre-cast must show a net gain ALONE on gfx1151 (s1 gate) or ship the tile only.
+// Scope (both): AMD coopmat1, the classified quantized types q4_K / q5_0 / q8_0 / q6_K / iq3_s (ggml_vk_b1_classified_type).
+// The TILE knob is a process-wide static read on the first shader load, PRECAST a device field read at device init.
+// The dispatch log names the f16-B / _l pipelines and adds a "path=mmid_precast ... reuse=0|1" line per staging cpy.
+// Exactness of both: byte-identical on the balkon 780M classifier vs a v59 binary - b1-cases 90/90 (n 1..2048, uniform /
+// skewed / hot), b1fix-cases (n 9/63/64/65, partial expert tiles) and b1fix2-cases (iq3_s, q6_K): see contrib 0231/0232 for
+// the counts; the gfx1151 production-graph byte comparison, the gate/up staging reuse, repeated execution and the GTT effect
+// are measured by the s1 gate.
 //
 // [TAG_VK_DISPATCH_LOG] GGML_VK_DISPATCH_LOG=1 (default off, read once at device init) prints one stderr line
 // "[vk-dispatch] op=... path=mm|mmv|mmv_p021|mmv_nc|mmv_rows|mm_id|mmv_id src0= src1= m= n= k= batch= [n_as= n_used=]
@@ -5190,9 +5203,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // [TAG_MMID_TILE_B1] the coopmat1 mul_mat_id pipelines' tiles. m / s are the mmq ones unchanged; l is, on AMD
         // coopmat1 (where upstream leaves mul_mat_id_l off), BM 128 x BN 64: the m tile's warp structure (warp tile WM x WN,
         // WMITER, TM / TN / TK fragments, BK) with twice the warps along M. Every output element still accumulates the same
-        // BK blocks of the same coopmat fragments in the same order - only which workgroup owns it changes. Evidence: byte-identical
-        // on the balkon 780M classifier (production expert shapes x n 1..2048 x uniform / skewed / hot / partial-tile routing,
-        // vs a v59 binary); the gfx1151 production-graph byte comparison is pending the oracle gate.
+        // BK blocks of the same coopmat fragments in the same order - only which workgroup owns it changes. Evidence: the
+        // balkon 780M byte classifier vs a v59 binary (counts in contrib 0232); the gfx1151 production-graph byte comparison
+        // is pending the oracle gate.
         // GGML_VK_MMID_TILE_BM128=0 keeps the upstream plan (l = the mmq l tile, and off on AMD).
         m_warptile_mmqidb1 = m_warptile_mmq; s_warptile_mmqidb1 = s_warptile_mmq; l_warptile_mmqidb1 = l_warptile_mmq;
         m_mmqidb1_wg_denoms = m_mmq_wg_denoms; s_mmqidb1_wg_denoms = s_mmq_wg_denoms; l_mmqidb1_wg_denoms = l_mmq_wg_denoms;
@@ -5231,8 +5244,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             } else if (!ggml_vk_matmul_shmem_support(device, l_warptile_mmqid, true, t)) {
                 device->mul_mat_id_l[i] = false;
             }
-            // [TAG_MMID_TILE_B1] the BM 128 x BN 64 mul_mat_id tile, where it fits (and the m tile is available)
-            if (ggml_vk_mmid_tile_b1(device) && device->mul_mat_id_m[i]) {
+            // [TAG_MMID_TILE_B1] the BM 128 x BN 64 mul_mat_id tile, where it fits (and the m tile is available) - only for
+            // the quantized types the byte classifier covers (ggml_vk_b1_classified_type); every other type keeps the
+            // upstream plan (on AMD: no l tile), incl. F32 / F16 / BF16 and the dequant-to-f16 fallback (review B1 I1)
+            if (ggml_vk_mmid_tile_b1(device) && device->mul_mat_id_m[i] && ggml_vk_b1_classified_type(t)) {
                 device->mul_mat_id_l[i] = ggml_vk_matmul_shmem_support(device, l_warptile_mmqidb1, true, t);
             }
 
@@ -5752,17 +5767,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_TQ2_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_TQ2_0], matmul_id_subgroup_tq2_0_f32, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_K], matmul_id_subgroup_q3_k_f32, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_K], matmul_id_subgroup_q4_k_f32, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
-        // [TAG_MMID_PRECAST_B] f16-B twins of the coopmat1 mul_mat_id pipelines (same shader source, B_TYPE f16; same tiles)
-        CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q4_0], matmul_id_subgroup_q4_0_f16, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
-        CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q4_1], matmul_id_subgroup_q4_1_f16, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
-        CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q5_0], matmul_id_subgroup_q5_0_f16, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
-        CREATE_MM2(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q5_1], matmul_id_subgroup_q5_1_f16, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
-        CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q8_0], matmul_id_subgroup_q8_0_f16, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
-        CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q2_K], matmul_id_subgroup_q2_k_f16, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
-        CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q3_K], matmul_id_subgroup_q3_k_f16, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        // [TAG_MMID_PRECAST_B] f16-B twins of the coopmat1 mul_mat_id pipelines (same shader source, B_TYPE f16; same tiles) for the
+        // classified types only (ggml_vk_b1_classified_type)
         CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q4_K], matmul_id_subgroup_q4_k_f16, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
-        CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q5_K], matmul_id_subgroup_q5_k_f16, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q5_0], matmul_id_subgroup_q5_0_f16, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q8_0], matmul_id_subgroup_q8_0_f16, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q6_K], matmul_id_subgroup_q6_k_f16, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_IQ3_S, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_IQ3_S], matmul_id_subgroup_iq3_s_f16, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_K], matmul_id_subgroup_q5_k_f32, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_K], matmul_id_subgroup_q6_k_f32, mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ1_S],   matmul_id_subgroup_iq1_s_f32,   mmqidb1_wg_denoms, warptile_mmqidb1, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
@@ -8312,7 +8323,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // [TAG_VK_DISPATCH_LOG] read once here; off = one bool test per matmul dispatch, nothing else
         device->dispatch_log = ggml_vk_env_bool("GGML_VK_DISPATCH_LOG", false);
         // [TAG_MMID_PRECAST_B] the coopmat1 mul_mat_id B pre-cast to f16 (see ggml_vk_mul_mat_id_q_f16)
-        device->mmid_precast_b = ggml_vk_env_bool("GGML_VK_MMID_PRECAST_B", true);
+        // review B1 M2: AMD coopmat1 only (measured there), like the tile
+        device->mmid_precast_b = ggml_vk_env_bool("GGML_VK_MMID_PRECAST_B", true) && device->vendor_id == VK_VENDOR_ID_AMD &&
+                                 device->driver_id != vk::DriverId::eAmdProprietary;
 
         // Same "default on, =0 disables" convention for the concat transpose split. Like the
         // fusions above, both arms are bit-identical, so this is an A/B knob and not a fallback.
@@ -11928,7 +11941,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // mul_mm id B load reads rows through row_ids, and the f32-B path is not padded either).
     bool precast_b = false;
     if (ctx->device->mmid_precast_b && !quantize_y && !y_non_contig && !x_non_contig && src1->type == GGML_TYPE_F32 &&
-        ggml_vk_dim01_contiguous(src1) && f16_type == GGML_TYPE_F16 && ggml_is_quantized(src0->type)) {
+        ggml_vk_dim01_contiguous(src1) && f16_type == GGML_TYPE_F16 && ggml_vk_b1_classified_type(src0->type)) {
         vk_matmul_pipeline pf = ggml_vk_get_mul_mat_mat_id_f16b_pipeline(ctx, src0->type, (ggml_prec)dst->op_params[0]);
         if (pf && mmp == ggml_vk_get_mul_mat_mat_id_pipeline(ctx, src0->type, GGML_TYPE_F32, (ggml_prec)dst->op_params[0])) {
             mmp = pf;
@@ -12157,6 +12170,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         const std::vector<uint32_t> pc = { (uint32_t)ne01, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)(ggml_nelements(src0)) };
         ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0,
             { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_X, 0, x_sz } }, pc, { (uint32_t)x_ne, 1, 1});
+    }
+    if (precast_b && ctx->device->dispatch_log) {
+        // [TAG_MMID_PRECAST_B] review B1 M5: the staging cpy, dispatched or reused from the previous mul_mat_id on src1
+        const bool reuse = ctx->prealloc_y_last_pipeline_used == to_fp16_vk_1.get() && ctx->prealloc_y_last_tensor_used == src1 &&
+                           ctx->prealloc_y_last_decode_vector_staging == y_decode_vector_staging;
+        fprintf(stderr, "[vk-dispatch] op=CPY path=mmid_precast src0=f32 src1=f16 m=%" PRIu64 " n=%" PRIu64 " k=1 batch=%" PRIu64 " pipeline=%s split_k=1 mmvq=0 mmq=0 fused=0 node=%s reuse=%d\n",
+                ne10, ne11 * ne12 * ne13, (uint64_t) 1, to_fp16_vk_1->name.c_str(), src1->name, (int) reuse);
     }
     if (y_non_contig) {
         if (ctx->prealloc_y_last_pipeline_used != to_fp16_vk_1.get() ||
