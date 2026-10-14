@@ -2573,6 +2573,10 @@ static bool ggml_vk_mmid_tile_b1(const vk_device & device) {
 // (the m tile's warp structure with twice the warps along M), used when m > 64 and n > 64; per-element accumulation unchanged.
 // [TAG_MMID_PRECAST_B] GGML_VK_MMID_PRECAST_B (default on; =0 off): coopmat1 quantized-A mul_mat_id converts the f32 B once
 // to f16 (the y staging cpy, shared by gate / up) and runs the f16-B twin of the same shader instead of converting per tile.
+// Staging cost: prealloc_y holds the f16 B - gate/up 2 560 x 2 048 = 10 MiB, the down projection 640 x 10 x 2 048 = 25 MiB at
+// n = 2 048 (grows prealloc_y to the largest). Exactness of both: byte-identical on the balkon 780M classifier (production
+// expert shapes, n 1..2048, uniform / skewed / hot / partial-tile routing, vs a v59 binary); the gfx1151 production-graph byte
+// comparison, the gate/up staging reuse, repeated execution and the GTT effect are measured by the s1 gate.
 //
 // [TAG_VK_DISPATCH_LOG] GGML_VK_DISPATCH_LOG=1 (default off, read once at device init) prints one stderr line
 // "[vk-dispatch] op=... path=mm|mmv|mmv_p021|mmv_nc|mmv_rows|mm_id|mmv_id src0= src1= m= n= k= batch= [n_as= n_used=]
@@ -5186,7 +5190,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // [TAG_MMID_TILE_B1] the coopmat1 mul_mat_id pipelines' tiles. m / s are the mmq ones unchanged; l is, on AMD
         // coopmat1 (where upstream leaves mul_mat_id_l off), BM 128 x BN 64: the m tile's warp structure (warp tile WM x WN,
         // WMITER, TM / TN / TK fragments, BK) with twice the warps along M. Every output element still accumulates the same
-        // BK blocks of the same coopmat fragments in the same order - only which workgroup owns it changes (bit-identical).
+        // BK blocks of the same coopmat fragments in the same order - only which workgroup owns it changes. Evidence: byte-identical
+        // on the balkon 780M classifier (production expert shapes x n 1..2048 x uniform / skewed / hot / partial-tile routing,
+        // vs a v59 binary); the gfx1151 production-graph byte comparison is pending the oracle gate.
         // GGML_VK_MMID_TILE_BM128=0 keeps the upstream plan (l = the mmq l tile, and off on AMD).
         m_warptile_mmqidb1 = m_warptile_mmq; s_warptile_mmqidb1 = s_warptile_mmq; l_warptile_mmqidb1 = l_warptile_mmq;
         m_mmqidb1_wg_denoms = m_mmq_wg_denoms; s_mmqidb1_wg_denoms = s_mmq_wg_denoms; l_mmqidb1_wg_denoms = l_mmq_wg_denoms;
