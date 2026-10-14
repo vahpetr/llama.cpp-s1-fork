@@ -3058,21 +3058,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
             conv_kernel_size - 1, conv_channels, il, &conv_tails);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
-
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
-
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
-    cb(conv_output_silu, "conv_output_silu", il);
-
+    // [TAG_CONV_INPUT_SPLIT] with the tails deferred, the conv (+ silu) and then the tails are expanded HERE, where the v59
+    // graph expanded the concat-view tails - before build_rs's state nodes - so the rest of the graph keeps the v59
+    // expansion order (B4 fix round 2: expanding them after build_rs moved the state rows ahead of the qkv projection and
+    // reshuffled the backend's reorder sets). Knob off (no deferred tails): the v59 code path, unchanged.
+    ggml_tensor * conv_output_proper = nullptr;
+    ggml_tensor * conv_output_silu   = nullptr;
     if (!conv_tails.empty()) {
+        conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+
+        conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        cb(conv_output_silu, "conv_output_silu", il);
+
         ggml_build_forward_expand(gf, conv_output_silu);
         for (ggml_tensor * t : conv_tails) {
             ggml_build_forward_expand(gf, t);
         }
+    }
+
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    cb(state, "state_predelta", il);
+
+    if (conv_tails.empty()) {
+        conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+
+        conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        cb(conv_output_silu, "conv_output_silu", il);
     }
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
