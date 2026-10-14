@@ -1,0 +1,39 @@
+#version 450
+
+// [TAG_HC_MIX_TAIL] fused SCALE + UNARY(SILU): silu(x * param1 + param2) in one pass.
+// Bit-exact against scale.comp followed by unary.comp's op_silu for f32:
+//   * the scale expression is scale.comp's, character for character, and the elided store
+//     rounded to f32 anyway (FLOAT_TYPE and D_TYPE are float);
+//   * op_silu is copied from unary.comp unchanged;
+//   * the fusion is only matched with param2 == 0 (ggml_vk_can_fuse_scale_silu), so whether the
+//     compiler contracts x * param1 + param2 into an fma or not cannot change a bit: both round
+//     x * param1 once, and -0 + +0 = +0 either way.
+// The indexing is scale.comp's: contiguous src and dst, 128 threads x 4 iterations = 512.
+
+#include "types.glsl"
+#include "generic_unary_head.glsl"
+
+const uint num_threads = 128;
+
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+float op_silu(float x) {
+    return x / (1.0f + exp(-x));
+}
+
+void main() {
+    uint idx = get_idx();
+
+    // num_threads * num_iter must equal 512, to match the wg_denoms and get_idx calculation
+    const uint num_iter = 4;
+
+    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+        if (idx >= p.ne) {
+            continue;
+        }
+
+        const float y = float(FLOAT_TYPE(data_a[get_aoffset() + idx]) * FLOAT_TYPE(p.param1) + FLOAT_TYPE(p.param2));
+        data_d[get_doffset() + idx] = D_TYPE(op_silu(y));
+        idx += num_threads;
+    }
+}

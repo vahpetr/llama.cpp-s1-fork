@@ -4154,6 +4154,177 @@ struct test_hc_combine_fuse : public test_case {
     }
 };
 
+// [TAG_HC_MIX_TAIL] qwen4exp hyper-connection mix tail (build_hc_mix), two forms:
+//
+//   HC_MIX_TAIL_FUSE   build_hc_mix node for node: RMS_NORM+MUL(w_norm) -> reshape -> MUL_MAT(w_down)
+//                      -> SCALE(1/hc) -> SILU -> MUL_MAT(w_up) -> SIGMOID -> MUL(xn, gate) -> reshape ->
+//                      hc-1 ADDs of strided stream views -> SCALE(1/hc), against the CPU backend (NMSE). On
+//                      Vulkan the graph exercises rms_norm_mul, scale_silu, sigmoid_mul and multi_add_scale
+//                      (GGML_VK_FUSION_LIST=1 names what fired).
+//   HC_MIX_TAIL_EXACT  the two new fusions against the unfused chain ON THE SAME BACKEND, bit for bit. Each
+//                      tail is built twice from the same inputs: arm A as the model emits it (fusable), arm B
+//                      with the would-be-elided intermediate flagged as a graph output, which every fusion
+//                      predicate refuses (ggml_node_has_n_uses) - so arm B runs exactly the v59 dispatches
+//                      (SCALE, SILU apart; multi_add, then SCALE). The graph returns concat(A - B, B - A) of
+//                      both tails: +0 everywhere iff A and B are the same floats, a sign-of-zero difference
+//                      leaves a -0 in one half. The CPU computes +0 everywhere and the outputs are compared
+//                      BITWISE (err = number of differing bit patterns, max 0). Inputs carry exact +0 / -0
+//                      entries and a wide silu range.
+struct test_hc_mix_tail_fuse : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+    const int64_t rank;
+    const bool    exact;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return exact ? "HC_MIX_TAIL_EXACT" : "HC_MIX_TAIL_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, hc, n_tokens, rank);
+    }
+
+    double max_nmse_err() override { return exact ? 0.0 : 5e-4; }
+    double max_err() override { return exact ? 0.0 : max_nmse_err(); }
+    double max_err(ggml_backend_t backend) override { GGML_UNUSED(backend); return max_err(); }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!exact) {
+            return nmse(a, b, n);
+        }
+        size_t bad = 0;
+        for (size_t i = 0; i < n; i++) {
+            bad += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        }
+        return (double) bad;
+    }
+
+    test_hc_mix_tail_fuse(int64_t n_embd = 2560, int64_t hc = 4, int64_t n_tokens = 5, int64_t rank = 320, bool exact = false)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens), rank(rank), exact(exact) {}
+
+    // the stream mean of build_hc_mix: (((s0 + s1) + s2) + s3) over strided views, then SCALE(1/hc);
+    // mark_sum flags the sum as an output so nothing can fuse the SCALE into it.
+    //
+    // Node order: the model's depth-first expansion interleaves VIEW s_c and ADD; in the model the
+    // scheduler's ggml_vk_graph_optimize then emits the (empty) views first, which is what makes the
+    // ADDs consecutive and lets multi_add match. ggml_backend_compare_graph_backend computes the graph
+    // as built, without graph_optimize, so the views are expanded into gf here first, and the chain
+    // right after it: the order graph_optimize produces, not the raw expansion.
+    ggml_tensor * stream_mean(ggml_context * ctx, ggml_tensor * gated, bool mark_sum) {
+        const size_t row = ggml_row_size(gated->type, n_embd);
+        std::vector<ggml_tensor *> views;
+        for (int64_t c = 0; c < hc; ++c) {
+            views.push_back(ggml_view_2d(ctx, gated, n_embd, n_tokens, row * hc, row * c));
+            if (gf && mode == MODE_TEST) {   // only the test mode builds gf before build_graph
+                ggml_build_forward_expand(gf, views.back());
+            }
+        }
+        ggml_tensor * mixed = views[0];
+        for (int64_t c = 1; c < hc; ++c) {
+            mixed = ggml_add(ctx, mixed, views[c]);
+        }
+        if (mark_sum && hc > 1) {
+            ggml_set_output(mixed);
+        }
+        ggml_tensor * out = ggml_scale(ctx, mixed, 1.0f / (float) hc);
+        if (gf && mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, out);
+        }
+        return out;
+    }
+
+    // silu(scale(lo, 1/hc)); mark_scale flags the scale as an output so the pair cannot fuse
+    ggml_tensor * scaled_silu(ggml_context * ctx, ggml_tensor * lo, bool mark_scale) {
+        ggml_tensor * s = ggml_scale(ctx, lo, 1.0f / (float) hc);
+        if (mark_scale) {
+            ggml_set_output(s);
+        }
+        return ggml_silu(ctx, s);
+    }
+
+    ggml_tensor * flat_diff(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
+        ggml_tensor * d0 = ggml_sub(ctx, a, b);
+        ggml_tensor * d1 = ggml_sub(ctx, b, a);
+        return ggml_concat(ctx, ggml_reshape_1d(ctx, d0, ggml_nelements(d0)),
+                                ggml_reshape_1d(ctx, d1, ggml_nelements(d1)), 0);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc_dim = hc * n_embd;
+
+        if (exact) {
+            ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, n_tokens);
+            ggml_set_name(lo, "lo");
+            ggml_tensor * gated = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_set_name(gated, "gated");
+
+            ggml_tensor * silu_a = scaled_silu(ctx, lo, false);
+            ggml_tensor * silu_b = scaled_silu(ctx, lo, true);
+            ggml_tensor * mix_a  = stream_mean(ctx, gated, false);
+            ggml_tensor * mix_b  = stream_mean(ctx, gated, true);
+
+            ggml_tensor * out = ggml_concat(ctx, flat_diff(ctx, silu_a, silu_b), flat_diff(ctx, mix_a, mix_b), 0);
+            ggml_set_name(out, "out");
+            return out;
+        }
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * w_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(w_norm, "w_norm");
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, rank);
+        ggml_set_name(w_down, "w_down");
+        ggml_tensor * w_up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, hc_dim);
+        ggml_set_name(w_up, "w_up");
+
+        ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w_norm);
+        xn = ggml_reshape_2d(ctx, xn, hc_dim, n_tokens);
+
+        ggml_tensor * lo = scaled_silu(ctx, ggml_mul_mat(ctx, w_down, xn), false);
+        ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_up, lo));
+
+        ggml_tensor * gated = ggml_mul(ctx, xn, gate);
+        gated = ggml_reshape_3d(ctx, gated, n_embd, hc, n_tokens);
+
+        ggml_tensor * out = stream_mean(ctx, gated, false);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0x9e3779b9u ^ (uint32_t) (n_embd*31 + hc*131 + n_tokens*17 + rank*7 + exact));
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->type != GGML_TYPE_F32) {
+                continue;
+            }
+            const std::string name = ggml_get_name(t);
+            float lo = -1.0f, hi = 1.0f;
+            if (name == "lo") {
+                lo = -12.0f; hi = 12.0f;    // both silu tails
+            } else if (name == "w_norm") {
+                lo = 0.5f; hi = 1.5f;       // the converter folds gamma to (1 + w)
+            } else if (name == "w_down" || name == "w_up") {
+                const float a = 2.0f / sqrtf((float) t->ne[0]);
+                lo = -a; hi = a;
+            }
+            std::uniform_real_distribution<float> u(lo, hi);
+            std::vector<float> v(ggml_nelements(t));
+            for (auto & e : v) {
+                e = u(rng);
+                // exact zeros of both signs in the exact form's inputs (1 in 32)
+                if (exact && (rng() & 31) == 0) {
+                    e = (rng() & 1) ? -0.0f : 0.0f;
+                }
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
+        }
+    }
+};
+
 // Fused Gated-DeltaNet decay pre-chain (qwen4exp build_layer_attn_linear):
 //   ADD(alpha, ssm_dt) -> UNARY(SOFTPLUS) -> MUL(., ssm_a)
 // Production geometry is nh = num_v_heads = 48 over the draft-length token range.
@@ -10521,6 +10692,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_combine_fuse(1, 4, 5));       // degenerate row
     test_cases.emplace_back(new test_hc_combine_fuse(2560, 1, 5));    // hc == 1
     test_cases.emplace_back(new test_hc_combine_fuse(257, 3, 7));     // all primes
+
+    // [TAG_HC_MIX_TAIL] qwen4exp hc_mix tail: the build_hc_mix chain against the CPU, and the two new fusions
+    // (multi_add_scale, scale_silu) bit for bit against the unfused chain on the same backend - production
+    // geometry (n_embd 2560, hc 4, rank 320) at decode / draft / prefill-ubatch token counts, then hc == 1,
+    // hc == 2 (one ADD: no multi_add), odd hc and off-geometry rows
+    for (bool exact : { false, true }) {
+        for (int64_t nt : { 1, 4, 5, 2048 }) {
+            test_cases.emplace_back(new test_hc_mix_tail_fuse(2560, 4, nt, 320, exact));
+        }
+        test_cases.emplace_back(new test_hc_mix_tail_fuse(2560, 1, 5, 320, exact));    // hc == 1
+        test_cases.emplace_back(new test_hc_mix_tail_fuse(2560, 2, 5, 320, exact));    // hc == 2
+        test_cases.emplace_back(new test_hc_mix_tail_fuse(2560, 3, 5, 320, exact));    // odd hc
+        test_cases.emplace_back(new test_hc_mix_tail_fuse(2560, 5, 4, 320, exact));    // odd hc, 4 adds
+        test_cases.emplace_back(new test_hc_mix_tail_fuse(257, 3, 7, 31, exact));      // all primes
+        test_cases.emplace_back(new test_hc_mix_tail_fuse(31, 4, 17, 5, exact));       // non-power-of-two row
+    }
 
     // qwen4exp Gated-DeltaNet decay pre-chain fusion, at the production geometry
     // (num_v_heads 48) over the draft-length range, plus off-geometry shapes and the

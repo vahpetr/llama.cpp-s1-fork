@@ -20,6 +20,10 @@ layout (push_constant) uniform parameter2
     uint nb[12][4];
 
     uint rms_partials;
+#if defined(MULTI_ADD_SCALE)
+    // [TAG_HC_MIX_TAIL] the trailing ggml_scale of the sum, applied exactly as scale.comp does
+    float scale_param1; float scale_param2;
+#endif
 } p;
 
 // No readonly/writeonly decorations. Workaround for MoltenVK Bug, see https://github.com/ggml-org/llama.cpp/issues/15498
@@ -164,7 +168,13 @@ void main() {
             sum += load_a(s, src_idx(s, i00, i01, i02, i03));
         }
         sum_sq += sum*sum;
+#if defined(MULTI_ADD_SCALE)
+        // the elided ADD store rounded to f32 (FLOAT_TYPE is float here), and scale.comp evaluates
+        // FLOAT_TYPE(x) * FLOAT_TYPE(param1) + FLOAT_TYPE(param2) on that value: the same expression
+        store_d(num_srcs, dst_idx(i00, i01, i02, i03), sum * FLOAT_TYPE(p.scale_param1) + FLOAT_TYPE(p.scale_param2));
+#else
         store_d(num_srcs, dst_idx(i00, i01, i02, i03), sum);
+#endif
 
         idx += num_threads;
     }

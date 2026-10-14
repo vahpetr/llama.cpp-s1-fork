@@ -1047,12 +1047,16 @@ struct vk_device_struct {
     // indexed by num_additional_fused_ops == num_adds - 1
     vk_pipeline pipeline_multi_add[MAX_FUSED_ADDS];
     vk_pipeline pipeline_multi_add_rms[MAX_FUSED_ADDS];
+    // [TAG_HC_MIX_TAIL] ADD+ADD(+ADD...)+SCALE, indexed like pipeline_multi_add (number of adds - 1)
+    vk_pipeline pipeline_multi_add_scale[MAX_FUSED_ADDS];
 
     vk_pipeline pipeline_add_id_f32;
 
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
     vk_pipeline pipeline_scale_f32;
+    // [TAG_HC_MIX_TAIL] SCALE + UNARY(SILU)
+    vk_pipeline pipeline_scale_silu_f32;
     vk_pipeline pipeline_log[2];
     vk_pipeline pipeline_tri[2];
     vk_pipeline pipeline_diag[2];
@@ -1241,6 +1245,9 @@ struct vk_device_struct {
     bool fuse_hc_combine;
     bool fuse_sigmoid_mul;
     bool fuse_gdn_pre;
+    // [TAG_HC_MIX_TAIL] GGML_VK_FUSE_MULTI_ADD_SCALE / GGML_VK_FUSE_SCALE_SILU
+    bool fuse_multi_add_scale;
+    bool fuse_scale_silu;
     // split a dim-0 concat with a transposed src1 into copy + tiled transpose-copy
     // (default on, GGML_VK_CONCAT_TRANSPOSE=0 turns it off)
     bool concat_transpose;
@@ -1780,6 +1787,17 @@ struct vk_op_multi_add_push_constants {
 // update multi_add.comp if this changes
 static_assert(MAX_PARAMETER_COUNT == 12);
 static_assert(sizeof(vk_op_multi_add_push_constants) <= 256);
+
+// [TAG_HC_MIX_TAIL] multi_add_scale: the multi_add layout plus the trailing SCALE's two params
+// (multi_add.comp under MULTI_ADD_SCALE declares the two floats after rms_partials)
+struct vk_op_multi_add_scale_push_constants {
+    vk_op_multi_add_push_constants base;
+    float scale_param1;
+    float scale_param2;
+};
+static_assert(std::is_standard_layout_v<vk_op_multi_add_scale_push_constants>);
+static_assert(offsetof(vk_op_multi_add_scale_push_constants, scale_param1) == sizeof(vk_op_multi_add_push_constants));
+static_assert(sizeof(vk_op_multi_add_scale_push_constants) <= 256);
 
 struct vk_op_topk_moe_push_constants {
     uint32_t n_rows;
@@ -2467,6 +2485,8 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // ggml_backend_vk_graph_compute; the sites are tried in this order, so disabling a longer pattern
 // lets its shorter prefix match instead (no mul_mat_add_add -> mul_mat_add fires):
 //   multi_add                        ADD+ADD(+ADD...)                     ggml_vk_fuse_multi_add
+//   multi_add_scale                  the trailing SCALE appended to a multi_add (qwen4exp hc_mix stream mean;
+//                                    disabling it leaves the plain multi_add + SCALE)
 //   mul_mat_add_add                  MUL_MAT+ADD+ADD                      (mat-vec bias adds)
 //   mul_mat_add                      MUL_MAT+ADD
 //   mul_mat_id_add_id_mul            MUL_MAT_ID+ADD_ID+MUL
@@ -2488,6 +2508,7 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 //   topk_moe_late_softmax            ARGSORT+VIEW+GET_ROWS+RESHAPE+SOFT_MAX+RESHAPE
 //   topk_moe_scale                   the optional trailing DIV+RESHAPE+SCALE / GET_ROWS+SCALE appended to any topk_moe_*
 //   add_softplus_mul                 ADD+SOFTPLUS+MUL                     (qwen4exp GDN decay pre-chain)
+//   scale_silu                       SCALE+SILU                           (qwen4exp hc_mix down projection)
 //   sigmoid_mul                      SIGMOID+MUL
 //   add_rms                          ADD that also writes the sum-of-squares partials consumed by the RMS_NORM
 //                                    right after it (ggml_vk_build_graph; decode only, rows == 1)
@@ -2510,7 +2531,7 @@ static const char * const vk_fusion_pattern_names[] = {
     "ssm_conv_bias_silu", "ssm_conv_silu", "rope_view_set_rows", "hc_combine", "snake", "topk_qsa",
     "topk_moe_early_softmax_norm", "topk_moe_sigmoid_norm_bias", "topk_moe_sqrt_softplus_norm_bias",
     "topk_moe_early_softmax", "topk_moe_late_softmax", "topk_moe_scale", "add_softplus_mul",
-    "sigmoid_mul", "add_rms",
+    "sigmoid_mul", "add_rms", "multi_add_scale", "scale_silu",
 };
 static bool vk_fusion_patterns_disabled_any = false;
 static std::vector<std::string> vk_fusion_patterns_disabled; // lower-case; trailing '*' = prefix match
@@ -2991,6 +3012,10 @@ struct ggml_backend_vk_context {
     bool fused_mul_sigmoid {};
     // ADD + UNARY(SOFTPLUS) + MUL: the GDN decay pre-chain, one dispatch off the ADD node
     bool fused_gdn_pre {};
+    // [TAG_HC_MIX_TAIL] multi_add whose last fused node is the trailing SCALE (num_additional_fused_ops
+    // then counts the adds AND the scale), and SCALE + SILU dispatched off the SCALE node
+    bool fused_multi_add_scale {};
+    bool fused_scale_silu {};
     // GGML_VK_FUSION_COUNT: add_rms fusions of the current graph (decided inside ggml_vk_build_graph)
     int fusion_count_add_rms {};
     // GGML_VK_FUSION_COUNT: running numerics signature of the current graph. Fed once per node
@@ -6509,6 +6534,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         for (uint32_t i = 0; i < MAX_FUSED_ADDS; ++i) {
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add[i],     "multi_add_f32_"     + std::to_string(i+1), multi_add_f32_len,     multi_add_f32_data,     "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add_rms[i], "multi_add_rms_f32_" + std::to_string(i+1), multi_add_rms_f32_len, multi_add_rms_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
+            ggml_vk_create_pipeline2(device, device->pipeline_multi_add_scale[i], "multi_add_scale_f32_" + std::to_string(i+1), multi_add_scale_f32_len, multi_add_scale_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_scale_push_constants), {512, 1, 1}, {i+2}, 1);
         }
     }
 
@@ -6528,6 +6554,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_antialias_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_scale_f32, "scale_f32", scale_f32_len, scale_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_scale_silu_f32, "scale_silu_f32", scale_silu_f32_len, scale_silu_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_log[0], "log_f32", log_f32_len, log_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_log[1], "log_f16", log_f16_len, log_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -8173,6 +8200,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->fuse_hc_combine  = fuse_enabled("GGML_VK_FUSE_HC_COMBINE");
         device->fuse_sigmoid_mul = fuse_enabled("GGML_VK_FUSE_SIGMOID_MUL");
         device->fuse_gdn_pre     = fuse_enabled("GGML_VK_FUSE_GDN_PRE");
+        // [TAG_HC_MIX_TAIL] the qwen4exp hc_mix tail: the ordered stream sum + its 1/hc SCALE
+        // (multi_add_scale, on top of multi_add) and the SCALE + SILU after the down projection
+        device->fuse_multi_add_scale = fuse_enabled("GGML_VK_FUSE_MULTI_ADD_SCALE") && device->multi_add &&
+                                       device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_scale_push_constants);
+        device->fuse_scale_silu      = fuse_enabled("GGML_VK_FUSE_SCALE_SILU");
 
         // Same "default on, =0 disables" convention for the concat transpose split. Like the
         // fusions above, both arms are bit-identical, so this is an A/B knob and not a fallback.
@@ -13111,7 +13143,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_SCALE:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_scale_f32;
+            return ctx->fused_scale_silu ? ctx->device->pipeline_scale_silu_f32 : ctx->device->pipeline_scale_f32;
         }
         return nullptr;
     case GGML_OP_SQR:
@@ -14310,16 +14342,21 @@ static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx,
     const ggml_tensor *first_node = cgraph->nodes[node_idx];
     const ggml_tensor *dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
 
+    // [TAG_HC_MIX_TAIL] under fused_multi_add_scale the last fused node is the SCALE: it is the
+    // destination, but it adds no source
+    const int32_t num_extra_adds = ctx->num_additional_fused_ops - (ctx->fused_multi_add_scale ? 1 : 0);
+    GGML_ASSERT(!(ctx->fused_multi_add_scale && ctx->do_add_rms_partials));
+
     // Make a list of all the tensors used by the op.
     // Last element of the list is the dest tensor.
     const ggml_tensor *tensors[MAX_PARAMETER_COUNT];
-    uint32_t num_srcs = ctx->num_additional_fused_ops + 2;
+    uint32_t num_srcs = num_extra_adds + 2;
     uint32_t num_tensors = num_srcs + 1;
     GGML_ASSERT(num_tensors + ctx->do_add_rms_partials <= MAX_PARAMETER_COUNT);
 
     tensors[0] = first_node->src[0];
     tensors[1] = first_node->src[1];
-    for (int32_t i = 0; i < ctx->num_additional_fused_ops; ++i) {
+    for (int32_t i = 0; i < num_extra_adds; ++i) {
         // check whether the previous result is src[0] or src[1]
         if (cgraph->nodes[node_idx + i] == cgraph->nodes[node_idx + i + 1]->src[0]) {
             tensors[i+2] = cgraph->nodes[node_idx + i + 1]->src[1];
@@ -14344,7 +14381,9 @@ static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx,
     }
     pc.rms_partials = ctx->do_add_rms_partials;
 
-    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, tensors[0], tensors[1], nullptr, dst, dst->op);
+    vk_pipeline pipeline = ctx->fused_multi_add_scale
+        ? ctx->device->pipeline_multi_add_scale[num_extra_adds]
+        : ggml_vk_op_get_pipeline(ctx, tensors[0], tensors[1], nullptr, dst, dst->op);
 
     if (pipeline == nullptr) {
         std::cerr << "ggml_vulkan: Error: Missing multi_add";
@@ -14396,8 +14435,8 @@ static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx,
     }
 
     static_assert(MAX_PARAMETER_COUNT == 12);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {
+    // a named initializer_list keeps its backing array alive to the end of this scope
+    const std::initializer_list<vk::DescriptorBufferInfo> descriptors = {
             ggml_vk_subbuffer(ctx, buf[0], offset[0]),
             ggml_vk_subbuffer(ctx, buf[1], offset[1]),
             ggml_vk_subbuffer(ctx, buf[2], offset[2]),
@@ -14410,7 +14449,17 @@ static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx,
             ggml_vk_subbuffer(ctx, buf[9], offset[9]),
             ggml_vk_subbuffer(ctx, buf[10], offset[10]),
             ggml_vk_subbuffer(ctx, buf[11], offset[11]),
-        }, pc, elements);
+    };
+    if (ctx->fused_multi_add_scale) {
+        // [TAG_HC_MIX_TAIL] the SCALE's (s, b) exactly as ggml_vk_scale passes them to scale.comp
+        vk_op_multi_add_scale_push_constants pcs;
+        pcs.base = pc;
+        pcs.scale_param1 = ggml_get_op_params_f32(dst, 0);
+        pcs.scale_param2 = ggml_get_op_params_f32(dst, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, descriptors, pcs, elements);
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, descriptors, pc, elements);
+    }
 }
 
 static void ggml_vk_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -15048,10 +15097,15 @@ static void ggml_vk_upscale(ggml_backend_vk_context * ctx, vk_context& subctx, c
     });
 }
 
-static void ggml_vk_scale(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+// scale_node carries the params; dst is where the result goes (the SILU node under fused_scale_silu)
+static void ggml_vk_scale(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst,
+                          const ggml_tensor * scale_node = nullptr) {
+    if (scale_node == nullptr) {
+        scale_node = dst;
+    }
     vk_op_unary_push_constants p = vk_op_unary_push_constants_init(src0, dst);
-    p.param1 = ggml_get_op_params_f32(dst, 0);
-    p.param2 = ggml_get_op_params_f32(dst, 1);
+    p.param1 = ggml_get_op_params_f32(scale_node, 0);
+    p.param2 = ggml_get_op_params_f32(scale_node, 1);
 
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_SCALE, std::move(p));
 }
@@ -17918,7 +17972,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     ggml_tensor * src2 = node->src[2];
     ggml_tensor * src3 = node->src[3];
 
-    if (node->op == GGML_OP_ADD) {
+    // [TAG_HC_MIX_TAIL] not after multi_add_scale: the partials would be of the sum, not of the
+    // scaled value the RMS_NORM reads
+    if (node->op == GGML_OP_ADD && !ctx->fused_multi_add_scale) {
         int next_node_idx = node_idx + 1 + ctx->num_additional_fused_ops;
         if (next_node_idx < cgraph->n_nodes &&
             cgraph->nodes[next_node_idx]->op == GGML_OP_RMS_NORM &&
@@ -18138,7 +18194,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_SCALE:
-        ggml_vk_scale(ctx, compute_ctx, src0, node);
+        if (ctx->fused_scale_silu) {
+            // [TAG_HC_MIX_TAIL] SCALE + SILU: the scale's params, the SILU's destination
+            ggml_vk_scale(ctx, compute_ctx, src0, cgraph->nodes[node_idx + 1], node);
+        } else {
+            ggml_vk_scale(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_SQR:
@@ -20175,6 +20236,100 @@ static uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const stru
     return num_adds;
 }
 
+// [TAG_HC_MIX_TAIL] multi_add_scale: the num_adds-long multi_add at node_idx (as returned by
+// ggml_vk_fuse_multi_add) plus the SCALE that consumes its result - the qwen4exp build_hc_mix
+// stream mean, ((s0 + s1) + s2) + s3 then * 1/hc. One dispatch writes the scaled sum.
+//
+// Bit-exactness: multi_add.comp keeps the f32 sum of the plain multi_add (same operands, same
+// order); under MULTI_ADD_SCALE it applies scale.comp's expression sum * param1 + param2 to that
+// f32 value instead of storing it. Only param2 == 0 is matched (it is what ggml_scale emits), so
+// an fma contraction in either shader cannot change a bit (see scale_silu.comp).
+//
+// Alias safety: ggml-alloc may hand the SCALE a destination that partially overlaps a stream
+// view (the gated tensor is dead once the last ADD has run). The overlap veto in graph_compute
+// would then undo the whole fusion, adds included; checking it here keeps the plain multi_add.
+static bool ggml_vk_can_fuse_multi_add_scale(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
+                                             uint32_t num_adds) {
+    if (!ctx->device->fuse_multi_add_scale || num_adds < 2 || num_adds > MAX_FUSED_ADDS) {
+        return false;
+    }
+    const int scale_idx = node_idx + (int) num_adds;
+    if (scale_idx >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_op ops[MAX_FUSED_ADDS + 1];
+    for (uint32_t k = 0; k < num_adds; ++k) {
+        ops[k] = GGML_OP_ADD;
+    }
+    ops[num_adds] = GGML_OP_SCALE;
+    // the adds' result has the scale as its only use, is not an output, and has its shape
+    if (!ggml_can_fuse(cgraph, node_idx, ops, (int) num_adds + 1)) {
+        return false;
+    }
+
+    const ggml_tensor * last_add = cgraph->nodes[scale_idx - 1];
+    const ggml_tensor * scale    = cgraph->nodes[scale_idx];
+    if (scale->src[0] != last_add || scale->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (ggml_get_op_params_f32(scale, 1) != 0.0f) {
+        return false;
+    }
+    if (get_misalign_bytes(ctx, scale)) {
+        return false;
+    }
+
+    for (int k = 0; k <= (int) num_adds; ++k) {
+        const ggml_tensor * node = cgraph->nodes[node_idx + k];
+        for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = node->src[s];
+            if (!src || src->op == GGML_OP_NONE) {
+                continue;
+            }
+            bool elided = false;
+            for (int n = 0; n <= k; ++n) {
+                elided = elided || cgraph->nodes[node_idx + n] == src;
+            }
+            if (!elided && ggml_vk_tensors_overlap(src, scale, true)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// [TAG_HC_MIX_TAIL] SCALE + UNARY(SILU), the qwen4exp build_hc_mix silu(scale(w_down x, 1/hc)).
+// scale_silu.comp evaluates scale.comp's expression and unary.comp's op_silu on the register
+// value; the elided store rounded to f32 anyway. Matched only for f32, param2 == 0 and
+// contiguous src / destination (scale.comp indexes linearly).
+static bool ggml_vk_can_fuse_scale_silu(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ctx->device->fuse_scale_silu) {
+        return false;
+    }
+    if (!ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_SCALE, GGML_OP_UNARY })) {
+        return false;
+    }
+
+    const ggml_tensor * scale = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * silu  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * x     = scale->src[0];
+
+    if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != scale) {
+        return false;
+    }
+    if (x->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (ggml_get_op_params_f32(scale, 1) != 0.0f) {
+        return false;
+    }
+    if (!ggml_are_same_shape(x, silu) || !ggml_is_contiguous(x) || !ggml_is_contiguous(silu)) {
+        return false;
+    }
+    return true;
+}
+
 static int32_t find_first_set(uint32_t x) {
     int32_t ret = 0;
     if (!x) {
@@ -20411,6 +20566,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_mul_sigmoid = false;
         ctx->fused_gdn_pre = false;
         ctx->fused_topk_qsa = false;
+        ctx->fused_multi_add_scale = false;
+        ctx->fused_scale_silu = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -20418,6 +20575,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+                // [TAG_HC_MIX_TAIL] extend by the trailing SCALE; a veto leaves the plain multi_add
+                if (ggml_vk_can_fuse_multi_add_scale(ctx, cgraph, i, num_adds) &&
+                    !vk_fusion_veto(ctx, "multi_add_scale")) {
+                    ctx->num_additional_fused_ops = num_adds;
+                    ctx->fused_multi_add_scale = true;
+                    fusion_string = "MULTI_ADD_SCALE";
+                    // the scale reads only the elided sum (its own src), elementwise
+                    op_srcs_fused_elementwise[num_adds] = true;
+                }
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD }) &&
                        !vk_fusion_veto(ctx, "mul_mat_add_add")) {
                 ctx->num_additional_fused_ops = 2;
@@ -20589,6 +20755,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // ggml_vk_tensors_overlap still rejects any overlap of theirs (they are read
                 // with a broadcast, not elementwise).
                 std::fill_n(op_srcs_fused_elementwise, 3, true);
+            } else if (ggml_vk_can_fuse_scale_silu(ctx, cgraph, i) &&
+                       !vk_fusion_veto(ctx, "scale_silu")) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_scale_silu = true;
+                fusion_string = "SCALE_SILU";
+                // each thread reads its own element of the scale's src into a register before it
+                // writes the same element of the destination, so an exact alias is safe
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse_sigmoid_mul(ctx, cgraph, i) &&
                        !vk_fusion_veto(ctx, "sigmoid_mul")) {
                 ctx->num_additional_fused_ops = 1;
@@ -20692,6 +20867,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_mul_sigmoid = false;
                 ctx->fused_gdn_pre = false;
                 ctx->fused_topk_qsa = false;
+                ctx->fused_multi_add_scale = false;
+                ctx->fused_scale_silu = false;
             }
         }
 
@@ -21168,6 +21345,19 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
+                    // [TAG_HC_MIX_TAIL] keep the trailing SCALE right behind the last ADD of an ADD
+                    // chain (multi_add_scale) and the SILU right behind its SCALE (scale_silu), so no
+                    // independent node is pulled in between them. Gated by the fusion knobs, so
+                    // GGML_VK_FUSE_MULTI_ADD_SCALE=0 / GGML_VK_FUSE_SCALE_SILU=0 also restore the v59 order.
+                    !(j == c+1 && c == current_set.back() &&
+                      !ctx->device->disable_fusion && ctx->device->fuse_multi_add_scale &&
+                      graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_SCALE &&
+                      ((graph->nodes[c]->src[0] && graph->nodes[c]->src[0]->op == GGML_OP_ADD) ||
+                       (graph->nodes[c]->src[1] && graph->nodes[c]->src[1]->op == GGML_OP_ADD))) &&
+                    !(j == c+1 && c == current_set.back() &&
+                      !ctx->device->disable_fusion && ctx->device->fuse_scale_silu &&
+                      graph->nodes[c]->op == GGML_OP_SCALE && graph->nodes[j]->op == GGML_OP_UNARY &&
+                      ggml_get_unary_op(graph->nodes[j]) == GGML_UNARY_OP_SILU) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL) &&
