@@ -111,6 +111,8 @@ against the code for this table.
 | `GGML_VK_CONCAT_TRANSPOSE=0`, `GGML_VK_FUSE_HC_COMBINE=0`, `GGML_VK_FUSE_SIGMOID_MUL=0`, `GGML_VK_FUSE_GDN_PRE=0` | on | disable one fork kernel / fusion (A/B) | EXACT | - |
 | `GGML_VK_FUSE_MULTI_ADD_SCALE=0`, `GGML_VK_FUSE_SCALE_SILU=0` | on | disable one hc_mix tail fusion (patch 0227: multi_add + trailing SCALE - qwen4exp hc_mix stream mean and QSA pooled-key mean - and SCALE + SILU; pattern names `multi_add_scale`, `scale_silu`; no node-order change) (B3 arm, not in a release yet) | EXACT | - |
 | `GGML_VK_FUSE_CONCAT_SSM_CONV=0` | on | read the GDN conv window from state | x instead of writing the concat (patch 0228; patterns `concat_ssm_conv`, `_silu`, `_bias_silu`; prefill ubatches only); =0 also restores the graph_optimize order (B4 arm, not in a release yet) | EXACT | - |
+| `GGML_VK_MMID_PRECAST_B=0` | on | coopmat1 mul_mat_id converts B to f16 once (shared by gate/up) and runs the f16-B twin of the shader instead of converting per tile (patch 0231, B1 arm, not in a release yet) | EXACT | - |
+| `GGML_VK_MMID_TILE_BM128=0` | on | AMD coopmat1 mul_mat_id large tile BM 128 x BN 64 (m > 64 and n > 64; upstream: off on AMD) (patch 0232, B1 arm, not in a release yet) | EXACT | - |
 | `GGML_VK_FA_DEADV_LDS=1`, `GGML_VK_FA_NO_ZERO_DEAD_V=1` | 0 | FA dead-column variants (A/B; the second reopens an RDNA3 signed-zero hazard) | DIAG | - |
 | `GGML_VK_OPT_WINDOW=N` | 20 | graph_optimize independence window | COMPOSITION | - |
 | `GGML_VK_DMMV_RM_{KQ,STDQ,KQ_INT,STDQ_INT,F32}` | built-in | rows per workgroup for dense mat-vec | EXACT | - |
