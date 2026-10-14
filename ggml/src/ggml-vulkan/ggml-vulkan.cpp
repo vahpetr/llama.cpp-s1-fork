@@ -2516,14 +2516,10 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // ggml_vk_graph_optimize's keep_pattern list is deliberately not gated: it only keeps a pattern's
 // nodes adjacent (GGML_VK_DISABLE_FUSION does not gate it either), so the node order of a run with
 // a pattern disabled is the same as with the pattern enabled.
-// [TAG_HC_MIX_TAIL] Exception: the two graph_optimize carve-outs for multi_add_scale (ADD of an ADD
-// chain -> SCALE) and scale_silu (SCALE -> SILU) ARE gated, by the per-fusion device knobs
-// GGML_VK_FUSE_MULTI_ADD_SCALE=0 / GGML_VK_FUSE_SCALE_SILU=0 (default on) and by
-// GGML_VK_DISABLE_FUSION. Only those restore the v59 node order; disabling the patterns by name here
-// (GGML_VK_DISABLE_FUSION_PATTERNS=multi_add_scale,scale_silu) stops the fusions but keeps the
-// knob-on order. The carve-outs reach beyond the pair: independent nodes v59 placed between the two
-// nodes move behind the second one, and a set that ended in an ADD (where the view pass is skipped)
-// now ends later, so views can move one set earlier.
+// [TAG_HC_MIX_TAIL] multi_add_scale and scale_silu add no graph_optimize carve-out (fix round 1: carve-outs
+// moved independent nodes and cost the QSA pool mean its multi_add), so the node order is the v59 order with
+// the knobs on or off (GGML_VK_FUSE_MULTI_ADD_SCALE=0 / GGML_VK_FUSE_SCALE_SILU=0, default on); the fusions
+// fire wherever v59's order already has the pair adjacent.
 //
 // Port note vs the source commit: the gate is the *last* term of each match condition instead of
 // the first, so a veto is only recorded for a pattern that really matched at this node and
@@ -21370,19 +21366,6 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
-                    // [TAG_HC_MIX_TAIL] keep the trailing SCALE right behind the last ADD of an ADD
-                    // chain (multi_add_scale) and the SILU right behind its SCALE (scale_silu), so no
-                    // independent node is pulled in between them. Gated by the fusion knobs, so
-                    // GGML_VK_FUSE_MULTI_ADD_SCALE=0 / GGML_VK_FUSE_SCALE_SILU=0 also restore the v59 order.
-                    !(j == c+1 && c == current_set.back() &&
-                      !ctx->device->disable_fusion && ctx->device->fuse_multi_add_scale &&
-                      graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_SCALE &&
-                      ((graph->nodes[c]->src[0] && graph->nodes[c]->src[0]->op == GGML_OP_ADD) ||
-                       (graph->nodes[c]->src[1] && graph->nodes[c]->src[1]->op == GGML_OP_ADD))) &&
-                    !(j == c+1 && c == current_set.back() &&
-                      !ctx->device->disable_fusion && ctx->device->fuse_scale_silu &&
-                      graph->nodes[c]->op == GGML_OP_SCALE && graph->nodes[j]->op == GGML_OP_UNARY &&
-                      ggml_get_unary_op(graph->nodes[j]) == GGML_UNARY_OP_SILU) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL) &&
