@@ -1011,6 +1011,8 @@ struct vk_device_struct {
     vk_matmul_pipeline2 pipeline_matmul_id_f16_f32;
 
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id[GGML_TYPE_COUNT];
+    // [TAG_MMID_PRECAST_B] the same coopmat1 mul_mat_id shaders with an f16 B (the activations pre-cast once per src1)
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_matmul_split_k_reduce;
@@ -1259,6 +1261,8 @@ struct vk_device_struct {
     bool fuse_concat_ssm_conv;
     // [TAG_VK_DISPATCH_LOG] GGML_VK_DISPATCH_LOG=1: one [vk-dispatch] line per MUL_MAT / MUL_MAT_VEC / MUL_MAT_ID dispatch
     bool dispatch_log;
+    // [TAG_MMID_PRECAST_B] GGML_VK_MMID_PRECAST_B (default on)
+    bool mmid_precast_b;
     // split a dim-0 concat with a transposed src1 into copy + tiled transpose-copy
     // (default on, GGML_VK_CONCAT_TRANSPOSE=0 turns it off)
     bool concat_transpose;
@@ -2556,6 +2560,9 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // GGML_VK_FUSION_COUNT can report it as disabled:<name>=<count>. Every ggml_vk_can_fuse*/
 // ggml_vk_fuse_multi_add predicate is side-effect free (none of them writes ctx->), so evaluating
 // the predicate before the gate changes nothing but the cost of a run that sets the knob.
+//
+// [TAG_MMID_PRECAST_B] GGML_VK_MMID_PRECAST_B (default on; =0 off): coopmat1 quantized-A mul_mat_id converts the f32 B once
+// to f16 (the y staging cpy, shared by gate / up) and runs the f16-B twin of the same shader instead of converting per tile.
 //
 // [TAG_VK_DISPATCH_LOG] GGML_VK_DISPATCH_LOG=1 (default off, read once at device init) prints one stderr line
 // "[vk-dispatch] op=... path=mm|mmv|mmv_p021|mmv_nc|mmv_rows|mm_id|mmv_id src0= src1= m= n= k= batch= [n_as= n_used=]
@@ -5709,6 +5716,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_TQ2_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_TQ2_0], matmul_id_subgroup_tq2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_K], matmul_id_subgroup_q3_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_K], matmul_id_subgroup_q4_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        // [TAG_MMID_PRECAST_B] f16-B twins of the coopmat1 mul_mat_id pipelines (same shader source, B_TYPE f16; same tiles)
+        CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q4_0], matmul_id_subgroup_q4_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q4_1], matmul_id_subgroup_q4_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q5_0], matmul_id_subgroup_q5_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q5_1], matmul_id_subgroup_q5_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q8_0], matmul_id_subgroup_q8_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q2_K], matmul_id_subgroup_q2_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q3_K], matmul_id_subgroup_q3_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q4_K], matmul_id_subgroup_q4_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q5_K], matmul_id_subgroup_q5_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q6_K], matmul_id_subgroup_q6_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_K], matmul_id_subgroup_q5_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_K], matmul_id_subgroup_q6_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ1_S],   matmul_id_subgroup_iq1_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
@@ -8257,6 +8275,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->fuse_concat_ssm_conv = fuse_enabled("GGML_VK_FUSE_CONCAT_SSM_CONV");
         // [TAG_VK_DISPATCH_LOG] read once here; off = one bool test per matmul dispatch, nothing else
         device->dispatch_log = ggml_vk_env_bool("GGML_VK_DISPATCH_LOG", false);
+        // [TAG_MMID_PRECAST_B] the coopmat1 mul_mat_id B pre-cast to f16 (see ggml_vk_mul_mat_id_q_f16)
+        device->mmid_precast_b = ggml_vk_env_bool("GGML_VK_MMID_PRECAST_B", true);
 
         // Same "default on, =0 disables" convention for the concat transpose split. Like the
         // fusions above, both arms are bit-identical, so this is an A/B knob and not a fallback.
@@ -9138,6 +9158,20 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
         GGML_ASSERT(support_fp32acc);
         return mmp.f32acc;
     }
+}
+
+
+// [TAG_MMID_PRECAST_B] the f16-B twin of the quantized-A mul_mat_id pipeline the f32-B path would take, or nullptr:
+// coopmat1 only, the same f16acc / f32acc choice as ggml_vk_get_mul_mat_mat_id_pipeline makes for quantized A.
+static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_f16b_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_prec prec) {
+    if (!ctx->device->coopmat_support || ctx->device->coopmat2 || src0_type >= GGML_TYPE_COUNT) {
+        return nullptr;
+    }
+    const vk_matmul_pipeline2 & p2 = ctx->device->pipeline_dequant_mul_mat_mat_id_f16b[src0_type];
+    const vk_matmul_pipeline2 & r2 = ctx->device->pipeline_dequant_mul_mat_mat_id[src0_type];
+    const vk_matmul_pipeline ref = ggml_vk_get_mul_mat_mat_id_pipeline(ctx, src0_type, GGML_TYPE_F32, prec);
+    const vk_matmul_pipeline p = ref == r2.f16acc ? p2.f16acc : ref == r2.f32acc ? p2.f32acc : nullptr;
+    return (p && !p->is_empty()) ? p : nullptr;
 }
 
 static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t m, uint32_t k) {
@@ -11824,14 +11858,14 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 #else
     const bool y_decode_vector_staging = false;
 #endif
-    const bool y_non_contig = y_decode_vector_staging ||
+    bool y_non_contig = y_decode_vector_staging ||
                               (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
                               !ggml_vk_dim01_contiguous(src1);
 
     const uint32_t y_staged_row_stride = y_decode_vector_staging ? (uint32_t)ggml_vk_align_size(ne10, 4) : (uint32_t)ne10;
 
-    const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
+    bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
     // [TAG_MMQ_INT8_KNOBS] GGML_VK_MMQ_INT8_MIN_N / _OPS on the batch's token count nei1 (the pipeline size choice's
@@ -11848,6 +11882,24 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         // Fall back to f16 dequant mul mat
         mmp = ggml_vk_get_mul_mat_mat_id_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
         quantize_y = false;
+    }
+
+    // [TAG_MMID_PRECAST_B] GGML_VK_MMID_PRECAST_B (default on): instead of the f32-B kernel converting every B element
+    // to f16 each time a tile loads it (once per M tile of every expert), convert B once into prealloc_y (the existing
+    // y_non_contig staging: the cpy pipeline, reused by the next mul_mat_id on the same src1 - gate and up share it)
+    // and run the f16-B twin of the same shader. Taken only where that twin exists and the f32-B pipeline would
+    // otherwise run unchanged (quantized A, no q8_1 path, contiguous f32 B). padded_n stays ne11 (no N padding: the
+    // mul_mm id B load reads rows through row_ids, and the f32-B path is not padded either).
+    bool precast_b = false;
+    if (ctx->device->mmid_precast_b && !quantize_y && !y_non_contig && !x_non_contig && src1->type == GGML_TYPE_F32 &&
+        ggml_vk_dim01_contiguous(src1) && f16_type == GGML_TYPE_F16 && ggml_is_quantized(src0->type)) {
+        vk_matmul_pipeline pf = ggml_vk_get_mul_mat_mat_id_f16b_pipeline(ctx, src0->type, (ggml_prec)dst->op_params[0]);
+        if (pf && mmp == ggml_vk_get_mul_mat_mat_id_pipeline(ctx, src0->type, GGML_TYPE_F32, (ggml_prec)dst->op_params[0])) {
+            mmp = pf;
+            precast_b = true;
+            y_non_contig = true;     // -> qy_needs_dequant: the f32 -> f16 cpy into prealloc_y
+            y_f32_kernel = false;
+        }
     }
 
     const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
@@ -11901,7 +11953,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
 
     // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
-    uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) :ne11;
+    uint32_t padded_n = (qy_needs_dequant && !precast_b) ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) :ne11;
     const uint64_t x_ne = ggml_nelements(src0);
     const uint64_t y_ne = (uint64_t)y_staged_row_stride * padded_n * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
