@@ -2505,8 +2505,8 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // the predicate before the gate changes nothing but the cost of a run that sets the knob.
 //
 // [TAG_VK_DISPATCH_LOG] GGML_VK_DISPATCH_LOG=1 (default off, read once at device init) prints one stderr line
-// "[vk-dispatch] op=... path=mm|mmv|mmv_p021|mmv_nc|mm_id|mmv_id src0= src1= m= n= k= batch= [n_as= n_used=]
-// pipeline= split_k= mmvq= mmq= fused= node=" per MUL_MAT / MUL_MAT_VEC / MUL_MAT_ID / MUL_MAT_ROWS dispatch, from
+// "[vk-dispatch] op=... path=mm|mmv|mmv_p021|mmv_nc|mmv_rows|mm_id|mmv_id src0= src1= m= n= k= batch= [n_as= n_used=]
+// pipeline= split_k= mmvq= mmq= fused= node=" per MUL_MAT / MUL_MAT_ID / MUL_MAT_ROWS dispatch (mat-vec or matmul), from
 // the decision point (see ggml_vk_dispatch_log); no barrier, no numeric effect.
 //
 // GGML_VK_FUSION_LIST=1 prints one stderr line "[vk-fusion] name: OP1+OP2+..." the first time
@@ -10465,7 +10465,7 @@ static vk_pipeline ggml_vk_matmul_f32_rows_twin(const vk_device & device, const 
 // [TAG_VK_DISPATCH_LOG] GGML_VK_DISPATCH_LOG=1 (read once at device init, default off): one stderr line per matmul
 // dispatch decision, printed where the pipeline has been chosen and before anything is recorded - no barrier, no
 // timing path, no effect on what runs:
-//   [vk-dispatch] op=MUL_MAT|MUL_MAT_VEC|MUL_MAT_ID|MUL_MAT_ROWS path=mm|mmv|mmv_p021|mmv_nc|mm_id|mmv_id
+//   [vk-dispatch] op=MUL_MAT|MUL_MAT_ID|MUL_MAT_ROWS (the ggml op) path=mm|mmv|mmv_p021|mmv_nc|mmv_rows|mm_id|mmv_id
 //                 src0=<type> src1=<type> m=<rows of A> n=<cols of B> k=<K> batch=<B batches> [n_as=<experts>
 //                 n_used=<experts per token>] pipeline=<name> split_k=<n> mmvq=<0|1> mmq=<0|1> fused=<extra nodes>
 //                 node=<dst name>
@@ -11492,6 +11492,10 @@ static void ggml_vk_mul_mat_vec_rows(ggml_backend_vk_context * ctx, vk_context& 
         groups_x = CEIL_DIV(groups_x, groups_z);
     }
 
+    if (ctx->device->dispatch_log) {
+        // [TAG_VK_DISPATCH_LOG] the MUL_MAT_ROWS mat-vec (decode QSA indexer score): m = the gathered rows
+        ggml_vk_dispatch_log(ctx, "mmv_rows", a, b, dst, ne01, ne11, ne10, ne12*ne13, -1, -1, twin, 1, false, false);
+    }
     ggml_pipeline_request_descriptor_sets(ctx, twin, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
 
     uint32_t base_work_group_y = 0;
