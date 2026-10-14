@@ -1013,6 +1013,12 @@ struct vk_device_struct {
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id[GGML_TYPE_COUNT];
     // [TAG_MMID_PRECAST_B] the same coopmat1 mul_mat_id shaders with an f16 B (the activations pre-cast once per src1)
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_COUNT];
+    // [TAG_INJECT_TILE_M16] the dense quantized-A coopmat1 matmul shaders with a BM 16 x BN 16 tile (one subgroup, one
+    // coopmat fragment) for m <= 16: the qwen4exp hc inject GEMM (m = 4). Only s / a_s are created (mul_mat_t16_s).
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_t16[GGML_TYPE_COUNT];
+    bool mul_mat_t16_l[GGML_TYPE_COUNT];
+    bool mul_mat_t16_m[GGML_TYPE_COUNT];
+    bool mul_mat_t16_s[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_matmul_split_k_reduce;
@@ -2501,6 +2507,16 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // RDNA (see ggml_vk_load_shaders). Read once (static).
 static bool ggml_vk_mmid_tile_b1(const vk_device & device) {
     static const bool on = ggml_vk_env_bool("GGML_VK_MMID_TILE_BM128", true);
+    return on && device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && !device->coopmat2 &&
+           device->driver_id != vk::DriverId::eAmdProprietary;
+}
+
+// [TAG_INJECT_TILE_M16] GGML_VK_DENSE_TILE_M16 (default on, =0 off): the AMD coopmat1 dense quantized-A matmul with
+// m <= 16 (the qwen4exp hc inject, m = 4, n = the ubatch, k = 4 x n_embd) runs a BM 16 x BN 16 tile instead of the
+// s tile (BM 32 x BN 32): twice the workgroups along N at the same per-element accumulation (same shader, BK, TM / TN / TK
+// coopmat fragments, K order). Types: q4_K (brain inject), q8_0 (balkon hands inject). Read once (static).
+static bool ggml_vk_inject_tile_m16(const vk_device & device) {
+    static const bool on = ggml_vk_env_bool("GGML_VK_DENSE_TILE_M16", true);
     return on && device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && !device->coopmat2 &&
            device->driver_id != vk::DriverId::eAmdProprietary;
 }
@@ -5048,8 +5064,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                           l_warptile_mmqid, m_warptile_mmqid, s_warptile_mmqid,
                           l_warptile_mmqid_int, m_warptile_mmqid_int, s_warptile_mmqid_int,
                           l_warptile_mmqid_int_k, m_warptile_mmqid_int_k, s_warptile_mmqid_int_k,
-                          l_warptile_mmqidb1, m_warptile_mmqidb1, s_warptile_mmqidb1;   // [TAG_MMID_TILE_B1]
+                          l_warptile_mmqidb1, m_warptile_mmqidb1, s_warptile_mmqidb1,   // [TAG_MMID_TILE_B1]
+                          l_warptile_mmqt16, m_warptile_mmqt16, s_warptile_mmqt16;      // [TAG_INJECT_TILE_M16]
     std::array<uint32_t, 3> l_mmqidb1_wg_denoms, m_mmqidb1_wg_denoms, s_mmqidb1_wg_denoms;  // [TAG_MMID_TILE_B1]
+    std::array<uint32_t, 3> l_mmqt16_wg_denoms, m_mmqt16_wg_denoms, s_mmqt16_wg_denoms;     // [TAG_INJECT_TILE_M16]
     std::array<uint32_t, 3> l_wg_denoms, m_wg_denoms, s_wg_denoms,
                             l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms,
                             l_mmq_wg_denoms_k, m_mmq_wg_denoms_k, s_mmq_wg_denoms_k,
@@ -5209,6 +5227,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // GGML_VK_MMID_TILE_BM128=0 keeps the upstream plan (l = the mmq l tile, and off on AMD).
         m_warptile_mmqidb1 = m_warptile_mmq; s_warptile_mmqidb1 = s_warptile_mmq; l_warptile_mmqidb1 = l_warptile_mmq;
         m_mmqidb1_wg_denoms = m_mmq_wg_denoms; s_mmqidb1_wg_denoms = s_mmq_wg_denoms; l_mmqidb1_wg_denoms = l_mmq_wg_denoms;
+        // [TAG_INJECT_TILE_M16] the s tile (one subgroup, BK, WMITER, TM / TN / TK, WARP unchanged) cut to one coopmat
+        // fragment: BM = WM = TM, BN = WN = TN (16 x 16 on RDNA); l / m slots carry the same tile and are never created
+        s_warptile_mmqt16 = s_warptile_mmq;
+        s_warptile_mmqt16[1] = s_warptile_mmqt16[4] = s_warptile_mmq[7];   // BM = WM = TM
+        s_warptile_mmqt16[2] = s_warptile_mmqt16[5] = s_warptile_mmq[8];   // BN = WN = TN
+        l_warptile_mmqt16 = m_warptile_mmqt16 = s_warptile_mmqt16;
+        s_mmqt16_wg_denoms = { s_warptile_mmqt16[1], s_warptile_mmqt16[2], 1 };
+        l_mmqt16_wg_denoms = m_mmqt16_wg_denoms = s_mmqt16_wg_denoms;
         if (ggml_vk_mmid_tile_b1(device)) {
             l_warptile_mmqidb1 = m_warptile_mmq;
             l_warptile_mmqidb1[0] = m_warptile_mmq[0] * 2;   // block size: twice the warps
@@ -5250,6 +5276,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (ggml_vk_mmid_tile_b1(device) && device->mul_mat_id_m[i] && ggml_vk_b1_classified_type(t)) {
                 device->mul_mat_id_l[i] = ggml_vk_matmul_shmem_support(device, l_warptile_mmqidb1, true, t);
             }
+            // [TAG_INJECT_TILE_M16] q4_K / q8_0 only, where the s tile itself is available
+            device->mul_mat_t16_l[i] = device->mul_mat_t16_m[i] = false;
+            device->mul_mat_t16_s[i] = ggml_vk_inject_tile_m16(device) && device->mul_mat_s[i] &&
+                                       (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q8_0) &&
+                                       s_warptile_mmqt16[1] == 16 && s_warptile_mmqt16[2] == 16 &&
+                                       ggml_vk_matmul_shmem_support(device, s_warptile_mmqt16, false, t);
 
             // The q8_1 mmq path has its own (larger) shmem layout, check it separately.
             // K-quants use the _int_k warptiles, others use _int.
@@ -5691,6 +5723,21 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_TQ2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_TQ2_0], matmul_tq2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q3_K], matmul_q3_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_K], matmul_q4_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        // [TAG_INJECT_TILE_M16] the BM 16 x BN 16 twins (s / a_s only), renamed "..._t16" for the dispatch / perf logs
+        CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_t16[GGML_TYPE_Q4_K], matmul_q4_k_f32, mmqt16_wg_denoms, warptile_mmqt16, vk_mat_mat_push_constants, 3, _t16);
+        CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_t16[GGML_TYPE_Q8_0], matmul_q8_0_f32, mmqt16_wg_denoms, warptile_mmqt16, vk_mat_mat_push_constants, 3, _t16);
+        for (ggml_type t16 : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
+            for (vk_matmul_pipeline * mp : { &device->pipeline_dequant_mul_mat_mat_t16[t16].f16acc, &device->pipeline_dequant_mul_mat_mat_t16[t16].f32acc }) {
+                if (*mp) {
+                    for (vk_pipeline * pp : { &(*mp)->s, &(*mp)->a_s }) {
+                        const std::string sfx = "_t16";   // load_shaders runs once per requested pipeline: rename once
+                        if (*pp && ((*pp)->name.size() < sfx.size() || (*pp)->name.compare((*pp)->name.size() - sfx.size(), sfx.size(), sfx) != 0)) {
+                            (*pp)->name += sfx;
+                        }
+                    }
+                }
+            }
+        }
         CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_K], matmul_q5_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q6_K], matmul_q6_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_S],   matmul_iq1_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
@@ -10755,6 +10802,23 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t d_ne = ggml_nelements(dst);
 
     const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
+
+    // [TAG_INJECT_TILE_M16] GGML_VK_DENSE_TILE_M16 (default on): m <= 16 on the coopmat1 s tile with split_k == 1 (decided
+    // on the base pipeline) takes the BM 16 x BN 16 twin - same shader, BK, fragments and K order per output element;
+    // quantized A (q4_K / q8_0), f32 B kernel only (no q8_1, no conversion pass, no row ids, no 64-bit indexing swap).
+    if (split_k == 1 && ne01 <= 16 && !quantize_y && !qx_needs_dequant && !qy_needs_dequant && !x_non_contig && !y_non_contig &&
+        !row_ids && src1->type == GGML_TYPE_F32 && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q8_0) &&
+        ctx->device->mul_mat_t16_s[src0->type] &&
+        ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
+        (pipeline == mmp->s || pipeline == mmp->a_s)) {
+        const vk_matmul_pipeline2 & t16  = ctx->device->pipeline_dequant_mul_mat_mat_t16[src0->type];
+        const vk_matmul_pipeline2 & base = ctx->device->pipeline_dequant_mul_mat_mat[src0->type];
+        const vk_matmul_pipeline tw = mmp == base.f16acc ? t16.f16acc : mmp == base.f32acc ? t16.f32acc : nullptr;
+        const vk_pipeline p = tw ? (pipeline == mmp->a_s ? tw->a_s : tw->s) : nullptr;
+        if (p) {
+            pipeline = p;
+        }
+    }
 
     // [TAG_QSA_POOL_REMAP] with row ids A is bound whole: the store, not M rows of it
     const uint64_t qx_sz = row_ids ? row_ids_a_bytes : ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
