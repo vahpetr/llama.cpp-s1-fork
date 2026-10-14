@@ -45,6 +45,38 @@ depths within one row of section 3 rather than across this table.
 Whole fill 0 -> 1M: 1.09 h. GTT is flat from the first step (102.7 GiB) because every compute buffer is reserved at load. No
 admission waits. Host RSS 3.3-7.5 GiB. The same 1M arm on v47 (2026-10-06): 17.8 t/s at 1M, fill 1.76 h, GTT 106 043 MiB.
 
+## 2a. S0.2 H0 rows (2026-10-15, v59, corpus tokens-s02)
+
+Image v59, 1M brain profile without the disk cache, corpus tokens-s02 (sha256 e77e4bea67adebe8..., 1 098 504 tokens), single runs
+(noise +-1.5 %). Decode rows are worst-of-3 windows of 128 tokens on a continuous history; they are a new baseline on this
+corpus and not comparable 1:1 with the rows above (other text, other acceptance).
+
+| row | value |
+|---|---|
+| cold prompt 128k (first request of the process) | 377.9 t/s (warm repeat 378.4) |
+| prefill 72k | 346.4 / 348.3 t/s |
+| fill step ->262k / ->524k / ->1M | 370.1 / 280.7 / 195.1 t/s (rows above: 361 / 281 / 192) |
+| whole fill 0 -> 1 046 528 | 1.07 h (rows above: 1.09 h) |
+| TTFT follow-up at 1M, 256 new tokens | 2 054 ms warm; 2 511 / 2 452 ms after a slot restore |
+| slot save at 32k / 262k / 1M | 0.57 / 3.72 / 14.48 GiB (3.2 s at 1M) |
+| GTT peak | 105 196 MiB |
+
+Serial decode without the draft versus draft on:
+
+| depth | no draft ms/tok | draft on ms/tok | draft acceptance | gain |
+|---|---|---|---|---|
+| 32 768 | 33.07 | 26.07 | 0.817 (223/273) | -21 % |
+| 262 144 | 33.76 | 22.10 | 0.800 (264/330) | -35 % |
+| 1 046 528 | 42.45 | 24.38 | 0.877 (306/349) | -43 % |
+
+Per-round verify width with the draft on (width = sampled token + drafts):
+
+| depth | share of rounds with width >= 3 | mean width |
+|---|---|---|
+| 32 768 | 41.0 % | 2.73 |
+| 262 144 | 65.8 % | 3.77 |
+| 1 046 528 | 97.4 % | 5.51 |
+
 ## 3. How we got here (same box, same weights)
 
 | build | date | decode cold | prefill 8k | decode 107k | prefill 107k | decode 213k | prefill 213k | notes |
