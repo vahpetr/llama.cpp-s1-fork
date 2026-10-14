@@ -16,7 +16,10 @@
 // builds against any fork revision, so two binaries (e.g. v59 and a candidate) can be compared line by line:
 // same sig = same dispatch sequence; same out/pool = same bits.
 //
-// usage: test-vk-graph-order [n_tokens=64] [rounds=2]
+// usage: test-vk-graph-order [n_tokens=64] [rounds=1] [b4|v59]   (rounds > 1 re-runs graph_optimize on the permuted
+//        graph in one process, which changes the fusions in every revision incl. v59 - a pre-existing effect; keep 1)
+// Pinned v59 reference: tests/fixtures/vk-graph-order-v59.txt (+ the producing command), checked by
+// tests/test-vk-graph-order.sh.
 // Exits 0 without output if no GPU device is present (not a ctest: the CPU ctest container has no GPU).
 
 #include "ggml.h"
@@ -60,9 +63,13 @@ struct model_t {
     ggml_tensor * conv_store;  // [3*CONV_CH] f32: the conv history row (read, then the tail written back)
 };
 
-// build_conv_state_at + the GDN conv (n_rs_seq == 0, prefill): concat(state, x^T) -> ssm_conv -> silu, the tail
-// copied from x^T into the history row (the [TAG_CONV_INPUT_SPLIT] form; with a v59 source the tail form is the
-// same code here, so both binaries run the same graph)
+// build_conv_state_at + the GDN conv (n_rs_seq == 0, prefill): concat(state, x^T) -> ssm_conv -> silu and the
+// history tail written back. Two forms, chosen by the third argument:
+//   v59  the tail is a view of the concat, expanded inside build_conv_state_at, i.e. BEFORE the conv (a1b6c324e)
+//   b4   [TAG_CONV_INPUT_SPLIT] the tail is transpose(view of x), expanded AFTER the conv (qwen4exp at stage8 with
+//        GGML_VK_FUSE_CONCAT_SSM_CONV on)
+// Both must write the same history bytes (conv_state=) and give the same output.
+static bool g_v59_form = false;
 static ggml_tensor * gdn_conv(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * store, ggml_tensor * x, ggml_tensor * w) {
     const int64_t nt = x->ne[1];
     // the history is read (build_rs's gather) before the tail overwrites it
@@ -70,12 +77,20 @@ static ggml_tensor * gdn_conv(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor 
     ggml_build_forward_expand(gf, state);
     ggml_tensor * x_t = ggml_transpose(ctx, x);
     ggml_tensor * ci  = ggml_concat(ctx, state, x_t, 0);
-    ggml_tensor * y   = ggml_silu(ctx, ggml_ssm_conv(ctx, ci, w));
+    ggml_tensor * dst = ggml_view_1d(ctx, store, 3*CONV_CH, 0);
+    if (g_v59_form) {
+        ggml_tensor * tail = ggml_view_3d(ctx, ci, 3, CONV_CH, 1, ci->nb[1], ci->nb[2], ggml_row_size(ci->type, ci->ne[0] - 3));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cont(ctx, tail), dst));
+        return ggml_silu(ctx, ggml_ssm_conv(ctx, ci, w));
+    }
+    ggml_tensor * y = ggml_silu(ctx, ggml_ssm_conv(ctx, ci, w));
     if (nt >= 3) {
-        // the tail after the conv, as qwen4exp's GDN layer expands it ([TAG_CONV_INPUT_SPLIT] deferred tails)
         ggml_build_forward_expand(gf, y);
-        ggml_tensor * tail = ggml_view_3d(ctx, x_t, 3, CONV_CH, 1, x_t->nb[1], x_t->nb[2], (nt - 3)*x_t->nb[0]);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cont(ctx, tail), ggml_view_1d(ctx, store, 3*CONV_CH, 0)));
+        ggml_tensor * tail = ggml_transpose(ctx, ggml_view_3d(ctx, x, CONV_CH, 3, 1, x->nb[1], x->nb[2], (nt - 3)*x->nb[1]));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cont(ctx, tail), dst));
+    } else {
+        ggml_tensor * tail = ggml_view_3d(ctx, ci, 3, CONV_CH, 1, ci->nb[1], ci->nb[2], ggml_row_size(ci->type, ci->ne[0] - 3));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cont(ctx, tail), dst));
     }
     return y;
 }
@@ -145,7 +160,8 @@ static void fill(ggml_tensor * t, uint32_t seed, float scale) {
 
 int main(int argc, char ** argv) {
     const int64_t nt     = argc > 1 ? atoll(argv[1]) : 64;
-    const int     rounds = argc > 2 ? atoi(argv[2]) : 2;
+    const int     rounds = argc > 2 ? atoi(argv[2]) : 1;
+    g_v59_form           = argc > 3 && strcmp(argv[3], "v59") == 0;
 
     ggml_backend_load_all();
     ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -279,8 +295,8 @@ int main(int argc, char ** argv) {
         h_out = ho;
         h_pool = hp;
     }
-    printf("[order-test] nt=%" PRId64 " rounds=%d nodes=%d out=0x%016" PRIx64 " pool=0x%016" PRIx64 " conv_state=0x%016" PRIx64 "\n",
-           nt, rounds, ggml_graph_n_nodes(gf), h_out, h_pool, h_conv);
+    printf("[order-test] form=%s nt=%" PRId64 " rounds=%d nodes=%d out=0x%016" PRIx64 " pool=0x%016" PRIx64 " conv_state=0x%016" PRIx64 "\n",
+           g_v59_form ? "v59" : "b4", nt, rounds, ggml_graph_n_nodes(gf), h_out, h_pool, h_conv);
 
     ggml_backend_sched_free(sched);
     ggml_free(ctx);

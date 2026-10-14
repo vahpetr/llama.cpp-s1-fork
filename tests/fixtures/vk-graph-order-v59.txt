@@ -1,0 +1,10 @@
+# pinned v59 reference for tests/test-vk-graph-order.sh
+# produced 2026-10-14T20:51:36Z on balkon: AMD Radeon 780M (RADV PHOENIX), image llama-dev:vulkan (mesa-vulkan-drivers 26.0.8-1ubuntu0.3)
+# by: git archive a1b6c324e + tests/test-vk-graph-order.cpp (prod-v11-stage8 026806994) + its CMake line; build target test-vk-graph-order;
+#     GGML_VK_FUSION_COUNT=1 bin/test-vk-graph-order <nt> 1 v59   (nt = 64, 2048)
+# nt=64
+[vk-fusion-count] graph nodes=153 hc_combine=4 multi_add=4 rms_norm_mul=8 sigmoid_mul=4 ssm_conv_silu=1 sig=0xaf8df6123f9b043b
+[order-test] form=v59 nt=64 rounds=1 nodes=153 out=0x1f8bb60fbc31546a pool=0xaff8904b6f2a5759 conv_state=0xf513793a319842b2
+# nt=2048
+[vk-fusion-count] graph nodes=153 hc_combine=4 multi_add=4 rms_norm_mul=8 sigmoid_mul=4 ssm_conv_silu=1 sig=0x296559a997810687
+[order-test] form=v59 nt=2048 rounds=1 nodes=153 out=0xcdba0a41553ddb52 pool=0xaff8904b6f2a5759 conv_state=0xeff95c9ba2cfacf7

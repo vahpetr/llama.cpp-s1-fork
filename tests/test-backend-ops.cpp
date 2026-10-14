@@ -4522,6 +4522,105 @@ struct test_concat_ssm_conv_fuse : public test_case {
     }
 };
 
+// [TAG_CONV_INPUT_SPLIT] the conv history tails qwen4exp's build_conv_state_at writes back: the v59 form (a view of
+// concat(state, x^T) - its last state_cols + slot columns) against the stage8 form (transpose of a token-range view of
+// x [ch, n_t, n_s]), each written into its own history row exactly as the model does it: n_rs_seq == 0 -> cpy(cont(tail),
+// row); rollback -> one cpy(tail, plane) per slot < K_write. Only the slots the model takes from x
+// (n_t >= state_cols + slot) compare the two forms; the others compare the concat form with itself. The graph returns
+// concat(X - C, C - X) over every written row, and err() demands an all-+0 bit pattern on BOTH backends, so a form
+// that is wrong the same way on the CPU fails too. sc 3 = the GDN conv (kernel 4), sc 9 = the PLE conv
+// ((kernel 4 - 1) x dilation 3).
+struct test_conv_tail : public test_case {
+    const int64_t sc;
+    const int64_t ch;
+    const int64_t n_t;
+    const int64_t n_s;
+    const int64_t k_write;   // 0 = the n_rs_seq == 0 form (cont + cpy); else the rollback planes 0..k_write-1
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_TAIL_EXACT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(sc, ch, n_t, n_s, k_write);
+    }
+
+    double max_nmse_err() override { return 0.0; }
+    double max_err() override { return 0.0; }
+    double max_err(ggml_backend_t backend) override { GGML_UNUSED(backend); return 0.0; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        size_t bad = 0;
+        for (size_t i = 0; i < n; i++) {
+            uint32_t ua, ub;
+            memcpy(&ua, &a[i], 4);
+            memcpy(&ub, &b[i], 4);
+            bad += (ua != 0) + (ub != 0);
+        }
+        return (double) bad;
+    }
+
+    test_conv_tail(int64_t sc = 3, int64_t ch = 10240, int64_t n_t = 2048, int64_t n_s = 1, int64_t k_write = 0)
+        : sc(sc), ch(ch), n_t(n_t), n_s(n_s), k_write(k_write) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, sc, ch, n_s);
+        ggml_set_name(state, "state");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ch, n_t, n_s);
+        ggml_set_name(x, "x");
+        ggml_tensor * ci = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+
+        auto tail_c = [&](int64_t back) {
+            return ggml_view_3d(ctx, ci, sc, ch, n_s, ci->nb[1], ci->nb[2], ggml_row_size(ci->type, ci->ne[0] - back));
+        };
+        // GGML_TEST_CONV_TAIL_NEGATIVE=1: the e787a6b86 form (a view OF x^T, nb[0] forced to 4) - must FAIL (review C1)
+        static const bool negative = getenv("GGML_TEST_CONV_TAIL_NEGATIVE") != nullptr;
+        auto tail_x = [&](int64_t back) {
+            if (negative) {
+                ggml_tensor * x_t = ggml_transpose(ctx, x);
+                return ggml_view_3d(ctx, x_t, sc, ch, n_s, x_t->nb[1], x_t->nb[2], (n_t - back)*x_t->nb[0]);
+            }
+            return ggml_transpose(ctx, ggml_view_3d(ctx, x, ch, sc, n_s, x->nb[1], x->nb[2], (n_t - back)*x->nb[1]));
+        };
+
+        ggml_tensor * out = nullptr;
+        const int64_t n_slots = k_write == 0 ? 1 : std::min<int64_t>(k_write, n_t);
+        for (int64_t slot = 0; slot < n_slots; ++slot) {
+            const int64_t back = sc + slot;
+            const bool    from_x = n_t >= back;
+            ggml_tensor * row_c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sc*ch, n_s);
+            ggml_tensor * row_x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sc*ch, n_s);
+            ggml_tensor * tc = tail_c(back);
+            ggml_tensor * tx = from_x ? tail_x(back) : tail_c(back);
+            ggml_tensor * wc = ggml_cpy(ctx, k_write == 0 ? ggml_cont(ctx, tc) : tc, row_c);
+            ggml_tensor * wx = ggml_cpy(ctx, k_write == 0 ? ggml_cont(ctx, tx) : tx, row_x);
+            ggml_tensor * d = ggml_concat(ctx, ggml_reshape_1d(ctx, ggml_sub(ctx, wx, wc), sc*ch*n_s),
+                                               ggml_reshape_1d(ctx, ggml_sub(ctx, wc, wx), sc*ch*n_s), 0);
+            out = out ? ggml_concat(ctx, out, d, 0) : d;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0x1b873593u ^ (uint32_t) (sc*31 + ch*131 + n_t*17 + n_s*7 + k_write));
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->type != GGML_TYPE_F32) {
+                continue;
+            }
+            std::vector<float> v(ggml_nelements(t));
+            for (auto & e : v) {
+                e = u(rng);   // finite, distinct: a wrong element shows as a non-zero difference
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
+        }
+    }
+};
+
 // Fused Gated-DeltaNet decay pre-chain (qwen4exp build_layer_attn_linear):
 //   ADD(alpha, ssm_dt) -> UNARY(SOFTPLUS) -> MUL(., ssm_a)
 // Production geometry is nh = num_v_heads = 48 over the draft-length token range.
@@ -10914,11 +11013,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_pool_mean_fuse(128, 2, 512, 1));
     test_cases.emplace_back(new test_qsa_pool_mean_fuse(128, 8, 333, 1));
 
+    // [TAG_CONV_INPUT_SPLIT] the history tails (GDN sc 3, PLE sc 9; n_rs_seq == 0 and rollback planes)
+    for (int64_t sc : { 3, 9 }) {
+        for (int64_t n_t : { 1, 4, 5, 2044, 2048 }) {
+            for (int64_t n_s : { 1, 2 }) {
+                for (int64_t kw : { 0, 1, 5 }) {
+                    test_cases.emplace_back(new test_conv_tail(sc, 10240, n_t, n_s, kw));
+                }
+            }
+        }
+    }
+
     // [TAG_CONV_INPUT_SPLIT] the GDN conv input without the concat (qwen4exp: 10240 channels, kernel 4) at
     // decode-verify / prefill-ubatch token counts, 2 sequences, the three conv tails, odd channel counts
     for (bool exact : { true, false }) {
         for (int extra : { 0, 1, 2 }) {
-            for (int64_t n_t : { 1, 3, 5, 2048 }) {
+            for (int64_t n_t : { 1, 3, 4, 5, 2044, 2048 }) {
                 test_cases.emplace_back(new test_concat_ssm_conv_fuse(10240, n_t, 1, extra, exact));
             }
             test_cases.emplace_back(new test_concat_ssm_conv_fuse(10240, 64, 2, extra, exact));

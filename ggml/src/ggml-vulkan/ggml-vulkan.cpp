@@ -2544,8 +2544,12 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // fire wherever v59's order already has the pair adjacent.
 // [TAG_CONV_INPUT_SPLIT] Exception: concat_ssm_conv_silu's keep_pattern (CONCAT -> SSM_CONV -> SILU, edges checked)
 // and the guard that stops graph_optimize hoisting that CONCAT ARE gated, by GGML_VK_FUSE_CONCAT_SSM_CONV (default
-// on; =0, or GGML_VK_DISABLE_FUSION, gives the v59 order). Without them the CONCAT is hoisted into an earlier set
-// and the pattern never forms. Disabling the concat_ssm_conv* patterns by name keeps the knob-on order.
+// on; =0, or GGML_VK_DISABLE_FUSION, gives the v59 order), and they apply only where the conv is the concat's single
+// use (the prefill shape; decode / short-verify graphs keep the v59 order). Without them the CONCAT is hoisted into an
+// earlier set and the pattern never forms. Disabling the concat_ssm_conv* patterns by name keeps the knob-on order.
+// Only the SILU form is protected: concat_ssm_conv and concat_ssm_conv_bias_silu fire only where the order happens to
+// be adjacent (qwen4exp emits the SILU form). qwen4exp reads the same knob (qwen4exp_conv_input_split): =0 also
+// restores its v59 graph (history tails viewing the concat, expanded before the conv).
 //
 // Port note vs the source commit: the gate is the *last* term of each match condition instead of
 // the first, so a veto is only recorded for a pattern that really matched at this node and
@@ -21502,7 +21506,10 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
             const ggml_tensor * concat = graph->nodes[start];
             const ggml_tensor * conv   = graph->nodes[start + 1];
             const ggml_tensor * silu   = graph->nodes[start + 2];
-            return conv->src[0] == concat && silu->src[0] == conv && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU;
+            // the fusable (prefill) shape only: the conv is the concat's single use. In decode / short-verify graphs
+            // the history tails still view the concat, the fusion cannot fire, and the v59 order is kept.
+            return conv->src[0] == concat && silu->src[0] == conv && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
+                   ggml_node_get_use_count(graph, start) == 1;
         };
 
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {

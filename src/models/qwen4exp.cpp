@@ -485,6 +485,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
 // apply_ubatch() filled before any set_input runs) and writes only its own tensor, so it is
 // independent of where in the input list it sits and of when the node that consumes it is built.
 // LLAMA_PLE_HOIST=1 enables the hoist (default off, see below); unset/0 = the in-loop placement.
+// [TAG_CONV_INPUT_SPLIT] the model side of the Vulkan concat_ssm_conv fusion, under the SAME knob
+// GGML_VK_FUSE_CONCAT_SSM_CONV (default on; =0 = the v59 graph node for node: the tails view the concat and are
+// expanded inside build_conv_state_at). Parsed as ggml-vulkan parses it (absent or empty = on, else atoi != 0).
+static bool qwen4exp_conv_input_split() {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_VK_FUSE_CONCAT_SSM_CONV");
+        return s == nullptr || *s == '\0' || atoi(s) != 0;
+    }();
+    return enabled;
+}
+
 static bool qwen4exp_ple_hoist_enabled() {
     static const bool enabled = [] {
         // default OFF since 2026-09-08: the v20 A/B measured the hoist at -3.5 % prefill (483.5 -> 466.5 t/s at 8k,
@@ -3494,12 +3505,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     // directly: the same floats (the concat is a bit copy), and the concat is left with the conv as its only
     // consumer, which lets the Vulkan backend read the conv window from state | x without writing the concat
     // (concat_ssm_conv). Shorter ubatches (decode, short verify) keep the concat views, as before.
-    const int64_t n_seq_t   = x_t->ne[0];
+    // x is [channels, n_seq_t, n_seqs] (tokens on ne[1]); a tail of x^T is the transpose of a token-range view of
+    // x (ggml_view_3d always gives nb[0] = the element size, so a view OF x^T cannot carry its token stride).
+    const int64_t n_seq_t   = x->ne[1];
     const int64_t k_tails   = cparams.n_rs_seq == 0 ? 1 :
         std::min<int64_t>(ubatch.n_seq_tokens, (int64_t) ubatch.rs_rollback_depth + 1);
-    const bool    tails_x   = n_seq_t >= state_cols + k_tails - 1;
-    ggml_tensor * tail_base = tails_x ? x_t : conv_input;
-    const int64_t tail_cols = tails_x ? n_seq_t : conv_input->ne[0];   // ne[0] of the view base
+    const bool    tails_x   = qwen4exp_conv_input_split() && n_seq_t >= state_cols + k_tails - 1;
+    // the [state_cols, channels, n_seqs] tail `back` columns before the end of the concat (back = state_cols + slot)
+    auto const & tail_view = [&](int64_t back) -> ggml_tensor * {
+        if (tails_x) {
+            return ggml_transpose(ctx0, ggml_view_3d(ctx0, x,
+                    channels, state_cols, n_seqs,
+                    x->nb[1], x->nb[2],
+                    (n_seq_t - back) * x->nb[1]));
+        }
+        return ggml_view_3d(ctx0, conv_input,
+                state_cols, channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, conv_input->ne[0] - back));
+    };
     // A caller that reads the concat with a conv takes the x-tail copies and expands them AFTER the conv:
     // that keeps x alive across the conv, so ggml-alloc cannot hand the conv's output the block x frees -
     // which would make the conv read x while it is being overwritten (the backend's overlap veto would
@@ -3514,10 +3538,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     if (cparams.n_rs_seq == 0) {
         // no rollback capacity: a single slot-0 write, unchanged from before [TAG_RECURRENT_ROLLBACK_SPLITS]
-        ggml_tensor * tail = ggml_view_3d(ctx0, tail_base,
-                state_cols, channels, n_seqs,
-                tail_base->nb[1], tail_base->nb[2],
-                (tail_cols - state_cols) * tail_base->nb[0]);
+        ggml_tensor * tail = tail_view(state_cols);
 
         ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
                 state_cols * channels, n_seqs,
@@ -3536,10 +3557,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         const int64_t K_write = std::min<int64_t>(ubatch.n_seq_tokens, (int64_t) ubatch.rs_rollback_depth + 1);
 
         for (int64_t slot = 0; slot < K_write; ++slot) {
-            ggml_tensor * tail = ggml_view_3d(ctx0, tail_base,
-                    state_cols, channels, n_seqs,
-                    tail_base->nb[1], tail_base->nb[2],
-                    (tail_cols - state_cols - slot) * tail_base->nb[0]);
+            ggml_tensor * tail = tail_view(state_cols + slot);
 
             ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
                     state_cols * channels, n_seqs,
