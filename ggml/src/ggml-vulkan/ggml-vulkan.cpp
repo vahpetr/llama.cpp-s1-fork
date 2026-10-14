@@ -2485,8 +2485,9 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // ggml_backend_vk_graph_compute; the sites are tried in this order, so disabling a longer pattern
 // lets its shorter prefix match instead (no mul_mat_add_add -> mul_mat_add fires):
 //   multi_add                        ADD+ADD(+ADD...)                     ggml_vk_fuse_multi_add
-//   multi_add_scale                  the trailing SCALE appended to a multi_add (qwen4exp hc_mix stream mean;
-//                                    disabling it leaves the plain multi_add + SCALE)
+//   multi_add_scale                  the trailing SCALE appended to a multi_add (qwen4exp hc_mix stream mean and
+//                                    the QSA pooled-key mean); nested in the multi_add match, so disabling
+//                                    multi_add disables it too; disabling it leaves the plain multi_add + SCALE
 //   mul_mat_add_add                  MUL_MAT+ADD+ADD                      (mat-vec bias adds)
 //   mul_mat_add                      MUL_MAT+ADD
 //   mul_mat_id_add_id_mul            MUL_MAT_ID+ADD_ID+MUL
@@ -2515,6 +2516,14 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 // ggml_vk_graph_optimize's keep_pattern list is deliberately not gated: it only keeps a pattern's
 // nodes adjacent (GGML_VK_DISABLE_FUSION does not gate it either), so the node order of a run with
 // a pattern disabled is the same as with the pattern enabled.
+// [TAG_HC_MIX_TAIL] Exception: the two graph_optimize carve-outs for multi_add_scale (ADD of an ADD
+// chain -> SCALE) and scale_silu (SCALE -> SILU) ARE gated, by the per-fusion device knobs
+// GGML_VK_FUSE_MULTI_ADD_SCALE=0 / GGML_VK_FUSE_SCALE_SILU=0 (default on) and by
+// GGML_VK_DISABLE_FUSION. Only those restore the v59 node order; disabling the patterns by name here
+// (GGML_VK_DISABLE_FUSION_PATTERNS=multi_add_scale,scale_silu) stops the fusions but keeps the
+// knob-on order. The carve-outs reach beyond the pair: independent nodes v59 placed between the two
+// nodes move behind the second one, and a set that ended in an ADD (where the view pass is skipped)
+// now ends later, so views can move one set earlier.
 //
 // Port note vs the source commit: the gate is the *last* term of each match condition instead of
 // the first, so a veto is only recorded for a pattern that really matched at this node and
@@ -2633,6 +2642,8 @@ static bool ggml_vk_sched_prof_enabled() {
 // [TAG_QSA_FUSED_SELECT] topk_qsa_op (QSA selections that arrived as one GGML_OP_QSA_TOP_K node
 // instead of as the seven-node topk_qsa pattern, i.e. GGML_VK_QSA_FUSED_SELECT=1). Neither can be
 // vetoed, so neither ever appears with a vetoed:/disabled: prefix.
+// [TAG_HC_MIX_TAIL] overlap:multi_add_scale counts multi_adds whose trailing SCALE matched but whose destination
+// overlapped a stream source: they ran as the plain multi_add (+ SCALE), so they also show in multi_add=.
 static bool ggml_vk_fusion_count_enabled() {
     static const bool enabled = ggml_vk_env_bool("GGML_VK_FUSION_COUNT", false);
     return enabled;
@@ -20242,14 +20253,22 @@ static uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const stru
 //
 // Bit-exactness: multi_add.comp keeps the f32 sum of the plain multi_add (same operands, same
 // order); under MULTI_ADD_SCALE it applies scale.comp's expression sum * param1 + param2 to that
-// f32 value instead of storing it. Only param2 == 0 is matched (it is what ggml_scale emits), so
-// an fma contraction in either shader cannot change a bit (see scale_silu.comp).
+// f32 value instead of storing it - the same expression shape, hence the same fma-contraction
+// decision as scale.comp (see scale_silu.comp for why that, not param2 == 0, is the guarantee).
+// Only param2 == 0 is matched (what ggml_scale emits).
+//
+// Sites in qwen4exp: build_hc_mix's stream mean (2 per layer + the MTP block's mixes) AND
+// build_qsa_pool's pooled-key mean (r CONT slices, ADD chain, SCALE(1/r); r = --qsa-ratio = 4 in
+// prod; both the pooled-cache dirty-block write and the full recompute; only when the QSA path runs,
+// i.e. at KV >= LLAMA_QSA_MIN_KV).
 //
 // Alias safety: ggml-alloc may hand the SCALE a destination that partially overlaps a stream
 // view (the gated tensor is dead once the last ADD has run). The overlap veto in graph_compute
 // would then undo the whole fusion, adds included; checking it here keeps the plain multi_add.
+// *overlap is set when the pattern matched and only the alias check refused it (GGML_VK_FUSION_COUNT reports
+// that as overlap:multi_add_scale, so the plain-multi_add fallback is visible).
 static bool ggml_vk_can_fuse_multi_add_scale(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
-                                             uint32_t num_adds) {
+                                             uint32_t num_adds, bool * overlap = nullptr) {
     if (!ctx->device->fuse_multi_add_scale || num_adds < 2 || num_adds > MAX_FUSED_ADDS) {
         return false;
     }
@@ -20292,6 +20311,9 @@ static bool ggml_vk_can_fuse_multi_add_scale(ggml_backend_vk_context * ctx, cons
                 elided = elided || cgraph->nodes[node_idx + n] == src;
             }
             if (!elided && ggml_vk_tensors_overlap(src, scale, true)) {
+                if (overlap) {
+                    *overlap = true;
+                }
                 return false;
             }
         }
@@ -20576,13 +20598,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
                 // [TAG_HC_MIX_TAIL] extend by the trailing SCALE; a veto leaves the plain multi_add
-                if (ggml_vk_can_fuse_multi_add_scale(ctx, cgraph, i, num_adds) &&
+                bool mas_overlap = false;
+                if (ggml_vk_can_fuse_multi_add_scale(ctx, cgraph, i, num_adds, &mas_overlap) &&
                     !vk_fusion_veto(ctx, "multi_add_scale")) {
                     ctx->num_additional_fused_ops = num_adds;
                     ctx->fused_multi_add_scale = true;
                     fusion_string = "MULTI_ADD_SCALE";
                     // the scale reads only the elided sum (its own src), elementwise
                     op_srcs_fused_elementwise[num_adds] = true;
+                } else if (mas_overlap && fusion_count) {
+                    ggml_vk_fusion_count_add(fusion_counts, "overlap:", "multi_add_scale");
                 }
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD }) &&
                        !vk_fusion_veto(ctx, "mul_mat_add_add")) {

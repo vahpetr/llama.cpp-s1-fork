@@ -4325,6 +4325,101 @@ struct test_hc_mix_tail_fuse : public test_case {
     }
 };
 
+// [TAG_HC_MIX_TAIL] the second multi_add_scale site: build_qsa_pool's key mean (qwen4exp), r = 4 CONT slices of the
+// gathered block members, ADD chain, SCALE(1/r) - [idx_dim, n_rows, n_stream] f32. Exact form as HC_MIX_TAIL_EXACT:
+// arm A as the model emits it, arm B with the sum flagged as an output (multi_add then SCALE: the v59 dispatches),
+// concat(A - B, B - A) compared bitwise against the CPU's +0. The slices are pre-expanded into gf, the order
+// ggml_vk_graph_optimize gives them (the CONTs are independent of each other, so they lead and the ADDs follow).
+struct test_qsa_pool_mean_fuse : public test_case {
+    const int64_t idx_dim;
+    const int64_t r;
+    const int64_t n_rows;
+    const int64_t n_stream;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_POOL_MEAN_EXACT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(idx_dim, r, n_rows, n_stream);
+    }
+
+    double max_nmse_err() override { return 0.0; }
+    double max_err() override { return 0.0; }
+    double max_err(ggml_backend_t backend) override { GGML_UNUSED(backend); return 0.0; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        size_t bad = 0;
+        for (size_t i = 0; i < n; i++) {
+            bad += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        }
+        return (double) bad;
+    }
+
+    test_qsa_pool_mean_fuse(int64_t idx_dim = 128, int64_t r = 4, int64_t n_rows = 512, int64_t n_stream = 1)
+        : idx_dim(idx_dim), r(r), n_rows(n_rows), n_stream(n_stream) {}
+
+    ggml_tensor * mean(ggml_context * ctx, ggml_tensor * members, bool mark_sum) {
+        std::vector<ggml_tensor *> slices;
+        for (int64_t i = 0; i < r; ++i) {
+            slices.push_back(ggml_cont(ctx, ggml_view_3d(ctx, members, idx_dim, n_rows, n_stream,
+                    members->nb[2], members->nb[3], i*members->nb[1])));
+            if (gf && mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, slices.back());
+            }
+        }
+        ggml_tensor * pooled = slices[0];
+        for (int64_t i = 1; i < r; ++i) {
+            pooled = ggml_add(ctx, pooled, slices[i]);
+        }
+        if (mark_sum && r > 1) {
+            ggml_set_output(pooled);
+        }
+        ggml_tensor * out = ggml_scale(ctx, pooled, 1.0f/(float) r);
+        if (gf && mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, out);
+        }
+        return out;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // the gathered members as get_rows leaves them, viewed [idx_dim, r, n_rows, n_stream]
+        ggml_tensor * members = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, idx_dim, r, n_rows, n_stream);
+        ggml_set_name(members, "members");
+
+        ggml_tensor * a = mean(ctx, members, false);
+        ggml_tensor * b = mean(ctx, members, true);
+
+        ggml_tensor * d0 = ggml_sub(ctx, a, b);
+        ggml_tensor * d1 = ggml_sub(ctx, b, a);
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_1d(ctx, d0, ggml_nelements(d0)),
+                                             ggml_reshape_1d(ctx, d1, ggml_nelements(d1)), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0x2545f491u ^ (uint32_t) (idx_dim*31 + r*131 + n_rows*17 + n_stream*7));
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->type != GGML_TYPE_F32) {
+                continue;
+            }
+            std::vector<float> v(ggml_nelements(t));
+            for (auto & e : v) {
+                e = u(rng);
+                if ((rng() & 31) == 0) {
+                    e = (rng() & 1) ? -0.0f : 0.0f;
+                }
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
+        }
+    }
+};
+
 // Fused Gated-DeltaNet decay pre-chain (qwen4exp build_layer_attn_linear):
 //   ADD(alpha, ssm_dt) -> UNARY(SOFTPLUS) -> MUL(., ssm_a)
 // Production geometry is nh = num_v_heads = 48 over the draft-length token range.
@@ -10708,6 +10803,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_hc_mix_tail_fuse(257, 3, 7, 31, exact));      // all primes
         test_cases.emplace_back(new test_hc_mix_tail_fuse(31, 4, 17, 5, exact));       // non-power-of-two row
     }
+    // [TAG_HC_MIX_TAIL] the QSA pooled-key mean (--qsa-ratio 4): pooled-cache dirty blocks, a full recompute, np2 streams,
+    // r = 2 (a single ADD: not fused) and r = 8
+    test_cases.emplace_back(new test_qsa_pool_mean_fuse(128, 4, 1, 1));
+    test_cases.emplace_back(new test_qsa_pool_mean_fuse(128, 4, 512, 1));
+    test_cases.emplace_back(new test_qsa_pool_mean_fuse(128, 4, 65536, 1));
+    test_cases.emplace_back(new test_qsa_pool_mean_fuse(128, 4, 4096, 2));
+    test_cases.emplace_back(new test_qsa_pool_mean_fuse(128, 2, 512, 1));
+    test_cases.emplace_back(new test_qsa_pool_mean_fuse(128, 8, 333, 1));
 
     // qwen4exp Gated-DeltaNet decay pre-chain fusion, at the production geometry
     // (num_v_heads 48) over the draft-length range, plus off-geometry shapes and the
