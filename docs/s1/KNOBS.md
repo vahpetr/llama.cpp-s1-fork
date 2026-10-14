@@ -109,6 +109,7 @@ against the code for this table.
 | `GGML_VK_MMID_COMPACT=0` | 1 | flattened (expert, tile) grid for mul_mat_id | EXACT | - |
 | `GGML_VK_DISABLE_HOIST_ROW_IDS=1` | 0 | per-workgroup ids scan instead of the hoisted table | EXACT | - |
 | `GGML_VK_CONCAT_TRANSPOSE=0`, `GGML_VK_FUSE_HC_COMBINE=0`, `GGML_VK_FUSE_SIGMOID_MUL=0`, `GGML_VK_FUSE_GDN_PRE=0` | on | disable one fork kernel / fusion (A/B) | EXACT | - |
+| `GGML_VK_FUSE_MULTI_ADD_SCALE=0`, `GGML_VK_FUSE_SCALE_SILU=0` | on | disable one hc_mix tail fusion (patch 0227: multi_add + trailing SCALE - qwen4exp hc_mix stream mean and QSA pooled-key mean - and SCALE + SILU; pattern names `multi_add_scale`, `scale_silu`; no node-order change) (B3 arm, not in a release yet) | EXACT | - |
 | `GGML_VK_FA_DEADV_LDS=1`, `GGML_VK_FA_NO_ZERO_DEAD_V=1` | 0 | FA dead-column variants (A/B; the second reopens an RDNA3 signed-zero hazard) | DIAG | - |
 | `GGML_VK_OPT_WINDOW=N` | 20 | graph_optimize independence window | COMPOSITION | - |
 | `GGML_VK_DMMV_RM_{KQ,STDQ,KQ_INT,STDQ_INT,F32}` | built-in | rows per workgroup for dense mat-vec | EXACT | - |
