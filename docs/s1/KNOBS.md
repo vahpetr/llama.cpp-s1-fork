@@ -82,6 +82,7 @@ against the code for this table.
 | `LLAMA_KQ_VIS=1` | 0 | KQ mask from cell/token metadata, no mask plane | EXACT | 1 |
 | `LLAMA_KQ_VIS_MIN_TOKENS=N` | 64 | below N tokens per batch use the classic mask plane | EXACT | 64 |
 | `LLAMA_KQ_VIS_PROF=1` | 0 | `kqvis-prof:` timing lines per window of <= 64 graphs (incl. graph-cache hit/miss) | DIAG | - |
+| `LLAMA_SPEC_TRACE_IDS=1` | 0 | one `[spec-ids]` line per speculative verify round: round, n_past, drafted ids (the proposals), width, accepted ids, draft / catch-up / verify wall, n_att; read by piagent `spec_ids_compare.py` (proposal identity + R83) and `spec_cost_attrib.py` (patch 0238, C3, not in a release yet) | DIAG | - |
 | `LLAMA_RESERVE_RUNTIME_SHAPE=1` | 0 | reserve max(worst-case, runtime) graph shape: no regrow mid-fill | SCHED | 1 |
 | `GGML_ALLOC_GROW_SLACK=P` | 0 | grow compute buffers with P % slack | SCHED | 10 |
 | `LLAMA_GTT_ADMISSION_MIB=N` | 0 (off) | before a prefill chunk grows GTT past N MiB, the slot waits | SCHED | GTT - 3424 |
