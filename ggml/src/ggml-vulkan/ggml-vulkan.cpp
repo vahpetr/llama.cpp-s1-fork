@@ -8446,7 +8446,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->fuse_concat_ssm_conv = fuse_enabled("GGML_VK_FUSE_CONCAT_SSM_CONV");
         // [TAG_VK_DISPATCH_LOG] read once here; off = one bool test per matmul dispatch, nothing else
         device->dispatch_log = ggml_vk_env_bool("GGML_VK_DISPATCH_LOG", false);
-        // [TAG_MMID_PRECAST_B] the coopmat1 mul_mat_id B pre-cast to f16 (see ggml_vk_mul_mat_id_q_f16)
         // [TAG_MMVQ_HOIST] C1: hoisted-weight mat-vec twins at 2..8 columns (default on; =0 the upstream pipelines)
         device->mmvq_hoist = ggml_vk_env_bool("GGML_VK_MMVQ_HOIST", true);
         // GGML_VK_MMVQ_HOIST_MIN_COLS: the twins from this many columns on (default 2; 780M order-balanced N-sweep, median of
@@ -8454,9 +8453,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // the s1 decode-band unit can sweep 2 vs 6)
         {
             const char * mc = getenv("GGML_VK_MMVQ_HOIST_MIN_COLS");
+            // 0 = off (as GGML_VK_MMVQ_HOIST=0); 1 behaves as 2 (n = 1 is never hoisted); > 8 clamps to 8 (the widest twin)
             const int v = mc ? atoi(mc) : 2;
+            if (v == 0) {
+                device->mmvq_hoist = false;
+            }
             device->mmvq_hoist_min_cols = (uint32_t) std::min(std::max(v, 2), (int) mul_mat_vec_max_cols);
         }
+        if (device->mmvq_hoist) {
+            GGML_LOG_WARN("ggml_vulkan: mmvq_hoist: on from %u columns (GGML_VK_MMVQ_HOIST / _MIN_COLS)\n", device->mmvq_hoist_min_cols);
+        }
+        // [TAG_MMID_PRECAST_B] the coopmat1 mul_mat_id B pre-cast to f16 (see ggml_vk_mul_mat_id_q_f16);
         // review B1 M2: AMD coopmat1 only (measured there), like the tile
         device->mmid_precast_b = ggml_vk_env_bool("GGML_VK_MMID_PRECAST_B", true) && device->vendor_id == VK_VENDOR_ID_AMD &&
                                  device->driver_id != vk::DriverId::eAmdProprietary;
