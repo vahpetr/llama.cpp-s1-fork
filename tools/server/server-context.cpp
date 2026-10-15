@@ -252,6 +252,19 @@ server_adm_op_decision server_admission_op_check(bool enabled, double bar_mib, d
 // It samples a CLONE of the sampler, never the live one, so turning the trace on cannot change the generated
 // output. The clone starts from the post-verification state, so for history-dependent samplers (penalties,
 // grammar) the probe is only an approximation - it is a diagnostic counter, not a correctness check.
+// [TAG_SPEC_TRACE_IDS] LLAMA_SPEC_TRACE_IDS=1: read once
+static bool server_spec_trace_ids() {
+    static const bool on = [] {
+        const char * s = getenv("LLAMA_SPEC_TRACE_IDS");
+        const bool v = s != nullptr && atoi(s) != 0;
+        if (v) {
+            fprintf(stderr, "[spec-ids] on (LLAMA_SPEC_TRACE_IDS=1): one line per verify round\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
 std::vector<llama_token> server_sample_and_accept_replay(
         common_sampler * smpl,
         llama_context * ctx,
@@ -843,7 +856,11 @@ struct server_slot {
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
 
+    // [TAG_SPEC_TRACE_IDS] the verify-round counter of the current request (LLAMA_SPEC_TRACE_IDS)
+    uint64_t spec_trace_round = 0;
+
     void reset() {
+        spec_trace_round = 0;
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
@@ -6636,6 +6653,30 @@ private:
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                // [TAG_SPEC_TRACE_IDS] LLAMA_SPEC_TRACE_IDS=1 (debug, default off): one machine-readable line per verify
+                // round - the proposals (the drafted ids in order, committed replay tokens first), the verify width and the
+                // accepted ids - for scripts/bench/probe/spec_ids_compare.py (proposal identity across two runs, R83 stats)
+                if (server_spec_trace_ids()) {
+                    std::string sd, sa;
+                    for (size_t i = 0; i < slot.spec_draft.size(); ++i) {
+                        sd += (i ? "," : "") + std::to_string(slot.spec_draft[i]);
+                    }
+                    for (size_t i = 0; i < accepted.size(); ++i) {
+                        sa += (i ? "," : "") + std::to_string(accepted[i]);
+                    }
+                    // t_*_us: this pass's host wall times of the draft / catch-up / verify phases (spec_rt, all slots of the pass);
+                    // n_att: the draft positions the drafter sampled this round (incl. a p_min stop; -1 = not reported) = the
+                    // number of draft-step graphs, the x of the per-step cost fit (spec_cost_attrib.py)
+                    const int n_att = common_speculative_get_draft_params(spec.get(), slot.id).n_attempted;
+                    fprintf(stderr, "[spec-ids] task=%d slot=%d round=%llu n_past=%d n_draft=%zu committed=%zu replay=%d synth=%d width=%zu n_acc=%zu draft=%s acc=%s"
+                            " t_draft_us=%lld t_catchup_us=%lld t_verify_us=%lld n_att=%d\n",
+                            slot.task ? slot.task->id : -1, slot.id, (unsigned long long) slot.spec_trace_round++,
+                            (int) slot.prompt.n_tokens(), n_draft, std::min(slot.spec_n_committed, n_draft),
+                            (int) slot.spec_is_replay, (int) !synth_probs.empty(), n_draft + 1, accepted.size() - 1,
+                            sd.empty() ? "-" : sd.c_str(), sa.c_str(),
+                            (long long) spec_rt.draft_us, (long long) spec_rt.catchup_us, (long long) spec_rt.verify_us, n_att);
+                }
 
                 // adaptive draft length: record this round's per-position acceptance here, before
                 // the branch, so it happens exactly once per verified round on every exit.
