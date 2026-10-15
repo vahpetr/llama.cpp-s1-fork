@@ -115,6 +115,7 @@ against the code for this table.
 | `GGML_VK_MMID_TILE_BM128=0` | on | AMD coopmat1 mul_mat_id large tile BM 128 x BN 64 (m > 64 and n > 64; upstream: off on AMD; q4_K / q5_0 / q8_0 / q6_K / iq3_s only, like PRECAST_B) (patch 0232, B1 arm, not in a release yet) | EXACT | - |
 | `GGML_VK_DENSE_TILE_M16=0` | on | AMD coopmat1 dense matmul with m <= 16 (the qwen4exp hc inject, m = 4) on a BM 16 x BN 16 tile instead of the s tile; q4_K / q8_0 A (patch 0234, B4c arm, not in a release yet) | EXACT | - |
 | `GGML_VK_DENSE_TILE_B2=0`, `GGML_VK_DENSE_TILE_B2_XL=1` | on / off | AMD coopmat1 dense matmul tile plan: q4_K / q5_0 / q6_K with m <= 384 on BM 64 x BN 128 instead of the l tile (split_k 1 only); _XL=1 also puts m >= 2048 on BM 128 x BN 256 (slower on the 780M) (patch 0233, B2 arm, not in a release yet) | EXACT | - |
+| `GGML_VK_QSA_SCORE_EPILOGUE=0` | on | indexer score as one node (GGML_OP_QSA_SCORE): ReLU, the ordered 4-head sum and the block bias in the coopmat1 store of the score GEMM, no per-head plane; decode / 2-token verify and non-coopmat1 backends keep the chain; read by qwen4exp, =0 = the v59 graph (patch 0235, A1 arm, not in a release yet) | EXACT | - |
 | `GGML_VK_FA_DEADV_LDS=1`, `GGML_VK_FA_NO_ZERO_DEAD_V=1` | 0 | FA dead-column variants (A/B; the second reopens an RDNA3 signed-zero hazard) | DIAG | - |
 | `GGML_VK_OPT_WINDOW=N` | 20 | graph_optimize independence window | COMPOSITION | - |
 | `GGML_VK_DMMV_RM_{KQ,STDQ,KQ_INT,STDQ_INT,F32}` | built-in | rows per workgroup for dense mat-vec | EXACT | - |
