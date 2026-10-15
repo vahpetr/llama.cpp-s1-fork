@@ -659,6 +659,21 @@ int main() {
             const std::string k = put(s, false, 7);              // pre-fix shape
             CHECK(!k.empty() && stored(s, k) == blob(false, 7));
             CHECK(put(s, false, 8) == k && stored(s, k) == blob(false, 7) && s.n_ckpt_unmarked_replaced == 0); // unmarked: reused
+            // a replacement whose write fails is not counted (the counter moves with the commit): the ckpt/ dir read-only
+            fs::path ckdir;
+            for (const auto & de : fs::recursive_directory_iterator(root)) {
+                if (de.is_directory() && de.path().filename() == "ckpt") {
+                    ckdir = de.path();
+                }
+            }
+            if (geteuid() != 0 && !ckdir.empty()) {
+                fs::permissions(ckdir, fs::perms::owner_read | fs::perms::owner_exec, fs::perm_options::replace, ec);
+                put(s, true, 12); // the write fails: no reference is added either
+                CHECK(stored(s, k) == blob(false, 7) && s.n_ckpt_unmarked_replaced == 0);
+                fs::permissions(ckdir, fs::perms::owner_all, fs::perm_options::replace, ec);
+            } else {
+                printf("IXY checkpoint provenance: failed-commit case skipped (root or no ckpt dir)\n");
+            }
             CHECK(put(s, true, 9) == k && stored(s, k) == blob(true, 9) && s.n_ckpt_unmarked_replaced == 1); // replaced, not linked
             CHECK(put(s, true, 10) == k && stored(s, k) == blob(true, 9) && s.n_ckpt_unmarked_replaced == 1); // marked: reused
             printf("IXY checkpoint provenance: unmarked replaced once by a marked one, marked reused\n");

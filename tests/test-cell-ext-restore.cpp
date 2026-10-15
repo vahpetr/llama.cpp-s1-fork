@@ -25,6 +25,9 @@
 //     recurrent reader (unchanged since) refuses at the first cell record, and restores exact; the pre-fix
 //     shape (no mark) is refused when the live sequence holds an image (checkpoint counter +1, sequence dropped from
 //     all three caches), loads and replays exact for a text-only sequence;
+//  T-rm / T-hole: an unmarked trunk state must be an intact history (cells at positions 0..n-1): an image conversation
+//     with its image prefix removed by seq_rm before the save, and a text one with a hole, are refused; marked they load;
+//     the checkpoint triplet must be exact ({1, 5, IXY1} is refused as an invalid stream);
 //  D-old: a pre-fix draft stream (recr_none branch, no mark) loads with cells == live;
 //  cost: the added per-restore copy over 1 048 576 cells (info line).
 //
@@ -431,6 +434,57 @@ static bool seq_gone(llama_context * ctx) {
            h->get_mem_idx()->seq_pos_max(0) == -1;
 }
 
+// T-rm / T-hole: an unmarked (pre-fix) trunk state is accepted only as an intact history: an image conversation whose
+// image prefix was removed by seq_rm(seq, 0, k) before the save (no image cell left, but its effect in the later rows),
+// and a text conversation with a hole, are refused (counter +1, nothing left); the same states MARKED load
+static void test_history(llama_model * model, const std::string & tag, const std::string & dir, bool hole) {
+    const std::string tc = tag + (hole ? " T-hole" : " T-rm");
+    auto live = make_ctx(model, false);
+    std::vector<llama_token> prompt;
+    auto * h = hyb(live.get());
+    if (hole) {
+        const auto t = tokens(60, 71);
+        decode_text(live.get(), t, 0);
+        prompt = t;
+        GGML_ASSERT(h->get_mem_attn()->seq_rm(0, 10, 20) && h->get_mem_idx()->seq_rm(0, 10, 20));
+    } else {
+        const auto t0 = tokens(40, 72);
+        const auto t1 = tokens(9,  73);
+        decode_text(live.get(), t0, 0);
+        decode_image(live.get(), 3, 4, 40, 74);
+        decode_text(live.get(), t1, 44);
+        prompt = t0;
+        prompt.insert(prompt.end(), 12, 0);
+        prompt.insert(prompt.end(), t1.begin(), t1.end());
+        // the image prefix removed from the KV caches (the recurrent rows keep its effect)
+        GGML_ASSERT(h->get_mem_attn()->seq_rm(0, 0, 44) && h->get_mem_idx()->seq_rm(0, 0, 44));
+    }
+    const auto attn_left = cells_of(h->get_mem_attn());
+    printf("info %s: %zu cells left, %d with x/y != pos\n", tc.c_str(), attn_left.size() / 5, n_xy_nontrivial(attn_left));
+
+    const std::string f_live = dir + "/hist-live-" + tag + ".bin";
+    const std::string f_old  = dir + "/hist-old-"  + tag + ".bin";
+    GGML_ASSERT(llama_state_seq_save_file(live.get(), f_live.c_str(), 0, prompt.data(), prompt.size()) > 0);
+    std::vector<llama_token> toks(prompt.size() + 8);
+    size_t n_tok = 0;
+    {
+        auto m = make_ctx(model, false);
+        check(llama_state_seq_load_file(m.get(), f_live.c_str(), 0, toks.data(), toks.size(), &n_tok) > 0,
+                tc + ": the same state MARKED (written by this build) loads");
+    }
+    check(write_prefix_shape(f_live, f_old, (uint32_t) (attn_left.size() / 5), h->get_mem_idx()->has_cell_ext()),
+            tc + ": provenance mark located and stripped (pre-fix shape)");
+    auto old = make_ctx(model, false);
+    const uint64_t r0 = llama_memory_hybrid_idx::n_xy_rejects();
+    const size_t nr = llama_state_seq_load_file(old.get(), f_old.c_str(), 0, toks.data(), toks.size(), &n_tok);
+    printf("info %s: pre-fix shape %s, rejections %llu -> %llu\n", tc.c_str(), nr ? "accepted" : "refused",
+            (unsigned long long) r0, (unsigned long long) llama_memory_hybrid_idx::n_xy_rejects());
+    check(nr == 0 && llama_memory_hybrid_idx::n_xy_rejects() == r0 + 1, tc + ": the pre-fix shape is refused (not an intact history, counter +1)");
+    check(seq_gone(old.get()), tc + ": nothing of it is left in attention, recurrent or indexer");
+    unlink(f_live.c_str());
+    unlink(f_old.c_str());
+}
+
 // CK: a target context checkpoint (PARTIAL_ONLY: the recurrent rows only) is marked; restored exact (marked); an
 // unmarked (pre-fix) one is refused when the live sequence holds an image (counter +1, the sequence dropped - the server
 // then re-processes the prompt), and loads as before for a text-only sequence
@@ -485,6 +539,15 @@ static void test_target_ckpt(llama_model * model, const std::string & tag, bool 
         check(nr == old.size() && llama_memory_hybrid_idx::n_xy_ckpt_rejects() == r0, tc + ": an unmarked checkpoint of a text-only prefix loads (an image after it in the live sequence)");
         GGML_ASSERT(llama_memory_seq_rm(mem, 0, n_past, -1));
         check(eq(decode_text(live.get(), t2, n_past), cont), tc + ": its replay == the first run");
+
+        // only the exact decoy triplet {1, 0, IXY1} is the mark: {1, 5, IXY1} reads as a legacy record whose n_seq_id is
+        // not 0 - refused by the recurrent reader, no provenance rejection counted
+        std::vector<uint8_t> bad = ck;
+        const uint32_t five = 5;
+        memcpy(bad.data() + 12, &five, sizeof(five));
+        const uint64_t r1 = llama_memory_hybrid_idx::n_xy_ckpt_rejects();
+        const size_t nb = llama_state_seq_set_data_ext(live.get(), bad.data(), bad.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        check(nb == 0 && llama_memory_hybrid_idx::n_xy_ckpt_rejects() == r1, tc + ": {1, 5, IXY1} is not the mark (refused as an invalid stream)");
     }
 
     // the OLD reader: v59 (a1b6c324e) hands a PARTIAL_ONLY trunk stream straight to llama_memory_recurrent::state_read
@@ -790,6 +853,8 @@ int main(int argc, char ** argv) {
         test_target(model.get(), tag, dir);
         test_prefix_text(model.get(), tag, dir);
         test_target_ckpt(model.get(), tag, true);
+        test_history(model.get(), tag, dir, false);
+        test_history(model.get(), tag, dir, true);
         test_target_ckpt(model.get(), tag, false);
         test_draft (model.get(), tag);
     }
