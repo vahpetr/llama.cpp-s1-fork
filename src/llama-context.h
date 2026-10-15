@@ -500,6 +500,7 @@ private:
         int64_t  plan_us = 0, n_plan = 0, n_plan_inc = 0, n_cen_inc = 0, n_cen_full = 0;
         int64_t  n_cen_fb[5] = {};
         int64_t  qin_us = 0, mir_bytes = 0, mir_runs = 0, mir_full = 0; // [TAG_QSA_INPUTS_INC]
+        int64_t  vmir_bytes = 0, n_vmir = 0, n_vmir_full = 0;           // [TAG_KQ_VIS_MIRROR]
         // [TAG_SPEC_ROUND_TIMING] speculative rounds reported by the server (llama_kqvis_prof_add_spec_round)
         int64_t  n_round = 0, t_draft_us = 0, t_catchup_us = 0, t_verify_us = 0, t_host_us = 0;
         int64_t  t_catchup_pf_us = 0; // the catch-up of passes without a drafting slot (prompt processing)

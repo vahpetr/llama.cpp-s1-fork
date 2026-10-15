@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
+#include <array>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -141,6 +143,7 @@ public:
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
     void reset() {
+        vis_mark_all(); // [TAG_KQ_VIS_MIRROR]
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();
@@ -274,6 +277,8 @@ public:
     void set(uint32_t i, const llama_kv_cells & other) {
         assert(i + other.pos.size() <= pos.size());
 
+        vis_mark_range(i, i + (uint32_t) other.pos.size()); // [TAG_KQ_VIS_MIRROR]
+
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = i + j;
 
@@ -309,6 +314,8 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = idxs[j];
 
+            vis_mark(idx); // [TAG_KQ_VIS_MIRROR]
+
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(idx);
             }
@@ -339,6 +346,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        vis_mark(i); // [TAG_KQ_VIS_MIRROR]
+
         seq_pos_rm(i);
         seq[i].reset();
         seq_lo[i] = 0;
@@ -358,6 +367,7 @@ public:
         assert(pos[i] != -1);
         assert(seq_id >= 0);
 
+        vis_mark(i); // [TAG_KQ_VIS_MIRROR]
         seq[i].reset(seq_id);
         seq_lo[i] &= ~seq_lo_bit(seq_id);
         seq_pos_dec(seq_id, pos[i]);
@@ -378,6 +388,8 @@ public:
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
+
+        vis_mark(i); // [TAG_KQ_VIS_MIRROR] (conservative: also when nothing changes)
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
@@ -472,6 +484,43 @@ public:
         }
     }
 
+    // [TAG_KQ_VIS_MIRROR] get_vis restricted to cells [lo, hi): the same per-cell expressions, plane j - lo
+    void get_vis_range(uint32_t lo, uint32_t hi, int32_t * __restrict c_pos, int32_t * __restrict c_seq,
+                       int32_t * __restrict c_x, int32_t * __restrict c_y) const {
+        assert(lo <= hi && hi <= pos.size());
+
+        const llama_pos         * __restrict p  = pos.data();
+        const uint32_t          * __restrict sl = seq_lo.data();
+        const llama_kv_cell_ext * __restrict e  = ext.data();
+
+        for (uint32_t j = lo; j < hi; ++j) {
+            const llama_pos pj   = p[j];
+            const uint32_t  keep = pj != -1 ? ~0u : 0u;
+
+            c_pos[j - lo] = pj;
+            c_seq[j - lo] = (int32_t) (sl[j] & keep);
+            c_x[j - lo]   = (int32_t) ((uint32_t) e[j].x & keep);
+            c_y[j - lo]   = (int32_t) ((uint32_t) e[j].y & keep);
+        }
+    }
+
+    // [TAG_KQ_VIS_MIRROR] per-consumer dirty ranges of the visibility metadata (pos / seq_lo / ext): every mutator marks
+    // the cells it touches; a device mirror registers a slot and takes (reads + clears) its range before an update.
+    // A fresh slot, reset() and resize() mark everything. Up to 4 consumers (cells shared between caches).
+    int vis_register() const {
+        assert(n_vis < (int) vis_dirty.size());
+        vis_dirty[n_vis] = vis_range_t();
+        return n_vis++;
+    }
+
+    void vis_take(int slot, uint32_t & lo, uint32_t & hi, bool & all) const {
+        assert(slot >= 0 && slot < n_vis);
+        lo  = vis_dirty[slot].lo;
+        hi  = vis_dirty[slot].hi;
+        all = vis_dirty[slot].all;
+        vis_dirty[slot] = vis_range_t{ UINT32_MAX, 0, false };
+    }
+
     // gather the token ids of the cells in `seqs` with position in [p0, p1)
     // the callback receives (seq_id, pos, token) for every such (cell, seq) pair
     // note: used by n-gram input embeddings to recover the tokens preceding a ubatch
@@ -503,6 +552,7 @@ public:
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
 
+        vis_mark(i); // [TAG_KQ_VIS_MIRROR]
         seq[i].set(seq_id);
         seq_lo[i] |= seq_lo_bit(seq_id);
         seq_pos_inc(seq_id, pos[i]);
@@ -599,6 +649,7 @@ public:
         assert(pos[i] == -1);
         assert(seq[i].none());
 
+        vis_mark(i); // [TAG_KQ_VIS_MIRROR]
         pos[i] = p;
 
         used.insert(i);
@@ -606,6 +657,7 @@ public:
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
         assert(i < ext.size());
+        vis_mark(i); // [TAG_KQ_VIS_MIRROR]
         ext[i] = p;
     }
 
@@ -616,6 +668,7 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        vis_mark(i); // [TAG_KQ_VIS_MIRROR]
         seq_pos_rm(i);
 
         pos[i]   += d;
@@ -648,6 +701,8 @@ public:
 
         const llama_pos p_old = pos[i];
 
+        vis_mark(i); // [TAG_KQ_VIS_MIRROR]
+
         seq_pos_rm(i);
 
         pos[i]   /= d;
@@ -659,6 +714,32 @@ public:
     }
 
 private:
+    // [TAG_KQ_VIS_MIRROR]
+    struct vis_range_t { uint32_t lo = UINT32_MAX; uint32_t hi = 0; bool all = true; };
+    mutable std::array<vis_range_t, 4> vis_dirty;
+    mutable int n_vis = 0;
+
+    void vis_mark(uint32_t i) const {
+        for (int k = 0; k < n_vis; ++k) {
+            vis_dirty[k].lo = std::min(vis_dirty[k].lo, i);
+            vis_dirty[k].hi = std::max(vis_dirty[k].hi, i + 1);
+        }
+    }
+    void vis_mark_range(uint32_t i0, uint32_t i1) const {
+        if (i0 >= i1) {
+            return;
+        }
+        for (int k = 0; k < n_vis; ++k) {
+            vis_dirty[k].lo = std::min(vis_dirty[k].lo, i0);
+            vis_dirty[k].hi = std::max(vis_dirty[k].hi, i1);
+        }
+    }
+    void vis_mark_all() const {
+        for (int k = 0; k < n_vis; ++k) {
+            vis_dirty[k].all = true;
+        }
+    }
+
     bool has_shift = false;
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
