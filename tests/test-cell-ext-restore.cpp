@@ -13,12 +13,18 @@
 //     restore into a fresh context: every cell's {pos, ext} of the attention AND the indexer cache equals the live
 //     one, a re-save is byte-identical to the live save, and a continuation (text + another image chunk) gives
 //     byte-identical logits to the in-memory continuation;
-//  T-old (PLE): the live save with the indexer x/y zeroed (an entry a pre-fix build re-saved after a restore) heals:
-//     indexer cells == live, re-save == live save, continuation logits == in-memory;
+//  T-old: the image save in the shape a pre-fix build wrote (no "IXY1" provenance mark before the indexer section,
+//     with PLE the indexer x / y zeroed) is rejected: the load fails, the rejection counter grows, nothing is left;
+//  TX: a text-only save in the pre-fix shape is accepted and healed: indexer cells == live, re-save == the live
+//     (marked) save, continuation logits == in-memory;
 //  D  MTP draft memory (LLAMA_MTP_QSA=1 only, otherwise it is a plain KV cache): text + an image (the MTP catch-up
 //     skips embedding batches, so the draft holds no image cell); seq data with flags 0 into a fresh context, and the
 //     speculative rollback checkpoint form (PARTIAL_ONLY, same context after seq_rm): the attention and indexer cells'
 //     {pos, ext} equal the live ones, and the next draft step's logits equal those before the rollback;
+//  CK: a target context checkpoint (PARTIAL_ONLY, recurrent only) opens with the mark and restores exact; the pre-fix
+//     shape (no mark) is refused when the live sequence holds an image (checkpoint counter +1, sequence dropped from
+//     all three caches), loads and replays exact for a text-only sequence;
+//  D-old: a pre-fix draft stream (recr_none branch, no mark) loads with cells == live;
 //  cost: the added per-restore copy over 1 048 576 cells (info line).
 //
 // usage: test-cell-ext-restore [dump_dir]   (dump_dir: keeps the T save files live-<fixture>.bin / rest-<fixture>.bin)
@@ -358,6 +364,133 @@ static size_t n_bytes_differing(const std::vector<uint8_t> & a, const std::vecto
     return n;
 }
 
+// [TAG_CELL_EXT_PROVENANCE] a save file rewritten into the shape a pre-fix build wrote: the "IXY1" mark in front of the
+// indexer section removed and, when the indexer serializes the cell ext, its x / y zeroed (what a pre-fix restore left)
+static bool prefix_shape(std::vector<uint8_t> & b, uint32_t n_cells, bool idx_ext) {
+    size_t o = std::string::npos;
+    for (size_t p = 0; p + 12 <= b.size(); ++p) {
+        uint32_t w[3];
+        memcpy(w, b.data() + p, sizeof(w));
+        if (w[0] == 0x31595849u && w[1] == 1 && w[2] == n_cells) {
+            o = p; // the last match: the indexer section is the state's last
+        }
+    }
+    if (o == std::string::npos) {
+        return false;
+    }
+    b.erase(b.begin() + o, b.begin() + o + 4);
+    if (idx_ext) {
+        for (uint32_t c = 0; c < n_cells; ++c) {
+            memset(b.data() + o + 8 + (size_t) c * 24 + 8, 0, 8); // record {pos, n_seq_id, x, y, tok, seq_id}: x, y
+        }
+    }
+    return true;
+}
+
+static bool write_prefix_shape(const std::string & src, const std::string & dst, uint32_t n_cells, bool idx_ext) {
+    auto b = read_file(src);
+    if (!prefix_shape(b, n_cells, idx_ext)) {
+        return false;
+    }
+    std::ofstream f(dst, std::ios::binary);
+    f.write((const char *) b.data(), b.size());
+    return true;
+}
+
+static std::vector<uint8_t> seq_data(llama_context * ctx, llama_state_seq_flags flags);
+
+// all three caches of the hybrid memory hold nothing of seq 0
+static bool seq_gone(llama_context * ctx) {
+    auto * h = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx));
+    return h->get_mem_attn()->seq_pos_max(0) == -1 && h->get_mem_recr()->seq_pos_max(0) == -1 &&
+           h->get_mem_idx()->seq_pos_max(0) == -1;
+}
+
+// CK: a target context checkpoint (PARTIAL_ONLY: the recurrent rows only) is marked; restored exact (marked); an
+// unmarked (pre-fix) one is refused when the live sequence holds an image (counter +1, the sequence dropped - the server
+// then re-processes the prompt), and loads as before for a text-only sequence
+static void test_target_ckpt(llama_model * model, const std::string & tag, bool image) {
+    const std::string tc = tag + (image ? " CK-image" : " CK-text");
+    const auto t0 = tokens(40, 61);
+    const auto t1 = tokens(9,  62);
+    const auto t2 = tokens(5,  63);
+
+    auto live = make_ctx(model, false);
+    decode_text(live.get(), t0, 0);
+    llama_pos n_past = 40;
+    if (image) {
+        decode_image(live.get(), 3, 4, 40, 64);
+        n_past = 44;
+    }
+    decode_text(live.get(), t1, n_past);
+    n_past += (llama_pos) t1.size();
+
+    const auto ck = seq_data(live.get(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    uint32_t w = 0;
+    memcpy(&w, ck.data() + 8, sizeof(w));
+    check(ck.size() > 12 && w == 0x31595849u, tc + ": the checkpoint stream opens with the IXY1 mark");
+
+    const auto cont = decode_text(live.get(), t2, n_past);
+    llama_memory_t mem = llama_get_memory(live.get());
+
+    // marked: back to the checkpoint, the replay is exact
+    GGML_ASSERT(llama_state_seq_set_data_ext(live.get(), ck.data(), ck.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == ck.size());
+    GGML_ASSERT(llama_memory_seq_rm(mem, 0, n_past, -1));
+    check(eq(decode_text(live.get(), t2, n_past), cont), tc + ": marked checkpoint restore + replay == the first run");
+
+    // unmarked (the shape a pre-fix build stored)
+    std::vector<uint8_t> old = ck;
+    old.erase(old.begin() + 8, old.begin() + 12);
+    const uint64_t r0 = llama_memory_hybrid_idx::n_xy_ckpt_rejects();
+    const size_t nr = llama_state_seq_set_data_ext(live.get(), old.data(), old.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    printf("info %s: unmarked checkpoint %s, checkpoint rejections %llu -> %llu\n", tc.c_str(), nr ? "accepted" : "refused",
+            (unsigned long long) r0, (unsigned long long) llama_memory_hybrid_idx::n_xy_ckpt_rejects());
+    if (image) {
+        check(nr == 0 && llama_memory_hybrid_idx::n_xy_ckpt_rejects() == r0 + 1, tc + ": an unmarked checkpoint of an image sequence is refused (counter +1)");
+        check(seq_gone(live.get()), tc + ": the sequence is dropped from attention, recurrent and indexer (the server re-processes)");
+    } else {
+        check(nr == old.size() && llama_memory_hybrid_idx::n_xy_ckpt_rejects() == r0, tc + ": an unmarked checkpoint of a text-only sequence loads");
+        GGML_ASSERT(llama_memory_seq_rm(mem, 0, n_past, -1));
+        check(eq(decode_text(live.get(), t2, n_past), cont), tc + ": its replay == the first run");
+    }
+}
+
+// TX: a text-only entry written by a pre-fix build stays accepted and is healed
+static void test_prefix_text(llama_model * model, const std::string & tag, const std::string & dir) {
+    const auto t0 = tokens(70, 51);
+    const auto t1 = tokens(6,  52);
+
+    auto live = make_ctx(model, false);
+    decode_text(live.get(), t0, 0);
+    const std::string f_live = dir + "/tx-live-" + tag + ".bin";
+    const std::string f_old  = dir + "/tx-old-"  + tag + ".bin";
+    const std::string f_re   = dir + "/tx-re-"   + tag + ".bin";
+    GGML_ASSERT(llama_state_seq_save_file(live.get(), f_live.c_str(), 0, t0.data(), t0.size()) > 0);
+    auto * h_live = hyb(live.get());
+    const auto idx_live = cells_of(h_live->get_mem_idx());
+    const auto cont_mem = decode_text(live.get(), t1, 70);
+
+    check(write_prefix_shape(f_live, f_old, (uint32_t) (idx_live.size() / 5), h_live->get_mem_idx()->has_cell_ext()),
+            tag + " TX: provenance mark located and stripped (pre-fix shape)");
+    auto old = make_ctx(model, false);
+    const uint64_t r0 = llama_memory_hybrid_idx::n_xy_rejects();
+    std::vector<llama_token> toks(t0.size() + 8);
+    size_t n_tok = 0;
+    const size_t nr = llama_state_seq_load_file(old.get(), f_old.c_str(), 0, toks.data(), toks.size(), &n_tok);
+    check(nr > 0 && llama_memory_hybrid_idx::n_xy_rejects() == r0, tag + " TX: a pre-fix text entry is accepted (no rejection)");
+    if (nr > 0) {
+        const int d = n_differing(idx_live, cells_of(hyb(old.get())->get_mem_idx()));
+        printf("info %s TX: pre-fix text entry, indexer cells differing after restore: %d\n", tag.c_str(), d);
+        check(d == 0, tag + " TX: healed - indexer cells == live");
+        GGML_ASSERT(llama_state_seq_save_file(old.get(), f_re.c_str(), 0, t0.data(), t0.size()) > 0);
+        check(n_bytes_differing(read_file(f_live), read_file(f_re)) == 0, tag + " TX: its re-save == the live (marked) save");
+        check(eq(decode_text(old.get(), t1, 70), cont_mem), tag + " TX: continuation logits == in-memory");
+    }
+    unlink(f_live.c_str());
+    unlink(f_old.c_str());
+    unlink(f_re.c_str());
+}
+
 // T: target save file -> fresh context restore
 static void test_target(llama_model * model, const std::string & tag, const std::string & dir) {
     const auto t0 = tokens(40, 11);
@@ -424,54 +557,21 @@ static void test_target(llama_model * model, const std::string & tag, const std:
     check(eq(cont_mem, cont_rest), tag + " T: continuation logits (text + image + text, every row) == in-memory");
     check(eq(cells_of(h_live->get_mem_idx()), cells_of(h_rest->get_mem_idx())), tag + " T: indexer cells equal after the continuation");
 
-    // an entry written by a build before the fix after a restore of its own: the indexer meta holds x = y = 0 (the C3
-    // shape). Its records are byte-equal to the attention meta's (same pos / ext / seq), so the second occurrence of
-    // that record block in the file is the indexer's
-    if (h_live->get_mem_idx()->has_cell_ext()) {
-        std::vector<int32_t> rec;
-        for (size_t i = 0; i + 4 < attn_live.size(); i += 5) {
-            rec.insert(rec.end(), { attn_live[i + 1], 1, attn_live[i + 2], attn_live[i + 3], attn_live[i + 4], 0 });
-        }
-        auto bytes = read_file(f_live);
-        const auto * pat = (const uint8_t *) rec.data();
-        const size_t n_pat = rec.size() * sizeof(int32_t);
-        auto find = [&](size_t from) {
-            auto it = std::search(bytes.begin() + from, bytes.end(), pat, pat + n_pat);
-            return it == bytes.end() ? std::string::npos : (size_t) (it - bytes.begin());
-        };
-        const size_t o_attn = find(0);
-        const size_t o_idx  = o_attn == std::string::npos ? o_attn : find(o_attn + n_pat);
-        check(o_idx != std::string::npos, tag + " T-old: indexer meta located in the save file");
-        if (o_idx != std::string::npos) {
-            for (size_t c = 0; c < rec.size() / 6; ++c) {
-                memset(bytes.data() + o_idx + (c * 6 + 2) * sizeof(int32_t), 0, 2 * sizeof(int32_t)); // x, y
-            }
-            const std::string f_old = dir + "/old-" + tag + ".bin";
-            {
-                std::ofstream f(f_old, std::ios::binary);
-                f.write((const char *) bytes.data(), bytes.size());
-            }
-            auto old = make_ctx(model, false);
-            n_tok = 0;
-            GGML_ASSERT(llama_state_seq_load_file(old.get(), f_old.c_str(), 0, toks.data(), toks.size(), &n_tok) > 0);
-            auto * h_old = hyb(old.get());
-            const int d_old = n_differing(idx_live, cells_of(h_old->get_mem_idx()));
-            printf("info %s T-old: zeroed indexer x/y in the file, indexer cells differing after restore: %d\n", tag.c_str(), d_old);
-            check(d_old == 0, tag + " T-old: an old-build entry (indexer x = y = 0) heals: indexer cells == live (x/y from attention, tok kept)");
-            const std::string f_old_re = dir + "/old-re-" + tag + ".bin";
-            GGML_ASSERT(llama_state_seq_save_file(old.get(), f_old_re.c_str(), 0, prompt.data(), prompt.size()) > 0);
-            check(n_bytes_differing(read_file(f_live), read_file(f_old_re)) == 0, tag + " T-old: its re-save == the live save");
-            std::vector<float> cont_old = decode_text(old.get(), t2, n_past);
-            auto l = decode_image(old.get(), 2, 2, n_past + 5, 22);
-            cont_old.insert(cont_old.end(), l.begin(), l.end());
-            l = decode_text(old.get(), t3, n_past + 7);
-            cont_old.insert(cont_old.end(), l.begin(), l.end());
-            check(eq(cont_mem, cont_old), tag + " T-old: continuation logits == in-memory");
-            unlink(f_old.c_str());
-            unlink(f_old_re.c_str());
-        }
-    } else {
-        printf("info %s T-old: the indexer serializes no ext - nothing an old build could have zeroed in the file\n", tag.c_str());
+    // [TAG_CELL_EXT_PROVENANCE] the same image entry as a pre-fix build wrote it (no provenance mark; with PLE the
+    // indexer x = y = 0 a restore left behind): its K/V may carry inference on zeroed x/y - rejected, a cache miss
+    {
+        const std::string f_old = dir + "/old-" + tag + ".bin";
+        check(write_prefix_shape(f_live, f_old, (uint32_t) (idx_live.size() / 5), h_live->get_mem_idx()->has_cell_ext()),
+                tag + " T-old: provenance mark located and stripped (pre-fix shape)");
+        auto old = make_ctx(model, false);
+        const uint64_t r0 = llama_memory_hybrid_idx::n_xy_rejects();
+        n_tok = 0;
+        const size_t nr = llama_state_seq_load_file(old.get(), f_old.c_str(), 0, toks.data(), toks.size(), &n_tok);
+        printf("info %s T-old: pre-fix image entry: load %s, rejections %llu -> %llu\n", tag.c_str(), nr ? "accepted" : "refused",
+                (unsigned long long) r0, (unsigned long long) llama_memory_hybrid_idx::n_xy_rejects());
+        check(nr == 0 && llama_memory_hybrid_idx::n_xy_rejects() == r0 + 1, tag + " T-old: a pre-fix image entry is rejected (load fails, counter +1)");
+        check(seq_gone(old.get()), tag + " T-old: nothing of it is left in attention, recurrent or indexer");
+        unlink(f_old.c_str());
     }
 
     if (dir.rfind("/tmp", 0) == 0 && getenv("TEST_CELL_EXT_DUMP") == nullptr) {
@@ -564,6 +664,24 @@ static void test_draft(llama_model * model, const std::string & tag) {
         check(d_attn == 0 && d_idx == 0, tag + " D: flags 0 restore - draft attention + indexer cells byte-equal");
     }
 
+    // D-old: the draft stream as a pre-fix build wrote it (no mark; with PLE indexer x / y zeroed) - the draft holds no
+    // image cell, so it loads and heals
+    {
+        auto data = seq_data(dft.get(), 0);
+        const bool ok = prefix_shape(data, (uint32_t) (idx_live.size() / 5), h->get_mem_idx()->has_cell_ext());
+        check(ok, tag + " D-old: provenance mark located and stripped in the draft stream");
+        auto fresh = make_ctx(model, true);
+        const uint64_t r0 = llama_memory_hybrid_idx::n_xy_rejects();
+        const size_t nr = ok ? llama_state_seq_set_data_ext(fresh.get(), data.data(), data.size(), 0, 0) : 0;
+        auto * hf = hyb(fresh.get());
+        const int d_attn = n_differing(attn_live, cells_of(hf->get_mem_attn()));
+        const int d_idx  = n_differing(idx_live,  cells_of(hf->get_mem_idx()));
+        printf("info %s D-old: pre-fix draft stream %s, cells differing: attention %d, indexer %d\n", tag.c_str(),
+                nr == data.size() ? "accepted" : "refused", d_attn, d_idx);
+        check(nr == data.size() && llama_memory_hybrid_idx::n_xy_rejects() == r0 && d_attn == 0 && d_idx == 0,
+                tag + " D-old: a pre-fix draft stream (recr_none branch) loads, cells == live");
+    }
+
     // speculative rollback checkpoint form: PARTIAL_ONLY, the same context after dropping the sequence
     {
         const auto data = seq_data(dft.get(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -618,6 +736,9 @@ int main(int argc, char ** argv) {
             unlink(gguf_path.c_str());
         }
         test_target(model.get(), tag, dir);
+        test_prefix_text(model.get(), tag, dir);
+        test_target_ckpt(model.get(), tag, true);
+        test_target_ckpt(model.get(), tag, false);
         test_draft (model.get(), tag);
     }
 

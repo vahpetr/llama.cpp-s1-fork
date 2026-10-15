@@ -87,6 +87,8 @@ struct server_deep_ckpt_meta {
     uint32_t    src_version = 0; // [TAG_CACHE_COMPAT2] the adopt source's payload format (its fingerprint's v<N>)
     std::string src_key; // (R92, sol review) the adopt source key written in the checkpoint's header: its owner (two legacy
                          //   sources share <root>/ckpt, so src_dir does not identify one)
+    bool        ixy_marked = false; // [TAG_CELL_EXT_PROVENANCE] its target stream carries LLAMA_STATE_IXY_MARK (written
+                                    //   by a build with the indexer x/y fix); an unmarked one is replaced, not reused
 };
 
 // the structural identity of a disk-cache fingerprint (named, length-delimited fields; shard identity arrays) for
@@ -149,6 +151,7 @@ struct server_disk_cache {
     uint64_t n_loads = 0;
     uint64_t n_evict = 0;
     uint64_t n_deep_rewinds = 0;
+    uint64_t n_ckpt_unmarked_replaced = 0; // [TAG_CELL_EXT_PROVENANCE] pre-fix checkpoints overwritten by ckpt_store
     uint64_t n_ckpt_dropped = 0;
     uint64_t n_blk_copied_total = 0; // (Codex gate r3 Major 1) adopted / legacy blocks copied into the own store at a save
     uint64_t n_deep_copied  = 0; // adopted deep checkpoints copied into the own namespace at a resave // deep checkpoints that did not restore
