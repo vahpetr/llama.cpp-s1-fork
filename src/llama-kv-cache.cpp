@@ -1944,6 +1944,14 @@ bool llama_kv_cells_fill_kq_vis(
     return true;
 }
 
+// [TAG_KQ_VIS_MIRROR] (pkg2 review, Minor) the cells can outlive this cache (shared through mem_other): give the
+// consumer slot back, so repeatedly created and destroyed sharers never exhaust the 4 slots
+llama_kv_cache::~llama_kv_cache() {
+    if (vis_mir_slot >= 0 && !v_cells.empty()) {
+        v_cells[0].vis_unregister(vis_mir_slot);
+    }
+}
+
 // [TAG_KQ_VIS_MIRROR] knobs (see the header)
 bool llama_kq_vis_mirror_enabled() {
     static const bool on = [] {
