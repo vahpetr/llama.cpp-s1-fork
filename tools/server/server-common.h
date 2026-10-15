@@ -193,6 +193,9 @@ public:
     // returns a pair of pointer to the chunk (nullptr if not found) and its start index in tokens
     std::pair<const mtmd::input_chunk_ptr *, size_t> find_next_media_chunk(size_t idx) const;
 
+    // [TAG_CELL_EXT_PROVENANCE] true if any of the first n tokens belongs to a media chunk
+    bool has_media(size_t n = SIZE_MAX) const;
+
     void push_back(llama_token tok);
 
     // will create a copy of the chunk if it contains non-text data

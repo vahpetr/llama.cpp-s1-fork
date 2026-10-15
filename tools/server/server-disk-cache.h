@@ -129,6 +129,11 @@ struct server_disk_cache {
     //   checkpoint of an adopt source that carries its learned descriptor loads target-only (draft data dropped)
     bool deep_get(const std::string & key, common_prompt_checkpoint & out, bool * io_error = nullptr, bool learn = false);
 
+    // [TAG_CELL_EXT_PROVENANCE] the proof that lets a pre-fix (unmarked) checkpoint load: an entry of this cache references
+    //   key (its deep refs or its in-RAM checkpoint keys) and the entry's stored token stream (.tok) has no media chunk in
+    //   its first n_tokens. An orphan checkpoint (no referencing entry) has no proof
+    bool ckpt_legacy_text_ok(const std::string & key, int64_t n_tokens) const;
+
     // reference a stored checkpoint a deep rewind used from prompt.deep (it then survives the collection)
     void deep_adopt(server_prompt & prompt, const server_deep_ckpt_meta & m);
 

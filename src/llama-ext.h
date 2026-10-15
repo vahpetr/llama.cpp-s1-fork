@@ -196,6 +196,14 @@ LLAMA_API size_t llama_state_seq_read_cb (struct llama_context * ctx, llama_seq_
 //   x / y are authoritative at save time. In a per-seq data blob (u32 magic, i32 seq id, stream) of a PARTIAL_ONLY
 //   trunk checkpoint: the words at bytes 8 / 12 / 16 are 1 / 0 / the mark
 #define LLAMA_STATE_IXY_MARK 0x31595849u
+
+// [TAG_CELL_EXT_PROVENANCE] an UNMARKED (pre-fix) qwen4exp state stream or context checkpoint is refused by default -
+//   its cells cannot prove that no image (zeroed indexer x / y) shaped its rows. accept = true lets the following
+//   restores of ctx load unmarked ones (healed, still refused when they hold an image cell or no intact history) - set
+//   it ONLY around a restore whose conversation the caller can prove text-only from its own records (the server: the
+//   disk-cache entry's stored token stream has no media chunk), and reset it after. Per context; no effect on marked
+//   states or on other memories
+LLAMA_API void llama_state_legacy_unmarked_accept(struct llama_context * ctx, bool accept);
 LLAMA_API std::string llama_state_seq_descriptor(const struct llama_context * ctx);
 
 // [TAG_MULTISLOT] the state the context-creation line `qsa_history_dense = on|off (reason)` prints (a library INFO

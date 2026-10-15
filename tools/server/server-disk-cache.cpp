@@ -2358,6 +2358,21 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
         return SERVER_DISK_LOAD_OTHER;
     }
 
+    // [TAG_CELL_EXT_PROVENANCE] a pre-fix (unmarked) state loads only when this entry's own stored token stream (.tok,
+    //   read into e.tokens at init) proves the conversation text-only - no media chunk anywhere in it
+    const bool legacy_text = !e.tokens.has_media();
+    struct legacy_guard {
+        llama_context * a; llama_context * b;
+        legacy_guard(llama_context * a, llama_context * b, bool on) : a(a), b(b) {
+            llama_state_legacy_unmarked_accept(a, on);
+            if (b) { llama_state_legacy_unmarked_accept(b, on); }
+        }
+        ~legacy_guard() {
+            llama_state_legacy_unmarked_accept(a, false);
+            if (b) { llama_state_legacy_unmarked_accept(b, false); }
+        }
+    } legacy(ctx_tgt, ctx_dft, legacy_text);
+
     llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
     server_disk_load_result res = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), rule_for(e, true, tgt_only));
     if (res == SERVER_DISK_LOAD_OK && ctx_dft) {
@@ -2842,6 +2857,18 @@ void server_disk_cache::deep_drop(const std::string & key, const char * why) {
     ckpts.erase(it);
     n_ckpt_dropped++;
     refresh_status();
+}
+
+bool server_disk_cache::ckpt_legacy_text_ok(const std::string & key, int64_t n_tokens) const {
+    // [TAG_CELL_EXT_PROVENANCE] see the declaration
+    for (const auto & e : entries) {
+        const bool refs = std::any_of(e.deep.begin(), e.deep.end(), [&](const auto & r) { return r.key == key; }) ||
+                          std::find(e.ckpt_keys.begin(), e.ckpt_keys.end(), key) != e.ckpt_keys.end();
+        if (refs && n_tokens > 0 && (size_t) n_tokens <= e.tokens.size() && !e.tokens.has_media((size_t) n_tokens)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void server_disk_cache::deep_gc() {
