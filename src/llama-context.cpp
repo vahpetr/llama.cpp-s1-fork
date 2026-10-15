@@ -133,7 +133,8 @@ void llama_context::kqvis_prof_flush(const char * reason) const {
                 " plan_us=%" PRId64 " n_plan=%" PRId64 " plan_avg=%.1f plan_inc=%" PRId64 " cen_inc=%" PRId64
                 " cen_full=%" PRId64 " fb=%" PRId64 "/%" PRId64 "/%" PRId64 "/%" PRId64
                 " qin_us=%" PRId64 " mir_kib=%" PRId64 " mir_runs=%" PRId64 " mir_full=%" PRId64
-                " n_round=%" PRId64 " t_draft_ms=%.3f t_catchup_ms=%.3f t_verify_ms=%.3f t_host_ms=%.3f t_catchup_pf_ms=%.3f\n",
+                " n_round=%" PRId64 " t_draft_ms=%.3f t_catchup_ms=%.3f t_verify_ms=%.3f t_host_ms=%.3f t_catchup_pf_ms=%.3f"
+                " vmir_kib=%.1f vmir=%" PRId64 " vmir_full=%" PRId64 "\n",
                 sched_prof_ctx_name(cparams.ctx_type), mode_name[w.mode & 3], w.cls == 1 ? "pp" : "dec", kqvis_n_win, reason,
                 w.graphs, w.reused, w.tokens, w.n_kv_min, w.n_kv_max, w.n_kv_sum/g, w.build_us, w.inputs_us,
                 w.fill_us, w.fill_us/g, w.in_wait_us, w.in_copy_us, w.kq_copy_us,
@@ -143,7 +144,7 @@ void llama_context::kqvis_prof_flush(const char * reason) const {
                 w.n_cen_full, w.n_cen_fb[1], w.n_cen_fb[2], w.n_cen_fb[3], w.n_cen_fb[4],
                 w.qin_us, w.mir_bytes/1024, w.mir_runs, w.mir_full,
                 w.n_round, w.t_draft_us/1000.0, w.t_catchup_us/1000.0, w.t_verify_us/1000.0, w.t_host_us/1000.0,
-                w.t_catchup_pf_us/1000.0);
+                w.t_catchup_pf_us/1000.0, w.vmir_bytes/1024.0, w.n_vmir, w.n_vmir_full);
         if (graph_cache_k > 0) {
             // [TAG_GRAPH_CACHE] the graph-cache counters of the window (only with LLAMA_GRAPH_CACHE > 0)
             LLAMA_LOG_WARN("kqvis-prof: ctx=%s win=%" PRId64 " graph-cache hit=%d miss=%d check=%d inval=%d\n",
@@ -2686,6 +2687,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // is a plain memcpy): the previous graph of this context must be done reading them
     if (llama_qsa_inputs_inc()) {
         ggml_backend_sched_synchronize(sched.get());
+    } else if (res->uses_kq_vis_mirror) {
+        // [TAG_KQ_VIS_MIRROR] this graph reads a visibility mirror, which set_inputs writes in place: the previous graph
+        // must be done reading it (graphs without a mirror - np2, non-offloaded, > MAX_TOKENS - keep their overlap)
+        ggml_backend_sched_synchronize(sched.get());
     }
 
     // [TAG_KQVIS_PROF]
@@ -2816,6 +2821,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         w.build_us   += kq_t_inputs_us - kq_t_start_us;
         w.inputs_us  += kq_t_compute_us - kq_t_inputs_us;
         w.fill_us    += fill.us;
+        w.vmir_bytes += fill.vmir_bytes;   // [TAG_KQ_VIS_MIRROR]
+        w.n_vmir     += fill.n_vmir;
+        w.n_vmir_full += fill.n_vmir_full;
         w.in_wait_us += in_wait_us;
         w.in_copy_us += in_copy_us;
         w.kq_copy_us += kq_copy_us;
