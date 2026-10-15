@@ -897,15 +897,17 @@ uint64_t llama_memory_hybrid_idx::n_xy_ckpt_rejects() {
 }
 
 namespace {
-// [TAG_CELL_EXT_PROVENANCE] a reader that hands out one already-read u32 first, then the wrapped stream
+// [TAG_CELL_EXT_PROVENANCE] a reader that hands out the already-read u32 words first, then the wrapped stream
 class llama_io_read_unread : public llama_io_read_i {
 public:
-    llama_io_read_unread(llama_io_read_i & in, uint32_t head) : in(in), head(head) {}
+    llama_io_read_unread(llama_io_read_i & in, const uint32_t * words, size_t n_words) : in(in), n_avail(n_words * sizeof(uint32_t)) {
+        memcpy(head, words, n_avail);
+    }
 
     void read(void * dst, size_t size) override {
         auto * out = static_cast<uint8_t *>(dst);
-        while (size > 0 && n_head < sizeof(head)) {
-            *out++ = reinterpret_cast<const uint8_t *>(&head)[n_head++];
+        while (size > 0 && n_head < n_avail) {
+            *out++ = reinterpret_cast<const uint8_t *>(head)[n_head++];
             size--;
         }
         if (size > 0) {
@@ -914,7 +916,7 @@ public:
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        GGML_ASSERT(n_head == sizeof(head)); // tensors never come first in a section
+        GGML_ASSERT(n_head == n_avail); // tensors never come first in a section
         in.read_tensor(tensor, offset, size);
     }
 
@@ -924,8 +926,9 @@ public:
 
 private:
     llama_io_read_i & in;
-    uint32_t          head;
-    size_t            n_head = 0;
+    uint32_t          head[3] = {};
+    size_t            n_avail = 0;
+    size_t            n_head  = 0;
 };
 }
 
@@ -942,9 +945,14 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
     }
 
     // [TAG_CELL_EXT_PROVENANCE] a PARTIAL_ONLY trunk stream (the target's context checkpoints: recurrent only) carries the
-    // mark too, in front - its end cannot be probed in a stream, an indexer section's front can
+    // mark too, in front (its end cannot be probed in a stream), as a decoy recurrent header {cell_count 1, pos 0,
+    // n_seq_id = mark} that an older reader refuses at once: v59 a1b6c324e src/llama-memory-hybrid-idx.cpp:933 hands a
+    // PARTIAL_ONLY stream to llama_memory_recurrent::state_read, which reads cell_count = 1 (llama-memory-recurrent.cpp:881),
+    // reserves a 1-cell ubatch (:1034) and fails the first record's `n_seq_id != 0` check (:1043, INVALID) - no large
+    // allocation (a bare mark word would be read as 828 987 465 cells, ~27 GB). The real recurrent section follows
     if (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
-        io.write(&LLAMA_IDX_STATE_XY_MARK, sizeof(LLAMA_IDX_STATE_XY_MARK));
+        const uint32_t decoy[3] = { 1, 0, LLAMA_IDX_STATE_XY_MARK };
+        io.write(decoy, sizeof(decoy));
     }
 
     llama_memory_hybrid::state_write(io, seq_id, flags);
@@ -1012,15 +1020,24 @@ void llama_memory_hybrid_idx::recr_state_read_partial(llama_io_read_i & io, llam
     // stay). One written before the fix (no mark) may hold recurrent rows computed on zeroed indexer x / y after an
     // image restore - with an image in the live sequence it is refused (the caller drops it and re-processes the
     // prompt); without one it is text-only state and loads as before
-    uint32_t head = 0;
-    io.read(&head, sizeof(head));
-
-    if (head == LLAMA_IDX_STATE_XY_MARK) {
-        get_mem_recr()->state_read(io, seq_id, flags);
-        return;
+    // the stream opens either with the decoy header {1, 0, mark} or with a pre-fix recurrent section: {cell_count, then
+    // per cell pos, n_seq_id (always 0 in a per-seq stream)} - only a cell_count of 1 is followed by those two words
+    uint32_t w[3] = {};
+    size_t   n_w  = 1;
+    io.read(&w[0], sizeof(w[0]));
+    if (w[0] == 1) {
+        io.read(&w[1], 2 * sizeof(uint32_t));
+        n_w = 3;
+        if (w[2] == LLAMA_IDX_STATE_XY_MARK) {
+            get_mem_recr()->state_read(io, seq_id, flags);
+            return;
+        }
     }
 
-    const uint32_t n_img = get_mem_attn()->n_cells_2d_seq(seq_id);
+    // pre-fix: only image cells within the checkpoint's own prefix count (its recurrent cell's position; the live
+    // sequence may run past it until the caller trims it)
+    const llama_pos p_max = w[0] == 1 ? (llama_pos) w[1] : (llama_pos) INT32_MAX;
+    const uint32_t n_img = get_mem_attn()->n_cells_2d_seq(seq_id, p_max);
     if (n_img > 0) {
         const uint64_t n = ++g_idx_xy_ckpt_rejects;
         LLAMA_LOG_WARN("%s: context checkpoint saved before the indexer x/y fix, %u image cells in the sequence: rejected "
@@ -1029,8 +1046,13 @@ void llama_memory_hybrid_idx::recr_state_read_partial(llama_io_read_i & io, llam
         throw std::runtime_error("pre-fix context checkpoint of a sequence with image cells");
     }
 
-    llama_io_read_unread io_head(io, head);
-    get_mem_recr()->state_read(io_head, seq_id, flags);
+    llama_io_read_unread io_head(io, w, n_w);
+    try {
+        get_mem_recr()->state_read(io_head, seq_id, flags);
+    } catch (...) {
+        io.set_status(io_head.status);
+        throw;
+    }
     io.set_status(io_head.status);
 }
 

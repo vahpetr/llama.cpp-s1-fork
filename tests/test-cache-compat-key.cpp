@@ -618,8 +618,8 @@ int main() {
         fs::remove_all(base, ec);
     }
 
-    // [TAG_CELL_EXT_PROVENANCE] a checkpoint stored by a build before the indexer x/y fix (its target blob has no
-    //   LLAMA_STATE_IXY_MARK at byte 8) is replaced by a marked one under the same prefix key, never linked; a marked one
+    // [TAG_CELL_EXT_PROVENANCE] a checkpoint stored by a build before the indexer x/y fix (its target blob does not
+    //   open with the decoy header {1, 0, LLAMA_STATE_IXY_MARK} at byte 8) is replaced by a marked one under the same prefix key, never linked; a marked one
     //   is reused; an unmarked blob over an unmarked one (a model without the mark) reuses
     {
         const fs::path root = fs::temp_directory_path() / ("cache-compat-ixy-" + std::to_string(getpid()));
@@ -632,8 +632,9 @@ int main() {
         }
         const auto blob = [](bool marked, uint8_t fill) {
             std::vector<uint8_t> d(64, fill);
-            const uint32_t w = marked ? LLAMA_STATE_IXY_MARK : 1u; // unmarked: the recurrent section's cell count
-            memcpy(d.data() + 8, &w, sizeof(w));
+            // marked: the decoy header {1, 0, mark}; unmarked: a recurrent section {cell_count 1, pos 31, n_seq_id 0}
+            const uint32_t w[3] = { 1u, marked ? 0u : 31u, marked ? LLAMA_STATE_IXY_MARK : 0u };
+            memcpy(d.data() + 8, w, sizeof(w));
             return d;
         };
         const auto put = [&](server_disk_cache & s, bool marked, uint8_t fill) {

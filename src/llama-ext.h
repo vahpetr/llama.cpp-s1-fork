@@ -191,9 +191,10 @@ LLAMA_API size_t llama_state_seq_read_cb (struct llama_context * ctx, llama_seq_
 #define LLAMA_STATE_ABI_REV 1
 
 // [TAG_CELL_EXT_PROVENANCE] the qwen4exp hybrid-idx provenance mark "IXY1": written in front of the indexer section
-//   and, in a PARTIAL_ONLY trunk stream (recurrent only), in front of the recurrent section, by a build whose indexer
+//   and, in a PARTIAL_ONLY trunk stream (recurrent only), in front of the recurrent section as the decoy recurrent
+//   header {u32 1, u32 0, u32 mark} (an older reader refuses it after a 1-cell reservation), by a build whose indexer
 //   x / y are authoritative at save time. In a per-seq data blob (u32 magic, i32 seq id, stream) of a PARTIAL_ONLY
-//   trunk checkpoint it is the word at byte 8
+//   trunk checkpoint: the words at bytes 8 / 12 / 16 are 1 / 0 / the mark
 #define LLAMA_STATE_IXY_MARK 0x31595849u
 LLAMA_API std::string llama_state_seq_descriptor(const struct llama_context * ctx);
 

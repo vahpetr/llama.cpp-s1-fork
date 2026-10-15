@@ -2682,7 +2682,7 @@ uint32_t llama_kv_cache::n_cells_2d(const slot_info_vec_t & sinfos) const {
     return n;
 }
 
-uint32_t llama_kv_cache::n_cells_2d_seq(llama_seq_id seq_id) const {
+uint32_t llama_kv_cache::n_cells_2d_seq(llama_seq_id seq_id, llama_pos p_max) const {
     // [TAG_CELL_EXT_PROVENANCE] see the declaration
     if (hparams.n_pos_per_embd() <= 1) {
         return 0;
@@ -2704,7 +2704,7 @@ uint32_t llama_kv_cache::n_cells_2d_seq(llama_seq_id seq_id) const {
             const llama_pos p = cells.pos_get(i);
             const auto &    e = cells.ext_get(i);
 
-            n += e.x != p || e.y != p;
+            n += p <= p_max && (e.x != p || e.y != p);
         }
     }
 

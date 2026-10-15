@@ -134,14 +134,16 @@ template <typename T> static bool get(std::istream & f, T & v) {
 static bool get_vec(std::istream & f, std::vector<uint8_t> & v);
 
 // [TAG_CELL_EXT_PROVENANCE] a per-seq data blob (u32 magic, i32 seq id, stream) of a PARTIAL_ONLY qwen4exp trunk
-//   checkpoint opens its stream with LLAMA_STATE_IXY_MARK when a build with the indexer x/y fix wrote it
+//   checkpoint opens its stream with the decoy header {1, 0, LLAMA_STATE_IXY_MARK} when a build with the indexer x/y
+//   fix wrote it (llama-ext.h)
+static const size_t CKPT_IXY_HEAD = 20;
 static bool ckpt_blob_ixy_marked(const uint8_t * d, size_t n) {
-    uint32_t w = 0;
-    if (n < 12) {
+    uint32_t w[3] = {};
+    if (n < CKPT_IXY_HEAD) {
         return false;
     }
-    memcpy(&w, d + 8, sizeof(w));
-    return w == LLAMA_STATE_IXY_MARK;
+    memcpy(w, d + 8, sizeof(w));
+    return w[0] == 1 && w[1] == 0 && w[2] == LLAMA_STATE_IXY_MARK;
 }
 static bool skip_vec(std::istream & f) {
     uint64_t n = 0;
@@ -1630,10 +1632,10 @@ void server_disk_cache::init() {
                  get_str_le(f, dh) && env_ver == ENVELOPE_VERSION && dh == desc_key && get_str(f, m.key) &&
                  get(f, m.n_tokens) && get(f, m.pos_min) && get(f, m.pos_max) && m.key + ".ck" == name;
             if (ok) {
-                // [TAG_CELL_EXT_PROVENANCE] the first 12 bytes of the target blob: flags_tgt, flags_dft, u64 length, blob
+                // [TAG_CELL_EXT_PROVENANCE] the first 20 bytes of the target blob: flags_tgt, flags_dft, u64 length, blob
                 uint32_t ft = 0, fd = 0;
                 uint64_t n_tgt = 0;
-                uint8_t  head[12] = {};
+                uint8_t  head[CKPT_IXY_HEAD] = {};
                 m.ixy_marked = get(f, ft) && get(f, fd) && get(f, n_tgt) && n_tgt >= sizeof(head) &&
                                (bool) f.read(reinterpret_cast<char *>(head), sizeof(head)) &&
                                ckpt_blob_ixy_marked(head, sizeof(head));
