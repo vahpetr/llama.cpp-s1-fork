@@ -1034,6 +1034,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+    // [TAG_MMVQ_HOIST] C1: the hoisted-weight twins for NUM_COLS >= 2 (index = cols - 1; [0] never created): f32 x f32 and the
+    // q8_1 MMVQ of q4_0 / q5_0 / q8_0 / q4_K. GGML_VK_MMVQ_HOIST=0 keeps the pipelines above.
+    vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32_hoist[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
+    vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32_hoist[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+    bool mmvq_hoist;
+    uint32_t mmvq_hoist_min_cols;   // GGML_VK_MMVQ_HOIST_MIN_COLS (default 2, 2..8)
     // [TAG_QSA_POOL_REMAP] the twins of pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32][i] for GGML_OP_MUL_MAT_ROWS
     vk_pipeline pipeline_dequant_mul_mat_vec_rows_f32_f32[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
@@ -6375,6 +6381,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_f32, 1, 1}, {wg_size_subgroup, rm_f32, i+1}, 1, false, use_subgroups, force_subgroup_size);
+            if (i > 0) { // [TAG_MMVQ_HOIST] same parameters as the pipeline above
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32_hoist[w][i], "mul_mat_vec_f32_f32_f32_hoist",  arr_dmmv_hoist_f32_f32_f32_len[reduc],  arr_dmmv_hoist_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_f32, 1, 1}, {wg_size_subgroup, rm_f32, i+1}, 1, false, use_subgroups, force_subgroup_size);
+            }
             // [TAG_QSA_POOL_REMAP] its GGML_OP_MUL_MAT_ROWS twin: the same everything, plus the row ids at binding 5
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_rows_f32_f32[w][i], "mul_mat_vec_rows_f32_f32_f32", arr_dmmv_rows_f32_f32_f32_len[reduc], arr_dmmv_rows_f32_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings + 1, sizeof(vk_mat_vec_push_constants), {rm_f32, 1, 1}, {wg_size_subgroup, rm_f32, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32",  arr_dmmv_f16_f32_f32_len[reduc],  arr_dmmv_f16_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
@@ -6454,6 +6463,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_S][i], "mul_mat_vec_iq1_s_q8_1_f32", arr_dmmv_iq1_s_q8_1_f32_len[reduc], arr_dmmv_iq1_s_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_M][i], "mul_mat_vec_iq1_m_q8_1_f32", arr_dmmv_iq1_m_q8_1_f32_len[reduc], arr_dmmv_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+
+                if (i > 0) { // [TAG_MMVQ_HOIST] the hoisted twins, same parameters as their base pipelines above
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32_hoist[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32_hoist", arr_dmmv_hoist_q4_0_q8_1_f32_len[reduc], arr_dmmv_hoist_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32_hoist[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_q8_1_f32_hoist", arr_dmmv_hoist_q5_0_q8_1_f32_len[reduc], arr_dmmv_hoist_q5_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32_hoist[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_q8_1_f32_hoist", arr_dmmv_hoist_q8_0_q8_1_f32_len[reduc], arr_dmmv_hoist_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32_hoist[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_q8_1_f32_hoist", arr_dmmv_hoist_q4_k_q8_1_f32_len[reduc], arr_dmmv_hoist_q4_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                }
 
             }
 #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
@@ -8430,7 +8446,24 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->fuse_concat_ssm_conv = fuse_enabled("GGML_VK_FUSE_CONCAT_SSM_CONV");
         // [TAG_VK_DISPATCH_LOG] read once here; off = one bool test per matmul dispatch, nothing else
         device->dispatch_log = ggml_vk_env_bool("GGML_VK_DISPATCH_LOG", false);
-        // [TAG_MMID_PRECAST_B] the coopmat1 mul_mat_id B pre-cast to f16 (see ggml_vk_mul_mat_id_q_f16)
+        // [TAG_MMVQ_HOIST] C1: hoisted-weight mat-vec twins at 2..8 columns (default on; =0 the upstream pipelines)
+        device->mmvq_hoist = ggml_vk_env_bool("GGML_VK_MMVQ_HOIST", true);
+        // GGML_VK_MMVQ_HOIST_MIN_COLS: the twins from this many columns on (default 2; 780M order-balanced N-sweep, median of
+        // 6 reps: n 2..5 = 0..-19 %, n 6..8 = -2..-16 % on the hoisted shapes, the untouched q6_K control within +-2 %;
+        // the s1 decode-band unit can sweep 2 vs 6)
+        {
+            const char * mc = getenv("GGML_VK_MMVQ_HOIST_MIN_COLS");
+            // 0 = off (as GGML_VK_MMVQ_HOIST=0); 1 behaves as 2 (n = 1 is never hoisted); > 8 clamps to 8 (the widest twin)
+            const int v = mc ? atoi(mc) : 2;
+            if (v == 0) {
+                device->mmvq_hoist = false;
+            }
+            device->mmvq_hoist_min_cols = (uint32_t) std::min(std::max(v, 2), (int) mul_mat_vec_max_cols);
+        }
+        if (device->mmvq_hoist) {
+            GGML_LOG_WARN("ggml_vulkan: mmvq_hoist: on from %u columns (GGML_VK_MMVQ_HOIST / _MIN_COLS)\n", device->mmvq_hoist_min_cols);
+        }
+        // [TAG_MMID_PRECAST_B] the coopmat1 mul_mat_id B pre-cast to f16 (see ggml_vk_mul_mat_id_q_f16);
         // review B1 M2: AMD coopmat1 only (measured there), like the tile
         device->mmid_precast_b = ggml_vk_env_bool("GGML_VK_MMID_PRECAST_B", true) && device->vendor_id == VK_VENDOR_ID_AMD &&
                                  device->driver_id != vk::DriverId::eAmdProprietary;
@@ -9149,7 +9182,8 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
 }
 
-static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t num_cols, uint32_t m, uint32_t k) {
+static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t num_cols, uint32_t m, uint32_t k,
+                                                        bool allow_hoist = false) {
     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec()");
     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16 || b_type == GGML_TYPE_Q8_1);
     GGML_ASSERT(num_cols >= 1 && num_cols <= mul_mat_vec_max_cols);
@@ -9230,7 +9264,17 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         }
+        // [TAG_MMVQ_HOIST] the plain MUL_MAT's MMVQ at >= 2 columns takes the hoisted twin when it exists
+        if (allow_hoist && ctx->device->mmvq_hoist && num_cols >= ctx->device->mmvq_hoist_min_cols && ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32_hoist[dmmv_wg][a_type][num_cols-1]) {
+            return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32_hoist[dmmv_wg][a_type][num_cols-1];
+        }
         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
+    }
+
+    // [TAG_MMVQ_HOIST] f32 x f32 at >= 2 columns (the plain MUL_MAT only: the MUL_MAT_ROWS twin lookup passes allow_hoist = false)
+    if (allow_hoist && ctx->device->mmvq_hoist && num_cols >= ctx->device->mmvq_hoist_min_cols && a_type == GGML_TYPE_F32 && b_type == GGML_TYPE_F32 &&
+        ctx->device->pipeline_dequant_mul_mat_vec_f32_f32_hoist[dmmv_wg][num_cols-1]) {
+        return ctx->device->pipeline_dequant_mul_mat_vec_f32_f32_hoist[dmmv_wg][num_cols-1];
     }
 
     return b_type == GGML_TYPE_F32 ? ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[dmmv_wg][a_type][num_cols-1] : ctx->device->pipeline_dequant_mul_mat_vec_f16_f32[dmmv_wg][a_type][num_cols-1];
@@ -11219,12 +11263,12 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     // Check for mmq first
-    vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, GGML_TYPE_Q8_1, ne11, ne20, ne00) : nullptr;
+    vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, GGML_TYPE_Q8_1, ne11, ne20, ne00, true) : nullptr;
     vk_pipeline to_q8_1 = nullptr;
 
     if (dmmv == nullptr) {
         // Fall back to f16 dequant mul mat
-        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, src1->type, ne11, ne20, ne00);
+        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, src1->type, ne11, ne20, ne00, true);
         quantize_y = false;
     }
 

@@ -11863,6 +11863,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1, 1024)); // too big (N>512)
 
+    // [TAG_MMVQ_HOIST] C1: the decode mat-vec shapes at 1..8 columns (f32 router, HC up / down / inject, q8_0 hands
+    // shapes, a q4_0 one) - n = 1 is the untouched path, n >= 2 the hoisted twins
+    for (int64_t n = 1; n <= 8; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,   512, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, GGML_TYPE_F32, 10240, n,   320, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,     4, n, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  2560, n,   640, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32,   512, n,  2560, {1, 1}, {1, 1}));
+    }
+
     // [TAG_DENSE_TILE_B2] the B2 hc tile (m <= 384, split_k 1) and its boundaries vs the CPU (review-B2 I1): the production
     // q4_K 320 x 10240, q5_0 / q6_K inside 65..384, the m 64 / 65 / 384 / 385 edges; m 2048 n 256 reaches the opt-in xl tile
     for (int64_t n : { 128, 1024, 2044, 2048 }) {
@@ -13370,6 +13381,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         if (type_a == GGML_TYPE_Q5_0 || type_a == GGML_TYPE_Q8_0 || type_a == GGML_TYPE_F32) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, 2048,   320, {1, 1}, {1, 1}));
         }
+    }
+    // [TAG_MMVQ_HOIST] C1: the N-sweep of the decode mat-vec shapes (sol 2026-10-09 G2: router f32 512 x 2560, HC q5_0
+    // 10240 x 320, HC q4_K 320 x 10240 + inject 4 x 10240, q4_K 2560 x 6144, q4_K 10240 x 2560, q6_K lm_head-like 10240 x 2560)
+    for (int64_t n = 1; n <= 8; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,   512, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, GGML_TYPE_F32, 10240, n,   320, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,     4, n, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  2560, n,  6144, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 10240, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, n,  2560, {1, 1}, {1, 1}));
     }
     // [TAG_DENSE_TILE_B2] B2: the production dense prefill GEMMs at n 128 / 512 / 2044 / 2048 (q4_K 10240 x 2560 and
     // 6144 x 2560, q4_K 320 x 10240, q5_0 10240 x 320; m x k)

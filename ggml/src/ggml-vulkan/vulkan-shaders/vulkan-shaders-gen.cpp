@@ -793,7 +793,19 @@ void process_shaders() {
             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         }
+        // [TAG_MMVQ_HOIST] the hoisted-weight MMVQ twins (C1), production decode types only
+        if (tname == "q4_0" || tname == "q5_0" || tname == "q8_0" || tname == "q4_k") {
+            string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_hoist", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"MMVQ_HOIST", "1"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_hoist_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"MMVQ_HOIST", "1"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_hoist_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}, {"MMVQ_HOIST", "1"}}));
+        }
 #endif
+        // [TAG_MMVQ_HOIST] the hoisted f32 x f32 mat-vec twin (C1: the f32 expert router)
+        if (tname == "f32") {
+            string_to_spv("mul_mat_vec_f32_f32_f32_hoist", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"MMVQ_HOIST", "1"}}));
+            string_to_spv("mul_mat_vec_f32_f32_f32_hoist_subgroup", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"MMVQ_HOIST", "1"}}));
+            string_to_spv("mul_mat_vec_f32_f32_f32_hoist_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}, {"MMVQ_HOIST", "1"}}));
+        }
 
         // Dequant shaders
         if (tname != "f16" && tname != "bf16") {
@@ -1321,6 +1333,25 @@ void write_output_files() {
             src << "const uint64_t arr_dmmv_id_" << tname << "_" << btype << "_f32_len[3] =  {mul_mat_vec_id_" << tname << "_" << btype << "_f32_len,  mul_mat_vec_id_" << tname << "_" << btype << "_f32_subgroup_len, mul_mat_vec_id_"  << tname << "_" << btype << "_f32_subgroup_no_shmem_len};\n";
         }
     }
+    }
+
+    // [TAG_MMVQ_HOIST] the hoisted mat-vec twins, by reduction mode like arr_dmmv_<t>_<b>_f32
+    {
+        std::vector<std::pair<std::string, std::string>> hoist = {{"f32", "f32"}};
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+        for (const char * t : {"q4_0", "q5_0", "q8_0", "q4_k"}) {
+            hoist.push_back({t, "q8_1"});
+        }
+#endif
+        for (const auto & tb : hoist) {
+            const std::string n = tb.first + "_" + tb.second + "_f32";
+            hdr << "extern const void * arr_dmmv_hoist_" << n << "_data[3];\n";
+            hdr << "extern const uint64_t arr_dmmv_hoist_" << n << "_len[3];\n";
+            if (basename(input_filepath) == "mul_mat_vec.comp") {
+                src << "const void * arr_dmmv_hoist_" << n << "_data[3] = {mul_mat_vec_" << n << "_hoist_data, mul_mat_vec_" << n << "_hoist_subgroup_data, mul_mat_vec_" << n << "_hoist_subgroup_no_shmem_data};\n";
+                src << "const uint64_t arr_dmmv_hoist_" << n << "_len[3] = {mul_mat_vec_" << n << "_hoist_len, mul_mat_vec_" << n << "_hoist_subgroup_len, mul_mat_vec_" << n << "_hoist_subgroup_no_shmem_len};\n";
+            }
+        }
     }
 
     // [TAG_QSA_POOL_REMAP] the GGML_OP_MUL_MAT_ROWS mat-vec twin, by reduction mode like arr_dmmv_f32_f32_f32

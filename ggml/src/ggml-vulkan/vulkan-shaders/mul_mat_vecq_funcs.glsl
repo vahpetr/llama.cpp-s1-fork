@@ -562,3 +562,47 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     return sum;
 }
 #endif
+
+// [TAG_MMVQ_HOIST] GGML_VK_MMVQ_HOIST (C1): the weight-side half of mmvq_dot_product (repack + scales), computed once per
+// (row, block) and reused across the NUM_COLS columns by the hoisted iter(); the column-side half takes that column's
+// q8_1 block explicitly. Same integer dot sums, same float expression per (column, row) as mmvq_dot_product.
+#ifdef MMVQ_HOIST
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0)
+struct mmvq_a_t { i32vec2 qs; FLOAT_TYPE dm; };
+mmvq_a_t mmvq_load_a(const uint ib_a, const uint iqs) {
+    mmvq_a_t a;
+#if QUANT_R == 2
+    a.qs = repack(ib_a, iqs);
+#else
+    a.qs = i32vec2(repack(ib_a, iqs * 2), repack(ib_a, iqs * 2 + 1));
+#endif
+    a.dm = get_dm(ib_a);
+    return a;
+}
+FLOAT_TYPE mmvq_dot_a(const mmvq_a_t a, const int32_t b_qs[K_PER_ITER / 4], const vec2 b_ds) {
+    int32_t q_sum = 0;
+    q_sum += dotPacked4x8EXT(a.qs.x, b_qs[0]);
+    q_sum += dotPacked4x8EXT(a.qs.y, b_qs[1]);
+    // 2 quants per call => divide sums by 8/2 = 4
+    return mul_q8_1(q_sum, a.dm, b_ds, 4);
+}
+#elif defined(DATA_A_Q4_K)
+struct mmvq_a_t { i32vec4 qs; vec2 dm_scale; };
+mmvq_a_t mmvq_load_a(const uint ib_a, const uint iqs) {
+    mmvq_a_t a;
+    a.qs = repack4(ib_a, iqs * 4);
+    a.dm_scale = get_dm_scale(ib_a, iqs * 4);
+    return a;
+}
+FLOAT_TYPE mmvq_dot_a(const mmvq_a_t a, const int32_t b_qs[K_PER_ITER / 4], const vec2 b_ds) {
+    int32_t q_sum = 0;
+    q_sum += dotPacked4x8EXT(a.qs.x, b_qs[0]);
+    q_sum += dotPacked4x8EXT(a.qs.y, b_qs[1]);
+    q_sum += dotPacked4x8EXT(a.qs.z, b_qs[2]);
+    q_sum += dotPacked4x8EXT(a.qs.w, b_qs[3]);
+    return FLOAT_TYPE(float(b_ds.x) * float(a.dm_scale.x) * float(q_sum) - float(a.dm_scale.y) * float(b_ds.y / 2));
+}
+#else
+#error MMVQ_HOIST: type not covered
+#endif
+#endif // MMVQ_HOIST

@@ -118,7 +118,38 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
     }
 }
 
-#if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
+#if (defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)) && defined(MMVQ_HOIST)
+// [TAG_MMVQ_HOIST] GGML_VK_MMVQ_HOIST (C1): the B vec4 of all NUM_COLS columns first, then per row the A vec4 loaded ONCE and
+// dotted with each column - every temp[j][n] gets the same dot(v, b) term per iteration in the same order -> same sums.
+void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i)
+{
+    const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
+    const uint iqs = 0; // quant index
+    const uint iybs = col; // y block start index
+
+    vec4 hb[NUM_COLS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        hb[j] = data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4];
+    }
+
+    uint ibi = first_row*p.ncols;
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+#ifdef A_ROW_IDS
+        const uint ib = (uint(data_row_ids[a_row_ids_base + first_row + n])*p.ncols + col)/QUANT_K; // block index
+#else
+        const uint ib = (ibi + col)/QUANT_K; // block index
+        ibi += p.ncols;
+#endif
+
+        const vec4 v = dequantize4_2aligned(ib, iqs, a_offset);
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            // matrix multiplication
+            temp[j][n] += dot(v, hb[j]);
+        }
+    }
+}
+#elif defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
 void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i)
 {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
