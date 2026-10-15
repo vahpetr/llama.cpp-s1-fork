@@ -507,14 +507,26 @@ public:
     // [TAG_KQ_VIS_MIRROR] per-consumer dirty ranges of the visibility metadata (pos / seq_lo / ext): every mutator marks
     // the cells it touches; a device mirror registers a slot and takes (reads + clears) its range before an update.
     // A fresh slot, reset() and resize() mark everything. Up to 4 consumers (cells shared between caches).
+    // a slot is reclaimed by vis_unregister (the consumer's destructor): at most 4 consumers ALIVE at a time (pkg2 review, Minor)
     int vis_register() const {
-        GGML_ASSERT(n_vis < (int) vis_dirty.size() && "KQ visibility mirror: more than 4 consumers of one llama_kv_cells");
-        vis_dirty[n_vis] = vis_range_t();
-        return n_vis++;
+        for (int k = 0; k < (int) vis_dirty.size(); ++k) {
+            if (!(vis_used & (1u << k))) {
+                vis_used |= 1u << k;
+                vis_dirty[k] = vis_range_t();
+                n_vis = std::max(n_vis, k + 1);
+                return k;
+            }
+        }
+        GGML_ABORT("KQ visibility mirror: more than 4 live consumers of one llama_kv_cells");
+    }
+
+    void vis_unregister(int slot) const {
+        GGML_ASSERT(slot >= 0 && slot < (int) vis_dirty.size() && (vis_used & (1u << slot)));
+        vis_used &= ~(1u << slot);
     }
 
     void vis_take(int slot, uint32_t & lo, uint32_t & hi, bool & all) const {
-        assert(slot >= 0 && slot < n_vis);
+        assert(slot >= 0 && slot < n_vis && (vis_used & (1u << slot)));
         lo  = vis_dirty[slot].lo;
         hi  = vis_dirty[slot].hi;
         all = vis_dirty[slot].all;
@@ -717,7 +729,8 @@ private:
     // [TAG_KQ_VIS_MIRROR]
     struct vis_range_t { uint32_t lo = UINT32_MAX; uint32_t hi = 0; bool all = true; };
     mutable std::array<vis_range_t, 4> vis_dirty;
-    mutable int n_vis = 0;
+    mutable int n_vis = 0;        // slots [0, n_vis) are marked (a free slot is marked harmlessly; registering resets it)
+    mutable uint32_t vis_used = 0; // live consumers
 
     void vis_mark(uint32_t i) const {
         for (int k = 0; k < n_vis; ++k) {

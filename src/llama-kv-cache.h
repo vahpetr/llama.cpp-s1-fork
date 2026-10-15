@@ -155,7 +155,7 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "");
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache(); // [TAG_KQ_VIS_MIRROR] releases the mirror's consumer slot in the (possibly shared) cells
 
     //
     // llama_memory_i
