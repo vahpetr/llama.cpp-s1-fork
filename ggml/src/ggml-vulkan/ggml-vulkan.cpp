@@ -2535,14 +2535,16 @@ static bool ggml_vk_b1_classified_type(ggml_type t) {
     return t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q6_K || t == GGML_TYPE_IQ3_S;
 }
 
-// [TAG_DENSE_TILE_B2] GGML_VK_DENSE_TILE_B2 (default on, =0 off): the AMD coopmat1 dense quantized-A matmul B2 tiles
+// [TAG_DENSE_TILE_B2] GGML_VK_DENSE_TILE_B2 (default OFF since run4, =1 on): the AMD coopmat1 dense quantized-A matmul B2 tiles
 // (ggml_vk_mul_mat_q_f16): hc = BM 64 x BN 128 for m <= 384 (default on), and, only with GGML_VK_DENSE_TILE_B2_XL=1
 // (default off: 10-20 % SLOWER on the 780M for the large shapes; for the gfx1151 screen arm), xl = BM 128 x BN 256 for
 // m >= 2048. Both EXACT. Read once (static). Transfer note: on the 780M the hc gain is largest on 320 x 10240 at n 512-1024,
 // but gfx1151 (more cores) runs that shape with split_k > 1 up to n 1024 (S0.3 S4 raw), where B2 does not apply - on gfx1151
 // only the split_k == 1 widths (n >= ~2044) can gain. The production-graph byte check is pending the oracle gate.
 static bool ggml_vk_dense_tile_b2(const vk_device & device) {
-    static const bool on = ggml_vk_env_bool("GGML_VK_DENSE_TILE_B2", true);
+    // default OFF (ruling 2026-10-15, gfx1151 interim run4 per-op: the hc tile made q4_K 320 x 10240 at n 2048 137 -> 356 ms
+    // and q6_K 49 -> 93 ms per ubatch; the 780M gain does not transfer). =1 enables it (A/B only).
+    static const bool on = ggml_vk_env_bool("GGML_VK_DENSE_TILE_B2", false);
     return on && device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && !device->coopmat2 &&
            device->driver_id != vk::DriverId::eAmdProprietary;
 }
