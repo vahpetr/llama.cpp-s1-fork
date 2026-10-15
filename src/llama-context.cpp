@@ -191,6 +191,8 @@ void llama_context::kqvis_prof_flush(const char * reason) const {
 //       [qsa-score] ctx=<main|mtp> g=<graph> il=<il> chunk=<k> n_past=<p> n_blocks=<n> n_tps=<rows> n_stream=<ns>
 //                   fnv=<FNV-1a 64 of the f32 bytes>
 //     chunk = the k-th score plane of this layer in this graph. Observing the score ends a scheduler sub-range too.
+//     [TAG_QSA_SCORE_EPILOGUE] with GGML_VK_QSA_SCORE_EPILOGUE on, the plane is the GGML_OP_QSA_SCORE node itself (the
+//     graph keeps the bias as its own ADD while this knob is set, so the hashed plane stays the pre-bias sum)
 // Everything is off by default; level 1 without the new knobs prints the same records as before plus the new fields.
 static int llama_qsa_dump_ids_level() {
     static const int level = [] {
@@ -374,13 +376,14 @@ struct llama_qsa_ids_dump {
     }
 
     // score pass: the pooled plane the score reads, found through the score's sources (head-sum adds -> views -> relu ->
-    // reshape -> MUL_MAT_ROWS(store, q, remap) or MUL_MAT(pooled, q))
+    // reshape -> MUL_MAT_ROWS(store, q, remap) or MUL_MAT(pooled, q); or [TAG_QSA_SCORE_EPILOGUE] the QSA_SCORE node itself)
     void dump_score_operand(ggml_tensor * score, int t_il) {
         std::vector<ggml_tensor *> todo = { score };
         ggml_tensor * mm = nullptr;
         for (size_t k = 0; k < todo.size() && k < 256 && mm == nullptr; ++k) {
             ggml_tensor * x = todo[k];
-            if (x->op == GGML_OP_MUL_MAT_ROWS || (x->op == GGML_OP_MUL_MAT && x->src[0] && x->src[0]->type == GGML_TYPE_F32)) {
+            if (x->op == GGML_OP_MUL_MAT_ROWS || (x->op == GGML_OP_MUL_MAT && x->src[0] && x->src[0]->type == GGML_TYPE_F32) ||
+                x->op == GGML_OP_QSA_SCORE) { // [TAG_QSA_SCORE_EPILOGUE] the same operands: store/pooled src[0], rows src[2]
                 mm = x;
                 break;
             }
@@ -395,7 +398,7 @@ struct llama_qsa_ids_dump {
                     (unsigned long long) graph, t_il, (long long) n_past);
             return;
         }
-        if (mm->op == GGML_OP_MUL_MAT) {
+        if (mm->op == GGML_OP_MUL_MAT || (mm->op == GGML_OP_QSA_SCORE && mm->src[2] == nullptr)) {
             dump_pooled(mm->src[0], "matmul", t_il);
             return;
         }

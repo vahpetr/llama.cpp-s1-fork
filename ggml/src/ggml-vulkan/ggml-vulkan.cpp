@@ -996,6 +996,10 @@ struct vk_device_struct {
     // [TAG_QSA_POOL_REMAP] GGML_OP_MUL_MAT_ROWS: pipeline_matmul_f32's twins with A's rows named by a row-id buffer
     // (same SPIR-V defines + A_ROW_IDS, same spec constants / tiles / alignment); empty on coopmat2 devices
     vk_matmul_pipeline pipeline_matmul_f32_rows {};
+    // [TAG_QSA_SCORE_EPILOGUE] GGML_OP_QSA_SCORE: pipeline_matmul_f32's / pipeline_matmul_f32_rows's twins with the indexer
+    // score epilogue (ReLU, ordered head sum, bias) in the store; coopmat1 devices only (empty elsewhere)
+    vk_matmul_pipeline pipeline_matmul_f32_qsa {};
+    vk_matmul_pipeline pipeline_matmul_f32_rows_qsa {};
     vk_matmul_pipeline pipeline_matmul_f32_f16 {};
     vk_matmul_pipeline pipeline_matmul_bf16 {};
     vk_matmul_pipeline2 pipeline_matmul_f16;
@@ -1469,6 +1473,16 @@ struct vk_mat_mat_push_constants {
     uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
     uint32_t padded_N;
 };
+
+// [TAG_QSA_SCORE_EPILOGUE] the matmul_f32_f32[_rows]_qsa push constants: the matmul's own (the plain product's values),
+// then the epilogue's (mul_mm.comp under QSA_SCORE_EPILOGUE declares them after padded_N)
+struct vk_mat_mat_qsa_push_constants {
+    vk_mat_mat_push_constants mm;
+    uint32_t n_head; uint32_t has_bias;
+    uint32_t stride_o; uint32_t batch_stride_o;
+};
+static_assert(std::is_standard_layout_v<vk_mat_mat_qsa_push_constants>);
+static_assert(offsetof(vk_mat_mat_qsa_push_constants, n_head) == sizeof(vk_mat_mat_push_constants));
 
 #define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
@@ -5391,6 +5405,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (!device->pipeline_matmul_f32_rows) {
         device->pipeline_matmul_f32_rows = std::make_shared<vk_matmul_pipeline_struct>();
     }
+    if (!device->pipeline_matmul_f32_qsa) {
+        device->pipeline_matmul_f32_qsa = std::make_shared<vk_matmul_pipeline_struct>();
+    }
+    if (!device->pipeline_matmul_f32_rows_qsa) {
+        device->pipeline_matmul_f32_rows_qsa = std::make_shared<vk_matmul_pipeline_struct>();
+    }
     if (!device->pipeline_matmul_f32_f16) {
         device->pipeline_matmul_f32_f16 = std::make_shared<vk_matmul_pipeline_struct>();
     }
@@ -5753,6 +5773,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_rows, matmul_f32_f32_rows, , wg_denoms, warptile, vk_mat_mat_push_constants, 4, ); // [TAG_QSA_POOL_REMAP]
+        // [TAG_QSA_SCORE_EPILOGUE] same slots / tiles / spec constants as the two above; bindings A, B, D, row ids, bias
+        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_qsa, matmul_f32_f32_qsa, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
+        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_rows_qsa, matmul_f32_f32_rows_qsa, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_f16, matmul_f32_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16_f32, matmul_f16_f32, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
@@ -10768,6 +10791,23 @@ static vk_pipeline ggml_vk_matmul_f32_rows_twin(const vk_device & device, const 
     return nullptr;
 }
 
+// [TAG_QSA_SCORE_EPILOGUE] the twin of a pipeline_matmul_f32 pipeline in pipeline_matmul_f32[_rows]_qsa (same slot), or
+// nullptr
+static vk_pipeline ggml_vk_matmul_f32_qsa_twin(const vk_device & device, const vk_pipeline & p, bool rows) {
+    const vk_matmul_pipeline & a = device->pipeline_matmul_f32;
+    const vk_matmul_pipeline & b = rows ? device->pipeline_matmul_f32_rows_qsa : device->pipeline_matmul_f32_qsa;
+    if (!a || !b || !p) {
+        return nullptr;
+    }
+    if (p == a->l)   { return b->l;   }
+    if (p == a->m)   { return b->m;   }
+    if (p == a->s)   { return b->s;   }
+    if (p == a->a_l) { return b->a_l; }
+    if (p == a->a_m) { return b->a_m; }
+    if (p == a->a_s) { return b->a_s; }
+    return nullptr;
+}
+
 // row_ids != nullptr [TAG_QSA_POOL_REMAP]: src0 describes the get_rows copy ([K, M, n_b], contiguous) whose buffer
 // position is the store's, row_ids_a_bytes the store's size; every decision below is made for that src0, exactly as
 // for the plain MUL_MAT, and only the chosen pipeline is swapped for its row-id twin
@@ -11858,6 +11898,76 @@ static void ggml_vk_mul_mat_vec_rows(ggml_backend_vk_context * ctx, vk_context& 
         // the unused fusion bindings 3 and 4 alias D, as in the plain dispatch
         ggml_vk_dispatch_pipeline(ctx, subctx, twin, { d_X, d_Y, d_D, d_D, d_D, d_ID }, pc, { groups_x, groups_y, groups_z });
         base_work_group_y += groups_y;
+    }
+}
+
+// [TAG_QSA_SCORE_EPILOGUE] GGML_OP_QSA_SCORE (qwen4exp indexer score): the score product exactly as the plain op would
+// run it - ggml_vk_mul_mat_q_f16's choices for a contiguous f32 A ([K, M, n_b]: the pooled keys, or the row-id view of the
+// store, as ggml_vk_mul_mat_rows describes it) and a contiguous f32 B ([K, n_head*N, n_b]): the f32 matmul, its
+// alignment / tile (s/m/l) choice, split_k (always 1 here: K < 2048, checked by supports_op and asserted) - on that
+// pipeline's QSA twin, whose epilogue writes relu-ordered-head-sum(+bias) instead of the per-head plane. supports_op
+// keeps every shape the plain op would send to the mat-vec, a conversion pass, q8_1, an M split or a 64-bit-indexing
+// pipeline off this node (the graph builds the old chain for those).
+static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * a    = dst->src[0];
+    const ggml_tensor * b    = dst->src[1];
+    const ggml_tensor * rows = dst->src[2];
+    const ggml_tensor * bias = dst->src[3];
+
+    const uint32_t n_head = (uint32_t) ggml_get_op_params_i32(dst, 0);
+
+    const uint32_t K   = (uint32_t) a->ne[0];
+    const uint32_t M   = (uint32_t) dst->ne[0];
+    const uint32_t N   = (uint32_t) b->ne[1];   // n_head * queries: the product's columns
+    const uint32_t n_b = (uint32_t) b->ne[2];
+
+    GGML_ASSERT(N == n_head*dst->ne[1] && n_b == dst->ne[2]);
+
+    vk_matmul_pipeline mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, GGML_TYPE_F32, GGML_TYPE_F32, GGML_PREC_DEFAULT);
+    GGML_ASSERT(mmp == ctx->device->pipeline_matmul_f32);
+    // the plain op would try q8_1 first: there is no f32 x q8_1 matmul, so it falls back to this same mmp
+    GGML_ASSERT(!(ctx->device->integer_dot_product || ctx->device->mmq_cm1) ||
+                ggml_vk_get_mul_mat_mat_pipeline(ctx, GGML_TYPE_F32, GGML_TYPE_Q8_1, GGML_PREC_DEFAULT) == nullptr);
+
+    const uint32_t kpad    = ggml_vk_align_size(K, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, M, N, GGML_TYPE_F32, GGML_TYPE_F32));
+    const bool     aligned = K == kpad && M > 8 && N > 8;
+    vk_pipeline    base    = ggml_vk_guess_matmul_pipeline(ctx, mmp, M, N, aligned, GGML_TYPE_F32, GGML_TYPE_F32);
+    GGML_ASSERT(ggml_vk_guess_split_k(ctx, M, N, K, false, base) == 1);
+
+    vk_pipeline pipeline = ggml_vk_matmul_f32_qsa_twin(ctx->device, base, rows != nullptr);
+    GGML_ASSERT(pipeline != nullptr);
+
+    if (ctx->device->dispatch_log) {
+        ggml_vk_dispatch_log(ctx, rows ? "mm_rows_qsa" : "mm_qsa", a, b, dst, M, N, K, n_b, -1, -1, pipeline, 1, false, false);
+    }
+
+    // the plain product's push constants (ggml_vk_mul_mat_q_f16 -> ggml_vk_matmul, split_k == 1), D = its [M, N, n_b] plane
+    const uint32_t stride_d       = M;
+    const uint32_t stride_batch_x = K*M;
+    const uint32_t stride_batch_y = K*N;
+    const uint32_t stride_batch_d = stride_d*N;
+
+    vk_subbuffer d_X  = ggml_vk_tensor_subbuffer(ctx, a);
+    vk_subbuffer d_Y  = ggml_vk_tensor_subbuffer(ctx, b);
+    vk_subbuffer d_D  = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer d_ID = rows ? ggml_vk_tensor_subbuffer(ctx, rows) : d_D;
+    vk_subbuffer d_B  = bias ? ggml_vk_tensor_subbuffer(ctx, bias) : d_D;
+
+    const uint32_t max_z = ctx->device->properties.limits.maxComputeWorkGroupCount[2];
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(n_b, max_z));
+
+    uint32_t base_work_group_z = 0;
+    while (base_work_group_z < n_b) {
+        const uint32_t groups_z = std::min(n_b - base_work_group_z, max_z);
+
+        const vk_mat_mat_qsa_push_constants pc = {
+            { M, N, K, K, K, stride_d, stride_batch_x, stride_batch_y, stride_batch_d, base_work_group_z, n_b, K,
+              n_b, n_b, 1, 1, N },
+            n_head, bias ? 1u : 0u,
+            (uint32_t) (dst->nb[1]/sizeof(float)), (uint32_t) (dst->nb[2]/sizeof(float)),
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_X, d_Y, d_D, d_ID, d_B }, pc, { M, N, groups_z });
+        base_work_group_z += groups_z;
     }
 }
 
@@ -18929,6 +19039,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_mul_mat_rows(ctx, compute_ctx, cgraph, node_idx);
 
         break;
+    case GGML_OP_QSA_SCORE: // [TAG_QSA_SCORE_EPILOGUE]
+        ggml_vk_qsa_score(ctx, compute_ctx, node);
+
+        break;
 
     case GGML_OP_FLASH_ATTN_EXT:
         ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node->src[5], node);
@@ -21436,6 +21550,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
 
+        if (vk_fusion_list_enabled && cgraph->nodes[i]->op == GGML_OP_QSA_SCORE) {
+            // [TAG_QSA_SCORE_EPILOGUE] one node, listed like a fusion so the fusion sets of two runs can be diffed
+            ggml_vk_fusion_list_report("qsa_score_epilogue", cgraph, i, 1, cgraph->nodes[i]->src[3] ? "+bias" : nullptr);
+        }
         if (vk_fusion_list_enabled && ctx->num_additional_fused_ops > 0 && fusion_string) {
             std::string name = fusion_string;
             for (char & c : name) {
@@ -21461,6 +21579,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // 12 move from topk_qsa= to topk_qsa_op= and the total is unchanged.
             if (cgraph->nodes[i]->op == GGML_OP_QSA_TOP_K) {
                 ggml_vk_fusion_count_add(fusion_counts, "", "topk_qsa_op");
+            }
+            // [TAG_QSA_SCORE_EPILOGUE] qsa_score_epilogue=<count>: indexer scores dispatched as one GGML_OP_QSA_SCORE (the
+            // score GEMM with ReLU + head sum (+ bias) in its store) instead of MUL_MAT[_ROWS] + RELU + CONT + ADD/MULTI_ADD
+            // (+ bias ADD); qsa_score_epilogue_bias counts those that also folded the bias. Not a fusion pattern: one node.
+            if (cgraph->nodes[i]->op == GGML_OP_QSA_SCORE) {
+                ggml_vk_fusion_count_add(fusion_counts, "", "qsa_score_epilogue");
+                if (cgraph->nodes[i]->src[3]) {
+                    ggml_vk_fusion_count_add(fusion_counts, "", "qsa_score_epilogue_bias");
+                }
             }
 
             // mmid_mul_nofuse:<reason>=count - why the expert-weight multiply stayed unfused at this
@@ -22932,6 +23059,42 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const uint64_t range = device->properties.limits.maxStorageBufferRange;
                 return ggml_nbytes(a) <= range && (uint64_t) ggml_row_size(a->type, a->ne[0])*ggml_nelements(rows) <= range;
             }
+        case GGML_OP_QSA_SCORE:
+            {
+                // [TAG_QSA_SCORE_EPILOGUE] only where the plain product (MUL_MAT of the pooled keys / MUL_MAT_ROWS of the
+                // store) runs the coopmat1 f32 matmul with split_k 1 and no conversion pass - the epilogue lives in that
+                // shader's store - and the heads of a query fit one coopmat fragment (TN % n_head == 0). Everything else
+                // (decode / short verify widths that take the mat-vec, coopmat2, scalar devices, K >= 2048, > 4 GB A)
+                // is refused, and the graph keeps the unfused chain for it.
+                const ggml_tensor * a    = op->src[0];
+                const ggml_tensor * b    = op->src[1];
+                const ggml_tensor * rows = op->src[2];
+                const ggml_tensor * bias = op->src[3];
+                const int n_head = ggml_get_op_params_i32(op, 0);
+                if (!device->coopmat_support || device->coopmat2 || !a || !b ||
+                    !device->pipeline_matmul_f32_qsa || device->pipeline_matmul_f32_qsa->is_empty() ||
+                    !device->pipeline_matmul_f32_rows_qsa || device->pipeline_matmul_f32_rows_qsa->is_empty() ||
+                    n_head <= 0 || device->coopmat_n == 0 || device->coopmat_n % (uint32_t) n_head != 0 ||
+                    a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(op) ||
+                    b->ne[3] != 1 || op->ne[3] != 1 || a->ne[0] >= 2048) {
+                    return false;
+                }
+                if (rows && (rows->type != GGML_TYPE_I32 || !ggml_is_contiguous(rows) || a->ne[2] != 1 || a->ne[3] != 1)) {
+                    return false;
+                }
+                if (bias && (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias))) {
+                    return false;
+                }
+                // ggml_vk_mul_mat's mat-vec branch: N == 1, or N <= mul_mat_vec_max_cols on one batch
+                const int64_t N = b->ne[1];
+                if (N == 1 || (N <= mul_mat_vec_max_cols && b->ne[2] == 1)) {
+                    return false;
+                }
+                const uint64_t range = device->properties.limits.maxStorageBufferRange;
+                return ggml_nbytes(a) <= range && ggml_nbytes(b) <= range && ggml_nbytes(op) <= range &&
+                       (!rows || (uint64_t) ggml_row_size(a->type, a->ne[0])*ggml_nelements(rows) <= range);
+            }
         case GGML_OP_QSA_BIAS:
             {
                 // [TAG_QSA_COMPACT_BIAS] I32 contiguous tables (and rows), an F32 contiguous result
@@ -23797,6 +23960,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_mul_mat_id(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ROWS) { // [TAG_QSA_POOL_REMAP]
             tensor_clone = ggml_mul_mat_rows(ggml_ctx, src_clone[0], src_clone[2], src_clone[1]);
+        } else if (tensor->op == GGML_OP_QSA_SCORE) { // [TAG_QSA_SCORE_EPILOGUE]
+            tensor_clone = ggml_qsa_score(ggml_ctx, src_clone[0], src_clone[2], src_clone[1], src_clone[3],
+                                          ggml_get_op_params_i32(tensor, 0));
         } else if (tensor->op == GGML_OP_SUB) {
             tensor_clone = ggml_sub(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL) {
