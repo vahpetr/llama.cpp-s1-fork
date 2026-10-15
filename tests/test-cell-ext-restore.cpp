@@ -21,7 +21,8 @@
 //     skips embedding batches, so the draft holds no image cell); seq data with flags 0 into a fresh context, and the
 //     speculative rollback checkpoint form (PARTIAL_ONLY, same context after seq_rm): the attention and indexer cells'
 //     {pos, ext} equal the live ones, and the next draft step's logits equal those before the rollback;
-//  CK: a target context checkpoint (PARTIAL_ONLY, recurrent only) opens with the mark and restores exact; the pre-fix
+//  CK: a target context checkpoint (PARTIAL_ONLY, recurrent only) opens with the decoy header {1, 0, IXY1} that the v59
+//     recurrent reader (unchanged since) refuses at the first cell record, and restores exact; the pre-fix
 //     shape (no mark) is refused when the live sequence holds an image (checkpoint counter +1, sequence dropped from
 //     all three caches), loads and replays exact for a text-only sequence;
 //  D-old: a pre-fix draft stream (recr_none branch, no mark) loads with cells == live;
@@ -44,6 +45,9 @@
 #include "../src/llama-model-saver.h"
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-memory-recurrent.h"
+#include "../src/llama-io.h"
+#include "../src/llama-ext.h"
 
 #include <algorithm>
 #include <chrono>
@@ -54,6 +58,7 @@
 #include <iterator>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -399,6 +404,26 @@ static bool write_prefix_shape(const std::string & src, const std::string & dst,
 
 static std::vector<uint8_t> seq_data(llama_context * ctx, llama_state_seq_flags flags);
 
+// a plain in-memory llama_io_read_i (the library's own readers are not exported)
+struct buf_reader : llama_io_read_i {
+    buf_reader(const uint8_t * p, size_t n) : p(p), n(n) {}
+    void read(void * dst, size_t size) override {
+        if (size > n - off) {
+            throw std::runtime_error("buf_reader: past the end");
+        }
+        memcpy(dst, p + off, size);
+        off += size;
+    }
+    void read_tensor(ggml_tensor * t, size_t offset, size_t size) override {
+        std::vector<uint8_t> tmp(size);
+        read(tmp.data(), size);
+        ggml_backend_tensor_set(t, tmp.data(), offset, size);
+    }
+    size_t n_bytes() override { return off; }
+    const uint8_t * p;
+    size_t n, off = 0;
+};
+
 // all three caches of the hybrid memory hold nothing of seq 0
 static bool seq_gone(llama_context * ctx) {
     auto * h = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx));
@@ -426,9 +451,11 @@ static void test_target_ckpt(llama_model * model, const std::string & tag, bool 
     n_past += (llama_pos) t1.size();
 
     const auto ck = seq_data(live.get(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-    uint32_t w = 0;
-    memcpy(&w, ck.data() + 8, sizeof(w));
-    check(ck.size() > 12 && w == 0x31595849u, tc + ": the checkpoint stream opens with the IXY1 mark");
+    uint32_t w[3] = {};
+    if (ck.size() > 20) {
+        memcpy(w, ck.data() + 8, sizeof(w));
+    }
+    check(w[0] == 1 && w[1] == 0 && w[2] == LLAMA_STATE_IXY_MARK, tc + ": the checkpoint stream opens with the decoy header {1, 0, IXY1}");
 
     const auto cont = decode_text(live.get(), t2, n_past);
     llama_memory_t mem = llama_get_memory(live.get());
@@ -438,9 +465,15 @@ static void test_target_ckpt(llama_model * model, const std::string & tag, bool 
     GGML_ASSERT(llama_memory_seq_rm(mem, 0, n_past, -1));
     check(eq(decode_text(live.get(), t2, n_past), cont), tc + ": marked checkpoint restore + replay == the first run");
 
+    // text: an image AFTER the checkpoint's prefix in the live sequence (the server trims it only after the load) does not
+    // make a text-only pre-fix checkpoint refused
+    if (!image) {
+        decode_image(live.get(), 2, 2, n_past + (llama_pos) t2.size(), 65);
+    }
+
     // unmarked (the shape a pre-fix build stored)
     std::vector<uint8_t> old = ck;
-    old.erase(old.begin() + 8, old.begin() + 12);
+    old.erase(old.begin() + 8, old.begin() + 20);
     const uint64_t r0 = llama_memory_hybrid_idx::n_xy_ckpt_rejects();
     const size_t nr = llama_state_seq_set_data_ext(live.get(), old.data(), old.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     printf("info %s: unmarked checkpoint %s, checkpoint rejections %llu -> %llu\n", tc.c_str(), nr ? "accepted" : "refused",
@@ -449,9 +482,28 @@ static void test_target_ckpt(llama_model * model, const std::string & tag, bool 
         check(nr == 0 && llama_memory_hybrid_idx::n_xy_ckpt_rejects() == r0 + 1, tc + ": an unmarked checkpoint of an image sequence is refused (counter +1)");
         check(seq_gone(live.get()), tc + ": the sequence is dropped from attention, recurrent and indexer (the server re-processes)");
     } else {
-        check(nr == old.size() && llama_memory_hybrid_idx::n_xy_ckpt_rejects() == r0, tc + ": an unmarked checkpoint of a text-only sequence loads");
+        check(nr == old.size() && llama_memory_hybrid_idx::n_xy_ckpt_rejects() == r0, tc + ": an unmarked checkpoint of a text-only prefix loads (an image after it in the live sequence)");
         GGML_ASSERT(llama_memory_seq_rm(mem, 0, n_past, -1));
         check(eq(decode_text(live.get(), t2, n_past), cont), tc + ": its replay == the first run");
+    }
+
+    // the OLD reader: v59 (a1b6c324e) hands a PARTIAL_ONLY trunk stream straight to llama_memory_recurrent::state_read
+    // (its llama-memory-hybrid-idx.cpp:933), and that reader and llama_batch_allocr::ubatch_reserve are unchanged since
+    // - so the same call here is v59's path: the decoy header must be refused at the first cell record, cheaply
+    {
+        buf_reader io(ck.data() + 8, ck.size() - 8);
+        bool threw = false;
+        const auto t_start = std::chrono::steady_clock::now();
+        try {
+            hyb(live.get())->get_mem_recr()->state_read(io, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        } catch (const std::exception &) {
+            threw = true;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+        printf("info %s: old (v59) recurrent reader on this checkpoint: %s after %zu bytes, status %d, %.3f ms\n", tc.c_str(),
+                threw ? "refused" : "ACCEPTED", io.n_bytes(), io.status, ms);
+        check(threw && io.status == LLAMA_STATE_READ_INVALID && io.n_bytes() <= 12,
+                tc + ": the v59 recurrent reader refuses the checkpoint at its first cell record (INVALID, <= 12 bytes read)");
     }
 }
 
