@@ -2156,6 +2156,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // score reads it through (a dirty-list graph only; the full pool has no remap and keeps `pooled`)
     ggml_tensor * pool_store = nullptr;
     ggml_tensor * pool_remap = nullptr;
+    ggml_tensor * pool_store16 = nullptr; // [TAG_QSA_POOLED_F16_MIRROR]
 
     if (pooled_cache) {
         // [TAG_QSA_POOLED_CACHE] (M3) one update per layer, before the selection (and every [TAG_QSA_CHUNK]
@@ -2188,6 +2189,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_tensor * st = ggml_cpy(ctx0, fresh, dst);
             ggml_format_name(st, "indexer_k_store-%d", il);
 
+            // [TAG_QSA_POOLED_F16_MIRROR] the same rows into the f16 mirror (the full pool's score reads the f32 copy)
+            if (store->f16_mirror) {
+                ggml_tensor * store16 = store->layers_f16.at(il);
+                ggml_tensor * dst16   = ggml_view_3d(ctx0, store16, idx_dim, n_blocks, n_stream,
+                        store16->nb[1], store16->nb[1]*store->n_rows, store16->nb[1]*store->n_rows*inp->full_s0);
+                ggml_tensor * st16 = ggml_cpy(ctx0, fresh, dst16);
+                ggml_format_name(st16, "indexer_k_store16-%d", il);
+                ggml_build_forward_expand(gf, st16);
+            }
+
             if (n_stream == 1) {
                 // the selection reads the rows it just stored (f32 copies: the same bits), so the chain is pulled
                 // into the graph where the recompute's is - at its first consumer - and `fresh` dies at the copy.
@@ -2210,12 +2221,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                     ggml_reshape_2d(ctx0, fresh, idx_dim, cap*n_stream), inp->dirty_dst);
             ggml_format_name(st, "indexer_k_store-%d", il);
 
+            // [TAG_QSA_POOLED_F16_MIRROR] the same rows, from the same values, into the f16 mirror - expanded here, so it
+            // is written whether or not this graph's score reads it (a mat-vec width reads the f32 store)
+            ggml_tensor * st16 = nullptr;
+            if (store->f16_mirror) {
+                st16 = ggml_set_rows(ctx0, store->layers_f16.at(il),
+                        ggml_reshape_2d(ctx0, fresh, idx_dim, cap*n_stream), inp->dirty_dst);
+                ggml_format_name(st16, "indexer_k_store16-%d", il);
+                ggml_build_forward_expand(gf, st16);
+            }
+
             if (llama_qsa_pool_remap_indexed()) {
                 // [TAG_QSA_POOL_REMAP] no copy: (iv) is folded into the score, which reads row remap[b] of the store
                 // (after (iii), through st) for block b - ggml_mul_mat_rows, bit-identical to get_rows + mul_mat. The
                 // remap input is shared by every layer of this ratio; the store is the layer's own.
                 pool_store = st;
                 pool_remap = ggml_reshape_2d(ctx0, inp->remap, n_blocks, n_stream);
+                pool_store16 = st16;
             } else {
                 pooled = ggml_get_rows(ctx0, st, inp->remap);
                 pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
@@ -2250,6 +2272,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         prep->pooled   = pooled;
         prep->pool_store = pool_store;
         prep->pool_remap = pool_remap;
+        prep->pool_store16 = pool_store16;
         prep->q        = q;
         prep->kq_mask  = kq_mask;
         prep->width    = width;
@@ -2267,7 +2290,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_build_forward_expand(gf, bias);
     }
 
-    return build_qsa_select(inp, pooled, q, bias, kq_mask, width, blk_bias, il, pool_store, pool_remap, vis_cells, vis_toks);
+    return build_qsa_select(inp, pooled, q, bias, kq_mask, width, blk_bias, il, pool_store, pool_remap, vis_cells, vis_toks,
+            pool_store16);
 }
 
 // [TAG_QSA_COMPACT_BIAS] the two table inputs that replace the [n_blocks, n_tps, n_stream] f32 plane
@@ -2302,7 +2326,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
         ggml_tensor *         pool_store,
         ggml_tensor *         pool_remap,
         ggml_tensor *         vis_cells,
-        ggml_tensor *         vis_toks) {
+        ggml_tensor *         vis_toks,
+        ggml_tensor *         pool_store16) {
     GGML_ASSERT((pooled != nullptr) != (pool_store != nullptr && pool_remap != nullptr));
 
     const int64_t n_idx_h  = hparams.indexer_n_head;
@@ -2320,6 +2345,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
         const bool fold_bias = blk_bias && !qwen4exp_qsa_dump_score();
         ggml_tensor * fused = ggml_qsa_score(ctx0, pooled ? pooled : pool_store, pooled ? nullptr : pool_remap, q,
                 fold_bias ? bias : nullptr, (int) n_idx_h);
+        // [TAG_QSA_POOLED_F16_MIRROR] the store's f16 mirror, a read hint: the coopmat1 product reads it instead of
+        // converting the f32 store (same f16 values); the result is the same node's either way
+        if (pool_store16 != nullptr && !pooled) {
+            ggml_qsa_score_set_a_f16(fused, pool_store16);
+        }
         if (sched != nullptr && ggml_backend_supports_op(ggml_backend_sched_get_backend(sched, 0), fused)) {
             score  = fused;
             biased = fold_bias;
@@ -2728,7 +2758,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
         }
 
         ggml_tensor * top_k = build_qsa_select(prep.inp, prep.pooled, q_idx, bias_c, mask_c, width, prep.blk_bias, il,
-                prep.pool_store, prep.pool_remap, vis ? prep.vis_cells : nullptr, toks_c);
+                prep.pool_store, prep.pool_remap, vis ? prep.vis_cells : nullptr, toks_c, prep.pool_store16);
 
         if (np > nc) {
             // [TAG_QSA_CHUNK_PAD] THE CUT: from here on only the nc real queries exist - the ids and the mask rows

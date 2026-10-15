@@ -180,6 +180,51 @@ bool llama_qsa_history_dense(const char ** reason) {
     return !mm;
 }
 
+// [TAG_QSA_POOLED_F16_MIRROR] see the header
+static bool llama_qsa_pooled_f16_mirror_env() {
+    static const bool on = [] {
+        const char * s  = getenv("LLAMA_QSA_POOLED_F16_MIRROR");
+        const char * se = getenv("GGML_VK_QSA_SCORE_EPILOGUE"); // its only reader is the score epilogue (A1)
+        return (s == nullptr || atoi(s) != 0) && (se == nullptr || atoi(se) != 0);
+    }();
+    return on;
+}
+
+bool llama_qsa_pooled_f16_mirror_check() {
+    static const bool on = [] {
+        const char * s = getenv("LLAMA_QSA_POOLED_F16_MIRROR_CHECK");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return on;
+}
+
+int64_t llama_qsa_pooled_store::f16_mirror_check() const {
+    if (!f16_mirror) {
+        return 0;
+    }
+    int64_t rows = 0;
+    std::vector<float>       f32;
+    std::vector<ggml_fp16_t> got, want;
+    for (const auto & [il, t] : layers) {
+        const ggml_tensor * t16 = layers_f16.at(il);
+        const int64_t n = ggml_nelements(t);
+        f32.resize(n); got.resize(n); want.resize(n);
+        ggml_backend_tensor_get(t,   f32.data(), 0, n*sizeof(float));
+        ggml_backend_tensor_get(t16, got.data(), 0, n*sizeof(ggml_fp16_t));
+        ggml_fp32_to_fp16_row(f32.data(), want.data(), n);
+        for (int64_t i = 0; i < n; ++i) {
+            if (got[i] != want[i]) {
+                LLAMA_LOG_ERROR("%s: [qsa-f16-mirror] MISMATCH il=%d row=%lld col=%lld f32=%a (0x%08x) mirror=0x%04x want=0x%04x\n",
+                        __func__, il, (long long) (i/t->ne[0]), (long long) (i%t->ne[0]), f32[i],
+                        (unsigned) *(const uint32_t *) &f32[i], (unsigned) got[i], (unsigned) want[i]);
+                GGML_ABORT("LLAMA_QSA_POOLED_F16_MIRROR_CHECK: the f16 mirror differs from its f32 store");
+            }
+        }
+        rows += t->ne[1];
+    }
+    return rows;
+}
+
 bool llama_qsa_census_check() {
     return llama_qsa_census_inc() && llama_qsa_census_check_env();
 }
@@ -546,6 +591,20 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         ggml_format_name(t, "cache_qsa_pooled_l%d", il);
 
         st->layers[il] = t;
+
+        // [TAG_QSA_POOLED_F16_MIRROR] a GPU store only (a CPU product reads f32 and would never use it)
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (llama_qsa_pooled_f16_mirror_env() && dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_tensor * t16 = ggml_new_tensor_2d(it->second.get(), GGML_TYPE_F16, st->idx_dim, (int64_t) st->n_rows*st->n_stream);
+            ggml_format_name(t16, "cache_qsa_pooled_f16_l%d", il);
+
+            st->layers_f16[il] = t16;
+        }
+    }
+    // all layers or none (one decision per memory)
+    st->f16_mirror = !st->layers_f16.empty() && st->layers_f16.size() == st->layers.size();
+    if (!st->f16_mirror) {
+        st->layers_f16.clear();
     }
 
     size_t total = 0;
@@ -565,6 +624,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         }
 
         // unused rows are read by the score GEMM before the bias drops them: keep them finite
+        // ([TAG_QSA_POOLED_F16_MIRROR] all-zero bytes are +0.0 in f32 and in f16: the mirror starts equal to the store)
         ggml_backend_buffer_clear(buf, 0);
 
         total += ggml_backend_buffer_get_size(buf);
@@ -654,8 +714,20 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     qsa_store->stats.n_reset = 0;
 
     LLAMA_LOG_INFO("%s: LLAMA_QSA_POOLED_CACHE=1: %zu layers, ratio %u, %u block slots + 1 spare row x %u streams, "
-            "idx_dim %u, f32: %zu bytes\n", __func__, ils.size(), ratio, qsa_store->n_slots, qsa_store->n_stream,
-            qsa_store->idx_dim, total);
+            "idx_dim %u, f32%s: %zu bytes\n", __func__, ils.size(), ratio, qsa_store->n_slots, qsa_store->n_stream,
+            qsa_store->idx_dim, qsa_store->f16_mirror ? " + f16 mirror" : "", total);
+
+    // [TAG_QSA_POOLED_F16_MIRROR] the proof line (WARN reaches the server log)
+    {
+        const size_t bytes16 = (size_t) ils.size()*qsa_store->idx_dim*qsa_store->n_rows*qsa_store->n_stream*sizeof(ggml_fp16_t);
+        LLAMA_LOG_WARN("%s: qsa_pooled_f16_mirror: %s (LLAMA_QSA_POOLED_F16_MIRROR %s, GGML_VK_QSA_SCORE_EPILOGUE %s)%s: "
+                       "%.2f MiB in the store buffers%s\n", __func__, qsa_store->f16_mirror ? "on" : "off",
+                       getenv("LLAMA_QSA_POOLED_F16_MIRROR") ? getenv("LLAMA_QSA_POOLED_F16_MIRROR") : "unset",
+                       getenv("GGML_VK_QSA_SCORE_EPILOGUE") ? getenv("GGML_VK_QSA_SCORE_EPILOGUE") : "unset",
+                       qsa_store->f16_mirror || !llama_qsa_pooled_f16_mirror_env() ? "" : " (not a GPU store)",
+                       qsa_store->f16_mirror ? bytes16/1024.0/1024.0 : 0.0,
+                       qsa_store->f16_mirror && llama_qsa_pooled_f16_mirror_check() ? "; LLAMA_QSA_POOLED_F16_MIRROR_CHECK=1" : "");
+    }
 
     // [TAG_QSA_POOL_REMAP] read (and prove) how the score reads the store, at load
     (void) llama_qsa_pool_remap_indexed();

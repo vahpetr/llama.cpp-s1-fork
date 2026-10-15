@@ -2849,6 +2849,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // queued after this one.
     llama_qsa_store_publish(mctx, status == GGML_STATUS_SUCCESS);
 
+    // [TAG_QSA_POOLED_F16_MIRROR] LLAMA_QSA_POOLED_F16_MIRROR_CHECK=1 (debug): wait for the graph, then every f16 mirror row must
+    // be the f16 of its f32 store row (aborts on the first mismatch)
+    if (llama_qsa_pooled_f16_mirror_check() && status == GGML_STATUS_SUCCESS) {
+        if (const auto * c = dynamic_cast<const llama_memory_hybrid_idx_context *>(mctx)) {
+            if (const auto * st = c->get_qsa_store(); st != nullptr && st->f16_mirror) {
+                ggml_backend_sched_synchronize(sched.get());
+                const int64_t rows = st->f16_mirror_check();
+                static std::atomic<int64_t> n_checks { 0 };
+                const int64_t k = ++n_checks;
+                if (k <= 4 || (k & (k - 1)) == 0) {
+                    LLAMA_LOG_WARN("%s: [qsa-f16-mirror] check %lld ok: %lld rows (every layer) equal the f16 of the f32 store\n",
+                            __func__, (long long) k, (long long) rows);
+                }
+            }
+        }
+    }
+
     if (prof) {
         // graph_compute() is ggml_backend_sched_graph_compute_async(): on an asynchronous backend (Vulkan)
         // this is the host-side split walk + command recording + vkQueueSubmit time only - the GPU wait
