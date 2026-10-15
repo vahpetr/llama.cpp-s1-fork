@@ -3526,7 +3526,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         std::min<int64_t>(ubatch.n_seq_tokens, (int64_t) ubatch.rs_rollback_depth + 1);
     // the x-tail views below assume x has unit element stride in dim 0 (the conv itself reads x through the concat, so a
     // dim-0-strided x would only corrupt the history): otherwise keep the concat-view tails
-    const bool    tails_x   = qwen4exp_conv_input_split() && n_seq_t >= state_cols + k_tails - 1 &&
+    // only for a caller that defers the tails past its conv (the GDN layer): the PLE layer keeps its concat (per-tap views
+    // read it), so x-tails there would only move the PLE CONCAT away from its v59 position (review-B4c I2)
+    const bool    tails_x   = deferred_tails != nullptr && qwen4exp_conv_input_split() && n_seq_t >= state_cols + k_tails - 1 &&
                               x->nb[0] == ggml_type_size(x->type) && !ggml_is_quantized(x->type);
     // the [state_cols, channels, n_seqs] tail `back` columns before the end of the concat (back = state_cols + slot)
     auto const & tail_view = [&](int64_t back) -> ggml_tensor * {
