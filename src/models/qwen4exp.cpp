@@ -3547,6 +3547,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     // that keeps x alive across the conv, so ggml-alloc cannot hand the conv's output the block x frees -
     // which would make the conv read x while it is being overwritten (the backend's overlap veto would
     // then undo concat_ssm_conv). Pure ordering: the history row is read by build_rs's gather before.
+    // B4 fix round 4 (gfx1151 interim run4: vetoed:concat_ssm_conv_silu in some wide graphs): the history rows are a
+    // GET_ROWS result in the compute buffer whose only consumer is the CONCAT, so ggml-alloc freed them right after the
+    // concat and the conv output could take their block - while the fused conv still reads them (overlap veto). Keep
+    // them alive for the graph (3 x channels floats per sequence and layer) whenever the concat is fused-capable.
+    if (tails_x && deferred_tails) {
+        ggml_set_keep_alive(rows);
+    }
     auto const & emit_tail = [&](ggml_tensor * cpy) {
         if (tails_x && deferred_tails) {
             deferred_tails->push_back(cpy);
