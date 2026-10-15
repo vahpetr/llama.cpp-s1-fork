@@ -1000,6 +1000,8 @@ struct vk_device_struct {
     // score epilogue (ReLU, ordered head sum, bias) in the store; coopmat1 devices only (empty elsewhere)
     vk_matmul_pipeline pipeline_matmul_f32_qsa {};
     vk_matmul_pipeline pipeline_matmul_f32_rows_qsa {};
+    // [TAG_QSA_POOLED_F16_MIRROR] the row-id QSA twin reading an f16 A (the pooled store's f16 mirror)
+    vk_matmul_pipeline pipeline_matmul_f16_f32_rows_qsa {};
     vk_matmul_pipeline pipeline_matmul_f32_f16 {};
     vk_matmul_pipeline pipeline_matmul_bf16 {};
     vk_matmul_pipeline2 pipeline_matmul_f16;
@@ -5411,6 +5413,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (!device->pipeline_matmul_f32_rows_qsa) {
         device->pipeline_matmul_f32_rows_qsa = std::make_shared<vk_matmul_pipeline_struct>();
     }
+    if (!device->pipeline_matmul_f16_f32_rows_qsa) {
+        device->pipeline_matmul_f16_f32_rows_qsa = std::make_shared<vk_matmul_pipeline_struct>();
+    }
     if (!device->pipeline_matmul_f32_f16) {
         device->pipeline_matmul_f32_f16 = std::make_shared<vk_matmul_pipeline_struct>();
     }
@@ -5776,6 +5781,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // [TAG_QSA_SCORE_EPILOGUE] same slots / tiles / spec constants as the two above; bindings A, B, D, row ids, bias
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_qsa, matmul_f32_f32_qsa, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_rows_qsa, matmul_f32_f32_rows_qsa, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
+        // [TAG_QSA_POOLED_F16_MIRROR] created under the F32 availability flags (mul_mat_{s,m,l}[F32]): it is selected for
+        // the slot the F32 plan picks, never by an f16 plan
+        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f16_f32_rows_qsa, matmul_f16_f32_rows_qsa, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_f16, matmul_f32_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16_f32, matmul_f16_f32, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
@@ -10793,9 +10801,11 @@ static vk_pipeline ggml_vk_matmul_f32_rows_twin(const vk_device & device, const 
 
 // [TAG_QSA_SCORE_EPILOGUE] the twin of a pipeline_matmul_f32 pipeline in pipeline_matmul_f32[_rows]_qsa (same slot), or
 // nullptr
-static vk_pipeline ggml_vk_matmul_f32_qsa_twin(const vk_device & device, const vk_pipeline & p, bool rows) {
+static vk_pipeline ggml_vk_matmul_f32_qsa_twin(const vk_device & device, const vk_pipeline & p, bool rows, bool a_f16 = false) {
     const vk_matmul_pipeline & a = device->pipeline_matmul_f32;
-    const vk_matmul_pipeline & b = rows ? device->pipeline_matmul_f32_rows_qsa : device->pipeline_matmul_f32_qsa;
+    const vk_matmul_pipeline & b = a_f16 ? device->pipeline_matmul_f16_f32_rows_qsa
+                                         : (rows ? device->pipeline_matmul_f32_rows_qsa : device->pipeline_matmul_f32_qsa);
+    GGML_ASSERT(!a_f16 || rows);
     if (!a || !b || !p) {
         return nullptr;
     }
@@ -11913,6 +11923,8 @@ static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx,
     const ggml_tensor * b    = dst->src[1];
     const ggml_tensor * rows = dst->src[2];
     const ggml_tensor * bias = dst->src[3];
+    // [TAG_QSA_POOLED_F16_MIRROR] the store's f16 mirror: the product reads it instead of converting `a` (same f16 values)
+    const ggml_tensor * a16  = rows ? dst->src[4] : nullptr;
 
     const uint32_t n_head = (uint32_t) ggml_get_op_params_i32(dst, 0);
 
@@ -11934,11 +11946,13 @@ static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx,
     vk_pipeline    base    = ggml_vk_guess_matmul_pipeline(ctx, mmp, M, N, aligned, GGML_TYPE_F32, GGML_TYPE_F32);
     GGML_ASSERT(ggml_vk_guess_split_k(ctx, M, N, K, false, base) == 1);
 
-    vk_pipeline pipeline = ggml_vk_matmul_f32_qsa_twin(ctx->device, base, rows != nullptr);
+    // the F32 plan's slot (alignment, tile), on the f16-A twin when the mirror is bound
+    vk_pipeline pipeline = ggml_vk_matmul_f32_qsa_twin(ctx->device, base, rows != nullptr, a16 != nullptr);
     GGML_ASSERT(pipeline != nullptr);
 
     if (ctx->device->dispatch_log) {
-        ggml_vk_dispatch_log(ctx, rows ? "mm_rows_qsa" : "mm_qsa", a, b, dst, M, N, K, n_b, -1, -1, pipeline, 1, false, false);
+        ggml_vk_dispatch_log(ctx, a16 ? "mm_rows_qsa_f16a" : (rows ? "mm_rows_qsa" : "mm_qsa"), a16 ? a16 : a, b, dst, M, N, K, n_b, -1, -1,
+                             pipeline, 1, false, false);
     }
 
     // the plain product's push constants (ggml_vk_mul_mat_q_f16 -> ggml_vk_matmul, split_k == 1), D = its [M, N, n_b] plane
@@ -11947,7 +11961,7 @@ static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx,
     const uint32_t stride_batch_y = K*N;
     const uint32_t stride_batch_d = stride_d*N;
 
-    vk_subbuffer d_X  = ggml_vk_tensor_subbuffer(ctx, a);
+    vk_subbuffer d_X  = ggml_vk_tensor_subbuffer(ctx, a16 ? a16 : a);
     vk_subbuffer d_Y  = ggml_vk_tensor_subbuffer(ctx, b);
     vk_subbuffer d_D  = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer d_ID = rows ? ggml_vk_tensor_subbuffer(ctx, rows) : d_D;
@@ -23086,6 +23100,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (bias && (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias))) {
                     return false;
                 }
+                // [TAG_QSA_POOLED_F16_MIRROR] the f16 mirror hint: an f16 copy of the store, read by the f16-A twin
+                const ggml_tensor * a16 = op->src[4];
+                if (a16 && (!rows || a16->type != GGML_TYPE_F16 || !ggml_is_contiguous(a16) ||
+                            a16->ne[0] != a->ne[0] || a16->ne[1] != a->ne[1] || a16->ne[2] != 1 || a16->ne[3] != 1 ||
+                            !device->pipeline_matmul_f16_f32_rows_qsa || device->pipeline_matmul_f16_f32_rows_qsa->is_empty())) {
+                    return false;
+                }
                 // ggml_vk_mul_mat's mat-vec branch: N == 1, or N <= mul_mat_vec_max_cols on one batch
                 const int64_t N = b->ne[1];
                 if (N == 1 || (N <= mul_mat_vec_max_cols && b->ne[2] == 1)) {
@@ -23963,6 +23984,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
         } else if (tensor->op == GGML_OP_QSA_SCORE) { // [TAG_QSA_SCORE_EPILOGUE]
             tensor_clone = ggml_qsa_score(ggml_ctx, src_clone[0], src_clone[2], src_clone[1], src_clone[3],
                                           ggml_get_op_params_i32(tensor, 0));
+            if (src_clone[4]) {
+                ggml_qsa_score_set_a_f16(tensor_clone, src_clone[4]);
+            }
         } else if (tensor->op == GGML_OP_SUB) {
             tensor_clone = ggml_sub(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL) {

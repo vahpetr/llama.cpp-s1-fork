@@ -8013,6 +8013,8 @@ struct test_qsa_score : public test_case {
     const bool    rows;   // MUL_MAT_ROWS form (store + remap) vs MUL_MAT (pooled)
     const int     bias;   // 0 none, 1 QSA_BIAS constants, 2 uniform
     const bool    exact;
+    const bool    f16a;   // [TAG_QSA_POOLED_F16_MIRROR] the op reads an f16 mirror of the store (set_rows of every row)
+    const float   scale;  // [TAG_QSA_POOLED_F16_MIRROR] the store's values x scale (1e-5: f16 denormals in the mirror)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -8020,11 +8022,17 @@ struct test_qsa_score : public test_case {
     }
 
     std::string vars() override {
+        if (f16a || scale != 1.0f) {
+            return VARS_TO_STR10(K, M, N, n_b, n_head, rows, bias, exact, f16a, scale);
+        }
         return VARS_TO_STR8(K, M, N, n_b, n_head, rows, bias, exact);
     }
 
-    test_qsa_score(int64_t K, int64_t M, int64_t N, int64_t n_b, int n_head, bool rows, int bias, bool exact)
-        : K(K), M(M), N(N), n_b(n_b), n_head(n_head), rows(rows), bias(bias), exact(exact) {}
+    test_qsa_score(int64_t K, int64_t M, int64_t N, int64_t n_b, int n_head, bool rows, int bias, bool exact,
+                   bool f16a = false, float scale = 1.0f)
+        : K(K), M(M), N(N), n_b(n_b), n_head(n_head), rows(rows), bias(bias), exact(exact), f16a(f16a), scale(scale) {
+        GGML_ASSERT(!f16a || rows);
+    }
 
     double max_nmse_err() override { return 5e-4; }
     double max_err() override { return exact ? 0.0 : max_nmse_err(); }
@@ -8088,6 +8096,14 @@ struct test_qsa_score : public test_case {
         }
 
         ggml_tensor * op = ggml_qsa_score(ctx, a, ids, b, bi, n_head);
+        if (f16a) {
+            // the store's f16 mirror as qwen4exp writes it: set_rows of the f32 rows into an F16 store
+            ggml_tensor * a16 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, K, n_rows());
+            ggml_set_name(a16, "a16");
+            ggml_tensor * all = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_rows());
+            ggml_set_name(all, "allrows");
+            ggml_qsa_score_set_a_f16(op, ggml_set_rows(ctx, a16, a, all));
+        }
         if (!exact) {
             ggml_set_name(op, "out");
             return op;
@@ -8119,6 +8135,16 @@ struct test_qsa_score : public test_case {
                     }
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(name, "allrows") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (size_t i = 0; i < v.size(); i++) {
+                    v[i] = (int32_t) i;
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(name, "a16") == 0) {
+                // every row is overwritten by the set_rows; a recognisable junk value elsewhere
+                std::vector<ggml_fp16_t> v(ggml_nelements(t), ggml_fp32_to_fp16(-7.0f));
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(ggml_fp16_t));
             } else if (strcmp(name, "a") == 0 || strcmp(name, "b") == 0) {
                 // unit-norm rows (the normed, roped keys and queries), so the scores straddle 0 and the ReLU matters
                 const int64_t n = ggml_nelements(t);
@@ -8130,8 +8156,9 @@ struct test_qsa_score : public test_case {
                         ss += (double) v[r*K + k]*v[r*K + k];
                     }
                     const float sc = ss > 0.0 ? (float) (1.0/std::sqrt(ss)) : 1.0f;
+                    const float sc2 = strcmp(name, "a") == 0 ? sc*scale : sc;
                     for (int64_t k = 0; k < K; k++) {
-                        v[r*K + k] *= sc;
+                        v[r*K + k] *= sc2;
                     }
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, n*sizeof(float));
@@ -13004,6 +13031,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // [TAG_QSA_POOLED_F16_MIRROR] the same op reading the store's f16 mirror (set_rows f32 -> f16 of every row), still bit for
+    // bit against the f32 chain: the widths, ragged M, both bias modes, unaligned K, two streams, head counts, the deployed
+    // depths, and the store scaled by 1e-5 (f16 denormals in the mirror) and 1e3
+    for (int bm : { 0, 1 }) {
+        for (int64_t M : { 1, 17, 129, 1000 }) {
+            for (int64_t N = 1; N <= 128; N += (N < 20 ? 1 : (N < 64 ? 7 : 16))) {
+                test_cases.emplace_back(new test_qsa_score(128, M, N, 1, 4, true, bm, true, true));
+            }
+            test_cases.emplace_back(new test_qsa_score(128, M, 128, 1, 4, true, bm, true, true));
+        }
+        for (int64_t N : { 1, 3, 6, 37, 128 }) {
+            test_cases.emplace_back(new test_qsa_score(128, 4133, N, 2, 4, true, bm, true, true));
+            test_cases.emplace_back(new test_qsa_score(72,  777,  N, 1, 4, true, bm, true, true));
+            test_cases.emplace_back(new test_qsa_score(128, 1000, N, 1, 4, true, bm, true, true, 1e-5f));
+            test_cases.emplace_back(new test_qsa_score(128, 1000, N, 1, 4, true, bm, true, true, 1e3f));
+        }
+        for (int H : { 1, 2, 8, 16 }) {
+            test_cases.emplace_back(new test_qsa_score(128, 1000, 9, 1, H, true, bm, true, true));
+        }
+    }
+    for (int64_t M : { 65536, 262144 }) {
+        for (int64_t N : { 3, 4, 5, 6, 9, 128 }) {
+            test_cases.emplace_back(new test_qsa_score(128, M, N, 1, 4, true, 1, true, true));
+        }
+    }
+
     // ... and the op against the CPU (NMSE)
     for (bool r : { false, true }) {
         for (int64_t N : { 3, 37, 128 }) {
@@ -13649,6 +13702,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // (the chain it replaces is timed arm against arm by the A1 classifier: the perf harness repeats only the output node)
     for (int64_t M : { 16384, 65536, 131072, 262144 }) {
         test_cases.emplace_back(new test_qsa_score(128, M, 128, 1, 4, true, 1, false));
+    }
+    // [TAG_QSA_POOLED_F16_MIRROR] decode / verify rounds at 1M (262144 blocks) and 524k: widths 3..6 (N 12..24), f32 store vs
+    // the f16 mirror (the mirror's set_rows of every row is part of the f16a graph: subtract test-backend-ops' SET_ROWS time
+    // or read the perf logger's QSA_SCORE line)
+    for (int64_t M : { 131072, 262144 }) {
+        for (int64_t N : { 3, 4, 5, 6 }) {
+            test_cases.emplace_back(new test_qsa_score(128, M, N, 1, 4, true, 1, false));
+            test_cases.emplace_back(new test_qsa_score(128, M, N, 1, 4, true, 1, false, true));
+        }
     }
 
     // [TAG_QSA_POOL_REMAP] the selected-K/V gather of the same verify graph ([TAG_QSA_GATHER_Q8]: q8_0 cells of 2 x 256

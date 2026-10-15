@@ -62,6 +62,18 @@ bool llama_qsa_history_dense(const char ** reason = nullptr);
 void llama_qsa_note_mm_positions();
 bool llama_qsa_census_check();
 
+// [TAG_QSA_POOLED_F16_MIRROR] (Program v8.1 A2a, contrib 0240) LLAMA_QSA_POOLED_F16_MIRROR (default 1 = on; 0 = off = the
+// f32-only store): next to every f32 pooled-key store layer an F16 [idx_dim, n_rows*n_stream] mirror, written in the same
+// graph from the same values (the full pool's cpy / the dirty rows' set_rows - f32 -> f16 round to nearest even, f16
+// denormals kept, as every Vulkan shader of this backend is patched to), and handed to the indexer score
+// (GGML_OP_QSA_SCORE, ggml_qsa_score_set_a_f16) whose coopmat1 product converts its A operand to f16 at load anyway: that
+// GEMM then reads 2 instead of 4 bytes per key element and the same f16 values. The f32 store stays authoritative: the
+// mat-vec widths (1-2 rows: decode, 2-token verify), the CPU and every other reader use it. Only on a GPU store with the
+// score epilogue on (GGML_VK_QSA_SCORE_EPILOGUE != 0). Cost: 2 B x idx_dim x n_rows x n_stream per QSA layer.
+// LLAMA_QSA_POOLED_F16_MIRROR_CHECK=1 (debug): after every graph (synchronised) every mirror row must equal the host's
+// f32 -> f16 (round to nearest even) of the f32 store row; the first mismatch aborts.
+bool llama_qsa_pooled_f16_mirror_check();
+
 //
 // [TAG_QSA_INPUTS_INC] LLAMA_QSA_INPUTS_INC=1 (default 0) - only with LLAMA_QSA_POOLED_CACHE=1, LLAMA_QSA_CENSUS_INC=1 and
 // LLAMA_QSA_COMPACT_BIAS=1 (WARN + off otherwise). The three O(n_kv) QSA graph inputs - cell_blk [n_kv, ns], remap
@@ -167,6 +179,14 @@ struct llama_qsa_pooled_store {
 
     // il -> F32 [idx_dim, n_rows*n_stream]
     std::map<int32_t, ggml_tensor *> layers;
+
+    // [TAG_QSA_POOLED_F16_MIRROR] il -> F16 [idx_dim, n_rows*n_stream] (f16_mirror only), same buffers as `layers`
+    bool                             f16_mirror = false;
+    std::map<int32_t, ggml_tensor *> layers_f16;
+
+    // [TAG_QSA_POOLED_F16_MIRROR] LLAMA_QSA_POOLED_F16_MIRROR_CHECK: compare every mirror row with the host f16 of its
+    // f32 row (the caller has synchronised the backends); aborts on the first mismatch. Returns the rows compared.
+    int64_t f16_mirror_check() const;
 
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 

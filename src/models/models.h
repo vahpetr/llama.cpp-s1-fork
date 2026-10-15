@@ -2328,6 +2328,7 @@ struct llama_model_qwen4exp : public llama_model_base {
             ggml_tensor *         pooled   = nullptr; // [idx_dim, n_blocks, n_stream]
             ggml_tensor *         pool_store = nullptr; // [TAG_QSA_POOL_REMAP] instead of pooled: the store ...
             ggml_tensor *         pool_remap = nullptr; // ... and the remap [n_blocks, n_stream] the score reads it through
+            ggml_tensor *         pool_store16 = nullptr; // [TAG_QSA_POOLED_F16_MIRROR] the store's f16 mirror (after its write)
             ggml_tensor *         q        = nullptr; // [idx_dim, n_idx_h*n_tps, n_stream]
             ggml_tensor *         kq_mask  = nullptr; // [n_kv, n_tps, 1, n_stream]
             int64_t               width    = 0;
@@ -2439,7 +2440,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * pool_store = nullptr,
                     ggml_tensor * pool_remap = nullptr,
                     ggml_tensor * vis_cells  = nullptr,  // [TAG_QSA_VIS] both non-null: ggml_qsa_top_k_vis over q's rows
-                    ggml_tensor * vis_toks   = nullptr); //   (vis_toks = their token records)
+                    ggml_tensor * vis_toks   = nullptr,  //   (vis_toks = their token records)
+                    ggml_tensor * pool_store16 = nullptr); // [TAG_QSA_POOLED_F16_MIRROR] f16 mirror of pool_store
 
         // [TAG_QSA_COMPACT_BIAS] the qsa_blk/qsa_qry inputs of LLAMA_QSA_COMPACT_BIAS=1
         void build_qsa_compact_inputs(

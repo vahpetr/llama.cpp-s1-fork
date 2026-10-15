@@ -3394,6 +3394,17 @@ struct ggml_tensor * ggml_qsa_score(
     return result;
 }
 
+// [TAG_QSA_POOLED_F16_MIRROR] see ggml.h
+void ggml_qsa_score_set_a_f16(
+        struct ggml_tensor * score,
+        struct ggml_tensor * a16) {
+    GGML_ASSERT(score->op == GGML_OP_QSA_SCORE && score->src[2] != NULL);
+    const struct ggml_tensor * a = score->src[0];
+    GGML_ASSERT(a16->type == GGML_TYPE_F16 && ggml_is_contiguous(a16));
+    GGML_ASSERT(a16->ne[0] == a->ne[0] && a16->ne[1] == a->ne[1] && a16->ne[2] == 1 && a16->ne[3] == 1);
+    score->src[4] = a16;
+}
+
 // ggml_mul_mat_id
 
 /*

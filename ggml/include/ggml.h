@@ -1499,6 +1499,15 @@ extern "C" {
             struct ggml_tensor  * bias,
             int                   n_head);
 
+    // [TAG_QSA_POOLED_F16_MIRROR] an optional f16 copy of a QSA_SCORE's store (rows != NULL), src[4]: a16 [K, n_rows] F16,
+    // contiguous, every row the round-to-nearest-even f16 of the same row of `a` (the caller keeps it so - qwen4exp writes
+    // both from the same values in the same graph). It changes nothing in the op's result: a backend whose product
+    // converts A to f16 anyway (Vulkan coopmat1) may read it instead of converting `a` itself; every other backend
+    // (CPU) ignores it and reads `a`.
+    GGML_API void ggml_qsa_score_set_a_f16(
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * a16);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows
