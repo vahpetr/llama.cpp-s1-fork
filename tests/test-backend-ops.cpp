@@ -13358,6 +13358,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, 2048,   320, {1, 1}, {1, 1}));
         }
     }
+    // [TAG_DENSE_TILE_B2] B2: the production dense prefill GEMMs at n 128 / 512 / 2044 / 2048 (q4_K 10240 x 2560 and
+    // 6144 x 2560, q4_K 320 x 10240, q5_0 10240 x 320; m x k)
+    for (int64_t n : { 128, 512, 2044, 2048 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 10240, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  6144, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, GGML_TYPE_F32, 10240, n,   320, {1, 1}, {1, 1}));
+    }
     // [TAG_B4_CONCAT_COST] B4 sizing: the GDN conv-input concat (state | x^T) and its ssm_conv at a 2048-token
     // ubatch (10240 channels, kernel 4), and the QSA chunk concat chain (left-deep, 9 chunks of ~228 rows of a
     // 4096-wide attention output; the k-th concat copies k+1 chunks)
