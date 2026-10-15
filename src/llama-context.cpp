@@ -450,8 +450,11 @@ struct llama_qsa_ids_dump {
     // [TAG_QSA_DUMP_SCORE] (contrib 0229 fix round 3, S0.1 tie verification) LLAMA_QSA_DUMP_TIES=1 (needs LLAMA_QSA_DUMP_SCORE=1;
     // default off): for the ubatches whose first position lies in LLAMA_QSA_DUMP_TIES_P=<lo>:<hi> (default every ubatch), per
     // score row (query) the K-th and (K+1)-th largest block scores (K = LLAMA_QSA_DUMP_TIES_K blocks = the selection budget):
-    //   [qsa-score-ties] ctx= g= il= chunk= n_past= k= rows= boundary_ties=<rows whose K-th == (K+1)-th score> any_dup=<rows with
-    //                    two equal scores among the top K+1>
+    //   [qsa-score-ties] ctx= g= il= chunk= n_past= k= rows= boundary_ties=<rows whose K-th == (K+1)-th score > 0> any_dup=<rows with
+    //                    two equal POSITIVE scores among the top K+1> boundary_ties_zero=<rows whose K-th == (K+1)-th == 0>
+    //                    any_dup_zero=<rows with two equal ZERO scores among the top K+1>
+    //   boundary_ties / any_dup are positive-score-only (unchanged keys); ReLU makes zero ties legitimate, also at K/K+1, so an
+    //   untied boundary needs boundary_ties == 0 AND boundary_ties_zero == 0 (pkg2 review, Minor)
     // a direct observation of tied scores at the selection boundary (the comparer's tie-prompt check reads it)
     void dump_score_ties(ggml_tensor * t, const float * v, int t_il) {
         static const bool on = [] { const char * s = getenv("LLAMA_QSA_DUMP_TIES"); return s && atoi(s) != 0; }();
@@ -472,25 +475,27 @@ struct llama_qsa_ids_dump {
         if (k < 1) {
             return;
         }
-        int64_t boundary = 0, dup = 0;
+        int64_t boundary = 0, dup = 0, boundary_zero = 0, dup_zero = 0;
         std::vector<float> row(nbk);
         for (int64_t r = 0; r < rows; ++r) {
             std::copy(v + r * nbk, v + (r + 1) * nbk, row.begin());
             std::nth_element(row.begin(), row.begin() + k, row.end(), std::greater<float>());
             std::sort(row.begin(), row.begin() + k + 1, std::greater<float>());
-            if (row[k - 1] == row[k] && row[k] > 0.0f) {
-                boundary++;
+            if (row[k - 1] == row[k]) {
+                (row[k] > 0.0f ? boundary : boundary_zero)++;
             }
+            bool d_pos = false, d_zero = false;
             for (int64_t j = 0; j < k; ++j) {
-                if (row[j] == row[j + 1] && row[j] > 0.0f) {
-                    dup++;
-                    break;
+                if (row[j] == row[j + 1]) {
+                    (row[j] > 0.0f ? d_pos : d_zero) = true;
                 }
             }
+            dup      += d_pos;
+            dup_zero += d_zero;
         }
-        fprintf(stderr, "[qsa-score-ties] ctx=%s g=%llu il=%d chunk=%d n_past=%lld k=%lld rows=%lld boundary_ties=%lld any_dup=%lld\n",
+        fprintf(stderr, "[qsa-score-ties] ctx=%s g=%llu il=%d chunk=%d n_past=%lld k=%lld rows=%lld boundary_ties=%lld any_dup=%lld boundary_ties_zero=%lld any_dup_zero=%lld\n",
                 ctx_name, (unsigned long long) graph, t_il, score_chunk, (long long) n_past, (long long) k, (long long) rows,
-                (long long) boundary, (long long) dup);
+                (long long) boundary, (long long) dup, (long long) boundary_zero, (long long) dup_zero);
     }
 
     void dump_selection(ggml_tensor * t) {
