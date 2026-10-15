@@ -157,6 +157,7 @@ struct server_disk_cache {
     uint64_t n_evict = 0;
     uint64_t n_deep_rewinds = 0;
     uint64_t n_ckpt_unmarked_replaced = 0; // [TAG_CELL_EXT_PROVENANCE] pre-fix checkpoints overwritten by ckpt_store
+    bool     legacy_unmarked = true;        // [TAG_CELL_EXT_PROVENANCE] LLAMA_LEGACY_UNMARKED (0 = never vouch for one)
     uint64_t n_ckpt_dropped = 0;
     uint64_t n_blk_copied_total = 0; // (Codex gate r3 Major 1) adopted / legacy blocks copied into the own store at a save
     uint64_t n_deep_copied  = 0; // adopted deep checkpoints copied into the own namespace at a resave // deep checkpoints that did not restore

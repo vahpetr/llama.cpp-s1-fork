@@ -204,6 +204,28 @@ LLAMA_API size_t llama_state_seq_read_cb (struct llama_context * ctx, llama_seq_
 //   disk-cache entry's stored token stream has no media chunk), and reset it after. Per context; no effect on marked
 //   states or on other memories
 LLAMA_API void llama_state_legacy_unmarked_accept(struct llama_context * ctx, bool accept);
+LLAMA_API bool llama_state_legacy_unmarked_accepted(const struct llama_context * ctx);
+
+// [TAG_CELL_EXT_PROVENANCE] the only way the server sets the flag: on construction for both contexts (b may be null),
+//   cleared again on every exit of the scope - normal return or exception (a bad_alloc in a state reader included)
+struct llama_state_legacy_accept_scope {
+    llama_context * a;
+    llama_context * b;
+    llama_state_legacy_accept_scope(llama_context * a, llama_context * b, bool accept) : a(a), b(b) {
+        llama_state_legacy_unmarked_accept(a, accept);
+        if (b) {
+            llama_state_legacy_unmarked_accept(b, accept);
+        }
+    }
+    ~llama_state_legacy_accept_scope() {
+        llama_state_legacy_unmarked_accept(a, false);
+        if (b) {
+            llama_state_legacy_unmarked_accept(b, false);
+        }
+    }
+    llama_state_legacy_accept_scope(const llama_state_legacy_accept_scope &) = delete;
+    llama_state_legacy_accept_scope & operator=(const llama_state_legacy_accept_scope &) = delete;
+};
 LLAMA_API std::string llama_state_seq_descriptor(const struct llama_context * ctx);
 
 // [TAG_MULTISLOT] the state the context-creation line `qsa_history_dense = on|off (reason)` prints (a library INFO

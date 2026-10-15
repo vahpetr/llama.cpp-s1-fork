@@ -518,6 +518,7 @@ public:
 
     // [TAG_CELL_EXT_PROVENANCE] llama_state_legacy_unmarked_accept (llama-ext.h)
     void set_legacy_unmarked_accept(bool accept) { legacy_accept = accept; }
+    bool legacy_unmarked_accept() const { return legacy_accept; }
 
 private:
     // [TAG_QSA_POOLED_CACHE] drop the derived entries of seq_id's stream (every stream if seq_id < 0)

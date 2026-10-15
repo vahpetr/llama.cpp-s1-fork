@@ -10,6 +10,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -726,6 +727,7 @@ static const char * const CACHE_ENV_EXACT[] = {
     "LLAMA_GTT_ADMISSION_MIB", "LLAMA_GTT_ADMISSION_MAX_WAIT_S", "LLAMA_GTT_SLOPE_B_PER_CELL",
     "LLAMA_GTT_STAGING_B_PER_CELL", "LLAMA_GTT_STAGING_STEP_MIB", "LLAMA_GTT_SLACK_PCT", "LLAMA_GTT_ONCE_MIB",
     "LLAMA_GTT_HOLES_FULL_CHUNK", "LLAMA_GTT_USED_PATH",
+    "LLAMA_LEGACY_UNMARKED", // [TAG_CELL_EXT_PROVENANCE] which stored states load, not what a loaded one computes
     // LLAMA_ARG_* aliases (common/arg.cpp): classified one by one by their parsed meaning - only the control plane
     "LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_API_KEY",
     // Vulkan speed / diagnostics only by contract
@@ -1129,6 +1131,10 @@ server_disk_cache::server_disk_cache(std::string dir, uint64_t quota_bytes, int3
       fingerprint(std::move(fingerprint)), has_mtmd(has_mtmd), ckpt_ratio(ckpt_ratio),
       ckpt_min_step(std::max(1, ckpt_min_step)), ckpt_max(std::max(2, ckpt_max)) {
     this->dir = (fs::path(root) / ("ns-" + this->fingerprint.substr(0, 16))).string();
+    // [TAG_CELL_EXT_PROVENANCE] LLAMA_LEGACY_UNMARKED=0: no pre-fix (unmarked) state or checkpoint is ever vouched for -
+    //   every one is refused (a cache miss); default 1: vouched for when its stored token stream proves it text-only
+    const char * lu = getenv("LLAMA_LEGACY_UNMARKED");
+    legacy_unmarked = !(lu && atoi(lu) == 0);
 }
 
 static int64_t mtime_s(const fs::path & p) {
@@ -1708,10 +1714,11 @@ void server_disk_cache::init() {
                 (now_s() - ns.t_newest) / 86400.0);
     }
     DSK_INF("dir %s: %zu entries + %zu deep checkpoints, %.2f GiB (quota %.0f GiB, min %d tokens, ttl %d days, "
-            "deep ratio %.2f min step %d max %d), %zu + %zu stale/foreign dropped\n",
+            "deep ratio %.2f min step %d max %d), %zu + %zu stale/foreign dropped, legacy unmarked states: %s\n",
             dir.c_str(), entries.size(), ckpts.size(), total_bytes() / (1024.0 * 1024.0 * 1024.0),
             quota / (1024.0 * 1024.0 * 1024.0), n_min_tokens, ttl_days, ckpt_ratio, ckpt_min_step, ckpt_max,
-            n_dropped, n_ck_dropped);
+            n_dropped, n_ck_dropped,
+            legacy_unmarked ? "accepted with a text-only proof (LLAMA_LEGACY_UNMARKED=1)" : "refused (LLAMA_LEGACY_UNMARKED=0)");
 
     refresh_status();
 }
@@ -2360,18 +2367,9 @@ server_disk_load_result server_disk_cache::load(int idx, llama_context * ctx_tgt
 
     // [TAG_CELL_EXT_PROVENANCE] a pre-fix (unmarked) state loads only when this entry's own stored token stream (.tok,
     //   read into e.tokens at init) proves the conversation text-only - no media chunk anywhere in it
-    const bool legacy_text = !e.tokens.has_media();
-    struct legacy_guard {
-        llama_context * a; llama_context * b;
-        legacy_guard(llama_context * a, llama_context * b, bool on) : a(a), b(b) {
-            llama_state_legacy_unmarked_accept(a, on);
-            if (b) { llama_state_legacy_unmarked_accept(b, on); }
-        }
-        ~legacy_guard() {
-            llama_state_legacy_unmarked_accept(a, false);
-            if (b) { llama_state_legacy_unmarked_accept(b, false); }
-        }
-    } legacy(ctx_tgt, ctx_dft, legacy_text);
+    //   (LLAMA_LEGACY_UNMARKED=0: never); the scope clears the flag on every exit, an exception included
+    const bool legacy_text = legacy_unmarked && !e.tokens.has_media();
+    llama_state_legacy_accept_scope legacy(ctx_tgt, ctx_dft, legacy_text);
 
     llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
     server_disk_load_result res = load_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), rule_for(e, true, tgt_only));
@@ -2861,6 +2859,9 @@ void server_disk_cache::deep_drop(const std::string & key, const char * why) {
 
 bool server_disk_cache::ckpt_legacy_text_ok(const std::string & key, int64_t n_tokens) const {
     // [TAG_CELL_EXT_PROVENANCE] see the declaration
+    if (!legacy_unmarked) {
+        return false;
+    }
     for (const auto & e : entries) {
         const bool refs = std::any_of(e.deep.begin(), e.deep.end(), [&](const auto & r) { return r.key == key; }) ||
                           std::find(e.ckpt_keys.begin(), e.ckpt_keys.end(), key) != e.ckpt_keys.end();
@@ -3509,6 +3510,7 @@ void server_disk_cache::refresh_status() {
         { "deep_rewinds",   n_deep_rewinds      },
         { "ckpt_dropped",   n_ckpt_dropped      },
         { "ckpt_unmarked_replaced", n_ckpt_unmarked_replaced }, // [TAG_CELL_EXT_PROVENANCE]
+        { "legacy_unmarked",        legacy_unmarked          }, // [TAG_CELL_EXT_PROVENANCE] LLAMA_LEGACY_UNMARKED
         { "deep_copied",    n_deep_copied       },
         { "blk_copied",     n_blk_copied_total  },
         { "evictions",      n_evict             },
