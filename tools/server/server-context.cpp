@@ -6665,14 +6665,17 @@ private:
                     for (size_t i = 0; i < accepted.size(); ++i) {
                         sa += (i ? "," : "") + std::to_string(accepted[i]);
                     }
-                    // t_*_us: this pass's host wall times of the draft / catch-up / verify phases (spec_rt, all slots of the pass)
+                    // t_*_us: this pass's host wall times of the draft / catch-up / verify phases (spec_rt, all slots of the pass);
+                    // n_att: the draft positions the drafter sampled this round (incl. a p_min stop; -1 = not reported) = the
+                    // number of draft-step graphs, the x of the per-step cost fit (spec_cost_attrib.py)
+                    const int n_att = common_speculative_get_draft_params(spec.get(), slot.id).n_attempted;
                     fprintf(stderr, "[spec-ids] task=%d slot=%d round=%llu n_past=%d n_draft=%zu committed=%zu replay=%d synth=%d width=%zu n_acc=%zu draft=%s acc=%s"
-                            " t_draft_us=%lld t_catchup_us=%lld t_verify_us=%lld\n",
+                            " t_draft_us=%lld t_catchup_us=%lld t_verify_us=%lld n_att=%d\n",
                             slot.task ? slot.task->id : -1, slot.id, (unsigned long long) slot.spec_trace_round++,
                             (int) slot.prompt.n_tokens(), n_draft, std::min(slot.spec_n_committed, n_draft),
                             (int) slot.spec_is_replay, (int) !synth_probs.empty(), n_draft + 1, accepted.size() - 1,
                             sd.empty() ? "-" : sd.c_str(), sa.c_str(),
-                            (long long) spec_rt.draft_us, (long long) spec_rt.catchup_us, (long long) spec_rt.verify_us);
+                            (long long) spec_rt.draft_us, (long long) spec_rt.catchup_us, (long long) spec_rt.verify_us, n_att);
                 }
 
                 // adaptive draft length: record this round's per-position acceptance here, before
