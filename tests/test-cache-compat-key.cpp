@@ -4,9 +4,11 @@
 #include "arg.h"
 #include "server-task.h"
 #include "server-context.h" // [TAG_MULTISLOT] server_multislot_envelope_check
+#include "../src/llama-ext.h" // [TAG_CELL_EXT_PROVENANCE] LLAMA_STATE_IXY_MARK
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <iterator>
 #include <thread>
 #include <cstdlib>
@@ -614,6 +616,54 @@ int main() {
                    (unsigned long long) b2.n_ckpt_target_only, b2.n_deep_ckpts());
         }
         fs::remove_all(base, ec);
+    }
+
+    // [TAG_CELL_EXT_PROVENANCE] a checkpoint stored by a build before the indexer x/y fix (its target blob has no
+    //   LLAMA_STATE_IXY_MARK at byte 8) is replaced by a marked one under the same prefix key, never linked; a marked one
+    //   is reused; an unmarked blob over an unmarked one (a model without the mark) reuses
+    {
+        const fs::path root = fs::temp_directory_path() / ("cache-compat-ixy-" + std::to_string(getpid()));
+        std::error_code ec;
+        fs::remove_all(root, ec);
+        const std::string fp = server_disk_cache_fingerprint_v2(cheap_a, parts());
+        llama_tokens toks;
+        for (int i = 0; i < 64; i++) {
+            toks.push_back(100 + i);
+        }
+        const auto blob = [](bool marked, uint8_t fill) {
+            std::vector<uint8_t> d(64, fill);
+            const uint32_t w = marked ? LLAMA_STATE_IXY_MARK : 1u; // unmarked: the recurrent section's cell count
+            memcpy(d.data() + 8, &w, sizeof(w));
+            return d;
+        };
+        const auto put = [&](server_disk_cache & s, bool marked, uint8_t fill) {
+            server_prompt pr;
+            pr.tokens = server_tokens(toks, false);
+            common_prompt_checkpoint c;
+            c.n_tokens = 32;
+            c.pos_min  = 0;
+            c.pos_max  = 31;
+            c.data_tgt = blob(marked, fill);
+            s.deep_put(pr, c, server_deep_ref::DEEP_KIND_ANCHOR);
+            return pr.deep.empty() ? std::string() : pr.deep[0].key;
+        };
+        const auto stored = [&](server_disk_cache & s, const std::string & key) {
+            common_prompt_checkpoint o;
+            bool io = false;
+            return s.deep_get(key, o, &io) && !io ? o.data_tgt : std::vector<uint8_t>();
+        };
+        {
+            server_disk_cache s(root.string(), 1ull << 30, 8, 30, fp, false, 0.5f, 8, 8);
+            s.init();
+            const std::string k = put(s, false, 7);              // pre-fix shape
+            CHECK(!k.empty() && stored(s, k) == blob(false, 7));
+            CHECK(put(s, false, 8) == k && stored(s, k) == blob(false, 7) && s.n_ckpt_unmarked_replaced == 0); // unmarked: reused
+            CHECK(put(s, true, 9) == k && stored(s, k) == blob(true, 9) && s.n_ckpt_unmarked_replaced == 1); // replaced, not linked
+            CHECK(put(s, true, 10) == k && stored(s, k) == blob(true, 9) && s.n_ckpt_unmarked_replaced == 1); // marked: reused
+            printf("IXY checkpoint provenance: unmarked replaced once by a marked one, marked reused\n");
+        }
+        // (the startup scan's mark read is not covered here: init() collects checkpoints no entry references)
+        fs::remove_all(root, ec);
     }
 
     if (n_fail) {

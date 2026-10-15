@@ -883,12 +883,50 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 // [TAG_CELL_EXT_PROVENANCE] written in front of the indexer section by a build whose indexer cells hold the true M-RoPE
 // x / y at save time (the 0239 restore fix: before it, a restore zeroed them and later inference ran on that). An
 // indexer section starts with its stream count (<= LLAMA_MAX_SEQ), so an unmarked (older) section cannot read as it.
-static const uint32_t LLAMA_IDX_STATE_XY_MARK = 0x31595849u; // "IXY1"
+static const uint32_t LLAMA_IDX_STATE_XY_MARK = LLAMA_STATE_IXY_MARK; // "IXY1"
 
 static std::atomic<uint64_t> g_idx_xy_rejects{0};
+static std::atomic<uint64_t> g_idx_xy_ckpt_rejects{0};
 
 uint64_t llama_memory_hybrid_idx::n_xy_rejects() {
     return g_idx_xy_rejects.load();
+}
+
+uint64_t llama_memory_hybrid_idx::n_xy_ckpt_rejects() {
+    return g_idx_xy_ckpt_rejects.load();
+}
+
+namespace {
+// [TAG_CELL_EXT_PROVENANCE] a reader that hands out one already-read u32 first, then the wrapped stream
+class llama_io_read_unread : public llama_io_read_i {
+public:
+    llama_io_read_unread(llama_io_read_i & in, uint32_t head) : in(in), head(head) {}
+
+    void read(void * dst, size_t size) override {
+        auto * out = static_cast<uint8_t *>(dst);
+        while (size > 0 && n_head < sizeof(head)) {
+            *out++ = reinterpret_cast<const uint8_t *>(&head)[n_head++];
+            size--;
+        }
+        if (size > 0) {
+            in.read(out, size);
+        }
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        GGML_ASSERT(n_head == sizeof(head)); // tensors never come first in a section
+        in.read_tensor(tensor, offset, size);
+    }
+
+    size_t n_bytes() override {
+        return in.n_bytes();
+    }
+
+private:
+    llama_io_read_i & in;
+    uint32_t          head;
+    size_t            n_head = 0;
+};
 }
 
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -901,6 +939,12 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
             mem_idx->state_write(io, seq_id, flags);
         }
         return;
+    }
+
+    // [TAG_CELL_EXT_PROVENANCE] a PARTIAL_ONLY trunk stream (the target's context checkpoints: recurrent only) carries the
+    // mark too, in front - its end cannot be probed in a stream, an indexer section's front can
+    if (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
+        io.write(&LLAMA_IDX_STATE_XY_MARK, sizeof(LLAMA_IDX_STATE_XY_MARK));
     }
 
     llama_memory_hybrid::state_write(io, seq_id, flags);
@@ -942,9 +986,10 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
+            get_mem_recr()->state_read(io, seq_id, flags);
+        } else {
+            recr_state_read_partial(io, seq_id, flags);
         }
-
-        get_mem_recr()->state_read(io, seq_id, flags);
 
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
@@ -962,6 +1007,33 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     }
 }
 
+void llama_memory_hybrid_idx::recr_state_read_partial(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // [TAG_CELL_EXT_PROVENANCE] a context checkpoint (PARTIAL_ONLY: recurrent only, the live attention / indexer cells
+    // stay). One written before the fix (no mark) may hold recurrent rows computed on zeroed indexer x / y after an
+    // image restore - with an image in the live sequence it is refused (the caller drops it and re-processes the
+    // prompt); without one it is text-only state and loads as before
+    uint32_t head = 0;
+    io.read(&head, sizeof(head));
+
+    if (head == LLAMA_IDX_STATE_XY_MARK) {
+        get_mem_recr()->state_read(io, seq_id, flags);
+        return;
+    }
+
+    const uint32_t n_img = get_mem_attn()->n_cells_2d_seq(seq_id);
+    if (n_img > 0) {
+        const uint64_t n = ++g_idx_xy_ckpt_rejects;
+        LLAMA_LOG_WARN("%s: context checkpoint saved before the indexer x/y fix, %u image cells in the sequence: rejected "
+                "(checkpoint rejections so far: %" PRIu64 ")\n", __func__, n_img, n);
+        io.set_status(LLAMA_STATE_READ_INVALID);
+        throw std::runtime_error("pre-fix context checkpoint of a sequence with image cells");
+    }
+
+    llama_io_read_unread io_head(io, head);
+    get_mem_recr()->state_read(io_head, seq_id, flags);
+    io.set_status(io_head.status);
+}
+
 void llama_memory_hybrid_idx::idx_state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
         const llama_kv_cache::slot_info_vec_t & sinfos_attn) {
     // [TAG_CELL_EXT_PROVENANCE] the attention cells are restored at this point (exactly, x / y included)
@@ -973,7 +1045,10 @@ void llama_memory_hybrid_idx::idx_state_read(llama_io_read_i & io, llama_seq_id 
     if (!marked) {
         // saved by a build before the fix: if it holds image cells, its indexer x / y may have been zeroed by a restore
         // before further inference was run and saved on top, so the K/V and recurrent rows can carry that - not
-        // repairable here. Text-only states are unaffected (x = y = pos, no consumer tells 0 from pos) and are healed
+        // repairable here. Text-only states are unaffected (x = y = pos, no consumer tells 0 from pos) and are healed.
+        // Conservative: a pre-fix image state that never went through a restore is correct but refused too; text cells
+        // cannot look like image ones (pos_add keeps the ext, but an M-RoPE cache has get_can_shift() false, so no
+        // K-shift / context shift / cache reuse ever moves them)
         const uint32_t n_img = get_mem_attn()->n_cells_2d(sinfos_attn);
         if (n_img > 0) {
             const uint64_t n = ++g_idx_xy_rejects;

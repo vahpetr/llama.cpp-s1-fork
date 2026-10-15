@@ -132,6 +132,17 @@ template <typename T> static bool get(std::istream & f, T & v) {
     return (bool) f.read(reinterpret_cast<char *>(&v), sizeof(T));
 }
 static bool get_vec(std::istream & f, std::vector<uint8_t> & v);
+
+// [TAG_CELL_EXT_PROVENANCE] a per-seq data blob (u32 magic, i32 seq id, stream) of a PARTIAL_ONLY qwen4exp trunk
+//   checkpoint opens its stream with LLAMA_STATE_IXY_MARK when a build with the indexer x/y fix wrote it
+static bool ckpt_blob_ixy_marked(const uint8_t * d, size_t n) {
+    uint32_t w = 0;
+    if (n < 12) {
+        return false;
+    }
+    memcpy(&w, d + 8, sizeof(w));
+    return w == LLAMA_STATE_IXY_MARK;
+}
 static bool skip_vec(std::istream & f) {
     uint64_t n = 0;
     if (!get(f, n) || n > (1ull << 33)) {
@@ -1618,6 +1629,15 @@ void server_disk_cache::init() {
             ok = get_le(f, magic) && magic == CKPT_ENV_MAGIC && get_str_le(f, fp) && fp == fp_short && get_le(f, env_ver) &&
                  get_str_le(f, dh) && env_ver == ENVELOPE_VERSION && dh == desc_key && get_str(f, m.key) &&
                  get(f, m.n_tokens) && get(f, m.pos_min) && get(f, m.pos_max) && m.key + ".ck" == name;
+            if (ok) {
+                // [TAG_CELL_EXT_PROVENANCE] the first 12 bytes of the target blob: flags_tgt, flags_dft, u64 length, blob
+                uint32_t ft = 0, fd = 0;
+                uint64_t n_tgt = 0;
+                uint8_t  head[12] = {};
+                m.ixy_marked = get(f, ft) && get(f, fd) && get(f, n_tgt) && n_tgt >= sizeof(head) &&
+                               (bool) f.read(reinterpret_cast<char *>(head), sizeof(head)) &&
+                               ckpt_blob_ixy_marked(head, sizeof(head));
+            }
             if (!ok && f.bad()) {
                 io_keys.insert(name.substr(0, name.size() - 3));
                 continue;
@@ -2497,9 +2517,16 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
     }
     const int64_t t_now = now_s();
     auto it = ckpts.find(key);
-    if (it != ckpts.end() && it->second.src_dir.empty()) {
+    // [TAG_CELL_EXT_PROVENANCE] the same prefix key, but a stored state from a build before the indexer x/y fix (its
+    //   recurrent rows may come from inference on zeroed image x/y): replaced by this one, never linked
+    const bool c_marked = ckpt_blob_ixy_marked(c.data_tgt.data(), c.data_tgt.size());
+    if (it != ckpts.end() && it->second.src_dir.empty() && (it->second.ixy_marked || !c_marked)) {
         it->second.t_used = t_now;
         return true;
+    }
+    if (it != ckpts.end() && it->second.src_dir.empty()) {
+        n_ckpt_unmarked_replaced++;
+        DSK_INF("checkpoint %s: stored before the indexer x/y fix, replacing it\n", key.c_str());
     }
     // [TAG_DISK_ADOPT] an adopt source's checkpoint: the source's file stays, the own namespace gets its own copy;
     //   (Codex gate r3 Major 5) the source's index record stays until the copy commits - a failed write leaves the
@@ -2541,6 +2568,7 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
     m.pos_max  = c.pos_max;
     m.bytes    = file_size_or_0(fin);
     m.t_used   = t_now;
+    m.ixy_marked = c_marked;
     ckpts[key] = m; // replaces an adopt source's record (src_dir) only now that the own copy is committed
     bytes_written += m.bytes;
     if (written) {
@@ -3450,6 +3478,7 @@ void server_disk_cache::refresh_status() {
                                         return e.has_dft && e.draft_cover < (int64_t) e.tokens.size(); }) },
         { "deep_rewinds",   n_deep_rewinds      },
         { "ckpt_dropped",   n_ckpt_dropped      },
+        { "ckpt_unmarked_replaced", n_ckpt_unmarked_replaced }, // [TAG_CELL_EXT_PROVENANCE]
         { "deep_copied",    n_deep_copied       },
         { "blk_copied",     n_blk_copied_total  },
         { "evictions",      n_evict             },

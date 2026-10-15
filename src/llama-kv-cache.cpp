@@ -2682,6 +2682,35 @@ uint32_t llama_kv_cache::n_cells_2d(const slot_info_vec_t & sinfos) const {
     return n;
 }
 
+uint32_t llama_kv_cache::n_cells_2d_seq(llama_seq_id seq_id) const {
+    // [TAG_CELL_EXT_PROVENANCE] see the declaration
+    if (hparams.n_pos_per_embd() <= 1) {
+        return 0;
+    }
+
+    uint32_t n = 0;
+    for (uint32_t s = 0; s < v_cells.size(); ++s) {
+        if (seq_id >= 0 && seq_to_stream[seq_id] != s) {
+            continue;
+        }
+
+        const auto & cells = v_cells[s];
+
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i) || (seq_id >= 0 && !cells.seq_has(i, seq_id))) {
+                continue;
+            }
+
+            const llama_pos p = cells.pos_get(i);
+            const auto &    e = cells.ext_get(i);
+
+            n += e.x != p || e.y != p;
+        }
+    }
+
+    return n;
+}
+
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
     const auto & cells = v_cells[cr.strm];
 

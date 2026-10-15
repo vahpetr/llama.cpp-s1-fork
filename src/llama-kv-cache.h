@@ -299,6 +299,9 @@ public:
     // (all but an image's first one). 0 for a cache without M-RoPE
     uint32_t n_cells_2d(const slot_info_vec_t & sinfos) const;
 
+    // [TAG_CELL_EXT_PROVENANCE] the same count over the live cells of seq_id (every sequence if seq_id < 0)
+    uint32_t n_cells_2d_seq(llama_seq_id seq_id) const;
+
     // for every token of the ubatch, the ids of the n tokens that precede it in its sequence
     // example for M-RoPE image case: tokens A B X X X C, where X is a 3-token image at pos 2 spanning positions 2..4:
     //   tok: A B X X X C

@@ -477,10 +477,12 @@ public:
     bool qsa_compact_bias() const { return qsa_compact; }
 
     // [TAG_MTP_QSA_PHASE] the census phase of this memory: 1 for the MTP draft memory under LLAMA_MTP_QSA_PHASE=1, else 0
-    // [TAG_CELL_EXT_PROVENANCE] pre-fix states rejected for their image cells, process-wide
-    static uint64_t n_xy_rejects();
-
     int32_t qsa_phase() const { return qsa_phase_v; }
+
+    // [TAG_CELL_EXT_PROVENANCE] pre-fix states rejected for their image cells / pre-fix context checkpoints (PARTIAL_ONLY)
+    // rejected for an image in the live sequence, process-wide
+    static uint64_t n_xy_rejects();
+    static uint64_t n_xy_ckpt_rejects();
 
 private:
     // [TAG_QSA_POOLED_CACHE] drop the derived entries of seq_id's stream (every stream if seq_id < 0)
@@ -489,6 +491,10 @@ private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
+
+    // [TAG_CELL_EXT_PROVENANCE] the recurrent section of a PARTIAL_ONLY trunk restore: its provenance mark, then the
+    // section; an unmarked (pre-fix) one is rejected when the live attention cells of seq_id hold an image cell
+    void recr_state_read_partial(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
     // [TAG_CELL_EXT_PROVENANCE] the indexer section of a restore: its provenance mark, then the section itself, then
     // idx_ext_restore; an unmarked (pre-fix) state holding image cells is rejected (throws, status INVALID)

@@ -186,7 +186,15 @@ LLAMA_API size_t llama_state_seq_read_cb (struct llama_context * ctx, llama_seq_
 //   and serialized widths, streams / unified mode / capacities, causal mode, the effective RoPE / YaRN parameters and
 //   the per-layer QSA ratio. Two contexts with different descriptors must not exchange state streams. The revision
 //   moves with any change of the stream's meaning that keeps its fields (e.g. a channel repacking).
+//   [TAG_CELL_EXT_PROVENANCE] the qwen4exp hybrid-idx stream gained the LLAMA_STATE_IXY_MARK word under rev 1 on purpose
+//   (old cache entries must keep their key to be healed or rejected by content, see llama-memory-hybrid-idx.cpp)
 #define LLAMA_STATE_ABI_REV 1
+
+// [TAG_CELL_EXT_PROVENANCE] the qwen4exp hybrid-idx provenance mark "IXY1": written in front of the indexer section
+//   and, in a PARTIAL_ONLY trunk stream (recurrent only), in front of the recurrent section, by a build whose indexer
+//   x / y are authoritative at save time. In a per-seq data blob (u32 magic, i32 seq id, stream) of a PARTIAL_ONLY
+//   trunk checkpoint it is the word at byte 8
+#define LLAMA_STATE_IXY_MARK 0x31595849u
 LLAMA_API std::string llama_state_seq_descriptor(const struct llama_context * ctx);
 
 // [TAG_MULTISLOT] the state the context-creation line `qsa_history_dense = on|off (reason)` prints (a library INFO
