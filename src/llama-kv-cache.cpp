@@ -2423,6 +2423,36 @@ const slot_info_vec_t *   sinfos_in) {
     }
 }
 
+uint32_t llama_kv_cache::ext_copy_from(const llama_kv_cache & src, const slot_info_vec_t & sinfos, bool keep_tok) {
+    // [TAG_CELL_EXT_RESTORE] see the declaration
+    uint32_t n = 0;
+    for (const auto & sinfo : sinfos) {
+        if (sinfo.empty()) {
+            continue;
+        }
+
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const uint32_t strm = sinfo.strm[s];
+
+            auto       & dst_cells = v_cells[strm];
+            const auto & src_cells = src.v_cells[strm];
+
+            for (const uint32_t idx : sinfo.idxs[s]) {
+                if (!src_cells.is_empty(idx) && !dst_cells.is_empty(idx)) {
+                    llama_kv_cell_ext e = src_cells.ext_get(idx);
+                    if (keep_tok) {
+                        e.tok = dst_cells.ext_get(idx).tok;
+                    }
+                    dst_cells.ext_set(idx, e);
+                    n++;
+                }
+            }
+        }
+    }
+
+    return n;
+}
+
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
     const auto & cells = v_cells[cr.strm];
 
@@ -2569,6 +2599,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         ubatch.seq_id_unq[0] = dest_seq_id;
 
+        // [TAG_CELL_EXT_RESTORE] the cell ext exactly as serialized, set again after apply_ubatch() below
+        std::vector<llama_kv_cell_ext> exts(has_cell_ext() ? cell_count : 0);
+
         for (uint32_t i = 0; i < cell_count; ++i) {
             llama_pos pos;
             uint32_t n_seq_id;
@@ -2585,6 +2618,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
+
+                exts[i] = ext;
 
                 if (hparams.n_pos_per_embd() > 1) {
                     ubatch.pos[i + ubatch.n_tokens]   = ext.y;
@@ -2644,6 +2679,14 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         //       only ext.tok and the M-RoPE 2D position round-trip through it
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         apply_ubatch(sinfo, ubatch);
+
+        // [TAG_CELL_EXT_RESTORE] the 2D position survives the ubatch only when THIS cache's hparams say M-RoPE; the
+        // qwen4exp indexer cache runs with rope NONE (n_pos 1) but serializes the ext for PLE, so apply_ubatch() left
+        // x = y = 0 where the live cells hold the 2D position (an image's real x/y). Restore what was serialized; for a
+        // cache whose ubatch round-trip already holds it (attention, M-RoPE) this writes the same values.
+        for (uint32_t i = 0; i < (uint32_t) exts.size(); ++i) {
+            cells.ext_set(sinfo.idxs[0][i], exts[i]);
+        }
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
 

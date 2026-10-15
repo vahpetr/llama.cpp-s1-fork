@@ -487,6 +487,9 @@ private:
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
 
+    // [TAG_CELL_EXT_RESTORE] after the indexer restore: the cell ext the indexer state does not carry, from the attention cells
+    void idx_ext_restore(const llama_kv_cache::slot_info_vec_t & sinfos_attn);
+
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
