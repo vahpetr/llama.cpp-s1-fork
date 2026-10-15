@@ -682,6 +682,20 @@ int main() {
             CHECK(!s.ckpt_legacy_text_ok(k, 32));
         }
         // (the startup scan's mark read is not covered here: init() collects checkpoints no entry references)
+        // the strict switch: LLAMA_LEGACY_UNMARKED=0 - no pre-fix state is ever vouched for (status shows it); the env
+        //   is classified exact (which stored states load, not what a loaded one computes: it does not move the key)
+        {
+            CHECK(server_cache_env_classify("LLAMA_LEGACY_UNMARKED") == SERVER_CACHE_ENV_EXACT);
+            setenv("LLAMA_LEGACY_UNMARKED", "0", 1);
+            server_disk_cache off((root / "sw0").string(), 1ull << 30, 8, 30, fp, false, 0.5f, 8, 8);
+            off.init();
+            unsetenv("LLAMA_LEGACY_UNMARKED");
+            server_disk_cache on((root / "sw1").string(), 1ull << 30, 8, 30, fp, false, 0.5f, 8, 8);
+            on.init();
+            CHECK(!off.legacy_unmarked && off.status().value("legacy_unmarked", true) == false);
+            CHECK(on.legacy_unmarked && on.status().value("legacy_unmarked", false) == true);
+            printf("IXY legacy switch: LLAMA_LEGACY_UNMARKED=0 -> refused, unset -> accepted with proof\n");
+        }
         // server_tokens::has_media: the proof's media test on a stored token stream (LLAMA_TOKEN_NULL = a media position)
         {
             llama_tokens t = toks;

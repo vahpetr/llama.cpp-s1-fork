@@ -63,6 +63,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <new>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -659,11 +660,31 @@ static void test_prefix_text(llama_model * model, const std::string & tag, const
         check(n0 == 0 && llama_memory_hybrid_idx::n_xy_rejects() == r + 1 && seq_gone(old0.get()),
                 tag + " TX: a pre-fix text entry WITHOUT the caller's proof is refused (counter +1)");
     }
+    {
+        // the server's scope clears the flag on every exit: an exception thrown inside the load (e.g. a bad_alloc in a
+        // state reader) leaves both contexts unvouched, and a later restore of the unmarked state is refused again
+        auto c1 = make_ctx(model, false);
+        auto c2 = make_ctx(model, true);
+        bool inside = false;
+        try {
+            llama_state_legacy_accept_scope scope(c1.get(), c2.get(), true);
+            inside = llama_state_legacy_unmarked_accepted(c1.get());
+            throw std::bad_alloc();
+        } catch (const std::bad_alloc &) {
+        }
+        check(inside && !llama_state_legacy_unmarked_accepted(c1.get()) && !llama_state_legacy_unmarked_accepted(c2.get()),
+                tag + " TX: an exception inside the accept scope clears the flag on both contexts");
+        const uint64_t r = llama_memory_hybrid_idx::n_xy_rejects();
+        check(llama_state_seq_load_file(c1.get(), f_old.c_str(), 0, toks.data(), toks.size(), &n_tok) == 0 &&
+              llama_memory_hybrid_idx::n_xy_rejects() == r + 1, tag + " TX: after that exception the unmarked state is refused again");
+    }
     auto old = make_ctx(model, false);
-    llama_state_legacy_unmarked_accept(old.get(), true); // the server's proof: its stored token stream has no media
     const uint64_t r0 = llama_memory_hybrid_idx::n_xy_rejects();
-    const size_t nr = llama_state_seq_load_file(old.get(), f_old.c_str(), 0, toks.data(), toks.size(), &n_tok);
-    llama_state_legacy_unmarked_accept(old.get(), false);
+    size_t nr = 0;
+    {
+        llama_state_legacy_accept_scope scope(old.get(), nullptr, true); // the server's proof: its stored token stream has no media
+        nr = llama_state_seq_load_file(old.get(), f_old.c_str(), 0, toks.data(), toks.size(), &n_tok);
+    }
     check(nr > 0 && llama_memory_hybrid_idx::n_xy_rejects() == r0, tag + " TX: a pre-fix text entry WITH the proof is accepted (no rejection)");
     if (nr > 0) {
         const int d = n_differing(idx_live, cells_of(hyb(old.get())->get_mem_idx()));

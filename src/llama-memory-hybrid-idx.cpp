@@ -903,6 +903,11 @@ void llama_state_legacy_unmarked_accept(llama_context * ctx, bool accept) {
     }
 }
 
+bool llama_state_legacy_unmarked_accepted(const llama_context * ctx) {
+    const auto * h = dynamic_cast<const llama_memory_hybrid_idx *>(llama_get_memory(ctx));
+    return h && h->legacy_unmarked_accept();
+}
+
 namespace {
 // [TAG_CELL_EXT_PROVENANCE] a reader that hands out the already-read u32 words first, then the wrapped stream
 class llama_io_read_unread : public llama_io_read_i {
