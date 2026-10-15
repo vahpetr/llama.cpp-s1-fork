@@ -2538,7 +2538,9 @@ static bool ggml_vk_b1_classified_type(ggml_type t) {
 // [TAG_DENSE_TILE_B2] GGML_VK_DENSE_TILE_B2 (default on, =0 off): the AMD coopmat1 dense quantized-A matmul B2 tiles
 // (ggml_vk_mul_mat_q_f16): hc = BM 64 x BN 128 for m <= 384 (default on), and, only with GGML_VK_DENSE_TILE_B2_XL=1
 // (default off: 10-20 % SLOWER on the 780M for the large shapes; for the gfx1151 screen arm), xl = BM 128 x BN 256 for
-// m >= 2048. Both EXACT. Read once (static).
+// m >= 2048. Both EXACT. Read once (static). Transfer note: on the 780M the hc gain is largest on 320 x 10240 at n 512-1024,
+// but gfx1151 (more cores) runs that shape with split_k > 1 up to n 1024 (S0.3 S4 raw), where B2 does not apply - on gfx1151
+// only the split_k == 1 widths (n >= ~2044) can gain. The production-graph byte check is pending the oracle gate.
 static bool ggml_vk_dense_tile_b2(const vk_device & device) {
     static const bool on = ggml_vk_env_bool("GGML_VK_DENSE_TILE_B2", true);
     return on && device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && !device->coopmat2 &&
@@ -4757,7 +4759,9 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
     };
 }
 
-static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
+// [TAG_DENSE_TILE_B2] exact_stage: size coopmat_stage as mul_mm.comp declares it (TM * TN * NUM_WARPS floats); the upstream
+// estimate divides by the warp count instead (kept for the upstream tiles so their eligibility stays the v59 one).
+static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type, bool exact_stage = false) {
 
     uint32_t lut_size = 0;
     switch (src0_type) {
@@ -4805,7 +4809,9 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
 
     const uint32_t load_bufs = (warptile[1] + warptile[2]) * (warptile[3] + bank_conflict_offset) * type_size;
     const uint32_t mmid_row_ids = mul_mat_id ? (warptile[2] * 2 * sizeof(uint16_t)) : 0;
-    const uint32_t coopmat_stage = device->coopmat_support ? warptile[7] * warptile[8] / warps * sizeof(float) : 0;
+    const uint32_t coopmat_stage = !device->coopmat_support ? 0 :
+                                   exact_stage ? warptile[7] * warptile[8] * warps * (uint32_t) sizeof(float) :
+                                                 warptile[7] * warptile[8] / warps * (uint32_t) sizeof(float);
     const uint32_t ballots_sh = mul_mat_id ? (warps * 4 * sizeof(uint32_t)) : 0;
 
     const uint32_t total_size = load_bufs + mmid_row_ids + coopmat_stage + lut_size + ballots_sh;
@@ -5316,8 +5322,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // [TAG_DENSE_TILE_B2] where the dense B2 tiles fit (only used where the l tile is the base choice), for the
             // production dense types the byte classifier covers (q4_K, q5_0, q6_K)
             const bool b2_type = t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q6_K;
-            device->mul_mat_b2_l[i] = ggml_vk_dense_tile_b2(device) && ggml_vk_dense_tile_b2_xl() && b2_type && device->mul_mat_l[i] && ggml_vk_matmul_shmem_support(device, l_warptile_mmqb2, false, t);
-            device->mul_mat_b2_m[i] = ggml_vk_dense_tile_b2(device) && b2_type && device->mul_mat_l[i] && ggml_vk_matmul_shmem_support(device, m_warptile_mmqb2, false, t);
+            device->mul_mat_b2_l[i] = ggml_vk_dense_tile_b2(device) && ggml_vk_dense_tile_b2_xl() && b2_type && device->mul_mat_l[i] && ggml_vk_matmul_shmem_support(device, l_warptile_mmqb2, false, t, true);
+            device->mul_mat_b2_m[i] = ggml_vk_dense_tile_b2(device) && b2_type && device->mul_mat_l[i] && ggml_vk_matmul_shmem_support(device, m_warptile_mmqb2, false, t, true);
             device->mul_mat_b2_s[i] = false;
 
             // The q8_1 mmq path has its own (larger) shmem layout, check it separately.

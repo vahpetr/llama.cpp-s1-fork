@@ -11863,6 +11863,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1, 1024)); // too big (N>512)
 
+    // [TAG_DENSE_TILE_B2] the B2 hc tile (m <= 384, split_k 1) and its boundaries vs the CPU (review-B2 I1): the production
+    // q4_K 320 x 10240, q5_0 / q6_K inside 65..384, the m 64 / 65 / 384 / 385 edges; m 2048 n 256 reaches the opt-in xl tile
+    for (int64_t n : { 128, 1024, 2044, 2048 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 320, n, 10240, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, GGML_TYPE_F32, 200, 512, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, GGML_TYPE_F32, 200, 512,  320, {1, 1}, {1, 1}));   // unaligned K
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 384, 1024, 2560, {1, 1}, {1, 1}));
+    for (int64_t m : { 64, 65, 384, 385 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 2047, 2560, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2048, 256, 2560, {1, 1}, {1, 1}));
+
     // [TAG_INJECT_TILE_M16] the qwen4exp hc inject GEMM (m = 4, k = 4 x 2560) and the m 16 / 17 edges of the BM 16 tile vs the CPU
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
         for (int64_t m : { 4, 16, 17 }) {
