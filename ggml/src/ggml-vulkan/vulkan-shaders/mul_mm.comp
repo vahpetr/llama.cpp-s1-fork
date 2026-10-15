@@ -77,6 +77,16 @@ layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
 layout (binding = 3) readonly buffer ROW_IDS {int data_row_ids[];};
 #endif
 
+#ifdef QSA_SCORE_EPILOGUE
+// [TAG_QSA_SCORE_EPILOGUE] GGML_OP_QSA_SCORE: the store epilogue of the indexer score. The product is this shader's
+// unchanged (same tiles, BK, fragments, K order, accumulator); D is the [M, N/n_head, n_b] result, and each output is
+//   relu(acc[m, t*n_head + 0]) + relu(acc[m, t*n_head + 1]) + ... (left to right) [+ bias[m, t, b]]
+// computed from the fragment's accumulators staged in coopmat_stage - the heads of a query are consecutive columns
+// inside one TN-wide fragment (TN % n_head == 0, fragment columns start at multiples of TN), so it is subgroup-local.
+// Binding 4 is the bias (aliased to D and never read when qsa_has_bias == 0).
+layout (binding = 4) readonly buffer QSA_BIAS {float data_qsa_bias[];};
+#endif
+
 layout (push_constant) uniform parameter
 {
     uint M;
@@ -107,6 +117,13 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+#ifdef QSA_SCORE_EPILOGUE
+    uint padded_N_unused;     // vk_mat_mat_push_constants::padded_N
+    uint qsa_n_head;
+    uint qsa_has_bias;
+    uint qsa_stride_o;        // the result's row stride (elements): t
+    uint qsa_batch_stride_o;  // the result's batch stride (elements): b
+#endif
 #endif
 } p;
 
@@ -438,6 +455,52 @@ void main() {
                 }
             }
             barrier();
+        }
+    }
+#elif defined(QSA_SCORE_EPILOGUE)
+    // [TAG_QSA_SCORE_EPILOGUE] per fragment: the accumulators go to the warp's coopmat_stage (column-major, stride TM,
+    // the very staging the unaligned store path uses), then each invocation reduces (row r, query j) pairs of it.
+    // The values read are the f32 accumulators the plain store would write (D_TYPE == ACC_TYPE == float: an identity
+    // conversion); relu is unary.comp's op_relu expression max(x, 0.0f); the sum runs h = 0, 1, ... as the chain's
+    // CONT + ADD/MULTI_ADD nodes do; the bias is added last, as the chain's bias ADD. precise: no contraction or
+    // reassociation of the adds.
+    {
+        const uint qsa_h   = p.qsa_n_head;
+        const uint qsa_qpf = TN / qsa_h;   // queries per fragment
+        [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
+            [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+                const uint row0 = dr + cm_row * TM;
+                const uint col0 = dc + cm_col * TN;
+                if (row0 < p.M && col0 < p.N) {
+                    coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
+
+                    controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+                    for (uint e = tiw; e < TM * qsa_qpf; e += WARP) {
+                        const uint r   = e % TM;
+                        const uint j   = e / TM;
+                        const uint row = row0 + r;
+                        const uint c0  = col0 + j * qsa_h;
+                        if (row < p.M && c0 < p.N) {
+                            const uint st = warp_i * TM * TN + (j * qsa_h) * TM + r;
+                            // The sum starts at relu(s0), not at 0 + relu(s0) as multi_add.comp does: the two are the same
+                            // bits because relu(s0) is never -0.0 - the accumulator starts at +0.0 and RNE addition of
+                            // products can only return +0.0 for an exact zero sum, so acc != -0.0, max(acc, 0.0f) >= +0.0,
+                            // and +0.0 + x == x bitwise for every x >= +0.0 (and for NaN). The chain's CONT(head 0) + ADD
+                            // form starts at relu(s0) exactly as here.
+                            precise float sum = max(float(coopmat_stage[st]), 0.0f);
+                            for (uint h = 1; h < qsa_h; h++) {
+                                sum += max(float(coopmat_stage[st + h * TM]), 0.0f);
+                            }
+                            const uint o = batch_idx * p.qsa_batch_stride_o + (c0 / qsa_h) * p.qsa_stride_o + row;
+                            if (p.qsa_has_bias != 0) {
+                                sum += data_qsa_bias[o];
+                            }
+                            data_d[o] = D_TYPE(sum);
+                        }
+                    }
+                    controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+                }
+            }
         }
     }
 #else

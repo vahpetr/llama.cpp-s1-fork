@@ -614,6 +614,14 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             string_to_spv(shader_name + "_f32_f32_rows" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"A_ROW_IDS", "1"}}), fp16, coopmat, coopmat2, f16acc);
         }
 
+        // [TAG_QSA_SCORE_EPILOGUE] GGML_OP_QSA_SCORE: the two f32 x f32 matmuls above (plain and row-id) with the indexer
+        // score epilogue (ReLU, ordered head sum, bias) in the coopmat1 store. Same defines + QSA_SCORE_EPILOGUE, so the
+        // product is the same code; coopmat1 only (the epilogue reads the fragment's coopmat_stage).
+        if (tname == "f32" && coopmat && !coopmat2 && !f16acc && !dot2 && matmul_id_type == MatMulIdType::NONE) {
+            string_to_spv(shader_name + "_f32_f32_qsa", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"QSA_SCORE_EPILOGUE", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(shader_name + "_f32_f32_rows_qsa", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"A_ROW_IDS", "1"}, {"QSA_SCORE_EPILOGUE", "1"}}), fp16, coopmat, coopmat2, f16acc);
+        }
+
         if (tname != "f16" && tname != "f32") {
             string_to_spv(shader_name + "_" + tname + "_f16" + dot2_sfx, source_name,  merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
         }

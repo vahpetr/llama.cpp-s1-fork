@@ -873,6 +873,43 @@ static bool qwen4exp_qsa_relu_inplace() {
     return enabled;
 }
 
+// [TAG_QSA_SCORE_EPILOGUE] (Program v8.1 A1, contrib 0235) GGML_VK_QSA_SCORE_EPILOGUE (default 1 = on; 0 = off): the
+// indexer score of build_qsa_select is ONE node, GGML_OP_QSA_SCORE - the score GEMM (MUL_MAT of the pooled keys or
+// MUL_MAT_ROWS of the store) with the ReLU, the ordered head sum ((s0 + s1) + s2) + s3 and the per-block bias computed in
+// its store epilogue - instead of MUL_MAT[_ROWS] + RELU + CONT + ADD/MULTI_ADD + bias ADD. EXACT: the product is the
+// same kernel / tile / K order, and the epilogue repeats the chain's arithmetic element by element (see ggml.h), so the
+// summed plane and the selection's input are the same bytes; what goes is the [n_blocks, 4 x queries] per-head plane
+// (written by the GEMM, rewritten by the ReLU, read by the CONT and the adds) and four dispatches per chunk.
+// Used only where the backend of the first device takes the node (Vulkan: the coopmat1 matmul path of the product;
+// decode / short-verify widths that run the mat-vec, and any other backend that refuses it, keep the chain).
+// LLAMA_QSA_DUMP_SCORE=1 (the oracle's score capture) keeps the bias as its own ADD after the node, so the captured
+// "indexer_score-<il>" is still the pre-bias summed plane - the same epilogue minus its last add ([vk-fusion-count]
+// qsa_score_epilogue only). The production path (capture off) folds the bias: qsa_score_epilogue + qsa_score_epilogue_bias,
+// node "indexer_score_biased-<il>". The capture pass and the ids pass thus differ by that one f32 add of {+0, 1e9, -inf}.
+// The knob is named for the backend behaviour it selects, like the other QSA A/B knobs, but read on the graph side;
+// off = exactly the v59 graph, node for node (the new pipelines are built and never dispatched).
+static bool qwen4exp_qsa_score_epilogue() {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_VK_QSA_SCORE_EPILOGUE");
+        const bool on = s == nullptr || atoi(s) != 0;
+        LLAMA_LOG_WARN("%s: qsa_score_epilogue: %s (GGML_VK_QSA_SCORE_EPILOGUE %s)\n", __func__, on ? "on" : "off",
+                       s ? s : "unset");
+        return on;
+    }();
+
+    return enabled;
+}
+
+// [TAG_QSA_SCORE_EPILOGUE] the oracle's score capture (llama-context.cpp, LLAMA_QSA_DUMP_SCORE) reads "indexer_score-<il>"
+static bool qwen4exp_qsa_dump_score() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_DUMP_SCORE");
+        return s != nullptr && atoi(s) != 0;
+    }();
+
+    return enabled;
+}
+
 // [TAG_QSA_CHUNK_PAD] (M4.3) LLAMA_QSA_CHUNK_PAD=1: [TAG_QSA_CHUNK] cuts the ubatch into full chunks of C queries
 // and pads the LAST one to C (its padding rows repeat the ubatch's last query), so every chunk's score GEMM and
 // selection run the same column count - gate M4 compares that against the balanced split (default 0, today's
@@ -2274,27 +2311,50 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
     const int64_t n_tps    = q->ne[1]/n_idx_h;
     const int64_t n_stream = q->ne[2];
 
-    // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
-    // [TAG_QSA_POOL_REMAP] the same product read straight from the store: [n_blocks, n_idx_h*n_tps, n_stream] either way
-    ggml_tensor * score = pooled ? ggml_mul_mat(ctx0, pooled, q) : ggml_mul_mat_rows(ctx0, pool_store, pool_remap, q);
-    score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-    score = qwen4exp_qsa_relu_inplace() ? ggml_relu_inplace(ctx0, score) : ggml_relu(ctx0, score); // [TAG_QSA_RELU_INPLACE]
+    ggml_tensor * score  = nullptr;
+    bool          biased = false;
 
-    // the heads sit side by side on ne[1] and there are few of them, so summing slices beats a
-    // transpose that would carry the whole block by token surface twice over
-    ggml_tensor * summed = nullptr;
-    for (int64_t h = 0; h < n_idx_h; ++h) {
-        ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
-                score->nb[2], score->nb[3], h*score->nb[1]);
-        summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+    // [TAG_QSA_SCORE_EPILOGUE] the whole chain below as one node, where the backend takes it (bias folded unless the score
+    // capture needs the pre-bias plane)
+    if (qwen4exp_qsa_score_epilogue()) {
+        const bool fold_bias = blk_bias && !qwen4exp_qsa_dump_score();
+        ggml_tensor * fused = ggml_qsa_score(ctx0, pooled ? pooled : pool_store, pooled ? nullptr : pool_remap, q,
+                fold_bias ? bias : nullptr, (int) n_idx_h);
+        if (sched != nullptr && ggml_backend_supports_op(ggml_backend_sched_get_backend(sched, 0), fused)) {
+            score  = fused;
+            biased = fold_bias;
+        }
     }
 
-    score = summed;
-    cb(score, "indexer_score", il);
+    if (score == nullptr) {
+        // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
+        // [TAG_QSA_POOL_REMAP] the same product read straight from the store: [n_blocks, n_idx_h*n_tps, n_stream] either way
+        score = pooled ? ggml_mul_mat(ctx0, pooled, q) : ggml_mul_mat_rows(ctx0, pool_store, pool_remap, q);
+        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+        score = qwen4exp_qsa_relu_inplace() ? ggml_relu_inplace(ctx0, score) : ggml_relu(ctx0, score); // [TAG_QSA_RELU_INPLACE]
 
-    // one value per block, so it is cheaper to bias here than after the cells are expanded
-    if (blk_bias) {
-        score = ggml_add(ctx0, score, bias);
+        // the heads sit side by side on ne[1] and there are few of them, so summing slices beats a
+        // transpose that would carry the whole block by token surface twice over
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
+                    score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+        }
+
+        score = summed;
+    }
+
+    if (biased) {
+        // [TAG_QSA_SCORE_EPILOGUE] the biased plane: not the "indexer_score-<il>" the score capture hashes
+        cb(score, "indexer_score_biased", il);
+    } else {
+        cb(score, "indexer_score", il);
+
+        // one value per block, so it is cheaper to bias here than after the cells are expanded
+        if (blk_bias) {
+            score = ggml_add(ctx0, score, bias);
+        }
     }
 
     // [TAG_QSA_WHOLE_BLOCKS] LLAMA_QSA_WHOLE_BLOCKS=1: the reference's block-level selection, always as the one node

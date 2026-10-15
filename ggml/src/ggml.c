@@ -1087,6 +1087,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "QSA_TOP_K",
     "QSA_BIAS",
     "MUL_MAT_ROWS",
+    "QSA_SCORE",
 
     "UNARY",
 
@@ -1104,7 +1105,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1206,6 +1207,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "qsa_top_k(score, cell_blk, mask)",
     "qsa_bias(blk, qry, rows)",
     "X[rows]*Y",
+    "qsa_score(a, rows, b, bias)",
 
     "unary(x)",
 
@@ -1223,7 +1225,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3343,6 +3345,51 @@ struct ggml_tensor * ggml_mul_mat_rows(
     result->src[0] = a;
     result->src[1] = b;
     result->src[2] = rows;
+
+    return result;
+}
+
+// ggml_qsa_score
+
+// [TAG_QSA_SCORE_EPILOGUE] see ggml.h: the indexer score GEMM with its ReLU, ordered head sum and bias as one node
+struct ggml_tensor * ggml_qsa_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * rows,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * bias,
+        int                   n_head) {
+    GGML_ASSERT(n_head > 0);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    GGML_ASSERT(b->ne[0] == a->ne[0] && b->ne[3] == 1 && b->ne[1] % n_head == 0);
+    GGML_ASSERT(!ggml_is_transposed(b));
+
+    int64_t M;
+    if (rows) {
+        GGML_ASSERT(rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows));
+        GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1 && rows->ne[2] == 1 && rows->ne[3] == 1);
+        GGML_ASSERT(b->ne[2] == rows->ne[1]);
+        M = rows->ne[0];
+    } else {
+        GGML_ASSERT(a->ne[3] == 1 && b->ne[2] == a->ne[2]);
+        M = a->ne[1];
+    }
+
+    const int64_t ne[4] = { M, b->ne[1]/n_head, b->ne[2], 1 };
+    if (bias) {
+        GGML_ASSERT(bias->type == GGML_TYPE_F32);
+        GGML_ASSERT(bias->ne[0] == ne[0] && bias->ne[1] == ne[1] && bias->ne[2] == ne[2] && bias->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, n_head);
+
+    result->op     = GGML_OP_QSA_SCORE;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = rows;
+    result->src[3] = bias;
 
     return result;
 }

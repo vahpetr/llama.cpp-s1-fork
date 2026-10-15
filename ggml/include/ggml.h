@@ -578,6 +578,7 @@ extern "C" {
         GGML_OP_QSA_TOP_K,
         GGML_OP_QSA_BIAS,   // [TAG_QSA_COMPACT_BIAS]
         GGML_OP_MUL_MAT_ROWS, // [TAG_QSA_POOL_REMAP]
+        GGML_OP_QSA_SCORE,    // [TAG_QSA_SCORE_EPILOGUE]
 
         GGML_OP_UNARY,
 
@@ -1471,6 +1472,32 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * rows,
             struct ggml_tensor  * b);
+
+    // [TAG_QSA_SCORE_EPILOGUE] the qwen4exp indexer block score as ONE node: the score product of ggml_mul_mat (rows ==
+    // NULL) or ggml_mul_mat_rows (rows != NULL), each product rectified, the n_head heads of a query summed left to right
+    // and the per-block bias added last. Element for element, on the same backend, the result is bit-identical to the
+    // chain it replaces:
+    //     s = ggml_relu(ggml_reshape_4d(<the product>, M, n_head, N, n_b))
+    //     r = ((cont(s[:, 0]) + s[:, 1]) + s[:, 2]) + ... + s[:, n_head - 1]        (ggml_add, in this order)
+    //     r = bias ? ggml_add(r, bias) : r
+    // (every backend runs the product with the kernel / tiling / K order its MUL_MAT (MUL_MAT_ROWS) would pick for the
+    // [K, M, n_b] x [K, n_head*N, n_b] product, and the ReLU / adds with its own unary / add arithmetic.)
+    //   a:      [K, M, n_b]  F32, contiguous   (rows == NULL)   or   [K, n_rows] F32, contiguous (rows != NULL)
+    //   rows:   [M, n_b]     I32, contiguous, or NULL
+    //   b:      [K, n_head*N, n_b] F32         (column t*n_head + h = head h of query t)
+    //   bias:   [M, N, n_b]  F32, or NULL
+    //   result: [M, N, n_b]  F32
+    // qwen4exp (GGML_VK_QSA_SCORE_EPILOGUE, default on) builds it with the bias folded in - the production path, counted
+    // as qsa_score_epilogue + qsa_score_epilogue_bias by GGML_VK_FUSION_COUNT; with LLAMA_QSA_DUMP_SCORE=1 (the oracle's
+    // score capture) it builds it with bias == NULL plus the old bias ADD, so the captured "indexer_score-<il>" is the
+    // pre-bias plane (qsa_score_epilogue only).
+    GGML_API struct ggml_tensor * ggml_qsa_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * rows,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * bias,
+            int                   n_head);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

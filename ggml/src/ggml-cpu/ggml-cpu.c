@@ -1527,6 +1527,131 @@ static void ggml_compute_forward_mul_mat_rows(
     ggml_compute_forward_mul_mat(&pmm, &mm);
 }
 
+// ggml_compute_forward_qsa_score
+
+// [TAG_QSA_SCORE_EPILOGUE] the CPU twin of GGML_OP_QSA_SCORE: the chain it replaces, run in the work buffer. The product
+// is the unchanged ggml_compute_forward_mul_mat (of the gathered rows when rows != NULL, as MUL_MAT_ROWS) into a
+// contiguous [M, n_head*N, n_b] plane - the shapes, strides and threads of the chain's MUL_MAT, so the same path and
+// reduction order - then per element the chain's own arithmetic: op_relu / ggml_vec_relu_f32 ((x > 0) ? x : 0) on each
+// head, the head sum in the order of the chain's ggml_add nodes (((r0 + r1) + r2) + ...) and the bias add last. The
+// result is bit-identical to the chain on this backend.
+static size_t ggml_qsa_score_gather_size(const struct ggml_tensor * dst) {
+    const struct ggml_tensor * a    = dst->src[0];
+    const struct ggml_tensor * rows = dst->src[2];
+    if (rows == NULL) {
+        return 0;
+    }
+    return GGML_PAD(ggml_row_size(a->type, a->ne[0])*ggml_nelements(rows), CACHE_LINE_SIZE);
+}
+
+static size_t ggml_qsa_score_plane_size(const struct ggml_tensor * dst) {
+    const int n_head = ggml_get_op_params_i32(dst, 0);
+    return GGML_PAD(sizeof(float)*(size_t) ggml_nelements(dst)*(size_t) n_head, CACHE_LINE_SIZE);
+}
+
+static void ggml_compute_forward_qsa_score(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * a    = dst->src[0];
+          struct ggml_tensor * b    = dst->src[1];
+    const struct ggml_tensor * rows = dst->src[2];
+    const struct ggml_tensor * bias = dst->src[3];
+
+    const int     n_head = ggml_get_op_params_i32(dst, 0);
+    const int64_t K      = a->ne[0];
+    const int64_t M      = dst->ne[0];
+    const int64_t N      = dst->ne[1];
+    const int64_t n_b    = dst->ne[2];
+    const size_t  row_sz = ggml_row_size(a->type, K);
+    const size_t  gsize  = ggml_qsa_score_gather_size(dst);
+    const size_t  psize  = ggml_qsa_score_plane_size(dst);
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && n_head > 0);
+    GGML_ASSERT(params->wsize >= gsize + psize);
+
+    char  * g     = (char *) params->wdata;
+    float * plane = (float *) (g + gsize);
+
+    // the product's A: the store's named rows gathered (MUL_MAT_ROWS), or a itself (MUL_MAT)
+    struct ggml_tensor ag = *a;
+    if (rows) {
+        GGML_ASSERT(rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows));
+        const int64_t   n_rows = a->ne[1];
+        const int32_t * ids    = (const int32_t *) rows->data;
+        const int64_t   n      = M*n_b;
+        const int64_t   dr     = (n + params->nth - 1)/params->nth;
+        const int64_t   ir0    = dr*params->ith;
+        const int64_t   ir1    = MIN(ir0 + dr, n);
+        for (int64_t i = ir0; i < ir1; ++i) {
+            const int32_t r = ids[i];
+            GGML_ASSERT(r >= 0 && r < n_rows);
+            memcpy(g + i*row_sz, (const char *) a->data + (size_t) r*a->nb[1], row_sz);
+        }
+
+        ggml_barrier(params->threadpool);
+
+        ag.op       = GGML_OP_NONE;
+        ag.view_src = NULL;
+        ag.data     = g;
+        ag.ne[0] = K; ag.ne[1] = M; ag.ne[2] = n_b; ag.ne[3] = 1;
+        ag.nb[0] = ggml_type_size(a->type);
+        ag.nb[1] = row_sz;
+        ag.nb[2] = row_sz*M;
+        ag.nb[3] = row_sz*M*n_b;
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            ag.src[i] = NULL;
+        }
+    }
+
+    // the chain's MUL_MAT output: [M, n_head*N, n_b] contiguous f32
+    struct ggml_tensor mm = *dst;
+    mm.op       = GGML_OP_MUL_MAT;
+    mm.view_src = NULL;
+    mm.data     = plane;
+    mm.ne[0] = M; mm.ne[1] = N*n_head; mm.ne[2] = n_b; mm.ne[3] = 1;
+    mm.nb[0] = sizeof(float);
+    mm.nb[1] = sizeof(float)*M;
+    mm.nb[2] = sizeof(float)*M*N*n_head;
+    mm.nb[3] = sizeof(float)*M*N*n_head*n_b;
+    mm.src[0] = &ag; // a copy of a's descriptor (or of the gathered rows'): same data, shapes and strides
+    mm.src[1] = b;
+    mm.src[2] = NULL;
+    mm.src[3] = NULL;
+    memset(mm.op_params, 0, sizeof(mm.op_params)); // GGML_PREC_DEFAULT, no hint: what ggml_mul_mat sets
+
+    struct ggml_compute_params pmm = *params;
+    pmm.wdata = g + gsize + psize;
+    pmm.wsize = params->wsize - gsize - psize;
+
+    ggml_compute_forward_mul_mat(&pmm, &mm);
+
+    ggml_barrier(params->threadpool);
+
+    // the epilogue, one (query, batch) row of the result per step, rows split evenly across the threads
+    const int64_t nr  = N*n_b;
+    const int64_t dr  = (nr + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t t = ir % N;
+        const int64_t s = ir / N;
+        const float * p0 = plane + (size_t) M*(size_t) (s*N*n_head + t*n_head);
+        float       * d  = (float *) ((char *) dst->data + t*dst->nb[1] + s*dst->nb[2]);
+        const float * bi = bias ? (const float *) ((const char *) bias->data + t*bias->nb[1] + s*bias->nb[2]) : NULL;
+        for (int64_t m = 0; m < M; ++m) {
+            float sum = (p0[m] > 0.f) ? p0[m] : 0.f;
+            for (int h = 1; h < n_head; ++h) {
+                const float x = p0[(size_t) h*M + m];
+                sum = sum + ((x > 0.f) ? x : 0.f);
+            }
+            if (bi) {
+                sum = sum + *(const float *) ((const char *) bi + m*bias->nb[0]);
+            }
+            *(float *) ((char *) d + m*dst->nb[0]) = sum;
+        }
+    }
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1920,6 +2045,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT_ROWS:
             {
                 ggml_compute_forward_mul_mat_rows(params, tensor);
+            } break;
+        case GGML_OP_QSA_SCORE:
+            {
+                ggml_compute_forward_qsa_score(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2422,6 +2551,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_MUL_MAT_ROWS:
+        case GGML_OP_QSA_SCORE:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;
@@ -2965,6 +3095,17 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         // [TAG_QSA_POOL_REMAP] the gathered rows, then what the MUL_MAT it runs needs
                         cur = ggml_mul_mat_rows_gather_size(node);
+
+                        const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
+
+                        if (node->src[1]->type != vec_dot_type) {
+                            cur += ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                        }
+                    } break;
+                case GGML_OP_QSA_SCORE:
+                    {
+                        // [TAG_QSA_SCORE_EPILOGUE] the gathered rows (if any), the product plane, then what its MUL_MAT needs
+                        cur = ggml_qsa_score_gather_size(node) + ggml_qsa_score_plane_size(node);
 
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
 
