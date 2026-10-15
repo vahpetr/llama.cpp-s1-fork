@@ -15,7 +15,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <mutex>
 #include <stdexcept>
+#include <tuple>
 
 //
 // [TAG_QSA_POOLED_CACHE] llama_qsa_pooled_store
@@ -178,6 +180,31 @@ bool llama_qsa_history_dense(const char ** reason) {
                      : "default; no M-RoPE image positions decoded";
     }
     return !mm;
+}
+
+// [TAG_QSA_POOLED_F16_MIRROR] does `dev` run QSA_SCORE (rows form) with an f16 store hint? A stand-in node with the store
+// and a GEMM width (16 columns: never the mat-vec), checked once per (device, K, heads)
+static bool llama_qsa_f16_mirror_supported(ggml_backend_dev_t dev, int64_t K, int64_t n_head) {
+    static std::mutex mtx;
+    static std::map<std::tuple<ggml_backend_dev_t, int64_t, int64_t>, bool> answers;
+    std::lock_guard<std::mutex> lock(mtx);
+    const auto key = std::make_tuple(dev, K, n_head);
+    if (auto it = answers.find(key); it != answers.end()) {
+        return it->second;
+    }
+    ggml_init_params ip = { /*.mem_size =*/ 16*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * a    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 65);
+    ggml_tensor * a16  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, K, 65);
+    ggml_tensor * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 64, 1);
+    ggml_tensor * b    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, n_head*16, 1);
+    ggml_tensor * bias = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 16, 1);
+    ggml_tensor * sc   = ggml_qsa_score(ctx, a, rows, b, bias, (int) n_head);
+    ggml_qsa_score_set_a_f16(sc, a16);
+    const bool ok = ggml_backend_dev_supports_op(dev, sc);
+    ggml_free(ctx);
+    answers.emplace(key, ok);
+    return ok;
 }
 
 // [TAG_QSA_POOLED_F16_MIRROR] see the header
@@ -561,6 +588,24 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     st->n_rows   = st->n_slots + 1;
     st->phase    = qsa_phase_v;   // [TAG_MTP_QSA_PHASE]
 
+    // [TAG_QSA_POOLED_F16_MIRROR] decided once, before any tensor is created (all layers or none): something must read it
+    // - the score reads the store through the remap (LLAMA_QSA_POOL_REMAP=indexed; the copy mode reads a get_rows plane) -
+    // and every layer's device must take the f16-A QSA_SCORE (a stand-in node: Vulkan coopmat1 only; never a CPU store)
+    bool mirror = llama_qsa_pooled_f16_mirror_env() && llama_qsa_pool_remap_indexed() && offload;
+    const char * mirror_why = !llama_qsa_pooled_f16_mirror_env() ? "knob" : !llama_qsa_pool_remap_indexed() ?
+            "LLAMA_QSA_POOL_REMAP is not indexed (nothing reads it)" : !offload ? "not offloaded" : "";
+    for (const int32_t il : ils) {
+        if (!mirror) {
+            break;
+        }
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+            !llama_qsa_f16_mirror_supported(dev, (int64_t) hp.indexer_head_size, (int64_t) hp.indexer_n_head)) {
+            mirror     = false;
+            mirror_why = "a QSA layer's device does not run the f16-A score (not Vulkan coopmat1)";
+        }
+    }
+
     // one context per buffer type, as llama_kv_cache places its layers
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
 
@@ -592,20 +637,15 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         st->layers[il] = t;
 
-        // [TAG_QSA_POOLED_F16_MIRROR] a GPU store only (a CPU product reads f32 and would never use it)
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        if (llama_qsa_pooled_f16_mirror_env() && dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        // [TAG_QSA_POOLED_F16_MIRROR] the decision above holds for every layer, so no f16 tensor is created for nothing
+        if (mirror) {
             ggml_tensor * t16 = ggml_new_tensor_2d(it->second.get(), GGML_TYPE_F16, st->idx_dim, (int64_t) st->n_rows*st->n_stream);
             ggml_format_name(t16, "cache_qsa_pooled_f16_l%d", il);
 
             st->layers_f16[il] = t16;
         }
     }
-    // all layers or none (one decision per memory)
-    st->f16_mirror = !st->layers_f16.empty() && st->layers_f16.size() == st->layers.size();
-    if (!st->f16_mirror) {
-        st->layers_f16.clear();
-    }
+    st->f16_mirror = mirror;
 
     size_t total = 0;
 
@@ -720,11 +760,11 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     // [TAG_QSA_POOLED_F16_MIRROR] the proof line (WARN reaches the server log)
     {
         const size_t bytes16 = (size_t) ils.size()*qsa_store->idx_dim*qsa_store->n_rows*qsa_store->n_stream*sizeof(ggml_fp16_t);
-        LLAMA_LOG_WARN("%s: qsa_pooled_f16_mirror: %s (LLAMA_QSA_POOLED_F16_MIRROR %s, GGML_VK_QSA_SCORE_EPILOGUE %s)%s: "
+        LLAMA_LOG_WARN("%s: qsa_pooled_f16_mirror: %s (LLAMA_QSA_POOLED_F16_MIRROR %s, GGML_VK_QSA_SCORE_EPILOGUE %s)%s%s: "
                        "%.2f MiB in the store buffers%s\n", __func__, qsa_store->f16_mirror ? "on" : "off",
                        getenv("LLAMA_QSA_POOLED_F16_MIRROR") ? getenv("LLAMA_QSA_POOLED_F16_MIRROR") : "unset",
                        getenv("GGML_VK_QSA_SCORE_EPILOGUE") ? getenv("GGML_VK_QSA_SCORE_EPILOGUE") : "unset",
-                       qsa_store->f16_mirror || !llama_qsa_pooled_f16_mirror_env() ? "" : " (not a GPU store)",
+                       qsa_store->f16_mirror ? "" : " - ", qsa_store->f16_mirror ? "" : mirror_why,
                        qsa_store->f16_mirror ? bytes16/1024.0/1024.0 : 0.0,
                        qsa_store->f16_mirror && llama_qsa_pooled_f16_mirror_check() ? "; LLAMA_QSA_POOLED_F16_MIRROR_CHECK=1" : "");
     }

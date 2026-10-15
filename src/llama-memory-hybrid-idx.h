@@ -70,8 +70,20 @@ bool llama_qsa_census_check();
 // GEMM then reads 2 instead of 4 bytes per key element and the same f16 values. The f32 store stays authoritative: the
 // mat-vec widths (1-2 rows: decode, 2-token verify), the CPU and every other reader use it. Only on a GPU store with the
 // score epilogue on (GGML_VK_QSA_SCORE_EPILOGUE != 0). Cost: 2 B x idx_dim x n_rows x n_stream per QSA layer.
+// Allocated only where it is read: GGML_VK_QSA_SCORE_EPILOGUE on, LLAMA_QSA_POOL_REMAP=indexed (the copy mode scores a
+// get_rows plane), an offloaded store, and every QSA layer's device taking the f16-A QSA_SCORE (a stand-in node at load:
+// Vulkan coopmat1); one decision per memory (all layers or none), made before any tensor is created.
+// Written on EVERY graph that writes the f32 store, also those whose width (1-2 rows: the mat-vec) does not read it:
+// the store's validity is one stamp per slot (llama_qsa_pooled_store::slot_stamp), and a valid slot is never pooled
+// again, so a skipped mirror write would leave a valid-f32 / stale-f16 slot that no later plan rewrites. Skipping
+// would need a second per-slot stamp and a re-conversion pass on the first GEMM round; the write it saves is one
+// set_rows of the round's dirty rows (a block or two per decode round), so it is kept.
 // LLAMA_QSA_POOLED_F16_MIRROR_CHECK=1 (debug): after every graph (synchronised) every mirror row must equal the host's
-// f32 -> f16 (round to nearest even) of the f32 store row; the first mismatch aborts.
+// f32 -> f16 (round to nearest even, denormals kept: ggml_fp32_to_fp16_row) of the f32 store row; the first mismatch
+// aborts. That checks the device conversion against the IEEE RNE reference; that the coopmat1 GEMM's own in-kernel
+// f32 -> f16 conversion is the same RNE was established by a probe on the 780M (MUL_MAT(store, I) rounded to f16 ==
+// the mirror, every element incl. denormals; A2a report) - the s1 unit's CHECK + the score-plane identity close it
+// on gfx1151.
 bool llama_qsa_pooled_f16_mirror_check();
 
 //
