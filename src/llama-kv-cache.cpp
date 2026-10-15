@@ -2423,8 +2423,9 @@ const slot_info_vec_t *   sinfos_in) {
     }
 }
 
-void llama_kv_cache::ext_copy_from(const llama_kv_cache & src, const slot_info_vec_t & sinfos) {
+uint32_t llama_kv_cache::ext_copy_from(const llama_kv_cache & src, const slot_info_vec_t & sinfos, bool keep_tok) {
     // [TAG_CELL_EXT_RESTORE] see the declaration
+    uint32_t n = 0;
     for (const auto & sinfo : sinfos) {
         if (sinfo.empty()) {
             continue;
@@ -2438,11 +2439,18 @@ void llama_kv_cache::ext_copy_from(const llama_kv_cache & src, const slot_info_v
 
             for (const uint32_t idx : sinfo.idxs[s]) {
                 if (!src_cells.is_empty(idx) && !dst_cells.is_empty(idx)) {
-                    dst_cells.ext_set(idx, src_cells.ext_get(idx));
+                    llama_kv_cell_ext e = src_cells.ext_get(idx);
+                    if (keep_tok) {
+                        e.tok = dst_cells.ext_get(idx).tok;
+                    }
+                    dst_cells.ext_set(idx, e);
+                    n++;
                 }
             }
         }
     }
+
+    return n;
 }
 
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {

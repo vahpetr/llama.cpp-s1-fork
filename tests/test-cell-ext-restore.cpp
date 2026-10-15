@@ -13,9 +13,13 @@
 //     restore into a fresh context: every cell's {pos, ext} of the attention AND the indexer cache equals the live
 //     one, a re-save is byte-identical to the live save, and a continuation (text + another image chunk) gives
 //     byte-identical logits to the in-memory continuation;
-//  D  MTP draft memory (LLAMA_MTP_QSA=1 only, otherwise it is a plain KV cache): seq data with flags 0 into a fresh
-//     context, and the speculative rollback checkpoint form (PARTIAL_ONLY, same context after seq_rm): the attention
-//     and indexer cells' {pos, ext} equal the live ones.
+//  T-old (PLE): the live save with the indexer x/y zeroed (an entry a pre-fix build re-saved after a restore) heals:
+//     indexer cells == live, re-save == live save, continuation logits == in-memory;
+//  D  MTP draft memory (LLAMA_MTP_QSA=1 only, otherwise it is a plain KV cache): text + an image (the MTP catch-up
+//     skips embedding batches, so the draft holds no image cell); seq data with flags 0 into a fresh context, and the
+//     speculative rollback checkpoint form (PARTIAL_ONLY, same context after seq_rm): the attention and indexer cells'
+//     {pos, ext} equal the live ones, and the next draft step's logits equal those before the rollback;
+//  cost: the added per-restore copy over 1 048 576 cells (info line).
 //
 // usage: test-cell-ext-restore [dump_dir]   (dump_dir: keeps the T save files live-<fixture>.bin / rest-<fixture>.bin)
 
@@ -35,6 +39,8 @@
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-memory-hybrid-idx.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -269,7 +275,9 @@ static std::vector<float> decode_text(llama_context * ctx, const std::vector<lla
 
 // an h x w "image" at temporal position p0, as mtmd lays out the M-RoPE positions: section 0 = p0, 1 = y, 2 = x;
 // returns the logits, the next text position is p0 + max(h, w)
-static std::vector<float> decode_image(llama_context * ctx, int h, int w, llama_pos p0, uint32_t seed) {
+// spec: also run the MTP catch-up over the batch, as the server's mtmd decode callback does
+static std::vector<float> decode_image(llama_context * ctx, int h, int w, llama_pos p0, uint32_t seed,
+                                       common_speculative * spec = nullptr) {
     const int n = h * w;
     llama_batch b = llama_batch_init(n, N_EMBD, 1);
     // llama_batch_init sizes pos for one section; M-RoPE embeddings take 4
@@ -290,6 +298,9 @@ static std::vector<float> decode_image(llama_context * ctx, int h, int w, llama_
     b.n_tokens = n;
     GGML_ASSERT(llama_decode(ctx, b) == 0);
     auto l = all_logits(ctx, n);
+    if (spec) {
+        GGML_ASSERT(common_speculative_process(spec, b));
+    }
     llama_batch_free(b);
     return l;
 }
@@ -413,6 +424,56 @@ static void test_target(llama_model * model, const std::string & tag, const std:
     check(eq(cont_mem, cont_rest), tag + " T: continuation logits (text + image + text, every row) == in-memory");
     check(eq(cells_of(h_live->get_mem_idx()), cells_of(h_rest->get_mem_idx())), tag + " T: indexer cells equal after the continuation");
 
+    // an entry written by a build before the fix after a restore of its own: the indexer meta holds x = y = 0 (the C3
+    // shape). Its records are byte-equal to the attention meta's (same pos / ext / seq), so the second occurrence of
+    // that record block in the file is the indexer's
+    if (h_live->get_mem_idx()->has_cell_ext()) {
+        std::vector<int32_t> rec;
+        for (size_t i = 0; i + 4 < attn_live.size(); i += 5) {
+            rec.insert(rec.end(), { attn_live[i + 1], 1, attn_live[i + 2], attn_live[i + 3], attn_live[i + 4], 0 });
+        }
+        auto bytes = read_file(f_live);
+        const auto * pat = (const uint8_t *) rec.data();
+        const size_t n_pat = rec.size() * sizeof(int32_t);
+        auto find = [&](size_t from) {
+            auto it = std::search(bytes.begin() + from, bytes.end(), pat, pat + n_pat);
+            return it == bytes.end() ? std::string::npos : (size_t) (it - bytes.begin());
+        };
+        const size_t o_attn = find(0);
+        const size_t o_idx  = o_attn == std::string::npos ? o_attn : find(o_attn + n_pat);
+        check(o_idx != std::string::npos, tag + " T-old: indexer meta located in the save file");
+        if (o_idx != std::string::npos) {
+            for (size_t c = 0; c < rec.size() / 6; ++c) {
+                memset(bytes.data() + o_idx + (c * 6 + 2) * sizeof(int32_t), 0, 2 * sizeof(int32_t)); // x, y
+            }
+            const std::string f_old = dir + "/old-" + tag + ".bin";
+            {
+                std::ofstream f(f_old, std::ios::binary);
+                f.write((const char *) bytes.data(), bytes.size());
+            }
+            auto old = make_ctx(model, false);
+            n_tok = 0;
+            GGML_ASSERT(llama_state_seq_load_file(old.get(), f_old.c_str(), 0, toks.data(), toks.size(), &n_tok) > 0);
+            auto * h_old = hyb(old.get());
+            const int d_old = n_differing(idx_live, cells_of(h_old->get_mem_idx()));
+            printf("info %s T-old: zeroed indexer x/y in the file, indexer cells differing after restore: %d\n", tag.c_str(), d_old);
+            check(d_old == 0, tag + " T-old: an old-build entry (indexer x = y = 0) heals: indexer cells == live (x/y from attention, tok kept)");
+            const std::string f_old_re = dir + "/old-re-" + tag + ".bin";
+            GGML_ASSERT(llama_state_seq_save_file(old.get(), f_old_re.c_str(), 0, prompt.data(), prompt.size()) > 0);
+            check(n_bytes_differing(read_file(f_live), read_file(f_old_re)) == 0, tag + " T-old: its re-save == the live save");
+            std::vector<float> cont_old = decode_text(old.get(), t2, n_past);
+            auto l = decode_image(old.get(), 2, 2, n_past + 5, 22);
+            cont_old.insert(cont_old.end(), l.begin(), l.end());
+            l = decode_text(old.get(), t3, n_past + 7);
+            cont_old.insert(cont_old.end(), l.begin(), l.end());
+            check(eq(cont_mem, cont_old), tag + " T-old: continuation logits == in-memory");
+            unlink(f_old.c_str());
+            unlink(f_old_re.c_str());
+        }
+    } else {
+        printf("info %s T-old: the indexer serializes no ext - nothing an old build could have zeroed in the file\n", tag.c_str());
+    }
+
     if (dir.rfind("/tmp", 0) == 0 && getenv("TEST_CELL_EXT_DUMP") == nullptr) {
         unlink(f_live.c_str());
         unlink(f_rest.c_str());
@@ -451,10 +512,45 @@ static void test_draft(llama_model * model, const std::string & tag) {
     GGML_ASSERT(llama_decode(tgt.get(), b) == 0);
     GGML_ASSERT(common_speculative_process(spec, b));
     llama_batch_free(b);
+    decode_image(tgt.get(), 3, 4, 96, 41, spec); // an image (mtmd decode + the server's MTP catch-up call), next text at 100
+    const llama_pos n_past = 100;
 
     const auto attn_live = cells_of(h->get_mem_attn());
     const auto idx_live  = cells_of(h->get_mem_idx());
-    check(!idx_live.empty(), tag + " D: the draft indexer holds cells");
+    {
+        const int n_nt = n_xy_nontrivial(idx_live), n_nt_attn = n_xy_nontrivial(attn_live);
+        printf("info %s D: draft cells with x/y != pos: indexer %d, attention %d (of %zu)\n", tag.c_str(), n_nt, n_nt_attn, idx_live.size() / 5);
+        if (getenv("TEST_CELL_EXT_VERBOSE")) {
+            for (size_t i = 0; i + 4 < idx_live.size(); i += 5) {
+                if (idx_live[i + 1] >= 90) printf("  cell %d pos %d x %d y %d tok %d\n", idx_live[i], idx_live[i + 1], idx_live[i + 2], idx_live[i + 3], idx_live[i + 4]);
+            }
+        }
+        // the MTP catch-up skips embedding batches (common/speculative.cpp: "TODO: how to make it work with vision
+        // tokens?"), so the draft memory never holds image cells - its rows are text (x = y = pos) + the token
+        check(n_nt == 0 && n_nt_attn == 0, tag + " D: the draft memory holds no image cells (the MTP catch-up skips embedding batches)");
+    }
+
+    // one draft from (n_past, id_last) with the given carry; returns the draft logits, the drafted cells dropped again
+    std::vector<uint8_t> carry;
+    GGML_ASSERT(common_speculative_get_state(spec, 0, carry));
+    auto draft = [&]() {
+        GGML_ASSERT(common_speculative_set_state(spec, 0, carry));
+        std::vector<llama_token> out;
+        auto & dp = common_speculative_get_draft_params(spec, 0);
+        dp.drafting = true;
+        dp.n_max    = -1;
+        dp.n_past   = n_past;
+        dp.id_last  = t0.back();
+        dp.prompt   = nullptr;
+        dp.result   = &out;
+        common_speculative_draft(spec);
+        const float * l = llama_get_logits_ith(dft.get(), -1);
+        std::vector<float> r = l ? std::vector<float>(l, l + N_VOCAB) : std::vector<float>();
+        llama_memory_seq_rm(llama_get_memory(dft.get()), 0, n_past, -1);
+        return r;
+    };
+    const auto logits_live = draft();
+    check(!logits_live.empty() && eq(cells_of(h->get_mem_idx()), idx_live), tag + " D: a draft step leaves the draft cells as they were");
 
     // disk / RAM prompt cache form: flags 0 into a fresh draft context
     {
@@ -477,9 +573,33 @@ static void test_draft(llama_model * model, const std::string & tag) {
         const int d_idx  = n_differing(idx_live,  cells_of(h->get_mem_idx()));
         printf("info %s D: PARTIAL_ONLY restore, cells differing: attention %d, indexer %d\n", tag.c_str(), d_attn, d_idx);
         check(d_attn == 0 && d_idx == 0, tag + " D: PARTIAL_ONLY (rollback checkpoint) restore - draft cells byte-equal");
+        check(eq(draft(), logits_live), tag + " D: PARTIAL_ONLY restore - the next draft step's logits == before the rollback");
     }
 
     common_speculative_free(spec);
+}
+
+// the restore's added cost at the prod size: llama_kv_cache::ext_copy_from's per-cell body over 1 048 576 cells
+static void bench_ext_copy() {
+    const uint32_t n = 1u << 20;
+    llama_kv_cells src, dst;
+    src.resize(n);
+    dst.resize(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        src.pos_set(i, (llama_pos) i); src.seq_add(i, 0); src.ext_set(i, { (llama_pos) i, (llama_pos) i, (llama_token) (i % 977) });
+        dst.pos_set(i, (llama_pos) i); dst.seq_add(i, 0);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!src.is_empty(i) && !dst.is_empty(i)) {
+            llama_kv_cell_ext e = src.ext_get(i);
+            e.tok = dst.ext_get(i).tok;
+            dst.ext_set(i, e);
+        }
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    printf("info cost: indexer ext copy over %u cells: %.2f ms per restore\n", n, ms);
+    check(dst.ext_get(n - 1).x == (llama_pos) (n - 1), "cost bench: the copy ran");
 }
 
 int main(int argc, char ** argv) {
@@ -500,6 +620,8 @@ int main(int argc, char ** argv) {
         test_target(model.get(), tag, dir);
         test_draft (model.get(), tag);
     }
+
+    bench_ext_copy();
 
     llama_backend_free();
     printf("%s: %d ok, %d failed\n", n_fail ? "FAIL" : "PASS", n_ok, n_fail);

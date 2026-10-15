@@ -951,16 +951,23 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 }
 
 void llama_memory_hybrid_idx::idx_ext_restore(const llama_kv_cache::slot_info_vec_t & sinfos_attn) {
-    // [TAG_CELL_EXT_RESTORE] an indexer state without the cell ext (no PLE: the indexer's rope NONE gives
-    // has_cell_ext() false, e.g. the MTP draft memory) restored x = y = 0, tok = 0, while its live cells hold the
-    // ext apply_ubatch wrote from the same ubatches as the attention cells - M-RoPE x/y (an image's 2D position) and
-    // the token. The attention cache serialized it, and the indexer took its layout, so take it from there.
-    // An indexer that serializes the ext (PLE) restored it exactly already.
-    if (mem_idx->has_cell_ext() || !get_mem_attn()->has_cell_ext()) {
+    // [TAG_CELL_EXT_RESTORE] the indexer's own restore cannot be trusted for x / y:
+    //  - an indexer state without the cell ext (no PLE: the indexer's rope NONE gives has_cell_ext() false, e.g. the MTP
+    //    draft memory) restored x = y = tok = 0;
+    //  - an indexer state with the ext (PLE) written by a build before this fix after a restore of its own already holds
+    //    x = y = 0 on the restored rows, and would keep them through every re-save.
+    // The live indexer cells hold the ext apply_ubatch wrote from the same ubatches as the attention cells, the attention
+    // cache serializes and restores x / y exactly, and the indexer took its layout - so x / y always come from there
+    // (old cache entries heal on the first restore; no cache-key change). The token is kept when the indexer serialized
+    // it. An attention cache without the ext (no M-RoPE, no PLE) has nothing better: the indexer keeps what it restored.
+    if (!get_mem_attn()->has_cell_ext()) {
         return;
     }
 
-    mem_idx->ext_copy_from(*get_mem_attn(), sinfos_attn);
+    const int64_t t0 = ggml_time_us();
+    const uint32_t n = mem_idx->ext_copy_from(*get_mem_attn(), sinfos_attn, /*keep_tok =*/ mem_idx->has_cell_ext());
+    LLAMA_LOG_DEBUG("%s: indexer cell ext of %u cells from the attention cells in %.3f ms\n", __func__, n,
+            (ggml_time_us() - t0) / 1000.0);
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
