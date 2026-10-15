@@ -28,6 +28,9 @@
 //  T-rm / T-hole: an unmarked trunk state must be an intact history (cells at positions 0..n-1): an image conversation
 //     with its image prefix removed by seq_rm before the save, and a text one with a hole, are refused; marked they load;
 //     the checkpoint triplet must be exact ({1, 5, IXY1} is refused as an invalid stream);
+//  provenance: an unmarked state loads only while the caller vouches for it (llama_state_legacy_unmarked_accept, the
+//     server's proof from its stored token stream); the cell checks are extra guards. TX / CK-text / D-old also run
+//     without the proof (refused); CP: the seq_cp(0, 1, 0, 40) destination of an image conversation is refused;
 //  D-old: a pre-fix draft stream (recr_none branch, no mark) loads with cells == live;
 //  cost: the added per-restore copy over 1 048 576 cells (info line).
 //
@@ -475,12 +478,63 @@ static void test_history(llama_model * model, const std::string & tag, const std
     check(write_prefix_shape(f_live, f_old, (uint32_t) (attn_left.size() / 5), h->get_mem_idx()->has_cell_ext()),
             tc + ": provenance mark located and stripped (pre-fix shape)");
     auto old = make_ctx(model, false);
+    llama_state_legacy_unmarked_accept(old.get(), true); // even if vouched for: the intact-history guard refuses it
     const uint64_t r0 = llama_memory_hybrid_idx::n_xy_rejects();
     const size_t nr = llama_state_seq_load_file(old.get(), f_old.c_str(), 0, toks.data(), toks.size(), &n_tok);
     printf("info %s: pre-fix shape %s, rejections %llu -> %llu\n", tc.c_str(), nr ? "accepted" : "refused",
             (unsigned long long) r0, (unsigned long long) llama_memory_hybrid_idx::n_xy_rejects());
     check(nr == 0 && llama_memory_hybrid_idx::n_xy_rejects() == r0 + 1, tc + ": the pre-fix shape is refused (not an intact history, counter +1)");
     check(seq_gone(old.get()), tc + ": nothing of it is left in attention, recurrent or indexer");
+    unlink(f_live.c_str());
+    unlink(f_old.c_str());
+}
+
+// CP: astra's counterexample to proving history from cells: a unified pool, seq 0 = text + image + text, then a partial
+// seq_cp(0, 1, 0, 40) - attention / indexer copy cells 0..39 (text only, contiguous) while the recurrent copy takes seq
+// 0's whole state (the image included). An unmarked save of seq 1 passes both cell guards; without the caller's proof
+// (a memory-API path never has one) it is refused
+static void test_seq_cp(llama_model * model, const std::string & tag, const std::string & dir) {
+    const std::string tc = tag + " CP";
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = N_CTX; cp.n_batch = 128; cp.n_ubatch = 64; cp.n_seq_max = 2; cp.kv_unified = true;
+    cp.n_threads = 4; cp.n_threads_batch = 4;
+    llama_context_ptr ctx(llama_init_from_model(model, cp));
+    GGML_ASSERT(ctx);
+    const auto t0 = tokens(40, 81);
+    const auto t1 = tokens(9,  82);
+    decode_text(ctx.get(), t0, 0);
+    decode_image(ctx.get(), 3, 4, 40, 83);
+    decode_text(ctx.get(), t1, 44);
+    llama_memory_seq_cp(llama_get_memory(ctx.get()), 0, 1, 0, 40);
+
+    auto * h = hyb(ctx.get());
+    std::vector<int32_t> c1;
+    {
+        const auto & cells = h->get_mem_attn()->get_cells(1);
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i) && cells.seq_has(i, 1)) {
+                c1.push_back(cells.pos_get(i));
+            }
+        }
+    }
+    printf("info %s: seq 1 holds %zu attention cells, recurrent pos_max %d, intact %d, image cells %u\n", tc.c_str(), c1.size(),
+            (int) h->get_mem_recr()->seq_pos_max(1), (int) h->get_mem_attn()->seq_history_intact(1, (llama_pos) INT32_MAX),
+            h->get_mem_attn()->n_cells_2d_seq(1, (llama_pos) INT32_MAX));
+
+    const std::string f_live = dir + "/cp-live-" + tag + ".bin";
+    const std::string f_old  = dir + "/cp-old-"  + tag + ".bin";
+    std::vector<llama_token> prompt(t0.begin(), t0.end());
+    GGML_ASSERT(llama_state_seq_save_file(ctx.get(), f_live.c_str(), 1, prompt.data(), prompt.size()) > 0);
+    check(write_prefix_shape(f_live, f_old, (uint32_t) c1.size(), h->get_mem_idx()->has_cell_ext()),
+            tc + ": provenance mark located and stripped (pre-fix shape)");
+    auto old = make_ctx(model, false);
+    std::vector<llama_token> toks(prompt.size() + 8);
+    size_t n_tok = 0;
+    const uint64_t r0 = llama_memory_hybrid_idx::n_xy_rejects();
+    const size_t nr = llama_state_seq_load_file(old.get(), f_old.c_str(), 0, toks.data(), toks.size(), &n_tok);
+    printf("info %s: unmarked seq_cp destination %s\n", tc.c_str(), nr ? "accepted" : "refused");
+    check(nr == 0 && llama_memory_hybrid_idx::n_xy_rejects() == r0 + 1 && seq_gone(old.get()),
+            tc + ": the unmarked seq_cp(0, 40) destination (cells intact + text-only) is refused without the proof");
     unlink(f_live.c_str());
     unlink(f_old.c_str());
 }
@@ -529,6 +583,7 @@ static void test_target_ckpt(llama_model * model, const std::string & tag, bool 
     std::vector<uint8_t> old = ck;
     old.erase(old.begin() + 8, old.begin() + 20);
     const uint64_t r0 = llama_memory_hybrid_idx::n_xy_ckpt_rejects();
+    llama_state_legacy_unmarked_accept(live.get(), true); // the server's proof (entry with a media-free prefix)
     const size_t nr = llama_state_seq_set_data_ext(live.get(), old.data(), old.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     printf("info %s: unmarked checkpoint %s, checkpoint rejections %llu -> %llu\n", tc.c_str(), nr ? "accepted" : "refused",
             (unsigned long long) r0, (unsigned long long) llama_memory_hybrid_idx::n_xy_ckpt_rejects());
@@ -548,6 +603,13 @@ static void test_target_ckpt(llama_model * model, const std::string & tag, bool 
         const uint64_t r1 = llama_memory_hybrid_idx::n_xy_ckpt_rejects();
         const size_t nb = llama_state_seq_set_data_ext(live.get(), bad.data(), bad.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         check(nb == 0 && llama_memory_hybrid_idx::n_xy_ckpt_rejects() == r1, tc + ": {1, 5, IXY1} is not the mark (refused as an invalid stream)");
+    }
+    llama_state_legacy_unmarked_accept(live.get(), false);
+    if (!image) {
+        // without the proof the same text checkpoint is refused (counter +1)
+        const uint64_t r2 = llama_memory_hybrid_idx::n_xy_ckpt_rejects();
+        const size_t n2 = llama_state_seq_set_data_ext(live.get(), old.data(), old.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        check(n2 == 0 && llama_memory_hybrid_idx::n_xy_ckpt_rejects() == r2 + 1, tc + ": the unmarked text checkpoint WITHOUT the proof is refused (counter +1)");
     }
 
     // the OLD reader: v59 (a1b6c324e) hands a PARTIAL_ONLY trunk stream straight to llama_memory_recurrent::state_read
@@ -587,12 +649,22 @@ static void test_prefix_text(llama_model * model, const std::string & tag, const
 
     check(write_prefix_shape(f_live, f_old, (uint32_t) (idx_live.size() / 5), h_live->get_mem_idx()->has_cell_ext()),
             tag + " TX: provenance mark located and stripped (pre-fix shape)");
-    auto old = make_ctx(model, false);
-    const uint64_t r0 = llama_memory_hybrid_idx::n_xy_rejects();
     std::vector<llama_token> toks(t0.size() + 8);
     size_t n_tok = 0;
+    {
+        // without the caller's proof (llama_state_legacy_unmarked_accept) an unmarked state is refused
+        auto old0 = make_ctx(model, false);
+        const uint64_t r = llama_memory_hybrid_idx::n_xy_rejects();
+        const size_t n0 = llama_state_seq_load_file(old0.get(), f_old.c_str(), 0, toks.data(), toks.size(), &n_tok);
+        check(n0 == 0 && llama_memory_hybrid_idx::n_xy_rejects() == r + 1 && seq_gone(old0.get()),
+                tag + " TX: a pre-fix text entry WITHOUT the caller's proof is refused (counter +1)");
+    }
+    auto old = make_ctx(model, false);
+    llama_state_legacy_unmarked_accept(old.get(), true); // the server's proof: its stored token stream has no media
+    const uint64_t r0 = llama_memory_hybrid_idx::n_xy_rejects();
     const size_t nr = llama_state_seq_load_file(old.get(), f_old.c_str(), 0, toks.data(), toks.size(), &n_tok);
-    check(nr > 0 && llama_memory_hybrid_idx::n_xy_rejects() == r0, tag + " TX: a pre-fix text entry is accepted (no rejection)");
+    llama_state_legacy_unmarked_accept(old.get(), false);
+    check(nr > 0 && llama_memory_hybrid_idx::n_xy_rejects() == r0, tag + " TX: a pre-fix text entry WITH the proof is accepted (no rejection)");
     if (nr > 0) {
         const int d = n_differing(idx_live, cells_of(hyb(old.get())->get_mem_idx()));
         printf("info %s TX: pre-fix text entry, indexer cells differing after restore: %d\n", tag.c_str(), d);
@@ -679,6 +751,7 @@ static void test_target(llama_model * model, const std::string & tag, const std:
         check(write_prefix_shape(f_live, f_old, (uint32_t) (idx_live.size() / 5), h_live->get_mem_idx()->has_cell_ext()),
                 tag + " T-old: provenance mark located and stripped (pre-fix shape)");
         auto old = make_ctx(model, false);
+        llama_state_legacy_unmarked_accept(old.get(), true); // even if vouched for: the image-cell guard refuses it
         const uint64_t r0 = llama_memory_hybrid_idx::n_xy_rejects();
         n_tok = 0;
         const size_t nr = llama_state_seq_load_file(old.get(), f_old.c_str(), 0, toks.data(), toks.size(), &n_tok);
@@ -785,7 +858,14 @@ static void test_draft(llama_model * model, const std::string & tag) {
         auto data = seq_data(dft.get(), 0);
         const bool ok = prefix_shape(data, (uint32_t) (idx_live.size() / 5), h->get_mem_idx()->has_cell_ext());
         check(ok, tag + " D-old: provenance mark located and stripped in the draft stream");
+        {
+            auto f0 = make_ctx(model, true);
+            const uint64_t r = llama_memory_hybrid_idx::n_xy_rejects();
+            check(llama_state_seq_set_data_ext(f0.get(), data.data(), data.size(), 0, 0) == 0 &&
+                  llama_memory_hybrid_idx::n_xy_rejects() == r + 1, tag + " D-old: WITHOUT the proof the pre-fix draft stream is refused");
+        }
         auto fresh = make_ctx(model, true);
+        llama_state_legacy_unmarked_accept(fresh.get(), true);
         const uint64_t r0 = llama_memory_hybrid_idx::n_xy_rejects();
         const size_t nr = ok ? llama_state_seq_set_data_ext(fresh.get(), data.data(), data.size(), 0, 0) : 0;
         auto * hf = hyb(fresh.get());
@@ -855,6 +935,7 @@ int main(int argc, char ** argv) {
         test_target_ckpt(model.get(), tag, true);
         test_history(model.get(), tag, dir, false);
         test_history(model.get(), tag, dir, true);
+        test_seq_cp(model.get(), tag, dir);
         test_target_ckpt(model.get(), tag, false);
         test_draft (model.get(), tag);
     }

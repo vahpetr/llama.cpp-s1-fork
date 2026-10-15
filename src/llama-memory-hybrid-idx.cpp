@@ -896,6 +896,13 @@ uint64_t llama_memory_hybrid_idx::n_xy_ckpt_rejects() {
     return g_idx_xy_ckpt_rejects.load();
 }
 
+void llama_state_legacy_unmarked_accept(llama_context * ctx, bool accept) {
+    // [TAG_CELL_EXT_PROVENANCE] see llama-ext.h; a memory without the mark (any other model) has nothing to vouch for
+    if (auto * h = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx))) {
+        h->set_legacy_unmarked_accept(accept);
+    }
+}
+
 namespace {
 // [TAG_CELL_EXT_PROVENANCE] a reader that hands out the already-read u32 words first, then the wrapped stream
 class llama_io_read_unread : public llama_io_read_i {
@@ -1039,17 +1046,22 @@ void llama_memory_hybrid_idx::recr_state_read_partial(llama_io_read_i & io, llam
     // the caller trims it) must be image-free AND an intact history - the live cells at pos <= p_max exactly 0..p_max.
     // A removed prefix (seq_rm(seq, 0, k) after an image) or a hole means the recurrent rows may come from cells that
     // are gone, an image among them, which the cell test cannot see
+    // [TAG_CELL_EXT_PROVENANCE] cells cannot prove a history (a partial seq_cp shares a recurrent tail the attention copy
+    // does not show): an unmarked checkpoint is refused unless the caller vouches for it
+    // (llama_state_legacy_unmarked_accept: the server, from its own stored token stream - no media chunk); the cell
+    // checks stay as extra guards
     const llama_pos p_max = w[0] == 1 ? (llama_pos) w[1] : (llama_pos) INT32_MAX;
     const uint32_t n_img = get_mem_attn()->n_cells_2d_seq(seq_id, p_max);
     const bool     whole = get_mem_attn()->seq_history_intact(seq_id, p_max);
-    if (n_img > 0 || !whole) {
+    if (!legacy_accept || n_img > 0 || !whole) {
         const uint64_t n = ++g_idx_xy_ckpt_rejects;
+        const char * why = !legacy_accept ? "no provenance mark and not vouched for as text-only"
+                         : n_img > 0      ? "image cells in its prefix"
+                                          : "the live prefix is not an intact history from position 0";
         LLAMA_LOG_WARN("%s: context checkpoint saved before the indexer x/y fix rejected, reason: %s "
-                "(checkpoint rejections so far: %" PRIu64 ")\n", __func__,
-                n_img > 0 ? "image cells in its prefix" : "the live prefix is not an intact history from position 0", n);
+                "(checkpoint rejections so far: %" PRIu64 ")\n", __func__, why, n);
         io.set_status(LLAMA_STATE_READ_INVALID);
-        throw std::runtime_error(n_img > 0 ? "pre-fix context checkpoint of a sequence with image cells"
-                                           : "pre-fix context checkpoint without an intact history");
+        throw std::runtime_error(std::string("pre-fix context checkpoint: ") + why);
     }
 
     llama_io_read_unread io_head(io, w, n_w);
@@ -1081,16 +1093,20 @@ void llama_memory_hybrid_idx::idx_state_read(llama_io_read_i & io, llama_seq_id 
         // later K/V and recurrent rows: an unmarked trunk state is accepted only as an intact history - its cells at
         // positions exactly 0..n-1 per sequence. The MTP draft memory (recr_none) never holds an image cell (the catch-up
         // skips embedding batches) and loads only next to its target stream, which this check covers.
+        // Cells cannot prove a history at all (a partial seq_cp shares a recurrent tail the attention copy does not
+        // show): an unmarked state is refused unless the caller vouches for it (llama_state_legacy_unmarked_accept: the
+        // server, from its own stored token stream - no media chunk); the cell checks stay as extra guards.
         const uint32_t n_img = get_mem_attn()->n_cells_2d(sinfos_attn);
         const bool     whole = recr_none || get_mem_attn()->seq_history_intact(seq_id, (llama_pos) INT32_MAX);
-        if (n_img > 0 || !whole) {
+        if (!legacy_accept || n_img > 0 || !whole) {
             const uint64_t n = ++g_idx_xy_rejects;
+            const char * why = !legacy_accept ? "no provenance mark and not vouched for as text-only"
+                             : n_img > 0      ? "image cells"
+                                              : "not an intact history from position 0 (removed prefix or hole)";
             LLAMA_LOG_WARN("%s: state saved before the indexer x/y fix rejected as a cache miss, reason: %s "
-                    "(rejections so far: %" PRIu64 ")\n", __func__,
-                    n_img > 0 ? "image cells" : "not an intact history from position 0 (removed prefix or hole)", n);
+                    "(rejections so far: %" PRIu64 ")\n", __func__, why, n);
             io.set_status(LLAMA_STATE_READ_INVALID);
-            throw std::runtime_error(n_img > 0 ? "pre-fix sequence state with image cells"
-                                               : "pre-fix sequence state without an intact history");
+            throw std::runtime_error(std::string("pre-fix sequence state: ") + why);
         }
     }
 

@@ -484,6 +484,9 @@ public:
     static uint64_t n_xy_rejects();
     static uint64_t n_xy_ckpt_rejects();
 
+    // [TAG_CELL_EXT_PROVENANCE] llama_state_legacy_unmarked_accept (llama-ext.h)
+    void set_legacy_unmarked_accept(bool accept) { legacy_accept = accept; }
+
 private:
     // [TAG_QSA_POOLED_CACHE] drop the derived entries of seq_id's stream (every stream if seq_id < 0)
     void qsa_store_invalidate(llama_seq_id seq_id);
@@ -506,6 +509,9 @@ private:
 
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
+    // [TAG_CELL_EXT_PROVENANCE] unmarked (pre-fix) states load only while the caller vouches for them (default: refused)
+    bool legacy_accept = false;
+
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;

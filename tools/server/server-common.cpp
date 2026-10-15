@@ -9,6 +9,7 @@
 
 #include "server-common.h"
 
+#include <algorithm>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -475,6 +476,14 @@ std::pair<const mtmd::input_chunk_ptr *, size_t> server_tokens::find_next_media_
         return { &it->second, it->first };
     }
     return { nullptr, 0 };
+}
+
+bool server_tokens::has_media(size_t n) const {
+    if (!map_idx_to_media.empty() && map_idx_to_media.begin()->first < n) {
+        return true;
+    }
+    const size_t m = std::min(n, tokens.size());
+    return std::find(tokens.begin(), tokens.begin() + m, LLAMA_TOKEN_NULL) != tokens.begin() + m;
 }
 
 void server_tokens::push_back(llama_token tok) {

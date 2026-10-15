@@ -5880,6 +5880,22 @@ private:
                                     }
 
                                     bool restored = false;
+                                    // [TAG_CELL_EXT_PROVENANCE] a pre-fix (unmarked) checkpoint loads only with the disk cache's
+                                    //   proof: an entry referencing it whose stored token stream has no media chunk in its prefix
+                                    //   (orphans and checkpoints of this process's own making get none; the latter are marked)
+                                    bool ck_legacy = false;
+                                    if (!do_reset && disk_cache) {
+                                        try {
+                                            ck_legacy = disk_cache->ckpt_legacy_text_ok(
+                                                    slot.prompt.tokens.prefix_keys({ (size_t) it->n_tokens }).at(0), it->n_tokens);
+                                        } catch (const std::exception &) {
+                                            ck_legacy = false;
+                                        }
+                                    }
+                                    llama_state_legacy_unmarked_accept(ctx_tgt, ck_legacy);
+                                    if (ctx_dft) {
+                                        llama_state_legacy_unmarked_accept(ctx_dft, ck_legacy);
+                                    }
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         restored = it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
@@ -5904,6 +5920,10 @@ private:
                                         } else {
                                             restored = it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
                                         }
+                                    }
+                                    llama_state_legacy_unmarked_accept(ctx_tgt, false);
+                                    if (ctx_dft) {
+                                        llama_state_legacy_unmarked_accept(ctx_dft, false);
                                     }
                                     if (!do_reset && restored && !common_speculative_set_state(spec.get(), slot.id, it->data_spec)) {
                                         // the draft's speculative state did not restore (Codex gate r2 Major 1): the same miss

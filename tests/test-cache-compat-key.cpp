@@ -677,8 +677,19 @@ int main() {
             CHECK(put(s, true, 9) == k && stored(s, k) == blob(true, 9) && s.n_ckpt_unmarked_replaced == 1); // replaced, not linked
             CHECK(put(s, true, 10) == k && stored(s, k) == blob(true, 9) && s.n_ckpt_unmarked_replaced == 1); // marked: reused
             printf("IXY checkpoint provenance: unmarked replaced once by a marked one, marked reused\n");
+            // the proof for a pre-fix checkpoint: an entry referencing it with a media-free stored token stream - an orphan
+            //   checkpoint (no entry) has none
+            CHECK(!s.ckpt_legacy_text_ok(k, 32));
         }
         // (the startup scan's mark read is not covered here: init() collects checkpoints no entry references)
+        // server_tokens::has_media: the proof's media test on a stored token stream (LLAMA_TOKEN_NULL = a media position)
+        {
+            llama_tokens t = toks;
+            CHECK(!server_tokens(t, true).has_media());
+            t[40] = LLAMA_TOKEN_NULL;
+            const server_tokens st(t, true);
+            CHECK(st.has_media() && st.has_media(41) && !st.has_media(40));
+        }
         fs::remove_all(root, ec);
     }
 
