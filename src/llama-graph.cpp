@@ -2889,11 +2889,18 @@ static std::unique_ptr<T> build_attn_inp_kv_impl(
             const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
             const int64_t n_tps    = ubatch.n_tokens/n_stream;
 
-            inp->self_kq_vis_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, n_kv, 4, n_stream);
+            // [TAG_KQ_VIS_MIRROR] single stream, small ubatch: the cells are a view of the cache's device mirror (updated in
+            // place by set_input), not a per-graph host input
+            ggml_tensor * mir = n_stream == 1 ? mctx_cur->kq_vis_mirror_view(ctx0, n_kv, ubatch) : nullptr;
+            if (mir) {
+                inp->self_kq_vis_cells = mir;
+            } else {
+                inp->self_kq_vis_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, n_kv, 4, n_stream);
+                ggml_set_input(inp->self_kq_vis_cells);
+                ggml_set_name(inp->self_kq_vis_cells, "attn_inp_kq_vis_cells");
+            }
             inp->self_kq_vis_toks  = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, n_tps, n_stream);
-            ggml_set_input(inp->self_kq_vis_cells);
             ggml_set_input(inp->self_kq_vis_toks);
-            ggml_set_name(inp->self_kq_vis_cells, "attn_inp_kq_vis_cells");
             ggml_set_name(inp->self_kq_vis_toks,  "attn_inp_kq_vis_toks");
 
             // [TAG_KQ_VIS] two-class bridge: at >= LLAMA_KQ_VIS_MIN_TOKENS tokens build_attn runs FA over

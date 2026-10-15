@@ -36,7 +36,18 @@ struct llama_kqvis_prof_fill {
     int64_t us     = 0; // host fill time
     int32_t n_mask = 0; // set_input_kq_mask calls
     int32_t n_vis  = 0; // set_input_kq_vis calls
+    int64_t vmir_bytes = 0; // [TAG_KQ_VIS_MIRROR] bytes written to the device visibility mirrors
+    int32_t n_vmir     = 0; // [TAG_KQ_VIS_MIRROR] set_input_kq_vis calls served by a mirror
+    int32_t n_vmir_full = 0; // [TAG_KQ_VIS_MIRROR] ... of them full rewrites (layout change / everything dirty)
 };
+
+// [TAG_KQ_VIS_MIRROR] LLAMA_KQ_VIS_MIRROR (default 1; only with LLAMA_KQ_VIS=1): the per-cell visibility metadata of a
+// single-stream cache lives in a device-resident mirror that set_input updates incrementally (the cells marked dirty since
+// the last update), for ubatches of <= LLAMA_KQ_VIS_MIRROR_MAX_TOKENS (default 16) tokens - the graph reads the mirror
+// instead of a per-graph host input upload. The consumed bytes are the ones a fresh fill would write
+// (LLAMA_KQ_VIS_MIRROR_CHECK=1: every update reads the mirror back, compares with a fresh fill and aborts on a mismatch).
+bool     llama_kq_vis_mirror_enabled();
+uint32_t llama_kq_vis_mirror_max_tokens();
 
 // the calling thread's accumulator
 llama_kqvis_prof_fill & llama_kqvis_prof_fill_tls();
@@ -265,6 +276,10 @@ public:
     // [TAG_KQ_VIS] the metadata GGML_OP_KQ_MASK turns into the mask set_input_kq_mask writes:
     // cells_dst I32 [n_kv, 4, n_stream], toks_dst I32 [4, n_tps, n_stream]; false = not expressible
     bool set_input_kq_vis(ggml_tensor * cells_dst, ggml_tensor * toks_dst, const llama_ubatch * ubatch) const;
+    // [TAG_KQ_VIS_MIRROR] a contiguous [n_kv, 4, 1] view of the device mirror for this ubatch, or nullptr (no mirror,
+    // > 1 stream, ubatch above the mirror's token limit)
+    ggml_tensor * kq_vis_mirror_view(ggml_context * ctx, int64_t n_kv, const llama_ubatch & ubatch) const;
+    bool set_input_kq_vis_mirror(ggml_tensor * cells_dst, ggml_tensor * toks_dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -348,6 +363,13 @@ private:
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
+
+    // [TAG_KQ_VIS_MIRROR] the device mirror of the visibility planes ([n_kv, 4] I32 in the layout of the last write)
+    ggml_tensor * vis_mir = nullptr;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> vis_mir_bufs;
+    int vis_mir_slot = -1;
+    mutable int64_t vis_mir_n_kv = -1;
+    mutable std::vector<int32_t> vis_mir_tmp;
 
     std::vector<kv_layer> layers;
 
@@ -465,6 +487,7 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     bool set_input_kq_vis    (ggml_tensor * cells_dst, ggml_tensor * toks_dst, const llama_ubatch * ubatch) const;
+    ggml_tensor * kq_vis_mirror_view(ggml_context * ctx, int64_t n_kv, const llama_ubatch & ubatch) const; // [TAG_KQ_VIS_MIRROR]
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

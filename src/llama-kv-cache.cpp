@@ -297,6 +297,37 @@ llama_kv_cache::llama_kv_cache(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    // [TAG_KQ_VIS_MIRROR] the device mirror of the visibility planes (single-stream caches with offloaded layers only)
+    if (llama_kq_vis_mirror_enabled() && n_stream == 1 && offload && !hparams.no_alloc && !layers.empty() && v_cells.size() == 1) {
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(model.dev_layer(layers[0].il));
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ size_t(2u*ggml_tensor_overhead()),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) {
+            throw std::runtime_error("failed to create ggml context for the KQ visibility mirror");
+        }
+        vis_mir = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4*(int64_t) kv_size);
+        ggml_format_name(vis_mir, "kq_vis_mirror%s", name_tag);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (!buf) {
+            ggml_free(ctx);
+            throw std::runtime_error("failed to allocate buffer for the KQ visibility mirror");
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        vis_mir_bufs.emplace_back(ggml_context_ptr(ctx), buf);
+        vis_mir_slot = v_cells[0].vis_register();
+
+        // WARN: the proof line must reach the server log (INFO does not)
+        LLAMA_LOG_WARN("%s: kq_vis_mirror = on (LLAMA_KQ_VIS_MIRROR): %s %.2f MiB, ubatches <= %u tokens read it instead of a "
+                       "per-graph upload%s\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
+                       llama_kq_vis_mirror_max_tokens(),
+                       getenv("LLAMA_KQ_VIS_MIRROR_CHECK") && atoi(getenv("LLAMA_KQ_VIS_MIRROR_CHECK")) ? "; LLAMA_KQ_VIS_MIRROR_CHECK=1" : "");
+    }
+
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
@@ -1883,7 +1914,49 @@ bool llama_kv_cells_fill_kq_vis(
     return true;
 }
 
+// [TAG_KQ_VIS_MIRROR] knobs (see the header)
+bool llama_kq_vis_mirror_enabled() {
+    static const bool on = [] {
+        const char * vis = getenv("LLAMA_KQ_VIS");
+        const char * mir = getenv("LLAMA_KQ_VIS_MIRROR");
+        return vis != nullptr && atoi(vis) != 0 && (mir == nullptr || *mir == '\0' || atoi(mir) != 0);
+    }();
+    return on;
+}
+
+uint32_t llama_kq_vis_mirror_max_tokens() {
+    static const uint32_t n = [] {
+        const char * env = getenv("LLAMA_KQ_VIS_MIRROR_MAX_TOKENS");
+        return env != nullptr ? (uint32_t) strtoul(env, nullptr, 10) : 16u;
+    }();
+    return n;
+}
+
+static bool llama_kq_vis_mirror_check() {
+    static const bool on = [] {
+        const char * env = getenv("LLAMA_KQ_VIS_MIRROR_CHECK");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return on;
+}
+
+ggml_tensor * llama_kv_cache::kq_vis_mirror_view(ggml_context * ctx, int64_t n_kv, const llama_ubatch & ubatch) const {
+    if (vis_mir == nullptr || ubatch.n_tokens == 0 || ubatch.n_tokens > llama_kq_vis_mirror_max_tokens() || n_kv <= 0 ||
+        n_kv > (int64_t) v_cells[0].size()) {
+        return nullptr;
+    }
+    // the layout of a fresh fill: one contiguous plane of n_kv per field, one stream
+    ggml_tensor * v = ggml_view_3d(ctx, vis_mir, n_kv, 4, 1, n_kv*sizeof(int32_t), 4*n_kv*sizeof(int32_t), 0);
+    ggml_set_name(v, "kq_vis_cells_mir");
+    return v;
+}
+
 bool llama_kv_cache::set_input_kq_vis(ggml_tensor * cells_dst, ggml_tensor * toks_dst, const llama_ubatch * ubatch) const {
+    // [TAG_KQ_VIS_MIRROR] the cells are a view of the device mirror: bring it up to date, fill only the token records
+    if (vis_mir != nullptr && cells_dst->view_src == vis_mir) {
+        return set_input_kq_vis_mirror(cells_dst, toks_dst, ubatch);
+    }
+
     GGML_ASSERT(ggml_backend_buffer_is_host(cells_dst->buffer) && ggml_backend_buffer_is_host(toks_dst->buffer));
     GGML_ASSERT(cells_dst->type == GGML_TYPE_I32 && toks_dst->type == GGML_TYPE_I32);
     GGML_ASSERT(cells_dst->ne[1] == 4 && toks_dst->ne[0] == 4 && cells_dst->ne[2] == toks_dst->ne[2]);
@@ -1902,6 +1975,92 @@ bool llama_kv_cache::set_input_kq_vis(ggml_tensor * cells_dst, ggml_tensor * tok
     }
 
     return ok;
+}
+
+// [TAG_KQ_VIS_MIRROR] the mirror update: token records as llama_kv_cells_fill_kq_vis (one stream), cell planes = the
+// dirty cells' get_vis values written in place (a layout change - other n_kv - or a fully dirty range rewrites all)
+bool llama_kv_cache::set_input_kq_vis_mirror(ggml_tensor * cells_dst, ggml_tensor * toks_dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(toks_dst->buffer));
+    GGML_ASSERT(toks_dst->type == GGML_TYPE_I32 && toks_dst->ne[0] == 4 && toks_dst->ne[2] == 1 && cells_dst->ne[2] == 1);
+    GGML_ASSERT(toks_dst->ne[1] == (int64_t) ubatch->n_tokens && v_cells.size() == 1);
+
+    const bool prof = llama_kqvis_prof_enabled();
+    const int64_t t_start = prof ? ggml_time_us() : 0;
+
+    const int64_t n_kv = cells_dst->ne[0];
+    const bool is_2d = ubatch->is_pos_2d();
+
+    int32_t * toks = (int32_t *) toks_dst->data;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        if (seq_id < 0 || seq_id >= 32 || seq_to_stream[seq_id] != 0) {
+            return false;
+        }
+        int32_t * t = toks + 4*i;
+        t[0] = ubatch->pos[i];
+        t[1] = (int32_t) (1u << seq_id);
+        t[2] = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : INT32_MAX;
+        t[3] = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : INT32_MAX;
+    }
+
+    const auto & cells = v_cells[0];
+    GGML_ASSERT((int64_t) cells.size() >= n_kv);
+
+    uint32_t lo = 0, hi = 0;
+    bool all = false;
+    cells.vis_take(vis_mir_slot, lo, hi, all);
+
+    int64_t bytes = 0;
+    bool full = false;
+    if (all || n_kv != vis_mir_n_kv) {
+        vis_mir_tmp.resize(4*(size_t) n_kv);
+        int32_t * c = vis_mir_tmp.data();
+        cells.get_vis((uint32_t) n_kv, c, c + n_kv, c + 2*n_kv, c + 3*n_kv);
+        ggml_backend_tensor_set(vis_mir, c, 0, 4*n_kv*sizeof(int32_t));
+        vis_mir_n_kv = n_kv;
+        bytes = 4*n_kv*sizeof(int32_t);
+        full = true;
+    } else {
+        hi = std::min<uint32_t>(hi, (uint32_t) n_kv);
+        if (lo < hi) {
+            const int64_t n = hi - lo;
+            vis_mir_tmp.resize(4*(size_t) n);
+            int32_t * c = vis_mir_tmp.data();
+            cells.get_vis_range(lo, hi, c, c + n, c + 2*n, c + 3*n);
+            for (int64_t f = 0; f < 4; ++f) {
+                ggml_backend_tensor_set(vis_mir, c + f*n, (f*n_kv + lo)*sizeof(int32_t), n*sizeof(int32_t));
+            }
+            bytes = 4*n*sizeof(int32_t);
+        }
+    }
+
+    if (llama_kq_vis_mirror_check()) {
+        std::vector<int32_t> fresh(4*(size_t) n_kv), dev(4*(size_t) n_kv);
+        int32_t * c = fresh.data();
+        cells.get_vis((uint32_t) n_kv, c, c + n_kv, c + 2*n_kv, c + 3*n_kv);
+        ggml_backend_tensor_get(vis_mir, dev.data(), 0, 4*n_kv*sizeof(int32_t));
+        if (memcmp(fresh.data(), dev.data(), 4*n_kv*sizeof(int32_t)) != 0) {
+            for (int64_t k = 0; k < 4*n_kv; ++k) {
+                if (fresh[k] != dev[k]) {
+                    LLAMA_LOG_ERROR("%s: kq_vis_mirror MISMATCH n_kv=%lld field=%lld cell=%lld fresh=%d mirror=%d (dirty %u..%u all=%d)\n",
+                            __func__, (long long) n_kv, (long long) (k/n_kv), (long long) (k%n_kv), fresh[k], dev[k], lo, hi, (int) all);
+                    break;
+                }
+            }
+            GGML_ABORT("LLAMA_KQ_VIS_MIRROR_CHECK: the device mirror differs from a fresh fill");
+        }
+    }
+
+    if (prof) {
+        auto & acc = llama_kqvis_prof_fill_tls();
+        acc.us += ggml_time_us() - t_start;
+        acc.n_vis++;
+        acc.n_vmir++;
+        acc.n_vmir_full += full;
+        acc.vmir_bytes += bytes;
+    }
+
+    return true;
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -3034,6 +3193,10 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 bool llama_kv_cache_context::set_input_kq_vis(ggml_tensor * cells_dst, ggml_tensor * toks_dst, const llama_ubatch * ubatch) const {
     return kv->set_input_kq_vis(cells_dst, toks_dst, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_context::kq_vis_mirror_view(ggml_context * ctx, int64_t n_kv, const llama_ubatch & ubatch) const {
+    return kv->kq_vis_mirror_view(ctx, n_kv, ubatch);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
