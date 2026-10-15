@@ -2305,6 +2305,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
         ggml_tensor *         vis_toks) {
     GGML_ASSERT((pooled != nullptr) != (pool_store != nullptr && pool_remap != nullptr));
 
+    // [TAG_QSA_DUMP_SCORE] (pkg2 review, Major) LLAMA_QSA_DUMP_SCORE=1: the score capture (llama-context.cpp
+    // dump_score_operand) reads the pooled-key operand when the observed "indexer_score-<il>" node has run. In the unfused
+    // chain the operand's last consumer is the earlier matmul, so ggml-alloc may hand its storage to the CONT / ADD nodes
+    // in between. Keep the operand (and the remap rows) alive for the whole graph while the capture is on - debug only,
+    // the graph and its allocation are unchanged with the knob off.
+    static const bool dump_score_live = [] { const char * s = getenv("LLAMA_QSA_DUMP_SCORE"); return s != nullptr && atoi(s) != 0; }();
+    if (dump_score_live) {
+        ggml_set_keep_alive(pooled ? pooled : pool_store);
+        if (pool_remap != nullptr) {
+            ggml_set_keep_alive(pool_remap);
+        }
+    }
+
     const int64_t n_idx_h  = hparams.indexer_n_head;
     const int64_t n_blocks = pooled ? pooled->ne[1] : pool_remap->ne[0];
     const int64_t n_kv     = inp->cell_blk->ne[0];
