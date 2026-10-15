@@ -922,6 +922,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
             if (mem_idx) {
                 mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+                idx_ext_restore(sinfos_attn);
             }
             return;
         }
@@ -936,6 +937,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
             if (mem_idx) {
                 mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+                idx_ext_restore(sinfos_attn);
             }
         }
 
@@ -946,6 +948,19 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 
         throw;
     }
+}
+
+void llama_memory_hybrid_idx::idx_ext_restore(const llama_kv_cache::slot_info_vec_t & sinfos_attn) {
+    // [TAG_CELL_EXT_RESTORE] an indexer state without the cell ext (no PLE: the indexer's rope NONE gives
+    // has_cell_ext() false, e.g. the MTP draft memory) restored x = y = 0, tok = 0, while its live cells hold the
+    // ext apply_ubatch wrote from the same ubatches as the attention cells - M-RoPE x/y (an image's 2D position) and
+    // the token. The attention cache serialized it, and the indexer took its layout, so take it from there.
+    // An indexer that serializes the ext (PLE) restored it exactly already.
+    if (mem_idx->has_cell_ext() || !get_mem_attn()->has_cell_ext()) {
+        return;
+    }
+
+    mem_idx->ext_copy_from(*get_mem_attn(), sinfos_attn);
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {

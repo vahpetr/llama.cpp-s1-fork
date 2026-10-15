@@ -266,6 +266,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_link_libraries(test-state-portable PRIVATE server-context)
     llama_test(test-state-portable NAME test-state-portable-qsa LABEL mtp)
     set_tests_properties(test-state-portable-qsa PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
+    # [TAG_CELL_EXT_RESTORE] a per-seq restore gives the indexer cache the live cell ext (M-RoPE x/y + token): target
+    # save file (with / without PLE) and the MTP draft memory (flags 0 + the PARTIAL_ONLY rollback form, -qsa)
+    llama_build_and_test(test-cell-ext-restore.cpp LABEL mtp)
+    llama_test(test-cell-ext-restore NAME test-cell-ext-restore-qsa LABEL mtp)
+    set_tests_properties(test-cell-ext-restore-qsa PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
     llama_build_and_test(test-spec-draft-policy.cpp LABEL mtp) # [TAG_SPEC_DRAFT_POLICY] tput draft length rule + cooldown (v51)
     # [TAG_GRAPH_CACHE] LLAMA_GRAPH_CACHE off vs K=8 vs K=8 + CHECK: logits / drafts / [qsa-ids] identical, regrow invalidates
     llama_build(test-graph-cache.cpp)

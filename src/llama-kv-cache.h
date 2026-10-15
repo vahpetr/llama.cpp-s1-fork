@@ -272,6 +272,11 @@ public:
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
 
+    // [TAG_CELL_EXT_RESTORE] for every cell of sinfos (a layout this cache shares with src, cell for cell): ext = src's
+    // ext. For a mirroring cache whose state does not serialize the ext (has_cell_ext() false) while its live cells
+    // hold the same ext as the cache it mirrors (both written by apply_ubatch from the same ubatches)
+    void ext_copy_from(const llama_kv_cache & src, const slot_info_vec_t & sinfos);
+
     // for every token of the ubatch, the ids of the n tokens that precede it in its sequence
     // example for M-RoPE image case: tokens A B X X X C, where X is a 3-token image at pos 2 spanning positions 2..4:
     //   tok: A B X X X C
