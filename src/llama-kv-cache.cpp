@@ -2711,6 +2711,39 @@ uint32_t llama_kv_cache::n_cells_2d_seq(llama_seq_id seq_id, llama_pos p_max) co
     return n;
 }
 
+bool llama_kv_cache::seq_history_intact(llama_seq_id seq_id, llama_pos p_max) const {
+    // [TAG_CELL_EXT_PROVENANCE] see the declaration
+    const llama_seq_id s0 = seq_id >= 0 ? seq_id : 0;
+    const llama_seq_id s1 = seq_id >= 0 ? seq_id + 1 : (llama_seq_id) n_seq_max;
+
+    std::vector<llama_pos> ps;
+    for (llama_seq_id s = s0; s < s1; ++s) {
+        ps.clear();
+
+        const auto & cells = v_cells[seq_to_stream[s]];
+
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i) && cells.seq_has(i, s) && cells.pos_get(i) <= p_max) {
+                ps.push_back(cells.pos_get(i));
+            }
+        }
+
+        std::sort(ps.begin(), ps.end());
+
+        for (size_t k = 0; k < ps.size(); ++k) {
+            if (ps[k] != (llama_pos) k) {
+                return false;
+            }
+        }
+
+        if (p_max != (llama_pos) INT32_MAX && seq_id >= 0 && (llama_pos) ps.size() != p_max + 1) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
     const auto & cells = v_cells[cr.strm];
 

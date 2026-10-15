@@ -2526,10 +2526,7 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
         it->second.t_used = t_now;
         return true;
     }
-    if (it != ckpts.end() && it->second.src_dir.empty()) {
-        n_ckpt_unmarked_replaced++;
-        DSK_INF("checkpoint %s: stored before the indexer x/y fix, replacing it\n", key.c_str());
-    }
+    const bool replacing_unmarked = it != ckpts.end() && it->second.src_dir.empty();
     // [TAG_DISK_ADOPT] an adopt source's checkpoint: the source's file stays, the own namespace gets its own copy;
     //   (Codex gate r3 Major 5) the source's index record stays until the copy commits - a failed write leaves the
     //   intact source checkpoint indexed
@@ -2571,6 +2568,10 @@ bool server_disk_cache::ckpt_store(const std::string & key, const common_prompt_
     m.bytes    = file_size_or_0(fin);
     m.t_used   = t_now;
     m.ixy_marked = c_marked;
+    if (replacing_unmarked) {
+        n_ckpt_unmarked_replaced++; // counted once the replacement is committed
+        DSK_INF("checkpoint %s: stored before the indexer x/y fix, replaced\n", key.c_str());
+    }
     ckpts[key] = m; // replaces an adopt source's record (src_dir) only now that the own copy is committed
     bytes_written += m.bytes;
     if (written) {
