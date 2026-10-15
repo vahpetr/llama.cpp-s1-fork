@@ -19,6 +19,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
@@ -443,6 +444,53 @@ struct llama_qsa_ids_dump {
         fprintf(stderr, "[qsa-score] ctx=%s g=%llu il=%d chunk=%d n_past=%lld n_blocks=%lld n_tps=%lld n_stream=%lld fnv=%016llx\n",
                 ctx_name, (unsigned long long) graph, t_il, score_chunk, (long long) n_past, (long long) t->ne[0],
                 (long long) t->ne[1], (long long) t->ne[2], (unsigned long long) fnv_bytes(sb.data(), nb));
+        dump_score_ties(t, (const float *) sb.data(), t_il);
+    }
+
+    // [TAG_QSA_DUMP_SCORE] (contrib 0229 fix round 3, S0.1 tie verification) LLAMA_QSA_DUMP_TIES=1 (needs LLAMA_QSA_DUMP_SCORE=1;
+    // default off): for the ubatches whose first position lies in LLAMA_QSA_DUMP_TIES_P=<lo>:<hi> (default every ubatch), per
+    // score row (query) the K-th and (K+1)-th largest block scores (K = LLAMA_QSA_DUMP_TIES_K blocks = the selection budget):
+    //   [qsa-score-ties] ctx= g= il= chunk= n_past= k= rows= boundary_ties=<rows whose K-th == (K+1)-th score> any_dup=<rows with
+    //                    two equal scores among the top K+1>
+    // a direct observation of tied scores at the selection boundary (the comparer's tie-prompt check reads it)
+    void dump_score_ties(ggml_tensor * t, const float * v, int t_il) {
+        static const bool on = [] { const char * s = getenv("LLAMA_QSA_DUMP_TIES"); return s && atoi(s) != 0; }();
+        if (!on) {
+            return;
+        }
+        static const long long k_env = [] { const char * s = getenv("LLAMA_QSA_DUMP_TIES_K"); return s ? atoll(s) : 0LL; }();
+        static long long p_lo = 0, p_hi = -1;
+        static const bool p_set = [] {
+            const char * s = getenv("LLAMA_QSA_DUMP_TIES_P");
+            return s && sscanf(s, "%lld:%lld", &p_lo, &p_hi) == 2;
+        }();
+        if (p_set && (n_past < p_lo || n_past > p_hi)) {
+            return;
+        }
+        const int64_t nbk = t->ne[0], rows = t->ne[1] * t->ne[2] * t->ne[3];
+        const int64_t k = std::min<int64_t>(k_env > 0 ? k_env : 64, nbk - 1);
+        if (k < 1) {
+            return;
+        }
+        int64_t boundary = 0, dup = 0;
+        std::vector<float> row(nbk);
+        for (int64_t r = 0; r < rows; ++r) {
+            std::copy(v + r * nbk, v + (r + 1) * nbk, row.begin());
+            std::nth_element(row.begin(), row.begin() + k, row.end(), std::greater<float>());
+            std::sort(row.begin(), row.begin() + k + 1, std::greater<float>());
+            if (row[k - 1] == row[k] && row[k] > 0.0f) {
+                boundary++;
+            }
+            for (int64_t j = 0; j < k; ++j) {
+                if (row[j] == row[j + 1] && row[j] > 0.0f) {
+                    dup++;
+                    break;
+                }
+            }
+        }
+        fprintf(stderr, "[qsa-score-ties] ctx=%s g=%llu il=%d chunk=%d n_past=%lld k=%lld rows=%lld boundary_ties=%lld any_dup=%lld\n",
+                ctx_name, (unsigned long long) graph, t_il, score_chunk, (long long) n_past, (long long) k, (long long) rows,
+                (long long) boundary, (long long) dup);
     }
 
     void dump_selection(ggml_tensor * t) {
