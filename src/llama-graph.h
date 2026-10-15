@@ -993,6 +993,10 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
+    // [TAG_KQ_VIS_MIRROR] an attention input of this graph reads a cache's device visibility mirror (written in place
+    // by set_inputs: the previous graph must be done before)
+    bool uses_kq_vis_mirror = false;
+
     ggml_context_ptr ctx_compute;
 
     // memory buffers used to evaluate the model

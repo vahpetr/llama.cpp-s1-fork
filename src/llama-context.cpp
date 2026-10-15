@@ -2687,8 +2687,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // is a plain memcpy): the previous graph of this context must be done reading them
     if (llama_qsa_inputs_inc()) {
         ggml_backend_sched_synchronize(sched.get());
-    } else if (llama_kq_vis_mirror_enabled() && ubatch.n_tokens <= llama_kq_vis_mirror_max_tokens()) {
-        // [TAG_KQ_VIS_MIRROR] the visibility mirror is written in place too: the previous graph must be done reading it
+    } else if (res->uses_kq_vis_mirror) {
+        // [TAG_KQ_VIS_MIRROR] this graph reads a visibility mirror, which set_inputs writes in place: the previous graph
+        // must be done reading it (graphs without a mirror - np2, non-offloaded, > MAX_TOKENS - keep their overlap)
         ggml_backend_sched_synchronize(sched.get());
     }
 

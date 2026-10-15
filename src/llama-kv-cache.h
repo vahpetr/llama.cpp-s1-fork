@@ -366,6 +366,8 @@ private:
 
     // [TAG_KQ_VIS_MIRROR] the device mirror of the visibility planes ([n_kv, 4] I32 in the layout of the last write)
     ggml_tensor * vis_mir = nullptr;
+    ggml_backend_buffer_type_t vis_mir_buft = nullptr; // set when this cache has (or, in a no_alloc pass, would have) a mirror
+    size_t vis_mir_bytes = 0;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> vis_mir_bufs;
     int vis_mir_slot = -1;
     mutable int64_t vis_mir_n_kv = -1;

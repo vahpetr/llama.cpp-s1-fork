@@ -508,7 +508,7 @@ public:
     // the cells it touches; a device mirror registers a slot and takes (reads + clears) its range before an update.
     // A fresh slot, reset() and resize() mark everything. Up to 4 consumers (cells shared between caches).
     int vis_register() const {
-        assert(n_vis < (int) vis_dirty.size());
+        GGML_ASSERT(n_vis < (int) vis_dirty.size() && "KQ visibility mirror: more than 4 consumers of one llama_kv_cells");
         vis_dirty[n_vis] = vis_range_t();
         return n_vis++;
     }

@@ -1418,6 +1418,7 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    uses_kq_vis_mirror = false; // [TAG_KQ_VIS_MIRROR]
 
     const size_t meta_size = ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false);
     if (buf_compute_meta_size != meta_size) {
@@ -2931,6 +2932,7 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    res->uses_kq_vis_mirror |= inp->self_kq_vis_cells != nullptr && inp->self_kq_vis_cells->view_src != nullptr; // [TAG_KQ_VIS_MIRROR]
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -2939,6 +2941,7 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv_hyb() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl<llm_graph_input_attn_kv_hyb>(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    res->uses_kq_vis_mirror |= inp->self_kq_vis_cells != nullptr && inp->self_kq_vis_cells->view_src != nullptr; // [TAG_KQ_VIS_MIRROR]
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -3726,6 +3729,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    res->uses_kq_vis_mirror |= inp_attn->self_kq_vis_cells != nullptr && inp_attn->self_kq_vis_cells->view_src != nullptr; // [TAG_KQ_VIS_MIRROR]
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
