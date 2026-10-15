@@ -216,12 +216,14 @@ public:
     //   sinfos_in : if set, the layout to use instead of searching. one entry per stream, cell count must match the blob
     //   both are indexed by THIS cache's streams: [TAG_MULTISLOT] a per-seq blob may come from a writer with another
     //   stream count, its one non-empty block lands in the stream of seq_id
+    //   n_stream_read: if set, the section's leading stream count, already read from io by the caller
     void state_read_sinfo(
             llama_io_read_i & io,
                llama_seq_id   seq_id,
       llama_state_seq_flags   flags,
           slot_info_vec_t *   sinfos_out,
-    const slot_info_vec_t *   sinfos_in);
+    const slot_info_vec_t *   sinfos_in,
+             const uint32_t * n_stream_read = nullptr);
 
     //
     // graph_build API
@@ -291,6 +293,11 @@ public:
     // ext.x / ext.y = src's, ext.tok = src's unless keep_tok. For a mirroring cache whose live cells hold the same ext as
     // the cache it mirrors (both written by apply_ubatch from the same ubatches). Returns the number of cells set
     uint32_t ext_copy_from(const llama_kv_cache & src, const slot_info_vec_t & sinfos, bool keep_tok);
+
+    // [TAG_CELL_EXT_PROVENANCE] the number of occupied cells of sinfos whose M-RoPE 2D position differs from the text
+    // default x = y = pos (the batch allocator broadcasts a text token's position to every section): image cells
+    // (all but an image's first one). 0 for a cache without M-RoPE
+    uint32_t n_cells_2d(const slot_info_vec_t & sinfos) const;
 
     // for every token of the ubatch, the ids of the n tokens that precede it in its sequence
     // example for M-RoPE image case: tokens A B X X X C, where X is a 3-token image at pos 2 spanning positions 2..4:

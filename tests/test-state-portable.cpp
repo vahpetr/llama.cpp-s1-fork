@@ -333,14 +333,22 @@ static std::vector<uint8_t> two_block_body(const std::vector<uint8_t> & b0, cons
         uint32_t z = 1;
         memcpy(&z, b0.data() + 8 + a, 4);
         bool end_ok = 12 + a == b0.size();
-        if (!end_ok && 20 + a <= b0.size()) {
+        // [TAG_CELL_EXT_PROVENANCE] the indexer section may open with the 4-byte "IXY1" provenance mark
+        size_t m = 0;
+        if (!end_ok && 16 + a <= b0.size()) {
+            uint32_t mk0 = 0, mk1 = 0;
+            memcpy(&mk0, b0.data() + 12 + a, 4);
+            memcpy(&mk1, b1.data() + 12 + a, 4);
+            m = mk0 == 0x31595849u && mk1 == 0x31595849u ? 4 : 0;
+        }
+        if (!end_ok && 20 + a + m <= b0.size()) {
             uint32_t s0 = 0, c0 = 1, s1 = 0, z1 = 1, c1 = 0;
-            memcpy(&s0, b0.data() + 12 + a, 4);
-            memcpy(&c0, b0.data() + 16 + a, 4);
-            memcpy(&s1, b1.data() + 12 + a, 4);
-            memcpy(&z1, b1.data() + 16 + a, 4);
-            if (24 + a <= b1.size()) {
-                memcpy(&c1, b1.data() + 20 + a, 4);
+            memcpy(&s0, b0.data() + 12 + a + m, 4);
+            memcpy(&c0, b0.data() + 16 + a + m, 4);
+            memcpy(&s1, b1.data() + 12 + a + m, 4);
+            memcpy(&z1, b1.data() + 16 + a + m, 4);
+            if (24 + a + m <= b1.size()) {
+                memcpy(&c1, b1.data() + 20 + a + m, 4);
             }
             end_ok = s0 == 2 && c0 == c && s1 == 2 && z1 == 0 && c1 == c;
         }

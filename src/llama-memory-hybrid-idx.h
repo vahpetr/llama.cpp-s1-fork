@@ -477,6 +477,9 @@ public:
     bool qsa_compact_bias() const { return qsa_compact; }
 
     // [TAG_MTP_QSA_PHASE] the census phase of this memory: 1 for the MTP draft memory under LLAMA_MTP_QSA_PHASE=1, else 0
+    // [TAG_CELL_EXT_PROVENANCE] pre-fix states rejected for their image cells, process-wide
+    static uint64_t n_xy_rejects();
+
     int32_t qsa_phase() const { return qsa_phase_v; }
 
 private:
@@ -486,6 +489,11 @@ private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
+
+    // [TAG_CELL_EXT_PROVENANCE] the indexer section of a restore: its provenance mark, then the section itself, then
+    // idx_ext_restore; an unmarked (pre-fix) state holding image cells is rejected (throws, status INVALID)
+    void idx_state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+            const llama_kv_cache::slot_info_vec_t & sinfos_attn);
 
     // [TAG_CELL_EXT_RESTORE] after the indexer restore: the cell ext the indexer state does not carry, from the attention cells
     void idx_ext_restore(const llama_kv_cache::slot_info_vec_t & sinfos_attn);

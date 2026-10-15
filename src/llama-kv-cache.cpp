@@ -2515,7 +2515,8 @@ void llama_kv_cache::state_read_sinfo(
            llama_seq_id   seq_id,
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
-const slot_info_vec_t *   sinfos_in) {
+const slot_info_vec_t *   sinfos_in,
+         const uint32_t * n_stream_read) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2535,7 +2536,11 @@ const slot_info_vec_t *   sinfos_in) {
     }
 
     uint32_t n_stream_cur;
-    io.read(&n_stream_cur, sizeof(n_stream_cur));
+    if (n_stream_read) {
+        n_stream_cur = *n_stream_read;
+    } else {
+        io.read(&n_stream_cur, sizeof(n_stream_cur));
+    }
 
     // [TAG_MULTISLOT] per-seq state is stream-count agnostic: the file's stream blocks are the WRITER's streams, and
     //   a per-sequence save holds cells in at most one of them (the sequence's own stream). Any stream count is
@@ -2640,6 +2645,35 @@ uint32_t llama_kv_cache::ext_copy_from(const llama_kv_cache & src, const slot_in
                     }
                     dst_cells.ext_set(idx, e);
                     n++;
+                }
+            }
+        }
+    }
+
+    return n;
+}
+
+uint32_t llama_kv_cache::n_cells_2d(const slot_info_vec_t & sinfos) const {
+    // [TAG_CELL_EXT_PROVENANCE] see the declaration
+    if (hparams.n_pos_per_embd() <= 1) {
+        return 0;
+    }
+
+    uint32_t n = 0;
+    for (const auto & sinfo : sinfos) {
+        if (sinfo.empty()) {
+            continue;
+        }
+
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const auto & cells = v_cells[sinfo.strm[s]];
+
+            for (const uint32_t idx : sinfo.idxs[s]) {
+                if (!cells.is_empty(idx)) {
+                    const llama_pos p = cells.pos_get(idx);
+                    const auto &    e = cells.ext_get(idx);
+
+                    n += e.x != p || e.y != p;
                 }
             }
         }

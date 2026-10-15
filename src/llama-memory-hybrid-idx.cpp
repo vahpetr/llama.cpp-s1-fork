@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-ext.h"
 #include "llama-model.h"
 
 #include "ggml-cpp.h"
@@ -879,12 +880,24 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
     return mb;
 }
 
+// [TAG_CELL_EXT_PROVENANCE] written in front of the indexer section by a build whose indexer cells hold the true M-RoPE
+// x / y at save time (the 0239 restore fix: before it, a restore zeroed them and later inference ran on that). An
+// indexer section starts with its stream count (<= LLAMA_MAX_SEQ), so an unmarked (older) section cannot read as it.
+static const uint32_t LLAMA_IDX_STATE_XY_MARK = 0x31595849u; // "IXY1"
+
+static std::atomic<uint64_t> g_idx_xy_rejects{0};
+
+uint64_t llama_memory_hybrid_idx::n_xy_rejects() {
+    return g_idx_xy_rejects.load();
+}
+
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // [TAG_MTP_QSA] the MTP draft memory: the draft KV's own semantics (llama_kv_cache writes its cells whatever the
     // PARTIAL_ONLY flag says), and the indexer section follows it the same way; no recurrent section
     if (recr_none) {
         get_mem_attn()->state_write(io, seq_id, flags);
         if (mem_idx) {
+            io.write(&LLAMA_IDX_STATE_XY_MARK, sizeof(LLAMA_IDX_STATE_XY_MARK));
             mem_idx->state_write(io, seq_id, flags);
         }
         return;
@@ -896,6 +909,7 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
     // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         if (mem_idx) {
+            io.write(&LLAMA_IDX_STATE_XY_MARK, sizeof(LLAMA_IDX_STATE_XY_MARK));
             mem_idx->state_write(io, seq_id, flags);
         }
     }
@@ -921,8 +935,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         if (recr_none) {
             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
             if (mem_idx) {
-                mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
-                idx_ext_restore(sinfos_attn);
+                idx_state_read(io, seq_id, flags, sinfos_attn);
             }
             return;
         }
@@ -936,8 +949,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
             if (mem_idx) {
-                mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
-                idx_ext_restore(sinfos_attn);
+                idx_state_read(io, seq_id, flags, sinfos_attn);
             }
         }
 
@@ -948,6 +960,32 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 
         throw;
     }
+}
+
+void llama_memory_hybrid_idx::idx_state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+        const llama_kv_cache::slot_info_vec_t & sinfos_attn) {
+    // [TAG_CELL_EXT_PROVENANCE] the attention cells are restored at this point (exactly, x / y included)
+    uint32_t head = 0;
+    io.read(&head, sizeof(head));
+
+    const bool marked = head == LLAMA_IDX_STATE_XY_MARK;
+
+    if (!marked) {
+        // saved by a build before the fix: if it holds image cells, its indexer x / y may have been zeroed by a restore
+        // before further inference was run and saved on top, so the K/V and recurrent rows can carry that - not
+        // repairable here. Text-only states are unaffected (x = y = pos, no consumer tells 0 from pos) and are healed
+        const uint32_t n_img = get_mem_attn()->n_cells_2d(sinfos_attn);
+        if (n_img > 0) {
+            const uint64_t n = ++g_idx_xy_rejects;
+            LLAMA_LOG_WARN("%s: state saved before the indexer x/y fix holds %u image cells: rejected as a cache miss "
+                    "(rejections so far: %" PRIu64 ")\n", __func__, n_img, n);
+            io.set_status(LLAMA_STATE_READ_INVALID);
+            throw std::runtime_error("pre-fix sequence state with image cells");
+        }
+    }
+
+    mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn, marked ? nullptr : &head);
+    idx_ext_restore(sinfos_attn);
 }
 
 void llama_memory_hybrid_idx::idx_ext_restore(const llama_kv_cache::slot_info_vec_t & sinfos_attn) {
