@@ -133,7 +133,8 @@ services:
       # Upgrading from v59k or older: v60 changed the saved-state format, so the disk-cache key is new. To keep the stored
       # conversations, uncomment the next two lines with the OLD key (the ns-<key> directory name in /slots/prompt-cache/hands,
       # or "key" in GET /disk-cache of the old server): read-only, text entries load, image entries are refused, new saves go
-      # to the new namespace (docs/s1/DEPLOY.md). A fresh install has nothing to adopt.
+      # to the new namespace (docs/s1/DEPLOY.md). Required when upgrading: a namespace that is NOT adopted is deleted by the
+      # cache cleanup once idle past the TTL or once foreign namespaces exceed half the quota. A fresh install has nothing to adopt.
       # - "--cache-disk-adopt"
       # - "<old key>"
       - "--no-context-shift"
