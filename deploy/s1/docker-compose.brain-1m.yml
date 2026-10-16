@@ -4,7 +4,8 @@
 # Model: Qwen3.8-Flash-Next-Uncensored i1-Q4_K_M (mradermacher) + the MTP draft head + the vision projector.
 # Context: 1 048 576 tokens in one slot = static YaRN x4 over the native 262 144 + QSA sparse attention above 64k.
 # Measured (prod v52/v53 numerics, 2026-10-09): GTT 102.7 GiB flat at every depth, decode 35.5 t/s at 1M and 44.7 t/s at 524k,
-# cold fill 0 -> 1M in 1.09 h. Needs the 110 GiB GTT host setting (docs/s1/HOST-TUNING.md); with less GTT use the 524k file.
+# cold fill 0 -> 1M in 1.09 h. v60 (2026-10-16): cold fill 0 -> 1M in 44 min (oracle probe), GTT after load 105 414 MiB
+# (102.9 GiB); decode on v60 not re-measured yet (docs/s1/BENCHMARKS.md section 0). Needs the 110 GiB GTT host setting (docs/s1/HOST-TUNING.md); with less GTT use the 524k file.
 #
 #   deploy/s1/setup-brain.sh        # downloads + checks the weights, pulls the image, starts this file, smoke-tests it
 #   or by hand: docker compose -f docker-compose.brain-1m.yml up -d   (MODELS_DIR / SLOTS_DIR / LLAMA_S1_IMAGE override the defaults)
@@ -18,7 +19,7 @@ services:
       context: ../..
       dockerfile: .devops/vulkan.Dockerfile
       target: server
-    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v59}   # prebuilt; `docker compose build` builds the same thing from this tree
+    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v60}   # prebuilt; `docker compose build` builds the same thing from this tree
     container_name: llama-s1-brain-1m
     restart: unless-stopped
     stop_grace_period: 90s            # on SIGTERM the server writes its slot to the disk prompt cache (a few seconds at 1M)
@@ -157,6 +158,14 @@ services:
       - "0.125"                         # deep checkpoints: dense near the end of a conversation, logarithmic in depth
       - --cache-disk-ckpt-max
       - "32"                            # per conversation (113 MiB each for this model)
+      # --- upgrading from v59 or older: keep the stored conversations (docs/s1/DEPLOY.md, "Upgrading from v59") ---
+      # v60 changed the saved-state format, so its disk-cache key (the ns-<key> directory under the --cache-disk dir) is new and
+      # it starts with an empty namespace. To keep reading the old one, uncomment the next two lines and put the OLD key there:
+      # the ns-<key> directory name of the old version, or "key" in GET /disk-cache of the old server (16 hex digits). It is
+      # opened read-only: text conversations load, ones with images are refused (re-prefilled once), new saves go to the new
+      # namespace, and a rollback to the old image finds its namespace untouched. A fresh install has nothing to adopt.
+      # - --cache-disk-adopt
+      # - "<old key>"
       - --slot-prompt-similarity
       - "0.5"
       - --no-context-shift              # the recurrent layers cannot shift; the client must compact before the window is full
