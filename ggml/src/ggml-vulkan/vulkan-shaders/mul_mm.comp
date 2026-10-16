@@ -195,7 +195,9 @@ void main() {
         return;
     }
 #else
+#ifndef QSA_SCORE_KREUSE
     const uint ic = gl_WorkGroupID.y;
+#endif
 #endif
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
@@ -217,8 +219,22 @@ void main() {
 #endif
 
     const uint blocks_m = (p.M + BM - 1) / BM;
+#ifdef QSA_SCORE_KREUSE
+    // [TAG_QSA_SCORE_KREUSE] GGML_OP_QSA_SCORE with the pooled keys reused across the query tiles of a chunk: the
+    // workgroups are numbered M tile major - x = ir * blocks_n + ic, one workgroup row (y = 0), split_k 1 (ik = 0) - so
+    // the blocks_n workgroups that read the same BM x K tile of keys run back to back and all but the first find it in
+    // cache, instead of the whole pool being streamed once per N tile (x = ir, y = ic). Each workgroup then runs this
+    // shader's per-tile program unchanged - the same A / B loads, shared-memory layout, fragments, coopMatMulAdd sequence
+    // over K, +0 accumulator start and epilogue - for its (ir, ic): only which tile a workgroup id names changes, so every
+    // output's bits are the per-tile twin's.
+    const uint kr_blocks_n = (p.N + BN - 1) / BN;
+    const uint ir = gl_WorkGroupID.x / kr_blocks_n;
+    const uint ic = gl_WorkGroupID.x % kr_blocks_n;
+    const uint ik = 0;
+#else
     const uint ir = gl_WorkGroupID.x % blocks_m;
     const uint ik = gl_WorkGroupID.x / blocks_m;
+#endif
 
     const uint WNITER = (WM * WN) / (WARP * TM * TN * WMITER);
     const uint WSUBM = WM / WMITER;

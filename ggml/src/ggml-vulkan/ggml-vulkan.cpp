@@ -1002,6 +1002,12 @@ struct vk_device_struct {
     vk_matmul_pipeline pipeline_matmul_f32_rows_qsa {};
     // [TAG_QSA_POOLED_F16_MIRROR] the row-id QSA twin reading an f16 A (the pooled store's f16 mirror)
     vk_matmul_pipeline pipeline_matmul_f16_f32_rows_qsa {};
+    // [TAG_QSA_SCORE_KREUSE] the three QSA twins above with the pooled keys reused across query tiles (workgroups numbered
+    // M tile major, so the N tiles of one key tile run back to back); same slots / tiles / spec constants / push constants;
+    // empty when GGML_VK_QSA_SCORE_KREUSE=0
+    vk_matmul_pipeline pipeline_matmul_f32_qsa_kr {};
+    vk_matmul_pipeline pipeline_matmul_f32_rows_qsa_kr {};
+    vk_matmul_pipeline pipeline_matmul_f16_f32_rows_qsa_kr {};
     vk_matmul_pipeline pipeline_matmul_f32_f16 {};
     vk_matmul_pipeline pipeline_matmul_bf16 {};
     vk_matmul_pipeline2 pipeline_matmul_f16;
@@ -1286,6 +1292,8 @@ struct vk_device_struct {
     bool fuse_concat_ssm_conv;
     // [TAG_VK_DISPATCH_LOG] GGML_VK_DISPATCH_LOG=1: one [vk-dispatch] line per MUL_MAT / MUL_MAT_VEC / MUL_MAT_ID dispatch
     bool dispatch_log;
+    // [TAG_QSA_SCORE_KREUSE] GGML_VK_QSA_SCORE_KREUSE (default on; 0 = the A2a dispatch order)
+    bool qsa_score_kreuse;
     // [TAG_MMID_PRECAST_B] GGML_VK_MMID_PRECAST_B (default on)
     bool mmid_precast_b;
     // split a dim-0 concat with a transposed src1 into copy + tiled transpose-copy
@@ -5416,6 +5424,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (!device->pipeline_matmul_f16_f32_rows_qsa) {
         device->pipeline_matmul_f16_f32_rows_qsa = std::make_shared<vk_matmul_pipeline_struct>();
     }
+    // [TAG_QSA_SCORE_KREUSE]
+    if (!device->pipeline_matmul_f32_qsa_kr) {
+        device->pipeline_matmul_f32_qsa_kr = std::make_shared<vk_matmul_pipeline_struct>();
+    }
+    if (!device->pipeline_matmul_f32_rows_qsa_kr) {
+        device->pipeline_matmul_f32_rows_qsa_kr = std::make_shared<vk_matmul_pipeline_struct>();
+    }
+    if (!device->pipeline_matmul_f16_f32_rows_qsa_kr) {
+        device->pipeline_matmul_f16_f32_rows_qsa_kr = std::make_shared<vk_matmul_pipeline_struct>();
+    }
     if (!device->pipeline_matmul_f32_f16) {
         device->pipeline_matmul_f32_f16 = std::make_shared<vk_matmul_pipeline_struct>();
     }
@@ -5784,6 +5802,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // [TAG_QSA_POOLED_F16_MIRROR] created under the F32 availability flags (mul_mat_{s,m,l}[F32]): it is selected for
         // the slot the F32 plan picks, never by an f16 plan
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f16_f32_rows_qsa, matmul_f16_f32_rows_qsa, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
+        // [TAG_QSA_SCORE_KREUSE] the same three twins, workgroups numbered M tile major (same flags, slots, tiles, spec and
+        // push constants); not created with the knob off
+        if (device->qsa_score_kreuse) {
+            CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_qsa_kr, matmul_f32_f32_qsa_kr, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
+            CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_rows_qsa_kr, matmul_f32_f32_rows_qsa_kr, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
+            CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f16_f32_rows_qsa_kr, matmul_f16_f32_rows_qsa_kr, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
+        }
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_f16, matmul_f32_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16_f32, matmul_f16_f32, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
@@ -8423,7 +8448,16 @@ static vk_device ggml_vk_get_device(size_t idx) {
                           device->subgroup_require_full_support ? 1 : 0);
         }
 
+        // [TAG_QSA_SCORE_KREUSE] read before the pipelines are declared (=0: the kr twins are never created)
+        device->qsa_score_kreuse = ggml_vk_env_bool("GGML_VK_QSA_SCORE_KREUSE", true);
+
         ggml_vk_load_shaders(device);
+
+        // [TAG_QSA_SCORE_KREUSE] the proof line
+        if (device->coopmat_support && !device->coopmat2) {
+            GGML_LOG_WARN("ggml_vulkan: qsa_score_kreuse: %s (GGML_VK_QSA_SCORE_KREUSE; QSA_SCORE planes of >= 2 N tiles dispatched "
+                          "key tile major)\n", device->qsa_score_kreuse ? "on" : "off");
+        }
 
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
         const bool prefers_transfer_queue =
@@ -10818,6 +10852,25 @@ static vk_pipeline ggml_vk_matmul_f32_qsa_twin(const vk_device & device, const v
     return nullptr;
 }
 
+// [TAG_QSA_SCORE_KREUSE] the twin of a QSA twin (pipeline_matmul_f32[_rows]_qsa / pipeline_matmul_f16_f32_rows_qsa) in the
+// matching *_qsa_kr struct (same slot), or nullptr (never created: knob off, no coopmat1)
+static vk_pipeline ggml_vk_qsa_kr_twin(const vk_device & device, const vk_pipeline & p, bool rows, bool a_f16) {
+    const vk_matmul_pipeline & a = a_f16 ? device->pipeline_matmul_f16_f32_rows_qsa
+                                         : (rows ? device->pipeline_matmul_f32_rows_qsa : device->pipeline_matmul_f32_qsa);
+    const vk_matmul_pipeline & b = a_f16 ? device->pipeline_matmul_f16_f32_rows_qsa_kr
+                                         : (rows ? device->pipeline_matmul_f32_rows_qsa_kr : device->pipeline_matmul_f32_qsa_kr);
+    if (!a || !b || !p) {
+        return nullptr;
+    }
+    if (p == a->l)   { return b->l;   }
+    if (p == a->m)   { return b->m;   }
+    if (p == a->s)   { return b->s;   }
+    if (p == a->a_l) { return b->a_l; }
+    if (p == a->a_m) { return b->a_m; }
+    if (p == a->a_s) { return b->a_s; }
+    return nullptr;
+}
+
 // row_ids != nullptr [TAG_QSA_POOL_REMAP]: src0 describes the get_rows copy ([K, M, n_b], contiguous) whose buffer
 // position is the store's, row_ids_a_bytes the store's size; every decision below is made for that src0, exactly as
 // for the plain MUL_MAT, and only the chosen pipeline is swapped for its row-id twin
@@ -11918,6 +11971,60 @@ static void ggml_vk_mul_mat_vec_rows(ggml_backend_vk_context * ctx, vk_context& 
 // pipeline's QSA twin, whose epilogue writes relu-ordered-head-sum(+bias) instead of the per-head plane. supports_op
 // keeps every shape the plain op would send to the mat-vec, a conversion pass, q8_1, an M split or a 64-bit-indexing
 // pipeline off this node (the graph builds the old chain for those).
+// [TAG_QSA_SCORE_KREUSE] the pipeline a QSA_SCORE node runs on: the plan above (the F32 plan's slot, its f16-A twin with the
+// mirror) and, where eligible, that pipeline's kr twin - the same per-tile program, its workgroups numbered key tile major
+// (x = ir * blocks_n + ic) so the N tiles of one key tile run back to back. Eligible (fail closed): the knob on, the kr twin
+// created, at least two N tiles in the plane (one tile = nothing to reuse: the decode / verify widths 3..9 and every chunk
+// of <= 32 queries on the 128-wide tile keep the A2a dispatch), split_k 1 (asserted), blocks_m * blocks_n within
+// maxComputeWorkGroupCount[0] (and its element count within 32 bits). The mat-vec widths (1..2) never reach QSA_SCORE (supports_op). Shared by the dispatch and
+// the [vk-fusion-count] key so the two cannot disagree.
+struct vk_qsa_score_plan {
+    vk_pipeline pipeline;
+    bool        kr        = false;   // the kr twin (key tile major workgroups)
+    uint32_t    blocks_m  = 0;       // M / N tiles of the plane (the pipeline's BM / BN)
+    uint32_t    blocks_n  = 0;
+};
+
+static vk_qsa_score_plan ggml_vk_qsa_score_plan(ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+    const ggml_tensor * a    = dst->src[0];
+    const ggml_tensor * b    = dst->src[1];
+    const ggml_tensor * rows = dst->src[2];
+    const ggml_tensor * a16  = rows ? dst->src[4] : nullptr;
+
+    const uint32_t K = (uint32_t) a->ne[0];
+    const uint32_t M = (uint32_t) dst->ne[0];
+    const uint32_t N = (uint32_t) b->ne[1];
+
+    vk_matmul_pipeline mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, GGML_TYPE_F32, GGML_TYPE_F32, GGML_PREC_DEFAULT);
+    GGML_ASSERT(mmp == ctx->device->pipeline_matmul_f32);
+    // the plain op would try q8_1 first: there is no f32 x q8_1 matmul, so it falls back to this same mmp
+    GGML_ASSERT(!(ctx->device->integer_dot_product || ctx->device->mmq_cm1) ||
+                ggml_vk_get_mul_mat_mat_pipeline(ctx, GGML_TYPE_F32, GGML_TYPE_Q8_1, GGML_PREC_DEFAULT) == nullptr);
+
+    const uint32_t kpad    = ggml_vk_align_size(K, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, M, N, GGML_TYPE_F32, GGML_TYPE_F32));
+    const bool     aligned = K == kpad && M > 8 && N > 8;
+    vk_pipeline    base    = ggml_vk_guess_matmul_pipeline(ctx, mmp, M, N, aligned, GGML_TYPE_F32, GGML_TYPE_F32);
+    GGML_ASSERT(ggml_vk_guess_split_k(ctx, M, N, K, false, base) == 1);
+
+    vk_qsa_score_plan plan;
+    // the F32 plan's slot (alignment, tile), on the f16-A twin when the mirror is bound
+    plan.pipeline = ggml_vk_matmul_f32_qsa_twin(ctx->device, base, rows != nullptr, a16 != nullptr);
+    GGML_ASSERT(plan.pipeline != nullptr);
+
+    plan.blocks_m = CEIL_DIV(M, plan.pipeline->wg_denoms[0]);
+    plan.blocks_n = CEIL_DIV(N, plan.pipeline->wg_denoms[1]);
+    const uint64_t n_wg = (uint64_t) plan.blocks_m*plan.blocks_n;
+    if (ctx->device->qsa_score_kreuse && plan.blocks_n >= 2 &&
+        n_wg <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] && n_wg*plan.pipeline->wg_denoms[0] <= UINT32_MAX) {
+        vk_pipeline kr = ggml_vk_qsa_kr_twin(ctx->device, plan.pipeline, rows != nullptr, a16 != nullptr);
+        if (kr != nullptr && kr->wg_denoms == plan.pipeline->wg_denoms && kr->align == plan.pipeline->align) {
+            plan.pipeline = kr;
+            plan.kr       = true;
+        }
+    }
+    return plan;
+}
+
 static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * a    = dst->src[0];
     const ggml_tensor * b    = dst->src[1];
@@ -11935,24 +12042,14 @@ static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx,
 
     GGML_ASSERT(N == n_head*dst->ne[1] && n_b == dst->ne[2]);
 
-    vk_matmul_pipeline mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, GGML_TYPE_F32, GGML_TYPE_F32, GGML_PREC_DEFAULT);
-    GGML_ASSERT(mmp == ctx->device->pipeline_matmul_f32);
-    // the plain op would try q8_1 first: there is no f32 x q8_1 matmul, so it falls back to this same mmp
-    GGML_ASSERT(!(ctx->device->integer_dot_product || ctx->device->mmq_cm1) ||
-                ggml_vk_get_mul_mat_mat_pipeline(ctx, GGML_TYPE_F32, GGML_TYPE_Q8_1, GGML_PREC_DEFAULT) == nullptr);
-
-    const uint32_t kpad    = ggml_vk_align_size(K, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, M, N, GGML_TYPE_F32, GGML_TYPE_F32));
-    const bool     aligned = K == kpad && M > 8 && N > 8;
-    vk_pipeline    base    = ggml_vk_guess_matmul_pipeline(ctx, mmp, M, N, aligned, GGML_TYPE_F32, GGML_TYPE_F32);
-    GGML_ASSERT(ggml_vk_guess_split_k(ctx, M, N, K, false, base) == 1);
-
-    // the F32 plan's slot (alignment, tile), on the f16-A twin when the mirror is bound
-    vk_pipeline pipeline = ggml_vk_matmul_f32_qsa_twin(ctx->device, base, rows != nullptr, a16 != nullptr);
-    GGML_ASSERT(pipeline != nullptr);
+    const vk_qsa_score_plan plan = ggml_vk_qsa_score_plan(ctx, dst);
+    vk_pipeline pipeline = plan.pipeline;
+    const bool  kr       = plan.kr;
 
     if (ctx->device->dispatch_log) {
-        ggml_vk_dispatch_log(ctx, a16 ? "mm_rows_qsa_f16a" : (rows ? "mm_rows_qsa" : "mm_qsa"), a16 ? a16 : a, b, dst, M, N, K, n_b, -1, -1,
-                             pipeline, 1, false, false);
+        const char * path = a16 ? (kr ? "mm_rows_qsa_f16a_kr" : "mm_rows_qsa_f16a")
+                                : (rows ? (kr ? "mm_rows_qsa_kr" : "mm_rows_qsa") : (kr ? "mm_qsa_kr" : "mm_qsa"));
+        ggml_vk_dispatch_log(ctx, path, a16 ? a16 : a, b, dst, M, N, K, n_b, -1, -1, pipeline, 1, false, false);
     }
 
     // the plain product's push constants (ggml_vk_mul_mat_q_f16 -> ggml_vk_matmul, split_k == 1), D = its [M, N, n_b] plane
@@ -11980,7 +12077,13 @@ static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx,
             n_head, bias ? 1u : 0u,
             (uint32_t) (dst->nb[1]/sizeof(float)), (uint32_t) (dst->nb[2]/sizeof(float)),
         };
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_X, d_Y, d_D, d_ID, d_B }, pc, { M, N, groups_z });
+        if (kr) {
+            // [TAG_QSA_SCORE_KREUSE] blocks_m * blocks_n workgroups in one row, key tile major (the shader derives ir, ic)
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_X, d_Y, d_D, d_ID, d_B }, pc,
+                                      { plan.blocks_m*plan.blocks_n*pipeline->wg_denoms[0], pipeline->wg_denoms[1], groups_z });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_X, d_Y, d_D, d_ID, d_B }, pc, { M, N, groups_z });
+        }
         base_work_group_z += groups_z;
     }
 }
@@ -21601,6 +21704,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ggml_vk_fusion_count_add(fusion_counts, "", "qsa_score_epilogue");
                 if (cgraph->nodes[i]->src[3]) {
                     ggml_vk_fusion_count_add(fusion_counts, "", "qsa_score_epilogue_bias");
+                }
+                // [TAG_QSA_SCORE_KREUSE] qsa_score_kreuse=<count>: those dispatched on the kr twin (key tile major, the pooled
+                // keys reused across the plane's N tiles); the dispatch's own plan, so the count is what ran. Not a fusion
+                // pattern: one node.
+                if (ggml_vk_qsa_score_plan(ctx, cgraph->nodes[i]).kr) {
+                    ggml_vk_fusion_count_add(fusion_counts, "", "qsa_score_kreuse");
                 }
             }
 
