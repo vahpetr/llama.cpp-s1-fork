@@ -222,11 +222,13 @@ void main() {
 #ifdef QSA_SCORE_KREUSE
     // [TAG_QSA_SCORE_KREUSE] GGML_OP_QSA_SCORE with the pooled keys reused across the query tiles of a chunk: the
     // workgroups are numbered M tile major - x = ir * blocks_n + ic, one workgroup row (y = 0), split_k 1 (ik = 0) - so
-    // the blocks_n workgroups that read the same BM x K tile of keys run back to back and all but the first find it in
-    // cache, instead of the whole pool being streamed once per N tile (x = ir, y = ic). Each workgroup then runs this
-    // shader's per-tile program unchanged - the same A / B loads, shared-memory layout, fragments, coopMatMulAdd sequence
-    // over K, +0 accumulator start and epilogue - for its (ir, ic): only which tile a workgroup id names changes, so every
-    // output's bits are the per-tile twin's.
+    // the blocks_n workgroups that read the same BM x K tile of keys have consecutive ids, instead of the whole pool lying
+    // between two readers of a tile (x = ir, y = ic). Consecutive ids do not guarantee consecutive execution or cache hits:
+    // the reuse is an observed performance effect (780M: docs/QSA-score-kreuse-perf.md), not a property this code relies
+    // on. Each workgroup runs this shader's per-tile program unchanged - the same A / B loads, shared-memory layout,
+    // fragments, coopMatMulAdd sequence over K, +0 accumulator start and epilogue - for its (ir, ic): only which tile a
+    // workgroup id names changes, so every output's bits are the per-tile twin's whatever the execution order.
+    // The host checks that the pipeline's wg_denoms are this shader's BM / BN (the decode of x depends on it).
     const uint kr_blocks_n = (p.N + BN - 1) / BN;
     const uint ir = gl_WorkGroupID.x / kr_blocks_n;
     const uint ic = gl_WorkGroupID.x % kr_blocks_n;
@@ -379,7 +381,14 @@ void main() {
         pos_b += BK / LOAD_VEC_B_EFF;
 
 #ifdef COOPMAT
+#if defined(QSA_SCORE_KREUSE) && defined(QSA_KREUSE_NEGCTL)
+        // [TAG_QSA_SCORE_KREUSE] NEGATIVE CONTROL BUILD ONLY (cmake -DGGML_VULKAN_QSA_KREUSE_NEGCTL=ON, never a shipped
+        // pipeline): the kr twins run the TK steps of each K block in reverse - the same products, another summation
+        // order - so tests/test-qsa-score-kreuse must see every kr plane differ
+        for (int i = int(BK) - int(TK); i >= 0; i -= int(TK)) {
+#else
         [[unroll]] for (uint i = 0; i < BK; i += TK) {
+#endif
             [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
                 // Load from shared into cache
                 coopMatLoad(cache_a, buf_a, a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);

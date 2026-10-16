@@ -2,13 +2,20 @@
 // tiles of a chunk (the kr twins: workgroups numbered key tile major), knob off vs on, bit for bit, on a GPU. One child per
 // arm (GGML_VK_QSA_SCORE_KREUSE is read once at device init):
 //   off: GGML_VK_QSA_SCORE_KREUSE=0 (the A2a dispatch order)    on: =1 (the default)
+//   lim4: =1 with GGML_VK_QSA_SCORE_KREUSE_MAX_WG=4 (test hook): planes of more than 4 workgroups take the fail-closed
+//         fallback to the A2a dispatch, the rest the kr twin
 // Each child runs the same case list - the three forms (pooled keys, store + remap, store + remap + f16 mirror), decode /
 // verify widths 1..9 and chunk sizes 33..512 queries (ragged N tails: 100, 127, 227 queries = partial last N tiles), ragged
 // and small M (17 / 33 rows: the s tile), K 128 (aligned), 72 and 192 (unaligned), two streams, 8 heads, bias none / the
 // QSA_BIAS constants, f16-denormal and large keys - and writes every score plane to a file.
-// PASS: the on arm's planes are byte-identical to the off arm's (and the supported / unsupported pattern is the same), the
-// off arm dispatched no kr pipeline, the on arm did (the dispatch log's path=..._kr, matched to the case by the node name),
-// widths 1..2 were refused (mat-vec, not QSA_SCORE), no output kept the junk the planes start with.
+// PASS: the on and lim4 arms' planes are byte-identical to the off arm's (and the supported / unsupported pattern is the
+// same), the off arm dispatched no kr pipeline, the on arm did (the dispatch log's path=..._kr, matched to the case by the
+// node name), widths 1..2 were refused (mat-vec, not QSA_SCORE), widths 3..9 took kr only at M <= 32 (width 9 at M 17 must:
+// two N tiles of the s tile), lim4 kept kr on some cases and fell back on others (M 65536 x 128 queries must fall back),
+// no output kept the junk the planes start with.
+// Negative control: in a -DGGML_VULKAN_QSA_KREUSE_NEGCTL=ON build (the kr twins sum the TK steps of each K block in reverse;
+// the proof line says NEGATIVE-CONTROL BUILD) the same run must find every kr case different and every other case equal,
+// and prints NEGATIVE CONTROL PASS.
 // Not a ctest: needs a Vulkan coopmat1 device whose QSA_SCORE runs; without one it prints SKIP and exits 0.
 // usage: test-qsa-score-kreuse                      (parent: runs the arms, compares)
 //        test-qsa-score-kreuse --child <file>       (one arm, the env decides)
@@ -311,33 +318,57 @@ int main(int argc, char ** argv) {
     const char * tmp = getenv("TMPDIR");
     const std::string dir = tmp && *tmp ? tmp : "/tmp";
     const std::string tag = std::to_string((long long) getpid());
-    const char * arms[2][2] = { { "off", "0" }, { "on", "1" } };
+    // off / on / on with a 4-workgroup limit (the test hook: planes of more than 4 workgroups fall back to the A2a dispatch)
+    const char * arms[3][2] = { { "off", "GGML_VK_QSA_SCORE_KREUSE=0" }, { "on", "GGML_VK_QSA_SCORE_KREUSE=1" },
+                                { "lim4", "GGML_VK_QSA_SCORE_KREUSE=1 GGML_VK_QSA_SCORE_KREUSE_MAX_WG=4" } };
     std::vector<arm_view> v;
     std::vector<std::vector<char>> planes;
+    bool negctl = false;
     for (const auto & arm : arms) {
         const std::string file = dir + "/test-qsa-score-kreuse-" + tag + "-" + arm[0] + ".bin";
-        const auto lines = run_child(argv[0], std::string("GGML_VK_DISPATCH_LOG=1 GGML_VK_QSA_SCORE_KREUSE=") + arm[1], file);
+        const auto lines = run_child(argv[0], std::string("GGML_VK_DISPATCH_LOG=1 ") + arm[1], file);
         if (!lines.empty() && lines[0].find("SKIP") != std::string::npos) { printf("test-qsa-score-kreuse: SKIP (no GPU)\n"); return 0; }
         v.push_back(view(lines));
         planes.push_back(slurp(file));
         remove(file.c_str());
-        if (strcmp(arm[0], "on") == 0) {
-            for (const auto & l : lines) {
-                if (l.rfind("[kr]", 0) == 0 || l.find("qsa_score_kreuse") != std::string::npos) { fputs(l.c_str(), stdout); }
+        for (const auto & l : lines) {
+            negctl = negctl || l.find("NEGATIVE-CONTROL BUILD") != std::string::npos;
+            if (strcmp(arm[0], "on") == 0 && (l.rfind("[kr]", 0) == 0 || l.find("qsa_score_kreuse") != std::string::npos)) {
+                fputs(l.c_str(), stdout);
             }
         }
     }
 
-    bool ok = true;
     const auto cases = make_cases();
-    size_t n_sup = 0, n_kr_cases = 0;
+    auto is_kr = [&](const arm_view & a, size_t i) {
+        const auto it = a.path.find(i);
+        return it != a.path.end() && it->second.size() > 3 && it->second.compare(it->second.size() - 3, 3, "_kr") == 0;
+    };
+    bool ok = true;
+    for (const auto & a : v) { ok = ok && a.rc0 && a.cases.size() == cases.size(); }
+
+    if (negctl) {
+        // [negative control] a -DGGML_VULKAN_QSA_KREUSE_NEGCTL=ON build: the kr twins sum the TK steps of each K block in
+        // reverse. The control holds when every kr case of the on arm differs from the off arm and no other case does
+        size_t n_kr = 0, n_kr_diff = 0, n_other_diff = 0;
+        for (size_t i = 0; i < cases.size() && i < v[1].cases.size() && i < v[0].cases.size(); ++i) {
+            const bool diff = v[1].cases[i] != v[0].cases[i];
+            if (is_kr(v[1], i)) { n_kr++; n_kr_diff += diff; } else { n_other_diff += diff; }
+        }
+        ok = ok && v[0].n_kr == 0 && n_kr > 0 && n_kr_diff == n_kr && n_other_diff == 0;
+        printf("test-qsa-score-kreuse: NEGATIVE CONTROL %s (build with the kr summation order reversed: %zu/%zu kr cases differ, "
+               "%zu other cases differ)\n", ok ? "PASS" : "FAIL", n_kr_diff, n_kr, n_other_diff);
+        return ok ? 0 : 1;
+    }
+
+    size_t n_sup = 0, n_kr_cases = 0, n_lim_kr = 0, n_lim_fallback = 0;
     for (size_t i = 0; i < v[0].cases.size(); ++i) { n_sup += v[0].cases[i].find(" unsupported") == std::string::npos; }
     for (size_t a = 0; a < v.size(); ++a) {
         const bool same_lines = v[a].cases == v[0].cases;
         const bool same_bytes = planes[a] == planes[0] && !planes[0].empty();
         printf("[kr-arm] %s rc0=%d cases=%zu identical_lines=%d identical_bytes=%d (%zu B) kr_dispatches=%zu\n", arms[a][0], (int) v[a].rc0,
                v[a].cases.size(), (int) same_lines, (int) same_bytes, planes[a].size(), v[a].n_kr);
-        ok = ok && v[a].rc0 && same_lines && same_bytes && v[a].cases.size() == cases.size();
+        ok = ok && same_lines && same_bytes;
         if (!same_lines) {
             for (size_t i = 0; i < std::min(v[a].cases.size(), v[0].cases.size()); ++i) {
                 if (v[a].cases[i] != v[0].cases[i]) { printf("  first difference:\n    off: %s    %s: %s", v[0].cases[i].c_str(), arms[a][0], v[a].cases[i].c_str()); break; }
@@ -347,14 +378,26 @@ int main(int argc, char ** argv) {
     // the knob decides: none off, kr on; widths 1..2 never reach QSA_SCORE; no junk left
     ok = ok && v[0].n_kr == 0 && v[1].n_kr > 0;
     for (size_t i = 0; i < cases.size() && i < v[1].cases.size(); ++i) {
+        const kr_case & c = cases[i];
         const bool unsup = v[1].cases[i].find(" unsupported") != std::string::npos;
-        const bool kr    = v[1].path.count(i) && v[1].path[i].size() > 3 && v[1].path[i].compare(v[1].path[i].size() - 3, 3, "_kr") == 0;
+        const bool kr    = is_kr(v[1], i);
         n_kr_cases += kr;
-        if (cases[i].Q <= 2 && cases[i].n_head == 4 && !unsup) { printf("  width %" PRId64 " reached QSA_SCORE: %s", cases[i].Q, v[1].cases[i].c_str()); ok = false; }
+        if (c.Q <= 2 && c.n_head == 4 && !unsup) { printf("  width %" PRId64 " reached QSA_SCORE: %s", c.Q, v[1].cases[i].c_str()); ok = false; }
         if (!unsup && v[1].cases[i].find(" junk=0 ") == std::string::npos) { printf("  junk left: %s", v[1].cases[i].c_str()); ok = false; }
         if (!unsup && v[1].path.count(i) == 0) { printf("  no dispatch line for case %zu\n", i); ok = false; }
+        // the widths 3..9 rule (ggml_vk_qsa_score_plan): one N tile - so the A2a dispatch - for M > 32; width 9 at M <= 32 is
+        // two N tiles of the s tile (BN 32) and takes kr
+        if (c.n_head == 4 && c.Q >= 3 && c.Q <= 9 && c.M > 32 && kr) { printf("  width %" PRId64 " at M %" PRId64 " took kr\n", c.Q, c.M); ok = false; }
+        if (c.n_head == 4 && c.Q == 9 && c.M == 17 && c.K == 128 && !kr) { printf("  width 9 at M 17 (2 s-tile N tiles) did not take kr: case %zu\n", i); ok = false; }
+        // the 4-workgroup limit: kr only where the plane needs <= 4 workgroups, the rest on the A2a dispatch (same bits, above)
+        if (kr) {
+            if (is_kr(v[2], i)) { n_lim_kr++; } else { n_lim_fallback++; }
+        } else if (is_kr(v[2], i)) { printf("  lim4 took kr where on did not: case %zu\n", i); ok = false; }
+        if (c.M == 65536 && c.Q == 128 && (!kr || is_kr(v[2], i))) { printf("  M 65536 x 128 queries: on kr=%d, lim4 kr=%d\n", (int) kr, (int) is_kr(v[2], i)); ok = false; }
     }
-    printf("test-qsa-score-kreuse: %s (%zu cases, %zu on the GEMM path, %zu of them on the kr twin in the on arm; off / on "
-           "byte-identical planes)\n", ok ? "PASS" : "FAIL", cases.size(), n_sup, n_kr_cases);
+    ok = ok && n_lim_kr > 0 && n_lim_fallback > 0;
+    printf("test-qsa-score-kreuse: %s (%zu cases, %zu on the GEMM path, %zu of them on the kr twin in the on arm; with the "
+           "4-workgroup limit %zu stay kr and %zu fall back to the A2a dispatch; off / on / lim4 byte-identical planes)\n",
+           ok ? "PASS" : "FAIL", cases.size(), n_sup, n_kr_cases, n_lim_kr, n_lim_fallback);
     return ok ? 0 : 1;
 }

@@ -10,15 +10,22 @@ store (16 / 32 / 64 MiB of f16 keys at 262k / 524k / 1M) once per N tile: 4 time
 ubatch, per QSA layer.
 
 The `*_qsa_kr` twins (same `mul_mm.comp`, `QSA_SCORE_KREUSE` defined) number the workgroups key tile major:
-`x = ir * blocks_n + ic`, `y = 0`. The `blocks_n` workgroups that read one BM x K tile of keys therefore run back to back,
-and all but the first find that tile in cache. Each workgroup still runs the per-tile program unchanged for its (ir, ic):
+`x = ir * blocks_n + ic`, `y = 0`. The `blocks_n` workgroups that read one BM x K tile of keys get consecutive ids.
+Consecutive ids do not guarantee consecutive execution or cache hits, so the reuse is an observed performance effect
+(below), not a property the code relies on; the bits do not depend on the execution order. Each workgroup still runs the per-tile program unchanged for its (ir, ic):
 the same A / B loads, shared-memory layout, fragments, `coopMatMulAdd` sequence over K, +0 accumulator start and epilogue.
 So every output's bits are the per-tile twin's. The SPIR-V of every other shader is byte-identical to the base.
 
 Eligible: knob on, coopmat1, plane of at least 2 N tiles, split_k 1, and `blocks_m * blocks_n` within
-`maxComputeWorkGroupCount[0]`. Everything else keeps the A2a dispatch:
-- decode / verify widths 3..9 (one N tile);
+`maxComputeWorkGroupCount[0]` (test hook `GGML_VK_QSA_SCORE_KREUSE_MAX_WG=<n>` lowers it to exercise the fallback).
+Everything else keeps the A2a dispatch:
+- decode / verify widths 3..9 when M > 32 (one N tile: s tile BN 32 up to N 32, m tile BN 64 at N 36). At M <= 32 the
+  s tile makes width 9 (N 36) two N tiles, so it takes the kr twin; deployed pools (M >= 16384) never do;
 - the mat-vec widths 1..2, which never reach QSA_SCORE.
+
+Negative control from the tree: configure with `-DGGML_VULKAN_QSA_KREUSE_NEGCTL=ON` (tests only: the kr twins sum the
+two TK steps of each K block in reverse, the proof line says NEGATIVE-CONTROL BUILD) and run `test-qsa-score-kreuse`:
+it must print `NEGATIVE CONTROL PASS` (every kr case differs, no other case does).
 
 ## 780M (balkon, RADV KHR_coopmat, GGML_VK_DISABLE_MMQ_CM1=1)
 
@@ -43,7 +50,10 @@ filled with `GGML_VK_PERF_LOGGER=1`. The sum of its QSA_SCORE GPU time per 64k s
 - ->1M, off arm only: 53.29 s (31 of 32 ubatches).
 
 The ->1M on arm was stopped by the GTT guard next to the hands server. The 1M off arm hit a perf-logger-only assert
-(`compute_ctx.expired()`) at its last ubatch, on the unchanged A2a path.
+(`GGML_ASSERT(ctx->compute_ctx.expired())`, the perf-logger timestamp setup in ggml_backend_vk_graph_compute, code of
+the parent) at its last ubatch. Triage (same workload, GGML_VK_PERF_LOGGER=1): at 81 920 tokens the parent 845c6fbcd,
+this branch knob off and knob on all complete without it; at 1M none of the three reached the last ubatch on balkon
+(two stopped by the GTT guard at 1 021 952 / 991 232, the third ended by a host crash at 624 640). Not classified.
 
 Power-of-two pools gain the most: M 65536 2.46 -> 2.03 ms, 131072 4.75 -> 4.00 ms. The per-tile order shows a jump
 there (61440 -> 65536: +18 % time for +6.7 % keys), and the key-major order removes it.
@@ -56,8 +66,9 @@ there (61440 -> 65536: +18 % time for +6.7 % keys), and the key-major order remo
 | one workgroup iterating the N tiles, keys re-loaded per tile (cache-hot), base LDS (perf only, not bit-tested) | -8..-25 % | fewer workgroups in flight than the key-major order |
 | **key-major workgroup order (kept)** | **-4..-37 %** (-13..-37 % at power-of-two pools, -4..-11 % between them) | - |
 
-Negative control: the kept twin with only the two TK steps of each K block swapped makes all 119 kr cases of
-`test-qsa-score-kreuse` differ, and 0 of the non-kr cases. The test therefore detects a per-output summation-order change.
+Negative control (the NEGCTL build above): only the two TK steps of each K block swapped in the kr twins makes every kr
+case of `test-qsa-score-kreuse` differ and none of the others. The test therefore detects a per-output summation-order
+change.
 
 ## Not done
 
