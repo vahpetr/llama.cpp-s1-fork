@@ -120,9 +120,10 @@ against the code for this table.
 
 ## v60 package - patches 0227-0240
 
-All of these are in v60 and none is set in my composes: the "default" column is what v60 runs. Every compute change below is
-EXACT (bit-identical logits, states and selected ids against v59 on my oracle, see docs/s1/BENCHMARKS.md); the `=0` switches
-exist for A/B runs and to bisect. Patch numbers: docs/s1/PATCHES.md.
+All of these are in v60 and none is set in my composes: the "default" column is what v60 runs. Every compute change below
+that is on by default is EXACT as part of the gated package (bit-identical logits, states and ordered selected ids against v59
+on my oracle, see docs/s1/BENCHMARKS.md section 0); the `=0` switches exist for A/B runs and to bisect. The B2 tile (0233) is off
+and was not in the gated configuration. Patch numbers: docs/s1/PATCHES.md.
 
 **On by default in v60:** `GGML_VK_FUSE_MULTI_ADD_SCALE`, `GGML_VK_FUSE_SCALE_SILU` (0227), `GGML_VK_FUSE_CONCAT_SSM_CONV` (0228),
 `GGML_VK_MMID_PRECAST_B` (0231), `GGML_VK_MMID_TILE_BM128` (0232), `GGML_VK_DENSE_TILE_M16` (0234), `GGML_VK_QSA_SCORE_EPILOGUE`
@@ -139,7 +140,7 @@ exist for A/B runs and to bisect. Patch numbers: docs/s1/PATCHES.md.
 | `GGML_VK_MMID_PRECAST_B=0` | on | 0231: AMD coopmat1 mul_mat_id converts B to f16 once (shared by gate and up) and runs the f16-B twin of the shader, instead of converting in every tile; q4_K / q5_0 / q8_0 / q6_K / iq3_s experts only | EXACT | - |
 | `GGML_VK_MMID_TILE_BM128=0` | on | 0232: AMD coopmat1 mul_mat_id uses a BM 128 x BN 64 tile when m > 64 and n > 64 (upstream keeps the large tile off on AMD); same types as above | EXACT | - |
 | `GGML_VK_DENSE_TILE_M16=0` | on | 0234: AMD coopmat1 dense matmul with m <= 16 (the qwen4exp hc inject, m = 4) on a BM 16 x BN 16 tile instead of the s tile; q4_K / q8_0 A, split_k 1 | EXACT | - |
-| `GGML_VK_DENSE_TILE_B2=1`, `GGML_VK_DENSE_TILE_B2_XL=1` | off, off | 0233: AMD coopmat1 dense tile plan for q4_K / q5_0 / q6_K with m <= 384 on BM 64 x BN 128 (split_k 1 only); `_XL=1` also m >= 2048 on BM 128 x BN 256. Off because the hc tile is 2.6x slower on gfx1151 for q4_K 320 x 10240 (137.5 -> 356.4 ms per 2048-token ubatch); A/B only | EXACT | - |
+| `GGML_VK_DENSE_TILE_B2=1`, `GGML_VK_DENSE_TILE_B2_XL=1` | off, off | 0233: AMD coopmat1 dense tile plan for q4_K / q5_0 / q6_K with m <= 384 on BM 64 x BN 128 (split_k 1 only); `_XL=1` also m >= 2048 on BM 128 x BN 256. Off because the hc tile is 2.6x slower on gfx1151 for q4_K 320 x 10240 (137.5 -> 356.4 ms per 2048-token ubatch); A/B only | op tests bit-identical; not covered by the package gate | - |
 | `GGML_VK_QSA_SCORE_EPILOGUE=0` | on | 0235: the QSA indexer score is one node (`GGML_OP_QSA_SCORE`): ReLU, the ordered 4-head sum and the block bias happen in the coopmat1 store of the score GEMM, no per-head plane. Decode / 2-token verify and non-coopmat1 backends keep the op chain; `=0` = the v59 graph node for node | EXACT | - |
 | `LLAMA_QSA_POOLED_F16_MIRROR=0`, `LLAMA_QSA_POOLED_F16_MIRROR_CHECK=1` | on, off | 0240: an f16 mirror of the QSA pooled-key store, written in the same graph as the f32 rows; the indexer score GEMM at 3+ rows (prefill chunks, verify rounds) reads it instead of converting the f32 keys (half the bytes, the same f16 values). 1-2 rows and the CPU keep the f32 store. Costs half the f32 store: about 0.8 GiB at 1M (measured +779 MiB). Off as well when the score epilogue is off. `_CHECK=1` compares every mirror row with its f32 row after each graph and aborts on a difference (debug) | EXACT | - |
 | `GGML_VK_MMVQ_HOIST=0`, `GGML_VK_MMVQ_HOIST_MIN_COLS=N` | on, 2 | 0236: mat-vec at 2..8 columns (the speculative verify widths): the MMVQ q4_0 / q5_0 / q8_0 / q4_K and the f32 x f32 kernels unpack A once per row instead of once per column, from N columns on (0 = off, > 8 = 8). Startup line `mmvq_hoist: on from N columns` | EXACT | - |
