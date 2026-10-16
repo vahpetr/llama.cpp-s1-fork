@@ -228,7 +228,7 @@ records and upstream status live in my private repo; ask if you want one.
 | 0230 | vulkan: `GGML_VK_DISPATCH_LOG` - one line per matmul dispatch decision | v60, diagnostic, off |
 | 0231 | vulkan: mul_mat_id B pre-cast to f16 once, shared by gate and up, f16-B shader twin (AMD coopmat1; q4_K / q5_0 / q8_0 / q6_K / iq3_s) (B1a); 780M: bit-identical on 90 production cases vs v59, speed within +-1 % there | v60, on (EXACT) |
 | 0232 | vulkan: mul_mat_id BM 128 x BN 64 tile on AMD coopmat1 for m > 64, n > 64 (B1b); test-backend-ops MUL_MAT_ID vs CPU 890/890 | v60, on (EXACT) |
-| 0233 | vulkan: dense coopmat1 tile plan for the hc shapes (BM 64 x BN 128, optional XL BM 128 x BN 256) (B2); 2.6x slower on gfx1151 for q4_K 320 x 10240, so off | v60, off (EXACT when on) |
+| 0233 | vulkan: dense coopmat1 tile plan for the hc shapes (BM 64 x BN 128, optional XL BM 128 x BN 256) (B2); 2.6x slower on gfx1151 for q4_K 320 x 10240, so off | v60, built, off by default, not in the gated configuration (op tests bit-identical) |
 | 0234 | vulkan: BM 16 x BN 16 coopmat1 tile for dense matmul with m <= 16 (the hc inject, m = 4) (B4c); 780M q4_K m 4 x n 2048 x k 10240: 1 588 -> 1 278 us (-19.5 %) | v60, on (EXACT) |
 | 0235 | qwen4exp + vulkan: the QSA indexer score as one op `GGML_OP_QSA_SCORE` (ReLU, ordered head sum and block bias in the coopmat1 store of the score GEMM) (A1) | v60, on (EXACT) |
 | 0236 | vulkan: mat-vec at 2..8 columns unpacks A once per row instead of once per column (MMVQ q4_0 / q5_0 / q8_0 / q4_K, f32 x f32) (C1) | v60, on (EXACT) |
