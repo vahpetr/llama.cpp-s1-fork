@@ -22,7 +22,7 @@ against the code for this table.
 | `--cache-disk-ttl-days N` | 14 | delete entries unused this long (0 = never) | SCHED | 14 |
 | `--cache-disk-ckpt-ratio F` | 0.125 | keep a stored recurrent checkpoint when its gap is >= F x its distance to the conversation end | SCHED | 0.125 |
 | `--cache-disk-ckpt-max N` | 32 | stored checkpoints per conversation (113 MiB each for this model) | SCHED | 32 |
-| `--cache-disk-adopt KEY,...` | - | open another build's cache namespace read-only (after an exact upgrade); entries are verified at load | EXACT when the source build is exact | - |
+| `--cache-disk-adopt KEY,...` | - | open other builds' cache namespaces read-only (`KEY` = the 16-hex key a build shows in `GET /disk-cache` and logs as `own key`; its directory is `ns-<KEY>`). Only a source with the same model / draft / mmproj files, per-slot context size and KV types is opened; entries are verified at load, new saves go to the own namespace, the source is never written. Use it after an upgrade that changes the key, e.g. v59 -> v60 (docs/s1/DEPLOY.md) | EXACT when the source build is exact; v60 loading pre-v60 entries: see `LLAMA_LEGACY_UNMARKED` | the previous version's key (1M profile, since v60) |
 | `--spec-draft-n-max-adaptive` | off | adapt the draft length per slot from the running acceptance | output-preserving | - |
 | `--spec-draft-n-max-adaptive-cost a,b[,c,d]` | built-in | depth-aware cost model for the rule above | - | - |
 | `--spec-draft-n-max-adaptive-measure` | on | prefer measured round times over the cost model | - | - |
@@ -54,7 +54,8 @@ against the code for this table.
 | `LLAMA_QSA_BYPASS_EXHAUSTIVE=0` | on | 0 keeps the full QSA graph when the selection already covers every key | DIAG | - |
 | `LLAMA_QSA_TAIL_FIX=0` | on | 0 restores the old tail-cell bias (bug) | DIAG | - |
 | `LLAMA_QSA_INDEXED_SORT=1` | 0 | sorted ids for the frozen-state tool | DIAG | - |
-| `LLAMA_QSA_ROUTING_COST=1`, `LLAMA_QSA_DUMP_IDS=1`, `LLAMA_QSA_CENSUS_CHECK=1`, `LLAMA_QSA_COMPACT_BIAS_CHECK=1`, `LLAMA_QSA_TAIL_ASSERT=1` | 0 | cost logging, `[qsa-ids]` dumps, oracle checks | DIAG | - |
+| `LLAMA_QSA_ROUTING_COST=1`, `LLAMA_QSA_DUMP_IDS=1\|2`, `LLAMA_QSA_CENSUS_CHECK=1`, `LLAMA_QSA_COMPACT_BIAS_CHECK=1`, `LLAMA_QSA_TAIL_ASSERT=1` | 0 | cost logging, `[qsa-ids]` dumps (since 0229 with a sha256 of the ordered id stream per layer and one `[qsa-ids-chunk]` record per selection chunk; `=2` also writes the raw ids to `LLAMA_QSA_DUMP_DIR`, optional graph range `LLAMA_QSA_DUMP_G=lo:hi`), oracle checks | DIAG | - |
+| `LLAMA_QSA_DUMP_SCORE=1`, `LLAMA_QSA_DUMP_TIES=1` (+ `_TIES_K=N`, `_TIES_P=lo:hi`) | 0 | `[qsa-score]` hash of every indexer score plane (pre-bias); `[qsa-score-ties]` tied scores at the top-k boundary (patch 0229). No compute op changes, but the observed tensors become scheduler split points, so fusions across them cannot form: compare capture-on runs with capture-on runs only | DIAG | - |
 | `GGML_VK_QSA_FUSED_SELECT=1` | 0 | score + block map + mask -> top-k ids in one op | EXACT | 1 |
 | `GGML_VK_QSA_SCRATCH_PRESIZE=1`, `..._FA=1` | 0 | presize the selection / indexed-FA scratch at load | SCHED | 1, 1 |
 | `GGML_VK_QSA_TOPK=v1\|v2` | v2 | top-k kernel (v2 = distributed radix threshold, byte-identical to v1) | EXACT | - |
@@ -79,10 +80,10 @@ against the code for this table.
 | `LLAMA_GRAPH_CACHE=K` | 0 | keep K built graphs + allocation plans, reuse on an exact match | EXACT | 8 |
 | `LLAMA_GRAPH_CACHE_CHECK=1\|2\|3` | 0 | rebuild and compare on every hit (1 plan, 2 outputs, 3 stale inputs); aborts on a difference | DIAG | - |
 | `LLAMA_GRAPH_CACHE_CHECK_INJECT=...` | - | fault injection for the check | DIAG | - |
+| `LLAMA_GRAPH_CACHE_TRACE=1` | 0 | one `[graph-cache] ctx= n_past= n_tokens= cache= reused= inval=` line per computed ubatch (patch 0229) | DIAG | - |
 | `LLAMA_KQ_VIS=1` | 0 | KQ mask from cell/token metadata, no mask plane | EXACT | 1 |
 | `LLAMA_KQ_VIS_MIN_TOKENS=N` | 64 | below N tokens per batch use the classic mask plane | EXACT | 64 |
 | `LLAMA_KQ_VIS_PROF=1` | 0 | `kqvis-prof:` timing lines per window of <= 64 graphs (incl. graph-cache hit/miss) | DIAG | - |
-| `LLAMA_SPEC_TRACE_IDS=1` | 0 | one `[spec-ids]` line per speculative verify round: round, n_past, drafted ids (the proposals), width, accepted ids, draft / catch-up / verify wall, n_att; read by piagent `spec_ids_compare.py` (proposal identity + R83) and `spec_cost_attrib.py` (patch 0238, C3, not in a release yet) | DIAG | - |
 | `LLAMA_RESERVE_RUNTIME_SHAPE=1` | 0 | reserve max(worst-case, runtime) graph shape: no regrow mid-fill | SCHED | 1 |
 | `GGML_ALLOC_GROW_SLACK=P` | 0 | grow compute buffers with P % slack | SCHED | 10 |
 | `LLAMA_GTT_ADMISSION_MIB=N` | 0 (off) | before a prefill chunk grows GTT past N MiB, the slot waits | SCHED | GTT - 3424 |
@@ -110,23 +111,42 @@ against the code for this table.
 | `GGML_VK_MMID_COMPACT=0` | 1 | flattened (expert, tile) grid for mul_mat_id | EXACT | - |
 | `GGML_VK_DISABLE_HOIST_ROW_IDS=1` | 0 | per-workgroup ids scan instead of the hoisted table | EXACT | - |
 | `GGML_VK_CONCAT_TRANSPOSE=0`, `GGML_VK_FUSE_HC_COMBINE=0`, `GGML_VK_FUSE_SIGMOID_MUL=0`, `GGML_VK_FUSE_GDN_PRE=0` | on | disable one fork kernel / fusion (A/B) | EXACT | - |
-| `GGML_VK_FUSE_MULTI_ADD_SCALE=0`, `GGML_VK_FUSE_SCALE_SILU=0` | on | disable one hc_mix tail fusion (patch 0227: multi_add + trailing SCALE - qwen4exp hc_mix stream mean and QSA pooled-key mean - and SCALE + SILU; pattern names `multi_add_scale`, `scale_silu`; no node-order change) (B3 arm, not in a release yet) | EXACT | - |
-| `GGML_VK_FUSE_CONCAT_SSM_CONV=0` | on | read the GDN conv window from state | x instead of writing the concat (patch 0228; patterns `concat_ssm_conv`, `_silu`, `_bias_silu`; prefill ubatches only); =0 also restores the graph_optimize order (B4 arm, not in a release yet) | EXACT | - |
-| `GGML_VK_MMID_PRECAST_B=0` | on | coopmat1 mul_mat_id converts B to f16 once (shared by gate/up) and runs the f16-B twin of the shader instead of converting per tile (patch 0231, B1 arm, not in a release yet) | EXACT | - |
-| `GGML_VK_MMID_TILE_BM128=0` | on | AMD coopmat1 mul_mat_id large tile BM 128 x BN 64 (m > 64 and n > 64; upstream: off on AMD; q4_K / q5_0 / q8_0 / q6_K / iq3_s only, like PRECAST_B) (patch 0232, B1 arm, not in a release yet) | EXACT | - |
-| `GGML_VK_DENSE_TILE_M16=0` | on | AMD coopmat1 dense matmul with m <= 16 (the qwen4exp hc inject, m = 4) on a BM 16 x BN 16 tile instead of the s tile; q4_K / q8_0 A (patch 0234, B4c arm, not in a release yet) | EXACT | - |
-| `GGML_VK_DENSE_TILE_B2=1`, `GGML_VK_DENSE_TILE_B2_XL=1` | off / off | AMD coopmat1 dense matmul tile plan: q4_K / q5_0 / q6_K with m <= 384 on BM 64 x BN 128 instead of the l tile (split_k 1 only); _XL=1 also puts m >= 2048 on BM 128 x BN 256 (slower on the 780M) (patch 0233; default off since the gfx1151 run4 ruling: the hc tile is 2.6x slower there on q4_K 320 x 10240; A/B only) | EXACT | - |
-| `GGML_VK_MMVQ_HOIST=0`, `GGML_VK_MMVQ_HOIST_MIN_COLS=N` | on, 2 | mat-vec at 2..8 columns (decode verify widths): the MMVQ q4_0 / q5_0 / q8_0 / q4_K and f32 x f32 twins unpack A once per row instead of once per column, from N columns on (0 = off, > 8 = 8) (patch 0236, C1 arm, not in a release yet) | EXACT | - |
-| `LLAMA_KQ_VIS_MIRROR=0`, `LLAMA_KQ_VIS_MIRROR_MAX_TOKENS=N`, `LLAMA_KQ_VIS_MIRROR_CHECK=1` | on, 16, off | with LLAMA_KQ_VIS=1: the KQ visibility planes of a single-stream cache live in a device mirror updated with the changed cells only, read by ubatches of <= N tokens instead of a per-graph upload; CHECK reads it back and aborts on any difference from a fresh fill (patch 0237, C2 arm, not in a release yet) | EXACT | - |
-| `GGML_VK_QSA_SCORE_EPILOGUE=0` | on | indexer score as one node (GGML_OP_QSA_SCORE): ReLU, the ordered 4-head sum and the block bias in the coopmat1 store of the score GEMM, no per-head plane; decode / 2-token verify and non-coopmat1 backends keep the chain; read by qwen4exp, =0 = the v59 graph (patch 0235, A1 arm, not in a release yet) | EXACT | - |
-| `LLAMA_QSA_POOLED_F16_MIRROR=0`, `LLAMA_QSA_POOLED_F16_MIRROR_CHECK=1` | on, off | f16 mirror of the QSA pooled-key store (GPU stores, with the score epilogue on), written with the f32 rows in the same graph; the indexer score GEMM (3+ rows: prefill chunks, verify rounds) reads it instead of converting the f32 keys (half the bytes, same f16 values); 1-2 rows and the CPU keep the f32 store. +0.5 x the f32 store (1M: about 0.8 GiB). _CHECK=1 compares every mirror row with the f16 of its f32 row after each graph (debug, aborts) (patch 0240, A2a arm, not in a release yet) | EXACT | - |
 | `GGML_VK_FA_DEADV_LDS=1`, `GGML_VK_FA_NO_ZERO_DEAD_V=1` | 0 | FA dead-column variants (A/B; the second reopens an RDNA3 signed-zero hazard) | DIAG | - |
 | `GGML_VK_OPT_WINDOW=N` | 20 | graph_optimize independence window | COMPOSITION | - |
 | `GGML_VK_DMMV_RM_{KQ,STDQ,KQ_INT,STDQ_INT,F32}` | built-in | rows per workgroup for dense mat-vec | EXACT | - |
 | `GGML_VK_ASYNC_READ_UMA=1`, `GGML_VK_ASYNC_READ_COPYBUF=1`, `GGML_VK_FLOPS_SEED_LEGACY=1`, `GGML_VK_DISABLE_DESCRIPTOR_REUSE=1` | 0 | readback / submit / descriptor variants (A/B) | EXACT | - |
 | `GGML_VK_DISABLE_FUSION_PATTERNS=a,b`, `GGML_VK_FUSION_LIST=1`, `GGML_VK_FUSION_COUNT=1`, `GGML_VK_FUSION_DIAG=1`, `GGML_VK_SUBMIT_LOG=1` | - | fusion / submit diagnostics | DIAG | - |
-| `GGML_VK_DISPATCH_LOG=1` | 0 | one `[vk-dispatch]` line per MUL_MAT / MUL_MAT_VEC / MUL_MAT_ID dispatch: path, types, m/n/k, n_as/n_used, pipeline, split_k, mmvq/mmq (patch 0230, not in a release yet) | DIAG (no barrier) | - |
 | `GGML_SCHED_PROFILE=1`, `GGML_GET_ROWS_STATS=1\|2` | 0 | host-side scheduler timers, get_rows census | DIAG | - |
+
+## v60 package - patches 0227-0240
+
+All of these are in v60 and none is set in my composes: the "default" column is what v60 runs. Every compute change below is
+EXACT (bit-identical logits, states and selected ids against v59 on my oracle, see docs/s1/BENCHMARKS.md); the `=0` switches
+exist for A/B runs and to bisect. Patch numbers: docs/s1/PATCHES.md.
+
+**On by default in v60:** `GGML_VK_FUSE_MULTI_ADD_SCALE`, `GGML_VK_FUSE_SCALE_SILU` (0227), `GGML_VK_FUSE_CONCAT_SSM_CONV` (0228),
+`GGML_VK_MMID_PRECAST_B` (0231), `GGML_VK_MMID_TILE_BM128` (0232), `GGML_VK_DENSE_TILE_M16` (0234), `GGML_VK_QSA_SCORE_EPILOGUE`
+(0235), `GGML_VK_MMVQ_HOIST` from 2 columns (0236), `LLAMA_KQ_VIS_MIRROR` (0237, only with `LLAMA_KQ_VIS=1`),
+`LLAMA_QSA_POOLED_F16_MIRROR` (0240, only with the score epilogue on), `LLAMA_LEGACY_UNMARKED=1` (0239).
+**Off by default in v60:** `GGML_VK_DENSE_TILE_B2`, `GGML_VK_DENSE_TILE_B2_XL` (0233, slower on gfx1151), and every debug knob:
+`GGML_VK_DISPATCH_LOG` (0230), `LLAMA_SPEC_TRACE_IDS` (0238), `LLAMA_QSA_DUMP_*` / `LLAMA_GRAPH_CACHE_TRACE` (0229), the
+`_CHECK` modes of 0237 and 0240.
+
+| knob | default | effect | class | prod |
+|---|---|---|---|---|
+| `GGML_VK_FUSE_MULTI_ADD_SCALE=0`, `GGML_VK_FUSE_SCALE_SILU=0` | on, on | 0227: a multi_add followed by a SCALE runs as one dispatch (qwen4exp hc_mix stream mean and the QSA pooled-key mean), SCALE + SILU after the hc w_down projection runs as one; pattern names `multi_add_scale`, `scale_silu` for `GGML_VK_DISABLE_FUSION_PATTERNS`; the node order is v59's with the knobs on or off | EXACT | - |
+| `GGML_VK_FUSE_CONCAT_SSM_CONV=0` | on | 0228: the GDN conv reads its window from the conv state and x instead of a written concat (prefill ubatches only; patterns `concat_ssm_conv`, `_silu`, `_bias_silu`); `=0` also restores the v59 graph_optimize order | EXACT | - |
+| `GGML_VK_MMID_PRECAST_B=0` | on | 0231: AMD coopmat1 mul_mat_id converts B to f16 once (shared by gate and up) and runs the f16-B twin of the shader, instead of converting in every tile; q4_K / q5_0 / q8_0 / q6_K / iq3_s experts only | EXACT | - |
+| `GGML_VK_MMID_TILE_BM128=0` | on | 0232: AMD coopmat1 mul_mat_id uses a BM 128 x BN 64 tile when m > 64 and n > 64 (upstream keeps the large tile off on AMD); same types as above | EXACT | - |
+| `GGML_VK_DENSE_TILE_M16=0` | on | 0234: AMD coopmat1 dense matmul with m <= 16 (the qwen4exp hc inject, m = 4) on a BM 16 x BN 16 tile instead of the s tile; q4_K / q8_0 A, split_k 1 | EXACT | - |
+| `GGML_VK_DENSE_TILE_B2=1`, `GGML_VK_DENSE_TILE_B2_XL=1` | off, off | 0233: AMD coopmat1 dense tile plan for q4_K / q5_0 / q6_K with m <= 384 on BM 64 x BN 128 (split_k 1 only); `_XL=1` also m >= 2048 on BM 128 x BN 256. Off because the hc tile is 2.6x slower on gfx1151 for q4_K 320 x 10240 (137.5 -> 356.4 ms per 2048-token ubatch); A/B only | EXACT | - |
+| `GGML_VK_QSA_SCORE_EPILOGUE=0` | on | 0235: the QSA indexer score is one node (`GGML_OP_QSA_SCORE`): ReLU, the ordered 4-head sum and the block bias happen in the coopmat1 store of the score GEMM, no per-head plane. Decode / 2-token verify and non-coopmat1 backends keep the op chain; `=0` = the v59 graph node for node | EXACT | - |
+| `LLAMA_QSA_POOLED_F16_MIRROR=0`, `LLAMA_QSA_POOLED_F16_MIRROR_CHECK=1` | on, off | 0240: an f16 mirror of the QSA pooled-key store, written in the same graph as the f32 rows; the indexer score GEMM at 3+ rows (prefill chunks, verify rounds) reads it instead of converting the f32 keys (half the bytes, the same f16 values). 1-2 rows and the CPU keep the f32 store. Costs half the f32 store: about 0.8 GiB at 1M (measured +779 MiB). Off as well when the score epilogue is off. `_CHECK=1` compares every mirror row with its f32 row after each graph and aborts on a difference (debug) | EXACT | - |
+| `GGML_VK_MMVQ_HOIST=0`, `GGML_VK_MMVQ_HOIST_MIN_COLS=N` | on, 2 | 0236: mat-vec at 2..8 columns (the speculative verify widths): the MMVQ q4_0 / q5_0 / q8_0 / q4_K and the f32 x f32 kernels unpack A once per row instead of once per column, from N columns on (0 = off, > 8 = 8). Startup line `mmvq_hoist: on from N columns` | EXACT | - |
+| `LLAMA_KQ_VIS_MIRROR=0`, `LLAMA_KQ_VIS_MIRROR_MAX_TOKENS=N`, `LLAMA_KQ_VIS_MIRROR_CHECK=1` | on, 16, off | 0237, with `LLAMA_KQ_VIS=1`: the KQ visibility planes of a single-stream cache live in a device mirror updated with the changed cells only; ubatches of <= N tokens read it instead of a per-graph upload (at 1M that upload was 16.6 MiB per round). `_CHECK=1` reads it back and aborts on any difference from a fresh fill. Startup line `kq_vis_mirror = on` | EXACT | - |
+| `LLAMA_LEGACY_UNMARKED=0\|1` | 1 | 0239: how v60 treats state written by v59 and older ("unmarked": no `IXY1` mark). 1 = a disk-cache entry or a context checkpoint is loaded only when its stored token stream has no image, and its cells pass the intact-text-history check; image entries are refused (a cache miss). 0 = strict: no unmarked state is ever loaded. A raw `/slots` restore of an unmarked file is refused either way. Shown in the disk-cache startup line (`legacy unmarked states: ...`) and in `GET /disk-cache` (`legacy_unmarked`) | EXACT (cache policy, no key change) | - (= 1) |
+| `GGML_VK_DISPATCH_LOG=1` | 0 | 0230: one `[vk-dispatch]` line per MUL_MAT / MUL_MAT_ID / MUL_MAT_ROWS dispatch decision: path, types, m / n / k, n_as / n_used, pipeline, split_k, mmvq / mmq; no barrier | DIAG | - |
+| `LLAMA_SPEC_TRACE_IDS=1` | 0 | 0238: one `[spec-ids]` line per speculative verify round: round, n_past, the drafted ids, width, the accepted ids, draft / catch-up / verify wall time, n_att (draft positions sampled). For comparing draft proposals between two builds | DIAG | - |
 
 ## Test / debug only
 
