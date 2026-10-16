@@ -5,19 +5,24 @@ contributor rules for llama.cpp itself are in
 [upstream AGENTS.md](https://github.com/ggml-org/llama.cpp/blob/master/AGENTS.md); they apply to anything sent upstream from here.
 Read README.md first, then docs/s1/KNOBS.md (every flag and env knob) and docs/s1/PATCHES.md (every change, numbered).
 
+This tree is **v60** (2026-10-16): fork revision `845c6fbcd` (`prod-v11-stage8-pkg7`) plus the docs and deploy files of this
+`s1-public` branch. Image `vahpetr/llama-cpp-s1-fork:v60` (= `:v60k` = `:latest`); deploy steps in docs/s1/DEPLOY.md, what
+changed in docs/s1/RELEASE-NOTES.md.
+
 ## Where the fork's code lives
 
 | area | files |
 |---|---|
-| model graph: QSA sparse attention, MTP draft block, PLE gather, hyper-connections | `src/models/qwen4exp.cpp`, `src/models/delta-net-base.cpp` |
-| hybrid memory with the QSA indexer cache: pooled keys, census, store plan, incremental inputs | `src/llama-memory-hybrid-idx.cpp/.h` |
-| KQ mask from metadata (`LLAMA_KQ_VIS`), cells | `src/llama-graph.cpp`, `src/llama-kv-cache.cpp`, `src/llama-kv-cells.h` |
+| model graph: QSA sparse attention (incl. the fused score op), MTP draft block, PLE gather, hyper-connections, GDN conv input split | `src/models/qwen4exp.cpp`, `src/models/delta-net-base.cpp` |
+| hybrid memory with the QSA indexer cache: pooled keys (+ f16 mirror), census, store plan, incremental inputs, cell-ext restore | `src/llama-memory-hybrid-idx.cpp/.h` |
+| state provenance: the `IXY1` mark, the legacy-state accept API | `src/llama-ext.h`, `src/llama-kv-cache.cpp` (`seq_history_intact`) |
+| KQ mask from metadata (`LLAMA_KQ_VIS`), its device mirror with per-consumer dirty ranges, cells | `src/llama-graph.cpp`, `src/llama-kv-cache.cpp`, `src/llama-kv-cells.h` |
 | graph + allocation-plan cache, reserve shape, MTP catch-up | `src/llama-context.cpp`, `ggml/src/ggml-backend.cpp`, `ggml/src/ggml-alloc.c` |
 | speculative decoding (MTP draft, replay, adaptive / tput policy) | `common/speculative.cpp`, `common/sampling.cpp` |
 | server: slots, checkpoints, GTT admission, multi-slot routing, stop-type log | `tools/server/server-context.cpp`, `server-task.cpp` |
-| disk prompt cache (tiers, deep checkpoints, namespaces, adopt, fingerprint) | `tools/server/server-disk-cache.cpp/.h` |
-| Vulkan kernels: QSA top-k, indexed / metadata FA, KQ mask, fusions, MMQ int8, expert telemetry | `ggml/src/ggml-vulkan/ggml-vulkan.cpp`, `vulkan-shaders/{topk_radix_select*,flash_attn_*,kq_mask,qsa_bias,hc_combine,add_softplus_mul,mul_mmq_cm1*}` |
-| new ops (`GGML_OP_QSA_TOP_K`, `QSA_BIAS`, `KQ_MASK`, FA with ids / metadata, `get_rows_type`) | `ggml/include/ggml.h`, `ggml/src/ggml.c`, `ggml/src/ggml-cpu/ops.cpp` |
+| disk prompt cache (tiers, deep checkpoints, namespaces, adopt, fingerprint, legacy-state policy `LLAMA_LEGACY_UNMARKED`) | `tools/server/server-disk-cache.cpp/.h` |
+| Vulkan kernels: QSA top-k, indexed / metadata FA, KQ mask, fusions, MMQ int8, expert telemetry; v60: QSA score epilogue and the matmul tile plans (`mul_mm`), mat-vec hoist, hc_mix tail and conv-input fusions | `ggml/src/ggml-vulkan/ggml-vulkan.cpp`, `vulkan-shaders/{topk_radix_select*,flash_attn_*,kq_mask,qsa_bias,hc_combine,add_softplus_mul,mul_mmq_cm1*,mul_mm,mul_mat_vec*,multi_add,scale_silu,ssm_conv}` |
+| new ops (`GGML_OP_QSA_TOP_K`, `QSA_BIAS`, `QSA_SCORE`, `KQ_MASK`, FA with ids / metadata, `get_rows_type`) | `ggml/include/ggml.h`, `ggml/src/ggml.c`, `ggml/src/ggml-cpu/ops.cpp`, `ggml/src/ggml-cpu/ggml-cpu.c` |
 | webui (compaction, per-chat settings, timing chips, frozen tools) | `tools/ui/` (Svelte; tests under `tools/ui/tests/`) |
 | tools | `tools/mtp-replay/`, `tools/qsa-frozen/`, `tools/s1/gguf_hc_q8.py` |
 | deploy + docs | `deploy/`, `docs/s1/` |
@@ -30,7 +35,11 @@ Fork code and commits carry `[TAG_<NAME>]` markers. `git grep -n TAG_GRAPH_CACHE
 `_MIN_KV`, `_SCRATCH`, `_WHOLE_BLOCKS`), `TAG_KQ_VIS`, `TAG_MTP_QSA`, `TAG_MTP_CATCHUP_NOATTN`, `TAG_GRAPH_CACHE`,
 `TAG_MULTISLOT`, `TAG_GTT_ADMISSION`, `TAG_KV_GRAPH_SPAN`, `TAG_DISK_PROMPT_CACHE`, `TAG_DEEP_CKPT`, `TAG_DISK_ADOPT`,
 `TAG_CACHE_COMPAT2`, `TAG_STATE_DESCRIPTOR`, `TAG_SPEC_DRAFT_POLICY`, `TAG_SPEC_ROUND_TIMING`, `TAG_WEBUI`, `TAG_VK_EXPERT_OCC`,
-`TAG_UP<pr>` (an upstream back-port). New work gets a new tag in both the code comment and the commit subject.
+`TAG_UP<pr>` (an upstream back-port). v60 added `TAG_HC_MIX_TAIL` (0227), `TAG_CONV_INPUT_SPLIT` (0228), `TAG_QSA_DUMP_IDS` /
+`TAG_QSA_DUMP_SCORE` (0229), `TAG_VK_DISPATCH_LOG` (0230), `TAG_MMID_PRECAST_B` / `TAG_MMID_TILE_B1` (0231 / 0232),
+`TAG_DENSE_TILE_B2` (0233), `TAG_INJECT_TILE_M16` (0234), `TAG_QSA_SCORE_EPILOGUE` (0235), `TAG_MMVQ_HOIST` (0236),
+`TAG_KQ_VIS_MIRROR` (0237), `TAG_SPEC_TRACE_IDS` (0238), `TAG_CELL_EXT_RESTORE` / `TAG_CELL_EXT_PROVENANCE` (0239),
+`TAG_QSA_POOLED_F16_MIRROR` (0240). New work gets a new tag in both the code comment and the commit subject.
 
 ## Build and test contract
 
@@ -39,7 +48,11 @@ Fork code and commits carry `[TAG_<NAME>]` markers. `git grep -n TAG_GRAPH_CACHE
    Fork tests: `test-qsa-census-inc` (census vs a frozen reference, fuzzed), `test-qsa-select`, `test-qsa-relu-inplace`,
    `test-kq-mask-meta` / `test-kq-vis-fill-equiv` (metadata mask == plane), `test-graph-cache` / `test-sched-snapshot` (cache
    off == on == CHECK), `test-mtp-catchup` / `test-mtp-qsa-restore` / `test-mtp-qsa-phase` / `test-mtp-carrier`,
-   `test-state-portable` (np1 <-> np2 state), `test-cache-compat-key`, `test-spec-draft-policy`, `test-draft-accept-eog`.
+   `test-state-portable` (np1 <-> np2 state), `test-cache-compat-key` (incl. the unmarked-checkpoint rules),
+   `test-spec-draft-policy`, `test-draft-accept-eog`, `test-cell-ext-restore` / `-qsa` (state restore with and without PLE,
+   text and image entries, marked and unmarked).
+   Built but not ctests (need a Vulkan coopmat1 GPU): `test-qsa-f16-mirror` (mirror off vs on + CHECK through the model graph),
+   `test-vk-graph-order` (fusion / dispatch order through the scheduler, `tests/test-vk-graph-order.sh`).
 2. Vulkan op tests on a box with the GPU: build with `-DGGML_VULKAN=ON`, then
    `test-backend-ops -b Vulkan0 -o <OP>` for every op you touched (`FLASH_ATTN_EXT`, `MUL_MAT_ID`, `TOPK_QSA`, `QSA_TOP_K`,
    `KQ_MASK`, `GET_ROWS`, ...). The fork added cases at the deployed shapes; `GGML_TEST_TOPK_PROD=1` enables the large ones.
@@ -52,7 +65,11 @@ Fork code and commits carry `[TAG_<NAME>]` markers. `git grep -n TAG_GRAPH_CACHE
 - **EXACT**: same tokens, same probabilities, same state bytes. Proof = per-step slot state hashes identical (save the slot,
   sha256), `[qsa-ids]` selection dumps identical (`LLAMA_QSA_DUMP_IDS=1`), the census oracle identical (fixed prompts, greedy,
   512 tokens, every position compared with probabilities), and CHECK modes where they exist (`LLAMA_GRAPH_CACHE_CHECK`,
-  `LLAMA_QSA_CENSUS_CHECK`).
+  `LLAMA_QSA_CENSUS_CHECK`, `LLAMA_KQ_VIS_MIRROR_CHECK`, `LLAMA_QSA_POOLED_F16_MIRROR_CHECK`). Since v60 the gate is my S0.1
+  oracle: one probe program (private) drives the production configuration through fixed prompts and compares the new build
+  with the previous one bit for bit - logits at every captured position, the saved states, the QSA ids per chunk (`[qsa-ids]`
+  sha256 records, patch 0229) - across verify widths 1-9, depths 8k -> 1M, and restore / replay histories. v60 vs v59: 1 502
+  logit positions and 224 state points identical, on gfx1151.
 - **COMPOSITION**: same per-op math, different batching / routing / selection order, so near-ties can flip a token. Proof =
   teacher-forced replay after the first divergence: every divergence must be a near-tie or a selection flip that the reference
   also accepts (my "R81" classifier), plus needles and speed. A change that cannot be classified this way is treated as LOSSY.
