@@ -55,7 +55,7 @@ git archive <rev> | docker build -f .devops/vulkan.Dockerfile --build-arg APP_RE
   --target server -t vahpetr/llama-cpp-s1-fork:v60 -
 ```
 
-v60 = rev `845c6fbcd` (the `prod-v11-stage8-pkg7` head; this branch only adds docs and deploy files on top). `:v60`, `:v60k`
+v60 = rev `845c6fbcd` (the `prod-v11-stage8-pkg7` head; this branch adds docs, deploy files, `tools/s1` and comment scrubs on top). `:v60`, `:v60k`
 and `:latest` are one image (digest `sha256:794113766af1129c65e9541bcc4b9b3bac4d378fa38b38cd4d7c5f00fbf7a0d1`), built on the
 780M box; my s1 production image is the same revision built on s1, and the EXACT gate ran on that one. Rollback: `:v59` /
 `:v59k` (rev `a1b6c324e`, one image, `sha256:5da04b0d8bc24f022c28d0cce0d993c4ed2c5837527113625dbeade5699d5f92`) stay
@@ -71,10 +71,10 @@ in docs/s1/WEIGHTS.md), then `docker compose -f <file> up -d`.
 ## First start: what to expect
 
 - **GTT after load** (`cat /sys/class/drm/card*/device/mem_info_gtt_used`): brain-1m 104 672-105 193 MiB on v59, 105 414 MiB
-  on v60 (the f16 pooled-key mirror, +0.8 GiB), brain-524k
-  ~94 500 MiB, hands ~73 GiB (interpolated between measured 786k and 1M pools: 70.7 and 75.2 GiB). On s1 these stay flat at
-  every depth because `--kv-graph-span 0` reserves the compute buffers for the full span at load. An allocation error at load
-  means the GTT limit is too small.
+  on v60 (the f16 pooled-key mirror, +0.8 GiB) and 106 032 MiB after the first requests (the admission bar is 109 216),
+  brain-524k ~94 500 MiB (v59), hands ~73 GiB (interpolated between measured 786k and 1M pools: 70.7 and 75.2 GiB). On v59 the
+  1M fill stayed at 105 188-105 196 MiB (per-step readings on v52, peaks on v59) because `--kv-graph-span 0` reserves the compute buffers for the full span at load;
+  the v60 peak over a full fill is not measured yet. An allocation error at load means the GTT limit is too small.
 - **Log proofs** (`-lv 4`): `n_ctx = 1048576` (or 525312), `freq_scale = 0.25` for target and draft, the QSA ratio line,
   `graph cache: K = 8`, `kq_vis: on`; from v60 also `qsa_score_epilogue: on`, `mmvq_hoist: on from 2 columns`,
   `kq_vis_mirror = on`, `qsa_pooled_f16_mirror: on`, and the disk-cache line `legacy unmarked states: ...`.
