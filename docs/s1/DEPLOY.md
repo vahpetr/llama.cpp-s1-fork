@@ -6,7 +6,7 @@ long version, with the upgrade from v59, the rollback and the checks I run after
 
 | box | profile | compose file | image | context | GTT after load |
 |---|---|---|---|---|---|
-| s1: Ryzen AI Max+ 395 (Radeon 8060S, gfx1151), 128 GB | brain, 1M | `deploy/s1/docker-compose.brain-1m.yml` | `:v60` | 1 048 576, 1 slot | 105 414 MiB on v60 (needs the 110 GiB GTT setting) |
+| s1: Ryzen AI Max+ 395 (Radeon 8060S, gfx1151), 128 GB | brain, 1M | `deploy/s1/docker-compose.brain-1m.yml` | `:v60` | 1 048 576, 1 slot | 105 414 MiB on v60, 106 032 after the first requests (needs the 110 GiB GTT setting) |
 | s1 | brain, 524k | `deploy/s1/docker-compose.brain-524k.yml` | `:v60` | 525 312, 1 slot | ~94 500 MiB on v59; v60 not measured on this profile |
 | balkon: Ryzen 9 7940HS + Radeon 780M (gfx1103), 96 GB | hands | `deploy/balkon/docker-compose.hands.yml` | `:v60k` | 917 504 pool, 5 slots | ~73 GiB (interpolated, v54-era) |
 
@@ -42,8 +42,10 @@ see "The image" in deploy/README.md (`BUILD=1` in the setup scripts does it). Bu
 6. **The admission bar.** `LLAMA_GTT_ADMISSION_MIB` defaults to 109 216 = GTT size - 3 424 MiB on my box; the setup script
    computes it from yours. Check `LLAMA_GTT_USED_PATH` points at your GPU's `card` index.
 
-What to expect on v60 (1M profile): GTT 105 414 MiB after load, flat at every depth; a cold fill of 1M tokens takes about
-44 min, 0 -> 524k about 20 min (oracle probe numbers); prefill ~550 t/s on an 8k prompt, ~330 t/s near 1M. Decode on v60 is not
+What to expect on v60 (1M profile): GTT 105 414 MiB after load and 106 032 MiB after the first requests (llama-server with the
+vision projector); the highest value I have on v60 is 106 357 MiB, the oracle probe's peak during its score-capture pass
+(without the projector). The admission bar is 109 216 MiB. The server's peak over a full 1M fill on v60 is not measured yet
+(v59: 105 196 MiB). A cold fill of 1M tokens takes about 44 min, 0 -> 524k about 20 min (oracle probe numbers); prefill ~550 t/s on an 8k prompt, ~330 t/s near 1M. Decode on v60 is not
 re-measured yet; on v59 it was 26.1 / 22.1 / 24.4 ms/token at 32k / 262k / 1M on my corpus (draft on, worst of 3 windows).
 
 ## 3. balkon: the 780M hands
@@ -61,14 +63,23 @@ re-measured yet; on v59 it was 26.1 / 22.1 / 24.4 ms/token at 32k / 262k / 1M on
 
 The disk prompt cache stores conversations under `--cache-disk DIR` in one subdirectory per compatibility key,
 `DIR/ns-<key>`. The key covers the model files, the context size, the KV types, the build's compute libraries and the
-format of the saved state. v60 changes
-the state format (patch 0239 adds an `IXY1` mark), so **v60 has a new key and starts with an empty namespace**. The old one is
-not deleted. To keep using the stored conversations, let v60 adopt the old namespace read-only:
+format of the saved state. v60 changes the state format (patch 0239 adds an `IXY1` mark), so **v60 has a new key and starts
+with an empty namespace**.
 
+**Adopt the old namespace; do not skip it.** The server treats every namespace with another key as foreign and cleans foreign
+namespaces up: one that is not adopted is deleted once it has been idle past `--cache-disk-ttl-days` (14 in my composes), or
+as soon as all foreign namespaces together exceed half of `--cache-disk-gib` (100 GiB with 200). A v59 1M namespace can be
+larger than that on its own, so a v60 start without the adopt lines can delete it at once, and a rollback to v59 would then
+find nothing. Only an adopted namespace is protected. If you may want to roll back, you can also copy the old namespace
+before the switch (`cp -a --reflink=auto ns-<key> <somewhere else>`; a reflink copy costs no space on XFS / Btrfs).
+
+0. **Update the checkout** to the v60 files: `git fetch origin && git checkout s1-public && git pull`. The commented adopt
+   block exists only in the v60 composes.
 1. **Before you stop v59**, note its key: `curl -s http://127.0.0.1:8000/disk-cache | python3 -c 'import sys, json;
    print(json.load(sys.stdin)["key"])'`, or look at the directory name: `ls deploy/s1/slots/prompt-cache/brain-1m/` shows
-   `ns-<key>` (16 hex digits). v59's log also prints `own key <key>` at start.
-2. **Edit the compose.** In `docker-compose.brain-1m.yml` uncomment the two lines under "upgrading from v59 or older" and put
+   `ns-<key>` (16 hex digits). v59's log also prints `own key <key>` at start. If there are several `ns-*` directories, use the
+   key `/disk-cache` reports: that is the one v59 writes to.
+2. **Edit the compose (required).** In `docker-compose.brain-1m.yml` uncomment the two lines under "upgrading from v59 or older" and put
    that key in place of `<old key>`:
    ```yaml
          - --cache-disk-adopt
@@ -92,9 +103,9 @@ What happens to the old entries (v59 and older, "unmarked"):
 - **Raw slot files** (`/slots?action=restore`) written by v59 are refused.
 - **Strict mode:** `LLAMA_LEGACY_UNMARKED=0` in the compose environment refuses every unmarked state and checkpoint (each a
   cache miss). The default is 1.
-- The old namespace is never written. Remove the adopt lines at the next key change, or once you no longer need the old
-  conversations; namespaces of other keys are removed only when idle past `--cache-disk-ttl-days` or over half the quota, and
-  an adopted one never.
+- The old namespace is never written by v60, and it is not deleted while it is adopted. Keep the adopt lines as long as you
+  might roll back or want the old conversations; once you remove them, the cleanup above applies to it (idle past the TTL, or
+  foreign namespaces over half the quota).
 
 On my box the switch was gated end to end: 24 of 24 checks passed (adopted load, new-vs-old tokens identical, re-save into the
 new namespace, restart, rollback load, old namespace byte-identical afterwards).
@@ -104,11 +115,22 @@ block; the directory is `slots/prompt-cache/hands`).
 
 ## 5. Rollback
 
-Restore the previous compose file (image `:v59` / `:v59k`, no `--cache-disk-adopt` line for the v59 key) and
-`docker compose ... up -d`. v59 opens its own namespace, which v60 only read, so it finds every conversation it had.
-Conversations saved by v60 are in v60's namespace and are not visible to v59: v59 refuses those entries cheaply (it reads the
-mark as an invalid stream and drops the entry, no large allocation). Switching forward again, v60 finds its namespace as it
-left it.
+```sh
+cd llama.cpp-s1-fork
+git checkout <the commit or tag you ran v59 from> -- deploy/    # the v59 composes (image :v59 / :v59k, no adopt lines)
+docker compose -f deploy/s1/docker-compose.brain-1m.yml up -d   # recreates the container on :v59
+# or keep the v60 file: comment the two adopt lines out again and start it with the v59 image
+LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v59 docker compose -f deploy/s1/docker-compose.brain-1m.yml up -d
+curl -s http://127.0.0.1:8000/disk-cache | python3 -c 'import sys, json; d = json.load(sys.stdin); print(d["key"], d["n_entries"])'
+```
+
+The last line should show the v59 key with its entries. If v60 ran with the adopt lines, v59 finds its namespace as it left
+it: v60 only read it. If v60 ran without them, the namespace may have been deleted (section 4); then restore your copy.
+
+Conversations saved by v60 are in v60's namespace, which v59 does not read (another key). To v59 it is a foreign namespace
+under the same cleanup rule: it survives the rollback only while it is younger than the TTL and the foreign namespaces stay
+under half the quota. A v60 state handed to v59 directly (a raw slot file) is refused cheaply: v59 reads the mark as an
+invalid stream and stops, no large allocation.
 
 ## 6. Smoke checks you can run
 
@@ -130,8 +152,9 @@ docker logs llama-s1-brain-1m 2>&1 | grep -E 'n_ctx *=|qsa_score_epilogue: |mmvq
 - The v60 startup lines: `qsa_score_epilogue: on`, `mmvq_hoist: on from 2 columns`, `kq_vis_mirror = on` (target and draft on the
   brain), `qsa_pooled_f16_mirror: on`. If one says off, an env variable in your compose is switching it off
   ([KNOBS.md](KNOBS.md), "v60 package").
-- GTT stays at the after-load level during a fill on s1 (`--kv-graph-span 0` reserves everything at load). An allocation error
-  at load means the GTT limit is too small.
+- GTT: 105 414 MiB after load on v60 and about 106 000 MiB after the first requests on my box; it must stay below the
+  admission bar (109 216 MiB with a 110 GiB GTT). `--kv-graph-span 0` reserves the compute buffers for the full span at load, so
+  an allocation error at load means the GTT limit is too small.
 - **Determinism:** send the same greedy request twice (`"temperature":0`, `"cache_prompt":false`) to `/completion` with
   `"n_predict":64` and compare `content`; they should match. Every finished request logs one
   `stop processing: ... stop=<eos|limit|word|cancel>` line.
