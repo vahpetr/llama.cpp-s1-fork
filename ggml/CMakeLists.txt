@@ -226,6 +226,7 @@ option(GGML_VULKAN_DEBUG                    "ggml: enable Vulkan debug output"  
 option(GGML_VULKAN_MEMORY_DEBUG             "ggml: enable Vulkan memory debug output"         OFF)
 option(GGML_VULKAN_SHADER_DEBUG_INFO        "ggml: enable Vulkan shader debug info"           OFF)
 option(GGML_VULKAN_QSA_KREUSE_NEGCTL        "ggml: Vulkan QSA_SCORE kr negative-control build (tests only)" OFF)
+option(GGML_VULKAN_QSA_TOPK_NOKEYS_NEGCTL   "ggml: Vulkan QSA select nokeys negative-control build (tests only)" OFF)
 option(GGML_VULKAN_VALIDATE                 "ggml: enable Vulkan validation"                  OFF)
 option(GGML_VULKAN_RUN_TESTS                "ggml: run Vulkan tests"                          OFF)
 option(GGML_WEBGPU                          "ggml: use WebGPU"                                OFF)

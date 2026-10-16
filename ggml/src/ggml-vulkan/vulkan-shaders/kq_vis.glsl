@@ -88,6 +88,32 @@ float kqv_value_of(const int p0, const uint sm, const int x0, const int y0, cons
     return 0.0;
 }
 
+#ifdef QSA_TOPK_NOKEYS
+// [TAG_QSA_TOPK_NOKEYS] the integer twin of kqv_value for flags without ALiBi and SWA (causal or not; f16 is irrelevant
+// there): true exactly where kqv_value returns +0, false where it returns -inf - the same conditions in the same order,
+// the same lazy loads, no float
+bool kqv_visible(const uint cbase, const uint n_kv, const uint j, const ivec4 t, const bool causal) {
+    const uint sm = uint(kqv_cell_load(cbase + n_kv + j));
+    if ((sm & uint(t.y)) == 0u) {
+        return false;
+    }
+    if (causal) {
+        const int p0 = kqv_cell_load(cbase + j);
+        if (p0 > t.x) {
+            return false;
+        }
+        if (p0 == t.x) {
+            const int x0 = kqv_cell_load(cbase + 2u * n_kv + j);
+            const int y0 = kqv_cell_load(cbase + 3u * n_kv + j);
+            if (y0 > t.w || (y0 == t.w && x0 > t.z)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+#endif
+
 // the mask value of cell j (of the stream whose planes start at cbase) for token record t, loading
 // the cell planes lazily: seq bits, then pos, then x / y only at a causal tie
 float kqv_value(const uint cbase, const uint n_kv, const uint j, const ivec4 t, const uint flags, const int n_swa) {

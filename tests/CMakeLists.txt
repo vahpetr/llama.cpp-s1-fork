@@ -250,6 +250,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # limit (the A2a fallback), bit for bit on a GPU; not a ctest - needs a Vulkan coopmat1 device, SKIP otherwise.
     # --perf: ms per call at the deployed chunk shape. A -DGGML_VULKAN_QSA_KREUSE_NEGCTL=ON build is its negative control.
     llama_build(test-qsa-score-kreuse.cpp)
+    # [TAG_QSA_TOPK_NOKEYS] the QSA selection without the key rows, knob off vs on: runs test-backend-ops -o QSA_TOP_K_NOKEYS in
+    # both arms and compares the dumped ordered ids byte for byte; not a ctest - needs a Vulkan device, SKIP otherwise.
+    # A -DGGML_VULKAN_QSA_TOPK_NOKEYS_NEGCTL=ON build is its negative control.
+    llama_build(test-qsa-topk-nokeys.cpp)
     llama_test(test-mtp-qsa-restore LABEL mtp)
     set_tests_properties(test-mtp-qsa-restore PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
     llama_test(test-mtp-qsa-restore NAME test-mtp-qsa-restore-phase LABEL mtp)

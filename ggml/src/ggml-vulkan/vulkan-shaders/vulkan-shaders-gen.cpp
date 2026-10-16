@@ -1102,6 +1102,13 @@ void process_shaders() {
     // [TAG_QSA_VIS] the QSA selection over the visibility metadata (ggml_qsa_top_k_vis), both kernels
     string_to_spv("topk_radix_select_vis_f32", "topk_radix_select.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}});
     string_to_spv("topk_radix_select_v2_vis_f32", "topk_radix_select_v2.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}});
+    // [TAG_QSA_TOPK_NOKEYS] the metadata variant's cell form without the key rows (A3); the negative-control build ranks the
+    // emit's ties in reverse (tests only)
+#ifdef GGML_VULKAN_QSA_TOPK_NOKEYS_NEGCTL
+    string_to_spv("topk_radix_select_v2_vis_nk_f32", "topk_radix_select_v2.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}, {"QSA_TOPK_NOKEYS", "1"}, {"QSA_TOPK_NOKEYS_NEGCTL", "1"}});
+#else
+    string_to_spv("topk_radix_select_v2_vis_nk_f32", "topk_radix_select_v2.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}, {"QSA_TOPK_NOKEYS", "1"}});
+#endif
     string_to_spv("qsa_bias_f32", "qsa_bias.comp", {}); // [TAG_QSA_COMPACT_BIAS]
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
