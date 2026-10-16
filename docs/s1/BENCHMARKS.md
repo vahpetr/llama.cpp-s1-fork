@@ -251,7 +251,7 @@ the 1M profile of the sections above. The stock argv is the fork's minus `--qsa-
 
 | measurement | stock b10689 | v60 | v60 vs stock |
 |---|---:|---:|---:|
-| cold prompt 8k / 32k / 72k / 128k, t/s | 353.8 / 312.6 / 247.8 / 192.0 | 544.3 / 455.8 / 338.2 / 245.9 | +53.9 / +45.8 / +36.5 / +28.1 % |
+| cold prompt 8k / 32k / 72k / 128k, t/s (128k: n = 1; both MTP off) | 353.8 / 312.6 / 247.8 / 192.0 | 544.3 / 455.8 / 338.2 / 245.9 | +53.9 / +45.8 / +36.5 / +28.1 % |
 | prefill steps 65 536 -> 261 120, aggregate, t/s | 107.3 | 124.1 | +15.7 % |
 | last step 207 110 -> 261 120, t/s | 81.4 | 91.4 | +12.2 % |
 | decode at 26k / 131k / 261k, MTP off, ms/token (restore path both) | 37.82 / 56.04 / 77.81 | 31.76 / 41.05 / 52.18 | +19.1 / +36.5 / +49.1 % t/s |
@@ -259,18 +259,18 @@ the 1M profile of the sections above. The stock argv is the fork's minus `--qsa-
 | GTT at 262k, MTP off | 88 137 MiB | 85 420 MiB | -3.1 % |
 | TTFT, continuation at 261.6k + 256 new tokens, median of 3 | 5 359 ms | 3 659 ms (MTP on) | x1.46 |
 
-- **No stock MTP number.** b10689 refused the sidecar draft GGUF (`failed to load draft model`); its `qwen4exp` has no MTP graph.
-- **Greedy-64 identity, stock vs fork, both MTP off: 62/64 tokens equal, first divergence at token 48.** Reported, not graded:
+- **No stock MTP number.** b10689 failed to load the sidecar draft GGUF (`failed to load draft model`); upstream `qwen4exp` has no MTP graph.
+- **Greedy-64 identity, stock vs fork, both MTP off: 62/64 tokens equal (against stock rep 0), first divergence at token 48.** Reported, not graded:
   stock lacks the GDN normalization fix (upstream PR #28068) and the fork's exactness patches.
 - **The stock server was not run-to-run deterministic in this run:** greedy-64 rep 0 != rep 1 on the same 2 000-token prompt
-  within one process; the fork arms passed the same probe. Observed once (2 reps); reported, not diagnosed.
+  within one process; the fork arms were deterministic (fk0 with the strict top-5 check, fkm tokens only). Observed once (2 reps); reported, not diagnosed.
 
 Method: corpus `tokens-s02.bin` (identical prompts in every arm), 1 slot, `-ub 2048`, KV q8_0. Cold prompts with
 `cache_prompt` false, median of 3 (128k: n = 1). Fill: continuous history, one request per step; the fork fills in its MTP-on
 process (the draft catches up on every prompt token), stock without a draft. Decode bands: greedy, 64 warm-up + 3 x 128 timed
 tokens of one request, median window; both MTP-off sides by the restore path (each from its own saved history), the fork MTP
 column continuous (a restore drops the draft KV). GTT at 262k: stock at the end of its continuous fill, fork in the MTP-off
-restore band at 261 120. TTFT: median of 3 (1 warm, 2 after a restore).
+restore band at 261 120 (the fork reserves the full KV at load). TTFT: median of 3 (1 warm, 2 after a restore).
 
 Not comparable:
 
