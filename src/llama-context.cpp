@@ -170,7 +170,7 @@ void llama_context::kqvis_prof_flush(const char * reason) const {
 // [TAG_QSA_POOLED_CACHE] (M3) the same callback also hashes every "indexer_k-<il>" - the pooled block keys the
 // selection scores - as one `[qsa-pooled]` line per (graph, layer) (see dump_pooled), so the pooled-key cache
 // (LLAMA_QSA_POOLED_CACHE=1) and the recompute can be compared value for value, not only by the ids they select.
-// [TAG_QSA_DUMP_IDS] (S0.1 oracle, contrib 0229) records for the EXACT oracle (scripts/bench/probe/oracle_probe.cpp):
+// [TAG_QSA_DUMP_IDS] (S0.1 oracle, contrib 0229) records for the EXACT oracle (an external probe tool):
 //   - every selection tensor computed (one per chunk with LLAMA_QSA_CHUNK) also gets an identity record keyed by its
 //     semantic position, not by the graph counter:
 //       [qsa-ids-chunk] ctx=<main|mtp> g=<graph> il=<il> chunk=<k> n_past=<pos of the ubatch's first token>

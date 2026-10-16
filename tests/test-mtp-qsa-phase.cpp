@@ -1,5 +1,5 @@
 // [TAG_MTP_QSA_PHASE] the sparse MTP draft's QSA block phase against the reference (M1 of
-// docs/verification/2026-10-07-mtp-indexer-parity.md in the piagent repo), on the CPU.
+// the MTP indexer parity notes), on the CPU.
 //
 // Entries e_k = (h_{k-1}, x_k), k >= 1. The fork's draft memory stores e_k at position k and a carrier row c at position 0;
 // SGLang's draft-extend keeps the target positions with the tokens shifted left, so it stores e_k at k - 1 and has no c.

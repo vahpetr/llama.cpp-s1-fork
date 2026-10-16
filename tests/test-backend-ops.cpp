@@ -7403,7 +7403,7 @@ struct test_topk_qsa : public test_case {
 // under it - the shader writes ids while other workgroups are still reading the score - so forcing
 // it would assert a graph the allocator cannot build. The reachability claim is checked where it
 // can be: the M2.1 replay runs the real ggml_gallocr over the production reserve graph and reports
-// dst-over-src overlaps for every QSA_TOP_K node (scripts/bench/probe/qsa_fusion_replay.cpp).
+// dst-over-src overlaps for every QSA_TOP_K node (an external fusion-replay probe).
 struct test_qsa_top_k : public test_case {
     const int64_t   n_blocks;
     const int64_t   n_kv;

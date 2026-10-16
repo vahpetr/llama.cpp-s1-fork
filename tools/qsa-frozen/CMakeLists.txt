@@ -1,4 +1,4 @@
-# [TAG_QSA_FROZEN] llama-qsa-frozen: fill / probe / replay for the frozen-M6 isolation (~/claude-tmp/codex/m6-frozen.sh)
+# [TAG_QSA_FROZEN] llama-qsa-frozen: fill / probe / replay for the frozen-M6 isolation
 set(TARGET llama-qsa-frozen)
 add_executable(${TARGET} qsa-frozen.cpp)
 # the attention cache's per-cell positions come from the internal memory classes, as in the tests

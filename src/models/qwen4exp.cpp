@@ -1089,7 +1089,7 @@ static bool qwen4exp_qsa_prefill_indexed() {
     return indexed;
 }
 
-// [TAG_QSA_INDEXED_SORT] (frozen-M6 isolation, ~/claude-tmp/codex/m6-frozen.sh) LLAMA_QSA_INDEXED_SORT=1 (default 0 = node for
+// [TAG_QSA_INDEXED_SORT] (frozen-M6 isolation) LLAMA_QSA_INDEXED_SORT=1 (default 0 = node for
 // node as before): the indexed flash attention reads each row's QSA_TOP_K ids SORTED ASCENDING, i.e. walks the selected
 // cells in KV order as the scan does, so an indexed-vs-scan difference that the order explains disappears with it (the
 // radix select emits winners, then ties, each run ascending). The ids are < 2^24, so cast to F32, argsort ascending,
@@ -2442,7 +2442,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
         // the surface that name refers to is the one the op exists not to materialize. The
         // selection keeps the name "indexer_top_k-<il>", so a diff of two runs on the SAME side of
         // the knob still pairs it. It does NOT pair ACROSS the knob: fa_rb_nodediff's key is
-        // name|op|type|ne (scripts/bench/probe/fa_rb_nodediff.cpp:281-290) and the op differs -
+        // name|op|type|ne (the node-diff tool's record key) and the op differs -
         // RESHAPE below, QSA_TOP_K here. Cross-arm equality is established by the corpus census and
         // by qsa_fusion_replay's REPLAY_QSA_OP_SELFTEST, not by the node diff.
         ggml_tensor * top_k = vis
@@ -3448,7 +3448,7 @@ static void qwen4exp_ple_prefetch(const ggml_tensor * t, const std::vector<int32
 //   "<n_tokens> <id0> <id1> ... <id_{n_heads*n_tokens-1}>"
 // the ids in exactly the layout the graph input holds them, head-minor: idx[i*n_heads + h], so a
 // reader recovers n_heads as (count-1)/n_tokens and the head of an id as (position % n_heads).
-// Consumed by scripts/bench/probe/ple_rowid_skew.py (unique fraction, hot-row and 4 KiB-page
+// Consumed by an external row-id skew analysis (unique fraction, hot-row and 4 KiB-page
 // coverage) -- no GPU and no server change needed to answer whether a packed hot-row cache pays.
 //
 // Cost when LLAMA_PLE_DUMP is unset: one load of a function-local static and a null test per

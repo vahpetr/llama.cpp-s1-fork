@@ -1826,7 +1826,7 @@ void llama_qsa_census_full(
         cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
     }
 
-    // [TAG_QSA_WHOLE_BLOCKS] D6 (docs/verification/2026-10-03-indexer-reference-notes.md): the spare id above is
+    // [TAG_QSA_WHOLE_BLOCKS] D6 (the indexer reference notes): the spare id above is
     // boosted for EVERY query, so every unpooled visible cell is selected outside the block budget - right for the
     // tail (the newest incomplete group of a sequence), wrong for a FRAGMENT: an incomplete group in an older bucket
     // (a block straddling a seq_cp fork point, a position hole), which the reference never forms because it groups

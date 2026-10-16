@@ -10,7 +10,7 @@
 //
 // [TAG_QSA_WHOLE_BLOCKS] LLAMA_QSA_WHOLE_BLOCKS=1 (default 0): the QSA selection in the reference's block-level form -
 // the indexer_top_k/r best whole blocks plus each query's (q+1) mod r tail cells (HF Qwen4ExpTextQSAIndexer, D1/D2 of
-// docs/verification/2026-10-03-indexer-reference-notes.md) - instead of the top indexer_top_k + r - 1 cells.
+// the indexer reference notes) - instead of the top indexer_top_k + r - 1 cells.
 // MODEL-OUTPUT knob: off is today's graph node for node.
 //
 // the parser: 0 for unset / "" / "0", 1 for "1", -1 for anything else (WARN, treated as 0)
@@ -82,7 +82,7 @@ bool llama_qsa_census_check();
 // f32 -> f16 (round to nearest even, denormals kept: ggml_fp32_to_fp16_row) of the f32 store row; the first mismatch
 // aborts. That checks the device conversion against the IEEE RNE reference; that the coopmat1 GEMM's own in-kernel
 // f32 -> f16 conversion is the same RNE was established by a probe on the 780M (MUL_MAT(store, I) rounded to f16 ==
-// the mirror, every element incl. denormals; A2a report) - the s1 unit's CHECK + the score-plane identity close it
+// the mirror, every element incl. denormals; A2a report) - the gfx1151 gate's CHECK + the score-plane identity close it
 // on gfx1151.
 bool llama_qsa_pooled_f16_mirror_check();
 
@@ -145,7 +145,7 @@ void llama_qsa_census_full(const llama_kv_cells & cells, bool is_pos_2d, int64_t
 
 // [TAG_MTP_QSA_PHASE] LLAMA_MTP_QSA_PHASE=1 (default 0, read once per process; honoured only in the MTP draft memory,
 // i.e. an indexer cache that holds no trunk layer): the reference block phase for the sparse MTP draft (M1 of
-// docs/verification/2026-10-07-mtp-indexer-parity.md). The draft stores e_k = (h_{k-1}, x_k) at position k plus a carrier
+// the MTP indexer parity notes). The draft stores e_k = (h_{k-1}, x_k) at position k plus a carrier
 // row at 0; SGLang stores e_k at k - 1. With phase 1 every census works on idx = pos - 1: bucket (pos - 1)/r, block rope
 // start pb*r + 1, tail start (q/r)*r + 1 - the reference's 4-blocks and tail. The carrier (idx -1) has no block, ever,
 // and is handled as the reference's absent entry: in both selection forms it goes to the second unused block id, which

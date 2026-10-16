@@ -1,5 +1,5 @@
 // [TAG_QSA_FROZEN] llama-qsa-frozen — the frozen-M6 isolation tool (roadmap v5.1 stage 0a, math-code audit queue #3 = Codex #4).
-// Spec: the header of ~/claude-tmp/codex/m6-frozen.sh. It separates the four effects mixed in the M6 gate's KL (membership,
+// It separates the four effects mixed in the M6 gate's KL (membership,
 // FA traversal order, kernel path, amplification) by freezing the inputs of one probe ubatch:
 //
 //   fill   -m GGUF --text FILE --depths D1,D2,... --probe 2048 --layers 3,23,47 --state-dir DIR --capture-dir DIR --out FILE

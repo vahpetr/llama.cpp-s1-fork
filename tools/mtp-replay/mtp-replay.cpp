@@ -1,6 +1,6 @@
 // llama-mtp-replay: teacher-forced crossed replay with direct logit capture - separates H3 (int8 prompt processing changes the
 // KV/GDN state + the MTP carrier, so the draft agrees less) from H5 (verify-batch numerics != plain decode) and measures the
-// draft-target disagreement per path (piagent docs/verification/2026-10-02-counsel-astra-int8-acceptance.md §2 + §5). The
+// draft-target disagreement per path (the int8 acceptance review, §2 + §5). The
 // int8 knobs (GGML_VK_DISABLE_MMQ_CM1, GGML_VK_MMQ_INT8_MIN_N / _OPS) are read at Vulkan device init: one process = one mode,
 // prefill mode P x verify mode V is crossed through state files.
 //   prefill: --prompt-text F [--chat] | --prompt-ids F, --state-out S [--gen G [--gen-out F]] - the prompt in -b chunks (target

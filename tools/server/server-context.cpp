@@ -6673,7 +6673,7 @@ private:
 
                 // [TAG_SPEC_TRACE_IDS] LLAMA_SPEC_TRACE_IDS=1 (debug, default off): one machine-readable line per verify
                 // round - the proposals (the drafted ids in order, committed replay tokens first), the verify width and the
-                // accepted ids - for scripts/bench/probe/spec_ids_compare.py (proposal identity across two runs, R83 stats)
+                // accepted ids - for an external comparer (proposal identity across two runs, R83 stats)
                 if (server_spec_trace_ids()) {
                     std::string sd, sa;
                     for (size_t i = 0; i < slot.spec_draft.size(); ++i) {
