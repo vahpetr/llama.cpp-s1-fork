@@ -23,14 +23,14 @@ parse_args "$@"
 BRAIN_CTX="${BRAIN_CTX:-1m}"
 case "$BRAIN_CTX" in
     1m)   COMPOSE="$HERE/docker-compose.brain-1m.yml";   CONTAINER=llama-s1-brain-1m;   NEED_GTT_MIB=112640
-          EXPECT="GTT after load ~105 000 MiB (102.7 GiB), flat at every depth; cold fill 0 -> 1M ~1.1 h, 0 -> 524k ~26 min" ;;
+          EXPECT="GTT after load ~105 400 MiB (102.9 GiB), flat at every depth; cold fill 0 -> 1M ~44 min, 0 -> 524k ~20 min" ;;
     524k) COMPOSE="$HERE/docker-compose.brain-524k.yml"; CONTAINER=llama-s1-brain-524k; NEED_GTT_MIB=98000
-          EXPECT="GTT after load ~94 500 MiB (92.3 GiB), flat at every depth; cold fill 0 -> 524k ~26 min" ;;
+          EXPECT="GTT after load ~94 500 MiB (92.3 GiB) on v59, a little more on v60, flat at every depth; cold fill 0 -> 524k ~26 min on v59 (faster on v60)" ;;
     *) die "BRAIN_CTX must be 1m or 524k" ;;
 esac
 export MODELS_DIR="${MODELS_DIR:-$HERE/models}"
 export SLOTS_DIR="${SLOTS_DIR:-$HERE/slots}"
-export LLAMA_S1_IMAGE="${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v59}"
+export LLAMA_S1_IMAGE="${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v60}"
 PORT=8000
 
 # ---- weights, sha256 as published on Hugging Face (LFS oid) and checked against my local files, as of 2026-10-10 ----------
