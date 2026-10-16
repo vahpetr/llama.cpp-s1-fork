@@ -20,7 +20,7 @@ services:
       context: ../..
       dockerfile: .devops/vulkan.Dockerfile
       target: server
-    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v59k}   # prebuilt; `docker compose build` builds the same thing from this tree
+    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v60k}   # prebuilt; `docker compose build` builds the same thing from this tree
     container_name: llama-s1-hands
     restart: unless-stopped
     stop_grace_period: 90s            # on SIGTERM the server writes its slots to the disk prompt cache
@@ -130,6 +130,12 @@ services:
       - "0.125"
       - "--cache-disk-ckpt-max"
       - "32"
+      # Upgrading from v59k or older: v60 changed the saved-state format, so the disk-cache key is new. To keep the stored
+      # conversations, uncomment the next two lines with the OLD key (the ns-<key> directory name in /slots/prompt-cache/hands,
+      # or "key" in GET /disk-cache of the old server): read-only, text entries load, image entries are refused, new saves go
+      # to the new namespace (docs/s1/DEPLOY.md). A fresh install has nothing to adopt.
+      # - "--cache-disk-adopt"
+      # - "<old key>"
       - "--no-context-shift"
       - "--spec-type"
       - "draft-mtp"
