@@ -163,7 +163,9 @@ services:
       # it starts with an empty namespace. To keep reading the old one, uncomment the next two lines and put the OLD key there:
       # the ns-<key> directory name of the old version, or "key" in GET /disk-cache of the old server (16 hex digits). It is
       # opened read-only: text conversations load, ones with images are refused (re-prefilled once), new saves go to the new
-      # namespace, and a rollback to the old image finds its namespace untouched. A fresh install has nothing to adopt.
+      # namespace, and a rollback to the old image finds its namespace untouched. Required when upgrading: a namespace that is
+      # NOT adopted is deleted by the cache cleanup once idle past --cache-disk-ttl-days or once foreign namespaces exceed half of
+      # --cache-disk-gib (a 1M namespace can on its own). A fresh install has nothing to adopt.
       # - --cache-disk-adopt
       # - "<old key>"
       - --slot-prompt-similarity
