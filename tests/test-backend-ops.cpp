@@ -1594,7 +1594,10 @@ struct test_case {
             // before any comparison can short-circuit the callback
             // the case's output node, named "out" by every selection test - one file per case, so a
             // graph that happens to carry a second TOP_K cannot overwrite it
-            if (dump_ids_dir() && (t1->op == GGML_OP_TOP_K || t1->op == GGML_OP_QSA_TOP_K) &&
+            // [TAG_QSA_TOPK_NOKEYS] also the (plane, metadata) concat of QSA_TOP_K_VIS / QSA_TOP_K_NOKEYS, ids as f32
+            if (dump_ids_dir() && (t1->op == GGML_OP_TOP_K || t1->op == GGML_OP_QSA_TOP_K ||
+                                   (t1->op == GGML_OP_CONCAT && (ud->tc->current_op_name == "QSA_TOP_K_VIS" ||
+                                                                 ud->tc->current_op_name == "QSA_TOP_K_NOKEYS"))) &&
                 strcmp(ggml_get_name(t1), "out") == 0) {
                 dump_ids(dump_ids_dir(), ud->tc->current_op_name + "(" + ud->tc->vars() + ")", bn1, t1, f1);
             }
@@ -9755,12 +9758,17 @@ static double qsa_vis_halves_differ(const float * x, size_t n, size_t half_strid
     return d;
 }
 
+// [TAG_QSA_TOPK_NOKEYS] modes 3.. (QSA_TOP_K_NOKEYS, the A3 domain and tie stress): 3 every block equal, 4 signed zeros
+// (+0 / -0) among quantized scores, 5 the normal boundary (FLT_MIN, its neighbours, +-0, 1e-30, -inf), 6 ties across
+// tiles (a long run of equal blocks that k cuts inside, spanning tile boundaries), 7 subnormal scores (OUTSIDE the
+// integer key's domain: a diagnostic registered only with GGML_TEST_NOKEYS_SUBNORMAL=1)
 struct test_qsa_top_k_vis : public test_case {
     const int64_t n_kv, n_tps, n_stream;
     const int     width, n_sel, mode, holes;
     const bool    rope2d, pad, mutate;
+    bool          nokeys_family = false;   // [TAG_QSA_TOPK_NOKEYS] reported as QSA_TOP_K_NOKEYS
 
-    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QSA_TOP_K_VIS"; }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return nokeys_family ? "QSA_TOP_K_NOKEYS" : "QSA_TOP_K_VIS"; }
     std::string vars() override {
         return VARS_TO_STR11(n_kv, n_tps, n_stream, width, n_sel, mode, holes, rope2d, pad, mutate, n_full());
     }
@@ -9821,6 +9829,15 @@ struct test_qsa_top_k_vis : public test_case {
                     r[b] = mode == 0 ? 8.0f*x                                                   // (almost) distinct
                          : (x < 0.6f ? 0.0f : std::floor(16.0f*u01(rng))/4.0f);                  // ReLU-tied, quantized
                     if (mode == 2 && u01(rng) < 0.05f) { r[b] = -INFINITY; }                    // dead blocks
+                    if (mode == 3) { r[b] = 0.5f; }                                             // every block equal
+                    if (mode == 4 && x < 0.5f) { r[b] = (rng() & 1u) ? 0.0f : -0.0f; }          // signed zeros
+                    if (mode == 5) {                                                            // the normal boundary
+                        static const float vals[8] = { FLT_MIN, 2.0f*FLT_MIN, std::nextafter(FLT_MIN, 1.0f), 0.0f, -0.0f,
+                                                       1e-30f, -INFINITY, 4.0f*FLT_MIN };
+                        r[b] = vals[rng() % 8u];
+                    }
+                    if (mode == 6) { r[b] = (b % 1500) < 900 ? 1.0f : 0.25f*std::floor(4.0f*x); } // ties across tiles
+                    if (mode == 7) { r[b] = x < 0.5f ? std::ldexp(1.0f + std::floor(8.0f*x), -140) : 0.0f; } // subnormal
                 }
                 if (mode == 2) {
                     // the census's +1e9 boost on the block of the row's own cell (the tail)
@@ -13387,6 +13404,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             fv(64,  4096, 2051, 1, true,  false);   // M-RoPE ties
             fv(64,  4096, 2051, 1, false, true);    // dead (-1) ids
             fv(9,   4096, 1,    1, false, false);   // one id: the row's own cell
+        }
+    }
+
+    // [TAG_QSA_TOPK_NOKEYS] (A3) QSA_TOP_K_NOKEYS: the metadata cell form against its plane form ON THE SAME BACKEND, bit for
+    // bit in order (the plane form always keeps the keyed passes, so with GGML_VK_QSA_TOPK_NOKEYS=1 this compares keyed and
+    // nokeys within one run), and against the CPU per row. The production shapes: decode / verify rows 1..9, the 128-query
+    // chunk and a ragged 100, depths 65 536 (one tile ragged: + 2047) and 262 145, two streams, k = 2051, the tie / domain
+    // modes 0..6 (7 = subnormal scores, outside the domain: only with GGML_TEST_NOKEYS_SUBNORMAL=1), holes 0 / 100 (100 =
+    // fewer visible cells than k), pad (the chunk tail). tests/test-qsa-topk-nokeys runs these with the knob off and on and
+    // compares the dumped ids (GGML_TEST_DUMP_IDS) byte for byte.
+    {
+        const bool sub = getenv("GGML_TEST_NOKEYS_SUBNORMAL") != nullptr;
+        auto nk = [&](int64_t n_kv, int64_t n_tps, int64_t ns, int mode, int holes, bool pad) {
+            auto * tc = new test_qsa_top_k_vis(n_kv, n_tps, ns, 2051, 0, mode, holes, false, pad, false);
+            tc->nokeys_family = true;
+            test_cases.emplace_back(tc);
+        };
+        const int modes_hi = sub ? 8 : 7;
+        for (int mode = 0; mode < modes_hi; ++mode) {
+            for (int64_t n_tps : { 1, 2, 3, 6, 9 }) {
+                nk(65536, n_tps, 1, mode, 0, false);
+            }
+            nk(65536 + 2047, 128, 1, mode, 0,   false);
+            nk(65536 + 2047, 100, 1, mode, 0,   true);
+            nk(65536,        128, 2, mode, 5,   false);
+            nk(65536,        128, 1, mode, 100, false);
+            nk(262144 + 1,   128, 1, mode, 0,   false);
         }
     }
 
