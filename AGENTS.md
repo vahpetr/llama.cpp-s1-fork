@@ -68,8 +68,9 @@ Fork code and commits carry `[TAG_<NAME>]` markers. `git grep -n TAG_GRAPH_CACHE
   `LLAMA_QSA_CENSUS_CHECK`, `LLAMA_KQ_VIS_MIRROR_CHECK`, `LLAMA_QSA_POOLED_F16_MIRROR_CHECK`). Since v60 the gate is my S0.1
   oracle: one probe program (private) drives the production configuration through fixed prompts and compares the new build
   with the previous one bit for bit - logits at every captured position, the saved states, the QSA ids per chunk (`[qsa-ids]`
-  sha256 records, patch 0229) - across verify widths 1-9, depths 8k -> 1M, and restore / replay histories. v60 vs v59: 1 502
-  logit positions and 224 state points identical, on gfx1151.
+  sha256 records, patch 0229) - at verify widths 1-6 in full and the last 6 positions of widths 7-9, depths 8k -> 1M, and
+  restore / replay histories. v60 vs v59: 1 502 logit positions and 224 state points identical, on gfx1151, the package as a
+  whole, production configuration minus the vision projector, one slot, text corpus.
 - **COMPOSITION**: same per-op math, different batching / routing / selection order, so near-ties can flip a token. Proof =
   teacher-forced replay after the first divergence: every divergence must be a near-tie or a selection flip that the reference
   also accepts (my "R81" classifier), plus needles and speed. A change that cannot be classified this way is treated as LOSSY.
