@@ -151,6 +151,7 @@ Per-round verify width with the draft on (width = sampled token + drafts):
 | v53 (QSA + sparse draft + graph cache) | 2026-10-09 | 61.0 | 550 | 51.6 | 407 | 59.9 | 421 | 1 slot |
 
 The stock rows used a different quant (IQ4_XS / UD-Q4_K_XL of the base model), so they are a rough reference, not a paired A/B.
+The paired A/B on the same GGUF (stock b10689 vs v60, n_ctx 262 144 dense) is section 9.
 At depth the gain comes from QSA (sparse attention over 2 051 selected cells per query instead of the whole context); at 1M it is
 the difference between possible and not.
 
@@ -240,3 +241,45 @@ off, KV f16 and contexts up to 128k. It is a different configuration, not a regr
 Pending (scheduled): the per-lever attribution arms (fork with B1 / B3 / B4 / B4c / C1 and the graph cache off, and a second
 arm with every other fork-only kernel off), the MTP-on arms, the backend-sampling arms, and a probe of which fork fusions
 actually fire on this model.
+
+## 9. Stock llama.cpp b10689 vs this fork (v60), same GGUF, gfx1151, n_ctx 262 144 dense (2026-10-16)
+
+Run `20261016-203641` on s1. Stock = the official image `ghcr.io/ggml-org/llama.cpp:server-vulkan-b10689` (build 10689 /
+57291f264); fork = the v60 image (845c6fbcd). Same files in every arm: Qwen3.8-Flash-Next-Uncensored i1-Q4_K_M + mmproj f16;
+the MTP draft only in the fork's MTP arm. n_ctx 262 144, attention dense on both sides (fork `--qsa-ratio 0`), so this is not
+the 1M profile of the sections above. The stock argv is the fork's minus `--qsa-ratio 0 --kv-graph-span 0`.
+
+| measurement | stock b10689 | v60 | v60 vs stock |
+|---|---:|---:|---:|
+| cold prompt 8k / 32k / 72k / 128k, t/s | 353.8 / 312.6 / 247.8 / 192.0 | 544.3 / 455.8 / 338.2 / 245.9 | +53.9 / +45.8 / +36.5 / +28.1 % |
+| prefill steps 65 536 -> 261 120, aggregate, t/s | 107.3 | 124.1 | +15.7 % |
+| last step 207 110 -> 261 120, t/s | 81.4 | 91.4 | +12.2 % |
+| decode at 26k / 131k / 261k, MTP off, ms/token (restore path both) | 37.82 / 56.04 / 77.81 | 31.76 / 41.05 / 52.18 | +19.1 / +36.5 / +49.1 % t/s |
+| decode at 26k / 131k / 261k, fork MTP on (continuous), ms/token | no stock MTP | 20.00 / 24.69 / 40.88 (acceptance 0.782 / 0.949 / 0.852) | +89.1 / +127.0 / +90.3 % vs stock MTP off |
+| GTT at 262k, MTP off | 88 137 MiB | 85 420 MiB | -3.1 % |
+| TTFT, continuation at 261.6k + 256 new tokens, median of 3 | 5 359 ms | 3 659 ms (MTP on) | x1.46 |
+
+- **No stock MTP number.** b10689 refused the sidecar draft GGUF (`failed to load draft model`); its `qwen4exp` has no MTP graph.
+- **Greedy-64 identity, stock vs fork, both MTP off: 62/64 tokens equal, first divergence at token 48.** Reported, not graded:
+  stock lacks the GDN normalization fix (upstream PR #28068) and the fork's exactness patches.
+- **The stock server was not run-to-run deterministic in this run:** greedy-64 rep 0 != rep 1 on the same 2 000-token prompt
+  within one process; the fork arms passed the same probe. Observed once (2 reps); reported, not diagnosed.
+
+Method: corpus `tokens-s02.bin` (identical prompts in every arm), 1 slot, `-ub 2048`, KV q8_0. Cold prompts with
+`cache_prompt` false, median of 3 (128k: n = 1). Fill: continuous history, one request per step; the fork fills in its MTP-on
+process (the draft catches up on every prompt token), stock without a draft. Decode bands: greedy, 64 warm-up + 3 x 128 timed
+tokens of one request, median window; both MTP-off sides by the restore path (each from its own saved history), the fork MTP
+column continuous (a restore drops the draft KV). GTT at 262k: stock at the end of its continuous fill, fork in the MTP-off
+restore band at 261 120. TTFT: median of 3 (1 warm, 2 after a restore).
+
+Not comparable:
+
+- 524k and 1M exist only in the fork (QSA + YaRN x4 over the native 262 144 window); stock stops at 262 144. QSA itself is
+  fork-only and off here; the 1M-profile step numbers (474.3 t/s at 196 608 -> 262 144 etc.) are QSA numbers, not these.
+- MTP needs the fork's sidecar draft GGUF (blk.48 nextn, vocabulary pruned to 65 536); upstream b10689 has no MTP graph.
+- Fork base is b10664 + PR #27742 + drluoto + the GDN fix, not b10689: "fork vs b10689" also contains ~25 upstream commits.
+- YaRN x4 (`--rope-scaling yarn --rope-scale 4 --yarn-orig-ctx 262144`) runs in both arms, as in the committed compose; a stock
+  user at 262k would not set it.
+- Decode bands differ by path: the MTP-off columns are restore-path on both sides, the fork MTP column is continuous.
+- Fork-only features (disk prompt cache, slot adoption, GTT admission, `--kv-graph-span`) are off or inert in every arm; the
+  fork's env knobs stay set in the fork arms.
