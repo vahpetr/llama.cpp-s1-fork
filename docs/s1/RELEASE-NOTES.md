@@ -23,7 +23,8 @@ composes: every new knob runs at its code default.
   marks its saved state (`IXY1`).
 - Diagnostics, off by default: QSA id / score dumps and a graph-cache trace (0229), a matmul dispatch log (0230), a
   per-round speculative ids trace (0238).
-- In the tree, off: a dense tile plan for the hc shapes (0233, B2): 2.6x slower on gfx1151 for one of its shapes.
+- Built, off by default, not in the gated configuration: a dense tile plan for the hc shapes (0233, B2); 2.6x slower on gfx1151
+  for one of its shapes. Its op tests are bit-identical; it is not EXACT-claimed.
 
 **Measured** (1M profile, oracle probe, v59 -> v60; details in BENCHMARKS.md section 0):
 
@@ -32,12 +33,15 @@ composes: every new knob runs at its code default.
 | fill step -> 262k / -> 524k / -> 1M | 368.0 / 284.1 / 194.9 t/s | 474.3 / 413.2 / 328.9 t/s | +28.9 / +45.4 / +68.7 % |
 | cold fill 0 -> 1M | 64.3 min | 44.0 min | -31.6 % time |
 | cold prompt 8k / 32k / 64k | 503.4 / 423.0 / 335.4 t/s | 548.8 / 458.6 / 357.8 t/s | +9.0 / +8.4 / +6.7 % |
-| GTT | 104 078 MiB (probe) / 104 591 MiB (server after load) | 104 900 / 105 414 MiB | +822 / +823 MiB |
+| GTT, probe fill-pass peak (no projector) | 104 078 MiB | 104 900 MiB | +822 MiB |
+| GTT, llama-server with the projector | 104 591 MiB (v59 live, just before the switch) | 105 414 MiB after load, 106 032 after the first requests | |
 | decode at depth, TTFT at 1M, server GTT peak over a fill | measured on v59 | pending | |
 
-**Class: EXACT.** On my S0.1 oracle v60 matched v59 bit for bit: logits at 1 502 positions, 224 saved states, and the QSA
-selected ids, across verify widths 1-9, depths 8k -> 1M, and restore / replay histories, on gfx1151 with the production
-configuration. Not covered: multi-slot stream offsets. The one change in behaviour is 0239's, and only for restored image
+**Class: EXACT.** The package as a whole, gated on gfx1151 with the 1M production configuration minus the vision projector,
+one slot, on my S0.1 oracle corpus (text): v60 matched v59 bit for bit, with logits at 1 502 positions, 224 saved states and the
+ordered QSA selected ids, at verify widths 1-6 in full and the last 6 positions of widths 7-9, depths 8k -> 1M, and restore /
+replay histories. Not covered: multi-slot stream offsets. No claim for other model families, and not a claim of equality with
+upstream. The one change in behaviour is 0239's, and only for restored image
 conversations, which were wrong before.
 
 **Disk cache: new key, the old namespace is adopted read-only.** The state format changed, so v60 writes to a new namespace.

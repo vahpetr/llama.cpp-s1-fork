@@ -16,7 +16,7 @@ KV q8_0, one slot, YaRN x4, QSA above 64k, s1 (Ryzen AI Max+ 395, GTT 110 GiB, V
 Method: my oracle probe, a small libllama program that drives the 1M brain configuration (same model files, flags and env as
 the compose, without the vision projector) through a fixed token corpus and logs the wall time of every operation. Fill rows:
 one continuous cold fill in steps of 65 536 tokens with the MTP draft on; t/s = new tokens / wall of the step. Cold prompt rows:
-the first prompt of a fresh process. v59 = rev `a1b6c324e` (plus the dump-only patch 0229, so both arms log the same records),
+cold (not cached) prompts in one fresh process; the 8k prompt is its first operation, 32k and 64k come later. v59 = rev `a1b6c324e` (plus the dump-only patch 0229, so both arms log the same records),
 v60 = rev `845c6fbcd`; same corpus, same argv and env; single runs, the two passes ran about a day apart. Before trusting the
 probe I checked it against llama-server on v59: the fill steps agree within 1.2 % and the whole fill within 0.2 % (section 2a).
 The probe's GTT has no vision projector, so it is not the server's GTT.
@@ -44,14 +44,17 @@ Server rows, llama-server with the full compose (vision projector loaded):
 |---|---|---|---|
 | GTT after load | 104 591 MiB | 105 414 MiB (+823) | the v60 deploy on 2026-10-16: v59 live just before the switch, v60 after load |
 | GTT after the deploy smoke requests | - | 106 032 MiB | same deploy; the admission bar is 109 216 |
-| GTT peak over a 1M fill | 105 196 MiB (section 2a) | pending (projection: ~106 018 MiB) | |
+| GTT peak over a 1M fill | 105 196 MiB (section 2a) | pending (at least 106 032 MiB, the after-smoke value) | |
+| GTT peak, oracle probe score-capture pass (no projector) | 105 538 MiB | 106 357 MiB (+819) | the gate's maximum; capture buffers, not a serving state |
 | decode at depth (worst of 3 windows, draft on) | 26.07 / 22.10 / 24.38 ms/tok at 32k / 262k / 1M (section 2a) | pending | |
-| TTFT, 256 new tokens on a warm 1M history | 2 054 ms (section 2a) | pending | |
+| TTFT, 256 new tokens on a 1M history | 2 452 ms median of 3 (2 054 ms warm, section 2a) | pending | |
 | cold prompt 128k | 377.9 t/s (section 2a) | pending | |
 
 Class: EXACT. On my S0.1 oracle (fixed prompts, greedy; every compared position's logits, the saved states and the QSA
-selected ids, across verify widths 1-9, depths 8k -> 1M, and restore / replay histories) v60 matched v59 bit for bit at all
-1 502 compared logit positions and 224 state points. The gate ran on gfx1151 with the production configuration (one slot);
+selected ids in order, at verify widths 1-6 in full and the last 6 positions of widths 7-9, depths 8k -> 1M, and restore /
+replay histories) v60 matched v59 bit for bit at all 1 502 compared logit positions and 224 state points. The gate ran on
+gfx1151 with the production configuration minus the vision projector (one slot, a text corpus); it covers the package as a
+whole, not each patch alone, and the B2 tile (0233, off by default) was not in it;
 multi-slot stream offsets were not covered. On the live server after the switch, three fixed requests (a 32k prompt, a chat,
 a needle at 26.7k) gave the same tokens and the same number of accepted drafts as on v59; on the 32k prompt the top-5
 logprobs differed by exactly 0.
@@ -229,6 +232,10 @@ above, so this is not a like-for-like allocation comparison).
 Identity: greedy 64 tokens on a ~1k prompt were identical in both builds; the top-5 logprobs were not (top-5 id lists equal at
 45 of 64 positions, max |delta logprob| 1.9 on matching ids). The fork claims EXACT only for Qwen3.8-Flash-Next against its own
 previous version; for this model it is a different build with different numerics, not an EXACT claim.
+
+Why these decode numbers are higher than the A3B row in section 7 (decode 31 t/s) and my earlier 31-33 ms/token band for
+this model on this box: those were measured with the MTP draft on (my A3B hands compose: draft-mtp, KV q8_0); this A/B runs MTP
+off, KV f16 and contexts up to 128k. It is a different configuration, not a regression.
 
 Pending (scheduled): the per-lever attribution arms (fork with B1 / B3 / B4 / B4c / C1 and the graph cache off, and a second
 arm with every other fork-only kernel off), the MTP-on arms, the backend-sampling arms, and a probe of which fork fusions
