@@ -60,6 +60,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -941,7 +942,17 @@ int main(int argc, char ** argv) {
     common_log_set_verbosity_thold(-1);
     llama_backend_init();
 
-    std::string dir = argc > 1 ? argv[1] : "/tmp";
+    // a private scratch directory per run: the ctest variants (plain / -qsa) run in parallel and use the same file names
+    std::string dir;
+    bool own_dir = false;
+    if (argc > 1) {
+        dir = argv[1];
+    } else {
+        char tmpl[] = "/tmp/test-cell-ext-restore-XXXXXX";
+        GGML_ASSERT(mkdtemp(tmpl) != nullptr);
+        dir = tmpl;
+        own_dir = true;
+    }
     const std::string gguf_path = dir + "/test-cell-ext-restore-ple-" + std::to_string(getpid()) + ".gguf";
 
     for (const bool ple : { false, true }) {
@@ -962,6 +973,11 @@ int main(int argc, char ** argv) {
     }
 
     bench_ext_copy();
+
+    if (own_dir && getenv("TEST_CELL_EXT_DUMP") == nullptr) {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
 
     llama_backend_free();
     printf("%s: %d ok, %d failed\n", n_fail ? "FAIL" : "PASS", n_ok, n_fail);
