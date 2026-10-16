@@ -6,15 +6,41 @@ box with a Ryzen 9 7940HS and a Radeon 780M (RDNA3, 96 GB) serves as the "hands"
 
 The model is **Qwen3.8-Flash-Next** (`qwen4exp`): a 177B-parameter MoE (125B weights + a 51B n-gram embedding table, ~6B active
 per token, MTP head, vision). Stock llama.cpp runs it at ~24-27 t/s with a dense 262k window and no working speculative
-decoding. This fork runs it with a **1 048 576-token context in one slot at 35-60 t/s decode**, in 102.7 GiB of GPU memory.
+decoding. This fork runs it with a **1 048 576-token context in one slot at 35-60 t/s decode**, in about 103 GiB of GPU memory.
 
 Everything here was measured on my two boxes. Numbers, dates and image versions: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md).
+Deploying it, upgrading and rolling back: [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md). Flags and knobs: [docs/s1/KNOBS.md](docs/s1/KNOBS.md).
+
+## What v60 adds (2026-10-16)
+
+v60 is v59 plus fourteen patches (0227-0240) aimed at prefill on this GPU, mostly at depth: fused hyper-connection tails and a
+GDN conv input without the concat pass, MoE expert GEMMs with a one-time f16 cast of the activations and a larger tile, a
+16 x 16 tile for the m = 4 hyper-connection inject, the QSA indexer score as one op with an f16 mirror of its pooled keys, a
+mat-vec that unpacks the weights once per row for the speculative verify widths, and a device-resident KQ visibility mirror.
+Every one of them is EXACT: on my oracle v60 gives bit-identical logits, saved states and selected ids to v59. One defect is
+fixed (0239: a restored conversation with images lost the image tokens' positions in the indexer cache); because of it the
+saved-state format changed, so v60 has a new disk-cache key and adopts the v59 cache read-only (DEPLOY.md, section 4).
+Release notes: [docs/s1/RELEASE-NOTES.md](docs/s1/RELEASE-NOTES.md).
+
+1M brain profile, i1-Q4_K_M + MTP draft, KV q8_0, one slot, v59 -> v60:
+
+| metric | v59 | v60 | change | method |
+|---|---|---|---|---|
+| prefill of the 65 536-token step ending at 262k / 524k / 1M | 368.0 / 284.1 / 194.9 t/s | **474.3 / 413.2 / 328.9 t/s** | +28.9 / +45.4 / +68.7 % | oracle probe, continuous cold fill, draft on |
+| cold fill 0 -> 1M | 64.3 min | **44.0 min** | -31.6 % time | oracle probe, sum of 18 prefill steps |
+| cold prompt 8k / 32k / 64k | 503.4 / 423.0 / 335.4 t/s | 548.8 / 458.6 / 357.8 t/s | +9.0 / +8.4 / +6.7 % | oracle probe, first prompt of the process |
+| GTT after load | 104 591 MiB | 105 414 MiB | +823 MiB | llama-server with the vision projector, deploy smoke |
+| decode at depth, TTFT at 1M | 26.1 / 22.1 / 24.4 ms/tok at 32k / 262k / 1M; TTFT 2.05 s | pending | | llama-server, my corpus, draft on |
+
+The probe is a libllama program that runs the compose's configuration (without the projector) through a fixed corpus; on v59
+it matched llama-server within 1.2 % per step. Single runs, the v59 and v60 passes about a day apart.
 
 ## What it gives
 
-Same box, one conversation, one slot for the fork's current column (the fork columns use the i1-Q4_K_M weights):
+Same box, one conversation, one slot for the fork's current column (the fork columns use the i1-Q4_K_M weights). The last
+column is the v53 suite of 2026-10-09/10 (v54-v59 have the same numerics); v60's prefill gains are in the table above:
 
-| | stock llama.cpp (Aug 2026) | this fork, dense (Sep 9) | this fork now (v53-v59) |
+| | stock llama.cpp (Aug 2026) | this fork, dense (Sep 9) | this fork, v53-v59 |
 |---|---|---|---|
 | decode, empty context | 24-27 t/s | 49.6 t/s (Sep 6) | **61 t/s** |
 | decode at 107k / 213k | - | 41.8 / 29.4 t/s | **51.6 / 59.9 t/s** |
@@ -66,7 +92,7 @@ What does that:
 - **Telemetry.** The stop type of every reply at INFO (`stop=eos|limit|word|cancel`), per-round speculative timings, `kqvis-prof`
   lines, expert-occupancy stats, `disk_cache_*` in `/metrics`, `GET /disk-cache`.
 
-The full list (226 numbered changes, including upstream back-ports): [docs/s1/PATCHES.md](docs/s1/PATCHES.md).
+The full list (240 numbered changes, including upstream back-ports): [docs/s1/PATCHES.md](docs/s1/PATCHES.md).
 
 ## What is hardware-specific and what is not
 
@@ -76,8 +102,32 @@ The full list (226 numbered changes, including upstream back-ports): [docs/s1/PA
   matrices on a large MoE; I measured them on gfx1151 and gfx1103 only.
 - **Generic (libllama / server / webui, any backend):** the QSA model logic and memory, graph and plan cache, disk prompt cache,
   GTT admission (reads an AMD sysfs file; the path is a knob), the webui, the speculative-decoding fixes, the logs.
-- **Model-specific:** QSA and the MTP work apply to `qwen4exp` only. Other models run as on upstream.
+- **Model-specific:** QSA and the MTP work apply to `qwen4exp` only. Other models run upstream's model code with the fork's
+  generic kernels.
 - **Not tested:** ROCm/HIP and NVIDIA. The new ops have CPU and Vulkan implementations only.
+
+### Other models
+
+Which v60-era levers can help another model:
+
+| lever | patches / knob | scope |
+|---|---|---|
+| B1: MoE expert GEMMs, f16 pre-cast of B + BM 128 x BN 64 tile | 0231, 0232 | generic: any `mul_mat_id` on AMD coopmat1 with q4_K / q5_0 / q8_0 / q6_K / iq3_s experts |
+| B4: GDN conv input without the concat pass | 0228 | generic fusion (CONCAT + SSM_CONV); fires where a model's graph has that shape. Whether it does on Qwen3.6: pending |
+| B4c: 16 x 16 tile for m <= 16 matmuls | 0234 | generic: dense matmul with m <= 16, q4_K / q8_0 weights, AMD coopmat1 |
+| C1: mat-vec unpack hoist | 0236 | generic: mat-vec at 2-8 columns (speculative verify widths) |
+| graph + allocation-plan cache | 0192-0196, `LLAMA_GRAPH_CACHE` | generic (libllama) |
+| disk prompt cache | `--cache-disk` | generic (server) |
+| B3: hc_mix tail fusion | 0227 | Qwen3.8-Flash-Next only (the sites are its hyper-connections and QSA pooling) |
+| QSA line: A1 score epilogue, A2a f16 mirror, the indexer cache and 0239 | 0118-0161, 0235, 0239, 0240 | Qwen3.8-Flash-Next only |
+
+One A/B so far on another family: Qwen3.6-35B-A3B UD-Q4_K_XL on the 780M (KV f16, 262k context, one slot, MTP off), upstream
+b10689 vs this fork at the v60 revision with the graph cache on. Cold prefill 8k / 32k / 72k: 304.7 / 212.5 / 131.4 ->
+312.5 / 226.1 / 153.1 t/s (+2.6 / +6.4 / +16.5 %, median of 3). Decode at depth 4k / 32k / 128k: 53.9 / 63.1 / 91.6 -> 46.6 /
+55.2 / 86.2 ms/token (one request per depth, no noise band). Greedy tokens were identical, the logprobs were not: this is
+another family with other numerics, and I make no EXACT claim for it. The fork's base is b10664 plus drluoto's branch, so the
+comparison also contains about 25 upstream commits; the arms that switch the fork's levers off one group at a time, and the
+MTP-on arms, are pending. Details: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md), section 8.
 
 ## Hardware and host setup
 
@@ -101,13 +151,16 @@ checks their sha256; (hands only) re-encodes the BF16 hyper-connection weights a
 `tools/s1/gguf_hc_q8.py`; pulls the image (or builds it with `BUILD=1`); starts the compose file and smoke-tests it.
 `--dry-run` shows every step first. Which weights and why: [docs/s1/WEIGHTS.md](docs/s1/WEIGHTS.md). I redistribute no weights;
 they come from their authors' Hugging Face repos.
-The published images (`vahpetr/llama-cpp-s1-fork:v59` = `:latest`, `:v59k`) are built from my `prod-v11-stage7` revision
-(v59 = `a1b6c324e`; `:v58` / `:v58k` stay as the rollback); this `s1-public` branch only adds docs and deploy files on top.
+The published image `vahpetr/llama-cpp-s1-fork:v60` = `:v60k` = `:latest` (one digest,
+`sha256:794113766af1129c65e9541bcc4b9b3bac4d378fa38b38cd4d7c5f00fbf7a0d1`) is built from my `prod-v11-stage8-pkg7` revision
+(v60 = `845c6fbcd`; `:v59` / `:v59k` stay as the rollback); this `s1-public` branch only adds docs and deploy files on top.
+Upgrading an install with stored conversations from v59: the disk-cache key changes, see
+[docs/s1/DEPLOY.md](docs/s1/DEPLOY.md), section 4 (one `--cache-disk-adopt` line).
 My production draft head is a vocabulary-pruned variant built from my own traffic, so the public setup uses dzannotti's
 full-vocabulary head, and the decode numbers above are an upper bound for it.
 
-First start on s1: GTT after load ~105 000 MiB (1M) or ~94 500 MiB (524k), flat afterwards; the first long prompt fills at
-~550 t/s falling to ~190 t/s near 1M.
+First start on s1: GTT after load ~105 400 MiB (1M, v60) or ~94 500 MiB (524k, v59; v60 adds the f16 mirror, not measured
+there), flat afterwards; the first long prompt fills at ~550 t/s falling to ~330 t/s near 1M (v60).
 
 ## Known limitations
 
@@ -118,6 +171,8 @@ First start on s1: GTT after load ~105 000 MiB (1M) or ~94 500 MiB (524k), flat 
 - **Two slots give no extra throughput** on these boxes (-15 % total, measured). A second slot is for concurrency only.
 - **After a checkpoint rewind** (disk cache, branch, copy) the continuation can differ from a fresh prefill at near-tie tokens:
   the same math in a different batch composition. The state itself is verified, the text is not guaranteed byte-identical.
+- **Pre-v60 disk-cache entries with images are not loaded by v60** (they may carry the defect 0239 fixes); text entries are.
+  A rollback to v59 does not see conversations saved by v60.
 - One model load per GPU at a time; a build or a second load next to a loaded 1M model has run my box out of memory.
 - Single-user setups. No multi-tenant hardening beyond upstream's.
 
