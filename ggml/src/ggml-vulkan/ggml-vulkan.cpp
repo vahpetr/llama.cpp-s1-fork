@@ -1292,8 +1292,10 @@ struct vk_device_struct {
     bool fuse_concat_ssm_conv;
     // [TAG_VK_DISPATCH_LOG] GGML_VK_DISPATCH_LOG=1: one [vk-dispatch] line per MUL_MAT / MUL_MAT_VEC / MUL_MAT_ID dispatch
     bool dispatch_log;
-    // [TAG_QSA_SCORE_KREUSE] GGML_VK_QSA_SCORE_KREUSE (default on; 0 = the A2a dispatch order)
-    bool qsa_score_kreuse;
+    // [TAG_QSA_SCORE_KREUSE] GGML_VK_QSA_SCORE_KREUSE (default on; 0 = the A2a dispatch order); the kr dispatch's workgroup
+    // count limit (maxComputeWorkGroupCount[0], or the smaller GGML_VK_QSA_SCORE_KREUSE_MAX_WG test hook)
+    bool     qsa_score_kreuse;
+    uint32_t qsa_score_kreuse_max_wg;
     // [TAG_MMID_PRECAST_B] GGML_VK_MMID_PRECAST_B (default on)
     bool mmid_precast_b;
     // split a dim-0 concat with a transposed src1 into copy + tiled transpose-copy
@@ -5803,8 +5805,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // the slot the F32 plan picks, never by an f16 plan
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f16_f32_rows_qsa, matmul_f16_f32_rows_qsa, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
         // [TAG_QSA_SCORE_KREUSE] the same three twins, workgroups numbered M tile major (same flags, slots, tiles, spec and
-        // push constants); not created with the knob off
-        if (device->qsa_score_kreuse) {
+        // push constants); not created with the knob off. The shader decodes (ir, ic) from x with its spec-constant BM / BN,
+        // the host builds x from wg_denoms: a tile table whose two sides disagree leaves the twins uncreated (fail closed)
+        const bool kr_tiles_agree = l_warptile[1] == l_wg_denoms[0] && l_warptile[2] == l_wg_denoms[1] &&
+                                    m_warptile[1] == m_wg_denoms[0] && m_warptile[2] == m_wg_denoms[1] &&
+                                    s_warptile[1] == s_wg_denoms[0] && s_warptile[2] == s_wg_denoms[1];
+        if (device->qsa_score_kreuse && !kr_tiles_agree) {
+            GGML_LOG_WARN("ggml_vulkan: qsa_score_kreuse: the f32 tile table's BM/BN differ from its wg_denoms - kr twins not created\n");
+        }
+        if (device->qsa_score_kreuse && kr_tiles_agree) {
             CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_qsa_kr, matmul_f32_f32_qsa_kr, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
             CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_rows_qsa_kr, matmul_f32_f32_rows_qsa_kr, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
             CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f16_f32_rows_qsa_kr, matmul_f16_f32_rows_qsa_kr, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
@@ -8448,15 +8457,30 @@ static vk_device ggml_vk_get_device(size_t idx) {
                           device->subgroup_require_full_support ? 1 : 0);
         }
 
-        // [TAG_QSA_SCORE_KREUSE] read before the pipelines are declared (=0: the kr twins are never created)
+        // [TAG_QSA_SCORE_KREUSE] read before the pipelines are declared (=0: the kr twins are never created).
+        // GGML_VK_QSA_SCORE_KREUSE_MAX_WG=<n> (test hook, default unset): a smaller workgroup-count limit for the kr dispatch, so
+        // the fallback to the A2a dispatch (plane beyond the limit) can be exercised on a real device
         device->qsa_score_kreuse = ggml_vk_env_bool("GGML_VK_QSA_SCORE_KREUSE", true);
+        device->qsa_score_kreuse_max_wg = device->properties.limits.maxComputeWorkGroupCount[0];
+        if (const char * mw = getenv("GGML_VK_QSA_SCORE_KREUSE_MAX_WG")) {
+            const long long v = atoll(mw);
+            if (v > 0 && (uint64_t) v < device->qsa_score_kreuse_max_wg) {
+                device->qsa_score_kreuse_max_wg = (uint32_t) v;
+            }
+        }
 
         ggml_vk_load_shaders(device);
 
         // [TAG_QSA_SCORE_KREUSE] the proof line
         if (device->coopmat_support && !device->coopmat2) {
+#ifdef GGML_VULKAN_QSA_KREUSE_NEGCTL
+            const char * negctl = " NEGATIVE-CONTROL BUILD: the kr twins sum K in the wrong order";
+#else
+            const char * negctl = "";
+#endif
             GGML_LOG_WARN("ggml_vulkan: qsa_score_kreuse: %s (GGML_VK_QSA_SCORE_KREUSE; QSA_SCORE planes of >= 2 N tiles dispatched "
-                          "key tile major)\n", device->qsa_score_kreuse ? "on" : "off");
+                          "key tile major; max %u workgroups)%s\n", device->qsa_score_kreuse ? "on" : "off",
+                          device->qsa_score_kreuse_max_wg, negctl);
         }
 
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
@@ -11974,9 +11998,13 @@ static void ggml_vk_mul_mat_vec_rows(ggml_backend_vk_context * ctx, vk_context& 
 // [TAG_QSA_SCORE_KREUSE] the pipeline a QSA_SCORE node runs on: the plan above (the F32 plan's slot, its f16-A twin with the
 // mirror) and, where eligible, that pipeline's kr twin - the same per-tile program, its workgroups numbered key tile major
 // (x = ir * blocks_n + ic) so the N tiles of one key tile run back to back. Eligible (fail closed): the knob on, the kr twin
-// created, at least two N tiles in the plane (one tile = nothing to reuse: the decode / verify widths 3..9 and every chunk
-// of <= 32 queries on the 128-wide tile keep the A2a dispatch), split_k 1 (asserted), blocks_m * blocks_n within
-// maxComputeWorkGroupCount[0] (and its element count within 32 bits). The mat-vec widths (1..2) never reach QSA_SCORE (supports_op). Shared by the dispatch and
+// created, at least two N tiles in the plane (one tile = nothing to reuse), split_k 1 (asserted), blocks_m * blocks_n within
+// maxComputeWorkGroupCount[0] (or the GGML_VK_QSA_SCORE_KREUSE_MAX_WG test hook) and its element count within 32 bits.
+// Which widths that leaves on the A2a dispatch depends on the tile the F32 plan picks (n_head = 4, N = 4 * queries): with
+// M > 32 the decode / verify widths 3..8 (N 12..32, s tile BN 32) and 9 (N 36, m tile BN 64) are one N tile and keep it;
+// with M <= 32 (the s tile, BN 32) width 9 (N 36) is two N tiles and takes the kr twin, as does any width >= 9 there. On
+// the deployed pools (M >= 16384 blocks) widths 3..9 never take it; a 128-query chunk (N 512, l tile BN 128) always does.
+// The cache reuse is an observed effect of the order, not relied on; the bits do not depend on it. The mat-vec widths (1..2) never reach QSA_SCORE (supports_op). Shared by the dispatch and
 // the [vk-fusion-count] key so the two cannot disagree.
 struct vk_qsa_score_plan {
     vk_pipeline pipeline;
@@ -12015,9 +12043,11 @@ static vk_qsa_score_plan ggml_vk_qsa_score_plan(ggml_backend_vk_context * ctx, c
     plan.blocks_n = CEIL_DIV(N, plan.pipeline->wg_denoms[1]);
     const uint64_t n_wg = (uint64_t) plan.blocks_m*plan.blocks_n;
     if (ctx->device->qsa_score_kreuse && plan.blocks_n >= 2 &&
-        n_wg <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] && n_wg*plan.pipeline->wg_denoms[0] <= UINT32_MAX) {
+        n_wg <= ctx->device->qsa_score_kreuse_max_wg && n_wg*plan.pipeline->wg_denoms[0] <= UINT32_MAX) {
         vk_pipeline kr = ggml_vk_qsa_kr_twin(ctx->device, plan.pipeline, rows != nullptr, a16 != nullptr);
-        if (kr != nullptr && kr->wg_denoms == plan.pipeline->wg_denoms && kr->align == plan.pipeline->align) {
+        if (kr != nullptr) {
+            // the twin is the same CREATE_MM slot (same tile table): its tile / alignment must be the per-tile twin's
+            GGML_ASSERT(kr->wg_denoms == plan.pipeline->wg_denoms && kr->align == plan.pipeline->align);
             plan.pipeline = kr;
             plan.kr       = true;
         }

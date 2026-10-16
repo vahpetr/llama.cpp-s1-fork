@@ -246,8 +246,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # [TAG_QSA_POOLED_F16_MIRROR] the f16 pooled-key mirror through the model graph on a GPU (mirror off vs on + CHECK: full-pool
     # writer, dirty writer, restore, the MTP draft store); not a ctest - needs a Vulkan coopmat1 device, SKIP otherwise
     llama_build(test-qsa-f16-mirror.cpp)
-    # [TAG_QSA_SCORE_KREUSE] the QSA_SCORE pooled-key reuse across query tiles, knob off vs on (and capped), bit for bit on a
-    # GPU; not a ctest - needs a Vulkan coopmat1 device, SKIP otherwise. --perf: ms per call at the deployed chunk shape
+    # [TAG_QSA_SCORE_KREUSE] the QSA_SCORE pooled-key reuse across query tiles, knob off vs on vs on with a tiny workgroup
+    # limit (the A2a fallback), bit for bit on a GPU; not a ctest - needs a Vulkan coopmat1 device, SKIP otherwise.
+    # --perf: ms per call at the deployed chunk shape. A -DGGML_VULKAN_QSA_KREUSE_NEGCTL=ON build is its negative control.
     llama_build(test-qsa-score-kreuse.cpp)
     llama_test(test-mtp-qsa-restore LABEL mtp)
     set_tests_properties(test-mtp-qsa-restore PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")

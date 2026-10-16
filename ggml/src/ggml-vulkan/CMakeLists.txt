@@ -139,6 +139,12 @@ if (Vulkan_FOUND)
         list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_SHADER_DEBUG_INFO=ON)
     endif()
 
+    # [TAG_QSA_SCORE_KREUSE] negative-control build for tests/test-qsa-score-kreuse only (wrong summation order in the kr twins)
+    if (GGML_VULKAN_QSA_KREUSE_NEGCTL)
+        add_compile_definitions(GGML_VULKAN_QSA_KREUSE_NEGCTL)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_QSA_KREUSE_NEGCTL=ON)
+    endif()
+
     if (GGML_VULKAN_VALIDATE)
         add_compile_definitions(GGML_VULKAN_VALIDATE)
     endif()
