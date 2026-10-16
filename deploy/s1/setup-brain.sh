@@ -23,9 +23,9 @@ parse_args "$@"
 BRAIN_CTX="${BRAIN_CTX:-1m}"
 case "$BRAIN_CTX" in
     1m)   COMPOSE="$HERE/docker-compose.brain-1m.yml";   CONTAINER=llama-s1-brain-1m;   NEED_GTT_MIB=112640
-          EXPECT="GTT after load ~105 400 MiB (102.9 GiB), flat at every depth; cold fill 0 -> 1M ~44 min, 0 -> 524k ~20 min" ;;
+          EXPECT="GTT ~105 400 MiB after load, ~106 000 MiB after the first requests (bar 109 216); cold fill 0 -> 1M ~44 min, 0 -> 524k ~20 min" ;;
     524k) COMPOSE="$HERE/docker-compose.brain-524k.yml"; CONTAINER=llama-s1-brain-524k; NEED_GTT_MIB=98000
-          EXPECT="GTT after load ~94 500 MiB (92.3 GiB) on v59, a little more on v60, flat at every depth; cold fill 0 -> 524k ~26 min on v59 (faster on v60)" ;;
+          EXPECT="GTT after load ~94 500 MiB (92.3 GiB) on v59, more on v60 (not measured); cold fill 0 -> 524k ~26 min on v59 (faster on v60)" ;;
     *) die "BRAIN_CTX must be 1m or 524k" ;;
 esac
 export MODELS_DIR="${MODELS_DIR:-$HERE/models}"
