@@ -23,7 +23,7 @@ parse_args "$@"
 COMPOSE="$HERE/docker-compose.hands.yml"; CONTAINER=llama-s1-hands; NEED_GTT_MIB=79872
 export MODELS_DIR="${MODELS_DIR:-$HERE/models}"
 export SLOTS_DIR="${SLOTS_DIR:-$HERE/slots}"
-export LLAMA_S1_IMAGE="${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v60k}"
+export LLAMA_S1_IMAGE="${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v61k}"
 PORT=8000
 TOOL="$ROOT/tools/s1/gguf_hc_q8.py"
 

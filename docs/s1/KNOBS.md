@@ -60,6 +60,8 @@ against the code for this table.
 | `GGML_VK_QSA_SCRATCH_PRESIZE=1`, `..._FA=1` | 0 | presize the selection / indexed-FA scratch at load | SCHED | 1, 1 |
 | `GGML_VK_QSA_TOPK=v1\|v2` | v2 | top-k kernel (v2 = distributed radix threshold, byte-identical to v1) | EXACT | - |
 | `GGML_VK_QSA_TOPK_WAVE`, `GGML_VK_QSA_TOPK_CPT` | auto | top-k subgroup size / cells per invocation | EXACT | - |
+| `GGML_VK_QSA_SCORE_KREUSE=0` | on | v61, 0241: key-tile-major dispatch of the indexer score GEMM (A2b); details in "v61 package" below | EXACT | - |
+| `GGML_VK_QSA_TOPK_NOKEYS=0` | on | v61, 0243: top-k select without key rows (A3); details in "v61 package" below | EXACT | - |
 
 ## MTP draft - `LLAMA_MTP_*`
 
@@ -117,6 +119,20 @@ against the code for this table.
 | `GGML_VK_ASYNC_READ_UMA=1`, `GGML_VK_ASYNC_READ_COPYBUF=1`, `GGML_VK_FLOPS_SEED_LEGACY=1`, `GGML_VK_DISABLE_DESCRIPTOR_REUSE=1` | 0 | readback / submit / descriptor variants (A/B) | EXACT | - |
 | `GGML_VK_DISABLE_FUSION_PATTERNS=a,b`, `GGML_VK_FUSION_LIST=1`, `GGML_VK_FUSION_COUNT=1`, `GGML_VK_FUSION_DIAG=1`, `GGML_VK_SUBMIT_LOG=1` | - | fusion / submit diagnostics | DIAG | - |
 | `GGML_SCHED_PROFILE=1`, `GGML_GET_ROWS_STATS=1\|2` | 0 | host-side scheduler timers, get_rows census | DIAG | - |
+
+## v61 package - patches 0241-0243
+
+Both are in v61 and neither is set in my composes: the "default" column is what v61 runs. On by default, EXACT as part of the
+gated package (bit-identical logits, states and ordered selected ids against the v59 reference on my oracle, and each lever's
+off arm equal to the same reference; docs/s1/BENCHMARKS.md section 0a). The `=0` switches exist for A/B runs and to bisect.
+Each prints one startup line (shown in the effect column). 0242 has no knob.
+
+| knob | default | effect | class | prod |
+|---|---|---|---|---|
+| `GGML_VK_QSA_SCORE_KREUSE=0` | on | 0241 (A2b): a QSA_SCORE plane of >= 2 N tiles (a prefill chunk: 128 queries x 4 heads = 4 N tiles) runs on the `*_qsa_kr` twin of the pipeline v60 picks, with the workgroups numbered key tile major, so the workgroups reading one tile of pooled keys are dispatched back to back. Each workgroup runs the same per-tile program, so the bits do not change. Needs coopmat1 (not coopmat2) and split_k 1; one-N-tile planes (decode / verify widths) keep the v60 dispatch. `=0`: the v60 dispatch order, the kr pipelines are not created. Startup line `qsa_score_kreuse: on\|off (...; max <n> workgroups)` | EXACT | - |
+| `GGML_VK_QSA_SCORE_KREUSE_MAX_WG=N` | unset (device limit) | 0241: a plane whose workgroup count exceeds `maxComputeWorkGroupCount[0]` falls back to the v60 dispatch; this test hook lowers that limit (only values below the device's are taken) so the fallback can be exercised on a real device | EXACT (the gate ran it at 4) | - |
+| `GGML_VK_QSA_TOPK_NOKEYS=0` | on (with the v2 select) | 0243 (A3): the cell form of the QSA top-k select (`topk_radix_select_v2_vis_nk`) computes each cell's key from the score bits and the visibility with integer instructions instead of storing and re-loading per-cell key rows; the scratch has no key region (a 524k test: 258 -> 32.25 MiB preallocated). Equal to the keyed path for finite / -inf, non-subnormal scores. The block form and v1 are unchanged. `=0`: the v60 keyed path. Startup line `qsa_topk: v2 ...; nokeys on\|off` | EXACT | - |
+| `GGML_VK_QSA_TOPK_NOKEYS_CHECK=1` | off | 0243, debug: flags visible scores outside the domain where the integer key equals the keyed one (subnormal / NaN / +inf) in a host-visible word and logs one WARN at synchronize; it does not change the selection | DIAG | - |
 
 ## v60 package - patches 0227-0240
 
