@@ -6,7 +6,7 @@ One entry per published image. Older versions (v52-v59) are summarised in the li
 ## v61 - 2026-10-17
 
 Images: `vahpetr/llama-cpp-s1-fork:v61` = `:v61k` = `:latest`
-(`HUBDIGEST_V61`), revision `7a438f3ba` (`prod-v11-stage8-pkg8`).
+(`sha256:46fc98c6f86902b220309e172691758e9806eaf2fc411a640d4ac2f5595b7c63`), revision `7a438f3ba` (`prod-v11-stage8-pkg8`).
 Rollback: `:v60` / `:v60k` (`845c6fbcd`). In production on my s1 brain (1M profile) since 2026-10-17 15:31; the balkon hands
 run `:v61k`.
 
@@ -29,7 +29,7 @@ new knobs run at their code default (on).
 | cold fill 0 -> 1M | 44.0 min | 41.8 min | -5.0 % time |
 | cold prompt 8k / 32k / 64k | 548.8 / 458.6 / 357.8 t/s | 550.0 / 457.5 / 357.9 t/s | +0.2 / -0.2 / +0.0 % |
 | GTT, probe peak (score-capture pass) / fill-pass peak (no projector) | 106 357 / 104 900 MiB | 106 095 / 104 544 MiB | -262 / -356 MiB |
-| GTT, llama-server with the projector, after load | 105 414 MiB | 105 495 MiB (105 519 after the smoke requests) | +81 MiB |
+| GTT, llama-server with the projector, after load | 105 414 MiB | 105 495 MiB (105 519 peak after the smoke requests) | +81 MiB |
 | A2b score GEMM per call, 16 shapes (kernel test, gate run) | | median ratio 0.877 (0.673-1.097) | at pools >= 98 304 blocks: -30 to -32 % (f32 rows), -12 to -23 % (f16 mirror, the production form) |
 | A3 select, one QSA layer, 64k step -> 262k / -> 524k / -> 1M | 1.834 / 3.757 / 7.616 s | 1.219 / 2.993 / 6.097 s | -33.6 / -20.3 / -20.0 % |
 | decode at depth, TTFT at 1M, server GTT peak over a fill | pending | pending | |
