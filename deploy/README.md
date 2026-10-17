@@ -56,7 +56,7 @@ git archive <rev> | docker build -f .devops/vulkan.Dockerfile --build-arg APP_RE
 ```
 
 v61 = rev `7a438f3ba` (the `prod-v11-stage8-pkg8` head; this branch adds docs, deploy files, `tools/s1` and comment scrubs on top). `:v61`, `:v61k`
-and `:latest` are one image (digest `HUBDIGEST_V61`), built on the
+and `:latest` are one image (digest `sha256:46fc98c6f86902b220309e172691758e9806eaf2fc411a640d4ac2f5595b7c63`), built on the
 780M box; my s1 production image is the same revision built on s1, and the EXACT gate ran on that one. Rollback: `:v60` /
 `:v60k` (rev `845c6fbcd`, one image, `sha256:794113766af1129c65e9541bcc4b9b3bac4d378fa38b38cd4d7c5f00fbf7a0d1`; same
 disk-cache key as v61) and `:v59` / `:v59k` (rev `a1b6c324e`, one image,
