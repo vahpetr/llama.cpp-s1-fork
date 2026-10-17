@@ -5,8 +5,8 @@ contributor rules for llama.cpp itself are in
 [upstream AGENTS.md](https://github.com/ggml-org/llama.cpp/blob/master/AGENTS.md); they apply to anything sent upstream from here.
 Read README.md first, then docs/s1/KNOBS.md (every flag and env knob) and docs/s1/PATCHES.md (every change, numbered).
 
-This tree is **v60** (2026-10-16): fork revision `845c6fbcd` (`prod-v11-stage8-pkg7`) plus the docs and deploy files of this
-`s1-public` branch. Image `vahpetr/llama-cpp-s1-fork:v60` (= `:v60k` = `:latest`); deploy steps in docs/s1/DEPLOY.md, what
+This tree is **v61** (2026-10-17): fork revision `7a438f3ba` (`prod-v11-stage8-pkg8`) plus the docs and deploy files of this
+`s1-public` branch. Image `vahpetr/llama-cpp-s1-fork:v61` (= `:v61k` = `:latest`); deploy steps in docs/s1/DEPLOY.md, what
 changed in docs/s1/RELEASE-NOTES.md.
 
 ## Where the fork's code lives
@@ -39,7 +39,7 @@ Fork code and commits carry `[TAG_<NAME>]` markers. `git grep -n TAG_GRAPH_CACHE
 `TAG_QSA_DUMP_SCORE` (0229), `TAG_VK_DISPATCH_LOG` (0230), `TAG_MMID_PRECAST_B` / `TAG_MMID_TILE_B1` (0231 / 0232),
 `TAG_DENSE_TILE_B2` (0233), `TAG_INJECT_TILE_M16` (0234), `TAG_QSA_SCORE_EPILOGUE` (0235), `TAG_MMVQ_HOIST` (0236),
 `TAG_KQ_VIS_MIRROR` (0237), `TAG_SPEC_TRACE_IDS` (0238), `TAG_CELL_EXT_RESTORE` / `TAG_CELL_EXT_PROVENANCE` (0239),
-`TAG_QSA_POOLED_F16_MIRROR` (0240). New work gets a new tag in both the code comment and the commit subject.
+`TAG_QSA_POOLED_F16_MIRROR` (0240); v61 added `TAG_QSA_SCORE_KREUSE` (0241) and `TAG_QSA_TOPK_NOKEYS` (0243). New work gets a new tag in both the code comment and the commit subject.
 
 ## Build and test contract
 
@@ -70,7 +70,8 @@ Fork code and commits carry `[TAG_<NAME>]` markers. `git grep -n TAG_GRAPH_CACHE
   with the previous one bit for bit - logits at every captured position, the saved states, the QSA ids per chunk (`[qsa-ids]`
   sha256 records, patch 0229) - at verify widths 1-6 in full and the last 6 positions of widths 7-9, depths 8k -> 1M, and
   restore / replay histories. v60 vs v59: 1 502 logit positions and 224 state points identical, on gfx1151, the package as a
-  whole, production configuration minus the vision projector, one slot, text corpus.
+  whole, production configuration minus the vision projector, one slot, text corpus; v61 the same against the same v59
+  reference, plus an off arm per lever (docs/s1/BENCHMARKS.md section 0a).
 - **COMPOSITION**: same per-op math, different batching / routing / selection order, so near-ties can flip a token. Proof =
   teacher-forced replay after the first divergence: every divergence must be a near-tie or a selection flip that the reference
   also accepts (my "R81" classifier), plus needles and speed. A change that cannot be classified this way is treated as LOSSY.
