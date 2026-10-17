@@ -28,7 +28,7 @@ v61 is v60 plus three patches. Two are speed levers for the QSA indexer at depth
 The package is EXACT, gated the same way as v60: on gfx1151 with the 1M production configuration minus the vision projector,
 one slot, my S0.1 oracle corpus (text), v61 matched the v59 reference bit for bit (logits at 1 502 positions, 224 state
 points, ordered selected ids, restore / replay histories); with A2b off, A2b forced onto its fallback (a 4-workgroup limit)
-and A3 off, the short case set matched the same reference. 91 checks PASS, 4 INFO, 0 FAIL (13 h 35 min). The state format
+and A3 off, the short case set matched the same reference. 91 checks PASS, 4 INFO, 0 FAIL (13 h 35 min wall, 13 h 21 min of sections). The state format
 and the disk-cache key are v60's: an install on v60 switches by changing the image (the v59 adopt line, if you have it, stays
 as it is).
 Release notes: [docs/s1/RELEASE-NOTES.md](docs/s1/RELEASE-NOTES.md).
@@ -43,7 +43,7 @@ Release notes: [docs/s1/RELEASE-NOTES.md](docs/s1/RELEASE-NOTES.md).
 | step on a restored prefix, -> 262k / -> 524k / -> 1M | 472.8 / 413.1 / 326.0 t/s | 488.4 / 432.3 / 355.6 t/s | +3.3 / +4.6 / +9.1 % | oracle probe |
 | GTT peak, oracle probe (no projector) | 106 357 MiB | 106 095 MiB | -262 MiB | the gate's score-capture pass; admission bar 109 216 |
 | GTT peak, oracle probe fill pass | 104 900 MiB | 104 544 MiB | -356 MiB | the gate's fill pass |
-| GTT, llama-server with the vision projector, after load | 105 414 MiB | 105 495 MiB (105 519 after the smoke requests) | +81 MiB | deploy smokes, 2026-10-16 / 2026-10-17 |
+| GTT, llama-server with the vision projector, after load | 105 414 MiB | 105 495 MiB (105 519 peak after the smoke requests) | +81 MiB | deploy smokes, 2026-10-16 / 2026-10-17 |
 | decode at depth, TTFT at 1M | pending | pending | | |
 
 Kernel level, s1: the A2b score GEMM per call at the deployed chunk shape, 16 shapes (pool 16 384-262 144 blocks, key forms
@@ -231,7 +231,7 @@ checks their sha256; (hands only) re-encodes the BF16 hyper-connection weights a
 `--dry-run` shows every step first. Which weights and why: [docs/s1/WEIGHTS.md](docs/s1/WEIGHTS.md). I redistribute no weights;
 they come from their authors' Hugging Face repos.
 The published image `vahpetr/llama-cpp-s1-fork:v61` = `:v61k` = `:latest` (one digest,
-`HUBDIGEST_V61`) is built from my `prod-v11-stage8-pkg8` revision
+`sha256:46fc98c6f86902b220309e172691758e9806eaf2fc411a640d4ac2f5595b7c63`) is built from my `prod-v11-stage8-pkg8` revision
 (v61 = `7a438f3ba`; `:v60` / `:v60k` stay as the rollback, v60 = `845c6fbcd`, digest
 `sha256:794113766af1129c65e9541bcc4b9b3bac4d378fa38b38cd4d7c5f00fbf7a0d1`); this `s1-public` branch adds docs, deploy files,
 `tools/s1` and comment scrubs on top.

@@ -97,7 +97,7 @@ Kernel level (s1, rev `7a438f3ba`, knob off vs on in one build):
 |---|---|---|---|
 | A2b: QSA_SCORE ms per call at the deployed chunk shape, 16 shapes (pool 16 384-262 144 blocks; f32 rows and f16-mirror forms), the gate's run | | | median ratio 0.877 (min 0.673, max 1.097) |
 | A2b: pool 262 144 blocks, f16-mirror form (the production form at 3+ rows) / f32 rows, the gate's run | 2.929 / 3.870 ms | 2.568 / 2.696 ms | -12.3 / -30.3 % |
-| A2b: pools 98 304-262 144 blocks, gate's run / a second run the same day | | | f32 rows -30.3 to -32.2 / -30.2 to -32.5 %; f16 mirror -12.3 to -22.6 / -15.9 to -21.2 % |
+| A2b: pools 98 304-262 144 blocks, gate's run / a second run the same day (medians 0.877 / 0.830) | | | f32 rows -30.3 to -32.2 / -30.2 to -32.5 %; f16 mirror -12.3 to -22.6 / -15.9 to -21.2 % |
 | A2b: pools 16 384-65 536 blocks, gate's run | | | -32.7 to +9.7 % (small calls, mixed) |
 | A3: QSA_TOP_K GPU time, one QSA layer, 64k step -> 262k / -> 524k / -> 1M | 1.834 / 3.757 / 7.616 s | 1.219 / 2.993 / 6.097 s | -33.6 / -20.3 / -20.0 % |
 | A3: selection scratch preallocated (524k test fill) | 258.00 MiB | 32.25 MiB | -225.75 MiB (the cell-form scratch 257 -> 1 MiB) |
