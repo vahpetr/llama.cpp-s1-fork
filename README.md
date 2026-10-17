@@ -147,22 +147,24 @@ Which v60-era levers can help another model:
 | lever | patches / knob | scope |
 |---|---|---|
 | B1: MoE expert GEMMs, f16 pre-cast of B + BM 128 x BN 64 tile | 0231, 0232 | generic: any `mul_mat_id` on AMD coopmat1 with q4_K / q5_0 / q8_0 / q6_K / iq3_s experts |
-| B4: GDN conv input without the concat pass | 0228 | generic fusion (CONCAT + SSM_CONV); fires where a model's graph has that shape. Whether it does on Qwen3.6: pending |
+| B4: GDN conv input without the concat pass | 0228 | generic fusion (CONCAT + SSM_CONV); fires where a model's graph has that shape. On Qwen3.6-35B-A3B it does not fire (probe, 2026-10-17) |
 | B4c: 16 x 16 tile for m <= 16 matmuls | 0234 | generic: dense matmul with m <= 16, q4_K / q8_0 weights, AMD coopmat1 |
 | C1: mat-vec unpack hoist | 0236 | generic: mat-vec at 2-8 columns (speculative verify widths), MMVQ q4_0 / q5_0 / q8_0 / q4_K and f32 x f32 |
 | graph + allocation-plan cache | 0192-0196, `LLAMA_GRAPH_CACHE` | generic (libllama) |
 | disk prompt cache | `--cache-disk` | generic (server) |
-| B3: hc_mix tail fusion | 0227 | a generic graph-pattern fusion (multi_add + SCALE, SCALE + SILU); the sites I know are Qwen3.8-Flash-Next's hyper-connections and QSA pooling. Whether it fires on other models: pending (probe not run) |
+| B3: hc_mix tail fusion | 0227 | a generic graph-pattern fusion (multi_add + SCALE, SCALE + SILU); the sites I know are Qwen3.8-Flash-Next's hyper-connections and QSA pooling. On Qwen3.6-35B-A3B it does not fire (probe, 2026-10-17) |
 | QSA line: A1 score epilogue, A2a f16 mirror, the indexer cache and 0239 | 0118-0161, 0235, 0239, 0240 | Qwen3.8-Flash-Next only |
 
-One A/B so far on another family: Qwen3.6-35B-A3B UD-Q4_K_XL on the 780M (KV f16, 262k context, one slot, MTP off), upstream
+One A/B so far on another family: Qwen3.6-35B-A3B UD-Q4_K_XL on the 780M (KV f16, 262k context, one slot), upstream
 b10689 vs this fork at the v60 revision with `GGML_VK_DISABLE_MMQ_CM1=1 GGML_VK_FREE_WAIT_IDLE=1 GGML_ALLOC_GROW_SLACK=10
-LLAMA_RESERVE_RUNTIME_SHAPE=1 LLAMA_GRAPH_CACHE=8` (the int8 MMQ switch keeps both arms on the same matmul path). Cold prefill 8k / 32k / 72k: 304.7 / 212.5 / 131.4 ->
-312.5 / 226.1 / 153.1 t/s (+2.6 / +6.4 / +16.5 %, median of 3). Decode at depth 4k / 32k / 128k: 53.9 / 63.1 / 91.6 -> 46.6 /
-55.2 / 86.2 ms/token (one request per depth, no noise band). Greedy tokens were identical, the logprobs were not: this is
-another family with other numerics, and I make no EXACT claim for it. The fork's base is b10664 plus drluoto's branch, so the
-comparison also contains about 25 upstream commits; the arms that switch the fork's levers off one group at a time, and the
-MTP-on arms, are pending. Details: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md), section 8.
+LLAMA_RESERVE_RUNTIME_SHAPE=1 LLAMA_GRAPH_CACHE=8` (the int8 MMQ switch keeps both arms on the same matmul path), run 2026-10-17.
+MTP off: cold prefill 8k / 32k / 72k 304.1 / 212.9 / 130.7 -> 310.7 / 225.1 / 152.6 t/s (+2.2 / +5.7 / +16.8 %); decode at depth
+4k / 32k / 128k 49.77 / 56.03 / 85.28 -> 46.22 / 54.62 / 84.38 ms/token (one request per depth, no noise band). The fork's base
+is b10664 plus drluoto's branch, so "fork vs upstream" also contains about 25 upstream commits. Per-lever split done (the same
+fork with the levers off): +3.7 / +1.5 / +1.1 % prefill at 8k / 32k / 72k, attributed mainly to B1; decode below 1 % (n = 1,
+not measurable); B3/B4 do not fire; MTP on +8.9 / +3.3 % at 4k / 32k and -7.8 % at 128k with lower draft acceptance (0.890 vs
+0.924) (n = 1); greedy tokens identical 64/64 in every pair. No EXACT claim for this
+family (other numerics). Details: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md), section 8.
 
 ## Hardware and host setup
 

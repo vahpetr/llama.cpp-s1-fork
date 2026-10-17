@@ -197,50 +197,115 @@ loads at 6.8 GB/s cold, 8.8-10 GB/s from page cache. For comparison, re-prefill 
 
 QSA on the 780M at 128k: +48 % prefill, +68 % decode vs dense. `-ub 4096`, forced MMVQ and int8 MMQ: no gain.
 
-## 8. Another model family: Qwen3.6-35B-A3B on the 780M, upstream vs this fork (2026-10-16, partial)
+## 8. Another model family: Qwen3.6-35B-A3B on the 780M, upstream vs this fork (2026-10-17)
 
 Question: do the generic levers help a model the fork was not built for? Model Qwen3.6-35B-A3B UD-Q4_K_XL (unsloth's file, MTP head included), balkon
-(Radeon 780M, Vulkan/RADV, Mesa 25.2.8), the hands server stopped. Both arms: `-c 262144 --parallel 1 -ngl 999 -b 2048 -ub 2048
--t 8 -tb 8 --no-mmap --fit off --cache-ram 0`, KV f16 and flash attention at upstream's defaults, MTP off. Upstream = the official
-image `ghcr.io/ggml-org/llama.cpp:server-vulkan-b10689`. Fork = this tree at the v60 revision with `GGML_VK_DISABLE_MMQ_CM1=1
-GGML_VK_FREE_WAIT_IDLE=1 GGML_ALLOC_GROW_SLACK=10 LLAMA_RESERVE_RUNTIME_SHAPE=1 LLAMA_GRAPH_CACHE=8` (the int8 MMQ switch keeps
-the arms on the same matmul path: b10689 predates upstream's int8 coopmat1 MMQ).
+(Radeon 780M, Vulkan/RADV, Mesa 25.2.8, kernel 7.0.0-38), the hands server stopped. All arms: `-c 262144 --parallel 1 -ngl 999 -b 2048 -ub 2048
+-t 8 -tb 8 --no-mmap --fit off --cache-ram 0`, no `--cache-disk`, KV f16 and flash attention at upstream's defaults, one slot. Upstream = the official
+image `ghcr.io/ggml-org/llama.cpp:server-vulkan-b10689`, no env. Fork = this tree at the v60 revision (image `flash-next:vulkan-pkg7-845c6fb`).
+Arms and their env, verbatim:
 
-Caveat: the fork's base is b10664 plus drluoto's branch, not b10689, so "fork vs upstream" also contains about 25 upstream
-commits and the drluoto changes. The per-lever split (the same fork with the listed levers switched off) is pending.
+- **fork** (fk; fkc = the same env on the same night as fk0a/fk0b): `GGML_VK_DISABLE_MMQ_CM1=1 GGML_VK_FREE_WAIT_IDLE=1 GGML_ALLOC_GROW_SLACK=10 LLAMA_RESERVE_RUNTIME_SHAPE=1 LLAMA_GRAPH_CACHE=8`
+- **fk0a** (the listed levers off, graph cache off): `GGML_VK_DISABLE_MMQ_CM1=1 GGML_VK_FREE_WAIT_IDLE=1 GGML_ALLOC_GROW_SLACK=10 LLAMA_RESERVE_RUNTIME_SHAPE=1 GGML_VK_MMID_PRECAST_B=0 GGML_VK_MMID_TILE_BM128=0 GGML_VK_FUSE_MULTI_ADD_SCALE=0 GGML_VK_FUSE_SCALE_SILU=0 GGML_VK_FUSE_CONCAT_SSM_CONV=0 GGML_VK_DENSE_TILE_M16=0 GGML_VK_MMVQ_HOIST=0`
+- **fk0b** (every fork-only knob off): `GGML_VK_DISABLE_MMQ_CM1=1 GGML_VK_FREE_WAIT_IDLE=1 GGML_ALLOC_GROW_SLACK=10 LLAMA_RESERVE_RUNTIME_SHAPE=1 GGML_VK_MMID_PRECAST_B=0 GGML_VK_MMID_TILE_BM128=0 GGML_VK_FUSE_MULTI_ADD_SCALE=0 GGML_VK_FUSE_SCALE_SILU=0 GGML_VK_FUSE_CONCAT_SSM_CONV=0 GGML_VK_DENSE_TILE_M16=0 GGML_VK_MMVQ_HOIST=0 GGML_VK_FUSE_GDN_PRE=0 GGML_VK_FUSE_SIGMOID_MUL=0 GGML_VK_FUSE_HC_COMBINE=0 GGML_VK_CONCAT_TRANSPOSE=0 GGML_VK_MMID_COMPACT=0 GGML_VK_DISABLE_HOIST_ROW_IDS=1 GGML_VK_FA_GQA_TOKENS=0 GGML_VK_FA_NO_ZERO_DEAD_V=1 LLAMA_GDN_NO_DIRECT=1 LLAMA_SAMPLER_FASTPATH=0`
 
-Cold prefill, t/s, median of 3:
+`GGML_VK_DISABLE_MMQ_CM1=1` keeps the fork on the same matmul path as upstream (b10689 predates upstream's int8 coopmat1 MMQ).
+MTP-on arms add `draft-mtp` (n-max 3, p-min 0.7); the -bs arms add backend sampling.
 
-| prompt | upstream b10689 | fork (v60 rev) | change |
+Mixed reference: the fork's base is b10664 plus drluoto's branch and a GDN fix, not b10689, so "fork vs upstream" mixes the
+fork's levers with about 25 upstream commits, the drluoto changes and fork-only default kernels. Per-lever attribution comes
+only from fk vs fk0a. fk0b vs upstream bounds what is not a fork knob; some fk0b knobs may also switch off paths upstream has,
+so it is a lower bound, not an upstream equivalent. Gain columns: positive = the first-named build is better (higher t/s,
+lower ms/token).
+
+Cold prefill, t/s, median (MTP off):
+
+| prompt | upstream | fork | fork vs up | fkc | fk0a | fk vs fk0a | fk0b | fk0b vs up | n up/fk/fkc/fk0a/fk0b |
+|---|---|---|---|---|---|---|---|---|---|
+| 8k | 304.1 | 310.7 | +2.2 % | 330.7 | 318.9 | **+3.7 %** | 280.1 | -7.9 % | 3/3/1/1/1 |
+| 32k | 212.9 | 225.1 | +5.7 % | 227.8 | 224.5 | **+1.5 %** | 199.4 | -6.3 % | 3/3/1/1/1 |
+| 72k | 130.7 | 152.6 | +16.8 % | 153.3 | 151.6 | **+1.1 %** | 122.8 | -6.0 % | 3/3/1/1/1 |
+
+The fk vs fk0a column uses fkc (same night as fk0a/fk0b).
+
+Decode right after each cold prefill, ms/token (128 tokens, median over the repeats):
+
+| prompt | upstream | fork | fork vs up | fk0a | fk vs fk0a |
+|---|---|---|---|---|---|
+| 8k | 46.48 | 46.91 | -0.9 % | 46.78 | +0.0 % |
+| 32k | 53.50 | 54.42 | -1.7 % | 54.30 | -0.2 % |
+| 72k | 65.17 | 66.84 | -2.6 % | 66.86 | -0.1 % |
+
+Decode at depth, MTP off, ms/token (median of 3 windows of 128 tokens of one request per depth: n = 1, no noise band):
+
+| depth | upstream | fork | fork vs up | fkc | fk0a | fk vs fk0a | fk0b |
+|---|---|---|---|---|---|---|---|
+| 4k | 49.77 | 46.22 | +7.1 % | 46.39 | 46.13 | -0.6 % | 50.30 |
+| 32k | 56.03 | 54.62 | +2.5 % | 54.48 | 54.54 | +0.1 % | 58.70 |
+| 128k | 85.28 | 84.38 | +1.1 % | - | - | - | - |
+
+Decode at depth, MTP on (draft-mtp n-max 3, p-min 0.7, the multi-row verify path), ms/token, n = 1:
+
+| depth | upstream | fork | fork vs up | draft acceptance up / fork |
+|---|---|---|---|---|
+| 4k | 35.54 | 32.39 | +8.9 % | 0.934 / 0.932 |
+| 32k | 39.48 | 38.17 | +3.3 % | 0.958 / 0.965 |
+| 128k | 69.70 | 75.16 | -7.8 % | 0.924 / 0.890 |
+
+At 128k the fork is 7.8 % slower with a lower draft acceptance, at n = 1. Acceptance is content-dependent and each arm continues
+the conversation with its own generated tokens (the 32k/128k contexts differ by at most 2 x 448 tokens between arms), so this
+row does not separate kernel speed from acceptance; no fk0a MTP arm exists to isolate it.
+
+Backend sampling (`-bs`), MTP off, depth 4k only: upstream 45.51, fork 45.57 ms/token (-0.1 %).
+
+Which fork levers fire on this model (probe: 2k cold prompt + 32 tokens, MTP on, `GGML_VK_FUSION_LIST=1 GGML_VK_DISPATCH_LOG=1`,
+fk vs fk0a):
+
+- B4 `concat_ssm_conv`, B3 `multi_add_scale` and B3 `scale_silu` do not fire on qwen35moe (11 distinct fusions in both arms, none
+  only in one of them).
+- B1 mmid precast fires: 83 staging cpys in fk, 0 in fk0a; the expert GEMMs run `matmul_id_subgroup_q4_k/q6_k_f16_f16acc_aligned_l`
+  in fk vs `matmul_id_subgroup_q4_k/q6_k_f32_f16acc_aligned_m` in fk0a.
+- C1 MMVQ hoist fires: the `mul_mat_vec_*_hoist` pipelines appear in fk only.
+- A1/A2a (QSA; no QSA metadata in the GGUF), C2 (needs `LLAMA_KQ_VIS=1`, set in no arm) and hc_combine (qwen4exp only) do not
+  apply by construction. The graph cache K = 8 is set by env in fk; its proof line does not reach the server log.
+
+Reading per lever class (attribution = fk vs fk0a only, n = 1 per point):
+
+- **B1 (expert GEMM pre-cast + BM128 tile):** fires; the fk vs fk0a prefill gain of +3.7 / +1.5 / +1.1 % at 8k / 32k / 72k is
+  attributed mainly to B1 (fk0a also turns off C1, B4c and the graph cache).
+- **C1 + graph cache (decode, MTP off):** fk vs fk0a at depth -0.6 / +0.1 % (4k / 32k) and +0.0 / -0.2 / -0.1 % right after the
+  prefills: below 1 % (n = 1, no noise band), so neither is measurable on this model. fk0a drops both together, so they are not separated.
+- **B3 / B4:** contribute nothing here because they do not fire.
+- **B4c (m <= 16 tile):** not isolated (there is no fk0a MTP process).
+- The large "fork vs up" prefill gain at 72k (+16.8 %) is mostly not the listed levers (fk vs fk0a +1.1 %); it is the mixed
+  reference. fk0b is -7.9 / -6.3 / -6.0 % vs upstream in prefill; that is a lower bound for the non-knob part, not an
+  upstream-equivalent arm.
+
+Identity (greedy 64 tokens, ignore_eos, top-5 logprobs, ~1k prompt): the generated tokens were IDENTICAL (64/64) in every pair
+(upstream vs fork MTP off and MTP on, fk vs fk0a, fk0a vs fk0b, MTP off vs on in each build). fk vs fk0a: top-5 lists equal at
+64/64 positions, max |delta logprob| 0 (fkc vs fk0a), so the levers do not change the numerics on this 64-token probe. Upstream vs fork (MTP off): top-5
+lists equal at 45/64 positions, max |delta logprob| 1.899 on matching ids; this is a difference between two builds with different
+numerics, reported, not a defect. The fork claims EXACT only for Qwen3.8-Flash-Next against its own previous version; for this
+model it makes no EXACT claim.
+
+GTT peak per process, MiB:
+
+| arm | MTP off | MTP on | -bs |
 |---|---|---|---|
-| 8k | 304.7 | 312.5 | +2.6 % |
-| 32k | 212.5 | 226.1 | +6.4 % |
-| 72k | 131.4 | 153.1 | +16.5 % |
+| upstream | 27 984 | 31 453 | 28 256 |
+| fork | 28 289 | 31 477 | 28 292 |
 
-Decode, ms/token (lower is better):
-
-| point | upstream b10689 | fork (v60 rev) | change |
-|---|---|---|---|
-| right after the 8k / 32k / 72k prompt (128 tokens, median of 3) | 48.96 / 58.44 / 71.68 | 48.04 / 55.05 / 66.72 | -1.9 / -5.8 / -6.9 % |
-| at depth 4k (median of 3 windows of 128 tokens, one request) | 53.86 | 46.64 | -13.4 % |
-| at depth 32k | 63.13 | 55.19 | -12.6 % |
-| at depth 128k | 91.64 | 86.23 | -5.9 % |
-
-The depth rows are n = 1 (one request per depth) with no noise band; each arm continues with its own generated tokens, so the
-contexts differ by a few hundred tokens. GTT peak: 27 984 MiB upstream, 28 289 MiB fork (the fork arm runs the allocator env
-above, so this is not a like-for-like allocation comparison).
-
-Identity: greedy 64 tokens on a ~1k prompt were identical in both builds; the top-5 logprobs were not (top-5 id lists equal at
-45 of 64 positions, max |delta logprob| 1.9 on matching ids). The fork claims EXACT only for Qwen3.8-Flash-Next against its own
-previous version; for this model it is a different build with different numerics, not an EXACT claim.
+The fork arms run the A3B-profile allocator env (`GGML_VK_FREE_WAIT_IDLE=1 GGML_ALLOC_GROW_SLACK=10 LLAMA_RESERVE_RUNTIME_SHAPE=1`),
+so this is "A3B profile vs stock", not a like-for-like allocation comparison.
 
 Why these decode numbers are higher than the A3B row in section 7 (decode 31 t/s) and my earlier 31-33 ms/token band for
-this model on this box: those were measured with the MTP draft on (my A3B hands compose: draft-mtp, KV q8_0); this A/B runs MTP
-off, KV f16 and contexts up to 128k. It is a different configuration, not a regression.
+this model on this box: those were measured with the MTP draft on (my A3B hands compose: draft-mtp, KV q8_0); in this A/B only the
+MTP-off tables run without the draft, and all arms use KV f16 and contexts up to 128k. The MTP-on rows here are closer (fork at
+4k: 32.39 ms/token, inside the old 31-33 band). It is a different configuration, not a regression.
 
-Pending (scheduled): the per-lever attribution arms (fork with B1 / B3 / B4 / B4c / C1 and the graph cache off, and a second
-arm with every other fork-only kernel off), the MTP-on arms, the backend-sampling arms, and a probe of which fork fusions
-actually fire on this model.
+Evidence: run 20261016T222558Z on balkon; upstream image `ghcr.io/ggml-org/llama.cpp:server-vulkan-b10689` sha256:584ed154…,
+fork image `flash-next:vulkan-pkg7-845c6fb` sha256:d21f904a…, model sha256 55983c5a…; kernel 7.0.0-38, Mesa 25.2.8; 24 driver
+checks and all runbook checks (pinned sums, images, model, argv/env as frozen per arm, hands restore) 0 FAIL.
 
 ## 9. Stock llama.cpp b10689 vs this fork (v60), same GGUF, gfx1151, n_ctx 262 144 dense (2026-10-16)
 
