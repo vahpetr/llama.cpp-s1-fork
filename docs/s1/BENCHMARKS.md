@@ -65,7 +65,7 @@ a needle at 26.7k) gave the same tokens and the same number of accepted drafts a
 logprobs differed by exactly 0.
 
 Observed and not explained yet: in the probe, state saves were about 1.8x slower on v60 than on v59 (21.4 s vs 11.6 s for the
-15.6 GB state at 1M) while loads and the state size were the same. A llama-server slot-save timing on v60 is pending.
+15.6 GB state at 1M) while loads and the state size were the same. On llama-server (section 2a, v61 vs v59, same bytes) the save took 0.5 -> 1.4 s at 262k and 3.2 -> 3.9 s at 1M; cause not established.
 
 ## 0a. v61 vs v60 (2026-10-17, 1M profile, oracle probe = the gate's fill/full passes)
 
