@@ -7,7 +7,7 @@
 | `balkon/docker-compose.hands.yml` | Ryzen 9 7940HS + 780M, 96 GB | 917 504 pool, 5 slots | ~73 GiB (interpolated) | 78 GiB |
 
 First set the host up ([docs/s1/HOST-TUNING.md](../docs/s1/HOST-TUNING.md)): without the GTT change none of these load.
-Step by step, including the upgrade from v59 (new disk-cache key) and the rollback: [docs/s1/DEPLOY.md](../docs/s1/DEPLOY.md).
+Step by step, including the upgrade from v60 (same key) or v59 (new disk-cache key) and the rollback: [docs/s1/DEPLOY.md](../docs/s1/DEPLOY.md).
 Why these weights: [docs/s1/WEIGHTS.md](../docs/s1/WEIGHTS.md). Every flag and knob: [docs/s1/KNOBS.md](../docs/s1/KNOBS.md).
 
 ## The scripts
@@ -38,7 +38,7 @@ Both are idempotent and resumable (re-run after an interrupted download; finishe
 3. **Re-encode (hands only, CPU, a few minutes):** `tools/s1/gguf_hc_q8.py` turns the 290 BF16 `hc_*` tensors into Q8_0 and
    copies `output.weight` + `token_embd.weight` from the Q8_0 head, in one pass. The script checks that exactly those 292
    tensors changed type, compares the result with my file's sha256, and hardlinks the untouched PLE shard (no 29 GB copy).
-4. **Image:** `docker pull vahpetr/llama-cpp-s1-fork:v60` (s1) or `:v60k` (balkon). `BUILD=1` builds it from this tree instead.
+4. **Image:** `docker pull vahpetr/llama-cpp-s1-fork:v61` (s1) or `:v61k` (balkon). `BUILD=1` builds it from this tree instead.
 5. **Start** the compose file, wait for `/health` (up to 15-20 min; the brain's first start pre-reads the 33 GiB PLE range),
    print the expected GTT and fill times, and smoke-test: `/props` n_ctx, one short completion, `/disk-cache` own key and entries.
 
@@ -52,15 +52,18 @@ production images:
 
 ```sh
 git archive <rev> | docker build -f .devops/vulkan.Dockerfile --build-arg APP_REVISION=<rev> --label llama.rev=<rev> \
-  --target server -t vahpetr/llama-cpp-s1-fork:v60 -
+  --target server -t vahpetr/llama-cpp-s1-fork:v61 -
 ```
 
-v60 = rev `845c6fbcd` (the `prod-v11-stage8-pkg7` head; this branch adds docs, deploy files, `tools/s1` and comment scrubs on top). `:v60`, `:v60k`
-and `:latest` are one image (digest `sha256:794113766af1129c65e9541bcc4b9b3bac4d378fa38b38cd4d7c5f00fbf7a0d1`), built on the
-780M box; my s1 production image is the same revision built on s1, and the EXACT gate ran on that one. Rollback: `:v59` /
-`:v59k` (rev `a1b6c324e`, one image, `sha256:5da04b0d8bc24f022c28d0cce0d993c4ed2c5837527113625dbeade5699d5f92`) stay
-published; set `LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v59` (or `:v59k`). v60 uses a new disk-cache key, so read
-"Upgrading from v59" in docs/s1/DEPLOY.md before switching an install that has stored conversations. Build with no model loaded on the GPU: on the
+v61 = rev `7a438f3ba` (the `prod-v11-stage8-pkg8` head; this branch adds docs, deploy files, `tools/s1` and comment scrubs on top). `:v61`, `:v61k`
+and `:latest` are one image (digest `HUBDIGEST_V61`), built on the
+780M box; my s1 production image is the same revision built on s1, and the EXACT gate ran on that one. Rollback: `:v60` /
+`:v60k` (rev `845c6fbcd`, one image, `sha256:794113766af1129c65e9541bcc4b9b3bac4d378fa38b38cd4d7c5f00fbf7a0d1`; same
+disk-cache key as v61) and `:v59` / `:v59k` (rev `a1b6c324e`, one image,
+`sha256:5da04b0d8bc24f022c28d0cce0d993c4ed2c5837527113625dbeade5699d5f92`) stay published; set
+`LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v60` (or `:v60k`, `:v59`, `:v59k`). v60 and v61 use a new disk-cache key against
+v59, so read "Upgrading from v59" in docs/s1/DEPLOY.md before switching a v59 install that has stored conversations; from v60
+it is an image change. Build with no model loaded on the GPU: on the
 128 GB box a build next to a loaded model has run it out of memory. `docker compose -f <file> build` does the same from a checkout.
 
 ## By hand
@@ -71,15 +74,17 @@ in docs/s1/WEIGHTS.md), then `docker compose -f <file> up -d`.
 ## First start: what to expect
 
 - **GTT after load** (`cat /sys/class/drm/card*/device/mem_info_gtt_used`): brain-1m 104 672-105 193 MiB on v59, 105 414 MiB
-  on v60 (the f16 pooled-key mirror, +0.8 GiB) and 106 032 MiB after the first requests (the admission bar is 109 216),
+  on v60 (the f16 pooled-key mirror, +0.8 GiB) and 106 032 MiB after the first requests, 105 495 MiB on v61 and 105 519 MiB
+  after its smoke requests (the admission bar is 109 216),
   brain-524k ~94 500 MiB (v59), hands ~73 GiB (interpolated between measured 786k and 1M pools: 70.7 and 75.2 GiB). On v59 the
   1M fill stayed at 105 188-105 196 MiB (per-step readings on v52, peaks on v59) because `--kv-graph-span 0` reserves the compute buffers for the full span at load;
-  the v60 peak over a full fill is not measured yet. An allocation error at load means the GTT limit is too small.
+  the v60 / v61 peak over a full fill is not measured yet. An allocation error at load means the GTT limit is too small.
 - **Log proofs** (`-lv 4`): `n_ctx = 1048576` (or 525312), `freq_scale = 0.25` for target and draft, the QSA ratio line,
   `graph cache: K = 8`, `kq_vis: on`; from v60 also `qsa_score_epilogue: on`, `mmvq_hoist: on from 2 columns`,
-  `kq_vis_mirror = on`, `qsa_pooled_f16_mirror: on`, and the disk-cache line `legacy unmarked states: ...`.
-- **Cold fill** on s1 (one long prompt, empty cache), 1M profile: 0 -> 524k in 19.8 min, 0 -> 1M in 44 min on v60 (25.6 min
-  and 64 min on v59), oracle probe. Prefill ~550 t/s on short prompts, ~330 t/s near 1M (v59: ~195 t/s).
+  `kq_vis_mirror = on`, `qsa_pooled_f16_mirror: on`, and the disk-cache line `legacy unmarked states: ...`; from v61 also
+  `qsa_score_kreuse: on` and `qsa_topk: v2 ...; nokeys on`.
+- **Cold fill** on s1 (one long prompt, empty cache), 1M profile: 0 -> 524k in 19.2 min, 0 -> 1M in 41.8 min on v61 (19.8 / 44
+  min on v60, 25.6 / 64 min on v59), oracle probe. Prefill ~550 t/s on short prompts, ~357 t/s near 1M (v60: ~330, v59: ~195 t/s).
 - **Host RAM:** the PLE table lives in the page cache, so `MemAvailable` sits at a few GiB on s1 with the brain loaded. That is
   normal. Do not start a second model or a big build on the same box.
 - **Disk prompt cache** (`slots/prompt-cache/<profile>`): ~15 KB per cached token (a 1M conversation is ~17 GiB). One directory
