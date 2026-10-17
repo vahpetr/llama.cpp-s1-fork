@@ -79,8 +79,8 @@ Release notes: [docs/s1/RELEASE-NOTES.md](docs/s1/RELEASE-NOTES.md).
 | cold prompt 8k / 32k / 64k | 503.4 / 423.0 / 335.4 t/s | 548.8 / 458.6 / 357.8 t/s | +9.0 / +8.4 / +6.7 % | oracle probe, cold prompts in one process (8k = its first prompt) |
 | GTT, llama-server with the vision projector | 104 591 MiB (v59 live, just before the switch) | 105 414 MiB after load, 106 032 after the first requests | | deploy smoke, 2026-10-16 |
 | GTT peak, oracle probe (no projector) | 105 538 MiB | 106 357 MiB | +819 MiB | the gate's score-capture pass; admission bar 109 216 |
-| decode at depth | 26.1 / 22.1 / 24.4 ms/tok at 32k / 262k / 1M | pending | | llama-server, my corpus, draft on, worst of 3 windows of 128 tokens |
-| TTFT, 256 new tokens on a 1M history | 2.45 s (median of 3; 2.05 s warm) | pending | | llama-server |
+| decode at depth | 26.1 / 22.1 / 24.4 ms/tok at 32k / 262k / 1M | not measured on v60 | v61: 25.83 / 21.04 / 19.92 ms/tok (BENCHMARKS section 2a) | llama-server, my corpus, draft on, worst of 3 windows of 128 tokens |
+| TTFT, 256 new tokens on a 1M history | 2.45 s (median of 3; 2.05 s warm) | not measured on v60 | v61: 1.89 s median (1.59 s warm) | llama-server |
 
 The probe is a libllama program that runs the compose's configuration (without the projector) through a fixed corpus; on v59
 it matched llama-server within 1.2 % per step. Single runs, the v59 and v60 passes about a day apart.
