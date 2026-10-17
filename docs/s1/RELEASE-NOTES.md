@@ -3,6 +3,52 @@
 One entry per published image. Older versions (v52-v59) are summarised in the lineage table of
 [BENCHMARKS.md](BENCHMARKS.md), section 0; every change is a numbered row in [PATCHES.md](PATCHES.md).
 
+## v61 - 2026-10-17
+
+Images: `vahpetr/llama-cpp-s1-fork:v61` = `:v61k` = `:latest`
+(`HUBDIGEST_V61`), revision `7a438f3ba` (`prod-v11-stage8-pkg8`).
+Rollback: `:v60` / `:v60k` (`845c6fbcd`). In production on my s1 brain (1M profile) since 2026-10-17 15:31; the balkon hands
+run `:v61k`.
+
+**What it is.** v60 plus patches 0241-0243, two levers for the QSA indexer at depth. No new environment in the composes: both
+new knobs run at their code default (on).
+
+- QSA score (0241, A2b): the indexer score GEMM's workgroups are numbered key-tile-major, so the query tiles of a prefill
+  chunk read each tile of pooled keys back to back instead of streaming the whole store once per query tile. Same per-tile
+  program, same bits. Planes of one N tile (decode / verify widths) keep the v60 dispatch, and so does a plane above the
+  device's workgroup-count limit.
+- QSA select (0243, A3): the top-k select over the score plane computes each cell's key from the score bits and the
+  visibility with integer instructions instead of writing and re-reading key rows; the selection scratch loses its key region.
+- 0242: a test runs in a private temp dir (two ctest variants raced on shared names); comment wording. No code change.
+
+**Measured** (1M profile, oracle probe, v60 -> v61; details in BENCHMARKS.md section 0a):
+
+| metric | v60 | v61 | change |
+|---|---|---|---|
+| fill step -> 262k / -> 524k / -> 1M | 474.3 / 413.2 / 328.9 t/s | 491.4 / 433.9 / 357.1 t/s | +3.6 / +5.0 / +8.6 % |
+| cold fill 0 -> 1M | 44.0 min | 41.8 min | -5.0 % time |
+| cold prompt 8k / 32k / 64k | 548.8 / 458.6 / 357.8 t/s | 550.0 / 457.5 / 357.9 t/s | +0.2 / -0.2 / +0.0 % |
+| GTT, probe peak (score-capture pass) / fill-pass peak (no projector) | 106 357 / 104 900 MiB | 106 095 / 104 544 MiB | -262 / -356 MiB |
+| GTT, llama-server with the projector, after load | 105 414 MiB | 105 495 MiB (105 519 after the smoke requests) | +81 MiB |
+| A2b score GEMM per call, 16 shapes (kernel test, gate run) | | median ratio 0.877 (0.673-1.097) | at pools >= 98 304 blocks: -30 to -32 % (f32 rows), -12 to -23 % (f16 mirror, the production form) |
+| A3 select, one QSA layer, 64k step -> 262k / -> 524k / -> 1M | 1.834 / 3.757 / 7.616 s | 1.219 / 2.993 / 6.097 s | -33.6 / -20.3 / -20.0 % |
+| decode at depth, TTFT at 1M, server GTT peak over a fill | pending | pending | |
+
+**Class: EXACT.** The package as a whole, gated on gfx1151 like v60 (1M production configuration minus the vision projector,
+one slot, S0.1 oracle corpus, text): bit-identical to the v59 reference at 1 502 logit positions and 224 state points, with
+the ordered QSA selected ids, at verify widths 1-6 in full and the last 6 positions of widths 7-9, depths 8k -> 1M, and
+restore / replay histories. With A2b off, A2b forced onto its fallback and A3 off, the short case set matched the same
+reference. Gate: 91 PASS, 4 INFO, 0 FAIL. Not covered: multi-slot stream offsets. No claim for other model families.
+
+**Disk cache: unchanged.** Same state format and key as v60. On my box v61 reads v60's entries and v60 reads v61's (same-key
+check, 13 of 13 required checks); the read-only adopt of the v59 namespace stays as it was. Switching v60 <-> v61 is an image
+change.
+
+**Known open items.**
+
+- Decode bands, TTFT at 1M and the server GTT peak over a 1M fill: pending (also on v60).
+- The 524k profile was not re-measured on v61.
+
 ## v60 - 2026-10-16
 
 Images: `vahpetr/llama-cpp-s1-fork:v60` = `:v60k` = `:latest`

@@ -11,6 +11,48 @@ decoding. This fork runs it with a **1 048 576-token context in one slot at 35-6
 Everything here was measured on my two boxes. Numbers, dates and image versions: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md).
 Deploying it, upgrading and rolling back: [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md). Flags and knobs: [docs/s1/KNOBS.md](docs/s1/KNOBS.md).
 
+## What v61 adds (2026-10-17)
+
+v61 is v60 plus three patches. Two are speed levers for the QSA indexer at depth, both on by default (no compose change):
+
+- **0241, A2b: pooled-key reuse in the indexer score GEMM.** A 128-query prefill chunk is four query tiles. v60 streamed the
+  whole pooled-key store once per query tile; v61 numbers the score GEMM's workgroups key-tile-major, so the four workgroups
+  that read the same tile of keys are dispatched back to back and the later ones usually find it in cache (an observed
+  effect; the bits do not depend on it). Each workgroup runs the same per-tile program as before, so every output bit is
+  unchanged. Knob `GGML_VK_QSA_SCORE_KREUSE` (coopmat1 devices).
+- **0243, A3: top-k select without key rows.** The select pass over the score plane no longer writes and re-reads a key row
+  per (row, cell); it computes the key from the score bits and the cell visibility with integer instructions. This also removes
+  the key region from the selection scratch (258 -> 32.25 MiB preallocated in a 524k test). Knob `GGML_VK_QSA_TOPK_NOKEYS`.
+- 0242: a test fix (a private temp dir per run) and comment wording; no code change.
+
+The package is EXACT, gated the same way as v60: on gfx1151 with the 1M production configuration minus the vision projector,
+one slot, my S0.1 oracle corpus (text), v61 matched the v59 reference bit for bit (logits at 1 502 positions, 224 state
+points, ordered selected ids, restore / replay histories); with A2b off, A2b forced onto its fallback (a 4-workgroup limit)
+and A3 off, the short case set matched the same reference. 91 checks PASS, 4 INFO, 0 FAIL (13 h 35 min). The state format
+and the disk-cache key are v60's: an install on v60 switches by changing the image (the v59 adopt line, if you have it, stays
+as it is).
+Release notes: [docs/s1/RELEASE-NOTES.md](docs/s1/RELEASE-NOTES.md).
+
+1M brain profile, i1-Q4_K_M + MTP draft, KV q8_0, one slot, v60 -> v61:
+
+| metric | v60 | v61 | change | method |
+|---|---|---|---|---|
+| prefill of the 65 536-token step ending at 262k / 524k / 1M | 474.3 / 413.2 / 328.9 t/s | **491.4 / 433.9 / 357.1 t/s** | +3.6 / +5.0 / +8.6 % | oracle probe, continuous cold fill, draft on |
+| cold fill 0 -> 1M | 44.0 min | **41.8 min** | -5.0 % time | oracle probe, sum of 18 prefill steps |
+| cold prompt 8k / 32k / 64k | 548.8 / 458.6 / 357.8 t/s | 550.0 / 457.5 / 357.9 t/s | +0.2 / -0.2 / +0.0 % | oracle probe; dense range, not touched by the levers |
+| step on a restored prefix, -> 262k / -> 524k / -> 1M | 472.8 / 413.1 / 326.0 t/s | 488.4 / 432.3 / 355.6 t/s | +3.3 / +4.6 / +9.1 % | oracle probe |
+| GTT peak, oracle probe (no projector) | 106 357 MiB | 106 095 MiB | -262 MiB | the gate's score-capture pass; admission bar 109 216 |
+| GTT peak, oracle probe fill pass | 104 900 MiB | 104 544 MiB | -356 MiB | the gate's fill pass |
+| GTT, llama-server with the vision projector, after load | 105 414 MiB | 105 495 MiB (105 519 after the smoke requests) | +81 MiB | deploy smokes, 2026-10-16 / 2026-10-17 |
+| decode at depth, TTFT at 1M | pending | pending | | |
+
+Kernel level, s1: the A2b score GEMM per call at the deployed chunk shape, 16 shapes (pool 16 384-262 144 blocks, key forms
+f32 rows and f16 mirror), median time ratio on/off 0.877 (0.673-1.097) in the gate's run; at pools of 98 304 blocks and more
+-30 to -32 % on f32 rows and -12 to -23 % on the f16 mirror (the production form). The
+A3 select of one QSA layer for the 64k step ending at 262k / 524k / 1M: 1.834 -> 1.219 / 3.757 -> 2.993 / 7.616 -> 6.097 s.
+The probe rows are single runs, the v60 and v61 passes a day apart; the dense rows (8k-64k) moved within 0.4 %.
+Server-side decode, TTFT and the GTT peak over a 1M fill are not re-measured on v61.
+
 ## What v60 adds (2026-10-16)
 
 v60 is v59 plus fourteen patches (0227-0240) aimed at prefill on this GPU, mostly at depth: fused hyper-connection tails and a
@@ -44,7 +86,7 @@ it matched llama-server within 1.2 % per step. Single runs, the v59 and v60 pass
 ## What it gives
 
 Same box, one conversation, one slot for the fork's current column (the fork columns use the i1-Q4_K_M weights). The last
-column is the v53 suite of 2026-10-09/10 (v54-v59 have the same numerics); v60's prefill gains are in the table above:
+column is the v53 suite of 2026-10-09/10 (v54-v59 have the same numerics); v60's and v61's prefill gains are in the tables above:
 
 | | stock llama.cpp (Aug 2026) | this fork, dense (Sep 9) | this fork, v53-v59 |
 |---|---|---|---|
@@ -153,7 +195,7 @@ Which v60-era levers can help another model:
 | graph + allocation-plan cache | 0192-0196, `LLAMA_GRAPH_CACHE` | generic (libllama) |
 | disk prompt cache | `--cache-disk` | generic (server) |
 | B3: hc_mix tail fusion | 0227 | a generic graph-pattern fusion (multi_add + SCALE, SCALE + SILU); the sites I know are Qwen3.8-Flash-Next's hyper-connections and QSA pooling. On Qwen3.6-35B-A3B it does not fire (probe, 2026-10-17) |
-| QSA line: A1 score epilogue, A2a f16 mirror, the indexer cache and 0239 | 0118-0161, 0235, 0239, 0240 | Qwen3.8-Flash-Next only |
+| QSA line: A1 score epilogue, A2a f16 mirror, A2b score key reuse, A3 select without key rows, the indexer cache and 0239 | 0118-0161, 0235, 0239, 0240, 0241, 0243 | Qwen3.8-Flash-Next only |
 
 One A/B so far on another family: Qwen3.6-35B-A3B UD-Q4_K_XL on the 780M (KV f16, 262k context, one slot), upstream
 b10689 vs this fork at the v60 revision with `GGML_VK_DISABLE_MMQ_CM1=1 GGML_VK_FREE_WAIT_IDLE=1 GGML_ALLOC_GROW_SLACK=10
@@ -188,18 +230,19 @@ checks their sha256; (hands only) re-encodes the BF16 hyper-connection weights a
 `tools/s1/gguf_hc_q8.py`; pulls the image (or builds it with `BUILD=1`); starts the compose file and smoke-tests it.
 `--dry-run` shows every step first. Which weights and why: [docs/s1/WEIGHTS.md](docs/s1/WEIGHTS.md). I redistribute no weights;
 they come from their authors' Hugging Face repos.
-The published image `vahpetr/llama-cpp-s1-fork:v60` = `:v60k` = `:latest` (one digest,
-`sha256:794113766af1129c65e9541bcc4b9b3bac4d378fa38b38cd4d7c5f00fbf7a0d1`) is built from my `prod-v11-stage8-pkg7` revision
-(v60 = `845c6fbcd`; `:v59` / `:v59k` stay as the rollback); this `s1-public` branch adds docs, deploy files, `tools/s1` and
-comment scrubs on top.
-Upgrading an install with stored conversations from v59: the disk-cache key changes, see
-[docs/s1/DEPLOY.md](docs/s1/DEPLOY.md), section 4 (one `--cache-disk-adopt` line).
+The published image `vahpetr/llama-cpp-s1-fork:v61` = `:v61k` = `:latest` (one digest,
+`HUBDIGEST_V61`) is built from my `prod-v11-stage8-pkg8` revision
+(v61 = `7a438f3ba`; `:v60` / `:v60k` stay as the rollback, v60 = `845c6fbcd`, digest
+`sha256:794113766af1129c65e9541bcc4b9b3bac4d378fa38b38cd4d7c5f00fbf7a0d1`); this `s1-public` branch adds docs, deploy files,
+`tools/s1` and comment scrubs on top.
+Upgrading from v60: same disk-cache key, change the image only. Upgrading an install with stored conversations from v59: the
+disk-cache key changes, see [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md), section 4 (one `--cache-disk-adopt` line).
 My production draft head is a vocabulary-pruned variant built from my own traffic, so the public setup uses dzannotti's
 full-vocabulary head, and the decode numbers above are an upper bound for it.
 
-First start on s1: GTT after load ~105 400 MiB (1M, v60; ~106 000 MiB after the first requests, bar 109 216) or ~94 500 MiB
-(524k, v59; v60 adds the f16 mirror, not measured there); the first long prompt fills at ~550 t/s falling to ~330 t/s near 1M
-(v60).
+First start on s1: GTT after load ~105 500 MiB (1M, v61; v60 105 414, ~106 000 MiB after the first requests on v60, bar
+109 216) or ~94 500 MiB (524k, v59; v60 adds the f16 mirror, not measured there); the first long prompt fills at ~550 t/s
+falling to ~357 t/s near 1M (v61; v60 ~330 t/s).
 
 ## Known limitations
 
@@ -210,8 +253,8 @@ First start on s1: GTT after load ~105 400 MiB (1M, v60; ~106 000 MiB after the 
 - **Two slots give no extra throughput** on these boxes (-15 % total, measured). A second slot is for concurrency only.
 - **After a checkpoint rewind** (disk cache, branch, copy) the continuation can differ from a fresh prefill at near-tie tokens:
   the same math in a different batch composition. The state itself is verified, the text is not guaranteed byte-identical.
-- **Pre-v60 disk-cache entries with images are not loaded by v60** (they may carry the defect 0239 fixes); text entries are.
-  A rollback to v59 does not see conversations saved by v60.
+- **Pre-v60 disk-cache entries with images are not loaded by v60 / v61** (they may carry the defect 0239 fixes); text entries
+  are. A rollback to v59 does not see conversations saved by v60 or v61 (v60 and v61 share one key).
 - One model load per GPU at a time; a build or a second load next to a loaded 1M model has run my box out of memory.
 - Single-user setups. No multi-tenant hardening beyond upstream's.
 
