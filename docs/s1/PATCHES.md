@@ -6,7 +6,8 @@ from upstream PR #27742 and an MTP draft graph. Upstream back-ports are marked a
 
 Status column:
 - **deployed (vNN)**: in my builds from image vNN on (my production line), still in this tree.
-- **v60**: in this tree (HEAD = v60, in production since 2026-10-16); "v60, on" / "v60, off" = the default of its knob.
+- **v60**: in this tree since v60 (in production 2026-10-16 to 2026-10-17); "v60, on" / "v60, off" = the default of its knob.
+- **v61**: in this tree (HEAD = v61, in production since 2026-10-17); "v61, on" = on by default.
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
 - **in tree, off**: compiled in, off unless you set its knob (docs/s1/KNOBS.md).
@@ -236,8 +237,15 @@ records and upstream status live in my private repo; ask if you want one.
 | 0238 | server: `LLAMA_SPEC_TRACE_IDS` - one `[spec-ids]` line per verify round (drafted / accepted ids, timings) (C3) | v60, diagnostic, off |
 | 0239 | llama + server: a per-sequence state read restores the indexer cache's cell ext (M-RoPE x / y + token); before, a restored image conversation had x = y = 0 in the indexer. State carries an `IXY1` mark; unmarked (pre-v60) state is refused unless its stored tokens prove it text-only (`LLAMA_LEGACY_UNMARKED`). Changes the state format, so the disk-cache key changes. Text logits unchanged | v60 (defect fix) |
 | 0240 | qwen4exp + vulkan: f16 mirror of the QSA pooled-key store, read by the score GEMM at 3+ rows (A2a); +779 MiB GTT at 1M | v60, on (EXACT) |
+| 0241 | vulkan: QSA_SCORE planes of >= 2 N tiles run on `*_qsa_kr` twins whose workgroups are numbered key tile major, so the query tiles of a chunk read each pooled-key tile back to back (A2b); same per-tile program, same bits; s1 kernel test median 0.877x per call over 16 shapes | v61, on (EXACT) |
+| 0242 | tests: test-cell-ext-restore uses a private temp dir per run; comments use neutral wording | v61, no code change |
+| 0243 | vulkan: QSA top-k select (cell form, v2) without per-cell key rows: the key is computed from the score bits and the visibility with integer instructions; no key region in the scratch (A3); s1 select per QSA layer at 1M 7.616 -> 6.097 s | v61, on (EXACT) |
 
 **0227-0240 apply order** on v59 (`a1b6c324e`): 0227, 0228, 0229, 0230, 0231, 0232, **0234, 0233**, 0235, 0236, 0237, 0238,
 0239, 0240 (0233 sits on 0234). Applied with a strict `git am` in that order they reproduce the v60 tree (`845c6fbcd`,
 `prod-v11-stage8-pkg7`). The gate covered the whole package at once, not each patch alone: the EXACT class above is the
 package's, plus each patch's own unit and op tests.
+
+**0241-0243 apply order** on v60 (`845c6fbcd`): 0242, 0241, 0243. Applied with a strict `git am` in that order they reproduce the
+v61 tree (`7a438f3ba`, `prod-v11-stage8-pkg8`). 0241 and 0242 touch disjoint files, so their order does not matter. The gate
+covered the package as a whole, plus an off arm per lever.

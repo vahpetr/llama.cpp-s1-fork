@@ -62,6 +62,74 @@ logprobs differed by exactly 0.
 Observed and not explained yet: in the probe, state saves were about 1.8x slower on v60 than on v59 (21.4 s vs 11.6 s for the
 15.6 GB state at 1M) while loads and the state size were the same. A llama-server slot-save timing on v60 is pending.
 
+## 0a. v61 vs v60 (2026-10-17, 1M profile, oracle probe = the gate's fill/full passes)
+
+Method as in section 0, with one difference: these rows come from the EXACT gate's own probe passes (the fill pass and the
+full pass of each gate), not from separate timing runs. v60 = gate of 2026-10-15/16 (rev `845c6fbcd`, fill pass 2026-10-16),
+v61 = gate of 2026-10-17 (rev `7a438f3ba`, fill pass 2026-10-17); same corpus, argv and env; single runs. The v59 and v60
+columns of section 0 were recomputed from the same kind of records with the same extraction and reproduce exactly.
+
+| metric | v60 | v61 | change |
+|---|---|---|---|
+| fill step 65 536 -> 131 072 | 512.2 t/s | 524.4 t/s | +2.4 % |
+| fill step 196 608 -> 262 144 | 474.3 t/s | **491.4 t/s** | +3.6 % |
+| fill step 262 144 -> 327 680 | 453.9 t/s | 470.8 t/s | +3.7 % |
+| fill step 458 752 -> 524 288 | 413.2 t/s | **433.9 t/s** | +5.0 % |
+| fill step 983 040 -> 1 048 576 | 328.9 t/s | **357.1 t/s** | +8.6 % |
+| cold fill 0 -> 262k / 0 -> 524k (sum of prefill walls) | 584.3 s / 1 190.2 s | 572.0 s / 1 153.0 s | -2.1 % / -3.1 % time |
+| cold fill 0 -> 1 048 576 (sum of 18 prefill walls) | 43.99 min | **41.80 min** | -5.0 % time (x1.05; x1.54 vs v59) |
+| cold prompt 8k | 548.8 t/s | 550.0 t/s | +0.2 % |
+| cold prompt 32k | 458.6 t/s | 457.5 t/s | -0.2 % |
+| cold prompt 64k | 357.8 t/s | 357.9 t/s | +0.0 % |
+| step on a restored prefix, 196 608 / 458 752 / 983 040 + 65 536 | 472.8 / 413.1 / 326.0 t/s | 488.4 / 432.3 / 355.6 t/s | +3.3 / +4.6 / +9.1 % |
+| GTT peak, fill pass (probe, no projector) | 104 900 MiB | 104 544 MiB | -356 MiB |
+| GTT peak, score-capture pass (the gate's maximum) | 106 357 MiB | 106 095 MiB | -262 MiB |
+
+The dense range (below 64k) is unchanged within 0.4 %; every QSA step gains, more with depth (+2.4 % at 131k to +8.6 % at
+1M), because both levers work on the indexer, whose cost grows with the pool. All 18 fill steps, v60 -> v61 wall (s):
+14.938 -> 14.881, 57.345 -> 57.475, 112.284 -> 112.250, 127.954 -> 124.964, 133.551 -> 129.088, 138.180 -> 133.356,
+144.386 -> 139.187, 149.070 -> 143.344, 153.853 -> 147.416, 158.620 -> 151.047, 164.056 -> 155.915, 168.396 -> 159.050,
+172.816 -> 162.442, 178.724 -> 166.930, 183.262 -> 171.082, 189.147 -> 176.088, 193.810 -> 179.741, 199.249 -> 183.503.
+
+Kernel level (s1, rev `7a438f3ba`, knob off vs on in one build):
+
+| measurement | off | on | change |
+|---|---|---|---|
+| A2b: QSA_SCORE ms per call at the deployed chunk shape, 16 shapes (pool 16 384-262 144 blocks; f32 rows and f16-mirror forms), the gate's run | | | median ratio 0.877 (min 0.673, max 1.097) |
+| A2b: pool 262 144 blocks, f16-mirror form (the production form at 3+ rows) / f32 rows, the gate's run | 2.929 / 3.870 ms | 2.568 / 2.696 ms | -12.3 / -30.3 % |
+| A2b: pools 98 304-262 144 blocks, gate's run / a second run the same day | | | f32 rows -30.3 to -32.2 / -30.2 to -32.5 %; f16 mirror -12.3 to -22.6 / -15.9 to -21.2 % |
+| A2b: pools 16 384-65 536 blocks, gate's run | | | -32.7 to +9.7 % (small calls, mixed) |
+| A3: QSA_TOP_K GPU time, one QSA layer, 64k step -> 262k / -> 524k / -> 1M | 1.834 / 3.757 / 7.616 s | 1.219 / 2.993 / 6.097 s | -33.6 / -20.3 / -20.0 % |
+| A3: selection scratch preallocated (524k test fill) | 258.00 MiB | 32.25 MiB | -225.75 MiB (the cell-form scratch 257 -> 1 MiB) |
+| A3: whole-pass wall inside the gate, prefill 8k / decode-like tails at 262k | | | ratio 0.980 / 0.993 |
+
+Gate section walls (v60 gate vs v61 gate; coarse: they include state hashing and capture I/O, not only compute):
+
+| section | v60 | v61 |
+|---|---|---|
+| arm (logits + states pass) | 116:36 | 115:03 |
+| ids capture | 125:59 | 124:00 |
+| score capture | 200:08 | 196:08 |
+| dispatch log pass | 35:53 | 35:27 |
+| fill pass | 45:48 | 43:35 |
+
+Server rows, llama-server with the full compose (vision projector loaded):
+
+| metric | v60 | v61 | source |
+|---|---|---|---|
+| GTT after load | 105 414 MiB | 105 495 MiB (+81) | the v61 deploy on 2026-10-17: v60 live just before the switch, v61 after load |
+| GTT after the deploy smoke requests | 106 032 MiB | 105 519 MiB | each version's deploy smoke; the admission bar is 109 216 |
+| GTT peak over a 1M fill | pending | pending | |
+| decode at depth (worst of 3 windows, draft on) | pending | pending | |
+| TTFT, 256 new tokens on a 1M history | pending | pending | |
+| cold prompt 128k | pending | pending | |
+
+Class: EXACT, the same gate as v60's (section 0) against the same v59 reference: 1 502 logit positions and 224 state points
+identical, ordered selected ids identical; plus an off arm per lever (A2b off, A2b forced onto its fallback with a 4-workgroup
+limit, A3 off) equal to the reference on the short case set. 91 PASS, 4 INFO, 0 FAIL. On the live server after the switch, the
+three fixed requests (a 32k prompt, a chat, a needle) gave the same tokens and accepted drafts as a fresh v60 reference; on the
+32k prompt the top-5 logprobs differed by exactly 0.
+
 ### Version lineage on the brain
 
 | version | date | what changed | class vs the previous | disk-cache key |
@@ -72,6 +140,7 @@ Observed and not explained yet: in the probe, state saves were about 1.8x slower
 | v55-v58 | 2026-10-10/11 | webui only | same numerics | same |
 | v59 | 2026-10-11 | server backend-sampling guard + webui | bit-identical to v58 | same |
 | v60 | 2026-10-16 | patches 0227-0240: prefill kernels (B1, B3, B4, B4c), QSA score epilogue (A1) and f16 pooled-key mirror (A2a), mat-vec hoist (C1), KQ visibility mirror (C2), indexer cell-ext restore (0239) | EXACT (oracle above) | new: adopts the v59 namespace read-only (docs/s1/DEPLOY.md) |
+| v61 | 2026-10-17 | patches 0241-0243: QSA score GEMM key-tile-major dispatch (A2b), QSA select without key rows (A3), test / comment polish | EXACT (section 0a) | same as v60 (the v59 adopt stays) |
 
 ## 1. Current build, 524k profile - suite runs 2026-10-09 21:50 and 2026-10-10 02:30 (image v53)
 
