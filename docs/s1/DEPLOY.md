@@ -16,7 +16,7 @@ long version, with the upgrade from v60 or v59, the rollback and the checks I ru
 
 | tag | revision | digest |
 |---|---|---|
-| `:v61`, `:v61k`, `:latest` (one image) | `7a438f3ba` (`prod-v11-stage8-pkg8`) | `HUBDIGEST_V61` |
+| `:v61`, `:v61k`, `:latest` (one image) | `7a438f3ba` (`prod-v11-stage8-pkg8`) | `sha256:46fc98c6f86902b220309e172691758e9806eaf2fc411a640d4ac2f5595b7c63` |
 | `:v60`, `:v60k` (rollback, one image; same disk-cache key as v61) | `845c6fbcd` (`prod-v11-stage8-pkg7`) | `sha256:794113766af1129c65e9541bcc4b9b3bac4d378fa38b38cd4d7c5f00fbf7a0d1` |
 | `:v59`, `:v59k` (older rollback, one image) | `a1b6c324e` (`prod-v11-stage7`) | `sha256:5da04b0d8bc24f022c28d0cce0d993c4ed2c5837527113625dbeade5699d5f92` |
 
@@ -43,7 +43,7 @@ see "The image" in deploy/README.md (`BUILD=1` in the setup scripts does it). Bu
 6. **The admission bar.** `LLAMA_GTT_ADMISSION_MIB` defaults to 109 216 = GTT size - 3 424 MiB on my box; the setup script
    computes it from yours. Check `LLAMA_GTT_USED_PATH` points at your GPU's `card` index.
 
-What to expect on v61 (1M profile): GTT 105 495 MiB after load and 105 519 MiB after the smoke requests (llama-server with the
+What to expect on v61 (1M profile): GTT 105 495 MiB after load and 105 519 MiB peak after the smoke requests (llama-server with the
 vision projector; v60: 105 414 after load, 106 032 after its first requests); the highest value I have on v61 is 106 095 MiB
 (v60: 106 357), the oracle probe's peak during its score-capture pass (without the projector). The admission bar is 109 216
 MiB. The server's peak over a full 1M fill on v60 / v61 is not measured yet (v59: 105 196 MiB). A cold fill of 1M tokens
