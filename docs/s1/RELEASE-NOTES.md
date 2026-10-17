@@ -46,7 +46,7 @@ change.
 
 **Known open items.**
 
-- Decode bands, TTFT at 1M and the server GTT peak over a 1M fill: pending (also on v60).
+- Decode bands, TTFT at 1M and the server GTT peak over a 1M fill, llama-server on the S0.2 corpus (2026-10-18): 25.83 / 21.04 / 19.92 ms/tok at 32k / 262k / 1M (v59 26.07 / 22.10 / 24.38), TTFT at 1M + 256 new tokens 1 886 ms median (1 592 warm; v59 2 452 / 2 054), server GTT over the fill 105 627 MiB (v59 105 193); BENCHMARKS.md section 2a, 2026-10-18; v60 was not measured this way.
 - The 524k profile was not re-measured on v61.
 
 ## v60 - 2026-10-16
@@ -81,7 +81,7 @@ composes: every new knob runs at its code default.
 | cold prompt 8k / 32k / 64k | 503.4 / 423.0 / 335.4 t/s | 548.8 / 458.6 / 357.8 t/s | +9.0 / +8.4 / +6.7 % |
 | GTT, probe fill-pass peak (no projector) | 104 078 MiB | 104 900 MiB | +822 MiB |
 | GTT, llama-server with the projector | 104 591 MiB (v59 live, just before the switch) | 105 414 MiB after load, 106 032 after the first requests | |
-| decode at depth, TTFT at 1M, server GTT peak over a fill | measured on v59 | pending | |
+| decode at depth, TTFT at 1M, server GTT peak over a fill | measured on v59 | not measured on v60 | measured on v61: 25.83 / 21.04 / 19.92 ms/tok at 32k / 262k / 1M (v59 26.07 / 22.10 / 24.38), TTFT at 1M + 256 new tokens 1 886 ms median (1 592 warm; v59 2 452 / 2 054), server GTT over the fill 105 627 MiB (v59 105 193); BENCHMARKS.md section 2a, 2026-10-18 |
 
 **Class: EXACT.** The package as a whole, gated on gfx1151 with the 1M production configuration minus the vision projector,
 one slot, on my S0.1 oracle corpus (text): v60 matched v59 bit for bit, with logits at 1 502 positions, 224 saved states and the
@@ -102,7 +102,7 @@ per-lever attribution is pending. BENCHMARKS.md section 8.
 
 **Known open items.**
 
-- Decode bands, TTFT at 1M and the server GTT peak over a 1M fill on v60: pending.
+- Decode bands, TTFT at 1M and the server GTT peak over a 1M fill on v60: not measured (v60 was live for one day); on v61 25.83 / 21.04 / 19.92 ms/tok at 32k / 262k / 1M (v59 26.07 / 22.10 / 24.38), TTFT at 1M + 256 new tokens 1 886 ms median (1 592 warm; v59 2 452 / 2 054), server GTT over the fill 105 627 MiB (v59 105 193); BENCHMARKS.md section 2a, 2026-10-18.
 - In the probe, state saves took about 1.8x as long as on v59 (21.4 s vs 11.6 s for the 15.6 GB state at 1M); loads and sizes
-  were unchanged. Cause not established; a server slot-save timing is pending.
+  were unchanged. Cause not established; a server slot-save timing (2026-10-18, v61 vs v59, same bytes): 262k 0.5 -> 1.4 s, 1M 3.2 -> 3.9 s, so the server shows a smaller form of it.
 - The 524k profile was not re-measured on v60.
