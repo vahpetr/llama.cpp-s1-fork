@@ -44,14 +44,16 @@ Release notes: [docs/s1/RELEASE-NOTES.md](docs/s1/RELEASE-NOTES.md).
 | GTT peak, oracle probe (no projector) | 106 357 MiB | 106 095 MiB | -262 MiB | the gate's score-capture pass; admission bar 109 216 |
 | GTT peak, oracle probe fill pass | 104 900 MiB | 104 544 MiB | -356 MiB | the gate's fill pass |
 | GTT, llama-server with the vision projector, after load | 105 414 MiB | 105 495 MiB (105 519 peak after the smoke requests) | +81 MiB | deploy smokes, 2026-10-16 / 2026-10-17 |
-| decode at depth, TTFT at 1M | pending | pending | | |
+| decode at depth (draft on, worst window) / TTFT at 1M + 256 new tokens / server GTT over a 1M fill | not measured on v60; v59: 26.07 / 22.10 / 24.38 ms/tok, 2 452 ms, 105 196 MiB | 25.83 / 21.04 / 19.92 ms/tok at 32k / 262k / 1M; 1 886 ms median (1 592 warm); 105 825 MiB at load, 105 627 over the fill | vs v59: -0.9 / -4.8 / -18.3 %; -23 %; +434 MiB | llama-server S0.2 rows, corpus tokens-s02, 2026-10-15 (v59) and 2026-10-18 (v61), BENCHMARKS section 2a |
 
 Kernel level, s1: the A2b score GEMM per call at the deployed chunk shape, 16 shapes (pool 16 384-262 144 blocks, key forms
 f32 rows and f16 mirror), median time ratio on/off 0.877 (0.673-1.097) in the gate's run; at pools of 98 304 blocks and more
 -30 to -32 % on f32 rows and -12 to -23 % on the f16 mirror (the production form). The
 A3 select of one QSA layer for the 64k step ending at 262k / 524k / 1M: 1.834 -> 1.219 / 3.757 -> 2.993 / 7.616 -> 6.097 s.
 The probe rows are single runs, the v60 and v61 passes a day apart; the dense rows (8k-64k) moved within 0.4 %.
-Server-side decode, TTFT and the GTT peak over a 1M fill are not re-measured on v61.
+Server-side rows (llama-server, the S0.2 corpus, the same driver and positions) exist for v59 and v61, not for v60: cold prompt
+128k 377.9 -> 427.4 t/s, fill 0 -> 1M 1.07 -> 0.70 h, decode with the draft 26.07 / 22.10 / 24.38 -> 25.83 / 21.04 / 19.92 ms/tok
+at 32k / 262k / 1M with the same accepted-draft counts, TTFT at 1M 2 452 -> 1 886 ms; docs/s1/BENCHMARKS.md section 2a.
 
 ## What v60 adds (2026-10-16)
 
