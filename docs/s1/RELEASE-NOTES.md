@@ -32,7 +32,7 @@ new knobs run at their code default (on).
 | GTT, llama-server with the projector, after load | 105 414 MiB | 105 495 MiB (105 519 peak after the smoke requests) | +81 MiB |
 | A2b score GEMM per call, 16 shapes (kernel test, gate run) | | median ratio 0.877 (0.673-1.097) | at pools >= 98 304 blocks: -30 to -32 % (f32 rows), -12 to -23 % (f16 mirror, the production form) |
 | A3 select, one QSA layer, 64k step -> 262k / -> 524k / -> 1M | 1.834 / 3.757 / 7.616 s | 1.219 / 2.993 / 6.097 s | -33.6 / -20.3 / -20.0 % |
-| decode at depth, TTFT at 1M, server GTT peak over a fill | pending | pending | |
+| decode at depth (draft on, worst window) / TTFT at 1M + 256 / server GTT over a 1M fill (llama-server, S0.2 corpus; BENCHMARKS section 2a, 2026-10-18) | not measured on v60; v59: 26.07 / 22.10 / 24.38 ms/tok at 32k / 262k / 1M, 2 452 ms, 105 196 MiB | 25.83 / 21.04 / 19.92 ms/tok; 1 886 ms median (1 592 warm); 105 825 MiB at load, 105 627 over the fill | vs v59: -0.9 / -4.8 / -18.3 %; -23 %; +434 MiB |
 
 **Class: EXACT.** The package as a whole, gated on gfx1151 like v60 (1M production configuration minus the vision projector,
 one slot, S0.1 oracle corpus, text): bit-identical to the v59 reference at 1 502 logit positions and 224 state points, with
