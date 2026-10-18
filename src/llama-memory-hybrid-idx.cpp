@@ -1044,6 +1044,10 @@ public:
         in.read_tensor(tensor, offset, size);
     }
 
+    void discard() override {
+        in.discard();
+    }
+
     size_t n_bytes() override {
         return in.n_bytes();
     }
@@ -1262,11 +1266,14 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
         return;
     }
 
-    get_mem_attn()->seq_rm(seq_id, -1, -1);
+    // [TAG_RESTORE_HARDEN] (up #27530) the attention and indexer cells the failed restore wrote are zeroed too (state_clear:
+    //   seq_rm + zero the rows only this sequence held) - attention may read free cells, and a damaged stream leaves
+    //   NaN rows behind; the recurrent cache zeroes its own rows when its read fails
+    get_mem_attn()->state_clear(seq_id);
     get_mem_recr()->seq_rm(seq_id, -1, -1);
 
     if (mem_idx) {
-        mem_idx->seq_rm(seq_id, -1, -1);
+        mem_idx->state_clear(seq_id);
     }
 }
 
