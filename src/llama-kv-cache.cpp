@@ -385,7 +385,9 @@ llama_kv_cache::llama_kv_cache(
 
             // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
             // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-            while (n_embd_head_k_all % (2*n_rot_k) == 0) {
+            // (fork) only for a constant head size: the DeepSeek indexer override above can set it with
+            //   n_embd_head_k_all <= 0, where this loop would double n_rot_k to 0 (SIGFPE, test-llama-archs deepseek4)
+            while (n_embd_head_k_all > 0 && n_embd_head_k_all % (2*n_rot_k) == 0) {
                 n_rot_k *= 2;
             }
         }
