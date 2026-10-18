@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -871,6 +872,55 @@ uint64_t run_layout(const layout_desc & d, std::mt19937_64 & rng, stats_t & st, 
 
 } // namespace
 
+// [TAG_KQ_VIS_MIRROR] (pkgfix review, Minor 1) the consumer slots of one llama_kv_cells as ~llama_kv_cache uses them
+// (vis_register in the constructor, vis_unregister in the destructor): two sharers destroyed in both orders, then 3
+// survivors + 8 create / destroy rounds of a 4th - the 4 slots are never exhausted, a fresh slot starts all-dirty, every
+// survivor keeps receiving the dirty marks. The ~llama_kv_cache wiring itself has no model fixture here (no qwen4exp
+// cache shares cells), it is two lines (llama-kv-cache.cpp vis_register / vis_unregister).
+static int run_vis_slots() {
+    struct consumer {
+        const llama_kv_cells & c; int slot;
+        explicit consumer(const llama_kv_cells & c) : c(c), slot(c.vis_register()) {}
+        ~consumer() { c.vis_unregister(slot); }
+    };
+    int bad = 0;
+    for (int order = 0; order < 2; ++order) {
+        llama_kv_cells cells;
+        cells.resize(64);
+        auto a = std::make_unique<consumer>(cells);
+        auto b = std::make_unique<consumer>(cells);
+        const int sa = a->slot, sb = b->slot;
+        if (order == 0) { a.reset(); b.reset(); } else { b.reset(); a.reset(); }
+        consumer c(cells), d(cells);
+        if (!((c.slot == sa || c.slot == sb) && (d.slot == sa || d.slot == sb) && c.slot != d.slot)) {
+            printf("vis slots: FAIL order %d: freed slots %d/%d not reused (%d, %d)\n", order, sa, sb, c.slot, d.slot);
+            bad++;
+        }
+    }
+    llama_kv_cells cells;
+    cells.resize(64);
+    consumer a(cells), b(cells), d(cells);
+    for (int r = 0; r < 8; ++r) {
+        consumer tmp(cells);
+        uint32_t lo, hi; bool all;
+        cells.vis_take(tmp.slot, lo, hi, all);
+        if (!all) { printf("vis slots: FAIL round %d: a fresh slot is not all-dirty\n", r); bad++; }
+        for (const consumer * x : { &a, &b, &d }) {
+            cells.vis_take(x->slot, lo, hi, all); // drain
+        }
+        cells.pos_set(r, r);
+        for (const consumer * x : { &a, &b, &d, &tmp }) {
+            cells.vis_take(x->slot, lo, hi, all);
+            if (!all && !(lo <= (uint32_t) r && hi > (uint32_t) r)) {
+                printf("vis slots: FAIL round %d: slot %d lost the mark of cell %d\n", r, x->slot, r);
+                bad++;
+            }
+        }
+    }
+    printf("vis slots: both destroy orders + 3 survivors x 8 create/destroy rounds: %s\n", bad ? "FAIL" : "OK");
+    return bad;
+}
+
 int main(int argc, char ** argv) {
     std::vector<const char *> pos_args;
     const char * dev_name = nullptr;
@@ -906,13 +956,14 @@ int main(int argc, char ** argv) {
         }
         printf("device: %s\n", ggml_backend_name(g_dev));
     }
+    const int vis_bad = run_vis_slots();
     int perf_bad = 0;
     if (perf) {
         GGML_ASSERT(g_dev && "--perf needs --device");
         perf_bad = run_perf(perf_nkv, perf_kv, perf_reps);
         if (n_random == 0) {
             ggml_backend_free(g_dev);
-            return perf_bad ? 1 : 0;
+            return perf_bad || vis_bad ? 1 : 0;
         }
     }
 
@@ -1000,7 +1051,7 @@ int main(int argc, char ** argv) {
                 ggml_backend_name(g_dev), g_ds.fa_bridge_diff);
     }
     const bool dev_pass = !g_dev || (g_ds.op_diff == 0 && g_ds.fa_diff == 0 && g_ds.fa_bridge_diff == 0 && g_ds.op_runs > 0 && g_ds.fa_runs > 0 && perf_bad == 0);
-    const bool pass = dev_pass && total_diff == 0 && failures == 0 && st.ctrl_detected == st.ctrl_runs && st.ctrl_runs > 0 &&
+    const bool pass = dev_pass && vis_bad == 0 && total_diff == 0 && failures == 0 && st.ctrl_detected == st.ctrl_runs && st.ctrl_runs > 0 &&
                       st.precond_rejected == st.precond_runs && st.fa_diff == 0 && !nd_fa_fail &&
                       (fa_budget == 0 || (st.fa_runs > 0 && st.fa_ctrl_detected == st.fa_ctrl_runs));
     printf("%s\n", pass ? "PASS" : "FAIL");

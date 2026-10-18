@@ -459,6 +459,9 @@ struct llama_qsa_ids_dump {
     //                    any_dup_zero=<rows with two equal ZERO scores among the top K+1>
     //   boundary_ties / any_dup are positive-score-only (unchanged keys); ReLU makes zero ties legitimate, also at K/K+1, so an
     //   untied boundary needs boundary_ties == 0 AND boundary_ties_zero == 0 (pkg2 review, Minor)
+    //   the counters read the pre-bias plane: masked / invisible blocks (causal future, empty pooled rows) score exactly 0 there,
+    //   so the _zero counters may report a tie the biased selection does not have (early causal rows with < K+1 visible blocks) -
+    //   conservative: a false "tied", never a false "untied" (pkgfix review, Minor 4)
     // a direct observation of tied scores at the selection boundary (the comparer's tie-prompt check reads it)
     void dump_score_ties(ggml_tensor * t, const float * v, int t_il) {
         static const bool on = [] { const char * s = getenv("LLAMA_QSA_DUMP_TIES"); return s && atoi(s) != 0; }();

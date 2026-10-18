@@ -389,7 +389,8 @@ public:
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
 
-        vis_mark(i); // [TAG_KQ_VIS_MIRROR] (conservative: also when nothing changes)
+        vis_mark(i); // [TAG_KQ_VIS_MIRROR] (conservative: also when nothing changes - after a seq_keep the next update is a
+                     // near-full partial write; correct, not on the prod path, C2 review M7)
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
@@ -508,6 +509,8 @@ public:
     // the cells it touches; a device mirror registers a slot and takes (reads + clears) its range before an update.
     // A fresh slot, reset() and resize() mark everything. Up to 4 consumers (cells shared between caches).
     // a slot is reclaimed by vis_unregister (the consumer's destructor): at most 4 consumers ALIVE at a time (pkg2 review, Minor)
+    // not synchronised (vis_used / n_vis / vis_dirty are plain mutable members): creating / destroying the caches that share
+    // one llama_kv_cells must be serialised by the caller, as every other use of shared cells already is (pkgfix review, Minor 2)
     int vis_register() const {
         for (int k = 0; k < (int) vis_dirty.size(); ++k) {
             if (!(vis_used & (1u << k))) {

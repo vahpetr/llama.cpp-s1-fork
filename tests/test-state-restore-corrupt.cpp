@@ -491,9 +491,13 @@ int main() {
         }
     }
 
-    std::remove(fx.path.c_str());
-    std::remove((fx.path + ".bad").c_str());
-    rmdir(dir);
+    if (n_fail == 0) {
+        std::remove(fx.path.c_str());
+        std::remove((fx.path + ".bad").c_str());
+        rmdir(dir);
+    } else {
+        printf("failure artefacts kept in %s\n", dir);
+    }
 
     g_model.reset();
     llama_backend_free();
