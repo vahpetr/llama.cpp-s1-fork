@@ -1064,10 +1064,13 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
     // [TAG_MTP_QSA] the MTP draft memory: the draft KV's own semantics (llama_kv_cache writes its cells whatever the
     // PARTIAL_ONLY flag says), and the indexer section follows it the same way; no recurrent section
     if (recr_none) {
-        get_mem_attn()->state_write(io, seq_id, flags);
+        // (up #30514) llama_kv_cache now honours PARTIAL_ONLY (writes nothing without SWA): the draft memory keeps its
+        //   format - the KV cells in every stream - so the flag is not passed on [TAG_RESTORE_HARDEN]
+        const llama_state_seq_flags flags_kv = flags & ~LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        get_mem_attn()->state_write(io, seq_id, flags_kv);
         if (mem_idx) {
             io.write(&LLAMA_IDX_STATE_XY_MARK, sizeof(LLAMA_IDX_STATE_XY_MARK));
-            mem_idx->state_write(io, seq_id, flags);
+            mem_idx->state_write(io, seq_id, flags_kv);
         }
         return;
     }
@@ -1113,9 +1116,11 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     try {
         // [TAG_MTP_QSA] mirrors state_write's recr_none branch: attention (whatever PARTIAL_ONLY says), then the indexer
         if (recr_none) {
-            get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
+            // (up #30514) the KV cells whatever PARTIAL_ONLY says, as state_write wrote them [TAG_RESTORE_HARDEN]
+            const llama_state_seq_flags flags_kv = flags & ~LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            get_mem_attn()->state_read_sinfo(io, seq_id, flags_kv, mem_idx ? &sinfos_attn : nullptr, nullptr);
             if (mem_idx) {
-                idx_state_read(io, seq_id, flags, sinfos_attn);
+                idx_state_read(io, seq_id, flags_kv, sinfos_attn);
             }
             return;
         }
