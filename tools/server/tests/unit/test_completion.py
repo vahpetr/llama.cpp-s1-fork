@@ -260,6 +260,55 @@ def test_pinned_request_on_busy_slot():
     assert run(pin_busy=True) == baseline
 
 
+# an idle empty slot is taken before the least recently used one that still holds a state (#30567)
+def test_lru_prefers_empty_slot():
+    global server
+    server.n_slots = 2
+    server.slot_save_path = "./tmp"
+    server.start()
+    long_a = "What is the capital of France? Tell me about its history, its rivers and its famous buildings in detail."
+    long_b = "Once upon a time a dragon named Ember guarded a golden key in a deep cave under the old mountain."
+    long_c = "To bake bread, mix flour, water and salt, then knead the dough for ten minutes until it is smooth."
+    a = server.make_request("POST", "/completion", data={"prompt": long_a, "n_predict": 4, "temperature": 0.0})
+    b = server.make_request("POST", "/completion", data={"prompt": long_b, "n_predict": 4, "temperature": 0.0})
+    assert a.status_code == 200 and b.status_code == 200
+    slot_a, slot_b = a.body["id_slot"], b.body["id_slot"]
+    assert slot_a != slot_b
+    # slot b is now the most recently used one - and empty
+    res = server.make_request("POST", f"/slots/{slot_b}?action=erase")
+    assert res.status_code == 200
+    c = server.make_request("POST", "/completion", data={"prompt": long_c, "n_predict": 4, "temperature": 0.0})
+    assert c.status_code == 200
+    assert c.body["id_slot"] == slot_b  # LRU alone would overwrite slot a
+
+
+# child tasks (n > 1) save the states they overwrite to the RAM prompt cache (#30567)
+def test_child_tasks_keep_overwritten_states():
+    global server
+    server.n_slots = 2
+    server.cache_ram = 100
+    server.start()
+    prompts = [
+        "What is the capital of France? Tell me about its history, its rivers and its famous buildings in detail.",
+        "Once upon a time a dragon named Ember guarded a golden key in a deep cave under the old mountain.",
+    ]
+    for i, p in enumerate(prompts):
+        res = server.make_request("POST", "/completion", data={"prompt": p, "id_slot": i, "n_predict": 4, "temperature": 0.0})
+        assert res.status_code == 200
+    # the parent and its child task take both slots
+    res = server.make_request("POST", "/chat/completions", data={
+        "max_tokens": 4, "n": 2, "temperature": 0.0,
+        "messages": [{"role": "user", "content": "Write a short poem about the sea and the wind."}],
+    })
+    assert res.status_code == 200
+    assert len(res.body["choices"]) == 2
+    # both earlier states come back from the prompt cache: only the tail of each prompt is processed again
+    for p in prompts:
+        res = server.make_request("POST", "/completion", data={"prompt": p, "n_predict": 4, "temperature": 0.0})
+        assert res.status_code == 200
+        assert res.body["timings"]["prompt_n"] <= 2
+
+
 def test_json_prompt_no_mtmd():
     global server
     server.start()
