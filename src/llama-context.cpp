@@ -4290,6 +4290,11 @@ public:
     llama_io_read_file(llama_file * f) : file(f) {}
 
     void read(void * dst, size_t size) override {
+        // [TAG_RESTORE_HARDEN] llama_file::read_raw clamps a buffered read at EOF without an error (the direct-io
+        //   fallback of #18801 relies on it): a truncated state file must throw here, not hand out stale bytes
+        if (size > file->size() - file->tell()) {
+            throw std::runtime_error("unexpectedly reached end of state file");
+        }
         file->read_raw(dst, size);
         size_read += size;
     }
@@ -4607,24 +4612,33 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
     std::unique_ptr<llama_io_read_i> io;
-    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-        // create a temporary io to read the magic and the src seq_id
-        io = std::make_unique<llama_io_read_host>(src, size);
+    // [TAG_RESTORE_HARDEN] a short / damaged ON_DEVICE header is an error like any other damaged stream (it threw out of
+    //   the API - std::terminate - or hit an assert before)
+    try {
+        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            // create a temporary io to read the magic and the src seq_id
+            llama_io_read_host io_head(src, size);
 
-        uint32_t magic_read;
-        io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
-            throw std::runtime_error("wrong sequence state magic");
+            uint32_t magic_read;
+            io_head.read(&magic_read, sizeof(magic_read));
+            if (io_magic != magic_read) {
+                throw std::runtime_error("wrong sequence state magic");
+            }
+
+            llama_seq_id seq_id_read;
+            io_head.read(&seq_id_read, sizeof(seq_id_read));
+
+            if (mem_storage.find(seq_id_read) == mem_storage.end()) {
+                throw std::runtime_error("no device snapshot for the sequence state's source sequence");
+            }
+
+            io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
+        } else {
+            io = std::make_unique<llama_io_read_host>(src, size);
         }
-
-        llama_seq_id seq_id_read;
-        io->read(&seq_id_read, sizeof(seq_id_read));
-
-        GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
-
-        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
-    } else {
-        io = std::make_unique<llama_io_read_host>(src, size);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        return 0;
     }
 
     try {

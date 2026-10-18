@@ -1053,6 +1053,12 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
                 return false;
             }
 
+            if (pos < 0 || pos == std::numeric_limits<llama_pos>::max()) { // [TAG_RESTORE_HARDEN] see llama_kv_cache
+                io.set_status(LLAMA_STATE_READ_INVALID);
+                LLAMA_LOG_ERROR("%s: invalid recurrent cell position %d\n", __func__, pos);
+                return false;
+            }
+
             ubatch.pos[i] = pos;
         }
         ubatch.n_seq_id[0] = 1;
