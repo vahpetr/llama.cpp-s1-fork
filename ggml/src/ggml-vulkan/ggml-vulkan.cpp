@@ -2533,6 +2533,10 @@ static bool vk_async_read_copybuf = false;
 // not HOST_CACHED (i.e. possibly write-combined). For the A/B only - see the eHostCached note in
 // ggml_vk_buffer_read_2d_async.
 static bool vk_async_read_uma_force = false;
+// [TAG_VK_BUF_LOG] GGML_VK_BUF_LOG=1: one "[vk-buf]" line per buffer allocation (kind, size, memory type, heap,
+// VkMemoryPropertyFlags, wc = host-visible but not HOST_CACHED, i.e. write-combined for CPU reads). Diagnostic only.
+static bool vk_buf_log_enabled = false;
+static thread_local const char * vk_buf_log_kind = nullptr;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
@@ -4262,6 +4266,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     buf->buffer = device->device.createBuffer(buffer_create_info);
 
     vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
+    uint32_t chosen_type_idx = UINT32_MAX; // [TAG_VK_BUF_LOG]
 
     vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
 
@@ -4308,6 +4313,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         }
 
         buf->memory_property_flags = mem_props.memoryTypes[memory_type_idx].propertyFlags;
+        chosen_type_idx = memory_type_idx;
         try {
             vk::ImportMemoryHostPointerInfoEXT import_info;
             import_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
@@ -4332,6 +4338,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
                 try {
                     buf->device_memory = device->device.allocateMemory({ mem_req.size, *mtype_it, &mem_flags_info });
                     buf->memory_property_flags = mem_props.memoryTypes[*mtype_it].propertyFlags;
+                    chosen_type_idx = *mtype_it;
                     done = true;
                     break;
                 } catch (const vk::SystemError& e) {
@@ -4377,6 +4384,17 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     device->memory_logger->log_allocation(buf, size);
 
+    if (vk_buf_log_enabled) { // [TAG_VK_BUF_LOG]
+        const uint32_t type_idx = chosen_type_idx;
+        const uint32_t heap_idx = type_idx < mem_props.memoryTypeCount ? mem_props.memoryTypes[type_idx].heapIndex : UINT32_MAX;
+        const bool wc = (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+                        !(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
+        GGML_LOG_INFO("[vk-buf] %s kind=%s size=%zu (%.2f MiB) type=%d heap=%d flags=%s wc=%d import=%d\n",
+                      device->name.c_str(), vk_buf_log_kind ? vk_buf_log_kind : "other", size, size / 1048576.0,
+                      type_idx == UINT32_MAX ? -1 : (int) type_idx, heap_idx == UINT32_MAX ? -1 : (int) heap_idx,
+                      vk::to_string(buf->memory_property_flags).c_str(), wc ? 1 : 0, import_ptr ? 1 : 0);
+    }
+
     // [TAG_VK_FREE_WAIT_IDLE]
     if (size >= vk_big_buffer_bytes && t0_us != 0) {
         const int64_t t1_us = ggml_vk_now_us();
@@ -4398,6 +4416,7 @@ static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk:
 
 static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     vk_buffer buf;
+    struct kind_guard { const char * prev = vk_buf_log_kind; kind_guard() { vk_buf_log_kind = "device"; } ~kind_guard() { vk_buf_log_kind = prev; } } kg; // [TAG_VK_BUF_LOG]
     try {
         if (device->prefer_host_memory) {
             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
@@ -8960,6 +8979,7 @@ static void ggml_vk_instance_init() {
     }
     vk_async_read_copybuf   = ggml_vk_env_bool("GGML_VK_ASYNC_READ_COPYBUF", false);
     vk_async_read_uma_force = ggml_vk_env_bool("GGML_VK_ASYNC_READ_UMA", false);
+    vk_buf_log_enabled      = ggml_vk_env_bool("GGML_VK_BUF_LOG", false);
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
     if (GGML_VK_PIPELINE_STATS != nullptr) {
@@ -9581,6 +9601,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
 
 static void * ggml_vk_host_malloc(vk_device& device, size_t size) {
     VK_LOG_MEMORY("ggml_vk_host_malloc(" << size << ")");
+    struct kind_guard { const char * prev = vk_buf_log_kind; kind_guard() { vk_buf_log_kind = "host"; } ~kind_guard() { vk_buf_log_kind = prev; } } kg; // [TAG_VK_BUF_LOG]
     vk_buffer buf = ggml_vk_create_buffer(device, size,
         {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
          vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
