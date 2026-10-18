@@ -282,6 +282,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-cell-ext-restore.cpp LABEL mtp)
     llama_test(test-cell-ext-restore NAME test-cell-ext-restore-qsa LABEL mtp)
     set_tests_properties(test-cell-ext-restore-qsa PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
+    # [TAG_RESTORE_HARDEN] a damaged per-seq state (truncated / overwritten blob, slot file, ON_DEVICE snapshot) is an error, never
+    # an abort or an allocation by a damaged count; a failed restore leaves the sequence empty, the other one untouched
+    # (up #27530 / #30514 / #28498 + catalogue 0.4); plain = dense MTP draft (plain KV cache), -qsa = hybrid-idx draft
+    llama_build_and_test(test-state-restore-corrupt.cpp LABEL mtp)
+    llama_test(test-state-restore-corrupt NAME test-state-restore-corrupt-qsa LABEL mtp)
+    set_tests_properties(test-state-restore-corrupt-qsa PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
     llama_build_and_test(test-spec-draft-policy.cpp LABEL mtp) # [TAG_SPEC_DRAFT_POLICY] tput draft length rule + cooldown (v51)
     # [TAG_GRAPH_CACHE] LLAMA_GRAPH_CACHE off vs K=8 vs K=8 + CHECK: logits / drafts / [qsa-ids] identical, regrow invalidates
     llama_build(test-graph-cache.cpp)

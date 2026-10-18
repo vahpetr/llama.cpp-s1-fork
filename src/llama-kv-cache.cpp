@@ -2922,6 +2922,14 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
+            // [TAG_RESTORE_HARDEN] a cell outside [0, LLAMA_POS_MAX) could never be removed again (seq_rm(seq, -1, -1)
+            //   clears [0, max)) and would stay in the sequence after the failed restore
+            if (pos < 0 || pos == std::numeric_limits<llama_pos>::max()) {
+                io.set_status(LLAMA_STATE_READ_INVALID);
+                LLAMA_LOG_ERROR("%s: invalid kv cell position %d\n", __func__, pos);
+                return false;
+            }
+
             if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
@@ -3027,6 +3035,12 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             io.read(&pos,      sizeof(pos));
             io.read(&n_seq_id, sizeof(n_seq_id));
+
+            if (pos < 0 || pos == std::numeric_limits<llama_pos>::max()) { // [TAG_RESTORE_HARDEN] as the per-seq path
+                io.set_status(LLAMA_STATE_READ_INVALID);
+                LLAMA_LOG_ERROR("%s: invalid kv cell position %d\n", __func__, pos);
+                return false;
+            }
 
             cells.pos_set(i, pos);
 
