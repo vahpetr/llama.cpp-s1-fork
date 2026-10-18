@@ -65,6 +65,8 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
+static bool llama_kq_vis_mirror_check(); // [TAG_KQ_VIS_MIRROR] LLAMA_KQ_VIS_MIRROR_CHECK, read once (defined below)
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -328,13 +330,15 @@ llama_kv_cache::llama_kv_cache(
         ggml_backend_buffer_clear(buf, 0);
         vis_mir_bytes = ggml_backend_buffer_get_size(buf);
         vis_mir_bufs.emplace_back(ggml_context_ptr(ctx), buf);
+        // released in ~llama_kv_cache; a throw later in this constructor skips the destructor and keeps the slot (it takes
+        // 4 such failures on one shared llama_kv_cells to reach the abort - accepted, pkgfix review Minor 3)
         vis_mir_slot = v_cells[0].vis_register();
 
         // WARN: the proof line must reach the server log (INFO does not)
         LLAMA_LOG_WARN("%s: kq_vis_mirror = on (LLAMA_KQ_VIS_MIRROR): %s %.2f MiB, ubatches <= %u tokens read it instead of a "
                        "per-graph upload%s\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
                        llama_kq_vis_mirror_max_tokens(),
-                       getenv("LLAMA_KQ_VIS_MIRROR_CHECK") && atoi(getenv("LLAMA_KQ_VIS_MIRROR_CHECK")) ? "; LLAMA_KQ_VIS_MIRROR_CHECK=1" : "");
+                       llama_kq_vis_mirror_check() ? "; LLAMA_KQ_VIS_MIRROR_CHECK=1" : "");
     }
 
     {
@@ -2069,6 +2073,8 @@ bool llama_kv_cache::set_input_kq_vis_mirror(ggml_tensor * cells_dst, ggml_tenso
             vis_mir_tmp.resize(4*(size_t) n);
             int32_t * c = vis_mir_tmp.data();
             cells.get_vis_range(lo, hi, c, c + n, c + 2*n, c + 3*n);
+            // one write per plane (the planes are n_kv apart): a memcpy on UMA; on a discrete device 4 staged copies per
+            // round - not material at 0.0 KiB/round (C2 review M6), a packed write if the dirty range ever grows (np2)
             for (int64_t f = 0; f < 4; ++f) {
                 ggml_backend_tensor_set(vis_mir, c + f*n, (f*n_kv + lo)*sizeof(int32_t), n*sizeof(int32_t));
             }

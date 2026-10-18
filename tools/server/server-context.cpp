@@ -231,6 +231,19 @@ server_adm_op_decision server_admission_op_check(bool enabled, double bar_mib, d
     return d;
 }
 
+// [TAG_SPEC_TRACE_IDS] LLAMA_SPEC_TRACE_IDS=1: read once
+static bool server_spec_trace_ids() {
+    static const bool on = [] {
+        const char * s = getenv("LLAMA_SPEC_TRACE_IDS");
+        const bool v = s != nullptr && atoi(s) != 0;
+        if (v) {
+            fprintf(stderr, "[spec-ids] on (LLAMA_SPEC_TRACE_IDS=1): one line per verify round\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
 // Replay after a checkpoint restore (partial draft acceptance on a context that cannot seq_rm partially).
 //
 // The leading `n_committed` tokens of `draft` were already sampled AND accepted on this very sampler during the
@@ -253,19 +266,6 @@ server_adm_op_decision server_admission_op_check(bool enabled, double bar_mib, d
 // It samples a CLONE of the sampler, never the live one, so turning the trace on cannot change the generated
 // output. The clone starts from the post-verification state, so for history-dependent samplers (penalties,
 // grammar) the probe is only an approximation - it is a diagnostic counter, not a correctness check.
-// [TAG_SPEC_TRACE_IDS] LLAMA_SPEC_TRACE_IDS=1: read once
-static bool server_spec_trace_ids() {
-    static const bool on = [] {
-        const char * s = getenv("LLAMA_SPEC_TRACE_IDS");
-        const bool v = s != nullptr && atoi(s) != 0;
-        if (v) {
-            fprintf(stderr, "[spec-ids] on (LLAMA_SPEC_TRACE_IDS=1): one line per verify round\n");
-        }
-        return v;
-    }();
-    return on;
-}
-
 std::vector<llama_token> server_sample_and_accept_replay(
         common_sampler * smpl,
         llama_context * ctx,

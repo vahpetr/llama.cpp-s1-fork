@@ -2334,9 +2334,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
     // dump_score_operand) reads the pooled-key operand when the observed "indexer_score-<il>" node has run. In the unfused
     // chain the operand's last consumer is the earlier matmul, so ggml-alloc may hand its storage to the CONT / ADD nodes
     // in between. Keep the operand (and the remap rows) alive for the whole graph while the capture is on - debug only,
-    // the graph and its allocation are unchanged with the knob off.
-    static const bool dump_score_live = [] { const char * s = getenv("LLAMA_QSA_DUMP_SCORE"); return s != nullptr && atoi(s) != 0; }();
-    if (dump_score_live) {
+    // the graph and its allocation are unchanged with the knob off. Knob on: the flag also lands on the external cache
+    // tensor (pool_store, and its view_src chain) for good - harmless, KEEP_ALIVE only matters for gallocr-owned tensors -
+    // and is set even when the caller installed its own eval callback (which ignores the dump): some compute-buffer bytes.
+    if (qwen4exp_qsa_dump_score()) {
         ggml_set_keep_alive(pooled ? pooled : pool_store);
         if (pool_remap != nullptr) {
             ggml_set_keep_alive(pool_remap);

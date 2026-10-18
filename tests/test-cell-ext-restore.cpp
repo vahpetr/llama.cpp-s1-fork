@@ -974,9 +974,12 @@ int main(int argc, char ** argv) {
 
     bench_ext_copy();
 
-    if (own_dir && getenv("TEST_CELL_EXT_DUMP") == nullptr) {
+    // the scratch dir goes unless TEST_CELL_EXT_DUMP is set - or a check failed: then its save files are the evidence
+    if (own_dir && getenv("TEST_CELL_EXT_DUMP") == nullptr && n_fail == 0) {
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
+    } else if (own_dir && n_fail > 0) {
+        printf("failure artefacts kept in %s\n", dir.c_str());
     }
 
     llama_backend_free();
