@@ -133,6 +133,453 @@ def test_slot_restore_legacy_token_list():
 
 
 
+# the slot file carries the live draft state: a restored slot drafts like a slot that was never saved
+#   (upstream ea736c1d5, #30574)
+def test_slot_restore_draft_state():
+    global server
+    server.model_draft_hf_repo = server.model_hf_repo
+    server.spec_type = "draft-simple"
+    server.start()
+
+    prompt = "What is the capital of France?"
+    turn = {}
+    for id_slot in [0, 1]:
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt,
+            "n_predict": 16,
+            "id_slot": id_slot,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        turn[id_slot] = res.body["content"]
+    assert turn[0] == turn[1]
+
+    res = server.make_request("POST", "/slots/0?action=save", data={
+        "filename": "draft_slot0.bin",
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/0?action=erase")
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": "draft_slot0.bin",
+    })
+    assert res.status_code == 200
+
+    timings = {}
+    for id_slot in [0, 1]:
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt + turn[id_slot] + " And",
+            "n_predict": 32,
+            "id_slot": id_slot,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        timings[id_slot] = res.body["timings"]
+
+    assert timings[0]["prompt_n"] == timings[1]["prompt_n"]
+    assert timings[0]["draft_n_accepted"] > 0
+    assert timings[0]["draft_n"]          == timings[1]["draft_n"]
+    assert timings[0]["draft_n_accepted"] == timings[1]["draft_n_accepted"]
+
+
+# [TAG_SLOT_FILE_DRAFT] round trip with a draft model (stories15M target + stories15M draft, T = 0): after a restore the
+#   continuation is byte-identical to the continuous run and the draft is warm from the first drafting round; a file
+#   without the appendices (the v62 layout: the llama state payload only) still restores, with the draft cold
+STORIES15M_URL = "https://huggingface.co/ggml-org/tiny-llamas/resolve/main/stories15M-q4_0.gguf"
+DRAFT_MAGIC = struct.pack("<I", 0x54464453)  # "SDFT"
+
+
+# the offset of the version-3 (r3; version 2 = the same layout) draft appendix that ends the file: magic(4) version(4), desc_tgt and desc_dft blobs,
+#   ident blob, draft_gap(4) bits(4), dft and spec blobs (each blob size(8) + data)
+def find_draft_appendix(data):
+    o = data.find(DRAFT_MAGIC)
+    while o > 0:
+        if struct.unpack_from("<I", data, o + 4)[0] in (2, 3):
+            pos = o + 8
+            try:
+                for i in range(5):
+                    if i == 3:
+                        pos += 8
+                    n = struct.unpack_from("<Q", data, pos)[0]
+                    pos += 8 + n
+            except struct.error:
+                pos = -1
+            if pos == len(data):
+                return o
+        o = data.find(DRAFT_MAGIC, o + 1)
+    assert False, "no draft appendix"
+
+
+def stories15m_draft_server():
+    srv = ServerPreset.tinyllama2()
+    srv.model_hf_repo = None
+    srv.model_file = download_file(STORIES15M_URL)
+    srv.model_draft = srv.model_file
+    srv.spec_type = "draft-simple"
+    srv.spec_draft_n_min = 1
+    srv.spec_draft_n_max = 8
+    srv.n_slots = 1
+    srv.n_ctx = 1024
+    srv.slot_save_path = "./tmp"
+    srv.temperature = 0.0
+    srv.fa = "off"
+    return srv
+
+
+def continue_turn(srv, prompt, n_predict):
+    res = srv.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "n_predict": n_predict,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "return_tokens": True,
+    })
+    assert res.status_code == 200
+    return res.body
+
+
+@pytest.mark.parametrize("n_predict", [9, 48])  # 9 = the first token + one drafting round of up to 8
+def test_slot_restore_draft_round_trip(n_predict):
+    global server
+    server = stories15m_draft_server()
+    server.start()
+
+    prompt = "Once upon a time, there was a little girl named Lily. She loved to play outside in the park with her friends."
+    first = continue_turn(server, prompt, 32)
+    follow = prompt + first["content"] + " One day,"
+
+    res = server.make_request("POST", "/slots/0?action=save", data={"filename": "draft_rt.bin"})
+    assert res.status_code == 200
+    path = os.path.join(server.slot_save_path, "draft_rt.bin")
+    assert res.body["n_written"] == os.path.getsize(path)
+    with open(path, "rb") as f:
+        data = f.read()
+    off_dft = find_draft_appendix(data)
+
+    # continuous: the slot was never saved / restored
+    cont = continue_turn(server, follow, n_predict)
+    assert cont["timings"]["draft_n_accepted"] > 0
+
+    # the old layout: the payload alone (what v62 wrote - the payload writer is unchanged)
+    # stories15M has no SWA / recurrent layers: no checkpoint appendix, the draft state follows the payload
+    with open(os.path.join(server.slot_save_path, "draft_rt_old.bin"), "wb") as f:
+        f.write(data[:off_dft])
+
+    for fname, warm in (("draft_rt.bin", True), ("draft_rt_old.bin", False)):
+        res = server.make_request("POST", "/slots/0?action=erase")
+        assert res.status_code == 200
+        res = server.make_request("POST", "/slots/0?action=restore", data={"filename": fname})
+        assert res.status_code == 200
+        assert res.body["n_read"] == os.path.getsize(os.path.join(server.slot_save_path, fname))
+
+        rest = continue_turn(server, follow, n_predict)
+        # byte-identical continuation at T = 0 (the target state is the saved one either way)
+        assert rest["tokens"] == cont["tokens"]
+        assert rest["content"] == cont["content"]
+        assert rest["timings"]["prompt_n"] == cont["timings"]["prompt_n"]
+        if warm:
+            # the draft continues the saved draft history: the same drafts, accepted from the first round
+            assert rest["timings"]["draft_n"] == cont["timings"]["draft_n"]
+            assert rest["timings"]["draft_n_accepted"] == cont["timings"]["draft_n_accepted"]
+            assert rest["timings"]["draft_n_accepted"] > 0
+        print(f"{fname}: n_predict={n_predict} draft_n={rest['timings']['draft_n']} "
+              f"draft_n_accepted={rest['timings']['draft_n_accepted']} (continuous {cont['timings']['draft_n']}/"
+              f"{cont['timings']['draft_n_accepted']})")
+
+
+# a draft state saved with another draft context is dropped (the draft starts empty) without failing the restore
+def test_slot_restore_draft_state_other_draft_context():
+    global server
+    server = stories15m_draft_server()
+    server.ctkd = "f16"
+    server.start()
+
+    prompt = "Once upon a time, there was a little girl named Lily."
+    first = continue_turn(server, prompt, 16)
+    cont_prompt = prompt + first["content"] + " One day,"
+    res = server.make_request("POST", "/slots/0?action=save", data={"filename": "draft_other.bin"})
+    assert res.status_code == 200
+    cont = continue_turn(server, cont_prompt, 16)
+
+    server.stop()
+    server.ctkd = "q8_0"
+    server.start()
+    res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "draft_other.bin"})
+    assert res.status_code == 200
+    rest = continue_turn(server, cont_prompt, 16)
+    assert rest["tokens"] == cont["tokens"]
+    assert rest["timings"]["prompt_n"] == cont["timings"]["prompt_n"]
+
+
+# a truncated draft section is ignored: the restore is the legacy one (cold draft), the tokens are unaffected
+def test_slot_restore_draft_state_truncated():
+    global server
+    server = stories15m_draft_server()
+    server.start()
+
+    prompt = "Once upon a time, there was a little girl named Lily."
+    first = continue_turn(server, prompt, 16)
+    follow = prompt + first["content"] + " One day,"
+    res = server.make_request("POST", "/slots/0?action=save", data={"filename": "draft_trunc.bin"})
+    assert res.status_code == 200
+    cont = continue_turn(server, follow, 16)
+
+    path = os.path.join(server.slot_save_path, "draft_trunc.bin")
+    with open(path, "rb") as f:
+        data = f.read()
+    off_dft = find_draft_appendix(data)
+    with open(path, "wb") as f:
+        f.write(data[:-5])
+
+    res = server.make_request("POST", "/slots/0?action=erase")
+    assert res.status_code == 200
+    res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "draft_trunc.bin"})
+    assert res.status_code == 200
+    assert res.body["n_read"] == off_dft  # the payload only
+    rest = continue_turn(server, follow, 16)
+    assert rest["tokens"] == cont["tokens"]
+
+
+# (review M2) the publish guard: with a disk cache, a restored warm draft lifts `partial` only for a file of the same
+#   namespace identity; a file from another identity (here: another semantic LLAMA_* env) keeps the warm draft but
+#   stays partial - the overwritten slot is refused by the disk cache (saves_refused_partial), never published
+@pytest.mark.parametrize("same_namespace", [True, False])
+def test_slot_restore_draft_namespace_guard(same_namespace):
+    global server
+    cache_dir = os.path.abspath(os.path.join("./tmp", f"u5-disk-cache-{int(same_namespace)}"))
+    if os.path.isdir(cache_dir):
+        import shutil
+        shutil.rmtree(cache_dir)
+    server = stories15m_draft_server()
+    server.extra_args = ["--cache-disk", cache_dir, "--cache-disk-gib", "1", "--cache-disk-min-tokens", "1"]
+    server.start()
+
+    prompt = "Once upon a time, there was a little girl named Lily. She loved to play outside in the park."
+    first = continue_turn(server, prompt, 16)
+    follow = prompt + first["content"] + " One day,"
+    res = server.make_request("POST", "/slots/0?action=save", data={"filename": "draft_ns.bin"})
+    assert res.status_code == 200
+    cont = continue_turn(server, follow, 9)
+
+    server.stop()
+    if not same_namespace:
+        server.env = {"LLAMA_U5_NAMESPACE_PROBE": "1"}  # an unregistered LLAMA_* name: semantic, in the env digest
+    server.start()
+    res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "draft_ns.bin"})
+    assert res.status_code == 200
+    rest = continue_turn(server, follow, 9)
+    assert rest["tokens"] == cont["tokens"]
+    # warm either way: the draft descriptor matches
+    assert rest["timings"]["draft_n_accepted"] == cont["timings"]["draft_n_accepted"] > 0
+
+    refused0 = server.make_request("GET", "/disk-cache").body["saves_refused_partial"]
+    continue_turn(server, "Unrelated text about a big red bus driving through the town at night.", 4)
+    refused = server.make_request("GET", "/disk-cache").body["saves_refused_partial"] - refused0
+    print(f"same_namespace={same_namespace}: saves_refused_partial delta {refused}")
+    if same_namespace:
+        assert refused == 0
+    else:
+        assert refused >= 1
+
+
+
+def draft_appendix_bits(data):
+    pos = find_draft_appendix(data) + 8
+    for _ in range(3):  # desc_tgt, desc_dft, ident
+        pos += 8 + struct.unpack_from("<Q", data, pos)[0]
+    return struct.unpack_from("<I", data, pos + 4)[0]  # after draft_gap(4)
+
+
+def disk_cache_saves(srv):
+    res = srv.make_request("GET", "/disk-cache")
+    assert res.status_code == 200
+    return res.body["saves"], res.body["n_entries"]
+
+
+# (astra pkg2 Critical) a shifted (noncanonical) slot keeps that provenance through the slot file: shift -> save ->
+#   restore x2 publishes nothing. Without the mark the first restore lifted both guards (prompt.clear() reset
+#   noncanonical, the warm same-identity draft cleared partial) and the second restore's disk save of the overwritten
+#   slot published the first restored - shifted - state as the canonical state of its tokens
+def test_slot_restore_noncanonical_never_published():
+    global server
+    cache_dir = os.path.abspath(os.path.join("./tmp", "u5-disk-cache-noncanonical"))
+    if os.path.isdir(cache_dir):
+        import shutil
+        shutil.rmtree(cache_dir)
+    server = stories15m_draft_server()
+    server.n_ctx = 256
+    server.enable_ctx_shift = True
+    server.extra_args = ["--cache-disk", cache_dir, "--cache-disk-gib", "1", "--cache-disk-min-tokens", "1"]
+    server.start()
+
+    prompt = "Once upon a time, there was a little girl named Lily. She loved to play outside in the park."
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "n_predict": 320,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "ignore_eos": True,
+    })
+    assert res.status_code == 200
+    assert res.body["truncated"] is True  # the context was shifted
+    assert res.body["timings"]["predicted_n"] == 320
+
+    res = server.make_request("POST", "/slots/0?action=save", data={"filename": "noncanonical.bin"})
+    assert res.status_code == 200
+    with open(os.path.join(server.slot_save_path, "noncanonical.bin"), "rb") as f:
+        data = f.read()
+    assert draft_appendix_bits(data) & 2, "the noncanonical provenance bit is not in the slot file"
+
+    saves0, entries0 = disk_cache_saves(server)
+    for i in range(2):
+        res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "noncanonical.bin"})
+        assert res.status_code == 200
+        assert res.body["n_read"] == len(data)
+    # an unrelated turn overwrites the slot: one more disk save of the restored state
+    continue_turn(server, "A big red bus drove through the town at night.", 4)
+    saves, entries = disk_cache_saves(server)
+    print(f"noncanonical: saves {saves0} -> {saves}, entries {entries0} -> {entries}")
+    assert saves == saves0
+    assert entries == entries0
+
+
+# (astra pkg2 delta r3) only a version-3 draft section of a canonical prompt makes a restored slot publishable. A pkg2 r1
+#   file (section version 2) wrote a shifted prompt with bits 0 - the same bytes as a canonical one - so a version-2
+#   section is never trusted: the draft restores warm, the prompt stays partial. "v2_shifted" is the r1 file of a shifted
+#   slot (this build's file with the version set to 2 and the bits cleared, the exact r1 layout), "v2" the same for a
+#   canonical slot, "v3" the unmodified canonical file (the positive control: published). The "nodraft_" variants run
+#   without a draft model (the n-gram / no-draft profiles, where a legacy restore used to stay publishable): the
+#   draft-less v3 section of a canonical slot is published, a shifted slot's file cut before the section (the r1 / v62
+#   layout of a draft-less slot: no provenance at all) is not
+@pytest.mark.parametrize("variant", ["v3", "v2", "v2_shifted", "nodraft_v3", "nodraft_nosection_shifted"])
+def test_slot_restore_pre_r3_section_never_published(variant):
+    global server
+    cache_dir = os.path.abspath(os.path.join("./tmp", f"u5-disk-cache-prov-{variant}"))
+    if os.path.isdir(cache_dir):
+        import shutil
+        shutil.rmtree(cache_dir)
+    server = stories15m_draft_server()
+    if variant.startswith("nodraft_"):
+        server.model_draft = None
+        server.spec_type = None
+        server.spec_draft_n_min = None
+        server.spec_draft_n_max = None
+    server.n_ctx = 256
+    server.enable_ctx_shift = True
+    server.extra_args = ["--cache-disk", cache_dir, "--cache-disk-gib", "1", "--cache-disk-min-tokens", "1"]
+    server.start()
+
+    shifted = variant.endswith("_shifted")
+    prompt = "Once upon a time, there was a little girl named Lily. She loved to play outside in the park."
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "n_predict": 320 if shifted else 16,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "ignore_eos": True,
+    })
+    assert res.status_code == 200
+    assert res.body["truncated"] is shifted
+
+    fname = f"prov_{variant}.bin"
+    path = os.path.join(server.slot_save_path, fname)
+    res = server.make_request("POST", "/slots/0?action=save", data={"filename": fname})
+    assert res.status_code == 200
+    with open(path, "rb") as f:
+        data = bytearray(f.read())
+    off = find_draft_appendix(data)
+    assert struct.unpack_from("<I", data, off + 4)[0] == 3
+    pos = off + 8
+    for _ in range(3):  # desc_tgt, desc_dft, ident
+        pos += 8 + struct.unpack_from("<Q", data, pos)[0]
+    bits_off = pos + 4  # after draft_gap(4)
+    assert (struct.unpack_from("<I", data, bits_off)[0] & 2 != 0) is shifted
+    if variant.startswith("v2"):
+        struct.pack_into("<I", data, off + 4, 2)
+        struct.pack_into("<I", data, bits_off, 0)
+    elif variant.endswith("_nosection_shifted"):
+        assert struct.unpack_from("<Q", data, bits_off + 4)[0] == 0  # n_dft: draft-less
+        data = data[:off]
+    if variant not in ("v3", "nodraft_v3"):
+        with open(path, "wb") as f:
+            f.write(data)
+
+    res = server.make_request("POST", "/slots/0?action=erase")  # no disk save: the restores below land in an empty slot
+    assert res.status_code == 200
+    saves0, entries0 = disk_cache_saves(server)
+    for _ in range(2):  # the second restore's disk save is the restored state's
+        res = server.make_request("POST", "/slots/0?action=restore", data={"filename": fname})
+        assert res.status_code == 200
+        assert res.body["n_read"] == len(data)
+    rest = continue_turn(server, "A big red bus drove through the town at night.", 4)
+    saves, entries = disk_cache_saves(server)
+    print(f"{variant}: saves {saves0} -> {saves}, entries {entries0} -> {entries}")
+    if variant in ("v3", "nodraft_v3"):
+        assert saves > saves0
+    else:
+        assert saves == saves0
+        assert entries == entries0
+
+# (astra pkg2 Important) the restore's host transient is one 16 MiB piece, not a whole tensor range: a draft K range of
+#   ~30k cells x 288 x f32 = ~33 MiB (above glibc's 32 MiB mmap threshold cap, so a whole-range buffer is fresh pages)
+#   was allocated at once by llama_io_read_cb::read_tensor; chunked, the peak RSS delta of the restore stays below it.
+#   The target K is q8_0 (~9 MiB a range), so the draft side decides. Linux only (VmHWM, clear_refs)
+def test_slot_restore_draft_memory_bound():
+    global server
+    if not os.path.exists("/proc/self/clear_refs"):
+        pytest.skip("needs /proc/<pid>/clear_refs (Linux)")
+    server = stories15m_draft_server()
+    server.n_ctx = 32768
+    server.n_batch = 2048
+    server.n_ubatch = 256
+    server.ctk = "q8_0"
+    server.ctkd = "f32"
+    # stories15M is trained at 128 tokens and the server caps the slot context there: lift the cap through the metadata
+    server.extra_args = ["--override-kv", "llama.context_length=int:32768"]
+    server.start()
+
+    unit = " Once upon a time, a girl played in the park."
+    res = server.make_request("POST", "/tokenize", data={"content": unit * 10})
+    assert res.status_code == 200
+    prompt = unit * (30000 * 10 // len(res.body["tokens"]))
+    res = server.make_request("POST", "/tokenize", data={"content": prompt})
+    assert res.status_code == 200
+    n_prompt = len(res.body["tokens"])
+    assert 28000 < n_prompt < 32000, n_prompt
+    first = continue_turn(server, prompt, 2)
+    res = server.make_request("POST", "/slots/0?action=save", data={"filename": "draft_mem.bin"})
+    assert res.status_code == 200
+    n_file = os.path.getsize(os.path.join(server.slot_save_path, "draft_mem.bin"))
+
+    pid = server.process.pid
+
+    def vm(field):
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith(field + ":"):
+                    return int(line.split()[1])  # kB
+        raise AssertionError(field)
+
+    deltas = []
+    for _ in range(2):
+        res = server.make_request("POST", "/slots/0?action=erase")
+        assert res.status_code == 200
+        with open(f"/proc/{pid}/clear_refs", "w") as f:
+            f.write("5")  # reset VmHWM to the current RSS
+        rss0 = vm("VmRSS")
+        res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "draft_mem.bin"})
+        assert res.status_code == 200
+        assert res.body["n_read"] == n_file
+        deltas.append((vm("VmHWM") - rss0) / 1024.0)
+    range_mib = n_prompt * 288 * 4 / 1024.0 / 1024.0
+    print(f"draft memory bound: n_prompt={n_prompt} file={n_file / 1048576:.1f} MiB draft K range={range_mib:.1f} MiB "
+          f"restore peak RSS delta={', '.join(f'{d:.1f}' for d in deltas)} MiB")
+    assert range_mib > 32
+    assert max(deltas) < 26, deltas
+
+
 def test_slot_erase():
     global server
     server.start()
@@ -627,7 +1074,7 @@ def test_slot_restore_preserves_context_checkpoints(swa_server, filename):
     assert res.body["timings"]["prompt_n"] == n_live
 
 
-# checkpoint appendix (fork version 2): magic(4) version(4), desc_tgt and desc_dft blobs (size(8) + data), count(4),
+# checkpoint appendix (fork version 2): magic(4) version(4), desc_tgt, desc_dft and ident blobs (size(8) + data), count(4),
 # then per checkpoint n_tokens(8) pos_min(4) pos_max(4) flags_tgt(4) flags_dft(4) and three blobs (target, draft,
 # speculative), each size(8) + data
 CKPT_HEADER_SIZE = 24
@@ -637,7 +1084,7 @@ def parse_ckpt_appendix(data, end=None):
     off = data.find(struct.pack("<II", 0x504b4353, 2))
     assert off > 0
     pos = off + 8
-    for _ in range(2):
+    for _ in range(3):  # desc_tgt, desc_dft, ident
         n = struct.unpack_from("<Q", data, pos)[0]
         pos += 8 + n
     count_off = pos
@@ -698,7 +1145,7 @@ def test_slot_restore_damaged_checkpoint_appendix(swa_server, damage):
     path = os.path.join(server.slot_save_path, "ckpt_damaged.bin")
     with open(path, "rb") as f:
         data = bytearray(f.read())
-    off, count_off, ckpts = parse_ckpt_appendix(data)
+    off, count_off, ckpts = parse_ckpt_appendix(data, find_draft_appendix(data))  # (r3) the draft section ends every file
 
     if damage == "oversized_blob":
         # the first target blob declares a size that cannot be allocated, it must be rejected before allocating

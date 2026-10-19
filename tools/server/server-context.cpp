@@ -4373,6 +4373,236 @@ private:
         return n_read;
     }
 
+    // [TAG_SLOT_FILE_DRAFT] (upstream ea736c1d5, #30574) the live draft state follows the checkpoints: the full draft
+    //   context and the speculative carry (MTP's pending_h, eagle3's boundary; draft-simple has none). The llama state
+    //   payload holds the target context only. Fork layout (version 3; version 2 = the same layout without a provenance proof): magic, version, desc_tgt, desc_dft, ident
+    //   (blobs, see [TAG_SLOT_FILE_CKPT]), draft_gap (i32), bits (u32: 1 = the prompt was `partial`, 2 = `noncanonical`), dft, spec. Version 1
+    //   (upstream: magic, version, dft, spec) still reads. A draft state that does not fit the draft context, another
+    //   draft descriptor or a carry the drafter rejects leave the legacy restore (draft sequence and carry reset, the
+    //   prompt partial), as does a file without the section. (review M1) The draft state is streamed between the
+    //   context and the file (llama_state_seq_write_cb / read_cb, as the disk cache): at 1M the MTP draft state is
+    //   ~2.2 GiB and is never held in host RAM as a whole: save and restore move it in pieces of at most 16 MiB
+    //   (SLOT_DRAFT_CHUNK here, LLAMA_STATE_READ_CHUNK in llama_io_read_cb::read_tensor, astra pkg2 Important)
+    static constexpr uint32_t SLOT_DRAFT_MAGIC      = 0x54464453; // "SDFT"
+    static constexpr uint32_t SLOT_DRAFT_VERSION_V1 = 1;          // upstream
+    static constexpr uint32_t SLOT_DRAFT_VERSION_V2 = 2;          // fork r1/r2: + descriptors + identity + draft coverage
+    // (astra pkg2 delta r3) version 3 = the version 2 layout with a known provenance: every save writes the section
+    //   (also without a draft state) and its `noncanonical` bit is reliable. A version 2 section (pkg2 r1 wrote a shifted
+    //   prompt with bits 0) or a file without the section has no provenance proof: the draft may restore warm, but the
+    //   prompt stays `partial` - never published - on every profile (draft model, n-gram, none)
+    static constexpr uint32_t SLOT_DRAFT_VERSION    = 3;
+    static constexpr uint32_t SLOT_DRAFT_BIT_PARTIAL = 1u << 0;
+    // (astra pkg2 Critical) the prompt was `noncanonical` (context shift / n_cache_reuse shift): the target KV is not
+    //   the state of its token prefix - the restore keeps the mark, so neither the slot nor its checkpoints are ever
+    //   published (disk save, deep_put) until a full recompute clears it, as in the live slot
+    static constexpr uint32_t SLOT_DRAFT_BIT_NONCANONICAL = 1u << 1;
+    static constexpr size_t   SLOT_DRAFT_CHUNK       = 16u << 20; // tensor ranges go to the file in 16 MiB pieces
+    // the dft blob is the llama_state_seq_get_data_ext() stream: its 8-byte head (the sequence-state magic, io_magic in
+    //   src/llama-context.cpp, + the source seq_id) and the state_seq_write_data body that write_cb / read_cb carry
+    static constexpr uint32_t SLOT_DRAFT_SEQ_MAGIC   = 0xaf143cd8;
+
+    // returns false if the draft state could not be written completely
+    bool save_slot_draft(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
+        n_written = 0;
+        const uint64_t n_dft = ctx_dft != nullptr ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        std::vector<uint8_t> data_spec;
+        // one carry is serializable (as the RAM cache): with more stateful implementations it stays empty and the
+        //   restore resets the draft side
+        if (spec && common_speculative_n_stateful(spec.get()) <= 1) {
+            common_speculative_get_state(spec.get(), slot.id, data_spec);
+        }
+        // (astra pkg2 delta r3) the section is always written, draft-less when there is no draft state: it is the
+        //   provenance record (bits) without which the restore keeps the prompt unpublishable
+        std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
+        if (!ofs) {
+            SLT_WRN(slot, "failed to append the draft state to '%s'\n", filepath.c_str());
+            return false;
+        }
+        const uint32_t magic     = SLOT_DRAFT_MAGIC;
+        const uint32_t version   = SLOT_DRAFT_VERSION;
+        const int32_t  draft_gap = slot.prompt.draft_gap;
+        const uint32_t bits      = (slot.prompt.partial      ? SLOT_DRAFT_BIT_PARTIAL      : 0u) |
+                                   (slot.prompt.noncanonical ? SLOT_DRAFT_BIT_NONCANONICAL : 0u);
+        ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
+        ckpt_write(ofs, &version, sizeof(version), n_written);
+        ckpt_write_buf(ofs, slot_file_bytes(slot_file_desc_tgt()), n_written);
+        ckpt_write_buf(ofs, slot_file_bytes(slot_file_desc_dft()), n_written);
+        ckpt_write_buf(ofs, slot_file_bytes(slot_file_ident()),    n_written);
+        ckpt_write(ofs, &draft_gap, sizeof(draft_gap), n_written);
+        ckpt_write(ofs, &bits,      sizeof(bits),      n_written);
+        ckpt_write(ofs, &n_dft,     sizeof(n_dft),     n_written);
+        if (n_dft > 0) {
+            // the same byte stream as llama_state_seq_get_data_ext(FLAGS_NONE), written as it is produced
+            uint64_t n_stream = 0;
+            std::vector<uint8_t> chunk;
+            llama_state_seq_writer w;
+            w.write = [&](const void * src, size_t size) {
+                ofs.write((const char *) src, size);
+                n_stream += size;
+            };
+            w.write_tensor = [&](ggml_tensor * t, size_t offset, size_t size) {
+                chunk.resize(std::min(size, SLOT_DRAFT_CHUNK));
+                for (size_t done = 0; done < size; ) {
+                    const size_t n = std::min(size - done, chunk.size());
+                    ggml_backend_tensor_get(t, chunk.data(), offset + done, n);
+                    ofs.write((const char *) chunk.data(), n);
+                    done += n;
+                }
+                n_stream += size;
+            };
+            const uint32_t     seq_magic = SLOT_DRAFT_SEQ_MAGIC;
+            const llama_seq_id seq_src   = slot.id;
+            w.write(&seq_magic, sizeof(seq_magic));
+            w.write(&seq_src,   sizeof(seq_src));
+            const size_t n_cb = llama_state_seq_write_cb(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE, w);
+            n_written += n_stream;
+            if (n_cb == 0 || n_cb + sizeof(seq_magic) + sizeof(seq_src) != n_dft || n_stream != n_dft) {
+                SLT_WRN(slot, "the draft state for '%s' streamed %" PRIu64 " of %" PRIu64 " bytes - the file is incomplete\n",
+                        filepath.c_str(), n_stream, n_dft);
+                return false;
+            }
+        }
+        ckpt_write_buf(ofs, data_spec, n_written);
+        ofs.flush();
+        if (!ofs) {
+            SLT_WRN(slot, "failed to append the draft state to '%s' - the draft state is incomplete\n", filepath.c_str());
+            return false;
+        }
+        SLT_INF(slot, "appended the draft state (%.3f MiB: dft %.3f + spec %.3f) to '%s'\n", (float) n_written / 1024 / 1024,
+                (float) n_dft / 1024 / 1024, (float) data_spec.size() / 1024 / 1024, filepath.c_str());
+        return true;
+    }
+
+    // returns the number of bytes consumed (the section parsed completely, its state restored or dropped), 0 if there
+    //   is no well-formed draft state at offset. Called after the legacy restore reset the draft sequence and the
+    //   carry and marked the prompt partial (speculative profiles): only a restored draft state lifts that
+    size_t load_slot_draft(const std::string & filepath, size_t offset, server_slot & slot) const {
+        std::ifstream ifs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
+        const size_t file_size = ifs ? (size_t) ifs.tellg() : 0;
+        if (!ifs || file_size < offset || !ifs.seekg(offset)) {
+            return 0;
+        }
+        const size_t n_avail = file_size - offset;
+        size_t n_read = 0;
+        uint32_t magic   = 0;
+        uint32_t version = 0;
+        if (!ckpt_read(ifs, &magic, sizeof(magic), n_read) || magic != SLOT_DRAFT_MAGIC) {
+            return 0;
+        }
+        std::vector<uint8_t> desc_tgt;
+        std::vector<uint8_t> desc_dft;
+        std::vector<uint8_t> ident;
+        int32_t  draft_gap = 0;
+        uint32_t bits      = SLOT_DRAFT_BIT_PARTIAL; // v1: no identity proof - never published (see below)
+        uint64_t n_dft     = 0;
+        std::vector<uint8_t> data_spec;
+        if (!ckpt_read(ifs, &version, sizeof(version), n_read) ||
+            (version != SLOT_DRAFT_VERSION && version != SLOT_DRAFT_VERSION_V2 && version != SLOT_DRAFT_VERSION_V1)) {
+            SLT_WRN(slot, "invalid draft state in '%s' - ignored\n", filepath.c_str());
+            return 0;
+        }
+        const bool v1 = version == SLOT_DRAFT_VERSION_V1;
+        const bool provenance_known = version == SLOT_DRAFT_VERSION; // (r3) v1 / v2: never published
+        if ((!v1 && (!ckpt_read_buf(ifs, desc_tgt, n_avail, n_read) ||
+                     !ckpt_read_buf(ifs, desc_dft, n_avail, n_read) ||
+                     !ckpt_read_buf(ifs, ident,    n_avail, n_read) ||
+                     !ckpt_read(ifs, &draft_gap, sizeof(draft_gap), n_read) ||
+                     !ckpt_read(ifs, &bits, sizeof(bits), n_read))) ||
+            !ckpt_read(ifs, &n_dft, sizeof(n_dft), n_read) || n_dft > n_avail - n_read) {
+            // (astra pkg2 Critical) a damaged v2 head hides the provenance bits: the restored state is never published
+            //   (legacy restore otherwise - the tokens are the payload's)
+            if (!v1) {
+                slot.prompt.noncanonical = true;
+            }
+            SLT_WRN(slot, "invalid draft state in '%s' - ignored%s\n", filepath.c_str(), v1 ? "" : ", the prompt is not published");
+            return 0;
+        }
+        // (astra pkg2 Critical) the provenance holds whatever happens to the draft side below: the target state is the
+        //   payload's, and a shifted payload stays unpublishable (prompt.clear() at the restore reset the mark)
+        if ((bits & SLOT_DRAFT_BIT_NONCANONICAL) != 0) {
+            slot.prompt.noncanonical = true;
+            SLT_INF(slot, "the slot file '%s' holds a shifted (noncanonical) state - never published\n", filepath.c_str());
+        }
+        // drop the draft side: whatever the checkpoint test-load left, and a partially streamed state
+        auto drop = [&](const char * why) {
+            if (ctx_dft != nullptr) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+            }
+            if (spec) {
+                common_speculative_reset_state(spec.get(), slot.id);
+            }
+            SLT_WRN(slot, "draft state in '%s' %s - dropped, the draft starts empty\n", filepath.c_str(), why);
+        };
+        const char * why = nullptr;
+        if (!v1 && std::string(desc_dft.begin(), desc_dft.end()) != slot_file_desc_dft()) {
+            why = "was saved by another draft context";
+        } else if (ctx_dft == nullptr ? n_dft > 0 : n_dft == 0) {
+            why = ctx_dft == nullptr ? "has a draft context state but this server has no draft context" : "has no draft context state";
+        } else if (n_dft > 0) {
+            // stream the draft state from the file into the draft context, bounded by its stored size
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+            uint64_t n_left = n_dft;
+            uint32_t     seq_magic = 0;
+            llama_seq_id seq_src   = 0;
+            llama_state_seq_reader r;
+            r.read = [&](void * dst, size_t size) {
+                if (size > n_left || !ifs.read((char *) dst, size)) {
+                    return false;
+                }
+                n_left -= size;
+                return true;
+            };
+            if (!r.read(&seq_magic, sizeof(seq_magic)) || !r.read(&seq_src, sizeof(seq_src)) || seq_magic != SLOT_DRAFT_SEQ_MAGIC) {
+                why = "has no sequence state stream";
+            } else {
+                const size_t n_cb = llama_state_seq_read_cb(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE, r);
+                if (n_cb == 0 || n_left != 0) {
+                    why = "does not match the draft context";
+                }
+            }
+        }
+        // past the draft state, whatever was consumed of it
+        ifs.clear();
+        if (!ifs.seekg((std::streamoff) (offset + n_read + n_dft))) {
+            drop("is truncated");
+            return 0;
+        }
+        n_read += n_dft;
+        if (!ckpt_read_buf(ifs, data_spec, n_avail, n_read)) {
+            drop("is truncated");
+            return 0;
+        }
+        // a provenance-only section (no draft context here or at save, no carry): nothing to restore on the draft side,
+        //   only the publication rule below applies
+        const bool draft_less = why == nullptr && ctx_dft == nullptr && n_dft == 0 && data_spec.empty();
+        if (why != nullptr) {
+            drop(why);
+            return n_read;
+        }
+        if (!draft_less && spec && !common_speculative_set_state(spec.get(), slot.id, data_spec)) {
+            // the carry belongs to the draft history just restored: without it the two disagree (the RAM swap-in rule)
+            drop("has a speculative carry the drafter does not restore");
+            return n_read;
+        }
+        // the draft side is the saved one: the prompt is as complete as it was at save. Publishing (partial = false)
+        //   additionally needs the target descriptor and the namespace identity (review M2: a layout match is no proof
+        //   of the same model / numerics) - otherwise the warm draft stays, but the prompt is never published
+        const std::string ident_own = slot_file_ident();
+        // (r3) and a known provenance: only a version 3 section of a canonical prompt clears `partial`
+        const bool tgt_ok = provenance_known && (bits & SLOT_DRAFT_BIT_NONCANONICAL) == 0 &&
+                            std::string(desc_tgt.begin(), desc_tgt.end()) == slot_file_desc_tgt() &&
+                            !ident_own.empty() && std::string(ident.begin(), ident.end()) == ident_own;
+        slot.prompt.partial   = !tgt_ok || (bits & SLOT_DRAFT_BIT_PARTIAL) != 0;
+        slot.prompt.draft_gap = (int32_t) std::clamp<int64_t>(draft_gap, 0, (int64_t) slot.prompt.tokens.size());
+        SLT_INF(slot, "restored the %s (%.3f MiB: dft %.3f + spec %.3f) from '%s'%s%s\n",
+                draft_less ? "slot-file provenance" : "draft state", (float) n_read / 1024 / 1024,
+                (float) n_dft / 1024 / 1024, (float) data_spec.size() / 1024 / 1024, filepath.c_str(),
+                slot.prompt.partial ? (provenance_known ? ", the prompt stays partial" : ", the prompt stays partial (no provenance proof: a pre-r3 section)")
+                                    : (slot.prompt.noncanonical ? ", noncanonical (never published)" : ""),
+                slot.prompt.draft_partial() ? ", draft-partial" : "");
+        return n_read;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -4571,11 +4801,11 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
-                    // [TAG_PARTIAL_PROMPT] /slots save is a target-only legacy snapshot: it writes the target context's
-                    //   sequence and the tokens - no draft KV, no prompt checkpoints / deep refs, no speculative carry,
-                    //   no turn boundaries. A restore of it is therefore marked partial on a speculative profile and
-                    //   is not published to the disk cache until recomputed (SLOT_RESTORE below). The full-tuple save /
-                    //   restore is deferred (D11); the disk cache (--cache-disk) keeps the full tuple
+                    // [TAG_PARTIAL_PROMPT] /slots save writes the target context's sequence and the tokens, then the
+                    //   prompt checkpoints ([TAG_SLOT_FILE_CKPT]) and the draft state + speculative carry
+                    //   ([TAG_SLOT_FILE_DRAFT]) as appendices - no deep refs, no turn boundaries. A file without the
+                    //   draft state (v62 and older) or with a pre-r3 one restores partial on every profile and is not
+                    //   published to the disk cache until recomputed (SLOT_RESTORE below)
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -4617,6 +4847,12 @@ private:
                         break;
                     }
 
+                    size_t nwrite_dft = 0;
+                    if (!save_slot_draft(filepath, *slot, nwrite_dft)) {
+                        send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -4626,7 +4862,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite + nwrite_ckpt;
+                    res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -4687,20 +4923,21 @@ private:
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
 
-                        // [TAG_PARTIAL_PROMPT] the snapshot holds the target state only: the draft context's sequence
+                        // [TAG_PARTIAL_PROMPT] the payload holds the target state only: the draft context's sequence
                         //   and the drafter's carry belong to the previous conversation - drop them ([TAG_SPEC_RESET]);
-                        //   the empty draft KV is not rebuilt for the restored prefix, so the prompt is partial
+                        //   the empty draft KV is not rebuilt for the restored prefix, so the prompt is partial unless
+                        //   the file's draft-state appendix restores the draft side (load_slot_draft below)
                         if (ctx_dft) {
                             llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
                         }
                         if (spec) {
                             common_speculative_reset_state(spec.get(), slot->id);
                         }
-                        slot->prompt.partial = ctx_dft != nullptr; // n-gram drafters rebuild from the tokens
-                        if (slot->prompt.partial) {
-                            SLT_INF(*slot, "legacy restore of %zu tokens: draft sequence and carry reset, the prompt is partial (not published to the disk cache until fully recomputed)\n",
-                                    slot->prompt.tokens.size());
-                        }
+                        // (astra pkg2 delta r3) on every profile, also n-gram / no draft: until a version 3 draft-state
+                        //   section proves the provenance (load_slot_draft below), the restored state is not published
+                        slot->prompt.partial = true;
+                        SLT_INF(*slot, "legacy restore of %zu tokens: draft sequence and carry reset, the prompt is partial (not published to the disk cache until fully recomputed or proven by the slot file)\n",
+                                slot->prompt.tokens.size());
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -4709,6 +4946,7 @@ private:
 
                     // nread is the end offset of the llama state payload within the file
                     const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
+                    const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, *slot);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -4719,7 +4957,7 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread + nread_ckpt;
+                    res->n_bytes  = nread + nread_ckpt + nread_dft;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
