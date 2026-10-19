@@ -1779,6 +1779,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_CKPT_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-ckpt-semantic"}, "N",
+        string_format("disk prompt cache: recurrent checkpoints at message boundaries (a user turn start, the end of the "
+                      "system prompt or of a tool result) kept per conversation on top of the depth schedule, the newest "
+                      "N; older ones fall back to the depth rule. Only checkpoints the prompt processing makes anyway are "
+                      "kept (no extra ubatch split); 0 = off (default: %d)", params.cache_disk_ckpt_semantic),
+        [](common_params & params, int value) {
+            params.cache_disk_ckpt_semantic = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_CKPT_SEMANTIC").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

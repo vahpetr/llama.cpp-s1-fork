@@ -1994,6 +1994,34 @@ private:
         }
     }
 
+    // [TAG_SEMANTIC_CKPT] (SC1) the kind a checkpoint leaving the slot's in-RAM list is stored as: semantic when it sits
+    //   at a message boundary of the slot's current prompt - a user turn start (the prompt processing splits there), or
+    //   within SEM_SLACK tokens of the end of the system prompt or of the input of a turn (a user message or a tool result:
+    //   the start of an assistant message that follows a non-assistant one), or of a tool result's span. That end is
+    //   where a request's generation prompt starts, and the prompt-tail split puts a checkpoint 4 tokens before the
+    //   prompt end, i.e. inside the generation prompt right after it (a template whose tool-response delimiter does not
+    //   tokenize like the prompt shows tool results as user messages - the assistant-start rule still finds their end).
+    //   Only positions the current task shares with the slot's prompt are judged (its message spans index its tokens)
+    uint8_t deep_kind_at(const server_slot & slot, int64_t n_tokens) const {
+        static constexpr int64_t SEM_SLACK = 16;
+        if (!disk_cache || disk_cache->ckpt_sem_max <= 0 || !slot.task || n_tokens > (int64_t) slot.prompt.n_tokens()) {
+            return server_deep_ref::DEEP_KIND_DEPTH;
+        }
+        const auto & spans = slot.task->params.message_spans.spans;
+        for (size_t i = 0; i < spans.size(); i++) {
+            const auto & sp = spans[i];
+            if (sp.role == COMMON_CHAT_ROLE_USER && (int64_t) sp.pos == n_tokens) {
+                return server_deep_ref::DEEP_KIND_SEMANTIC;
+            }
+            const bool input_end = (sp.role == COMMON_CHAT_ROLE_SYSTEM || sp.role == COMMON_CHAT_ROLE_TOOL) ||
+                    (i + 1 < spans.size() && sp.role != COMMON_CHAT_ROLE_ASSISTANT && spans[i + 1].role == COMMON_CHAT_ROLE_ASSISTANT);
+            if (input_end && std::llabs(n_tokens - (int64_t) (sp.pos + sp.len)) <= SEM_SLACK) {
+                return server_deep_ref::DEEP_KIND_SEMANTIC;
+            }
+        }
+        return server_deep_ref::DEEP_KIND_DEPTH;
+    }
+
     // collect deep checkpoints nothing references (see live_deep_refs)
     void deep_gc() {
         if (disk_cache) {
@@ -2580,6 +2608,7 @@ private:
                 server_disk_cache_fingerprint(params_base, cache_n_ctx_seq()), mctx != nullptr,
                 params_base.cache_disk_ckpt_ratio, params_base.checkpoint_min_step, params_base.cache_disk_ckpt_max);
             disk_cache->live_refs = [this]() { return live_deep_refs(); };
+            disk_cache->ckpt_sem_max = params_base.cache_disk_ckpt_semantic; // [TAG_SEMANTIC_CKPT]
             disk_cache->adopt_keys = string_split<std::string>(params_base.cache_disk_adopt, ',');
             disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types) +
                                       "/" + common_speculative_state_schema(spec.get()));
@@ -3988,7 +4017,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
-                deep_spill(slot, *it, server_deep_ref::DEEP_KIND_DEPTH);
+                deep_spill(slot, *it, deep_kind_at(slot, it->n_tokens)); // [TAG_SEMANTIC_CKPT]
 
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
@@ -4017,7 +4046,7 @@ private:
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
                     victim == slot.prompt.checkpoints.begin() ? "" : "; skipped the pinned restored checkpoint");
 
-            deep_spill(slot, *victim, server_deep_ref::DEEP_KIND_DEPTH);
+            deep_spill(slot, *victim, deep_kind_at(slot, victim->n_tokens)); // [TAG_SEMANTIC_CKPT]
 
             slot.prompt.checkpoints.erase(victim);
         }

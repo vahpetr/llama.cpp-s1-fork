@@ -149,6 +149,11 @@ struct server_disk_cache {
 
     int32_t min_tokens() const { return n_min_tokens; }
 
+    // [TAG_SEMANTIC_CKPT] (SC1) message-boundary checkpoints kept per conversation on top of the depth schedule
+    //   (--cache-disk-ckpt-semantic; 0 = none: the server classifies no checkpoint as semantic, thin() demotes any)
+    int32_t ckpt_sem_max = 0;
+    uint64_t n_deep_semantic = 0; // semantic checkpoints stored
+
     uint64_t total_bytes() const;
 
     // counters for the logs and /metrics
