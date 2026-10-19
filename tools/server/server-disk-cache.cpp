@@ -1714,9 +1714,9 @@ void server_disk_cache::init() {
                 (now_s() - ns.t_newest) / 86400.0);
     }
     DSK_INF("dir %s: %zu entries + %zu deep checkpoints, %.2f GiB (quota %.0f GiB, min %d tokens, ttl %d days, "
-            "deep ratio %.2f min step %d max %d), %zu + %zu stale/foreign dropped, legacy unmarked states: %s\n",
+            "deep ratio %.2f min step %d max %d semantic %d), %zu + %zu stale/foreign dropped, legacy unmarked states: %s\n",
             dir.c_str(), entries.size(), ckpts.size(), total_bytes() / (1024.0 * 1024.0 * 1024.0),
-            quota / (1024.0 * 1024.0 * 1024.0), n_min_tokens, ttl_days, ckpt_ratio, ckpt_min_step, ckpt_max,
+            quota / (1024.0 * 1024.0 * 1024.0), n_min_tokens, ttl_days, ckpt_ratio, ckpt_min_step, ckpt_max, ckpt_sem_max,
             n_dropped, n_ck_dropped,
             legacy_unmarked ? "accepted with a text-only proof (LLAMA_LEGACY_UNMARKED=1)" : "refused (LLAMA_LEGACY_UNMARKED=0)");
 
@@ -2491,7 +2491,7 @@ void server_disk_cache::thin(std::vector<server_deep_ref> & refs, int64_t n_end)
     // one ref per position, the most important kind wins
     for (size_t i = 1; i < refs.size();) {
         if (refs[i].n_tokens == refs[i - 1].n_tokens) {
-            if (refs[i].kind > refs[i - 1].kind) {
+            if (server_deep_ref::rank(refs[i].kind) > server_deep_ref::rank(refs[i - 1].kind)) {
                 refs[i - 1] = refs[i];
             }
             refs.erase(refs.begin() + i);
@@ -2503,6 +2503,17 @@ void server_disk_cache::thin(std::vector<server_deep_ref> & refs, int64_t n_end)
         return;
     }
 
+    // [TAG_SEMANTIC_CKPT] the newest ckpt_sem_max message-boundary refs stay on top of the schedule; an older one becomes
+    //   a depth candidate (kept only where the ratio rule wants a checkpoint). 0: every semantic ref is a depth one
+    {
+        int32_t n_sem = 0;
+        for (auto it = refs.rbegin(); it != refs.rend(); ++it) {
+            if (it->kind == server_deep_ref::DEEP_KIND_SEMANTIC && ++n_sem > ckpt_sem_max) {
+                it->kind = server_deep_ref::DEEP_KIND_DEPTH;
+            }
+        }
+    }
+
     std::vector<server_deep_ref> kept;
     for (size_t i = 0; i < refs.size(); i++) {
         const auto & r = refs[i];
@@ -2512,8 +2523,13 @@ void server_disk_cache::thin(std::vector<server_deep_ref> & refs, int64_t n_end)
         }
     }
 
+    // ckpt_max bounds the schedule (depth, branch, anchor); the semantic refs (<= ckpt_sem_max) come on top of it
+    const auto n_sched = [&]() {
+        return (int32_t) std::count_if(kept.begin(), kept.end(),
+                [](const auto & r) { return r.kind != server_deep_ref::DEEP_KIND_SEMANTIC; });
+    };
     for (uint8_t kind : { server_deep_ref::DEEP_KIND_DEPTH, server_deep_ref::DEEP_KIND_BRANCH }) {
-        for (size_t i = 1; (int32_t) kept.size() > ckpt_max && i < kept.size();) {
+        for (size_t i = 1; n_sched() > ckpt_max && i < kept.size();) {
             if (kept[i].kind == kind) {
                 kept.erase(kept.begin() + i);
             } else {
@@ -2643,15 +2659,19 @@ void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_che
     }
     need_enforce = written;
     if (written) {
-        DSK_INF("deep checkpoint at %" PRId64 " (%s) stored\n", c.n_tokens,
-                kind == server_deep_ref::DEEP_KIND_BRANCH ? "branch" : kind == server_deep_ref::DEEP_KIND_ANCHOR ? "anchor" : "depth");
+        DSK_INF("deep checkpoint at %" PRId64 " (%s) stored\n", c.n_tokens, server_deep_ref::name(kind));
+        if (kind == server_deep_ref::DEEP_KIND_SEMANTIC) {
+            n_deep_semantic++;
+        }
     }
 
     bool found = false;
     for (auto & r : prompt.deep) {
         if (r.n_tokens == c.n_tokens) {
             r.key  = key;
-            r.kind = std::max(r.kind, kind);
+            if (server_deep_ref::rank(kind) > server_deep_ref::rank(r.kind)) {
+                r.kind = kind;
+            }
             found  = true;
         }
     }
@@ -3490,6 +3510,8 @@ void server_disk_cache::refresh_status() {
         { "ttl_days",       ttl_days            },
         { "ckpt_ratio",     ckpt_ratio          },
         { "ckpt_max",       ckpt_max            },
+        { "ckpt_semantic",  ckpt_sem_max        },
+        { "deep_semantic",  n_deep_semantic     },
         { "n_entries",      entries.size()      },
         { "n_deep_ckpts",   ckpts.size()        },
         { "n_blocks",       blobs.size()        },

@@ -578,6 +578,28 @@ struct server_deep_ref {
     static constexpr uint8_t DEEP_KIND_DEPTH  = 0; // kept by the depth schedule
     static constexpr uint8_t DEEP_KIND_ANCHOR = 1; // first checkpoint of the conversation (system prompt + tools)
     static constexpr uint8_t DEEP_KIND_BRANCH = 2; // a point a branch was taken from
+    // [TAG_SEMANTIC_CKPT] (SC1) a checkpoint at a message boundary (a user turn start, the end of the system prompt or of
+    //   a tool result): the newest --cache-disk-ckpt-semantic of them are kept, older ones fall back to the depth rule
+    static constexpr uint8_t DEEP_KIND_SEMANTIC = 3;
+
+    // which ref survives at one position: branch > anchor (as before) > semantic > depth (an older build orders by value and keeps
+    //   every kind but depth / branch, so a semantic ref written here stays kept there: a rollback reads it)
+    static int rank(uint8_t kind) {
+        switch (kind) {
+            case DEEP_KIND_BRANCH:   return 3;
+            case DEEP_KIND_ANCHOR:   return 2;
+            case DEEP_KIND_SEMANTIC: return 1;
+            default:                 return 0;
+        }
+    }
+    static const char * name(uint8_t kind) {
+        switch (kind) {
+            case DEEP_KIND_ANCHOR:   return "anchor";
+            case DEEP_KIND_BRANCH:   return "branch";
+            case DEEP_KIND_SEMANTIC: return "semantic";
+            default:                 return "depth";
+        }
+    }
 };
 
 struct server_prompt {
