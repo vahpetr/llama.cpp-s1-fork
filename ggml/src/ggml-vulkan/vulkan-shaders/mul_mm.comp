@@ -312,6 +312,18 @@ void main() {
 
     // Workgroup has no work
     if (ic * BN >= _ne1) return;
+
+    // [TAG_MMID_SKIP] (#25483) only the first `rows` B columns of this tile are rows of the expert: the invocations whose B
+    // load column lies past them skip the load, the coopmat1 warps whose WN column block lies wholly past them skip the MACs
+#ifdef MMID_SKIP_NEGCTL
+    // NEGATIVE CONTROL BUILD ONLY (cmake -DGGML_VULKAN_MMID_SKIP_NEGCTL=ON, never a shipped pipeline): one row too few, so the
+    // last real row of each expert's last partial tile is never loaded - tests/test-mmid-skip must see the results change
+    const uint rows = _ne1 - ic * BN - 1;
+#else
+    const uint rows = _ne1 - ic * BN;
+#endif
+    uint required_work_items = rows * BK / LOAD_VEC_B_EFF / LOAD_VEC_BATCH_B;
+    uint required_warp_c = (rows + WN - 1) / WN;
 #endif
 
 #ifdef MUL_MAT_ID
@@ -367,6 +379,9 @@ void main() {
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
         }
+        #ifdef MUL_MAT_ID
+        if (gl_LocalInvocationID.x < required_work_items) {
+        #endif
         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
 #if !defined(MUL_MAT_ID)
             load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
@@ -374,6 +389,9 @@ void main() {
             load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
 #endif
         }
+        #ifdef MUL_MAT_ID
+        }
+        #endif
 
         barrier();
 
@@ -381,6 +399,9 @@ void main() {
         pos_b += BK / LOAD_VEC_B_EFF;
 
 #ifdef COOPMAT
+#ifdef MUL_MAT_ID
+        if (warp_c < required_warp_c) {
+#endif
 #if defined(QSA_SCORE_KREUSE) && defined(QSA_KREUSE_NEGCTL)
         // [TAG_QSA_SCORE_KREUSE] NEGATIVE CONTROL BUILD ONLY (cmake -DGGML_VULKAN_QSA_KREUSE_NEGCTL=ON, never a shipped
         // pipeline): the kr twins run the TK steps of each K block in reverse - the same products, another summation
@@ -400,6 +421,9 @@ void main() {
                 }
             }
         }
+#ifdef MUL_MAT_ID
+        }
+#endif
 #else
         [[unroll]] for (uint i = 0; i < BK / BK_STEP; i++) {
             // Load from shared into cache

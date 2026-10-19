@@ -463,6 +463,12 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         base_dict["MUL_MAT_ID_USE_SUBGROUPS"] = "1";
         shader_name = "matmul_id_subgroup";
     }
+#ifdef GGML_VULKAN_MMID_SKIP_NEGCTL
+    // [TAG_MMID_SKIP] negative-control build only: the mul_mat_id padding skip counts one row too few (mul_mm.comp)
+    if (matmul_id_type != MatMulIdType::NONE) {
+        base_dict["MMID_SKIP_NEGCTL"] = "1";
+    }
+#endif
 
     if (fp16) {
         base_dict["FLOAT16"] = "1";
