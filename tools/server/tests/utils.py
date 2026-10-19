@@ -128,6 +128,7 @@ class ServerProcess:
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
     env: dict | None = None   # extra environment variables for the server process
+    extra_args: list | None = None  # extra command-line arguments, appended as given
 
     # session variables
     process: subprocess.Popen | None = None
@@ -291,6 +292,8 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
             server_args.extend(["--cache-ram", self.cache_ram])
+        if self.extra_args:
+            server_args.extend(self.extra_args)
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:

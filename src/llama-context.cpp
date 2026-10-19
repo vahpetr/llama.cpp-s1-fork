@@ -4128,6 +4128,28 @@ llm_graph_cb llama_context::graph_get_cb() const {
 // state save/load
 //
 
+// [TAG_STATE_READ_CHUNK] (astra pkg2 Important) a tensor range read from a stream (file, callback) goes to the backend in
+//   pieces of at most LLAMA_STATE_READ_CHUNK bytes: the host transient of a restore is one piece, not the whole range
+//   (one KV layer range of the 1M MTP draft is ~1 GiB). The same bytes reach the same offsets, so the restored state is
+//   bit-identical; a stream that ends mid-range leaves the earlier pieces of that range written, as a failure between
+//   two ranges already left the earlier ranges written (the memory readers clean the cells up on failure)
+static constexpr size_t LLAMA_STATE_READ_CHUNK = 16u << 20;
+
+static void llama_state_read_tensor_chunked(llama_io_read_i & io, std::vector<uint8_t> & buf, ggml_tensor * tensor,
+                                            size_t offset, size_t size) {
+    // (astra pkg2 delta m3) one exact-size allocation per stream, reused for every range: no growth by reallocation
+    //   (which over-allocates and briefly holds the previous buffer too), so the host bound is LLAMA_STATE_READ_CHUNK
+    if (buf.size() != LLAMA_STATE_READ_CHUNK) {
+        std::vector<uint8_t>(LLAMA_STATE_READ_CHUNK).swap(buf);
+    }
+    for (size_t done = 0; done < size; ) {
+        const size_t n = std::min(size - done, LLAMA_STATE_READ_CHUNK);
+        io.read(buf.data(), n);
+        ggml_backend_tensor_set(tensor, buf.data(), offset + done, n);
+        done += n;
+    }
+}
+
 class llama_io_write_dummy : public llama_io_write_i {
 public:
     llama_io_write_dummy(bool skip_tensors) : skip_tensors(skip_tensors) {}
@@ -4303,9 +4325,7 @@ public:
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        temp_buffer.resize(size);
-        read(temp_buffer.data(), size);
-        ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+        llama_state_read_tensor_chunked(*this, temp_buffer, tensor, offset, size);
     }
 
     size_t n_bytes() override {
@@ -5924,9 +5944,7 @@ public:
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        temp_buffer.resize(size);
-        read(temp_buffer.data(), size);
-        ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+        llama_state_read_tensor_chunked(*this, temp_buffer, tensor, offset, size);
     }
 
     size_t n_bytes() override {
