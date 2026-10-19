@@ -146,6 +146,15 @@ three fixed requests (a 32k prompt, a chat, a needle) gave the same tokens and a
 | v59 | 2026-10-11 | server backend-sampling guard + webui | bit-identical to v58 | same |
 | v60 | 2026-10-16 | patches 0227-0240: prefill kernels (B1, B3, B4, B4c), QSA score epilogue (A1) and f16 pooled-key mirror (A2a), mat-vec hoist (C1), KQ visibility mirror (C2), indexer cell-ext restore (0239) | EXACT (oracle above) | new: adopts the v59 namespace read-only (docs/s1/DEPLOY.md) |
 | v61 | 2026-10-17 | patches 0241-0243: QSA score GEMM key-tile-major dispatch (A2b), QSA select without key rows (A3), test / comment polish | EXACT (section 0a) | same as v60 (the v59 adopt stays) |
+| v62 | 2026-10-19 | contrib 0244-0251 at rev e4af0a6ca: correctness and diagnostics, `--spec-draft-n-ubatch` ships unset | numbers = v61 (section 0b) | same as v61 |
+
+## 0b. v62 (2026-10-19): correctness release, numbers = v61
+
+
+v62 = v61 + patches 0244-0251 (correctness and diagnostics; `--spec-draft-n-ubatch` ships unset). Prefill, decode and fill
+are unchanged by design, so every v61 number below stands for v62. Slot save identity (u1-server-ab, llama-server): the saved
+bytes are identical v61 <-> v62 at 262k and 1M; save 527 -> 549 ms at 262k and 2 269 -> 2 316 ms at 1M (noise band).
+Source: docs/releases/v62-regressions.md in the piagent repo.
 
 ## 1. 524k profile baseline - suite runs 2026-10-09 21:50 and 2026-10-10 02:30 (image v53; v54-v61 keep these numerics,
 v60/v61 gated EXACT on the 1M oracle; their speed gains at depth are in sections 0 and 0a)
