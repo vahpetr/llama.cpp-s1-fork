@@ -51,6 +51,9 @@ struct task_params {
     bool stream          = false;
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
+    // [TAG_CACHE_PIN] (SC1) `cache_pin: {"tokens": N}`: keep a recurrent checkpoint at the first N prompt tokens in the disk
+    //   cache as this conversation's pin (-1 = none)
+    int64_t cache_pin_tokens = -1;
     bool return_tokens   = false;
     bool return_progress = false;
 
@@ -581,11 +584,17 @@ struct server_deep_ref {
     // [TAG_SEMANTIC_CKPT] (SC1) a checkpoint at a message boundary (a user turn start, the end of the system prompt or of
     //   a tool result): the newest --cache-disk-ckpt-semantic of them are kept, older ones fall back to the depth rule
     static constexpr uint8_t DEEP_KIND_SEMANTIC = 3;
+    // [TAG_CACHE_PIN] (SC1) the prefix a request pinned (`cache_pin`): never thinned, one per conversation (a newer pin
+    //   demotes the older one to a depth candidate); it lives as long as the conversation's entry - quota / TTL eviction
+    //   of the entry lets deep_gc() collect it like any other checkpoint
+    static constexpr uint8_t DEEP_KIND_PIN = 4;
 
-    // which ref survives at one position: branch > anchor (as before) > semantic > depth (an older build orders by value and keeps
-    //   every kind but depth / branch, so a semantic ref written here stays kept there: a rollback reads it)
+    // which ref survives at one position: pin > branch > anchor (as before) > semantic > depth (an older build orders by
+    //   value and keeps every kind but depth / branch, so a semantic / pin ref written here stays kept there: a rollback
+    //   reads it)
     static int rank(uint8_t kind) {
         switch (kind) {
+            case DEEP_KIND_PIN:      return 4;
             case DEEP_KIND_BRANCH:   return 3;
             case DEEP_KIND_ANCHOR:   return 2;
             case DEEP_KIND_SEMANTIC: return 1;
@@ -594,6 +603,7 @@ struct server_deep_ref {
     }
     static const char * name(uint8_t kind) {
         switch (kind) {
+            case DEEP_KIND_PIN:      return "pin";
             case DEEP_KIND_ANCHOR:   return "anchor";
             case DEEP_KIND_BRANCH:   return "branch";
             case DEEP_KIND_SEMANTIC: return "semantic";

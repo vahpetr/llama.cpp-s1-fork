@@ -2622,8 +2622,11 @@ void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_che
         deep_put(prompt, t, kind);
         return;
     }
-    // below min-step a re-process is cheaper than 113 MiB of disk (a short system prompt, a tiny chat)
-    if (quota == 0 || c.data_tgt.empty() || c.n_tokens < ckpt_min_step || c.n_tokens > (int64_t) prompt.tokens.size() ||
+    // below min-step a re-process is cheaper than 113 MiB of disk (a short system prompt, a tiny chat); [TAG_CACHE_PIN] a
+    //   pin is the client's explicit choice
+    const bool pin = kind == server_deep_ref::DEEP_KIND_PIN;
+    if (quota == 0 || c.data_tgt.empty() || (!pin && c.n_tokens < ckpt_min_step) || c.n_tokens < 1 ||
+        c.n_tokens > (int64_t) prompt.tokens.size() ||
         ((c.flags_tgt | c.flags_dft) & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
         return;
     }
@@ -2664,6 +2667,21 @@ void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_che
             n_deep_semantic++;
         }
     }
+    // [TAG_CACHE_PIN] (review m2) counted only when the ref becomes a pin anew (a client re-sending the same pin is not)
+    const bool was_pin = pin && std::any_of(prompt.deep.begin(), prompt.deep.end(), [&](const auto & r) {
+        return r.n_tokens == c.n_tokens && r.kind == server_deep_ref::DEEP_KIND_PIN;
+    });
+    if (pin) {
+        if (!was_pin) {
+            n_deep_pins++;
+        }
+        // [TAG_CACHE_PIN] one pin per conversation: an older pin becomes a depth candidate
+        for (auto & r : prompt.deep) {
+            if (r.kind == server_deep_ref::DEEP_KIND_PIN && r.n_tokens != c.n_tokens) {
+                r.kind = server_deep_ref::DEEP_KIND_DEPTH;
+            }
+        }
+    }
 
     bool found = false;
     for (auto & r : prompt.deep) {
@@ -2690,13 +2708,27 @@ void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_che
     }
 }
 
-void server_disk_cache::deep_adopt(server_prompt & prompt, const server_deep_ckpt_meta & m) {
-    for (const auto & r : prompt.deep) {
+void server_disk_cache::deep_adopt(server_prompt & prompt, const server_deep_ckpt_meta & m, uint8_t kind) {
+    if (kind == server_deep_ref::DEEP_KIND_PIN) { // [TAG_CACHE_PIN] see deep_put
+        if (!std::any_of(prompt.deep.begin(), prompt.deep.end(), [&](const auto & r) {
+                return r.key == m.key && r.kind == server_deep_ref::DEEP_KIND_PIN; })) {
+            n_deep_pins++; // (review m2) only a new pin
+        }
+        for (auto & r : prompt.deep) {
+            if (r.kind == server_deep_ref::DEEP_KIND_PIN && r.key != m.key) {
+                r.kind = server_deep_ref::DEEP_KIND_DEPTH;
+            }
+        }
+    }
+    for (auto & r : prompt.deep) {
         if (r.key == m.key) {
+            if (server_deep_ref::rank(kind) > server_deep_ref::rank(r.kind)) {
+                r.kind = kind;
+            }
             return;
         }
     }
-    prompt.deep.push_back({ m.n_tokens, m.key, server_deep_ref::DEEP_KIND_DEPTH });
+    prompt.deep.push_back({ m.n_tokens, m.key, kind });
     thin(prompt.deep, (int64_t) prompt.tokens.size());
 }
 
@@ -3512,6 +3544,7 @@ void server_disk_cache::refresh_status() {
         { "ckpt_max",       ckpt_max            },
         { "ckpt_semantic",  ckpt_sem_max        },
         { "deep_semantic",  n_deep_semantic     },
+        { "deep_pins",      n_deep_pins         },
         { "n_entries",      entries.size()      },
         { "n_deep_ckpts",   ckpts.size()        },
         { "n_blocks",       blobs.size()        },
