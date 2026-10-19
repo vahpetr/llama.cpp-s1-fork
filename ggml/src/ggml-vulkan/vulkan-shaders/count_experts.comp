@@ -61,114 +61,143 @@ uint fastdiv(uint n, uint mp, uint L) {
 //   [2*n_experts + 1,         )   row ids grouped by expert, packed as (i01 << 16) | (i00 & 0xffff)
 // Otherwise only data_d[expert_id] is written, holding that expert's row count.
 //
+// [TAG_MMID_HOIST_CHUNKED] (port of upstream #29998, 966baae76) p.n_experts may exceed N_EXPERTS_MAX:
+// the hoisting branch walks the experts in chunks of N_EXPERTS_MAX (one count / prefix / scatter round
+// per chunk over the same shared arrays), carrying the running row and tile totals across chunks.  For
+// n_experts <= N_EXPERTS_MAX it is a single round, the pre-port program.  A row id lands at
+// offsets[e] + its atomicAdd cursor either way, so the layout above does not depend on the chunking.
+//
 // [TAG_MMID_COMPACT] When p.tile_bn is also non-zero a third region follows the row id region.
 // The row id region is addressed from a fixed base and is at most ne00*ne01 words long (one packed
 // row id per (expert slot, token)), so the third region starts at a host-computable
 //   T = 2*n_experts + 1 + ne00*ne01
-// and holds the per-expert *tile* prefix sum for a tile width of p.tile_bn:
-//   [T + e]             sum over e' < e of ceil(count[e'] / tile_bn)
-//   [T + n_experts]     the total tile count, sum over all e of ceil(count[e] / tile_bn)
-// mul_mm.comp / mul_mmq.comp / mul_mm_cm2.comp binary-search that array to turn a flat workgroup
-// id into an (expert, ic) pair, which lets the host dispatch sum_e ceil(count_e / BN) tiles instead
-// of n_experts * ceil(nei1 / BN).  It is appended *after* the row ids on purpose: the header and
-// the row id region keep byte-identical contents and addressing either way, so turning the compact
-// grid on cannot move a single row id.
+// and holds the compact list of the (expert, N-tile) pairs that have rows, for a tile width of
+// p.tile_bn (the #29998 tile list; this fork keeps the contiguous row id region above and lists
+// (expert, ic) pairs instead of upstream's (expert, valid rows) on a tile-aligned row region):
+//   [T]                 the tile count, sum over all e of ceil(count[e] / tile_bn)
+//   [T + 1 + 2*t]       the expert of tile t
+//   [T + 2 + 2*t]       its N-tile index ic (rows ic*tile_bn .. of that expert)
+// Tiles are listed expert-major, ic ascending.  mul_mm.comp / mul_mmq.comp / mul_mmq_cm1.comp /
+// mul_mm_cm2.comp read entry t for flat workgroup t and return at once for t >= [T], which lets the
+// host dispatch a bound on sum_e ceil(count_e / BN) tiles instead of n_experts * ceil(nei1 / BN).
+// It is appended *after* the row ids on purpose: the header and the row id region keep
+// byte-identical contents and addressing either way, so turning the compact grid on cannot move a
+// single row id.
+void write_tiles(const uint tile_base, const uint expert, const uint count, const uint tile_begin) {
+    const uint n_tiles = (count + p.tile_bn - 1) / p.tile_bn;
+    for (uint t = 0; t < n_tiles; ++t) {
+        data_d[tile_base + 1 + 2 * (tile_begin + t)]     = expert;
+        data_d[tile_base + 1 + 2 * (tile_begin + t) + 1] = t;
+    }
+}
+
 void main() {
     const uint expert_id = gl_WorkGroupID.x;
     const uint num_elements = p.ne00 * p.ne01;
     const uint tid = gl_LocalInvocationID.x;
 
     if (p.hoist_row_ids != 0) {
-        // n_experts may exceed the workgroup size (e.g. 512 experts, 256 threads), so stride.
-        for (uint expert = tid; expert < p.n_experts; expert += BLOCK_SIZE) {
-            vals[expert] = 0;
-        }
-        barrier();
+        const uint tile_base = 2 * p.n_experts + 1 + num_elements;
+        // running totals over the chunks done so far; meaningful in the lanes that run the prefix
+        // (subgroup 0, or invocation 0 without subgroups), uniform across subgroup 0
+        uint total_rows = 0;
+        uint total_tiles = 0;
 
-        for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
-            const uint i01 = fastdiv(idx, p.ne00mp, p.ne00L);
-            const uint i00 = idx - i01 * p.ne00;
-            const uint expert = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
-            if (expert < p.n_experts) {
-                atomicAdd(vals[expert], 1);
+        for (uint expert_base = 0; expert_base < p.n_experts; expert_base += N_EXPERTS_MAX) {
+            const uint n_chunk = min(N_EXPERTS_MAX, p.n_experts - expert_base);
+
+            // n_chunk may exceed the workgroup size (e.g. 512 experts, 256 threads), so stride.
+            for (uint e = tid; e < n_chunk; e += BLOCK_SIZE) {
+                vals[e] = 0;
             }
-        }
-        barrier();
+            barrier();
+
+            for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
+                const uint i01 = fastdiv(idx, p.ne00mp, p.ne00L);
+                const uint i00 = idx - i01 * p.ne00;
+                const uint e = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00] - expert_base;
+                if (e < n_chunk) {
+                    atomicAdd(vals[e], 1);
+                }
+            }
+            barrier();
 
 #ifdef USE_SUBGROUPS
-        if (gl_SubgroupID == 0) {
-            // pad the trip count so the subgroup ops stay in uniform control flow
-            const uint n_experts_padded = (p.n_experts + gl_SubgroupSize - 1) & ~(gl_SubgroupSize - 1);
-            uint base = 0;
-            for (uint expert = gl_SubgroupInvocationID; expert < n_experts_padded; expert += gl_SubgroupSize) {
-                const bool in_range = expert < p.n_experts;
-                const uint count = in_range ? vals[expert] : 0;
-                const uint offset = base + subgroupExclusiveAdd(count);
-                if (in_range) {
-                    data_d[expert] = count;
-                    data_d[p.n_experts + expert] = offset;
-                    offsets[expert] = offset;
-                    cursors[expert] = 0;
-                }
-                base += subgroupAdd(count);
-            }
-            if (subgroupElect()) {
-                data_d[2 * p.n_experts] = base;
-            }
-            // [TAG_MMID_COMPACT] second pass over the same vals[]: the per-expert tile prefix sum.
-            // Same trip count and the same uniform control flow as the loop above; p.tile_bn is a
-            // push constant, so the branch is uniform across the dispatch.
-            if (p.tile_bn != 0) {
-                const uint tile_base = 2 * p.n_experts + 1 + num_elements;
-                uint tiles = 0;
-                for (uint expert = gl_SubgroupInvocationID; expert < n_experts_padded; expert += gl_SubgroupSize) {
-                    const bool in_range = expert < p.n_experts;
-                    const uint expert_tiles = in_range ? (vals[expert] + p.tile_bn - 1) / p.tile_bn : 0;
-                    const uint tile_offset = tiles + subgroupExclusiveAdd(expert_tiles);
+            if (gl_SubgroupID == 0) {
+                // pad the trip count so the subgroup ops stay in uniform control flow
+                const uint n_chunk_padded = (n_chunk + gl_SubgroupSize - 1) & ~(gl_SubgroupSize - 1);
+                uint base = total_rows;
+                for (uint e = gl_SubgroupInvocationID; e < n_chunk_padded; e += gl_SubgroupSize) {
+                    const bool in_range = e < n_chunk;
+                    const uint count = in_range ? vals[e] : 0;
+                    const uint offset = base + subgroupExclusiveAdd(count);
                     if (in_range) {
-                        data_d[tile_base + expert] = tile_offset;
+                        data_d[expert_base + e] = count;
+                        data_d[p.n_experts + expert_base + e] = offset;
+                        offsets[e] = offset;
+                        cursors[e] = 0;
                     }
-                    tiles += subgroupAdd(expert_tiles);
+                    base += subgroupAdd(count);
                 }
-                if (subgroupElect()) {
-                    data_d[tile_base + p.n_experts] = tiles;
+                total_rows = base;
+                // [TAG_MMID_COMPACT] second pass over the same vals[]: the tile list.  Same trip
+                // count and the same uniform control flow as the loop above; p.tile_bn is a push
+                // constant, so the branch is uniform across the dispatch.
+                if (p.tile_bn != 0) {
+                    uint tiles = total_tiles;
+                    for (uint e = gl_SubgroupInvocationID; e < n_chunk_padded; e += gl_SubgroupSize) {
+                        const bool in_range = e < n_chunk;
+                        const uint expert_tiles = in_range ? (vals[e] + p.tile_bn - 1) / p.tile_bn : 0;
+                        const uint tile_begin = tiles + subgroupExclusiveAdd(expert_tiles);
+                        if (in_range) {
+                            write_tiles(tile_base, expert_base + e, vals[e], tile_begin);
+                        }
+                        tiles += subgroupAdd(expert_tiles);
+                    }
+                    total_tiles = tiles;
                 }
             }
+#else
+            if (tid == 0) {
+                for (uint e = 0; e < n_chunk; ++e) {
+                    const uint count = vals[e];
+                    data_d[expert_base + e] = count;
+                    data_d[p.n_experts + expert_base + e] = total_rows;
+                    offsets[e] = total_rows;
+                    cursors[e] = 0;
+                    total_rows += count;
+                    // [TAG_MMID_COMPACT] see the subgroup branch above.
+                    if (p.tile_bn != 0) {
+                        write_tiles(tile_base, expert_base + e, count, total_tiles);
+                        total_tiles += (count + p.tile_bn - 1) / p.tile_bn;
+                    }
+                }
+            }
+#endif
+            barrier();
+
+            for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
+                const uint i01 = fastdiv(idx, p.ne00mp, p.ne00L);
+                const uint i00 = idx - i01 * p.ne00;
+                const uint e = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00] - expert_base;
+                if (e < n_chunk) {
+                    const uint row = atomicAdd(cursors[e], 1);
+                    const uint packed_row_id = (i01 << 16) | (i00 & 0xffffu);
+                    data_d[2 * p.n_experts + 1 + offsets[e] + row] = packed_row_id;
+                }
+            }
+            // the next chunk overwrites vals / offsets / cursors
+            barrier();
         }
+
+#ifdef USE_SUBGROUPS
+        if (gl_SubgroupID == 0 && subgroupElect()) {
 #else
         if (tid == 0) {
-            uint offset = 0;
-            for (uint expert = 0; expert < p.n_experts; ++expert) {
-                const uint count = vals[expert];
-                data_d[expert] = count;
-                data_d[p.n_experts + expert] = offset;
-                offsets[expert] = offset;
-                cursors[expert] = 0;
-                offset += count;
-            }
-            data_d[2 * p.n_experts] = offset;
-            // [TAG_MMID_COMPACT] see the subgroup branch above.
-            if (p.tile_bn != 0) {
-                const uint tile_base = 2 * p.n_experts + 1 + num_elements;
-                uint tiles = 0;
-                for (uint expert = 0; expert < p.n_experts; ++expert) {
-                    data_d[tile_base + expert] = tiles;
-                    tiles += (vals[expert] + p.tile_bn - 1) / p.tile_bn;
-                }
-                data_d[tile_base + p.n_experts] = tiles;
-            }
-        }
 #endif
-        barrier();
-
-        for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
-            const uint i01 = fastdiv(idx, p.ne00mp, p.ne00L);
-            const uint i00 = idx - i01 * p.ne00;
-            const uint expert = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
-            if (expert < p.n_experts) {
-                const uint row = atomicAdd(cursors[expert], 1);
-                const uint packed_row_id = (i01 << 16) | (i00 & 0xffffu);
-                data_d[2 * p.n_experts + 1 + offsets[expert] + row] = packed_row_id;
+            data_d[2 * p.n_experts] = total_rows;
+            if (p.tile_bn != 0) {
+                data_d[tile_base] = total_tiles;
             }
         }
         return;

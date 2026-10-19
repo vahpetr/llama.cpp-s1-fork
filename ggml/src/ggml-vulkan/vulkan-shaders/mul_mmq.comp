@@ -118,7 +118,7 @@ void main() {
     uint ic;
     uint expert_idx;
     if (p.mmid_compact != 0) {
-        if (!mmid_compact_tile(gl_WorkGroupID.z, expert_idx, ic)) {
+        if (!mmid_compact_tile(mmid_flat_tile(), expert_idx, ic)) {
             return;
         }
     } else {

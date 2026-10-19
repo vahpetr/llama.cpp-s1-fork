@@ -166,28 +166,21 @@ D_TYPE perElemOpD(const in uint32_t r, const in uint32_t c, const in D_TYPE elem
 }
 
 // [TAG_MMID_COMPACT] cm2 keeps its own copy of the row id helpers; this mirrors
-// mul_mm_id_funcs.glsl's mmid_compact_tile() exactly, see the comment there.
+// mul_mm_id_funcs.glsl's mmid_compact_tile() / mmid_flat_tile() exactly, see the comment there.
 bool mmid_compact_tile(uint flat_tile, out uint expert_idx, out uint ic) {
     const uint tile_base = 2 * p.n_experts + 1 + p.nei0 * p.nei1;
 
-    if (flat_tile >= uint(data_expert_count[tile_base + p.n_experts])) {
+    if (flat_tile >= uint(data_expert_count[tile_base])) {
         return false;
     }
 
-    uint lo = 0;
-    uint hi = p.n_experts;
-    while (hi - lo > 1) {
-        const uint mid = (lo + hi) >> 1;
-        if (uint(data_expert_count[tile_base + mid]) <= flat_tile) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-
-    expert_idx = lo;
-    ic         = flat_tile - uint(data_expert_count[tile_base + lo]);
+    expert_idx = uint(data_expert_count[tile_base + 1 + 2 * flat_tile]);
+    ic         = uint(data_expert_count[tile_base + 2 + 2 * flat_tile]);
     return true;
+}
+
+uint mmid_flat_tile() {
+    return gl_WorkGroupID.y + gl_WorkGroupID.z * gl_NumWorkGroups.y;
 }
 
 void load_row_ids(uint expert_idx, bool nei0_is_pow2, uint ic) {
@@ -282,7 +275,7 @@ void main() {
     uint ic;
     uint expert_idx;
     if (p.mmid_compact != 0) {
-        if (!mmid_compact_tile(gl_WorkGroupID.z, expert_idx, ic)) {
+        if (!mmid_compact_tile(mmid_flat_tile(), expert_idx, ic)) {
             return;
         }
     } else {
