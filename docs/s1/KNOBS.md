@@ -28,6 +28,7 @@ against the code for this table.
 | `--spec-draft-n-max-adaptive-measure` | on | prefer measured round times over the cost model | - | - |
 | `--backend-sampling` | off | upstream flag; on this fork it works with draft-mtp but bypasses the graph cache and the CPU fast path (slower decode) and is not bit-exact at temperature > 0, so keep it off for speed. Where the target context cannot hold a verify round (1 + n_max outputs per sequence) or under tensor split it is forced off at start (WRN `[bs-guard] --backend-sampling forced off: <reason>`; INF `[bs-guard] backend_sampling_supported=<0\|1> spec_type=<type> n_max=<N> outputs_per_seq=<M>` always) and a request with `backend_sampling: true` gets a 400; `/props` reports `backend_sampling_supported` and `speculative {type, n_max}` | LOSSY at temperature > 0 (sampling route) | off |
 | `--spec-draft-policy off\|tput` | off | tput = pick the draft length that maximises committed tokens per ms (gate: no gain here) | output-preserving | off |
+| `--spec-draft-n-ubatch N` (env `LLAMA_ARG_SPEC_DRAFT_N_UBATCH`) | 0 | 0250 (upstream #30459, v62 62.7): physical batch of the draft context; 0 = follow `-ub` (the default, identical to v61); a smaller N shrinks the draft's compute reserve (the second `sched_reserve … compute buffer size` of the start log; 1033.54 MiB at ub 2048 on the 1M brain) and chunks the MTP catch-up of a prefill ubatch into N-row pieces. Part of the disk-cache key today (cache_compat_measure hashes dft_ub: setting it = a new own key) | EXACT* (R110: draft identity across the catch-up width must hold - measured by the u4 unit before a compose sets it) | unset |
 
 ## Sparse attention (QSA) - `LLAMA_QSA_*`, `GGML_VK_QSA_*`
 
@@ -118,6 +119,7 @@ against the code for this table.
 | `GGML_VK_DMMV_RM_{KQ,STDQ,KQ_INT,STDQ_INT,F32}` | built-in | rows per workgroup for dense mat-vec | EXACT | - |
 | `GGML_VK_ASYNC_READ_UMA=1`, `GGML_VK_ASYNC_READ_COPYBUF=1`, `GGML_VK_FLOPS_SEED_LEGACY=1`, `GGML_VK_DISABLE_DESCRIPTOR_REUSE=1` | 0 | readback / submit / descriptor variants (A/B) | EXACT | - |
 | `GGML_VK_DISABLE_FUSION_PATTERNS=a,b`, `GGML_VK_FUSION_LIST=1`, `GGML_VK_FUSION_COUNT=1`, `GGML_VK_FUSION_DIAG=1`, `GGML_VK_SUBMIT_LOG=1` | - | fusion / submit diagnostics | DIAG | - |
+| `GGML_VK_BUF_LOG=1` | 0 | 0244 (v62 62.1, `[TAG_VK_BUF_LOG]`): one INFO line per Vulkan buffer allocation, `[vk-buf] <device> kind=device\|host\|other size=<B> (<MiB>) type=<memory type index> heap=<heap> flags=<VkMemoryPropertyFlags> wc=<0\|1> import=<0\|1>`; kind device = `ggml_vk_create_buffer_device` (weights, KV / recurrent / pool buffers, preallocs), host = pinned host memory, other = staging / aux; wc=1 = host-visible without HOST_CACHED (write-combined for CPU reads). Prints only (the #30049 read-path change is parked, R129) | DIAG | - |
 | `GGML_SCHED_PROFILE=1`, `GGML_GET_ROWS_STATS=1\|2` | 0 | host-side scheduler timers, get_rows census | DIAG | - |
 
 ## v61 package - patches 0241-0243
