@@ -401,11 +401,12 @@ static constexpr uint32_t p021_max_gqa_ratio = 8;
 // vals[] as its scratch and therefore needs N_EXPERTS_MAX >= BLOCK_SIZE.
 static constexpr uint32_t vk_count_experts_block_size = 256;
 
-// Largest n_as for which mul_mat_id can hoist the row ids (see #26686 and count_experts.comp).
+// Experts per round of the hoisting count_experts.comp (see #26686 and count_experts.comp).
 // It is the size of the three per-expert scratch arrays that count_experts.comp keeps in
 // shared memory, so the cost is n * 3 * 4 B = 6 KiB at 512 - safely below the 16 KiB of
 // shared memory Vulkan guarantees.  Passed to the shader as specialization constant 0.
-// 512 covers Qwen3.8-Flash-Next (n_as = 512); upstream had this fixed at 256.
+// 512 covers Qwen3.8-Flash-Next (n_as = 512) in one round; a larger n_as takes
+// ceil(n_as / 512) rounds ([TAG_MMID_HOIST_CHUNKED], #29998 chunks by 1024).
 //
 // Only the *hoisting* pipeline is specialized to this value: the plain counting pipeline keeps
 // N_EXPERTS_MAX = BLOCK_SIZE, i.e. exactly the upstream 3 KiB LDS footprint, so a model that does
@@ -10643,9 +10644,21 @@ static void ggml_vk_matmul_id(
     // (see the usage flags in ggml_vk_create_buffer) and would additionally need a DRAW_INDIRECT
     // barrier in ggml_vk_sync_buffers.
     if (mmid_compact) {
-        // elements[1] = 1 gives CEIL_DIV(1, BN) = 1, so y is flat and z carries the pair index.
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, 1, mmid_tile_bound });
+        // #29998: the flat tile index is y + z * num_y (mmid_flat_tile()); elements[1] is in units of
+        // BN (wg_denoms[1]), elements[2] in workgroups.  The tail of the last z row past the bound
+        // and the tiles past the real total return from mmid_compact_tile().
+        const uint32_t tiles_y = std::min(mmid_tile_bound, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+        const uint32_t tiles_z = CEIL_DIV(mmid_tile_bound, tiles_y);
+        // The workgroup counts moved from { m/BM, 1, bound } (v62) to { m/BM, bound, 1 }, so the [vk-fusion-count] sig of
+        // every graph with a MUL_MAT_ID changes by design: re-baseline a check that compares it with v62 (numerics unchanged,
+        // each workgroup still derives only (expert, ic, ir)).
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc,
+                                  { m, tiles_y * pipeline->wg_denoms[1], tiles_z });
     } else {
+        // The 3-D grid (GGML_VK_MMID_COMPACT=0, hoisting off, or past the compact limits) covers ceil(nei1 / BN) tiles per
+        // expert: with duplicate expert ids in a token's row an expert can hold more than nei1 rows and the rest are silently
+        // lost (the v62 behaviour; real top-k routing never repeats an id). GGML_VK_MMID_COMPACT=0 is not valid for a router
+        // that repeats ids.
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
     }
 }
@@ -12357,20 +12370,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const uint64_t n_as = ne02;
     // n_as counts, n_as offsets, one total, then one packed row id per (expert, token).
     // Hoisting requires 16-bit indices for the packing and a table that fits one binding.
-    // n_as is bounded by count_experts.comp's per-expert shared scratch, not by the packing:
-    // the (i01 << 16) | i00 row id constrains nei1 / nei0 only.
+    // The (i01 << 16) | i00 row id constrains nei1 / nei0 only.
     // A/B knob: GGML_VK_DISABLE_HOIST_ROW_IDS=1 falls back to the per-workgroup ids scan.
     // Value-parsed, not a presence test - see ggml_vk_env_bool [TAG_ENV_BOOL].
     static const bool disable_hoist_row_ids = ggml_vk_env_bool("GGML_VK_DISABLE_HOIST_ROW_IDS", false);
     const uint64_t hoisted_row_id_words = 2 * n_as + 1 + nei0 * nei1;
+    // [TAG_MMID_HOIST_CHUNKED] any n_as: count_experts.comp walks the experts in chunks of
+    // vk_count_experts_max_experts (#29998), so the scratch size no longer caps it.
     const bool hoist_row_ids = !disable_hoist_row_ids &&
-                                n_as <= vk_count_experts_max_experts && nei0 <= 0xffff && nei1 <= 0xffff &&
+                                nei0 <= 0xffff && nei1 <= 0xffff &&
                                 hoisted_row_id_words * sizeof(uint32_t) <=
                                     ctx->device->properties.limits.maxStorageBufferRange;
 
-    // [TAG_MMID_COMPACT] G51: flatten the (expert, N-tile) grid.  count_experts.comp appends a
-    // per-expert tile prefix sum after the row ids and the matmul_id shaders binary-search it to
-    // turn a flat workgroup id into (expert, ic), so the y*z extent shrinks from
+    // [TAG_MMID_COMPACT] G51: flatten the (expert, N-tile) grid.  count_experts.comp appends the
+    // list of the (expert, ic) pairs that hold rows after the row ids (#29998's tile list) and the
+    // matmul_id shaders read entry `flat workgroup id` of it, so the y*z extent shrinks from
     // n_as * ceil(nei1 / BN) to a host-computable bound on sum_e ceil(count_e / BN).  It rides on
     // the hoisted row id table, so it is off whenever hoisting is.
     // Value-parsed, not a presence test - see ggml_vk_env_bool [TAG_ENV_BOOL].
@@ -12489,28 +12503,34 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
 
-    // [TAG_MMID_COMPACT] The compact grid puts one (expert, N-tile) pair per z workgroup, so its
-    // extent is a bound on sum_e ceil(count_e / BN) rather than n_as.  Derivation:
+    // [TAG_MMID_COMPACT] The compact grid runs one workgroup per (expert, N-tile) pair that holds
+    // rows (count_experts.comp lists them, see its layout comment), so its extent is a bound on
+    // sum_e ceil(count_e / BN) rather than n_as * ceil(nei1 / BN).  The bound is upstream #29998's
+    // (ggml_vk_mul_mat_id_max_tiles): every tile is either full (BN rows) or the one partial tail of
+    // a nonempty expert, so with k nonempty experts and R routed rows
     //
-    //   sum_e ceil(c_e / BN) = #{e : c_e > 0} + sum_e floor((c_e - 1) / BN)          (c_e > 0 terms)
-    //                       <= min(n_as, R)   + floor(R / BN),   R = sum_e c_e <= nei0 * nei1
+    //   sum_e ceil(c_e / BN) <= floor((R - 1) / BN) + k  =  ceil(R / BN) - 1 + k,   k <= min(n_as, R)
     //
-    // using sum of floors <= floor of sum.  R is the number of routed rows, which the host bounds by
-    // nei0 * nei1 without reading anything back.  Prefill (n_as 512, nei0 10, nei1 2048, BN 128):
-    // 512 + 160 = 672 against 512 * ceil(2048/128) = 8 192 tile-columns.  A fully skewed router is
-    // the easy case - one expert with R rows is ceil(R / BN) <= 1 + floor(R / BN) tiles - so the
-    // bound holds for every routing, with the whole min(n_as, R) term to spare.
+    // and no more than R tiles (each holds >= 1 row).  R is the number of routed rows, which the
+    // host bounds by nei0 * nei1 without reading anything back, and the bound grows with R.
+    // Prefill (n_as 512, nei0 10, nei1 2048, BN 64): 320 + 511 = 831 against 512 * ceil(2048/64) =
+    // 16 384 tile-columns.  Duplicate ids within a token's row are just more rows of that expert:
+    // counted, listed and bounded the same way (#29998), where the 3-D grid stops at ceil(nei1 / BN)
+    // tiles per expert.
     //
-    // Unlike the old z extent (n_as, capped at 512 by the hoisting limit) this one grows with
-    // nei0 * nei1 / BN, so a pathological shape can exceed maxComputeWorkGroupCount[2] (65 535 is
-    // the Vulkan minimum).  Fall back to the 3-D grid there rather than tripping the assert in
-    // ggml_vk_dispatch_pipeline.  wg_denoms[1] is the pipeline's BN spec constant - the same value
-    // count_experts.comp is told to build the tile prefix sum with.
+    // The tiles are spread over y (up to maxComputeWorkGroupCount[1]) and z (#29998), so the 3-D
+    // grid fallback below is only reachable for a bound past maxCount[1] * maxCount[2] or a tile list
+    // past maxStorageBufferRange.  wg_denoms[1] is the pipeline's BN spec constant - the same value
+    // count_experts.comp is told to build the tile list with.
     uint32_t mmid_tile_bound = 0;
     if (mmid_compact) {
         const uint64_t n_rows = nei0 * nei1;
-        const uint64_t bound  = std::min<uint64_t>(n_as, n_rows) + n_rows / pipeline->wg_denoms[1];
-        if (bound <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
+        const uint64_t bn     = pipeline->wg_denoms[1];
+        const uint64_t bound  = std::min<uint64_t>(n_rows, CEIL_DIV(n_rows, bn) + std::min<uint64_t>(n_as, n_rows) - 1);
+        const uint64_t max_y  = ctx->device->properties.limits.maxComputeWorkGroupCount[1];
+        const uint64_t max_z  = ctx->device->properties.limits.maxComputeWorkGroupCount[2];
+        const uint64_t words  = hoisted_row_id_words + 1 + 2 * bound;
+        if (bound <= max_y * max_z && words * sizeof(uint32_t) <= ctx->device->properties.limits.maxStorageBufferRange) {
             mmid_tile_bound = (uint32_t)bound;
         } else {
             mmid_compact = false;
@@ -12571,10 +12591,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     vk_pipeline count_experts = hoist_row_ids ? ctx->device->pipeline_count_experts_hoist
                                               : ctx->device->pipeline_count_experts;
 
-    // [TAG_MMID_COMPACT] the tile prefix sum is n_as offsets plus the total, appended after the
-    // (fixed, nei0*nei1 word) row id region so the header and the row ids keep their addresses.
+    // [TAG_MMID_COMPACT] the tile list is its count plus two words per tile of the bound, appended
+    // after the (fixed, nei0*nei1 word) row id region so the header and the row ids keep their addresses.
     const size_t expert_data_size = sizeof(uint32_t) *
-        (hoist_row_ids ? hoisted_row_id_words + (mmid_compact ? n_as + 1 : 0) : n_as);
+        (hoist_row_ids ? hoisted_row_id_words + (mmid_compact ? 1 + 2 * (uint64_t)mmid_tile_bound : 0) : n_as);
 
     {
         if (
@@ -12672,8 +12692,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                            0, 0,
                                            mmid_compact ? pipeline->wg_denoms[1] : 0u };
         init_pushconst_fastdiv(pc);
+        // #29998: the count_experts binding starts at the ids offset aligned down to minStorageBufferOffsetAlignment and the
+        // shader adds the misalignment back (pc.a_offset); binding at the unaligned offset counted it twice on a device with
+        // alignment > 4. On RADV (alignment 4, s1 and balkon) the int32 ids are always 4-aligned, so the misalignment is 0 and
+        // the binding, the ids read and every count are the same as before. The matmul binding keeps the unaligned offset:
+        // the non-hoisted shaders read data_ids without a_offset.
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
-            { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc,
+            { ggml_vk_tensor_subbuffer(ctx, ids, true), expert_count_buf }, pc,
             { hoist_row_ids ? 1u : (uint32_t)n_as, 1, 1});
     }
     if (ggml_vk_expert_occ_enabled()) { // [TAG_VK_EXPERT_OCC] off: one cached-bool test
@@ -13014,11 +13039,14 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     }
 }
 
-static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx) {
-    ggml_tensor * dst = cgraph->nodes[node_idx];
-    ggml_tensor * src0 = dst->src[0];
-    ggml_tensor * src2 = dst->src[2];
+static bool ggml_vk_use_mul_mat_vec_id(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src2 = dst->src[2];
     return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
+}
+
+static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx) {
+    return ggml_vk_use_mul_mat_vec_id(cgraph->nodes[node_idx]);
 }
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -22870,6 +22898,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             {
                 ggml_type src0_type = op->src[0]->type;
                 if (op->op == GGML_OP_MUL_MAT_ID) {
+                    if (!ggml_vk_use_mul_mat_vec_id(op)) {
+                        const ggml_tensor * ids = op->src[2];
+                        // Shaders store row IDs as uint16_t slot and token indices (#29998).
+                        if (ids->ne[0] > int64_t(UINT16_MAX) + 1 || ids->ne[1] > int64_t(UINT16_MAX) + 1) {
+                            return false;
+                        }
+                    }
                     if (!device->mul_mat_id_s[src0_type] && !device->mul_mat_id_m[src0_type] && !device->mul_mat_id_l[src0_type]) {
                         // If there's not enough shared memory for row_ids and the result tile, fallback to CPU
                         return false;
