@@ -31,6 +31,15 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("cache_prompt", params.cache_prompt))
         ->set_desc("Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests"));
 
+    add((new field_nested("cache_pin"))
+        ->add_subfield((new field_num("tokens", params.cache_pin_tokens))
+            ->set_hard_limits(-1, std::numeric_limits<int64_t>::max())
+            ->set_desc("Number of leading prompt tokens to pin"))
+        ->set_desc("Pin a prompt prefix in the disk prompt cache (--cache-disk, recurrent / hybrid models): a checkpoint is "
+                   "taken at exactly that many prompt tokens and kept as this conversation's pin (one per conversation; it survives "
+                   "the checkpoint thinning, not the quota / TTL eviction of the conversation), so a "
+                   "branch or a new chat that shares the prefix starts there instead of re-processing it"));
+
     add((new field_bool("return_tokens", params.return_tokens))
         ->set_desc("Return the raw generated token ids in the `tokens` field"));
 

@@ -577,6 +577,9 @@ struct server_slot {
     // [TAG_DEEP_CKPT] a user-message start this task branched at after a deep-checkpoint rewind: the replay takes a
     //   checkpoint there and stores it, so the next branch from the same point is a rewind, not a replay; -1 = none
     int64_t ckpt_branch_pos = -1;
+    // [TAG_CACHE_PIN] (SC1) the request's cache_pin position still to be reached by this prompt processing (a split
+    //   and a checkpoint there, stored as the conversation's pin); -1 = none
+    int64_t ckpt_pin_pos = -1;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -2020,6 +2023,55 @@ private:
             }
         }
         return server_deep_ref::DEEP_KIND_DEPTH;
+    }
+
+    // [TAG_CACHE_PIN] (SC1) the request's `cache_pin: {"tokens": N}` once the kept prefix n_past is known: N beyond it is
+    //   reached by this prompt processing (a split and a checkpoint at N, stored as the pin); N inside it is pinned only
+    //   if a checkpoint at exactly N exists (in RAM or stored) - the state at N is gone otherwise; N must leave at least
+    //   one prompt token to process (a restore needs it)
+    // (review m2) the outcome as it is: pinned only if the conversation's deep refs now carry a pin at n (deep_put declines
+    //   noncanonical / partial prompts, more than one stateful speculative carry, on-device data, quota 0)
+    void cache_pin_report(const server_slot & slot, int64_t n, const char * src) const {
+        const bool ok = std::any_of(slot.prompt.deep.begin(), slot.prompt.deep.end(), [&](const auto & r) {
+            return r.n_tokens == n && r.kind == server_deep_ref::DEEP_KIND_PIN;
+        });
+        if (ok) {
+            SLT_INF(slot, "cache_pin: checkpoint at n_tokens = %" PRId64 " (%s) is this conversation's pin\n", n, src);
+        } else {
+            SLT_WRN(slot, "cache_pin: the checkpoint at %" PRId64 " was not stored (the disk cache declined it), not pinned\n", n);
+        }
+    }
+
+    void cache_pin_setup(server_slot & slot, int64_t n_past) {
+        slot.ckpt_pin_pos = -1;
+        const int64_t pin = slot.task->params.cache_pin_tokens;
+        if (pin <= 0 || !disk_cache) {
+            return;
+        }
+        if (pin >= (int64_t) slot.task->n_tokens()) {
+            SLT_WRN(slot, "cache_pin: %" PRId64 " tokens is not inside the prompt (%d tokens), ignored\n", pin, slot.task->n_tokens());
+            return;
+        }
+        if (pin > n_past) {
+            slot.ckpt_pin_pos = pin;
+            return;
+        }
+        for (const auto & ck : slot.prompt.checkpoints) {
+            if (ck.n_tokens == pin) {
+                deep_spill(slot, ck, server_deep_ref::DEEP_KIND_PIN);
+                cache_pin_report(slot, pin, "in RAM");
+                return;
+            }
+        }
+        for (const auto & m : disk_cache->deep_candidates(slot.task->tokens, pin)) {
+            if (m.n_tokens == pin) {
+                disk_cache->deep_adopt(slot.prompt, m, server_deep_ref::DEEP_KIND_PIN);
+                cache_pin_report(slot, pin, "stored");
+                return;
+            }
+            break; // deepest first
+        }
+        SLT_WRN(slot, "cache_pin: %" PRId64 " tokens are already processed without a checkpoint there, not pinned\n", pin);
     }
 
     // collect deep checkpoints nothing references (see live_deep_refs)
@@ -4077,7 +4129,11 @@ private:
         // [TAG_DEEP_CKPT] the first checkpoint of a conversation (system prompt + tools, shared by every chat and agent
         //   with the same setup) and a branch point are stored at once, the rest when they leave the in-RAM list
         if (disk_cache) {
-            if (cur.n_tokens == slot.ckpt_branch_pos) {
+            if (cur.n_tokens == slot.ckpt_pin_pos) { // [TAG_CACHE_PIN]
+                deep_spill(slot, cur, server_deep_ref::DEEP_KIND_PIN);
+                cache_pin_report(slot, cur.n_tokens, "new");
+                slot.ckpt_pin_pos = -1;
+            } else if (cur.n_tokens == slot.ckpt_branch_pos) {
                 deep_spill(slot, cur, server_deep_ref::DEEP_KIND_BRANCH);
                 slot.ckpt_branch_pos = -1;
             } else if (slot.prompt.deep.empty() && slot.prompt.checkpoints.size() == 1) {
@@ -6073,6 +6129,8 @@ private:
                         slot.prompt.deep.erase(std::remove_if(slot.prompt.deep.begin(), slot.prompt.deep.end(),
                                     [&](const auto & r) { return r.n_tokens > n_past; }), slot.prompt.deep.end());
 
+                        cache_pin_setup(slot, n_past); // [TAG_CACHE_PIN]
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -6135,6 +6193,7 @@ private:
                         slot.prompt.partial      = false; // [TAG_PARTIAL_PROMPT]
                         slot.prompt.draft_gap    = 0;     // [TAG_DRAFT_PARTIAL]
                         slot.prompt.adopted_from.clear(); // [TAG_DISK_ADOPT]
+                        cache_pin_setup(slot, 0); // [TAG_CACHE_PIN] (review m1) re-arm: the prefix is re-processed
 
                         slot.stats.n_prompt_cached = 0;
 
@@ -6268,6 +6327,11 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
+                        // [TAG_CACHE_PIN] the pinned prefix ends here: split, the next batch starts with its checkpoint
+                        if (do_checkpoint && slot.prompt.n_tokens() == slot.ckpt_pin_pos) {
+                            break;
+                        }
+
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
@@ -6331,7 +6395,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && n_tokens_start != slot.ckpt_pin_pos) {
                             do_checkpoint = false;
                         }
                     }
@@ -6352,7 +6416,7 @@ private:
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
-                            n_tokens_start == slot.ckpt_branch_pos ||
+                            n_tokens_start == slot.ckpt_branch_pos || n_tokens_start == slot.ckpt_pin_pos ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 

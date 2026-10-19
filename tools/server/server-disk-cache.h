@@ -135,7 +135,8 @@ struct server_disk_cache {
     bool ckpt_legacy_text_ok(const std::string & key, int64_t n_tokens) const;
 
     // reference a stored checkpoint a deep rewind used from prompt.deep (it then survives the collection)
-    void deep_adopt(server_prompt & prompt, const server_deep_ckpt_meta & m);
+    // kind: [TAG_CACHE_PIN] DEEP_KIND_PIN re-labels an already referenced checkpoint as the conversation's pin
+    void deep_adopt(server_prompt & prompt, const server_deep_ckpt_meta & m, uint8_t kind = server_deep_ref::DEEP_KIND_DEPTH);
 
     // [TAG_CKPT_LOAD_CHECKED] a checkpoint that passed deep_get but did not restore (state length mismatch): forget
     //   it and remove its file (an adopt source's file stays, read-only)
@@ -153,6 +154,7 @@ struct server_disk_cache {
     //   (--cache-disk-ckpt-semantic; 0 = none: the server classifies no checkpoint as semantic, thin() demotes any)
     int32_t ckpt_sem_max = 0;
     uint64_t n_deep_semantic = 0; // semantic checkpoints stored
+    uint64_t n_deep_pins     = 0; // [TAG_CACHE_PIN] pins set (a new checkpoint or an existing one re-labelled)
 
     uint64_t total_bytes() const;
 
