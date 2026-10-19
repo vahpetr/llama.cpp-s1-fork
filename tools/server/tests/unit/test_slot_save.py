@@ -1104,6 +1104,61 @@ def parse_ckpt_appendix(data, end=None):
     return off, count_off, ckpts
 
 
+# [TAG_SLOT_FILE_CKPT_NO_DEEP] (astra pkg2 Important, merge review M1 / m7) checkpoints restored from a slot file (id_task
+#   -2) are RAM-only: the ordinary conversation save of the restored slot writes the entry without them, so they never
+#   reach the shared checkpoint store (n_deep_ckpts). Before the fix the same-identity restore left them publishable and
+#   the .aux path stored them (a later load turns them into id_task -1 deep candidates). The default
+#   --checkpoint-min-step (8192) keeps deep_spill out of this short conversation: every stored checkpoint would be one
+#   of the entry save's
+def test_slot_restore_checkpoints_never_reach_disk_store(swa_server):
+    server = swa_server
+    cache_dir = os.path.abspath(os.path.join("./tmp", "pkg2-disk-cache-slot-ckpt"))
+    if os.path.isdir(cache_dir):
+        import shutil
+        shutil.rmtree(cache_dir)
+    server.extra_args = ["--cache-disk", cache_dir, "--cache-disk-gib", "1", "--cache-disk-min-tokens", "1"]
+    server.start()
+
+    base = "The quick brown fox jumps over the lazy dog. " * 20
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "The first ending of this story is a happy one.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    res = server.make_request("POST", "/slots/1?action=save", data={"filename": "ckpt_disk.bin"})
+    assert res.status_code == 200
+    with open(os.path.join(server.slot_save_path, "ckpt_disk.bin"), "rb") as f:
+        data = f.read()
+    _, _, ckpts = parse_ckpt_appendix(data, find_draft_appendix(data))  # (r3) the draft-less provenance section ends the file
+    assert len(ckpts) > 0
+
+    res = server.make_request("POST", "/slots/1?action=erase")  # no disk save: the restore below lands in an empty slot
+    assert res.status_code == 200
+
+    def status():
+        res = server.make_request("GET", "/disk-cache")
+        assert res.status_code == 200
+        return res.body["n_entries"], res.body["n_deep_ckpts"]
+
+    entries0, deep0 = status()
+    for _ in range(2):  # the second restore saves the first restored state (the ordinary entry save)
+        res = server.make_request("POST", "/slots/1?action=restore", data={"filename": "ckpt_disk.bin"})
+        assert res.status_code == 200
+    entries, deep = status()
+    print(f"slot-file checkpoints: {len(ckpts)} in the file; entries {entries0} -> {entries}, n_deep_ckpts {deep0} -> {deep}")
+    assert entries == entries0 + 1  # the restored conversation was saved
+    assert deep == deep0 == 0       # without the slot-file checkpoints
+
+    # still used from RAM: the second ending reuses the restored checkpoint, as without a disk cache
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "But the second ending was different and sad.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] > 0
+
 # a damaged appendix must be ignored, or its checkpoints dropped when they fail to load, without aborting the server
 @pytest.mark.parametrize("damage", ["oversized_blob", "empty_target", "corrupt_state", "many_checkpoints"])
 def test_slot_restore_damaged_checkpoint_appendix(swa_server, damage):

@@ -2004,7 +2004,15 @@ private:
     }
 
     // [TAG_DEEP_CKPT] a checkpoint leaving the slot's in-RAM list goes to the deep store (if the schedule keeps it)
+    // [TAG_SLOT_FILE_CKPT_NO_DEEP] (SC1 review m5, merge with U5) a checkpoint restored from a /slots file (id_task =
+    //   SLOT_FILE_CKPT_ID_TASK) is never stored in the deep store, whatever its kind (depth / semantic / pin): its bytes
+    //   come from a file outside the disk cache, and before U5 such checkpoints did not exist at all, so the deep store
+    //   stays exactly what v62 writes. It is still used from RAM (restore within the slot)
     void deep_spill(server_slot & slot, const common_prompt_checkpoint & ckpt, uint8_t kind) {
+        if (ckpt.id_task == SLOT_FILE_CKPT_ID_TASK) {
+            SLT_TRC(slot, "deep checkpoint at %" PRId64 " not stored: restored from a slot file\n", ckpt.n_tokens);
+            return;
+        }
         // (Codex gate r3 Major 2) not persisted with more than one stateful speculative implementation (one carry)
         if (disk_cache && common_speculative_n_stateful(spec.get()) <= 1) {
             disk_cache->deep_put(slot.prompt, ckpt, kind);
@@ -2071,7 +2079,8 @@ private:
             return;
         }
         for (const auto & ck : slot.prompt.checkpoints) {
-            if (ck.n_tokens == pin) {
+            // [TAG_SLOT_FILE_CKPT_NO_DEEP] (review m5) a slot-file checkpoint cannot become the pin (deep_spill declines it)
+            if (ck.n_tokens == pin && ck.id_task != SLOT_FILE_CKPT_ID_TASK) {
                 deep_spill(slot, ck, server_deep_ref::DEEP_KIND_PIN);
                 cache_pin_report(slot, pin, "in RAM");
                 return;
@@ -4041,7 +4050,12 @@ private:
             const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
             for (auto & ckpt : slot.prompt.checkpoints) {
                 if (ckpt.n_tokens == n_tokens_new && ckpt.pos_max == pos_max && ckpt.pos_min == pos_min) {
-                    ckpt.id_task = id_task;
+                    // [TAG_SLOT_FILE_CKPT_NO_DEEP] (review m5) a slot-file checkpoint keeps its origin mark: re-owning
+                    //   it would let it reach the deep store when it leaves the RAM list. The min-step rule still spares
+                    //   it - it is the pinned restored checkpoint for the rest of this task (ckpt_pinned_n_tokens below)
+                    if (ckpt.id_task != SLOT_FILE_CKPT_ID_TASK) {
+                        ckpt.id_task = id_task;
+                    }
                     slot.ckpt_pinned_n_tokens = ckpt.n_tokens; // [TAG_CKPT_PIN_RESTORED]
                     SLT_INF(slot, "context checkpoint at n_tokens = %" PRId64 " already present - kept, no copy (size = %.3f MiB)\n",
                             ckpt.n_tokens, (float) ckpt.size() / 1024 / 1024);
@@ -4171,7 +4185,7 @@ private:
     static constexpr uint32_t SLOT_CKPT_MAGIC      = 0x504b4353; // "SCKP"
     static constexpr uint32_t SLOT_CKPT_VERSION_V1 = 1;          // upstream
     static constexpr uint32_t SLOT_CKPT_VERSION    = 2;          // fork: + descriptors + identity + per-blob flags
-    static constexpr int      SLOT_FILE_CKPT_ID_TASK = -2;       // the origin mark of a checkpoint read from a slot file
+    static constexpr int      SLOT_FILE_CKPT_ID_TASK = SERVER_SLOT_FILE_CKPT_ID_TASK; // the origin mark of a checkpoint read from a slot file
 
     static bool ckpt_read(std::ifstream & ifs, void * dst, size_t size, size_t & n_read) {
         if (!ifs.read((char *) dst, size)) {

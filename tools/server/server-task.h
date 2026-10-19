@@ -612,6 +612,10 @@ struct server_deep_ref {
     }
 };
 
+// [TAG_SLOT_FILE_CKPT_NO_DEEP] the origin mark (common_prompt_checkpoint::id_task) of a checkpoint read from a /slots
+//   file (U5, 0257): such a checkpoint is used from RAM only - never a deep checkpoint, a pin or a disk entry's .aux
+static constexpr int SERVER_SLOT_FILE_CKPT_ID_TASK = -2;
+
 struct server_prompt {
     server_tokens tokens;
 

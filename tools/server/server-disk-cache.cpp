@@ -1859,15 +1859,24 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
             // the in-RAM checkpoints go to the content-addressed store (a later save of the same conversation, a
             // branch or a copy writes them once), the .aux keeps their keys
             // [TAG_CACHE_COMPAT2] adopted pre-8 checkpoints (foreign_unverified) are left out: never stamped
+            // [TAG_SLOT_FILE_CKPT_NO_DEEP] (astra pkg2 Important, merge review M1) so are checkpoints restored from a
+            //   /slots file (id_task -2): stored here they would enter the shared checkpoint store, come back from a
+            //   load as id_task -1 and be found by rewinds / cache_pin like deep checkpoints - RAM use only
             std::vector<const common_prompt_checkpoint *> own;
+            size_t n_slot_file = 0;
             for (const auto & c : prompt.checkpoints) {
-                if (!c.foreign_unverified) {
+                if (c.id_task == SERVER_SLOT_FILE_CKPT_ID_TASK) {
+                    n_slot_file++;
+                } else if (!c.foreign_unverified) {
                     own.push_back(&c);
                 }
             }
-            if (own.size() != prompt.checkpoints.size()) {
+            if (own.size() + n_slot_file != prompt.checkpoints.size()) {
                 DSK_INF("%zu adopted pre-8 checkpoint(s) not written under the full descriptor (read-only at their "
-                        "source)\n", prompt.checkpoints.size() - own.size());
+                        "source)\n", prompt.checkpoints.size() - own.size() - n_slot_file);
+            }
+            if (n_slot_file > 0) {
+                DSK_INF("%zu checkpoint(s) restored from a slot file not written (RAM use only)\n", n_slot_file);
             }
             std::vector<size_t> ns;
             for (const auto * c : own) {
@@ -2706,6 +2715,9 @@ void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_che
     if (need_enforce && total_bytes() > quota) {
         enforce("");
     }
+    if (written || pin) { // (merge review m1) /disk-cache shows the new deep checkpoint / pin counters at once
+        refresh_status();
+    }
 }
 
 void server_disk_cache::deep_adopt(server_prompt & prompt, const server_deep_ckpt_meta & m, uint8_t kind) {
@@ -2713,6 +2725,7 @@ void server_disk_cache::deep_adopt(server_prompt & prompt, const server_deep_ckp
         if (!std::any_of(prompt.deep.begin(), prompt.deep.end(), [&](const auto & r) {
                 return r.key == m.key && r.kind == server_deep_ref::DEEP_KIND_PIN; })) {
             n_deep_pins++; // (review m2) only a new pin
+            refresh_status(); // (merge review m1)
         }
         for (auto & r : prompt.deep) {
             if (r.kind == server_deep_ref::DEEP_KIND_PIN && r.key != m.key) {
