@@ -254,6 +254,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # both arms and compares the dumped ordered ids byte for byte; not a ctest - needs a Vulkan device, SKIP otherwise.
     # A -DGGML_VULKAN_QSA_TOPK_NOKEYS_NEGCTL=ON build is its negative control.
     llama_build(test-qsa-topk-nokeys.cpp)
+    # [TAG_MMID_SKIP] the mul_mat_id padding skip (#25483) over the partial-tile MUL_MAT_ID cases (runs test-backend-ops); not a
+    # ctest - needs a Vulkan device, SKIP otherwise. A -DGGML_VULKAN_MMID_SKIP_NEGCTL=ON build is its negative control.
+    llama_build(test-mmid-skip.cpp)
     llama_test(test-mtp-qsa-restore LABEL mtp)
     set_tests_properties(test-mtp-qsa-restore PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
     llama_test(test-mtp-qsa-restore NAME test-mtp-qsa-restore-phase LABEL mtp)

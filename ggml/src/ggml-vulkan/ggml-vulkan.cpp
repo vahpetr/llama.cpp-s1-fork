@@ -8531,6 +8531,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
                           device->qsa_score_kreuse_max_wg, negctl);
         }
 
+#ifdef GGML_VULKAN_MMID_SKIP_NEGCTL
+        // [TAG_MMID_SKIP] the proof line of the negative-control build (a shipped build has neither the line nor the string)
+        GGML_LOG_WARN("ggml_vulkan: mmid_skip: NEGATIVE-CONTROL BUILD: the mul_mat_id padding skip counts one row too few "
+                      "(the last row of each expert's last partial tile is dropped)\n");
+#endif
+
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
         const bool prefers_transfer_queue =
             device->vendor_id == VK_VENDOR_ID_AMD &&
