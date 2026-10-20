@@ -2759,6 +2759,9 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     llm->res->set_outputs(params);
 
+    // [TAG_QSA_DUMP_QIN] the score-operand hashes, each just before its score node (no-op with the knob off)
+    llm->res->qsa_qin_place();
+
     return llm->res->get_gf();
 }
 

@@ -254,6 +254,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # both arms and compares the dumped ordered ids byte for byte; not a ctest - needs a Vulkan device, SKIP otherwise.
     # A -DGGML_VULKAN_QSA_TOPK_NOKEYS_NEGCTL=ON build is its negative control.
     llama_build(test-qsa-topk-nokeys.cpp)
+    # [TAG_QSA_DUMP_QIN] (fr15) GGML_OP_QSA_HASH vs an independent reference (CPU + the first GPU): determinism, sensitivity,
+    # n_part independence; then LLAMA_QSA_DUMP_QIN through the synthetic qwen4exp model (target + MTP draft): knob on/off
+    # logits, ids records and (GPU) the [vk-fusion-count] signature identical, the qin records deterministic
+    llama_build_and_test(test-qsa-qin-hash.cpp)
     # [TAG_MMID_SKIP] the mul_mat_id padding skip (#25483) over the partial-tile MUL_MAT_ID cases (runs test-backend-ops); not a
     # ctest - needs a Vulkan device, SKIP otherwise. A -DGGML_VULKAN_MMID_SKIP_NEGCTL=ON build is its negative control.
     llama_build(test-mmid-skip.cpp)

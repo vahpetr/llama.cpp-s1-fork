@@ -143,7 +143,7 @@ int main() {
     }
     for (const char * n : { "LLAMA_ATTN_ROT_DISABLE", "LLAMA_MTP_CARRIER_ZERO", "LLAMA_QSA_MIN_KV", "LLAMA_KQ_VIS",
                             "LLAMA_QSA_POOL_REMAP", "GGML_VK_DISABLE_F16", "GGML_VK_DISABLE_COOPMAT", "GGML_VK_QSA_TOPK",
-                            "GGML_TOTAL_THREADS", "LLAMA_MTP_QSA", "LLAMA_PROBE_DUMMY",
+                            "GGML_TOTAL_THREADS", "LLAMA_MTP_QSA", "LLAMA_PROBE_DUMMY", "LLAMA_QSA_DUMP_QIN",
                             "GGML_SOMETHING_NEW", "LLAMA_TRACEX", "GGML_VK_PERF_LOGGER_X" }) {
         if (server_cache_env_classify(n) != SERVER_CACHE_ENV_SEMANTIC) {
             fprintf(stderr, "expected semantic: %s\n", n);
@@ -158,6 +158,9 @@ int main() {
         const std::string d1 = server_cache_env_digest({ "LLAMA_KQ_VIS=1", "LLAMA_TRACE=1" });
         CHECK(d1 != d0);
         CHECK(server_cache_env_digest({ "LLAMA_TRACE=2", "LLAMA_KQ_VIS=1" }) == d1);
+        // [TAG_QSA_DUMP_QIN] a probe-only knob keeps the key strict whatever its value, 0 included
+        CHECK(server_cache_env_digest({ "LLAMA_QSA_DUMP_QIN=0" }) != d0);
+        CHECK(server_cache_env_digest({ "LLAMA_QSA_DUMP_QIN=2" }) != server_cache_env_digest({ "LLAMA_QSA_DUMP_QIN=0" }));
         CHECK(server_cache_env_digest({ "LLAMA_KQ_VIS=0" }) != d1);
         CHECK(server_cache_env_digest({ "LLAMA_KQ_VIS=1", "LLAMA_PROBE_DUMMY=1" }) != d1);
     }

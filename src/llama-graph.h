@@ -935,6 +935,26 @@ struct llm_graph_fused_node {
     int il;
 };
 
+// [TAG_QSA_DUMP_QIN] (fr15, R130) LLAMA_QSA_DUMP_QIN: one in-graph content hash (GGML_OP_QSA_HASH) of an operand of a QSA
+// score node, written to slot `slot` of the context's persistent partials buffer (LLAMA_QSA_QIN_PARTS partials per slot,
+// LLAMA_QSA_QIN_SLOTS slots per graph) and printed by llama_context after the graph ran
+#define LLAMA_QSA_QIN_PARTS 128
+#define LLAMA_QSA_QIN_SLOTS 4096
+
+struct llm_graph_qsa_qin {
+    ggml_tensor *       node   = nullptr; // the QSA_HASH node (nullptr: no slot left, recorded as error=capacity)
+    const ggml_tensor * anchor = nullptr; // the score node that reads the operand; the hash runs right before it
+    int                 il     = -1;
+    int                 chunk  = 0;       // k-th record of this (il, what) in the graph = the score chunk
+    const char *        what   = "";      // q | bias_blk | bias_qry | bias | pooled | pooled16
+    const ggml_tensor * a      = nullptr; // the hashed operand and its gather rows (the once-per-graph key)
+    const ggml_tensor * a_rows = nullptr;
+    int64_t             rows   = 0;       // what=q: queries per stream (= [qsa-ids-chunk] rows); else the logical rows hashed
+    uint64_t            words  = 0;       // 32-bit words hashed
+    int                 slot   = -1;
+    bool                placed = false;   // put right before the anchor (false: left where the expand put it)
+};
+
 class llm_graph_result {
 public:
     llm_graph_result(int64_t max_nodes);
@@ -992,6 +1012,13 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+
+    // [TAG_QSA_DUMP_QIN] the hashes of this graph, in build order (empty with the knob off)
+    std::vector<llm_graph_qsa_qin> qsa_qin;
+
+    // [TAG_QSA_DUMP_QIN] expand the hashes into the graph, each immediately before its anchor (called once, at the end of
+    // llama_model::build_graph); a no-op without hashes
+    void qsa_qin_place();
 
     // [TAG_KQ_VIS_MIRROR] an attention input of this graph reads a cache's device visibility mirror (written in place
     // by set_inputs: the previous graph must be done before)
@@ -1219,6 +1246,12 @@ struct llm_graph_context {
     //
     // inputs
     //
+
+    // [TAG_QSA_DUMP_QIN] record a QSA_HASH of operand a (rows: the gather rows, or nullptr) read by the node anchor; the
+    // hash runs right before anchor. n_rows: the record's rows= (-1: the logical rows hashed); once: skip it when this
+    // graph already hashes the same (a, rows). No-op unless cparams.qsa_qin_buf is set.
+    void build_qsa_qin(ggml_tensor * a, ggml_tensor * rows, const ggml_tensor * anchor, int il, const char * what,
+                       int64_t n_rows = -1, bool once = false) const;
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;

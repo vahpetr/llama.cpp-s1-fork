@@ -1,0 +1,115 @@
+#version 450
+
+// [TAG_QSA_DUMP_QIN] (fr15, R130) GGML_OP_QSA_HASH: partial p (one workgroup) of the 64-bit content hash of a's 32-bit word
+// stream (definition: ggml.h ggml_qsa_hash; CPU reference: ggml-cpu/ops.cpp ggml_compute_forward_qsa_hash). Words
+// [p*chunk, min((p+1)*chunk, n_words)) (chunk = ggml_qsa_hash_chunk, a multiple of 4) of the logical rows - every row of a (has_rows == 0, i1 fastest), or row rows[k]
+// of a for the k-th logical row (has_rows != 0; binding 1 is a again when unused) - each contribute
+//   A = fmix32(w ^ (e * 0x9E3779B1)),  B = fmix32(rotl(w, 16) ^ (e * 0xC2B2AE3D + 0x27D4EB2F))
+// and the workgroup writes (sum A, sum B) mod 2^32 to dst[2p], dst[2p + 1]. Integer adds only: the partials do not
+// depend on how the invocations split the range or in which order the reduction adds, so they equal the CPU's bit
+// for bit. Reads a and rows, writes only dst.
+
+layout(push_constant) uniform parameter {
+    uint row_words;  // 32-bit words per row
+    uint n_words;    // words in the stream
+    uint chunk;      // words per partial
+    uint has_rows;
+    uint a_off;      // a's misalignment, in words
+    uint ne1;
+    uint ne2;
+    uint nb1;        // strides in words
+    uint nb2;
+    uint nb3;
+} p;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer A { uint data_a[]; };
+layout(binding = 1) readonly  buffer R { int  data_r[]; };
+layout(binding = 2) writeonly buffer D { uint data_d[]; };
+
+shared uint sh_a[256];
+shared uint sh_b[256];
+
+uint fmix32(uint h) {
+    h ^= h >> 16; h *= 0x85EBCA6Bu;
+    h ^= h >> 13; h *= 0xC2B2AE35u;
+    h ^= h >> 16;
+    return h;
+}
+
+// the logical row k's first word in data_a, or 0xFFFFFFFF for a gather index outside a
+uint row_base(const uint k) {
+    if (p.has_rows != 0u) {
+        const int r = data_r[k];
+        if (r < 0 || uint(r) >= p.ne1) {
+            return 0xFFFFFFFFu;
+        }
+        return p.a_off + uint(r) * p.nb1;
+    }
+    const uint i1 = k % p.ne1;
+    const uint t  = k / p.ne1;
+    const uint i2 = t % p.ne2;
+    const uint i3 = t / p.ne2;
+    return p.a_off + i1 * p.nb1 + i2 * p.nb2 + i3 * p.nb3;
+}
+
+void add_word(const uint e, const uint w, inout uint sa, inout uint sb) {
+    sa += fmix32(w ^ (e * 0x9E3779B1u));
+    sb += fmix32(((w << 16) | (w >> 16)) ^ (e * 0xC2B2AE3Du + 0x27D4EB2Fu));
+}
+
+void main() {
+    const uint part = gl_WorkGroupID.x;
+    const uint tid  = gl_LocalInvocationID.x;
+
+    // chunk is a multiple of 4 (ggml_qsa_hash_chunk), so e0 is too
+    const uint e0 = min(p.n_words, part * p.chunk);
+    const uint e1 = min(p.n_words, e0 + p.chunk);
+
+    uint sa = 0u;
+    uint sb = 0u;
+    if ((p.row_words & 3u) == 0u) {
+        // 4 consecutive words of one row per step: one row lookup per 4 words (n_words is a multiple of 4 here)
+        for (uint e = e0 + 4u * tid; e < e1; e += 1024u) {
+            const uint k    = e / p.row_words;
+            const uint base = row_base(k);
+            if (base == 0xFFFFFFFFu) {
+                for (uint q = 0u; q < 4u; ++q) {
+                    sa += fmix32((e + q) ^ 0xA5A5A5A5u) + 1u;
+                }
+                continue;
+            }
+            const uint a = base + (e - k * p.row_words);
+            add_word(e,      data_a[a],      sa, sb);
+            add_word(e + 1u, data_a[a + 1u], sa, sb);
+            add_word(e + 2u, data_a[a + 2u], sa, sb);
+            add_word(e + 3u, data_a[a + 3u], sa, sb);
+        }
+    } else {
+        for (uint e = e0 + tid; e < e1; e += 256u) {
+            const uint k    = e / p.row_words;
+            const uint base = row_base(k);
+            if (base == 0xFFFFFFFFu) {
+                sa += fmix32(e ^ 0xA5A5A5A5u) + 1u;
+                continue;
+            }
+            add_word(e, data_a[base + (e - k * p.row_words)], sa, sb);
+        }
+    }
+
+    sh_a[tid] = sa;
+    sh_b[tid] = sb;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            sh_a[tid] += sh_a[tid + s];
+            sh_b[tid] += sh_b[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        data_d[2u * part]      = sh_a[0];
+        data_d[2u * part + 1u] = sh_b[0];
+    }
+}

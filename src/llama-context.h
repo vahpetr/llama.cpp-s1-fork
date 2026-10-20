@@ -364,6 +364,17 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
+    // [TAG_QSA_DUMP_QIN] LLAMA_QSA_DUMP_QIN=1|2: the persistent QSA_HASH partials buffer (cparams.qsa_qin_buf lives in it;
+    // declared after `backends`, so it is freed before them), the graphs computed so far (the g= of the records, counted
+    // like the ids dump's), the occurrence counts of the record keys and the host copy of the partials
+    ggml_context_ptr        qsa_qin_ctx;
+    ggml_backend_buffer_ptr qsa_qin_buf;
+    uint64_t                qsa_qin_graph = 0;
+    std::map<std::string, int> qsa_qin_occ;
+    std::vector<int32_t>    qsa_qin_host;
+
+    void qsa_qin_flush(const llm_graph_result * res, int64_t n_past);
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 

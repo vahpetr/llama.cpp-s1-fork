@@ -1398,6 +1398,69 @@ int64_t llm_graph_result::get_max_nodes() const {
     return max_nodes;
 }
 
+// [TAG_QSA_DUMP_QIN] every hash is expanded at the tail (its operands are already in the graph: they are sources of its
+// anchor, which the outputs pulled in), then the node list is rebuilt in one pass with each hash moved to just before
+// its anchor. The relative order of every other node is unchanged, and so is the allocation: the hash's output is a
+// view of the persistent partials buffer (nothing to allocate) and each operand is still read by the anchor right after
+// it (the hash ends no lifetime). A hash whose expand pulled in more than itself, or whose anchor is not in the graph,
+// stays at the tail (placed=false, printed in its record).
+void llm_graph_result::qsa_qin_place() {
+    if (qsa_qin.empty()) {
+        return;
+    }
+    const int n0 = ggml_graph_n_nodes(gf);
+    int n_new = 0;
+    for (auto & r : qsa_qin) {
+        if (r.node == nullptr) {
+            continue;
+        }
+        const int n_pre = ggml_graph_n_nodes(gf);
+        ggml_build_forward_expand(gf, r.node);
+        r.placed = ggml_graph_n_nodes(gf) == n_pre + 1 && ggml_graph_node(gf, n_pre) == r.node;
+        n_new   += r.placed ? 1 : 0;
+    }
+    const int n_all = ggml_graph_n_nodes(gf);
+    if (n_all != n0 + n_new) {
+        // an expand pulled in nodes besides the hash: move nothing
+        for (auto & r : qsa_qin) {
+            r.placed = false;
+        }
+        return;
+    }
+
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> before;
+    for (const auto & r : qsa_qin) {
+        if (r.placed) {
+            before[r.anchor].push_back(r.node);
+        }
+    }
+
+    ggml_tensor ** nodes = ggml_graph_nodes(gf);
+    std::vector<ggml_tensor *> order;
+    order.reserve(n_all);
+    std::set<const ggml_tensor *> moved;
+    for (int i = 0; i < n0; ++i) {
+        auto it = before.find(nodes[i]);
+        if (it != before.end()) {
+            for (ggml_tensor * h : it->second) {
+                order.push_back(h);
+                moved.insert(h);
+            }
+        }
+        order.push_back(nodes[i]);
+    }
+    for (int i = n0; i < n_all; ++i) {
+        if (moved.count(nodes[i]) == 0) {
+            order.push_back(nodes[i]); // anchor not in the graph: stays at the tail
+        }
+    }
+    GGML_ASSERT((int) order.size() == n_all);
+    for (auto & r : qsa_qin) {
+        r.placed = r.placed && moved.count(r.node) != 0;
+    }
+    std::copy(order.begin(), order.end(), nodes);
+}
+
 void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
@@ -1419,6 +1482,7 @@ void llm_graph_result::reset() {
     inputs.clear();
     fused_nodes.clear();
     uses_kq_vis_mirror = false; // [TAG_KQ_VIS_MIRROR]
+    qsa_qin.clear(); // [TAG_QSA_DUMP_QIN]
 
     const size_t meta_size = ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false);
     if (buf_compute_meta_size != meta_size) {
@@ -2409,6 +2473,46 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
+}
+
+// [TAG_QSA_DUMP_QIN] (fr15, R130) one QSA_HASH of a score operand into the next slot of the persistent partials buffer;
+// placed by llm_graph_result::qsa_qin_place, read and printed by llama_context after the graph
+void llm_graph_context::build_qsa_qin(ggml_tensor * a, ggml_tensor * rows, const ggml_tensor * anchor, int il, const char * what,
+                                      int64_t n_rows, bool once) const {
+    ggml_tensor * buf = cparams.qsa_qin_buf;
+    if (buf == nullptr || a == nullptr || anchor == nullptr) {
+        return;
+    }
+    if (once) {
+        for (const auto & o : res->qsa_qin) {
+            if (o.a == a && o.a_rows == rows && strcmp(o.what, what) == 0) {
+                return;
+            }
+        }
+    }
+    llm_graph_qsa_qin r;
+    r.a      = a;
+    r.a_rows = rows;
+    r.anchor = anchor;
+    r.il     = il;
+    r.what   = what;
+    for (const auto & o : res->qsa_qin) {
+        r.chunk += o.il == il && strcmp(o.what, what) == 0;
+    }
+    r.rows  = n_rows >= 0 ? n_rows : (rows ? ggml_nelements(rows) : a->ne[1]*a->ne[2]*a->ne[3]);
+    r.words = ggml_qsa_hash_n_words(a, rows);
+    int n_slot = 0;
+    for (const auto & o : res->qsa_qin) {
+        n_slot += o.slot >= 0;
+    }
+    const int64_t slot_elems = 2*LLAMA_QSA_QIN_PARTS;
+    if (n_slot < buf->ne[0]/slot_elems) {
+        r.slot = n_slot;
+        ggml_tensor * dst = ggml_view_1d(ctx0, buf, slot_elems, (size_t) n_slot*slot_elems*ggml_element_size(buf));
+        r.node = ggml_qsa_hash(ctx0, a, rows, dst);
+        ggml_format_name(r.node, "qsa_qin_%s-%d", what, il);
+    }
+    res->qsa_qin.push_back(r);
 }
 
 // input embeddings with optional lora

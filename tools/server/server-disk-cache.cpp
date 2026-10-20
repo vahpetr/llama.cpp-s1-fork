@@ -745,7 +745,19 @@ static const char * const CACHE_ENV_EXACT[] = {
     "GGML_GET_ROWS_STATS", "GGML_GET_ROWS_THREADS",
 };
 
+// probe-only knobs: capture / debug switches for the oracle probe, never set in a deploy compose (the release smoke's env
+//   lint rejects LLAMA_QSA_DUMP_*). Registered explicitly as SEMANTIC, so their presence - any value, 0 included - keeps
+//   the cache key strict: a server started with one never shares a namespace with prod
+static const char * const CACHE_ENV_PROBE_ONLY[] = {
+    "LLAMA_QSA_DUMP_QIN", // [TAG_QSA_DUMP_QIN] (fr15) in-graph score-input hashes; numerics-neutral by test, still probe-only
+};
+
 server_cache_env_class server_cache_env_classify(const std::string & name) {
+    for (const char * e : CACHE_ENV_PROBE_ONLY) {
+        if (name == e) {
+            return SERVER_CACHE_ENV_SEMANTIC;
+        }
+    }
     if (name.rfind("LLAMA_ARG_", 0) == 0) {
         // the disk cache's own options (neutral since v1) and every other option alias: common_params_parse reads it
         //   into common_params like its argv form, so the parsed-param digest (server_cache_param_canon) carries its

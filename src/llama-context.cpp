@@ -216,6 +216,41 @@ static bool llama_qsa_dump_score_enabled() {
     return enabled;
 }
 
+// [TAG_QSA_DUMP_QIN] (fr15, ruling R130, contrib 0260) LLAMA_QSA_DUMP_QIN=1|2 (default off): what every QSA score node reads,
+// hashed IN the graph (GGML_OP_QSA_HASH, a 64-bit content hash, see ggml.h ggml_qsa_hash) - one record per (graph,
+// layer, chunk, operand) after the graph ran:
+//   [qsa-qin-chunk] ctx=<main|mtp> g=<graph> il=<il> chunk=<k> n_past=<p> what=<...> occ=<o> rows=<n> words=<n>
+//                   h64=<16 hex> placed=<1|0>
+//   what (qwen4exp build_qsa_select): q = the chunk's indexer queries (the transient the saved state does not determine;
+//     rows = queries per stream, as rows= of [qsa-ids-chunk]); bias_blk / bias_qry = the two tables of the compact bias
+//     fold (once per graph); bias = any other folded bias plane (per chunk); level 2 adds, once per (graph, layer),
+//     pooled = the f32 store rows remap[b] (or the full-pool plane) and pooled16 = the f16 mirror rows the coopmat1
+//     score reads (other what: rows = the logical rows hashed)
+//   LEVELS: 2 is the gate mode (the oracle's arm-ids pass): together with the ids records it covers every operand of the
+//     score. 1 (q + bias inputs, no pooled operand) is diagnostic only.
+//   chunk = the k-th record of (il, what) in the graph, the build order of the chunks (the [qsa-ids-chunk] chunk index);
+//   occ = how many earlier graphs of this context printed the same (n_past, il, chunk, what) - a re-prefill after a reset
+//     or a rewind repeats n_past; (ctx, n_past, il, chunk, what, occ) is the cross-run key, g only orders one run
+//   placed=0 (the hash could not be put right before its reader and ran at the graph's end) and error=capacity (more than
+//     LLAMA_QSA_QIN_SLOTS records in one graph, no hash) are FAILs for a comparator: a misplaced hash extends operand
+//     lifetimes and changes the allocation and the [vk-fusion-count] sig, a missing one leaves a hole
+// The hash nodes go into the graph right before their reader (llm_graph_result::qsa_qin_place) and write a slot of a
+// persistent device buffer of LLAMA_QSA_QIN_SLOTS x LLAMA_QSA_QIN_PARTS x 8 bytes (4 MiB) - no graph split, no eval
+// callback, nothing for the compute allocator (the hashed operands are all read by that reader right after). ggml-vulkan
+// keeps them out of graph_optimize's reordering and out of the GGML_VK_FUSION_COUNT signature (counted as qsa_hash=<n>);
+// a hash adds one use to the tensors it reads (q, the bias tables / plane, the pooled store, remap, mirror), which the
+// backend's single-use fusion checks (ggml_node_get_use_count) would see only if one of them were a fusion's elided
+// intermediate - none is, and the sig equality on vs off (tests/test-qsa-qin-hash) shows every other dispatch unchanged.
+// The partials are read once per graph (one synchronize + one copy of the used slots). Knob off: no buffer, no node, no read.
+static int llama_qsa_dump_qin_level() {
+    static const int level = [] {
+        const char * s = getenv("LLAMA_QSA_DUMP_QIN");
+        return s != nullptr ? atoi(s) : 0;
+    }();
+
+    return level;
+}
+
 // [TAG_QSA_DUMP_IDS] (contrib 0229) a self-contained SHA-256 for the identity records (debug path only)
 struct llama_qsa_sha256 {
     uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
@@ -1089,6 +1124,26 @@ llama_context::llama_context(
         // more, ggml-alloc reallocates it on demand (see ggml_backend_sched_alloc_splits).
         if (memory && cparams.kv_graph_span > 0) {
             memory->set_n_kv_reserve_max(cparams.kv_graph_span);
+        }
+    }
+
+    // [TAG_QSA_DUMP_QIN] the persistent partials buffer, on the first backend (the device of the layers; CPU without one)
+    if (!hparams.vocab_only && llama_qsa_dump_qin_level() > 0 && !backends.empty()) {
+        ggml_init_params ip = { ggml_tensor_overhead()*2, nullptr, true };
+        qsa_qin_ctx.reset(ggml_init(ip));
+        ggml_tensor * t = ggml_new_tensor_1d(qsa_qin_ctx.get(), GGML_TYPE_I32, (int64_t) 2*LLAMA_QSA_QIN_PARTS*LLAMA_QSA_QIN_SLOTS);
+        ggml_set_name(t, "qsa_qin_partials");
+        qsa_qin_buf.reset(ggml_backend_alloc_ctx_tensors(qsa_qin_ctx.get(), backends.front().get()));
+        if (qsa_qin_buf) {
+            ggml_backend_buffer_clear(qsa_qin_buf.get(), 0);
+            cparams.qsa_qin_buf   = t;
+            cparams.qsa_qin_level = llama_qsa_dump_qin_level();
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_DUMP_QIN=%d: in-graph QSA score-input hashes of the %s context -> stderr "
+                           "([qsa-qin-chunk], %s buffer %.2f MiB)\n", __func__, cparams.qsa_qin_level,
+                           sched_prof_ctx_name(cparams.ctx_type), ggml_backend_buffer_name(qsa_qin_buf.get()),
+                           ggml_backend_buffer_get_size(qsa_qin_buf.get())/1024.0/1024.0);
+        } else {
+            LLAMA_LOG_WARN("%s: LLAMA_QSA_DUMP_QIN: cannot allocate the partials buffer - off\n", __func__);
         }
     }
 
@@ -2786,6 +2841,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
 
+    // [TAG_QSA_DUMP_QIN] the score-input hashes of this graph
+    if (cparams.qsa_qin_buf != nullptr && status == GGML_STATUS_SUCCESS) {
+        qsa_qin_flush(res, ubatch.pos != nullptr && ubatch.n_tokens > 0 ? (int64_t) ubatch.pos[0] : -1);
+    }
+
     if (gc_exec && status == GGML_STATUS_SUCCESS) {
         graph_cache_check_exec_post(res);
     }
@@ -3914,6 +3974,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (n_sampling_outputs_max > 1) {
         res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
+    // [TAG_QSA_DUMP_QIN] room for the score-input hash nodes (knob off: unchanged)
+    if (cparams.qsa_qin_buf != nullptr) {
+        res += LLAMA_QSA_QIN_SLOTS;
+    }
     return res;
 }
 
@@ -4091,10 +4155,50 @@ ggml_status llama_context::graph_compute(
     if (qsa_ids_dump) {
         qsa_ids_dump->end_graph();
     }
+    // [TAG_QSA_DUMP_QIN] counted where the ids dump counts, so g= of both records names the same graph
+    qsa_qin_graph++;
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+// [TAG_QSA_DUMP_QIN] one synchronize, one read of the used slots, one record per hash (build order)
+void llama_context::qsa_qin_flush(const llm_graph_result * res, int64_t n_past) {
+    const auto & recs = res->qsa_qin;
+    if (recs.empty()) {
+        return;
+    }
+    const uint64_t g = qsa_qin_graph - 1;
+    int n_slot = 0;
+    for (const auto & r : recs) {
+        n_slot = std::max(n_slot, r.slot + 1);
+    }
+    const size_t slot_elems = 2*LLAMA_QSA_QIN_PARTS;
+    qsa_qin_host.resize(n_slot*slot_elems);
+    if (n_slot > 0) {
+        ggml_backend_sched_synchronize(sched.get());
+        ggml_backend_tensor_get(cparams.qsa_qin_buf, qsa_qin_host.data(), 0, qsa_qin_host.size()*sizeof(int32_t));
+    }
+    const char * ctx_name = sched_prof_ctx_name(cparams.ctx_type);
+    // occ: earlier graphs of this context with the same (n_past, il, chunk, what)
+    const auto occ_of = [&](const llm_graph_qsa_qin & r) {
+        char key[160];
+        snprintf(key, sizeof(key), "%lld|%d|%d|%s", (long long) n_past, r.il, r.chunk, r.what);
+        return qsa_qin_occ[key]++;
+    };
+    for (const auto & r : recs) {
+        if (r.slot < 0) {
+            fprintf(stderr, "[qsa-qin-chunk] ctx=%s g=%llu il=%d chunk=%d n_past=%lld what=%s occ=%d rows=%lld words=%llu error=capacity\n",
+                    ctx_name, (unsigned long long) g, r.il, r.chunk, (long long) n_past, r.what, occ_of(r), (long long) r.rows,
+                    (unsigned long long) r.words);
+            continue;
+        }
+        const uint64_t h = ggml_qsa_hash_combine(qsa_qin_host.data() + (size_t) r.slot*slot_elems, LLAMA_QSA_QIN_PARTS, r.words);
+        fprintf(stderr, "[qsa-qin-chunk] ctx=%s g=%llu il=%d chunk=%d n_past=%lld what=%s occ=%d rows=%lld words=%llu h64=%016llx placed=%d\n",
+                ctx_name, (unsigned long long) g, r.il, r.chunk, (long long) n_past, r.what, occ_of(r), (long long) r.rows,
+                (unsigned long long) r.words, (unsigned long long) h, r.placed ? 1 : 0);
+    }
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {

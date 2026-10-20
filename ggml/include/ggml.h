@@ -595,6 +595,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_QSA_HASH,     // [TAG_QSA_DUMP_QIN] appended last: every op value above is unchanged
+
         GGML_OP_COUNT,
     };
 
@@ -1507,6 +1509,38 @@ extern "C" {
     GGML_API void ggml_qsa_score_set_a_f16(
             struct ggml_tensor  * score,
             struct ggml_tensor  * a16);
+
+    // [TAG_QSA_DUMP_QIN] (fr15, R130) a deterministic 64-bit content hash of the exact bytes of a, computed on the device
+    // that holds a, written as n_part partial sums into dst. Debug / oracle capture only (LLAMA_QSA_DUMP_QIN): it reads
+    // a and writes only dst.
+    //   a:      any type; rows contiguous (nb[0] == type size), row bytes, nb[1..3] and the view offset multiples of 4.
+    //           The hashed stream is the 32-bit words of the logical rows in order: rows == NULL: every row of a
+    //           (i1 fastest, then i2, i3); rows != NULL (a 2-D: ne[2] == ne[3] == 1): row rows[k] of a for k = 0 ..
+    //           nelements(rows) - 1 (the gather ggml_mul_mat_rows / ggml_qsa_score read).
+    //   rows:   I32, contiguous, or NULL
+    //   dst:    I32 [2*n_part], contiguous - in practice a slot view of a persistent buffer; the result is a view of
+    //           dst's storage and its src[2] is dst's base tensor (no VIEW node in the graph); src[2] is not read - a
+    //           hazard tracker must take the node's own slot as the only memory it touches there
+    // Word e (0-based, mod 2^32) with value w contributes A(e, w) = fmix32(w ^ (e * 0x9E3779B1)) and
+    // B(e, w) = fmix32(rotl32(w, 16) ^ (e * 0xC2B2AE3D + 0x27D4EB2F)) (murmur3 fmix32); a row index outside a gives
+    // A = fmix32(e ^ 0xA5A5A5A5) + 1, B = 0. Partial p sums (mod 2^32) the words e in [p*c, (p+1)*c), c =
+    // ggml_qsa_hash_chunk(n_words, n_part) = ceil(n_words / n_part) rounded up to a multiple of 4: dst[2p] = sum A,
+    // dst[2p+1] = sum B. ggml_qsa_hash_combine folds the partials into the hash. Integer sums:
+    // the result does not depend on the order the device adds them in, and changing one word changes both sums.
+    GGML_API struct ggml_tensor * ggml_qsa_hash(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * rows,
+            struct ggml_tensor  * dst);
+
+    // [TAG_QSA_DUMP_QIN] the 64-bit hash from the 2*n_part partials of ggml_qsa_hash and the word count it hashed
+    GGML_API uint64_t ggml_qsa_hash_combine(const int32_t * partials, int64_t n_part, uint64_t n_words);
+
+    // [TAG_QSA_DUMP_QIN] the number of 32-bit words ggml_qsa_hash hashes for (a, rows)
+    GGML_API uint64_t ggml_qsa_hash_n_words(const struct ggml_tensor * a, const struct ggml_tensor * rows);
+
+    // [TAG_QSA_DUMP_QIN] the words per partial: ceil(n_words / n_part) rounded up to a multiple of 4
+    GGML_API uint64_t ggml_qsa_hash_chunk(uint64_t n_words, int64_t n_part);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

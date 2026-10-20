@@ -1103,9 +1103,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "QSA_HASH",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1223,9 +1225,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "qsa_hash(a, rows)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3403,6 +3407,65 @@ void ggml_qsa_score_set_a_f16(
     GGML_ASSERT(a16->type == GGML_TYPE_F16 && ggml_is_contiguous(a16));
     GGML_ASSERT(a16->ne[0] == a->ne[0] && a16->ne[1] == a->ne[1] && a16->ne[2] == 1 && a16->ne[3] == 1);
     score->src[4] = a16;
+}
+
+// ggml_qsa_hash
+
+// [TAG_QSA_DUMP_QIN]
+uint64_t ggml_qsa_hash_n_words(const struct ggml_tensor * a, const struct ggml_tensor * rows) {
+    const uint64_t row_words = (uint64_t) ggml_row_size(a->type, a->ne[0]) / 4;
+    const uint64_t n_rows    = rows ? (uint64_t) ggml_nelements(rows) : (uint64_t) (a->ne[1]*a->ne[2]*a->ne[3]);
+    return row_words*n_rows;
+}
+
+struct ggml_tensor * ggml_qsa_hash(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * rows,
+        struct ggml_tensor  * dst) {
+    GGML_ASSERT(a->nb[0] == ggml_type_size(a->type) && !ggml_is_quantized(a->type));
+    GGML_ASSERT(ggml_row_size(a->type, a->ne[0]) % 4 == 0 && a->nb[1] % 4 == 0 && a->nb[2] % 4 == 0 && a->nb[3] % 4 == 0);
+    GGML_ASSERT(a->view_offs % 4 == 0);
+    if (rows) {
+        GGML_ASSERT(rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows));
+        GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    }
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_is_contiguous(dst) && ggml_nelements(dst) == dst->ne[0]);
+    GGML_ASSERT(dst->ne[0] >= 2 && dst->ne[0] % 2 == 0);
+    // 32-bit word indices on the device
+    GGML_ASSERT(ggml_qsa_hash_n_words(a, rows) < ((uint64_t) 1 << 31));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, dst);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) (dst->ne[0]/2)); // n_part
+
+    result->op     = GGML_OP_QSA_HASH;
+    result->src[0] = a;
+    result->src[1] = rows;
+    // dst's base tensor as the src that names the storage (ggml-alloc needs a view's view_src in the graph): a VIEW src
+    // would be one more node in the graph. A backend's hazard tracking treats this src as the write target, not a read
+    // (ggml-vulkan: only the node's own slot counts).
+    result->src[2] = dst->view_src ? dst->view_src : dst;
+
+    return result;
+}
+
+uint64_t ggml_qsa_hash_chunk(uint64_t n_words, int64_t n_part) {
+    const uint64_t c = (n_words + (uint64_t) n_part - 1) / (uint64_t) n_part;
+    return (c + 3) & ~(uint64_t) 3;
+}
+
+uint64_t ggml_qsa_hash_combine(const int32_t * partials, int64_t n_part, uint64_t n_words) {
+    uint32_t sa = 0, sb = 0;
+    for (int64_t p = 0; p < n_part; ++p) {
+        sa += (uint32_t) partials[2*p];
+        sb += (uint32_t) partials[2*p + 1];
+    }
+    // splitmix64's finalizer (a bijection) over (sum A, sum B) keyed by the word count
+    uint64_t z = (((uint64_t) sa << 32) | sb) ^ (n_words * 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
 }
 
 // ggml_mul_mat_id

@@ -66,4 +66,9 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // [TAG_QSA_DUMP_QIN] LLAMA_QSA_DUMP_QIN=1|2: the context's persistent QSA_HASH partials buffer (null = the knob is off:
+    // the graph builder adds nothing) and the level (2 = also the pooled-key operand)
+    struct ggml_tensor * qsa_qin_buf   = nullptr;
+    int                  qsa_qin_level = 0;
 };

@@ -1210,6 +1210,7 @@ struct vk_device_struct {
     // [TAG_QSA_TOPK_NOKEYS] the metadata variant's cell form without the key rows (binding 6 = the CHECK word)
     vk_pipeline pipeline_topk_v2_qsa_vis_nk[6];
     vk_pipeline pipeline_qsa_bias;       // [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS
+    vk_pipeline pipeline_qsa_hash;       // [TAG_QSA_DUMP_QIN] GGML_OP_QSA_HASH
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
@@ -2023,6 +2024,20 @@ struct vk_op_qsa_bias_push_constants {
     uint32_t np;
     uint32_t n_stream;
     uint32_t has_rows;
+};
+
+// [TAG_QSA_DUMP_QIN] GGML_OP_QSA_HASH (qsa_hash.comp)
+struct vk_op_qsa_hash_push_constants {
+    uint32_t row_words;
+    uint32_t n_words;
+    uint32_t chunk;
+    uint32_t has_rows;
+    uint32_t a_off;
+    uint32_t ne1;
+    uint32_t ne2;
+    uint32_t nb1;
+    uint32_t nb2;
+    uint32_t nb3;
 };
 
 struct vk_op_im2col_push_constants {
@@ -7080,6 +7095,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     // [TAG_QSA_COMPACT_BIAS] 256 blocks per workgroup on x, one (t, s) row per workgroup on y
     ggml_vk_create_pipeline(device, device->pipeline_qsa_bias, "qsa_bias_f32", qsa_bias_f32_len, qsa_bias_f32_data, "main", 4, sizeof(vk_op_qsa_bias_push_constants), {256, 1, 1}, {}, 1);
+    // [TAG_QSA_DUMP_QIN] one workgroup (256 invocations) per partial
+    ggml_vk_create_pipeline(device, device->pipeline_qsa_hash, "qsa_hash", qsa_hash_len, qsa_hash_data, "main", 3, sizeof(vk_op_qsa_hash_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 
@@ -9696,6 +9713,12 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
     return vk_subbuffer{buffer, offset, size};
 }
 
+// [TAG_QSA_DUMP_QIN] a src that only names the storage the node writes (GGML_OP_QSA_HASH's src[2] = the whole partials
+// buffer; the node itself is its slot): neither a read nor a write for the hazard tracking - the node's own range is
+static bool ggml_vk_src_not_read(const ggml_tensor * node, uint32_t j) {
+    return node->op == GGML_OP_QSA_HASH && j == 2;
+}
+
 // Storage that a node writes through one of its *sources* instead of through its own tensor. Currently only
 // ggml_gated_delta_net_ext (src[6] is the destination of the state snapshots, see ggml.h). Both the graph
 // reordering and the memory-hazard tracking below have to treat it as a write, not as a read.
@@ -9762,7 +9785,9 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
         std::cerr << "(" << buffer.buffer << ", " << buffer.offset << ", " << buffer.range << "), ";
     }
     std::cerr << "}, (" << wg0 << "," << wg1 << "," << wg2 << "))");
-    if (ggml_vk_fusion_count_enabled()) {
+    // [TAG_QSA_DUMP_QIN] the capture's hash dispatches stay out of the signature, so a pass with LLAMA_QSA_DUMP_QIN on
+    // carries the same sig as the pass without it exactly when every other dispatch is the same
+    if (ggml_vk_fusion_count_enabled() && pipeline != ctx->device->pipeline_qsa_hash) {
         // GGML_VK_FUSION_COUNT numerics signature: which shader ran, and over how many workgroups.
         // The workgroup counts are where an offset-dependent decision that changes the arithmetic
         // becomes visible - split_k picks a different wg2, the mat-vec rows-per-workgroup knob a
@@ -17214,6 +17239,42 @@ static void ggml_vk_qsa_bias(ggml_backend_vk_context * ctx, vk_context& subctx, 
         pc, elements);
 }
 
+// [TAG_QSA_DUMP_QIN] GGML_OP_QSA_HASH: one dispatch of n_part workgroups; reads src0 (and rows), writes only the node (a slot
+// view of the caller's persistent partials buffer; src[2], the buffer's base, is skipped by the hazard tracking - see
+// ggml_vk_src_not_read - so only a real overlap syncs). Not part of the numerics signature (see ggml_vk_graph_compute).
+static void ggml_vk_qsa_hash(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * node) {
+    const ggml_tensor * a    = node->src[0];
+    const ggml_tensor * rows = node->src[1];
+
+    const uint32_t n_part  = (uint32_t) ggml_get_op_params_i32(node, 0);
+    const uint64_t n_words = ggml_qsa_hash_n_words(a, rows);
+    GGML_ASSERT(n_part > 0 && n_words < ((uint64_t) 1 << 31));
+
+    const uint32_t a_mis = get_misalign_bytes(ctx, a);
+    GGML_ASSERT(a_mis % 4 == 0);
+
+    vk_pipeline pipeline = ctx->device->pipeline_qsa_hash;
+    GGML_ASSERT(pipeline != nullptr);
+
+    vk_op_qsa_hash_push_constants pc {
+        (uint32_t) (ggml_row_size(a->type, a->ne[0]) / 4),
+        (uint32_t) n_words,
+        (uint32_t) ggml_qsa_hash_chunk(n_words, n_part),
+        rows != nullptr ? 1u : 0u,
+        a_mis / 4,
+        (uint32_t) a->ne[1],
+        (uint32_t) a->ne[2],
+        (uint32_t) (a->nb[1] / 4),
+        (uint32_t) (a->nb[2] / 4),
+        (uint32_t) (a->nb[3] / 4),
+    };
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, a, true), ggml_vk_tensor_subbuffer(ctx, rows != nullptr ? rows : a, rows == nullptr),
+          ggml_vk_tensor_subbuffer(ctx, node) },
+        pc, { n_part, 1, 1 });
+}
+
 static void ggml_vk_sum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     vk_op_sum_rows_push_constants p = vk_op_sum_rows_push_constants_init(src0, dst, ggml_nelements(src0));
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_SUM, p);
@@ -18885,7 +18946,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                 }
             }
             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
-                if (!cur_node->src[j]) {
+                if (!cur_node->src[j] || ggml_vk_src_not_read(cur_node, j)) {
                     continue;
                 }
                 if (overlaps_unsynced(cur_node->src[j], ctx->unsynced_nodes_written)) {
@@ -18923,7 +18984,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                 ctx->unsynced_nodes_written.push_back(cur_node);
             }
             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
-                if (!cur_node->src[j]) {
+                if (!cur_node->src[j] || ggml_vk_src_not_read(cur_node, j)) {
                     continue;
                 }
                 ctx->unsynced_nodes_read.push_back(cur_node->src[j]);
@@ -19223,6 +19284,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     // [TAG_QSA_COMPACT_BIAS]
     case GGML_OP_QSA_BIAS:
         ggml_vk_qsa_bias(ctx, compute_ctx, node);
+
+        break;
+    // [TAG_QSA_DUMP_QIN]
+    case GGML_OP_QSA_HASH:
+        ggml_vk_qsa_hash(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_SUM:
@@ -21913,18 +21979,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // mmid_mul_ok and mm_add_ok gate on, and what the shaders fold into their offsets).
             // The dispatch half (pipeline name + workgroup counts) is added in
             // ggml_vk_dispatch_pipeline, below, from inside ggml_vk_build_graph.
+            // [TAG_QSA_DUMP_QIN] a QSA_HASH node is counted (qsa_hash=<n>) instead of signed
             const ggml_tensor * node = cgraph->nodes[i];
-            uint64_t h = ggml_vk_fnv1a_str(ctx->fusion_sig, ggml_op_name(node->op));
-            h = ggml_vk_fnv1a_str(h, fusion_string ? fusion_string : "-");
-            const uint32_t nfused = (uint32_t) ctx->num_additional_fused_ops;
-            h = ggml_vk_fnv1a(h, &nfused, sizeof(nfused));
-            for (int s = -1; s < GGML_MAX_SRC; ++s) {
-                const ggml_tensor * t = s < 0 ? node : node->src[s];
-                const uint32_t misalign = (t && t->buffer && ggml_backend_buffer_is_vk(t->buffer))
-                                              ? get_misalign_bytes(ctx, t) : 0xffffffffu;
-                h = ggml_vk_fnv1a(h, &misalign, sizeof(misalign));
+            if (node->op == GGML_OP_QSA_HASH) {
+                ggml_vk_fusion_count_add(fusion_counts, "", "qsa_hash");
+            } else {
+                uint64_t h = ggml_vk_fnv1a_str(ctx->fusion_sig, ggml_op_name(node->op));
+                h = ggml_vk_fnv1a_str(h, fusion_string ? fusion_string : "-");
+                const uint32_t nfused = (uint32_t) ctx->num_additional_fused_ops;
+                h = ggml_vk_fnv1a(h, &nfused, sizeof(nfused));
+                for (int s = -1; s < GGML_MAX_SRC; ++s) {
+                    const ggml_tensor * t = s < 0 ? node : node->src[s];
+                    const uint32_t misalign = (t && t->buffer && ggml_backend_buffer_is_vk(t->buffer))
+                                                  ? get_misalign_bytes(ctx, t) : 0xffffffffu;
+                    h = ggml_vk_fnv1a(h, &misalign, sizeof(misalign));
+                }
+                ctx->fusion_sig = h;
             }
-            ctx->fusion_sig = h;
         }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
@@ -21980,7 +22051,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         for (const auto & kv : ctx->fusion_count_disabled) {
             fusion_counts["disabled:" + kv.first] = kv.second;
         }
-        std::string line = "[vk-fusion-count] graph nodes=" + std::to_string(cgraph->n_nodes);
+        // [TAG_QSA_DUMP_QIN] nodes= counts the graph without the capture's QSA_HASH nodes (reported as qsa_hash=)
+        int n_hash = 0;
+        for (const auto & kv : fusion_counts) {
+            if (kv.first == "qsa_hash") {
+                n_hash = kv.second;
+            }
+        }
+        std::string line = "[vk-fusion-count] graph nodes=" + std::to_string(cgraph->n_nodes - n_hash);
         for (const auto & kv : fusion_counts) {
             line += " " + kv.first + "=" + std::to_string(kv.second);
         }
@@ -22135,7 +22213,7 @@ static void ggml_vk_qsa_scratch_hint(ggml_backend_vk_context * ctx, const struct
 }
 
 // Sort the graph for improved parallelism.
-static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph)
+static void ggml_vk_graph_optimize_impl(ggml_backend_t backend, struct ggml_cgraph * graph)
 {
     VK_LOG_DEBUG("ggml_vk_graph_optimize(" << graph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -22542,6 +22620,61 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
     }
+}
+
+// [TAG_QSA_DUMP_QIN] (fr15) the capture's QSA_HASH nodes take no part in the reordering: they are taken out, the rest of the
+// split is optimized exactly as without them (same nodes, same order in, so the same order out), and each is put back
+// immediately before the node that followed it in the incoming order (llama places it right before the node that reads
+// what it hashes - the score, or the bias fold - so the hashed bytes are final and nothing the allocator frees moves). Without a QSA_HASH
+// node this is ggml_vk_graph_optimize_impl itself.
+static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph)
+{
+    int n_hash = 0;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        n_hash += graph->nodes[i]->op == GGML_OP_QSA_HASH;
+    }
+    if (n_hash == 0) {
+        ggml_vk_graph_optimize_impl(backend, graph);
+        return;
+    }
+
+    // hashes in front of each kept node (nullptr: at the end, after every kept node)
+    std::vector<ggml_tensor *> kept;
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> before;
+    std::vector<ggml_tensor *> pending;
+    kept.reserve(graph->n_nodes - n_hash);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_QSA_HASH) {
+            pending.push_back(node);
+            continue;
+        }
+        if (!pending.empty()) {
+            before[node] = std::move(pending);
+            pending.clear();
+        }
+        kept.push_back(node);
+    }
+
+    ggml_cgraph sub = *graph;
+    sub.nodes   = kept.data();
+    sub.n_nodes = (int) kept.size();
+    ggml_vk_graph_optimize_impl(backend, &sub);
+
+    int n = 0;
+    for (ggml_tensor * node : kept) {
+        auto it = before.find(node);
+        if (it != before.end()) {
+            for (ggml_tensor * h : it->second) {
+                graph->nodes[n++] = h;
+            }
+        }
+        graph->nodes[n++] = node;
+    }
+    for (ggml_tensor * h : pending) {
+        graph->nodes[n++] = h;
+    }
+    GGML_ASSERT(n == graph->n_nodes);
 }
 
 static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -23432,6 +23565,25 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 return device->pipeline_qsa_bias != nullptr;
+            }
+        case GGML_OP_QSA_HASH:
+            {
+                // [TAG_QSA_DUMP_QIN] the word stream in 32-bit indices, a's rows and strides in words, I32 partials
+                const ggml_tensor * a    = op->src[0];
+                const ggml_tensor * rows = op->src[1];
+                if (!a || ggml_is_quantized(a->type) || a->nb[0] != ggml_type_size(a->type) ||
+                    ggml_row_size(a->type, a->ne[0]) % 4 != 0 || a->nb[1] % 4 != 0 || a->nb[2] % 4 != 0 || a->nb[3] % 4 != 0 ||
+                    op->type != GGML_TYPE_I32 || !ggml_is_contiguous(op)) {
+                    return false;
+                }
+                if (rows && (rows->type != GGML_TYPE_I32 || !ggml_is_contiguous(rows))) {
+                    return false;
+                }
+                if (ggml_qsa_hash_n_words(a, rows) >= ((uint64_t) 1 << 31) ||
+                    ggml_nbytes(a) > device->properties.limits.maxStorageBufferRange) {
+                    return false;
+                }
+                return device->pipeline_qsa_hash != nullptr;
             }
         case GGML_OP_UPSCALE:
             if (op->op_params[0] & GGML_SCALE_FLAG_ANTIALIAS) {
@@ -24513,6 +24665,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                 : ggml_qsa_top_k(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], tensor->ne[0]);
         } else if (tensor->op == GGML_OP_QSA_BIAS) {
             tensor_clone = ggml_qsa_bias(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
+        } else if (tensor->op == GGML_OP_QSA_HASH) { // [TAG_QSA_DUMP_QIN]
+            tensor_clone = ggml_qsa_hash(ggml_ctx, src_clone[0], src_clone[1],
+                    ggml_view_1d(ggml_ctx, src_clone[2], tensor->ne[0], tensor->view_offs));
         } else if (tensor->op == GGML_OP_SUM) {
             tensor_clone = ggml_sum(ggml_ctx, src_clone[0]);
         } else if (tensor->op == GGML_OP_SUM_ROWS) {

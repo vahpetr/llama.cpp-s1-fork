@@ -2352,6 +2352,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
 
     ggml_tensor * score  = nullptr;
     bool          biased = false;
+    ggml_tensor * reader = nullptr; // [TAG_QSA_DUMP_QIN] the node that reads q (and the pooled keys)
 
     // [TAG_QSA_SCORE_EPILOGUE] the whole chain below as one node, where the backend takes it (bias folded unless the score
     // capture needs the pre-bias plane)
@@ -2367,6 +2368,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
         if (sched != nullptr && ggml_backend_supports_op(ggml_backend_sched_get_backend(sched, 0), fused)) {
             score  = fused;
             biased = fold_bias;
+            reader = fused;
         }
     }
 
@@ -2374,6 +2376,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
         // [TAG_QSA_POOL_REMAP] the same product read straight from the store: [n_blocks, n_idx_h*n_tps, n_stream] either way
         score = pooled ? ggml_mul_mat(ctx0, pooled, q) : ggml_mul_mat_rows(ctx0, pool_store, pool_remap, q);
+        reader = score;
         score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
         score = qwen4exp_qsa_relu_inplace() ? ggml_relu_inplace(ctx0, score) : ggml_relu(ctx0, score); // [TAG_QSA_RELU_INPLACE]
 
@@ -2387,6 +2390,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
         }
 
         score = summed;
+    }
+
+    // [TAG_QSA_DUMP_QIN] (fr15, R130) LLAMA_QSA_DUMP_QIN: what the score node reads, hashed in-graph (see llama-context.cpp).
+    //   level 1 (diagnostic): what=q, the chunk's queries (the score's q operand, rows = queries per stream as in
+    //     [qsa-ids-chunk]), and the inputs of the folded bias: a QSA_BIAS fold (compact bias) is hashed through its two
+    //     tables, once per graph and right before the first QSA_BIAS node reading them (what=bias_blk [2, n_blocks]
+    //     and what=bias_qry [2, n_tps]: the fold is an exact table lookup - qsa_bias.comp - of these and of the chunk's
+    //     row range, which the graph builds from the chunk geometry), any other folded bias as its plane, per chunk
+    //     (what=bias)
+    //   level 2 (the gate mode for the oracle's arm-ids pass): level 1 + once per (graph, layer) the pooled keys exactly as
+    //     the node reads them - what=pooled, the f32 store rows remap[b] (or the full-pool plane), and what=pooled16, the
+    //     f16 mirror rows remap[b] when the node carries the coopmat1 read hint (src[4])
+    // Knob off: nothing is added (cparams.qsa_qin_buf is null).
+    if (cparams.qsa_qin_buf != nullptr) {
+        build_qsa_qin(q, nullptr, reader, il, "q", q->ne[1]/n_idx_h);
+        ggml_tensor * fb = reader->op == GGML_OP_QSA_SCORE ? reader->src[3] : nullptr;
+        if (fb != nullptr && fb->op == GGML_OP_QSA_BIAS) {
+            build_qsa_qin(fb->src[0], nullptr, fb, il, "bias_blk", -1, true);
+            build_qsa_qin(fb->src[1], nullptr, fb, il, "bias_qry", -1, true);
+        } else if (fb != nullptr) {
+            build_qsa_qin(fb, nullptr, reader, il, "bias");
+        }
+        if (cparams.qsa_qin_level >= 2) {
+            // every chunk of a layer reads the same pooled operand: hashed at its first chunk
+            build_qsa_qin(pooled ? pooled : pool_store, pooled ? nullptr : pool_remap, reader, il, "pooled", -1, true);
+            if (reader->op == GGML_OP_QSA_SCORE && reader->src[4] != nullptr) {
+                build_qsa_qin(reader->src[4], reader->src[2], reader, il, "pooled16", -1, true);
+            }
+        }
     }
 
     if (biased) {

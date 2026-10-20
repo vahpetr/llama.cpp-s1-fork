@@ -1116,6 +1116,7 @@ void process_shaders() {
     string_to_spv("topk_radix_select_v2_vis_nk_f32", "topk_radix_select_v2.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}, {"QSA_TOPK_NOKEYS", "1"}});
 #endif
     string_to_spv("qsa_bias_f32", "qsa_bias.comp", {}); // [TAG_QSA_COMPACT_BIAS]
+    string_to_spv("qsa_hash", "qsa_hash.comp", {}); // [TAG_QSA_DUMP_QIN]
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

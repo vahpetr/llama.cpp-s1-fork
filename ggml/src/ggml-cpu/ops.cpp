@@ -9354,6 +9354,64 @@ void ggml_compute_forward_qsa_bias(
     }
 }
 
+// ggml_compute_forward_qsa_hash
+//
+// [TAG_QSA_DUMP_QIN] the reference for GGML_OP_QSA_HASH (definition: ggml.h ggml_qsa_hash): partial p of the 32-bit word
+// stream, two wrapping 32-bit sums of murmur3-fmix32 mixes of (word index, word). Integer arithmetic only, so every backend
+// writes the same partials; threads split the partials, each partial is summed by one thread.
+static inline uint32_t ggml_qsa_hash_fmix32(uint32_t h) {
+    h ^= h >> 16; h *= 0x85EBCA6Bu;
+    h ^= h >> 13; h *= 0xC2B2AE35u;
+    h ^= h >> 16;
+    return h;
+}
+
+void ggml_compute_forward_qsa_hash(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * a    = dst->src[0];
+    const ggml_tensor * rows = dst->src[1];
+
+    const int64_t  n_part    = ggml_get_op_params_i32(dst, 0);
+    const uint64_t row_words = (uint64_t) ggml_row_size(a->type, a->ne[0]) / 4;
+    const uint64_t n_words   = ggml_qsa_hash_n_words(a, rows);
+    const uint64_t chunk     = ggml_qsa_hash_chunk(n_words, n_part);
+
+    int32_t * out = (int32_t *) dst->data;
+
+    for (int64_t p = params->ith; p < n_part; p += params->nth) {
+        uint32_t sa = 0, sb = 0;
+        const uint64_t e0 = std::min(n_words, (uint64_t) p*chunk);
+        const uint64_t e1 = std::min(n_words, e0 + chunk);
+        for (uint64_t e = e0; e < e1; ++e) {
+            const uint64_t k = e / row_words; // logical row
+            const uint64_t j = e % row_words; // word in the row
+            const uint32_t ei = (uint32_t) e;
+            const char * row = nullptr;
+            if (rows) {
+                const int32_t r = ((const int32_t *) rows->data)[k];
+                if (r < 0 || r >= a->ne[1]) {
+                    sa += ggml_qsa_hash_fmix32(ei ^ 0xA5A5A5A5u) + 1u;
+                    continue;
+                }
+                row = (const char *) a->data + (size_t) r*a->nb[1];
+            } else {
+                const int64_t i1 = (int64_t) (k % (uint64_t) a->ne[1]);
+                const int64_t i2 = (int64_t) ((k / (uint64_t) a->ne[1]) % (uint64_t) a->ne[2]);
+                const int64_t i3 = (int64_t) (k / ((uint64_t) a->ne[1]*(uint64_t) a->ne[2]));
+                row = (const char *) a->data + i1*a->nb[1] + i2*a->nb[2] + i3*a->nb[3];
+            }
+            uint32_t w;
+            memcpy(&w, row + 4*j, 4);
+            sa += ggml_qsa_hash_fmix32(w ^ (ei * 0x9E3779B1u));
+            sb += ggml_qsa_hash_fmix32(((w << 16) | (w >> 16)) ^ (ei * 0xC2B2AE3Du + 0x27D4EB2Fu));
+        }
+        out[2*p]     = (int32_t) sa;
+        out[2*p + 1] = (int32_t) sb;
+    }
+}
+
 // [TAG_KQ_VIS] the metadata of a flash-attention node, if it has any (see ggml_flash_attn_ext_set_vis)
 struct fa_vis_src {
     const int32_t * cells = nullptr; // [n_kv, 4, n_stream]

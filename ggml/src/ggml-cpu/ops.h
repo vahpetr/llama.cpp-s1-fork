@@ -92,6 +92,7 @@ void ggml_compute_forward_top_k(const struct ggml_compute_params * params, struc
 void ggml_compute_forward_qsa_top_k(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_kq_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_qsa_bias(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_qsa_hash(const struct ggml_compute_params * params, struct ggml_tensor * dst); // [TAG_QSA_DUMP_QIN]
 void ggml_compute_forward_leaky_relu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_fill(const struct ggml_compute_params * params, struct ggml_tensor * dst);
