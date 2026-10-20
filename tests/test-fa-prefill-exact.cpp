@@ -4,9 +4,10 @@
 //
 // Prints one line per case with an FNV-1a 64 hash of the output bytes, so two builds (or two knob
 // settings of one build) can be compared bit for bit:   diff <(base --hash) <(cand --hash)
-// The inputs are a pure function of (case, --seed), never of the device or the build - for one C++ standard
-// library: they come from std::normal_distribution, whose algorithm is implementation-defined, so hashes are
-// comparable only between binaries built against the same libstdc++ (the same build image).
+// The inputs are a pure function of (case, --seed), never of the device, the build or the toolchain: std::mt19937
+// (fully specified by the standard) feeds a hand-rolled approximately normal generator made of exact integer -> float
+// conversions and IEEE round-to-nearest float adds/muls (no libm, no implementation-defined distribution), so binaries from different
+// build images (balkon vs s1) produce the same inputs.
 //
 // usage: test-fa-prefill-exact [--device NAME] [--kv a,b,c] [--nb a,b] [--types q8_0,f16] [--mask vis,plane]
 //                              [--reps N] [--warmup N] [--seed S] [--extra]
@@ -59,6 +60,19 @@ std::vector<int64_t> parse_list(const char * s) {
     }
     return v;
 }
+
+// Approximately N(0, 1): Irwin-Hall sum of 4 uniforms with 24-bit mantissas, centred and scaled to unit variance.
+// Every step is a fully specified IEEE operation (round to nearest) on values from std::mt19937.
+struct det_normal {
+    std::mt19937 & g;
+    float operator()() {
+        float sum = 0.0f;
+        for (int k = 0; k < 4; ++k) {
+            sum += (float) (g() >> 8) * (1.0f / 16777216.0f); // exact: a 24-bit integer times 2^-24
+        }
+        return (sum - 2.0f) * 1.7320508f;                     // var of the sum = 4/12 -> scale by sqrt(3)
+    }
+};
 
 uint64_t fnv1a(const void * p, size_t n) {
     const uint8_t * b = (const uint8_t *) p;
@@ -118,20 +132,20 @@ result run_case(ggml_backend_t be, const fa_case & c, uint32_t seed, int reps, i
 
     // inputs: a pure function of (n_kv, nb, type, seed) - identical for the vis and the plane graph
     std::mt19937 rng(seed ^ (uint32_t) (n_kv * 2654435761u) ^ (uint32_t) (nb * 40503u) ^ (uint32_t) c.type * 97u);
-    std::normal_distribution<float> nd(0.0f, 1.0f);
+    det_normal nd{ rng };
     {
         // Q with a per-head scale so the softmax is peaked for some heads and flat for others
         std::vector<float> qd((size_t) (HS * NH * nb));
         for (int64_t t = 0; t < nb; ++t)
             for (int64_t h = 0; h < NH; ++h) {
                 const float s = 0.5f + 0.25f * (float) (h % 8);
-                for (int64_t d = 0; d < HS; ++d) qd[(size_t) ((t * NH + h) * HS + d)] = s * nd(rng);
+                for (int64_t d = 0; d < HS; ++d) qd[(size_t) ((t * NH + h) * HS + d)] = s * nd();
             }
         ggml_backend_tensor_set(q0, qd.data(), 0, qd.size() * sizeof(float));
     }
     for (ggml_tensor * t : { kc, vc }) {
         std::vector<float> f((size_t) ggml_nelements(t));
-        for (float & x : f) x = nd(rng);
+        for (float & x : f) x = nd();
         std::vector<uint8_t> bytes(ggml_nbytes(t));
         if (c.type == GGML_TYPE_F16) {
             ggml_fp32_to_fp16_row(f.data(), (ggml_fp16_t *) bytes.data(), (int64_t) f.size());
@@ -228,6 +242,7 @@ int main(int argc, char ** argv) {
             const std::string s = next();
             do_vis = s.find("vis") != std::string::npos;
             do_plane = s.find("plane") != std::string::npos;
+            if (!do_vis && !do_plane) { fprintf(stderr, "mask %s? (vis, plane or vis,plane)\n", s.c_str()); return 2; }
         } else { fprintf(stderr, "unknown arg %s (see the header of %s)\n", a.c_str(), __FILE__); return 2; }
     }
 
@@ -254,6 +269,11 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (cases.empty()) {
+        fprintf(stderr, "FA1 no cases selected\n");
+        return 2;
+    }
+
     int fails = 0;
     std::vector<float> last_vis;
     uint64_t last_vis_hash = 0;
@@ -262,18 +282,27 @@ int main(int argc, char ** argv) {
         printf("FA1 kv=%" PRId64 " nb=%" PRId64 " type=%s mask=%s hash=%016" PRIx64 " ok=%d",
                c.n_kv, c.nb, ggml_type_name(c.type), c.vis ? "vis" : "plane", r.hash, (int) r.ok);
         if (reps > 0) printf(" ms_min=%.3f ms_med=%.3f", r.t_min, r.t_med);
-        if (!r.ok) ++fails;
+        bool fail = !r.ok; // one failure per case, whatever went wrong
         if (c.vis) {
-            last_vis = std::move(r.out);
-            last_vis_hash = r.hash;
-        } else if (do_vis && !last_vis.empty()) {
+            if (r.ok) {
+                last_vis = std::move(r.out);
+                last_vis_hash = r.hash;
+            } else {
+                last_vis.clear(); // its plane twin reports skip
+            }
+        } else if (do_vis) {
             // the case before this plane case is its vis twin (same inputs)
-            const bool same = last_vis_hash == r.hash && last_vis.size() == r.out.size() &&
-                              memcmp(last_vis.data(), r.out.data(), r.out.size() * sizeof(float)) == 0;
-            printf(" vis==plane=%d", (int) same);
-            if (!same) ++fails;
+            if (last_vis.empty() || !r.ok) {
+                printf(" vis==plane=skip");
+            } else {
+                const bool same = last_vis_hash == r.hash && last_vis.size() == r.out.size() &&
+                                  memcmp(last_vis.data(), r.out.data(), r.out.size() * sizeof(float)) == 0;
+                printf(" vis==plane=%d", (int) same);
+                fail = fail || !same;
+            }
             last_vis.clear();
         }
+        if (fail) ++fails;
         printf("\n");
         fflush(stdout);
     }
