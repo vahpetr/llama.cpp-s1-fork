@@ -15,7 +15,7 @@
 //   --kv      n_kv list (default 8192,32768,65536)
 //   --nb      query batch list (default 2048)
 //   --types   K/V cache types (default q8_0,f16)
-//   --mask    vis = ggml_flash_attn_ext_vis over cell/token metadata (the prod LLAMA_KQ_VIS path),
+//   --mask    comma list of exactly "vis" / "plane"; vis = ggml_flash_attn_ext_vis over cell/token metadata (the prod LLAMA_KQ_VIS path),
 //             plane = an f16 mask plane (default vis,plane)
 //   --reps    timed graph computes per case (default 0 = hash only); prints min / median ms
 //   --extra   also run the off-prod corner cases (unaligned n_kv, odd batches, decode/verify GQA folds)
@@ -81,8 +81,13 @@ uint64_t fnv1a(const void * p, size_t n) {
     return h;
 }
 
+// The input generator's version, printed in every hash line: bump it whenever det_normal or the input layout changes,
+// so a base built with an older harness shows up as an input mismatch, not as an output mismatch.
+constexpr const char * GEN_VERSION = "ih4";
+
 struct result {
     uint64_t hash = 0;
+    uint64_t in_hash = 0; // FNV-1a 64 over every input byte uploaded for the case
     std::vector<float> out;
     double t_min = 0, t_med = 0;
     bool ok = false;
@@ -142,6 +147,7 @@ result run_case(ggml_backend_t be, const fa_case & c, uint32_t seed, int reps, i
                 for (int64_t d = 0; d < HS; ++d) qd[(size_t) ((t * NH + h) * HS + d)] = s * nd();
             }
         ggml_backend_tensor_set(q0, qd.data(), 0, qd.size() * sizeof(float));
+        r.in_hash ^= fnv1a(qd.data(), qd.size() * sizeof(float));
     }
     for (ggml_tensor * t : { kc, vc }) {
         std::vector<float> f((size_t) ggml_nelements(t));
@@ -153,6 +159,7 @@ result run_case(ggml_backend_t be, const fa_case & c, uint32_t seed, int reps, i
             ggml_quantize_chunk(c.type, f.data(), bytes.data(), 0, f.size() / HS, HS, nullptr);
         }
         ggml_backend_tensor_set(t, bytes.data(), 0, bytes.size());
+        r.in_hash = r.in_hash * 1099511628211ull ^ fnv1a(bytes.data(), bytes.size());
     }
     const int64_t p0 = n_kv - nb; // query t sits at position p0 + t; cell j holds position j
     if (c.vis) {
@@ -164,6 +171,7 @@ result run_case(ggml_backend_t be, const fa_case & c, uint32_t seed, int reps, i
             cd[3 * n_kv + j] = 0;
         }
         ggml_backend_tensor_set(cells, cd.data(), 0, cd.size() * sizeof(int32_t));
+        r.in_hash = r.in_hash * 1099511628211ull ^ fnv1a(cd.data(), cd.size() * sizeof(int32_t));
         std::vector<int32_t> td((size_t) (4 * nb));
         for (int64_t t = 0; t < nb; ++t) {
             td[4 * t + 0] = (int32_t) (p0 + t);
@@ -172,6 +180,7 @@ result run_case(ggml_backend_t be, const fa_case & c, uint32_t seed, int reps, i
             td[4 * t + 3] = INT32_MAX;
         }
         ggml_backend_tensor_set(toks, td.data(), 0, td.size() * sizeof(int32_t));
+        r.in_hash = r.in_hash * 1099511628211ull ^ fnv1a(td.data(), td.size() * sizeof(int32_t));
     } else {
         std::vector<float> mf((size_t) (n_kv * nem1), -INFINITY);
         for (int64_t t = 0; t < nb; ++t)
@@ -179,6 +188,7 @@ result run_case(ggml_backend_t be, const fa_case & c, uint32_t seed, int reps, i
         std::vector<ggml_fp16_t> mh(mf.size());
         ggml_fp32_to_fp16_row(mf.data(), mh.data(), (int64_t) mf.size());
         ggml_backend_tensor_set(m, mh.data(), 0, mh.size() * sizeof(ggml_fp16_t));
+        r.in_hash = r.in_hash * 1099511628211ull ^ fnv1a(mh.data(), mh.size() * sizeof(ggml_fp16_t));
     }
 
     if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
@@ -239,10 +249,14 @@ int main(int argc, char ** argv) {
                 else { fprintf(stderr, "type %s?\n", t.c_str()); return 2; }
             }
         } else if (a == "--mask") {
-            const std::string s = next();
-            do_vis = s.find("vis") != std::string::npos;
-            do_plane = s.find("plane") != std::string::npos;
-            if (!do_vis && !do_plane) { fprintf(stderr, "mask %s? (vis, plane or vis,plane)\n", s.c_str()); return 2; }
+            do_vis = do_plane = false;
+            std::stringstream ss(next()); std::string m;
+            while (std::getline(ss, m, ',')) {
+                if (m == "vis") do_vis = true;
+                else if (m == "plane") do_plane = true;
+                else { fprintf(stderr, "mask %s? (vis, plane or vis,plane)\n", m.c_str()); return 2; }
+            }
+            if (!do_vis && !do_plane) { fprintf(stderr, "--mask needs vis and/or plane\n"); return 2; }
         } else { fprintf(stderr, "unknown arg %s (see the header of %s)\n", a.c_str(), __FILE__); return 2; }
     }
 
@@ -275,12 +289,14 @@ int main(int argc, char ** argv) {
     }
 
     int fails = 0;
+    uint64_t run_in_hash = 1469598103934665603ull; // all cases' inputs, printed once at the end
     std::vector<float> last_vis;
     uint64_t last_vis_hash = 0;
     for (const fa_case & c : cases) {
         result r = run_case(be, c, seed, reps, warmup);
-        printf("FA1 kv=%" PRId64 " nb=%" PRId64 " type=%s mask=%s hash=%016" PRIx64 " ok=%d",
-               c.n_kv, c.nb, ggml_type_name(c.type), c.vis ? "vis" : "plane", r.hash, (int) r.ok);
+        printf("FA1 kv=%" PRId64 " nb=%" PRId64 " type=%s mask=%s gen=%s seed=%u in=%016" PRIx64 " hash=%016" PRIx64 " ok=%d",
+               c.n_kv, c.nb, ggml_type_name(c.type), c.vis ? "vis" : "plane", GEN_VERSION, seed, r.in_hash, r.hash, (int) r.ok);
+        run_in_hash = run_in_hash * 1099511628211ull ^ r.in_hash;
         if (reps > 0) printf(" ms_min=%.3f ms_med=%.3f", r.t_min, r.t_med);
         bool fail = !r.ok; // one failure per case, whatever went wrong
         if (c.vis) {
@@ -306,6 +322,7 @@ int main(int argc, char ** argv) {
         printf("\n");
         fflush(stdout);
     }
+    printf("FA1 inputs gen=%s seed=%u run_in=%016" PRIx64 "\n", GEN_VERSION, seed, run_in_hash);
     printf("FA1 cases=%zu fails=%d\n", cases.size(), fails);
     ggml_backend_free(be);
     return fails == 0 ? 0 : 1;

@@ -4592,11 +4592,19 @@ struct vk_fa_tuning_params {
 static bool ggml_vk_fa_cm1_sfpv_alias(const vk_fa_tuning_params & params, bool f32acc, ggml_type k_type, bool dense_rows) {
     return dense_rows && ggml_vk_fa_sfpv_alias() && params.path == FA_COOPMAT1 && f32acc && k_type != GGML_TYPE_BF16;
 }
-// Twin of the kernel-side fold `V_CHUNK = flag && row_tiles == 1 && !INDEXED && SHMEM_STAGING == 0`
-// (flash_attn_cm1.comp) - keep both; get_fa_pipeline_state logs when they disagree.
+// Host policy for V_CHUNK. It is a strict subset of what the kernel accepts (host => kernel): on top of the kernel's
+// own fold (ggml_vk_fa_cm1_v_chunk_kernel_fold below) it requires an aligned pipeline, f16 V and a dense multi-row
+// dispatch. get_fa_pipeline_state logs if a set bit ever falls outside the kernel fold.
 static bool ggml_vk_fa_cm1_v_chunk(const vk_fa_tuning_params & params, ggml_type v_type, bool dense_rows) {
     return dense_rows && ggml_vk_fa_v_chunk() && params.path == FA_COOPMAT1 && params.block_rows == 16 &&
            !params.shmem_staging && v_type == GGML_TYPE_F16;
+}
+
+// Mirror of the kernel-side fold in flash_attn_cm1.comp, `V_CHUNK = flag && row_tiles == 1 && !INDEXED &&
+// SHMEM_STAGING == 0`: the pipelines on which the shader actually uses the V_CHUNK layout. Written separately from the
+// host policy on purpose, so the two can be compared.
+static bool ggml_vk_fa_cm1_v_chunk_kernel_fold(const vk_fa_tuning_params & params, bool indexed) {
+    return params.block_rows / 16 == 1 && !indexed && !params.shmem_staging;
 }
 
 static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type, bool vis = false);
@@ -4826,9 +4834,9 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
-    // [TAG_FA1] the kernel folds V_CHUNK off for these pipelines (see ggml_vk_fa_cm1_v_chunk): the bit would only make
-    // a distinct pipeline that is byte-identical to the legacy layout
-    if ((flags & 32768) && (params.block_rows != 16 || params.shmem_staging || indexed)) {
+    // [TAG_FA1] host policy and kernel fold diverged: the kernel folds V_CHUNK off for this pipeline, so the bit only
+    // makes a distinct pipeline that behaves as the legacy layout (no LDS saving)
+    if ((flags & 32768) && !ggml_vk_fa_cm1_v_chunk_kernel_fold(params, indexed)) {
         VK_LOG_DEBUG("get_fa_pipeline_state: V_CHUNK set on a pipeline the kernel folds it off for (Br=" << params.block_rows
                      << ", shmem_staging=" << params.shmem_staging << ", indexed=" << indexed << ")");
     }
