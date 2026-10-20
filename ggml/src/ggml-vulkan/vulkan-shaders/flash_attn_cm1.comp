@@ -50,7 +50,11 @@ const uint32_t row_tiles = Br / MatBr;
 //               rows at once, so kvsh only needs max(Bc x K chunk, MatBc x V chunk).  -5 KiB; costs two barriers per
 //               chunk on staged tiles only.  Host: row_tiles == 1, no SHMEM_STAGING, f16 V (no per-tile decode).
 const bool SFPV_ALIAS = (Flags & 16384) != 0;
-const bool V_CHUNK    = (Flags & 32768) != 0;
+// V_CHUNK is only defined for one row tile (the row_tiles > 1 paths - PVMat1, the dead_split staging of Bc rows -
+// need the whole-tile kvsh), for dense KV tiles (the per-chunk direct V load reads rows j * Bc + c, not ids) and
+// without whole-tile staging, so the kernel itself folds those conditions in: a dispatch that sets the bit on any
+// other pipeline gets the legacy layout, never a dropped P*V term or an out-of-bounds kvsh write.
+const bool V_CHUNK    = (Flags & 32768) != 0 && row_tiles == 1 && !INDEXED && SHMEM_STAGING == 0;
 
 const uint32_t rows_per_thread = Br / row_split;
 const uint32_t cols_per_iter = gl_WorkGroupSize.x / row_split;
@@ -135,54 +139,23 @@ shared uint32_t p_dead_lds[row_tiles * dead_words];
 uint32_t dead_cols[row_tiles * dead_words];
 bool any_dead_tile[row_tiles];
 
-// Stage one [Bc, MatBc * row_split] slice of V into kvsh, replacing the rows (KV columns)
-// that row tile "t" has marked dead by +0 when zero_dead is set.
-void stage_v_columns(const uint32_t j, const uint32_t hsv_tile, const uint32_t v_offset,
-                     const uint32_t tid, const uint32_t t, const bool zero_dead) {
-    const uint v_loads_per_thread = (Bc * v_cols) / gl_WorkGroupSize.x;
+// Stage rows [row0, row0 + nrows) of one [Bc, MatBc * row_split] slice of V into kvsh rows [dst_row0, +nrows),
+// replacing the rows (KV columns) that row tile "t" has marked dead by +0 when zero_dead is set.  The whole-tile
+// staging (stage_v_columns) and V_CHUNK's per-chunk staging are both this one per-element rule.
+void stage_v_rows(const uint32_t j, const uint32_t hsv_tile, const uint32_t v_offset,
+                  const uint32_t tid, const uint32_t t, const bool zero_dead,
+                  const uint32_t row0, const uint32_t nrows, const uint32_t dst_row0) {
+    const uint n_elems = nrows * v_cols;
+    const uint v_loads_per_thread = (n_elems + gl_WorkGroupSize.x - 1) / gl_WorkGroupSize.x;
 
     [[unroll]] for (uint32_t l = 0; l < v_loads_per_thread; ++l) {
         const uint idx = l * gl_WorkGroupSize.x + tid;
-        const uint row = idx / v_cols;
-        const uint col = idx % v_cols;
-
-        const uint v_row = FA_KV_ROW(j, row);
-        const uint v_col = hsv_tile * MatBc * row_split + col * 4;
-
-        const uint coord = v_row * v_stride * BLOCK_SIZE_V + v_col;
-        const uint ib = coord / BLOCK_SIZE_V;
-        const uint iqs = coord % BLOCK_SIZE_V;
-
-        const bool row_dead = zero_dead &&
-                              ((dead_cols[t * dead_words + row / 32] & (1u << (row % 32))) != 0);
-        if (row_dead) {
-            kvsh[row * vsh_stride + col] = FLOAT_TYPEV4(0.0f);
-        // [TAG_QSA_INDEXED_FA] (Check-in #9 a) indexed: the column is one of the W ids AND its cell is in the cache
-        } else if (!KV_bounds_check || (FA_KV_LIVE(j, row) && v_col < HSV)) {
-#if !defined(BFLOAT16)
-            if (USE_DECODE_V) {
-                kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-            } else
-#endif
-            {
-                kvsh[row * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
-            }
-        } else {
-            kvsh[row * vsh_stride + col] = FLOAT_TYPEV4(0.0f);
-        }
-    }
-}
-
-// [TAG_FA1] V_CHUNK: stage rows [bc_chunk * MatBc, +MatBc) of the [Bc, MatBc * row_split] V slice into kvsh rows
-// [0, MatBc), with exactly the per-element choice stage_v_columns makes (+0 for a dead row, the tail/bounds rule).
-void stage_v_chunk(const uint32_t j, const uint32_t hsv_tile, const uint32_t bc_chunk, const uint32_t v_offset,
-                   const uint32_t tid, const bool zero_dead) {
-    [[unroll]] for (uint32_t l = 0; l < (MatBc * v_cols + gl_WorkGroupSize.x - 1) / gl_WorkGroupSize.x; ++l) {
-        const uint idx = l * gl_WorkGroupSize.x + tid;
-        if (idx < MatBc * v_cols) {
+        // folds to true when the workgroup divides the slice (the whole-tile case)
+        if ((n_elems % gl_WorkGroupSize.x) == 0 || idx < n_elems) {
             const uint lrow = idx / v_cols;
-            const uint col  = idx % v_cols;
-            const uint row  = bc_chunk * MatBc + lrow;
+            const uint col = idx % v_cols;
+            const uint row = row0 + lrow;
+            const uint dst = (dst_row0 + lrow) * vsh_stride + col;
 
             const uint v_row = FA_KV_ROW(j, row);
             const uint v_col = hsv_tile * MatBc * row_split + col * 4;
@@ -191,23 +164,37 @@ void stage_v_chunk(const uint32_t j, const uint32_t hsv_tile, const uint32_t bc_
             const uint ib = coord / BLOCK_SIZE_V;
             const uint iqs = coord % BLOCK_SIZE_V;
 
-            const bool row_dead = zero_dead && ((dead_cols[row / 32] & (1u << (row % 32))) != 0);
+            const bool row_dead = zero_dead &&
+                                  ((dead_cols[t * dead_words + row / 32] & (1u << (row % 32))) != 0);
             if (row_dead) {
-                kvsh[lrow * vsh_stride + col] = FLOAT_TYPEV4(0.0f);
+                kvsh[dst] = FLOAT_TYPEV4(0.0f);
+            // [TAG_QSA_INDEXED_FA] (Check-in #9 a) indexed: the column is one of the W ids AND its cell is in the cache
             } else if (!KV_bounds_check || (FA_KV_LIVE(j, row) && v_col < HSV)) {
 #if !defined(BFLOAT16)
                 if (USE_DECODE_V) {
-                    kvsh[lrow * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+                    kvsh[dst] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
                 } else
 #endif
                 {
-                    kvsh[lrow * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
+                    kvsh[dst] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
                 }
             } else {
-                kvsh[lrow * vsh_stride + col] = FLOAT_TYPEV4(0.0f);
+                kvsh[dst] = FLOAT_TYPEV4(0.0f);
             }
         }
     }
+}
+
+// The whole [Bc, MatBc * row_split] slice for row tile "t".
+void stage_v_columns(const uint32_t j, const uint32_t hsv_tile, const uint32_t v_offset,
+                     const uint32_t tid, const uint32_t t, const bool zero_dead) {
+    stage_v_rows(j, hsv_tile, v_offset, tid, t, zero_dead, 0u, Bc, 0u);
+}
+
+// [TAG_FA1] V_CHUNK: rows [bc_chunk * MatBc, +MatBc) of the slice into kvsh rows [0, MatBc) (one row tile, t = 0).
+void stage_v_chunk(const uint32_t j, const uint32_t hsv_tile, const uint32_t bc_chunk, const uint32_t v_offset,
+                   const uint32_t tid, const bool zero_dead) {
+    stage_v_rows(j, hsv_tile, v_offset, tid, 0u, zero_dead, bc_chunk * MatBc, MatBc, 0u);
 }
 
 // The V operand of one P*V coopMatMulAdd, from global memory or from the kvsh staging tile.
