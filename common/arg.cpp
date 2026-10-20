@@ -1799,6 +1799,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_ASYNC").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-test"},
+        "disk prompt cache: honour the LLAMA_DISK_ASYNC_TEST=key=value,... test hooks (server tests only; without this "
+        "flag the variable is ignored with a warning)",
+        [](common_params & params) {
+            params.cache_disk_test = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

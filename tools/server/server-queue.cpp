@@ -352,9 +352,9 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             } else {
                 // wait for new tasks or timeout for checking sleeping condition
                 bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
-                    return (!queue_tasks.empty() || !running || req_wake.load());
+                    // (review r9 2) a wake is consumed where it is observed: one update_slots() pass per wake
+                    return (!queue_tasks.empty() || !running || req_wake.exchange(false));
                 });
-                req_wake = false;
                 if (res) {
                     break; // new task arrived or terminate
                 }

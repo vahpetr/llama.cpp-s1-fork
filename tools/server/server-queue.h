@@ -78,9 +78,11 @@ public:
 
     // [TAG_DISK_ASYNC_SAVE] run one more processing pass (update_slots) even without a task, e.g. to commit a background
     //   disk-cache save that finished on an idle server. Safe from any thread at any time: it takes no lock (the loop
-    //   holds mutex_tasks across the sleeping-state callbacks, which drain the disk-cache workers that call this); a
-    //   notify that races the loop's predicate check is caught by the loop's 1 s wait timeout. Does not reset the
-    //   idle-sleep timer and does not end a sleep (nothing is in flight then: the pre-sleep save drains)
+    //   holds mutex_tasks across the sleeping-state callbacks, which drain the disk-cache workers that call this). A
+    //   wake is never lost but can be LATE by up to the loop's 1 s wait timeout: published between the predicate's
+    //   false result and the wait, its notify finds no waiter and the next timed re-check sees the flag (taking the
+    //   mutex here would deadlock with that drain). Does not reset the idle-sleep timer and does not end a sleep
+    //   (nothing is in flight then: the pre-sleep save drains)
     void wake();
 
     // end the start_loop routine
