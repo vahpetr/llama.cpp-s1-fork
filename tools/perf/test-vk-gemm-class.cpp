@@ -5,7 +5,7 @@
 // GGML_VK_DISPATCH_LOG=1 adds the backend's [vk-dispatch] lines (the kernel each case took).
 // Inputs are deterministic per case id (the same bytes in every process): A uniform [-1, 1] quantized to type_a, B
 // uniform [-1, 1] f32, mul_mat_id ids = the first n_used entries of a shuffled expert permutation per token.
-// Memory cap (balkon runs next to the hands server): when the f32 output would exceed --max-out-mib (default 512),
+// Memory cap (balkon runs next to the hands server): when the f32 output would exceed --max-out-mib (default 256),
 // m is cut to a multiple of 256 that fits (m=<m used> m_case=<m>): same kernel family, fewer rows.
 // mode repeat3 runs the graph 3x in one process and checks the 3 outputs are identical (repeat_ok).
 //
@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <algorithm>
 #include <fstream>
 #include <functional>
@@ -109,6 +110,13 @@ int main(int argc, char ** argv) {
         }
     }
     const std::string out_dir = argv[2];
+    {   // the A cache dir next to out_dir (created here: a missing dir silently disabled the cache)
+        std::error_code ec;
+        std::filesystem::create_directories(out_dir + "/../acache", ec);
+        if (ec) {
+            fprintf(stderr, "warning: cannot create %s/../acache: %s (A is regenerated per case)\n", out_dir.c_str(), ec.message().c_str());
+        }
+    }
 
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -165,8 +173,10 @@ int main(int argc, char ** argv) {
             const int64_t chunk = 4096;
             const size_t  row_q = ggml_row_size(ta, e.k);
             std::vector<uint8_t> aq(ggml_nbytes(a));
-            // the quantized A is cached across processes (deterministic per case): <out_dir>/../acache/<id>-m<m>.bin
-            const std::string cpath = out_dir + "/../acache/" + e.id + "-m" + std::to_string(m) + ".bin";
+            // the quantized A is cached across processes (deterministic per case id): <out_dir>/../acache/<id>-<type_a>-m<m>-k<k>-e<n_mats>.bin
+            // (keyed by every input of the generator, so two case lists reusing an id cannot share a stale A)
+            const std::string cpath = out_dir + "/../acache/" + e.id + "-" + e.type_a + "-m" + std::to_string(m) + "-k" +
+                                      std::to_string(e.k) + "-e" + std::to_string(is_id ? e.n_mats : 1) + ".bin";
             if (FILE * fc = fopen(cpath.c_str(), "rb")) {
                 const size_t got = fread(aq.data(), 1, aq.size(), fc);
                 fclose(fc);

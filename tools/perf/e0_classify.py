@@ -3,7 +3,9 @@
 usage: e0_classify.py <base_dir> <variant_dir> [<variant_name>]   (each dir: <case>.bin + run.log with [e0-case] and
 [vk-dispatch] lines). Prints one TSV row per case: case, op, type, m(used), n, class (identical / differs),
 n_diff, max_abs_diff, first_diff (index: base -> variant), base kernel, variant kernel, repeat_ok."""
-import os, re, struct, sys
+import os, re, sys
+
+import numpy as np
 
 def kernels(log):
     k = {}
@@ -34,13 +36,19 @@ def main():
         if a == b:
             cls, nd, mx, first = "identical", 0, 0.0, "-"
         else:
-            n = min(len(a), len(b)) // 4; fa = struct.unpack(f"<{n}f", a[:4*n]); fv_ = struct.unpack(f"<{n}f", b[:4*n])
-            nd, mx, first = 0, 0.0, None
-            for i, (x, y) in enumerate(zip(fa, fv_)):
-                if struct.pack("<f", x) != struct.pack("<f", y):
-                    nd += 1; dd = abs(x - y)
-                    if dd > mx: mx = dd
-                    if first is None: first = f"{i}: {x!r} -> {y!r}"
+            # vectorised: compare as uint32 bit patterns (bitwise identity, NaN-safe), deltas as float32
+            n = min(len(a), len(b)) // 4
+            ua, ub = np.frombuffer(a[:4 * n], dtype="<u4"), np.frombuffer(b[:4 * n], dtype="<u4")
+            idx = np.flatnonzero(ua != ub)
+            nd = int(idx.size)
+            fa, fb_ = ua.view("<f4"), ub.view("<f4")
+            mx = float(np.nanmax(np.abs(fa[idx].astype(np.float64) - fb_[idx].astype(np.float64)))) if nd else 0.0
+            if nd:
+                first = f"{idx[0]}: {float(fa[idx[0]])!r} -> {float(fb_[idx[0]])!r}"
+            else:   # equal common prefix, different lengths
+                first = f"length {len(a)} -> {len(b)} bytes"
+            if len(a) != len(b):
+                nd += abs(len(a) - len(b)) // 4
             cls = "differs"
         rep = f"{cb[cid].get('repeat_ok','-')}/{cv[cid].get('repeat_ok','-')}"
         print(f"{name}\t{cid}\t{d['op']}\t{d['type']}\t{d['m']}\t{d['n']}\t{cls}\t{nd}\t{mx:.6g}\t{first}\t{kb.get(cid,'?')}\t{kv.get(cid,'?')}\t{rep}")
