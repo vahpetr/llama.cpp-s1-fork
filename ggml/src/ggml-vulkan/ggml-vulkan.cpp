@@ -2563,6 +2563,24 @@ static bool ggml_vk_mmid_tile_b1(const vk_device & device) {
            device->driver_id != vk::DriverId::eAmdProprietary;
 }
 
+// [TAG_FA1] coopmat1 flash attention shared-memory layouts (flash_attn_cm1.comp Flags 16384 / 32768): the kernel is
+// occupancy-bound by LDS on RDNA3 at HSK == HSV == 256. Both are layout-only - same operands, same coopMatMulAdd /
+// softmax / accumulation order - so a dispatch is bit-identical either way. Read once (static).
+// Default on, =0 off; applied only to dense multi-row dispatches (no kv ids, no GQA fold) - decode, verify and the
+// indexed QSA FA keep their pipelines byte for byte.
+// GGML_VK_FA_SFPV_ALIAS: pvsh shares sfsh's storage (disjoint lifetimes).
+// GGML_VK_FA_V_CHUNK:    a staged V tile goes through kvsh one 16-row chunk at a time; kvsh 8 KiB -> 2 KiB where K is
+//                        never staged (aligned f16), 3 KiB otherwise.
+// Together at HSK == HSV == 256, f32 accumulation, VIS: LDS 31 -> 21 KiB = 4 -> 6 workgroups per WGP on RDNA3 (one
+// alone does not cross an occupancy step). Measured on the 780M: dense prefill FA -14 % (n_kv 8k) / -16 % (32k).
+static bool ggml_vk_fa_sfpv_alias() {
+    static const bool on = ggml_vk_env_bool("GGML_VK_FA_SFPV_ALIAS", true);
+    return on;
+}
+static bool ggml_vk_fa_v_chunk() {
+    static const bool on = ggml_vk_env_bool("GGML_VK_FA_V_CHUNK", true);
+    return on;
+}
 // [TAG_INJECT_TILE_M16] GGML_VK_DENSE_TILE_M16 (default on, =0 off): the AMD coopmat1 dense quantized-A matmul with
 // m <= 16 (the qwen4exp hc inject, m = 4, n = the ubatch, k = 4 x n_embd) runs a BM 16 x BN 16 tile instead of the
 // s tile (BM 32 x BN 32): twice the workgroups along N at the same per-element accumulation (same shader, BK, TM / TN / TK
@@ -4566,6 +4584,19 @@ struct vk_fa_tuning_params {
     }
 };
 
+// [TAG_FA1] The conditions under which a coopmat1 FA pipeline takes each layout (get_fa_pipeline_state; the
+// shared-memory estimate keeps the legacy sizes). SFPV_ALIAS needs pvsh and sfsh of one element type: f32 accumulation, not BF16.
+// V_CHUNK: one row tile (the split dead-column path stages whole tiles), no whole-tile staging, f16 V (a quantized
+// V is decoded per tile on every KV tile, where per-chunk barriers would cost; with the f16 dequant scratch the
+// staged tiles are only the mask-boundary ones).
+static bool ggml_vk_fa_cm1_sfpv_alias(const vk_fa_tuning_params & params, bool f32acc, ggml_type k_type, bool dense_rows) {
+    return dense_rows && ggml_vk_fa_sfpv_alias() && params.path == FA_COOPMAT1 && f32acc && k_type != GGML_TYPE_BF16;
+}
+static bool ggml_vk_fa_cm1_v_chunk(const vk_fa_tuning_params & params, ggml_type v_type, bool dense_rows) {
+    return dense_rows && ggml_vk_fa_v_chunk() && params.path == FA_COOPMAT1 && params.block_rows == 16 &&
+           !params.shmem_staging && v_type == GGML_TYPE_F16;
+}
+
 static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type, bool vis = false);
 static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16, ggml_type v_type = GGML_TYPE_F16, bool vis = false, bool indexed = false);
 
@@ -4750,7 +4781,7 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type,
                                                   bool gqa_tokens = false, uint32_t vis_flags = 0, uint32_t vis_n_swa = 0,
-                                                  bool indexed = false) {
+                                                  bool indexed = false, bool dense_rows = false) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -4782,6 +4813,12 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
                      // alias if they are ever merged; see flash_attn_base.glsl.
                      (gqa_tokens        ? 128 : 0) |
                      (indexed           ? 256 : 0) | // [TAG_QSA_INDEXED_FA] FLASH_ATTN_EXT src[5] kv ids
+                     // [TAG_FA1] 16384 SFPV_ALIAS, 32768 V_CHUNK (coopmat1 layouts, bit-identical)
+                     // dense_rows: the caller's "no kv ids, no GQA fold" (one query row per Q row of one head)
+                     (ggml_vk_fa_cm1_sfpv_alias(params, f32acc, k_type, dense_rows) ? 16384 : 0) |
+                     // V_CHUNK only on aligned pipelines: with Clamp every V tile is staged, and per-chunk barriers
+                     // on every KV tile would cost more than the occupancy gives back
+                     (ggml_vk_fa_cm1_v_chunk(params, v_type, dense_rows && aligned) ? 32768 : 0) |
                      // [TAG_KQ_VIS] 512 VIS, 1024 causal, 2048 alibi, 4096/8192 swa type (flash_attn_vis.glsl)
                      vis_flags;
 
@@ -13129,7 +13166,10 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
 
 static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type, bool vis, bool indexed) {
     GGML_UNUSED(v_type);
-    // Needs to be kept up to date on shader changes
+    // Needs to be kept up to date on shader changes.
+    // [TAG_FA1] the SFPV_ALIAS / V_CHUNK layouts are deliberately NOT counted: they only shrink the shader's shared
+    // memory, so every verdict here (path choice, GQA fold, supports_op) stays the one the legacy layout gets and a
+    // dispatch's geometry - hence its arithmetic - cannot change with the knobs.
     const uint32_t Br = params.block_rows;
     const uint32_t Bc = params.block_cols;
 
@@ -13442,7 +13482,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    has_mask, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
-                                                                   gqa_tokens, vis_flags, (uint32_t) vis_n_swa, ids != nullptr);
+                                                                   gqa_tokens, vis_flags, (uint32_t) vis_n_swa, ids != nullptr,
+                                                                   /* [TAG_FA1] dense_rows */ ids == nullptr && !gqa_tokens && gqa_ratio == 1);
     GGML_ASSERT(!vis || fa_pipeline_state.path != FA_COOPMAT2);
 
     vk_pipeline pipeline = nullptr;
