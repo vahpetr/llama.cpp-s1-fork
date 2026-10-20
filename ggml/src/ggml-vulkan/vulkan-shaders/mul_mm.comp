@@ -315,12 +315,16 @@ void main() {
 
     // [TAG_MMID_SKIP] (#25483) only the first `rows` B columns of this tile are rows of the expert: the invocations whose B
     // load column lies past them skip the load, the coopmat1 warps whose WN column block lies wholly past them skip the MACs
+    // [TAG_MMID_TILE_G2A] review M1: _ne1 is the expert's full row count (hoisted) or may run past the tile (subgroup scan), so
+    // the rows of THIS tile are clamped to BN. Every tile before G2A had BLOCK_SIZE * LOAD_VEC_B / BK <= BN, so a B load column
+    // never reached BN and the clamp selects the same invocations; with block 512 / BN 64 / LOAD_VEC_B 8 the load columns run
+    // to 127 and an unclamped count > BN let invocations 256..511 write buf_b / read row_ids past BN.
 #ifdef MMID_SKIP_NEGCTL
     // NEGATIVE CONTROL BUILD ONLY (cmake -DGGML_VULKAN_MMID_SKIP_NEGCTL=ON, never a shipped pipeline): one row too few, so the
     // last real row of each expert's last partial tile is never loaded - tests/test-mmid-skip must see the results change
-    const uint rows = _ne1 - ic * BN - 1;
+    const uint rows = min(_ne1 - ic * BN - 1, BN);
 #else
-    const uint rows = _ne1 - ic * BN;
+    const uint rows = min(_ne1 - ic * BN, BN);
 #endif
     uint required_work_items = rows * BK / LOAD_VEC_B_EFF / LOAD_VEC_BATCH_B;
     uint required_warp_c = (rows + WN - 1) / WN;
