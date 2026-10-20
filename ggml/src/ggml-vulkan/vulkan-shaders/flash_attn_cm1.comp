@@ -38,6 +38,20 @@ const uint32_t MatBc = 16;
 // get_fa_tuning_params_coopmat1 and ggml_vk_flash_attn_coopmat_shmem_support cap Br at 32.
 const uint32_t row_tiles = Br / MatBr;
 
+// [TAG_FA1] two shared-memory layouts of this kernel (Flags bits 16384 / 32768, host knobs GGML_VK_FA_SFPV_ALIAS /
+// GGML_VK_FA_V_CHUNK).  The kernel is occupancy-bound by shared memory on RDNA3 at HSK == HSV == 256 (128 VGPRs
+// allow 8 subgroups per SIMD, 31 KiB of LDS allows 4), so these shrink it.  Neither changes an operand, the order
+// of any coopMatMulAdd, or a softmax/accumulation step - a dispatch's output is bit-identical with or without them.
+//   SFPV_ALIAS: pvsh lives in sfsh's storage.  sfsh (the S tile) is dead once P is in Psh (the barrier before the
+//               P*V blocks) and is next written by the next KV tile's K*Q^T store, after the barrier that closes
+//               this KV tile; pvsh is live only between those two barriers.  -4 KiB at Br 16, f32 accumulation.
+//   V_CHUNK:    when a V tile has to be staged through kvsh (mask-dead columns replaced by +0, KV bounds, quant V),
+//               it is staged one MatBc-row chunk at a time right before that chunk's coopMatMulAdd instead of all Bc
+//               rows at once, so kvsh only needs max(Bc x K chunk, MatBc x V chunk).  -5 KiB; costs two barriers per
+//               chunk on staged tiles only.  Host: row_tiles == 1, no SHMEM_STAGING, f16 V (no per-tile decode).
+const bool SFPV_ALIAS = (Flags & 16384) != 0;
+const bool V_CHUNK    = (Flags & 32768) != 0;
+
 const uint32_t rows_per_thread = Br / row_split;
 const uint32_t cols_per_iter = gl_WorkGroupSize.x / row_split;
 const uint32_t cols_per_thread = Bc / cols_per_iter;
@@ -61,17 +75,27 @@ shared FLOAT_TYPEV4 Psh[Bc * psh_stride];
 
 // Avoid padding for hsk==256 to make it fit in 48KB shmem.
 const uint32_t sfshstride = (HSK <= 128) ? (Br / 4 + 2) : Br / 4;
-shared ACC_TYPEV4 sfsh[Bc * sfshstride];
+// pvsh's first index is a query row of the Br tile, so it holds row_tiles coopmat tiles.
+const uint32_t osh_stride = row_split * MatBr / 4;
+const uint32_t sfsh_len = Bc * sfshstride;
+const uint32_t pvsh_len = Br * osh_stride;
+// [TAG_FA1] SFPV_ALIAS: sfsh also holds pvsh (O_TYPE == ACC_TYPE here, FA_PV_ACC_TYPE)
+shared ACC_TYPEV4 sfsh[SFPV_ALIAS ? (pvsh_len > sfsh_len ? pvsh_len : sfsh_len) : sfsh_len];
 
 const uint32_t D_pad = HSK_pad > HSV_pad ? HSK_pad : HSV_pad;
 const uint32_t kvsh_stride = (SHMEM_STAGING != 0 ? D_pad : MatBr) / 4 + 2;
 const uint v_cols = MatBc / 4 * row_split; // total cols, 4 vec4s per MatBc * number of subgroups
 const uint vsh_stride = v_cols;
-shared FLOAT_TYPEV4 kvsh[(kvsh_stride >= vsh_stride) ? (Bc * kvsh_stride) : (Bc * vsh_stride)];
+// [TAG_FA1] V_CHUNK: V is staged MatBc rows at a time, and K is staged at all only where the K*Q^T loop's stage_k
+// can be true (INDEXED, a decoded K type, KV bounds, a ragged HSK) - an aligned f16 pipeline reads K straight from
+// global memory, so kvsh is just the V chunk there.
+const uint32_t v_stage_rows = V_CHUNK ? MatBc : Bc;
+const uint32_t k_stage_possible = (INDEXED ? 1u : 0u) + (USE_DECODE_K ? 1u : 0u) + (KV_bounds_check ? 1u : 0u) +
+                                  ((HSK % 16) != 0 ? 1u : 0u) + (SHMEM_STAGING != 0 ? 1u : 0u) + (V_CHUNK ? 0u : 1u);
+const uint32_t k_stage_len = k_stage_possible != 0 ? Bc * kvsh_stride : 0u;
+shared FLOAT_TYPEV4 kvsh[(k_stage_len >= v_stage_rows * vsh_stride) ? k_stage_len : (v_stage_rows * vsh_stride)];
 
-// pvsh's first index is a query row of the Br tile, so it holds row_tiles coopmat tiles.
-const uint32_t osh_stride = row_split * MatBr / 4;
-shared O_TYPEV4 pvsh[Br * osh_stride];
+shared O_TYPEV4 pvsh[SFPV_ALIAS ? 1 : pvsh_len];
 
 shared ACC_TYPE slope[Br];
 
@@ -145,6 +169,43 @@ void stage_v_columns(const uint32_t j, const uint32_t hsv_tile, const uint32_t v
             }
         } else {
             kvsh[row * vsh_stride + col] = FLOAT_TYPEV4(0.0f);
+        }
+    }
+}
+
+// [TAG_FA1] V_CHUNK: stage rows [bc_chunk * MatBc, +MatBc) of the [Bc, MatBc * row_split] V slice into kvsh rows
+// [0, MatBc), with exactly the per-element choice stage_v_columns makes (+0 for a dead row, the tail/bounds rule).
+void stage_v_chunk(const uint32_t j, const uint32_t hsv_tile, const uint32_t bc_chunk, const uint32_t v_offset,
+                   const uint32_t tid, const bool zero_dead) {
+    [[unroll]] for (uint32_t l = 0; l < (MatBc * v_cols + gl_WorkGroupSize.x - 1) / gl_WorkGroupSize.x; ++l) {
+        const uint idx = l * gl_WorkGroupSize.x + tid;
+        if (idx < MatBc * v_cols) {
+            const uint lrow = idx / v_cols;
+            const uint col  = idx % v_cols;
+            const uint row  = bc_chunk * MatBc + lrow;
+
+            const uint v_row = FA_KV_ROW(j, row);
+            const uint v_col = hsv_tile * MatBc * row_split + col * 4;
+
+            const uint coord = v_row * v_stride * BLOCK_SIZE_V + v_col;
+            const uint ib = coord / BLOCK_SIZE_V;
+            const uint iqs = coord % BLOCK_SIZE_V;
+
+            const bool row_dead = zero_dead && ((dead_cols[row / 32] & (1u << (row % 32))) != 0);
+            if (row_dead) {
+                kvsh[lrow * vsh_stride + col] = FLOAT_TYPEV4(0.0f);
+            } else if (!KV_bounds_check || (FA_KV_LIVE(j, row) && v_col < HSV)) {
+#if !defined(BFLOAT16)
+                if (USE_DECODE_V) {
+                    kvsh[lrow * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+                } else
+#endif
+                {
+                    kvsh[lrow * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
+                }
+            } else {
+                kvsh[lrow * vsh_stride + col] = FLOAT_TYPEV4(0.0f);
+            }
         }
     }
 }
@@ -777,12 +838,35 @@ void main() {
                 // whose V has to be replaced by +0 (ZERO_DEAD_V).
                 const bool stage_v = USE_DECODE_V || KV_bounds_check ||
                                      (ZERO_DEAD_V && MASK_ENABLE && any_dead_tile[0]);
-                if (SHMEM_STAGING == 0 && stage_v) {
+                if (SHMEM_STAGING == 0 && stage_v && !V_CHUNK) {
                     stage_v_columns(j, hsv_tile, v_offset, tid, 0, ZERO_DEAD_V && MASK_ENABLE);
                 }
                 barrier();
 
-                if (hsv_offset < HSV_pad) {
+                if (V_CHUNK) {
+                    // [TAG_FA1] the same bc_chunk order and operands as below, V staged per chunk when staged at all.
+                    // The barriers sit outside the subgroup-dependent hsv_offset test, so they are workgroup-uniform.
+                    [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
+                        if (stage_v) {
+                            if (bc_chunk > 0) {
+                                barrier(); // the previous chunk's kvsh reads
+                            }
+                            stage_v_chunk(j, hsv_tile, bc_chunk, v_offset, tid, ZERO_DEAD_V && MASK_ENABLE);
+                            barrier();
+                        }
+                        if (hsv_offset < HSV_pad) {
+                            if (stage_v) {
+                                coopMatLoad(QMat, kvsh, gl_SubgroupID * (MatBc / 4), vsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                            } else {
+                                const uint v_tile_row = j * Bc + bc_chunk * MatBc;
+                                const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
+                                coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+                            }
+                            coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
+                            PVMat0 = coopMatMulAdd(KMat, QMat, PVMat0);
+                        }
+                    }
+                } else if (hsv_offset < HSV_pad) {
                     [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
                         FA_LOAD_V_TILE(stage_v)
 
@@ -832,9 +916,16 @@ void main() {
 
             if (hsv_offset < HSV_pad) {
                 // Store PVMat to pvsh and load into Of
-                coopMatStore(PVMat0, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
-                if (row_tiles > 1) {
-                    coopMatStore(PVMat1, pvsh, MatBc * osh_stride + o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                if (SFPV_ALIAS) {
+                    coopMatStore(PVMat0, sfsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                    if (row_tiles > 1) {
+                        coopMatStore(PVMat1, sfsh, MatBc * osh_stride + o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                } else {
+                    coopMatStore(PVMat0, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                    if (row_tiles > 1) {
+                        coopMatStore(PVMat1, pvsh, MatBc * osh_stride + o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                    }
                 }
             }
 
@@ -856,7 +947,7 @@ void main() {
 
                     if (hsv_col >= hsv_base && hsv_col < hsv_base + hsv_per_tile && hsv_col < HSV) {
                         const uint local_hsv = (hsv_col - hsv_base) / 4;
-                        Of[r][d_local] += pvsh[row * osh_stride + local_hsv];
+                        Of[r][d_local] += SFPV_ALIAS ? sfsh[row * osh_stride + local_hsv] : pvsh[row * osh_stride + local_hsv];
                     }
                 }
             }
