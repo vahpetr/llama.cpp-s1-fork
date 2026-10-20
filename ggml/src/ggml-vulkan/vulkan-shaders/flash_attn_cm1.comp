@@ -55,7 +55,9 @@ const bool SFPV_ALIAS = (Flags & 16384) != 0;
 // dispatch that sets the bit on any other pipeline gets the legacy layout, never a dropped P*V term or an
 // out-of-bounds kvsh write.  !INDEXED is not a correctness condition (an indexed pipeline has KV_bounds_check, so
 // it would stage every chunk with its ids honoured): the indexed QSA FA is deliberately kept byte-identical and
-// unmeasured under this layout.  Twin of the host predicate ggml_vk_fa_cm1_v_chunk (ggml-vulkan.cpp) - keep both.
+// unmeasured under this layout.  The host predicate ggml_vk_fa_cm1_v_chunk (ggml-vulkan.cpp) sets the bit only on a
+// subset of these pipelines (it adds policy: aligned, f16 V, dense rows); ggml_vk_fa_cm1_v_chunk_kernel_fold mirrors
+// this fold there - keep the two in step.
 const bool V_CHUNK    = (Flags & 32768) != 0 && row_tiles == 1 && !INDEXED && SHMEM_STAGING == 0;
 
 const uint32_t rows_per_thread = Br / row_split;
@@ -141,61 +143,65 @@ shared uint32_t p_dead_lds[row_tiles * dead_words];
 uint32_t dead_cols[row_tiles * dead_words];
 bool any_dead_tile[row_tiles];
 
-// Stage rows [ROW0, ROW0 + NROWS) of one [Bc, MatBc * row_split] slice of V into kvsh rows [0, NROWS), replacing
-// the rows (KV columns) that row tile T has marked dead by +0 when zero_dead is set.  The whole-tile staging
-// (stage_v_columns) and V_CHUNK's per-chunk staging (stage_v_chunk) are both this one per-element rule.  A macro,
-// so NROWS is a literal at each use: the trip count and the tail guard are constant expressions of spec constants
-// at every instance (no reliance on inlining a parameter); the whole-tile guard folds to true at specialization.
-#define FA_STAGE_V_ROWS(ROW0, NROWS, T)                                                                              \
+// Stage rows [ROW0, ROW0 + NROWS) of one [Bc, MatBc * row_split] slice of V (KV tile J, hsv tile HSV_TILE, V base
+// V_OFFSET) into DST_SH rows [0, NROWS), thread TID, replacing the rows (KV columns) that row tile T has marked dead in
+// DEAD by +0 when ZERO_DEAD is set.  The whole-tile staging (stage_v_columns) and V_CHUNK's per-chunk staging
+// (stage_v_chunk) are both this one per-element rule.  A macro, so NROWS is a literal at each use: the trip count and
+// the tail guard are constant expressions of spec constants at every instance (no reliance on inlining a parameter);
+// the whole-tile guard folds to true at specialization.  Every outside name it reads or writes is a parameter; the
+// rest are spec constants and the shader's bindings.
+#define FA_STAGE_V_ROWS(DST_SH, DEAD, J, HSV_TILE, V_OFFSET, TID, ZERO_DEAD, ROW0, NROWS, T)                        \
     [[unroll]] for (uint32_t l = 0; l < ((NROWS) * v_cols + gl_WorkGroupSize.x - 1) / gl_WorkGroupSize.x; ++l) {     \
-        const uint idx = l * gl_WorkGroupSize.x + tid;                                                               \
+        const uint idx = l * gl_WorkGroupSize.x + (TID);                                                             \
         if ((((NROWS) * v_cols) % gl_WorkGroupSize.x) == 0 || idx < (NROWS) * v_cols) {                              \
             const uint lrow = idx / v_cols;                                                                          \
             const uint col = idx % v_cols;                                                                           \
             const uint row = (ROW0) + lrow;                                                                          \
             const uint dst = lrow * vsh_stride + col;                                                                \
                                                                                                                      \
-            const uint v_row = FA_KV_ROW(j, row);                                                                    \
-            const uint v_col = hsv_tile * MatBc * row_split + col * 4;                                               \
+            const uint v_row = FA_KV_ROW((J), row);                                                                  \
+            const uint v_col = (HSV_TILE) * MatBc * row_split + col * 4;                                             \
                                                                                                                      \
             const uint coord = v_row * v_stride * BLOCK_SIZE_V + v_col;                                              \
             const uint ib = coord / BLOCK_SIZE_V;                                                                    \
             const uint iqs = coord % BLOCK_SIZE_V;                                                                   \
                                                                                                                      \
-            const bool row_dead = zero_dead &&                                                                       \
-                                  ((dead_cols[(T) * dead_words + row / 32] & (1u << (row % 32))) != 0);              \
+            const bool row_dead = (ZERO_DEAD) &&                                                                     \
+                                  (((DEAD)[(T) * dead_words + row / 32] & (1u << (row % 32))) != 0);                 \
             if (row_dead) {                                                                                          \
-                kvsh[dst] = FLOAT_TYPEV4(0.0f);                                                                      \
+                (DST_SH)[dst] = FLOAT_TYPEV4(0.0f);                                                                  \
             /* [TAG_QSA_INDEXED_FA] (Check-in #9 a) indexed: the column is one of the W ids AND its cell is cached */ \
-            } else if (!KV_bounds_check || (FA_KV_LIVE(j, row) && v_col < HSV)) {                                    \
-                FA_STAGE_V_LOAD                                                                                      \
+            } else if (!KV_bounds_check || (FA_KV_LIVE((J), row) && v_col < HSV)) {                                  \
+                FA_STAGE_V_LOAD(DST_SH, dst, ib, iqs, V_OFFSET, v_row, v_col)                                        \
             } else {                                                                                                 \
-                kvsh[dst] = FLOAT_TYPEV4(0.0f);                                                                      \
+                (DST_SH)[dst] = FLOAT_TYPEV4(0.0f);                                                                  \
             }                                                                                                        \
         }                                                                                                            \
     }
 
+// One staged V element: decoded from a quant block (IB, IQS) or read as f16 from row V_ROW, column V_COL.
 #if !defined(BFLOAT16)
-#define FA_STAGE_V_LOAD                                                                                              \
+#define FA_STAGE_V_LOAD(DST_SH, D, IB, IQS, V_OFFSET, V_ROW, V_COL)                                                  \
     if (USE_DECODE_V) {                                                                                              \
-        kvsh[dst] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);                                                   \
+        (DST_SH)[D] = dequantize4((IB), (IQS), (V_OFFSET), BINDING_IDX_V);                                           \
     } else {                                                                                                         \
-        kvsh[dst] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];                                             \
+        (DST_SH)[D] = data_vv4[((V_OFFSET) + (V_ROW) * v_stride + (V_COL)) / 4];                                     \
     }
 #else
-#define FA_STAGE_V_LOAD kvsh[dst] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
+#define FA_STAGE_V_LOAD(DST_SH, D, IB, IQS, V_OFFSET, V_ROW, V_COL)                                                  \
+    (DST_SH)[D] = data_vv4[((V_OFFSET) + (V_ROW) * v_stride + (V_COL)) / 4];
 #endif
 
 // The whole [Bc, MatBc * row_split] slice for row tile "t".
 void stage_v_columns(const uint32_t j, const uint32_t hsv_tile, const uint32_t v_offset,
                      const uint32_t tid, const uint32_t t, const bool zero_dead) {
-    FA_STAGE_V_ROWS(0u, Bc, t)
+    FA_STAGE_V_ROWS(kvsh, dead_cols, j, hsv_tile, v_offset, tid, zero_dead, 0u, Bc, t)
 }
 
 // [TAG_FA1] V_CHUNK: rows [bc_chunk * MatBc, +MatBc) of the slice into kvsh rows [0, MatBc) (one row tile, t = 0).
 void stage_v_chunk(const uint32_t j, const uint32_t hsv_tile, const uint32_t bc_chunk, const uint32_t v_offset,
                    const uint32_t tid, const bool zero_dead) {
-    FA_STAGE_V_ROWS(bc_chunk * MatBc, MatBc, 0u)
+    FA_STAGE_V_ROWS(kvsh, dead_cols, j, hsv_tile, v_offset, tid, zero_dead, bc_chunk * MatBc, MatBc, 0u)
 }
 
 // The V operand of one P*V coopMatMulAdd, from global memory or from the kvsh staging tile.
