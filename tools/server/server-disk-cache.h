@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -97,17 +98,38 @@ struct server_deep_ckpt_meta {
 //   is adopted for target-only loads - the draft stream's descriptor names its KV types, so it never loads)
 std::string server_disk_cache_fingerprint_structure(const std::string & fp, std::string * why = nullptr, bool draft_kv = true);
 
+struct server_disk_async; // [TAG_DISK_ASYNC_SAVE] the worker threads and the jobs in flight (server-disk-cache.cpp)
+struct server_disk_save_job;
+
 struct server_disk_cache {
     server_disk_cache(std::string dir, uint64_t quota_bytes, int32_t min_tokens, int32_t ttl_days,
                       std::string fingerprint, bool has_mtmd, float ckpt_ratio, int32_t ckpt_min_step, int32_t ckpt_max);
+    ~server_disk_cache(); // joins the workers; a save still in flight is not committed (no .meta: dropped at start)
 
     // scan the directory: keep the complete entries with this fingerprint, delete the rest, enforce the limits
     void init();
 
     // write the state of seq id_slot; a no-op when an entry already holds exactly these tokens. Entries that are a
     // prefix of the new one are replaced. Returns true if the state is on disk.
+    // [TAG_DISK_ASYNC_SAVE] with set_async(N > 0): returns true once the state is copied off the device (the slot may
+    //   be overwritten); the entry is committed by poll() / drain() after the workers hashed and wrote it
     bool save(llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot,
               const server_prompt & prompt);
+
+    // [TAG_DISK_ASYNC_SAVE] --cache-disk-async: host staging budget of the asynchronous save (0 = the synchronous v63
+    //   path); set before the first save
+    void set_async(uint64_t budget_bytes);
+    // commit the asynchronous saves whose files are written (server thread, every loop pass); a failed one is removed
+    void poll();
+    // wait for every asynchronous save and commit it (namespace switch, sleep, exit); returns the slots whose save failed
+    //   in the background during this drain (their save() had returned true when the copy was queued)
+    std::vector<int32_t> drain();
+    // a finished background save wakes the server loop through this (worker thread; set by the server)
+    std::function<void()> on_async_done;
+    // the newest save in flight that shares more than lcp_min tokens with tokens (and the ones before it) is waited for
+    //   and committed, so find() sees its entry
+    void await_pending(const server_tokens & tokens, size_t lcp_min);
+    size_t n_pending() const;
 
     // index of the entry with the longest common prefix with tokens, if longer than lcp_min and it fits n_ctx_slot
     int find(const server_tokens & tokens, size_t lcp_min, size_t n_ctx_slot, size_t * lcp_out) const;
@@ -194,8 +216,22 @@ struct server_disk_cache {
     const std::string & entry_id(int idx) const { return entries[idx].id; }
     uint64_t bytes_written  = 0;
     uint64_t bytes_loaded   = 0;
-    uint64_t save_us        = 0;
+    uint64_t save_us        = 0; // the server loop's part of the saves (all of a synchronous save)
     uint64_t load_us        = 0;
+    // [TAG_DISK_ASYNC_SAVE] timings for /metrics: the asynchronous part (hash + write of the copied blocks, from the
+    //   end of the device copy to the files written), the device copy, the last save / load
+    uint64_t save_async_us       = 0;
+    uint64_t save_copy_us        = 0; // device -> host copy inside the blocking part (both paths)
+    uint64_t save_wait_us        = 0; // blocking part spent waiting for staging room (async path)
+    uint64_t bytes_copied        = 0; // state bytes copied off the device by saves
+    uint64_t n_saves_async       = 0;
+    uint64_t n_saves_async_failed = 0;
+    uint64_t last_save_blocking_us = 0;
+    uint64_t last_save_total_us    = 0; // blocking + asynchronous
+    uint64_t last_save_bytes       = 0; // state bytes of the last committed save
+    uint64_t last_save_written     = 0; // bytes it wrote (new blocks, maps, .tok / .aux, checkpoints)
+    uint64_t last_load_us          = 0;
+    uint64_t last_load_bytes       = 0;
 
     size_t n_entries()    const { return entries.size(); }
     size_t n_deep_ckpts() const { return ckpts.size(); }
@@ -329,6 +365,26 @@ struct server_disk_cache {
     bool warned_unidentified = false; // an unreadable legacy .meta was reported (once per run)
 
     bool ckpt_store(const std::string & key, const common_prompt_checkpoint & c, bool * written);
+
+    // [TAG_DISK_ASYNC_SAVE]
+    std::unique_ptr<server_disk_async> as;
+    // the commit of a save (both paths): adopted / legacy blocks copied into the own store, .meta, the entry registered,
+    //   the prefixes it extends replaced, limits enforced. e.blobs, e.ckpt_keys, e.deep are set; tokens = the prompt's
+    bool save_commit(server_disk_cache_entry & e, bool ok, const server_tokens & tokens, size_t n_ckpts, uint64_t ckpt_bytes,
+                     uint64_t n_logical, uint64_t n_written, uint64_t n_ckpt_written, int64_t t_start, uint64_t blocking_us,
+                     int64_t t_done, int64_t t_captured); // blocking_us 0: the synchronous path; else the async job's copy
+                                                          //   time, t_captured / t_done the ends of its copy / files
+    bool save_async_begin(llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                          server_disk_cache_entry & e, const server_prompt & prompt, size_t n_ckpts, uint64_t ckpt_bytes,
+                          uint64_t n_ckpt_written, int64_t t_start);
+    void commit_job(server_disk_save_job & job);
+    // a save of exactly these tokens is in flight; save() then returns true although that save may still fail in the
+    //   background (review I9: reported by commit_job / drain())
+    bool pending_holds(const server_tokens & tokens) const;
+    uint64_t pending_bytes() const; // bytes the saves in flight wrote so far (charged at their commit)
+    std::vector<int32_t> lost_slots; // slots whose background save failed, collected while drain() commits
+    bool draining = false;
+    int  test_fail_meta = 0; // LLAMA_DISK_ASYNC_TEST_FAIL_META: the first N async commits fail their .meta (test hook)
     std::string blob_path(const std::string & key) const;
     bool        blob_writable(const std::string & key) const;
     bool save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path, const std::string & env_h,
