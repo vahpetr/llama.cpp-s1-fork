@@ -730,8 +730,7 @@ static const char * const CACHE_ENV_EXACT[] = {
     "LLAMA_GTT_STAGING_B_PER_CELL", "LLAMA_GTT_STAGING_STEP_MIB", "LLAMA_GTT_SLACK_PCT", "LLAMA_GTT_ONCE_MIB",
     "LLAMA_GTT_HOLES_FULL_CHUNK", "LLAMA_GTT_USED_PATH",
     "LLAMA_LEGACY_UNMARKED", // [TAG_CELL_EXT_PROVENANCE] which stored states load, not what a loaded one computes
-    "LLAMA_DISK_ASYNC_TEST_DELAY_MS", "LLAMA_DISK_ASYNC_TEST_FAIL_MAPS", "LLAMA_DISK_ASYNC_TEST_FAIL_META", // [TAG_DISK_ASYNC_SAVE]
-    "LLAMA_DISK_ASYNC_TEST_THREADS",                                                                     //   test hooks
+    "LLAMA_DISK_ASYNC_TEST", // [TAG_DISK_ASYNC_SAVE] test hooks, honoured only with --cache-disk-test
     // LLAMA_ARG_* aliases (common/arg.cpp): classified one by one by their parsed meaning - only the control plane
     "LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_API_KEY",
     // Vulkan speed / diagnostics only by contract
@@ -1141,6 +1140,70 @@ server_disk_cache::server_disk_cache(std::string dir, uint64_t quota_bytes, int3
     legacy_unmarked = !(lu && atoi(lu) == 0);
 }
 
+// [TAG_DISK_ASYNC_SAVE] (review r7 5) the test hooks: one variable LLAMA_DISK_ASYNC_TEST=key=value,... read here and only
+//   with --cache-disk-test (enabled = false: the variable is ignored with a warning - a leaked env never changes a prod
+//   cache). Keys:
+//     delay_ms=N             each background block task sleeps N ms first
+//     threads=N              worker count
+//     fail_maps=N            the first N map writes throw (a worker-side failure)
+//     fail_meta=N            the first N async commits fail their .meta (a commit-side failure)
+//     fail_job=N             the N-th submitted async save (1-based) fails at its end
+//     finalize_delay_ms=N    each save's end (maps) lags its block tasks by N ms
+//     finalize_delay_jobK_ms=N  the same for the K-th submitted save only (overrides the above)
+//     hold_write_jobK_ms=N   the K-th submitted save's first block write holds N ms while marked "being written"
+//     fail_enqueue=N         the N-th block task enqueue (1-based, all saves) throws std::bad_alloc
+//     max_jobs=N             saves in flight before a new save runs synchronously (default 2)
+//     check_pins=1           after each commit compare the cached pin set with a fresh derivation (pin_check_failures)
+//     quota_mib=N            the quota in MiB instead of --cache-disk-gib
+void server_disk_cache::set_test_hooks(bool enabled) {
+    const char * v = getenv("LLAMA_DISK_ASYNC_TEST");
+    if (!v || !*v) {
+        return;
+    }
+    if (!enabled) {
+        DSK_WRN("LLAMA_DISK_ASYNC_TEST=%s ignored: test hooks need --cache-disk-test\n", v);
+        return;
+    }
+    for (const auto & kv : string_split<std::string>(v, ',')) {
+        const auto eq = kv.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        const std::string k = kv.substr(0, eq);
+        const int val = atoi(kv.c_str() + eq + 1);
+        if (k == "delay_ms") {
+            hooks.delay_ms = std::max(0, val);
+        } else if (k == "threads") {
+            hooks.threads = std::max(0, val);
+        } else if (k == "fail_maps") {
+            hooks.fail_maps = std::max(0, val);
+        } else if (k == "fail_meta") {
+            test_fail_meta = std::max(0, val);
+        } else if (k == "fail_job") {
+            hooks.fail_job = val;
+        } else if (k == "finalize_delay_ms") {
+            hooks.finalize_delay_ms = std::max(0, val);
+        } else if (int job = 0, n_used = 0;
+                   sscanf(k.c_str(), "finalize_delay_job%d_ms%n", &job, &n_used) == 1 && n_used == (int) k.size()) {
+            hooks.finalize_delay_job[job] = std::max(0, val);
+        } else if (int job = 0, n_used = 0;
+                   sscanf(k.c_str(), "hold_write_job%d_ms%n", &job, &n_used) == 1 && n_used == (int) k.size()) {
+            hooks.hold_write_job[job] = std::max(0, val);
+        } else if (k == "fail_enqueue") {
+            hooks.fail_enqueue = val;
+        } else if (k == "check_pins") {
+            hooks.check_pins = val != 0;
+        } else if (k == "max_jobs") {
+            hooks.max_jobs = std::max(1, val);
+        } else if (k == "quota_mib") {
+            quota = (uint64_t) std::max(1, val) << 20;
+        } else {
+            DSK_WRN("LLAMA_DISK_ASYNC_TEST: unknown key %s\n", k.c_str());
+        }
+    }
+    DSK_WRN("test hooks active (--cache-disk-test): %s\n", v);
+}
+
 static int64_t mtime_s(const fs::path & p) {
     std::error_code ec;
     const auto mt = fs::last_write_time(p, ec);
@@ -1359,11 +1422,11 @@ void server_disk_cache::erase(size_t idx) {
     if (!entries[idx].src.empty()) {
         // [TAG_DISK_ADOPT] an adopt source's entry only loses its eligibility; its files stay
         src_dir_of.erase(entries[idx].id);
-        entries.erase(entries.begin() + idx);
+        erase_entry_at(idx);
         return;
     }
     remove_files(entries[idx].id);
-    entries.erase(entries.begin() + idx);
+    erase_entry_at(idx);
 }
 
 // [TAG_DISK_READ_STATUS] (Hermes gate Major 1) SEALED_IO: a file of the entry cannot be read now (open / read /
@@ -1546,7 +1609,7 @@ void server_disk_cache::init() {
                 !list_dir(fs::path(dir) / "ckpt", ls_ck, false, &err)) {
             DSK_WRN("cannot list %s: disk cache disabled for this run, no file touched\n", err.c_str());
             quota = 0;
-            entries.clear();
+            clear_entries();
             ckpts.clear();
             blobs.clear();
             blk_own.clear();
@@ -1576,7 +1639,7 @@ void server_disk_cache::init() {
         server_disk_cache_entry e;
         const sealed_status st = read_entry(id, fingerprint, e);
         if (st == SEALED_OK) {
-            entries.push_back(std::move(e));
+            push_entry(std::move(e));
         } else if (st == SEALED_IO) {
             DSK_WRN("entry %s not readable now (I/O error): kept on disk, skipped for this run\n", id.c_str());
             n_skipped++;
@@ -1691,7 +1754,7 @@ void server_disk_cache::init() {
         if (io) {
             DSK_WRN("entry %s references a file not readable now (I/O error): kept on disk, skipped for this run\n",
                     e.id.c_str());
-            entries.erase(entries.begin() + i);
+            erase_entry_at(i);
             n_skipped++;
         } else if (complete) {
             i++;
@@ -1727,12 +1790,16 @@ void server_disk_cache::init() {
     refresh_status();
 }
 
-void server_disk_cache::enforce(const std::string & protect) {
+void server_disk_cache::enforce(const std::string & protect, bool refresh) {
     const int64_t t_now = now_s();
+    // [TAG_DISK_ASYNC_SAVE] the pinned entries (the in-flight model before pinned_set()), once per pass: TTL and eviction
+    //   never remove one, so the set does not change inside this function
+    const std::set<std::string> pinned = pinned_set(); // (review r12 6) a copy: TTL / eviction erase() bump the generation
 
     if (ttl_days > 0) {
         for (size_t i = 0; i < entries.size();) {
-            if (entries[i].src.empty() && entries[i].id != protect && entries[i].id != protect_id && t_now - entries[i].t_used > (int64_t) ttl_days * 86400) {
+            if (entries[i].src.empty() && entries[i].id != protect && entries[i].id != protect_id &&
+                !pinned.count(entries[i].id) && t_now - entries[i].t_used > (int64_t) ttl_days * 86400) {
                 DSK_INF("expired %s (%zu tokens, idle %.1f days)\n", entries[i].id.c_str(), entries[i].tokens.size(),
                         (t_now - entries[i].t_used) / 86400.0);
                 erase(i);
@@ -1746,14 +1813,18 @@ void server_disk_cache::enforce(const std::string & protect) {
     deep_gc();
     blob_gc();
 
-    // [TAG_DISK_ASYNC_SAVE] (review r2 I4) the bytes of saves in flight are charged at their own commit (this enforce
-    //   then runs with the prefixes they replace already erased): adding them here double-counted those prefixes;
-    //   the overshoot while they are in flight is at most their new blocks (GET /disk-cache: bytes_pending)
-    while (total_bytes() > quota && !entries.empty()) {
+    // [TAG_DISK_ASYNC_SAVE] the saves in flight are charged (inflight_charge(): pending, capped by what this victim
+    //   search can free), so the quota holds while they write; TTL and the collections above always run
+    const uint64_t charge = inflight_charge(pinned, protect);
+    while (total_bytes() + charge > quota && !entries.empty()) {
         size_t victim = SIZE_MAX;
         double v_min  = 0.0;
         for (size_t i = 0; i < entries.size(); i++) {
-            if (entries[i].id == protect || entries[i].id == protect_id || !entries[i].src.empty()) {
+            // [TAG_DISK_ASYNC_SAVE] a pinned entry stays: the save that extends it may still fail (the conversation
+            //   would be gone) and its own files are already netted out of the charge; with only pinned / protected
+            //   entries left the loop stops
+            if (entries[i].id == protect || entries[i].id == protect_id || !entries[i].src.empty() ||
+                pinned.count(entries[i].id)) {
                 continue;
             }
             const double v = entry_value(entries[i], t_now);
@@ -1763,7 +1834,7 @@ void server_disk_cache::enforce(const std::string & protect) {
             }
         }
         if (victim == SIZE_MAX) {
-            break;
+            break; // only pinned / protected entries left
         }
         DSK_INF("quota: evicting %s (%zu tokens, %.2f GiB, value %.1f s/GiB)\n", entries[victim].id.c_str(),
                 entries[victim].tokens.size(), entries[victim].bytes / (1024.0 * 1024.0 * 1024.0), v_min);
@@ -1773,7 +1844,9 @@ void server_disk_cache::enforce(const std::string & protect) {
         blob_gc();
     }
 
-    refresh_status();
+    if (refresh) {
+        refresh_status();
+    }
 }
 
 bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot,
@@ -1827,6 +1900,20 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
     }
     if (pending_holds(prompt.tokens)) { // [TAG_DISK_ASYNC_SAVE] a save of exactly these tokens is in flight
         return true;
+    }
+
+    // [TAG_DISK_ASYNC_SAVE] (review r10 4, r11 1-2) backpressure, decided before any file of this save is written: with
+    //   two saves in flight (fixed; test hook max_jobs) this one runs synchronously (bounded by one save, as v63; the
+    //   entry is registered before any enforce() runs and the saves in flight keep their pins) - the loop never waits for an in-flight
+    //   save's remaining hash / write time, and no commit / quota pass runs while this save's files are unregistered.
+    //   Quota overshoot is bounded by the new blocks of max_jobs saves in flight
+    bool use_async = as != nullptr;
+    if (as) {
+        // (review r12 3) finished saves are committed first (nothing of this save is on disk yet), so a done-but-uncommitted
+        //   job does not turn this save synchronous; their failures are reported by the next poll()
+        poll_into(deferred_lost);
+        const int max_jobs = hooks.max_jobs > 0 ? hooks.max_jobs : 2;
+        use_async = (int) n_pending() < max_jobs;
     }
 
     for (const auto & ckpt : prompt.checkpoints) {
@@ -1993,21 +2080,46 @@ bool server_disk_cache::save(llama_context * ctx_tgt, llama_context * ctx_dft, c
 
     // [TAG_DISK_ASYNC_SAVE] --cache-disk-async: the streams are copied off the device here, hashed and written by the
     //   workers; poll() commits the entry (save_commit) once its files are on disk
-    if (ok && as) {
+    if (ok && use_async) {
         return save_async_begin(ctx_tgt, ctx_dft, id_slot, e, prompt, prompt.checkpoints.size(), ckpt_bytes,
                                 n_ckpt_written, t_start);
+    }
+
+    if (ok && as) { // (review r12 4) counted when the synchronous fallback starts writing
+        n_save_backpressure++;
+        if (!warned_backpressure) {
+            warned_backpressure = true;
+            DSK_WRN("%zu saves in flight: this save runs synchronously (counted as save_backpressure; logged once)\n",
+                    n_pending());
+        }
     }
 
     // [TAG_DISK_DELTA] the KV / recurrent state streams through 4 MiB content blocks: a block already on disk (the
     //   unchanged part of a conversation saved before, a branch, a copy) is referenced, only new ones are written
     uint64_t n_logical = 0, n_written = 0;
-    ok = ok && save_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), desc_tgt_full, e.blobs, n_logical, n_written);
-    if (ok && ctx_dft) {
-        ok = save_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_full, e.blobs, n_logical, n_written);
+    try {
+        ok = ok && save_stream(ctx_tgt, id_slot, path(e.id, ".tgt"), desc_tgt_full, e.blobs, n_logical, n_written);
+        if (ok && ctx_dft) {
+            ok = save_stream(ctx_dft, id_slot, path(e.id, ".dft"), desc_dft_full, e.blobs, n_logical, n_written);
+        }
+    } catch (const std::exception & err) {
+        if (!as) {
+            throw; // v63
+        }
+        // (review r13 2) [TAG_DISK_ASYNC_SAVE] the synchronous fallback fails like a write error: claims released,
+        //   partial files removed by save_commit
+        DSK_WRN("synchronous save failed: %s\n", err.what());
+        ok = false;
     }
+    release_sync_claims();
 
     return save_commit(e, ok, prompt.tokens, prompt.checkpoints.size(), ckpt_bytes, n_logical, n_written, n_ckpt_written,
                        t_start, 0, 0, 0);
+}
+
+// (review r14 7) the one prefix predicate of the in-flight model: a is a prefix of b (strict: a proper prefix)
+static bool tokens_prefix_of(const server_tokens & a, const server_tokens & b, bool strict) {
+    return (strict ? a.size() < b.size() : a.size() <= b.size()) && b.get_common_prefix(a) == a.size();
 }
 
 bool server_disk_cache::save_commit(server_disk_cache_entry & e, bool ok, const server_tokens & tokens, size_t n_ckpts,
@@ -2066,9 +2178,9 @@ bool server_disk_cache::save_commit(server_disk_cache_entry & e, bool ok, const 
         for (const char * ext : { ".tok", ".aux", ".tgt", ".dft" }) {
             e.own_bytes += file_size_or_0(path(e.id, ext));
         }
-        if (blocking_us != 0 && test_fail_meta > 0) { // LLAMA_DISK_ASYNC_TEST_FAIL_META
+        if (blocking_us != 0 && test_fail_meta > 0) { // test hook fail_meta
             test_fail_meta--;
-            DSK_WRN("%s", "injected .meta write failure (LLAMA_DISK_ASYNC_TEST_FAIL_META)\n");
+            DSK_WRN("%s", "injected .meta write failure (test hook fail_meta)\n");
             ok = false;
         } else {
             ok = write_meta(e);
@@ -2077,21 +2189,35 @@ bool server_disk_cache::save_commit(server_disk_cache_entry & e, bool ok, const 
 
     if (!ok) {
         DSK_WRN("failed to save %zu tokens, removing the partial entry\n", n);
-        n_saves_async_failed += blocking_us != 0; // [TAG_DISK_ASYNC_SAVE] counted before the status refresh below
         remove_files(e.id);
+        if (blocking_us != 0) {
+            // [TAG_DISK_ASYNC_SAVE] (review r3 I3, m7) commit_job collects and refreshes once, after it released the
+            //   job's block claims (a collection here would still see them as referenced)
+            n_saves_async_failed++;
+            return false;
+        }
         // [TAG_DISK_GC] the aborted save is a transaction boundary: blocks and checkpoints it wrote that no
         //   registered entry or live slot references go now (never inside erase(): during a prefix replacement the
         //   new entry's files exist before it is registered)
         deep_gc();
         blob_gc();
+        check_pins();
         refresh_status();
         return false;
     }
 
-    // older saves of the same conversation that this one extends are obsolete
+    // [TAG_DISK_ASYNC_SAVE] (review r13 1) a synchronous save is newer than every save in flight: those it extends are
+    //   obsolete now - marked here (they stop pinning, so the pass below replaces their prefixes) and dropped at their
+    //   commit. An async commit marks nothing (commits go in submission order: a later, shorter save is newer)
+    if (blocking_us == 0) {
+        mark_superseded(tokens);
+    }
+
+    // older saves of the same conversation that this one extends are obsolete - except one another save in flight also
+    //   extends ([TAG_DISK_ASYNC_SAVE] (review r9 10) pinned: if that save fails, the prefix is still its conversation's)
+    const std::set<std::string> pinned = pinned_set(); // (review r12 6) a copy: erase() bumps the generation
     for (size_t i = 0; i < entries.size();) {
-        if (entries[i].tokens.size() < n && entries[i].id != protect_id &&
-            tokens.get_common_prefix(entries[i].tokens) == entries[i].tokens.size()) {
+        if (entries[i].id != protect_id && !pinned.count(entries[i].id) && tokens_prefix_of(entries[i].tokens, tokens, true)) {
             erase(i);
         } else {
             i++;
@@ -2117,8 +2243,10 @@ bool server_disk_cache::save_commit(server_disk_cache_entry & e, bool ok, const 
     // [TAG_DISK_ASYNC_SAVE] save_us = the server loop's part (all of a synchronous save)
     const uint64_t total_us = (uint64_t) (ggml_time_us() - t_start);
     save_us += blocking_us == 0 ? total_us : blocking_us;
-    last_save_blocking_us = blocking_us == 0 ? total_us : blocking_us;
-    last_save_total_us    = blocking_us == 0 ? total_us : (uint64_t) std::max<int64_t>(0, t_done - t_start); // files written
+    if (blocking_us == 0) { // (review r11 5) an async save's gauges are set by commit_job (its commit included)
+        last_save_blocking_us = total_us;
+        last_save_total_us    = total_us;
+    }
     last_save_bytes       = e.bytes;
     last_save_written     = n_written + n_ckpt_written + file_size_or_0(path(e.id, ".aux")) + file_size_or_0(path(e.id, ".tok"));
     if (e.draft_cover < (int64_t) n) {
@@ -2126,16 +2254,26 @@ bool server_disk_cache::save_commit(server_disk_cache_entry & e, bool ok, const 
         DSK_INF("saved %s draft-partial: draft_cover %" PRId64 " of %zu tokens (the draft lacks the first %" PRId64 " rows)\n",
                 e.id.c_str(), e.draft_cover, n, (int64_t) n - e.draft_cover);
     }
-    entries.push_back(std::move(e));
+    push_entry(std::move(e));
     n_saves++;
     if (blocking_us != 0) { // [TAG_DISK_ASYNC_SAVE]
         n_saves_async++;
         save_async_us += (uint64_t) std::max<int64_t>(0, t_done - t_captured);
     }
 
-    enforce(id);
+    enforce(id, blocking_us == 0); // (review r11 4) an async commit refreshes once, in commit_job, after its timing
+    check_pins();
 
     return true;
+}
+
+// (review r11 6, r12 5) test hook check_pins: after every commit (both paths) the cached pin set must equal a fresh
+//   derivation
+void server_disk_cache::check_pins() {
+    if (as && hooks.check_pins && pinned_set() != pinned_set_fresh()) {
+        n_pin_check_failures++;
+        DSK_WRN("%s", "check_pins: the cached pin set differs from a fresh derivation\n");
+    }
 }
 
 //
@@ -2180,6 +2318,9 @@ struct server_disk_save_job {
     uint64_t                n_ckpt_written = 0;
     uint64_t                n_logical      = 0;
     int64_t                 t_start        = 0;
+    // own entries its commit replaces (id, own bytes): pinned while it is in flight, their own bytes netted out of its
+    //   quota charge
+    uint64_t                seq = 0; // submission number (test hooks fail_job / finalize_delay_jobK_ms)
     int64_t                 t_captured     = 0;
     int64_t                 t_done         = 0;
     uint64_t                blocking_us    = 0;
@@ -2189,9 +2330,14 @@ struct server_disk_save_job {
     std::atomic<uint64_t>   n_written{0};
     std::atomic<bool>       ok{true};
     // under server_disk_async::mtx
-    int  n_open   = 0;     // block tasks not finished
+    int  n_open   = 0;     // block tasks queued and not finished
+    uint64_t inl_held = 0; // (review r10 1) staging held by its inline segments (capacity), released at its end
     bool captured = false; // every block queued (or the capture failed)
     bool done     = false; // maps written (or failed): poll() may commit
+    std::atomic<bool> write_held{false}; // test hook hold_write_jobK_ms: the first block write was held
+    // (review r13 1) server thread: a synchronous save that extends this one committed while it was in flight - it no
+    //   longer pins anything and its commit drops it
+    bool superseded = false;
 };
 
 struct server_disk_async {
@@ -2204,8 +2350,8 @@ struct server_disk_async {
     };
 
     uint64_t budget   = 0;
-    int      delay_ms = 0; // LLAMA_DISK_ASYNC_TEST_DELAY_MS: test hook, each block task sleeps this long first
-    std::atomic<int> fail_maps{0}; // LLAMA_DISK_ASYNC_TEST_FAIL_MAPS: test hook, the first N map writes throw
+    server_disk_cache::test_hooks_t hooks; // set_test_hooks() (delay_ms, fail_job, finalize delays)
+    std::atomic<int> fail_maps{0}; // test hook fail_maps: map writes left to fail (counts down across workers)
     std::function<void()> on_job_done; // a job is done (worker thread): wakes the server loop
 
     std::mutex              mtx;
@@ -2223,6 +2369,10 @@ struct server_disk_async {
     //   much as the copy itself; at most POOL_MAX are kept (128 MiB resident between saves)
     static constexpr size_t POOL_MAX = 32;
     std::vector<std::unique_ptr<uint8_t[]>> pool;
+
+    uint64_t n_submitted = 0;  // jobs submitted (server thread)
+    uint64_t n_enqueued  = 0;  // block tasks enqueued (test hook fail_enqueue; under mtx)
+
     std::set<std::string>      writing; // keys a worker is writing now
 
     std::deque<std::unique_ptr<server_disk_save_job>> jobs; // submission order; the deque itself: server thread only
@@ -2263,11 +2413,22 @@ static bool disk_async_write_map(const server_disk_save_job::stream & st, std::a
 
 // marks the job done whatever happens (a map write that throws fails the job); never throws
 static void disk_async_finalize(server_disk_async & as, server_disk_save_job & job) {
+    { // test hooks finalize_delay_ms / finalize_delay_jobK_ms: a job's end lags its block tasks
+        const auto it = as.hooks.finalize_delay_job.find((int) job.seq + 1);
+        const int ms = it != as.hooks.finalize_delay_job.end() ? it->second : as.hooks.finalize_delay_ms;
+        if (ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        }
+    }
     try {
+        if (job.ok && (int64_t) job.seq + 1 == as.hooks.fail_job) {
+            DSK_WRN("%s", "asynchronous save: injected failure (test hook fail_job)\n");
+            job.ok = false;
+        }
         if (job.ok) {
             for (const auto & st : job.streams) {
-                if (as.fail_maps.load() > 0 && as.fail_maps.fetch_sub(1) > 0) { // LLAMA_DISK_ASYNC_TEST_FAIL_MAPS
-                    throw std::runtime_error("injected map write failure (LLAMA_DISK_ASYNC_TEST_FAIL_MAPS)");
+                if (as.fail_maps.load() > 0 && as.fail_maps.fetch_sub(1) > 0) { // test hook fail_maps
+                    throw std::runtime_error("injected map write failure (test hook fail_maps)");
                 }
                 if (!disk_async_write_map(st, job.n_written)) {
                     job.ok = false;
@@ -2279,8 +2440,16 @@ static void disk_async_finalize(server_disk_async & as, server_disk_save_job & j
         DSK_WRN("asynchronous save: map write failed: %s\n", err.what());
         job.ok = false;
     }
+    for (auto & st : job.streams) { // the inline bytes are in the maps (or the job failed): their staging goes back
+        for (auto & sg : st.segs) {
+            std::vector<uint8_t>().swap(sg.inl);
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(as.mtx);
+        as.held -= job.inl_held;
+        job.inl_held = 0;
+        as.cv_room.notify_all();
         job.t_done = ggml_time_us();
         job.done   = true;
         as.cv_done.notify_all();
@@ -2305,57 +2474,97 @@ struct disk_async_writing_guard {
 
 // hash / claim / write one copied block; the staging and job accounting is released exactly once, after the work, and
 //   a failure only fails the job (review C2)
+// (review r13 6) one block file write: a writer-unique temp file renamed into place (concurrent writers of the same
+//   key write the same bytes; the rename is atomic); false and no temp left on an error
+static bool disk_write_block_file(const fs::path & fin, const uint8_t * p, size_t n) {
+    static std::atomic<uint64_t> tmp_seq{0};
+    const std::string ftmp = fin.string() + ".tmp" + std::to_string(tmp_seq++);
+    bool wok = false;
+    {
+        std::ofstream fb(ftmp, std::ios::binary | std::ios::trunc);
+        fb.write(reinterpret_cast<const char *>(p), (std::streamsize) n);
+        wok = (bool) fb;
+    }
+    std::error_code ec;
+    if (wok) {
+        fs::rename(ftmp, fin, ec);
+        wok = !ec;
+    }
+    if (!wok) {
+        fs::remove(ftmp, ec);
+    }
+    return wok;
+}
+
+// (review r13 6) a claim's release (as.mtx held): the key stops being pending with its last claim
+static void disk_async_pending_release(server_disk_async & as, const std::string & key, int n) {
+    auto it = as.pending.find(key);
+    if (it != as.pending.end() && (it->second -= n) <= 0) {
+        as.pending.erase(it);
+    }
+}
+
+// (review r12 1) a worker's block store: under as.mtx wait while another writer holds THIS key (one block), claim it
+//   (pending[key]++: blob_gc() keeps it), and if the own file is absent mark it being written; write it outside the
+//   mutex; drop the mark. The commit releases the claim. fresh = this call wrote the file; false on a write error.
+//   hold_ms: test hook hold_write_jobK_ms (held while marked)
+static bool disk_async_store_block(server_disk_async & as, const fs::path & fin, const std::string & key,
+                                   const uint8_t * p, size_t n, bool & fresh, int hold_ms) {
+    fresh = false;
+    disk_async_writing_guard guard{ as };
+    bool present = false;
+    {
+        std::unique_lock<std::mutex> lock(as.mtx);
+        as.cv_done.wait(lock, [&] { return !as.writing.count(key); });
+        as.pending[key]++;
+        // under the mutex blob_gc() holds while it collects: a file seen here stays until the claim is released
+        present = file_present(fin) > 0;
+        if (!present) {
+            as.writing.insert(key);
+            guard.key = &key;
+        }
+    }
+    if (present) {
+        return true;
+    }
+    if (hold_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
+    }
+    if (!disk_write_block_file(fin, p, n)) {
+        return false;
+    }
+    fresh = true;
+    return true;
+}
+
 static void disk_async_block(server_disk_async & as, server_disk_async::task & t) {
     server_disk_save_job & job = *t.job;
     try {
-        if (as.delay_ms > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(as.delay_ms));
+        if (as.hooks.delay_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(as.hooks.delay_ms));
         }
         if (job.ok) {
             auto & b = *t.b;
             b.n   = t.n_buf;
             b.key = hash_key(t.buf.get(), t.n_buf);
             const fs::path fin = fs::path(job.blk_dir) / (b.key + ".blk");
-            disk_async_writing_guard guard{ as };
-            bool present = false;
-            {
-                std::unique_lock<std::mutex> lock(as.mtx);
-                as.cv_done.wait(lock, [&] { return !as.writing.count(b.key); });
-                as.pending[b.key]++;
-                // under the mutex blob_gc() holds while it collects: a file seen here stays until the job is committed
-                present = file_present(fin) > 0;
-                if (!present) {
-                    as.writing.insert(b.key);
-                    guard.key = &b.key;
-                }
+            bool fresh = false;
+            int hold_ms = 0; // test hook hold_write_jobK_ms
+            if (const auto ih = as.hooks.hold_write_job.find((int) job.seq + 1); ih != as.hooks.hold_write_job.end() &&
+                !job.write_held.exchange(true)) {
+                hold_ms = ih->second;
             }
-            if (!present) {
-                const std::string ftmp = fin.string() + ".tmp";
-                bool wok = false;
-                {
-                    std::ofstream fb(ftmp, std::ios::binary | std::ios::trunc);
-                    fb.write(reinterpret_cast<const char *>(t.buf.get()), (std::streamsize) t.n_buf);
-                    wok = (bool) fb;
-                }
-                std::error_code ec;
-                if (wok) {
-                    fs::rename(ftmp, fin, ec);
-                    wok = !ec;
-                }
-                if (!wok) {
-                    fs::remove(ftmp, ec);
-                    job.ok = false;
-                } else {
-                    b.fresh = true;
-                    job.n_written += b.n;
-                }
+            if (!disk_async_store_block(as, fin, b.key, t.buf.get(), t.n_buf, fresh, hold_ms)) {
+                job.ok = false;
+            } else if (fresh) {
+                b.fresh = true;
+                job.n_written += b.n;
             }
         }
     } catch (const std::exception & err) {
         DSK_WRN("asynchronous save: block failed: %s\n", err.what());
         job.ok = false;
     }
-    const size_t n_buf = t.n_buf;
     bool fin = false;
     {
         std::lock_guard<std::mutex> lock(as.mtx);
@@ -2363,7 +2572,7 @@ static void disk_async_block(server_disk_async & as, server_disk_async::task & t
             as.pool.push_back(std::move(t.buf)); // capacity reserved: no allocation
         }
         t.buf.reset();
-        as.held -= n_buf;
+        as.held -= BLOB_BYTES; // (review r10 1) charged at allocation capacity
         fin = --job.n_open == 0 && job.captured;
         as.cv_room.notify_all();
     }
@@ -2417,15 +2626,8 @@ void server_disk_cache::set_async(uint64_t budget_bytes) {
     }
     as = std::make_unique<server_disk_async>();
     as->budget = budget_bytes;
-    if (const char * d = getenv("LLAMA_DISK_ASYNC_TEST_DELAY_MS")) {
-        as->delay_ms = std::max(0, atoi(d));
-    }
-    if (const char * f = getenv("LLAMA_DISK_ASYNC_TEST_FAIL_MAPS")) {
-        as->fail_maps = std::max(0, atoi(f));
-    }
-    if (const char * f = getenv("LLAMA_DISK_ASYNC_TEST_FAIL_META")) {
-        test_fail_meta = std::max(0, atoi(f));
-    }
+    as->hooks     = hooks; // test hooks (set_test_hooks), copied once
+    as->fail_maps = hooks.fail_maps;
     as->pool.reserve(server_disk_async::POOL_MAX);
     as->on_job_done = [this]() {
         if (on_async_done) {
@@ -2434,14 +2636,14 @@ void server_disk_cache::set_async(uint64_t budget_bytes) {
     };
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
     int n_threads = (int) std::min(4u, std::max(1u, hw / 4));
-    if (const char * t = getenv("LLAMA_DISK_ASYNC_TEST_THREADS")) { // test hook: the worker count
-        n_threads = std::max(1, atoi(t));
+    if (hooks.threads > 0) { // test hook
+        n_threads = hooks.threads;
     }
     for (int i = 0; i < n_threads; i++) {
         as->threads.emplace_back(disk_async_worker, as.get());
     }
     DSK_INF("asynchronous save: %d worker threads, %.0f MiB staging%s\n", n_threads, budget_bytes / (1024.0 * 1024.0),
-            as->delay_ms > 0 ? string_format(" (test delay %d ms per block)", as->delay_ms).c_str() : "");
+            as->hooks.delay_ms > 0 ? string_format(" (test delay %d ms per block)", as->hooks.delay_ms).c_str() : "");
 }
 
 size_t server_disk_cache::n_pending() const {
@@ -2453,16 +2655,24 @@ bool server_disk_cache::pending_holds(const server_tokens & tokens) const {
         return false;
     }
     for (const auto & j : as->jobs) {
-        if (j->tokens.size() == tokens.size() && j->tokens.get_common_prefix(tokens) == tokens.size()) {
+        // (review r14 3) a superseded save is dropped at its commit: it holds nothing
+        if (!j->superseded && j->tokens.size() == tokens.size() && tokens_prefix_of(tokens, j->tokens, false)) {
             return true;
         }
     }
     return false;
 }
 
-void server_disk_cache::poll() {
+// (review r3 I5, r4 6) every commit entry point reports the background saves that failed into the caller's sink (one
+//   record per job: its entry id, token count and the slot it was copied from)
+
+void server_disk_cache::poll_into(std::vector<server_disk_lost> & lost) {
     if (!as) {
         return;
+    }
+    if (&lost != &deferred_lost && !deferred_lost.empty()) { // committed at the top of a save() (review r12 3)
+        lost.insert(lost.end(), deferred_lost.begin(), deferred_lost.end());
+        deferred_lost.clear();
     }
     while (!as->jobs.empty()) {
         {
@@ -2472,17 +2682,22 @@ void server_disk_cache::poll() {
             }
         }
         std::unique_ptr<server_disk_save_job> job = std::move(as->jobs.front());
-        as->jobs.pop_front();
-        commit_job(*job);
+        jobs_pop_front();
+        commit_job(*job, lost);
     }
 }
 
-std::vector<int32_t> server_disk_cache::drain() {
-    lost_slots.clear();
+std::vector<server_disk_lost> server_disk_cache::poll() {
+    std::vector<server_disk_lost> lost;
+    poll_into(lost);
+    return lost;
+}
+
+std::vector<server_disk_lost> server_disk_cache::drain() {
+    std::vector<server_disk_lost> lost;
     if (!as) {
-        return {};
+        return lost;
     }
-    draining = true;
     if (!as->jobs.empty()) {
         const int64_t t0 = ggml_time_us();
         const size_t  n  = as->jobs.size();
@@ -2494,53 +2709,162 @@ std::vector<int32_t> server_disk_cache::drain() {
         }
         DSK_INF("asynchronous save: waited %.0f ms for %zu save(s) in flight\n", (ggml_time_us() - t0) / 1000.0, n);
     }
-    poll();
-    draining = false;
-    std::vector<int32_t> lost = std::move(lost_slots);
-    lost_slots.clear();
-    std::sort(lost.begin(), lost.end());
-    lost.erase(std::unique(lost.begin(), lost.end()), lost.end()); // (review r2 m7) one report per slot
+    poll_into(lost);
     return lost;
 }
 
-void server_disk_cache::await_pending(const server_tokens & tokens, size_t lcp_min) {
+std::vector<server_disk_lost> server_disk_cache::await_pending(const server_tokens & tokens, size_t lcp_min) {
+    std::vector<server_disk_lost> lost;
     if (!as) {
-        return;
+        return lost;
     }
-    poll();
+    poll_into(lost);
     // (review I5) wait for the newest matching job and the ones before it (commits go in order); later jobs go on
     size_t n_wait = 0;
     for (size_t i = 0; i < as->jobs.size(); i++) {
-        if (as->jobs[i]->tokens.get_common_prefix(tokens) > lcp_min) {
+        // (review r14 2) a superseded save commits nothing a lookup could find (its extension is registered)
+        if (!as->jobs[i]->superseded && as->jobs[i]->tokens.get_common_prefix(tokens) > lcp_min) {
             n_wait = i + 1;
         }
     }
-    if (n_wait == 0) {
+    if (n_wait > 0) {
+        DSK_INF("a save of this conversation (%zu tokens) is in flight: waiting for it\n",
+                as->jobs[n_wait - 1]->tokens.size());
+        {
+            std::unique_lock<std::mutex> lock(as->mtx);
+            as->cv_done.wait(lock, [&] {
+                return std::all_of(as->jobs.begin(), as->jobs.begin() + n_wait, [](const auto & j) { return j->done; });
+            });
+        }
+        poll_into(lost);
+    }
+    return lost;
+}
+
+// [TAG_DISK_ASYNC_SAVE] (review r11 6) every change of the entries or of the jobs in flight goes through these: the
+//   derived pin set (pinned_set()) is cached per generation
+void server_disk_cache::push_entry(server_disk_cache_entry && e) {
+    entries.push_back(std::move(e));
+    ++gen;
+}
+
+void server_disk_cache::erase_entry_at(size_t idx) {
+    entries.erase(entries.begin() + idx);
+    ++gen;
+}
+
+void server_disk_cache::clear_entries() {
+    entries.clear();
+    ++gen;
+}
+
+void server_disk_cache::jobs_push(std::unique_ptr<server_disk_save_job> && job) {
+    as->jobs.push_back(std::move(job));
+    ++gen;
+}
+
+void server_disk_cache::jobs_pop_front() {
+    as->jobs.pop_front();
+    ++gen;
+}
+
+// [TAG_DISK_ASYNC_SAVE] the in-flight model (design after review r9):
+//   pinned  = an own entry whose tokens are a proper prefix of a save in flight (that save replaces it at its commit),
+//             derived from the jobs and the entries whenever needed - no per-job bookkeeping. A pinned entry is neither
+//             evicted, TTL-expired nor replaced by another save's commit until the save that extends it commits or fails
+//   pending = the bytes the saves in flight wrote so far, minus the OWN files (.tok / .aux / maps) of the pinned entries
+//             (each once): their blocks stay referenced by the continuation, so their own files are what the
+//             replacement frees (their unshared checkpoints are not netted: errs toward evicting earlier), at least 0
+//   charge  = min(pending, the bytes the victim search could free) - what enforce() / deep_put() add to the disk total
+std::set<std::string> server_disk_cache::pinned_set_fresh() const {
+    std::set<std::string> out;
+    if (!as) {
+        return out;
+    }
+    for (const auto & e : entries) {
+        if (!e.src.empty()) {
+            continue;
+        }
+        for (const auto & j : as->jobs) {
+            if (!j->superseded && tokens_prefix_of(e.tokens, j->tokens, true)) {
+                out.insert(e.id);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+// (review r10 5, r11 8) cached per generation (push_entry / erase_entry_at / clear_entries / jobs_push / jobs_pop_front)
+const std::set<std::string> & server_disk_cache::pinned_set() const {
+    if (pin_gen != gen) {
+        pin_cache = pinned_set_fresh();
+        pin_gen   = gen;
+    }
+    return pin_cache;
+}
+
+// (review r13 1) a committed synchronous save that strictly extends saves in flight supersedes them (server thread)
+void server_disk_cache::mark_superseded(const server_tokens & tokens) {
+    if (!as) {
         return;
     }
-    DSK_INF("a save of this conversation (%zu tokens) is in flight: waiting for it\n", as->jobs[n_wait - 1]->tokens.size());
-    {
-        std::unique_lock<std::mutex> lock(as->mtx);
-        as->cv_done.wait(lock, [&] {
-            return std::all_of(as->jobs.begin(), as->jobs.begin() + n_wait, [](const auto & j) { return j->done; });
-        });
+    for (auto & j : as->jobs) {
+        if (!j->superseded && tokens_prefix_of(j->tokens, tokens, true)) {
+            j->superseded = true;
+            ++gen; // its pins go
+            DSK_INF("asynchronous save of %s (%zu tokens) superseded by a synchronous save of %zu tokens\n",
+                    j->e.id.c_str(), j->tokens.size(), tokens.size());
+        }
     }
-    poll();
+}
+
+uint64_t server_disk_cache::pending_bytes(const std::set<std::string> & pinned) const {
+    if (!as) {
+        return 0;
+    }
+    uint64_t written = 0, freed = 0;
+    for (const auto & j : as->jobs) {
+        written += j->n_written.load();
+    }
+    for (const auto & e : entries) {
+        if (pinned.count(e.id)) {
+            freed += e.own_bytes;
+        }
+    }
+    return written > freed ? written - freed : 0;
 }
 
 uint64_t server_disk_cache::pending_bytes() const {
-    uint64_t n = 0;
-    if (as) {
-        for (const auto & j : as->jobs) {
-            n += j->n_written.load();
+    return pending_bytes(pinned_set());
+}
+
+// (review r9 1) the charge is capped by what eviction can free (the logical size of the own entries that are neither
+//   pinned nor protected), so the loop's target stays reachable and the behaviour is continuous: a save larger than
+//   that cannot empty the cache before it commits (its commit's own enforce() charges it exactly). Warned once per
+//   episode (when the cap starts to bind)
+uint64_t server_disk_cache::inflight_charge(const std::set<std::string> & pinned, const std::string & protect) {
+    const uint64_t pending = pending_bytes(pinned);
+    uint64_t evictable = 0;
+    for (const auto & e : entries) {
+        if (e.src.empty() && e.id != protect && e.id != protect_id && !pinned.count(e.id)) {
+            evictable += e.bytes;
         }
     }
-    return n;
+    const bool capped = pending > evictable;
+    if (capped && !charge_capped) {
+        DSK_WRN("saves in flight (%.1f MiB) exceed what eviction can free (%.1f MiB): charged %.1f MiB until they commit\n",
+                pending / (1024.0 * 1024.0), evictable / (1024.0 * 1024.0), evictable / (1024.0 * 1024.0));
+    }
+    charge_capped = capped;
+    return capped ? evictable : pending;
 }
 
 bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
                                          server_disk_cache_entry & e, const server_prompt & prompt, size_t n_ckpts,
                                          uint64_t ckpt_bytes, uint64_t n_ckpt_written, int64_t t_start) {
+    uint64_t copy_us = 0, wait_us = 0;
+
     auto job_up = std::make_unique<server_disk_save_job>();
     server_disk_save_job & job = *job_up;
     job.e              = std::move(e);
@@ -2551,9 +2875,26 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
     job.n_ckpt_written = n_ckpt_written;
     job.t_start        = t_start;
     job.id_slot        = id_slot;
-    as->jobs.push_back(std::move(job_up));
+    job.seq = as->n_submitted++; // (the entries it pins are derived from its tokens: pinned_set())
+    jobs_push(std::move(job_up));
 
-    uint64_t copy_us = 0, wait_us = 0;
+    // (review r10 1) every staged byte counts against the budget at allocation capacity: a block buffer as BLOB_BYTES,
+    //   the inline segments (cell metadata, small tensor ranges, e.g. a transposed V cache) by the capacity they grow
+    //   to, held until the job's end. Admission on that capacity; a single save larger than the budget proceeds once
+    //   nothing else is staged (its own inline bytes excepted)
+    const auto reserve = [&](uint64_t cap) {
+        const int64_t t_wait = ggml_time_us();
+        std::unique_lock<std::mutex> lock(as->mtx);
+        as->cv_room.wait(lock, [&] { return as->held <= job.inl_held || as->held + cap <= as->budget; });
+        as->held += cap;
+        wait_us += (uint64_t) (ggml_time_us() - t_wait);
+    };
+    const auto unreserve = [&](uint64_t cap) {
+        std::lock_guard<std::mutex> lock(as->mtx);
+        as->held -= cap;
+        as->cv_room.notify_all();
+    };
+
     const auto capture = [&](llama_context * ctx, const std::string & map_path, const std::string & env_h) {
         job.streams.emplace_back();
         auto & st = job.streams.back();
@@ -2561,21 +2902,42 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
         st.env_h    = env_h;
         const uint64_t n_logical0 = job.n_logical;
         std::vector<uint8_t> inl;
+        uint64_t inl_reserved = 0; // (review r12 7) staging reserved for the local buffer (not yet moved into a segment)
+        const auto grow_inline = [&](size_t add) { // reserve staging before the inline buffer grows
+            if (inl.size() + add <= inl.capacity()) {
+                return;
+            }
+            const size_t cap = std::max({ inl.size() + add, 2 * inl.capacity(), (size_t) (64u << 10) });
+            const uint64_t delta = cap - inl.capacity();
+            reserve(delta);
+            try {
+                inl.reserve(cap);
+            } catch (...) {
+                unreserve(delta);
+                throw;
+            }
+            std::lock_guard<std::mutex> lock(as->mtx);
+            job.inl_held += delta;
+            inl_reserved += delta;
+        };
         const auto flush_inline = [&]() {
             if (!inl.empty()) {
                 st.segs.emplace_back();
-                st.segs.back().inl = std::move(inl);
-                inl.clear();
+                st.segs.back().inl = std::move(inl); // keeps its capacity: still counted in job.inl_held
+                inl = std::vector<uint8_t>();
+                inl_reserved = 0; // released with the job's segments at its end
             }
         };
         llama_state_seq_writer w;
         w.write = [&](const void * src, size_t size) {
+            grow_inline(size);
             const auto * p = static_cast<const uint8_t *>(src);
             inl.insert(inl.end(), p, p + size);
             job.n_logical += size;
         };
         w.write_tensor = [&](ggml_tensor * tensor, size_t offset, size_t size) {
             if (size < (64u << 10)) { // inline, as save_stream
+                grow_inline(size);
                 const size_t at = inl.size();
                 inl.resize(at + size);
                 const int64_t t_copy = ggml_time_us();
@@ -2599,18 +2961,15 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
                 const size_t n = blk_end - pos;
                 server_disk_async::task t;
                 t.job = &job;
-                {
-                    const int64_t t_wait = ggml_time_us();
-                    std::unique_lock<std::mutex> lock(as->mtx);
-                    as->cv_room.wait(lock, [&] { return as->held == 0 || as->held + n <= as->budget; });
-                    as->held += n;
-                    wait_us += (uint64_t) (ggml_time_us() - t_wait);
-                    if (!as->pool.empty()) {
-                        t.buf = std::move(as->pool.back());
-                        as->pool.pop_back();
-                    }
-                }
+                reserve(BLOB_BYTES);
                 try {
+                    {
+                        std::lock_guard<std::mutex> lock(as->mtx);
+                        if (!as->pool.empty()) {
+                            t.buf = std::move(as->pool.back());
+                            as->pool.pop_back();
+                        }
+                    }
                     if (!t.buf) {
                         t.buf.reset(new uint8_t[BLOB_BYTES]); // n <= BLOB_BYTES: one block of a range
                     }
@@ -2623,23 +2982,35 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
                     st.segs.emplace_back();
                     st.segs.back().blk_ref = t.b;
                     job.e.blobs.push_back(""); // filled at commit (key order = map order)
-                } catch (...) {
-                    std::lock_guard<std::mutex> lock(as->mtx); // the reserved staging goes back
-                    as->held -= n;
-                    as->cv_room.notify_all();
-                    throw;
-                }
-                {
+                    // (review r10 2) queue insertion and n_open move together under the mutex: an allocation failure
+                    //   leaves no phantom task (the staging goes back below, the job fails, commits / drain go on)
                     std::lock_guard<std::mutex> lock(as->mtx);
-                    job.n_open++;
+                    if (as->hooks.fail_enqueue > 0 && (int64_t) ++as->n_enqueued == as->hooks.fail_enqueue) {
+                        throw std::bad_alloc(); // test hook fail_enqueue
+                    }
                     as->tasks.push_back(std::move(t));
+                    job.n_open++;
+                } catch (...) {
+                    unreserve(BLOB_BYTES);
+                    throw;
                 }
                 as->cv_task.notify_one();
                 pos = blk_end;
             }
         };
-        st.n_stream = llama_state_seq_write_cb(ctx, id_slot, 0, w);
-        flush_inline();
+        try {
+            st.n_stream = llama_state_seq_write_cb(ctx, id_slot, 0, w);
+            flush_inline();
+        } catch (...) {
+            // (review r11 7) the local inline buffer dies here: its staging share goes back now, not at the job's end
+            const uint64_t cap = inl_reserved; // exactly what was reserved for it (reserve() may allocate more)
+            {
+                std::lock_guard<std::mutex> lock(as->mtx);
+                job.inl_held -= cap;
+            }
+            unreserve(cap);
+            throw;
+        }
         return st.n_stream > 0 && st.n_stream == job.n_logical - n_logical0;
     };
 
@@ -2657,9 +3028,7 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
         job.ok = false;
     }
 
-    const int64_t t_now = ggml_time_us();
-    job.t_captured  = t_now;
-    job.blocking_us = (uint64_t) std::max<int64_t>(1, t_now - t_start);
+    job.t_captured = ggml_time_us();
     save_copy_us += copy_us;
     save_wait_us += wait_us;
     bytes_copied += job.n_logical;
@@ -2671,15 +3040,19 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
             as->cv_task.notify_one();
         }
     }
-    DSK_INF("saving %s: %zu tokens, %.1f MiB copied off the device in %.0f ms (copy %.0f ms, staging wait %.0f ms), "
-            "hashing / writing in the background%s\n", job.e.id.c_str(), job.tokens.size(),
-            job.n_logical / (1024.0 * 1024.0), job.blocking_us / 1000.0, copy_us / 1000.0, wait_us / 1000.0,
+    DSK_INF("saving %s: %zu tokens, %.1f MiB copied off the device in %.0f ms (copy %.0f ms, staging wait "
+            "%.0f ms), hashing / writing in the background%s\n", job.e.id.c_str(), job.tokens.size(),
+            job.n_logical / (1024.0 * 1024.0), (job.t_captured - t_start) / 1000.0, copy_us / 1000.0, wait_us / 1000.0,
             ok ? "" : " - the copy FAILED, the entry is dropped");
-    refresh_status(); // (review r2 m6) GET /disk-cache shows the copy timings and the save in flight
+    refresh_status(); // (review r4 5) the counters save() bumped, the copy timings and the save in flight
+    // (review r10 3, r11 3) the blocking part ends here: everything save() did on the server loop (the copy with its
+    //   staging wait - the loop is stalled then too - and the refresh); no wait for other saves happens on this path
+    job.blocking_us = (uint64_t) std::max<int64_t>(1, ggml_time_us() - t_start);
     return ok;
 }
 
-void server_disk_cache::commit_job(server_disk_save_job & job) {
+void server_disk_cache::commit_job(server_disk_save_job & job, std::vector<server_disk_lost> & lost) {
+    const int64_t t_commit = ggml_time_us(); // (review r10 3) the whole commit is server-loop time
     bool ok = job.ok;
     // keys this commit adds to the index / the own inventory: taken back if save_commit fails (review r2 C2)
     std::set<std::string> added_blob, added_own;
@@ -2703,24 +3076,39 @@ void server_disk_cache::commit_job(server_disk_save_job & job) {
     }
     const uint64_t n_written = job.n_written.load();
     const std::string id     = job.e.id; // save_commit moves the entry
-    const int64_t  t_commit  = ggml_time_us();
-    // (review I7) save_commit counts saves_async / saves_async_failed by its own result
-    ok = save_commit(job.e, ok, job.tokens, job.n_ckpts, job.ckpt_bytes, job.n_logical, n_written, job.n_ckpt_written,
-                     job.t_start, job.blocking_us, job.t_done, job.t_captured);
-    if (!ok) {
-        // (review I9) the save reported "on disk" when it was queued: the loss is reported here and by drain()
-        DSK_WRN("asynchronous save of slot %d (%s, %zu tokens) failed: the conversation is not on disk\n", job.id_slot,
-                id.c_str(), job.tokens.size());
-        if (draining) {
-            lost_slots.push_back(job.id_slot); // (review r2 I3) only failures committed by this drain
+    // (review r13 1, r14 1) superseded (marked by the synchronous save that extends it): dropped only while an own
+    //   registered entry still holds its tokens (extends or equals them - that extension may have been evicted,
+    //   dropped after a failed load or cleared since; then the save commits normally). A dropped save: its own files
+    //   go (its physical writes are counted), its claims are released as for a success (the rest is collected), no
+    //   timing gauge; (review r14 4) a failed one is not a lost conversation either - logged with its failure, counted
+    //   as superseded, not as failed
+    bool superseded = false;
+    if (job.superseded) {
+        for (const auto & en : entries) {
+            if (en.src.empty() && tokens_prefix_of(job.tokens, en.tokens, false)) {
+                superseded = true;
+                break;
+            }
+        }
+        if (!superseded) {
+            DSK_INF("asynchronous save of %s (%zu tokens): the save that superseded it is no longer registered, committing it\n",
+                    id.c_str(), job.tokens.size());
         }
     }
-    // the commit runs on the server loop too: part of the blocking time (save_us, the last-save gauge)
-    const uint64_t commit_us = (uint64_t) (ggml_time_us() - t_commit);
-    save_us += commit_us;
-    if (ok) {
-        last_save_blocking_us += commit_us;
-        DSK_DBG("committed %s in %.1f ms\n", id.c_str(), commit_us / 1000.0);
+    if (superseded) {
+        bytes_written += n_written + job.n_ckpt_written + file_size_or_0(path(id, ".aux")) + file_size_or_0(path(id, ".tok"));
+        remove_files(id);
+        n_saves_superseded++;
+        DSK_INF("asynchronous save of %s (%zu tokens) dropped at its commit: superseded by a registered extension%s\n",
+                id.c_str(), job.tokens.size(), ok ? "" : " (its background write had failed; the conversation is on disk in the extension)");
+    } else {
+        // (review I7) save_commit counts saves_async / saves_async_failed by its own result
+        ok = save_commit(job.e, ok, job.tokens, job.n_ckpts, job.ckpt_bytes, job.n_logical, n_written,
+                         job.n_ckpt_written, job.t_start, job.blocking_us, job.t_done, job.t_captured);
+    }
+    if (!ok && !superseded) {
+        // (review I9, r9 4) the save reported "on disk" when it was queued: the caller reports the loss (once, with when)
+        lost.push_back({ job.id_slot, id, job.tokens.size() });
     }
     // (review I8) per key: this job's references, and whether it wrote the file; a failed job's fresh file goes when
     //   no other job in flight and no entry references it
@@ -2732,41 +3120,71 @@ void server_disk_cache::commit_job(server_disk_save_job & job) {
             r.second = r.second || b.fresh;
         }
     }
-    {
-        std::lock_guard<std::mutex> lock(as->mtx);
-        if (!ok) {
-            // (review r2 C2) the index entries this failed commit added go again, so the fresh files below are unlinked
-            //   (a key another entry or job still needs keeps its record: not added here / still pending)
-            for (const auto & k : added_blob) {
-                const auto it = blobs.find(k);
-                const auto pk = as->pending.find(k);
-                if (it != blobs.end() && pk != as->pending.end() && pk->second == refs[k].first) {
-                    blob_bytes -= it->second;
-                    blobs.erase(it);
-                    if (added_own.count(k)) {
-                        blk_own.erase(k);
-                    }
+    // (review r6 1, r7 1) this job's keys an OWN registered entry references (an adopted entry reads its blocks from
+    //   its source store, never from the own dir unless blk_own lists the key - so its references do not keep an own copy)
+    std::set<std::string> entry_refs;
+    if (!ok) {
+        for (const auto & e : entries) {
+            if (!e.src.empty()) {
+                continue;
+            }
+            for (const auto & k : e.blobs) {
+                if (refs.count(k)) {
+                    entry_refs.insert(k);
                 }
             }
         }
+    }
+    {
+        std::lock_guard<std::mutex> lock(as->mtx);
         for (const auto & [key, r] : refs) {
             auto it = as->pending.find(key);
             if (it == as->pending.end()) {
                 continue;
             }
-            if (!ok && r.second && it->second == r.first && !blobs.count(key)) {
-                std::error_code ec;
-                fs::remove(fs::path(job.blk_dir) / (key + ".blk"), ec);
+            if (!ok && it->second == r.first) {
+                // (review r2 C2) the records this failed commit added go again (no other job in flight claims the key)
+                if (added_own.count(key)) {
+                    blk_own.erase(key);
+                }
+                const auto ib = blobs.find(key);
+                if (added_blob.count(key) && ib != blobs.end()) {
+                    blob_bytes -= ib->second;
+                    blobs.erase(ib);
+                }
+                // (review r3 I4, r6 1) the own-store file goes whenever this job is its last claimant, it is not (or no
+                //   longer) inventoried as own and no registered entry references it - whoever wrote it (a block
+                //   written by an earlier failed job that this one had claimed would otherwise stay on disk unindexed,
+                //   uncharged and invisible to blob_gc() until a restart). A legacy / adopt record of the key stays (that
+                //   copy is the read location again); an own record not added here stays for blob_gc()
+                if (!blk_own.count(key) && !entry_refs.count(key)) {
+                    std::error_code ec;
+                    fs::remove(fs::path(job.blk_dir) / (key + ".blk"), ec);
+                }
             }
-            it->second -= r.first;
-            if (it->second <= 0) {
-                as->pending.erase(it);
-            }
+            disk_async_pending_release(*as, key, r.first);
         }
     }
-    if (!ok) {
-        refresh_status(); // the failure path refreshed before the index entries above went
+    if (!ok || superseded) {
+        // [TAG_DISK_GC] (review r3 I3) the aborted / superseded save's checkpoints / blocks, collected after its claims went
+        deep_gc();
+        blob_gc();
     }
+    // (review r10 3) timings as implemented: the commit (index insertion, save_commit, claim cleanup / GC, this refresh
+    //   excepted) is server-loop time - save_us and the last save's blocking part = its capture + its commit; its total
+    //   runs from save() to the end of the commit (the FIFO wait for earlier saves included)
+    const uint64_t commit_us = (uint64_t) (ggml_time_us() - t_commit);
+    save_us += commit_us;
+    if (!superseded) {
+        last_save_commit_us = commit_us;
+    }
+    if (ok && !superseded) {
+        last_save_blocking_us = job.blocking_us + commit_us;
+        last_save_total_us    = (uint64_t) std::max<int64_t>(0, ggml_time_us() - job.t_start);
+        DSK_DBG("committed %s in %.1f ms\n", id.c_str(), commit_us / 1000.0);
+    }
+    check_pins(); // (review r13 3) every path: failed, superseded, committed
+    refresh_status(); // the snapshot carries the commit and its timing
 }
 
 int server_disk_cache::find(const server_tokens & tokens, size_t lcp_min, size_t n_ctx_slot, size_t * lcp_out) const {
@@ -3398,7 +3816,9 @@ void server_disk_cache::deep_put(server_prompt & prompt, const common_prompt_che
         DSK_INF("deep schedule: %zu -> %zu checkpoints for %zu tokens\n", n_before, prompt.deep.size(), prompt.tokens.size());
     }
 
-    if (need_enforce && total_bytes() > quota) {
+    // (review r4 2) as enforce(): the in-flight charge; (review r6 3) enforce() always runs its TTL / collections - its
+    //   victim search finds nothing when only pinned / protected entries are left
+    if (need_enforce && total_bytes() + inflight_charge(pinned_set(), "") > quota) {
         enforce("");
     }
     if (written || pin) { // (merge review m1) /disk-cache shows the new deep checkpoint / pin counters at once
@@ -3703,6 +4123,20 @@ void server_disk_cache::blob_drop_copy(const std::string & key) {
     }
 }
 
+// (review r12 1) the synchronous fallback's block claims go once its streams are written (the entry is registered
+//   right after, before any collection of the success path)
+void server_disk_cache::release_sync_claims() {
+    if (!as) {
+        sync_claims.clear();
+        return;
+    }
+    std::lock_guard<std::mutex> lock(as->mtx);
+    for (const auto & k : sync_claims) {
+        disk_async_pending_release(*as, k, 1);
+    }
+    sync_claims.clear();
+}
+
 bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path,
                                     const std::string & env_h, std::vector<std::string> & keys, uint64_t & n_logical,
                                     uint64_t & n_written) {
@@ -3766,21 +4200,65 @@ bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const 
             save_copy_us += (uint64_t) (ggml_time_us() - t_copy);
             bytes_copied += n;
             const std::string key = hash_key(buf.data(), n);
-            if (blobs.count(key) == 0) {
-                const std::string fin = blob_path(key);
-                const std::string ftmp = fin + ".tmp";
+            if (as) {
+                // [TAG_DISK_ASYNC_SAVE] (review r12 1, r13 2 / 7) the synchronous fallback beside saves in flight, on the
+                //   workers' claims and never waiting for them: the claim is taken and recorded in one step (recorded
+                //   claims are released after the streams, an exception included); a block a worker is writing NOW is
+                //   written here too (same bytes, writer-unique temp, atomic rename) - the entry never references a
+                //   file that is not there yet; any other absent block is marked being written (a worker meeting it
+                //   waits for this write, on its own thread), written, unmarked
+                const fs::path fin = fs::path(dir) / "blk" / (key + ".blk");
+                if (sync_claims.size() == sync_claims.capacity()) { // (review r14 6) geometric: the push_back below cannot throw
+                    sync_claims.reserve(std::max<size_t>(256, 2 * sync_claims.capacity()));
+                }
+                disk_async_writing_guard guard{ *as };
+                bool present = false, dup = false;
                 {
-                    std::ofstream fb(ftmp, std::ios::binary | std::ios::trunc);
-                    fb.write(reinterpret_cast<const char *>(buf.data()), n);
-                    ok = (bool) fb;
+                    std::lock_guard<std::mutex> lock(as->mtx);
+                    as->pending[key]++;
+                    sync_claims.push_back(key);
+                    // own files are removed on this thread only: an own record (a block this save or an earlier
+                    //   commit already holds) needs no stat and is never rewritten
+                    if (blk_own.count(key)) {
+                        present = true;
+                    } else if (as->writing.count(key)) {
+                        dup = true;
+                    } else {
+                        present = file_present(fin) > 0;
+                        if (!present) {
+                            as->writing.insert(key);
+                            guard.key = &key;
+                        }
+                    }
                 }
-                std::error_code ec;
-                if (ok) {
-                    fs::rename(ftmp, fin, ec);
-                    ok = !ec;
+                // (review r14 5) indexed before the write (blobs + blk_own): a file written here is never uncharged or
+                //   invisible to blob_gc(), whatever throws after it; a failed write takes back exactly the records it added
+                const bool new_blob = !blobs.count(key);
+                if (new_blob) {
+                    blobs[key] = n;
+                    blob_bytes += n;
                 }
-                if (!ok) {
-                    fs::remove(ftmp, ec);
+                const bool new_own = blk_own.insert(key).second;
+                if (!present) {
+                    if (!disk_write_block_file(fin, buf.data(), n)) {
+                        if (new_own) {
+                            blk_own.erase(key);
+                        }
+                        if (new_blob) {
+                            blobs.erase(key);
+                            blob_bytes -= n;
+                        }
+                        ok = false;
+                        break;
+                    }
+                    n_written += n;
+                    if (dup) {
+                        n_bytes_written_twice += n;
+                    }
+                }
+            } else if (blobs.count(key) == 0) {
+                if (!disk_write_block_file(blob_path(key), buf.data(), n)) {
+                    ok = false;
                     break;
                 }
                 blobs[key] = n;
@@ -4194,11 +4672,11 @@ void server_disk_cache::blob_gc() {
     }
 }
 
-void server_disk_cache::revalidate(const std::string & fp) {
-    drain(); // [TAG_DISK_ASYNC_SAVE] the saves in flight belong to the current namespace
+std::vector<server_disk_lost> server_disk_cache::revalidate(const std::string & fp) {
+    std::vector<server_disk_lost> lost = drain(); // [TAG_DISK_ASYNC_SAVE] the saves in flight belong to the current namespace
     if (server_disk_cache_same_identity(fp, fingerprint)) {
         fingerprint = fp; // [TAG_CACHE_COMPAT2] same namespace key: only the cheap part may differ
-        return;
+        return lost;
     }
     // [TAG_DISK_NAMESPACE] a mismatch is a miss, never a delete: open the new fingerprint's namespace, the old one
     //   stays as a foreign namespace (TTL / cap)
@@ -4206,7 +4684,7 @@ void server_disk_cache::revalidate(const std::string & fp) {
             fingerprint.substr(0, 16).c_str(), fp.substr(0, 16).c_str());
     fingerprint = fp;
     dir = (fs::path(root) / ("ns-" + fp.substr(0, 16))).string();
-    entries.clear();
+    clear_entries();
     ckpts.clear();
     blobs.clear();
     blk_own.clear();
@@ -4214,6 +4692,7 @@ void server_disk_cache::revalidate(const std::string & fp) {
     blk_src.clear();
     blob_bytes = 0;
     init();
+    return lost;
 }
 
 void server_disk_cache::refresh_status() {
@@ -4301,7 +4780,12 @@ void server_disk_cache::refresh_status() {
         { "load_seconds",   load_us / 1e6       },
         { "save_async",     as ? as->budget : 0 }, // [TAG_DISK_ASYNC_SAVE] staging bytes, 0 = synchronous
         { "saves_pending",  n_pending()         },
-        { "bytes_pending",  pending_bytes()     }, // written by the saves in flight, charged at their commit
+        { "bytes_pending",  pending_bytes()     }, // quota charge of the saves in flight: written minus what they replace
+        { "save_backpressure", n_save_backpressure }, // [TAG_DISK_ASYNC_SAVE] saves run synchronously: two saves in flight (fixed)
+        { "last_save_commit_seconds", last_save_commit_us / 1e6 }, // the commit part of the last async save
+        { "pin_check_failures", n_pin_check_failures }, // test hook check_pins
+        { "saves_superseded",   n_saves_superseded   }, // async saves dropped: a synchronous save extending them committed first
+        { "bytes_written_twice", n_bytes_written_twice }, // the synchronous fallback rewrote a block a worker was writing
         { "saves_async",    n_saves_async       },
         { "saves_async_failed", n_saves_async_failed },
         { "save_async_seconds", save_async_us / 1e6 },
@@ -4779,7 +5263,7 @@ void server_disk_cache::open_adopt_sources() {
                 std::all_of(e.blobs.begin(), e.blobs.end(), [&](const std::string & k) { return blobs.count(k) > 0; });
             if (complete) {
                 e.src = key;
-                entries.push_back(std::move(e));
+                push_entry(std::move(e));
                 a.n_entries++;
             } else {
                 // (Codex gate r2 Minor 1) an entry-specific warning and the dropped counter; its files stay either way

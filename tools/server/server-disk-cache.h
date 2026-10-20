@@ -98,6 +98,13 @@ struct server_deep_ckpt_meta {
 //   is adopted for target-only loads - the draft stream's descriptor names its KV types, so it never loads)
 std::string server_disk_cache_fingerprint_structure(const std::string & fp, std::string * why = nullptr, bool draft_kv = true);
 
+// [TAG_DISK_ASYNC_SAVE] a background save that failed (its save() had returned true when the copy was queued)
+struct server_disk_lost {
+    int32_t     id_slot  = -1; // the slot it was copied from (by now usually holding another conversation)
+    std::string id;            // its entry id
+    size_t      n_tokens = 0;
+};
+
 struct server_disk_async; // [TAG_DISK_ASYNC_SAVE] the worker threads and the jobs in flight (server-disk-cache.cpp)
 struct server_disk_save_job;
 
@@ -119,17 +126,29 @@ struct server_disk_cache {
     // [TAG_DISK_ASYNC_SAVE] --cache-disk-async: host staging budget of the asynchronous save (0 = the synchronous v63
     //   path); set before the first save
     void set_async(uint64_t budget_bytes);
+    // [TAG_DISK_ASYNC_SAVE] read LLAMA_DISK_ASYNC_TEST (keys in server-disk-cache.cpp) when enabled (--cache-disk-test),
+    //   else warn and ignore it; call before set_async() and init()
+    void set_test_hooks(bool enabled);
+    struct test_hooks_t { // the LLAMA_DISK_ASYNC_TEST keys (set_test_hooks)
+        int delay_ms = 0, threads = 0, fail_maps = 0, fail_job = -1, finalize_delay_ms = 0, fail_enqueue = 0, max_jobs = 0;
+        bool check_pins = false;
+        std::map<int, int> finalize_delay_job;
+        std::map<int, int> hold_write_job; // hold_write_jobK_ms
+    };
     // commit the asynchronous saves whose files are written (server thread, every loop pass); a failed one is removed
-    void poll();
-    // wait for every asynchronous save and commit it (namespace switch, sleep, exit); returns the slots whose save failed
-    //   in the background during this drain (their save() had returned true when the copy was queued)
-    std::vector<int32_t> drain();
+    std::vector<server_disk_lost> poll(); // returns the background saves it committed as failed
+    // wait for every asynchronous save and commit it (namespace switch, sleep, exit); returns the saves this drain
+    //   committed as failed (their save() had returned true when the copy was queued)
+    std::vector<server_disk_lost> drain();
     // a finished background save wakes the server loop through this (worker thread; set by the server)
     std::function<void()> on_async_done;
     // the newest save in flight that shares more than lcp_min tokens with tokens (and the ones before it) is waited for
     //   and committed, so find() sees its entry
-    void await_pending(const server_tokens & tokens, size_t lcp_min);
+    std::vector<server_disk_lost> await_pending(const server_tokens & tokens, size_t lcp_min); // failed saves as poll()
     size_t n_pending() const;
+    // bytes the saves in flight wrote so far minus the own files (.tok / .aux / maps) of the entries they will replace
+    //   (pinned, each once), at least 0 - GET /disk-cache bytes_pending, /metrics; enforce() charges it capped
+    uint64_t pending_bytes() const;
 
     // index of the entry with the longest common prefix with tokens, if longer than lcp_min and it fits n_ctx_slot
     int find(const server_tokens & tokens, size_t lcp_min, size_t n_ctx_slot, size_t * lcp_out) const;
@@ -226,10 +245,14 @@ struct server_disk_cache {
     uint64_t bytes_copied        = 0; // state bytes copied off the device by saves
     uint64_t n_saves_async       = 0;
     uint64_t n_saves_async_failed = 0;
-    uint64_t last_save_blocking_us = 0;
+    uint64_t last_save_blocking_us = 0; // server-loop time of the last save: all of a sync save; for an async one its copy
+                                        //   (staging wait included) + status refresh + commit, no wait for other saves
     uint64_t last_save_total_us    = 0; // blocking + asynchronous
     uint64_t last_save_bytes       = 0; // state bytes of the last committed save
     uint64_t last_save_written     = 0; // bytes it wrote (new blocks, maps, .tok / .aux, checkpoints)
+    uint64_t last_save_commit_us   = 0; // the commit part (server loop) of the last async save
+    uint64_t n_save_backpressure   = 0; // saves run synchronously because two saves (fixed) were in flight
+    uint64_t n_saves_superseded    = 0; // async saves dropped: a synchronous save extending them committed first
     uint64_t last_load_us          = 0;
     uint64_t last_load_bytes       = 0;
 
@@ -244,7 +267,7 @@ struct server_disk_cache {
 
     // after a model reload (wake-up from idle sleep): a changed fingerprint switches to that fingerprint's namespace
     //   (the old one stays as a foreign namespace)
-    void revalidate(const std::string & fingerprint);
+    std::vector<server_disk_lost> revalidate(const std::string & fingerprint); // drains first: failed saves as poll()
 
     // [TAG_STATE_DESCRIPTOR] what the state streams of these contexts contain (llama_state_seq_descriptor + the
     //   speculative carry schema, the token / media serialization versions and the checkpoint semantics revision);
@@ -377,14 +400,37 @@ struct server_disk_cache {
     bool save_async_begin(llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
                           server_disk_cache_entry & e, const server_prompt & prompt, size_t n_ckpts, uint64_t ckpt_bytes,
                           uint64_t n_ckpt_written, int64_t t_start);
-    void commit_job(server_disk_save_job & job);
+    void commit_job(server_disk_save_job & job, std::vector<server_disk_lost> & lost);
+    void poll_into(std::vector<server_disk_lost> & lost);
+    // [TAG_DISK_ASYNC_SAVE] the in-flight model (server-disk-cache.cpp, before pinned_set()): own entries that are a proper
+    //   prefix of a save in flight are pinned; the in-flight charge is capped by what eviction could free
+    const std::set<std::string> & pinned_set() const; // cached per generation
+    std::set<std::string> pinned_set_fresh() const;
+    // (review r11 6) the only mutations of entries / the jobs in flight (each bumps gen)
+    void push_entry(server_disk_cache_entry && e);
+    void erase_entry_at(size_t idx);
+    void clear_entries();
+    void jobs_push(std::unique_ptr<server_disk_save_job> && job);
+    void jobs_pop_front();
+    bool     warned_backpressure = false;
+    uint64_t n_pin_check_failures = 0;
+    uint64_t n_bytes_written_twice = 0; // the sync fallback rewrote a block a worker was writing (counted in bytes_written)
+    void     mark_superseded(const server_tokens & tokens);
+    void     check_pins();
+    std::vector<std::string> sync_claims; // block claims of the synchronous fallback's streams (save_stream)
+    void     release_sync_claims();
+    std::vector<server_disk_lost> deferred_lost; // failures committed at the top of a save() (next poll reports)
+    uint64_t pending_bytes(const std::set<std::string> & pinned) const;
+    uint64_t inflight_charge(const std::set<std::string> & pinned, const std::string & protect);
+    bool     charge_capped = false; // the cap bound at the last charge (warned when it starts to)
+    uint64_t gen = 0;                  // bumped when the entries or the jobs in flight change
+    mutable uint64_t pin_gen = UINT64_MAX;
+    mutable std::set<std::string> pin_cache; // pinned_set() of generation pin_gen
     // a save of exactly these tokens is in flight; save() then returns true although that save may still fail in the
     //   background (review I9: reported by commit_job / drain())
     bool pending_holds(const server_tokens & tokens) const;
-    uint64_t pending_bytes() const; // bytes the saves in flight wrote so far (charged at their commit)
-    std::vector<int32_t> lost_slots; // slots whose background save failed, collected while drain() commits
-    bool draining = false;
-    int  test_fail_meta = 0; // LLAMA_DISK_ASYNC_TEST_FAIL_META: the first N async commits fail their .meta (test hook)
+    int  test_fail_meta = 0; // test hook fail_meta: the first N async commits fail their .meta
+    test_hooks_t hooks;
     std::string blob_path(const std::string & key) const;
     bool        blob_writable(const std::string & key) const;
     bool save_stream(llama_context * ctx, int32_t id_slot, const std::string & map_path, const std::string & env_h,
@@ -406,7 +452,7 @@ struct server_disk_cache {
     void        remove_files(const std::string & id) const;
     bool        write_meta(const server_disk_cache_entry & e) const;
     void        erase(size_t idx);
-    void        enforce(const std::string & protect);
+    void        enforce(const std::string & protect, bool refresh = true); // refresh: the status snapshot at the end
     void        thin(std::vector<server_deep_ref> & refs, int64_t n_end) const;
 };
 

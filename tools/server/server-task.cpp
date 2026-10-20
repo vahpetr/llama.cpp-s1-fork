@@ -1717,6 +1717,10 @@ std::string server_task_result_metrics::to_metrics() {
             "disk_cache_saves_async_total", "Disk prompt cache: saves committed through the asynchronous path", (double) metrics.disk.n_saves_async
         }, {
             "disk_cache_saves_async_failed_total", "Disk prompt cache: asynchronous saves that failed in the background (files removed)", (double) metrics.disk.n_saves_async_failed
+        }, {
+            "disk_cache_save_backpressure_total", "Disk prompt cache: saves run synchronously because two asynchronous saves (fixed) were in flight", (double) metrics.disk.n_save_backpressure
+        }, {
+            "disk_cache_saves_superseded_total", "Disk prompt cache: asynchronous saves dropped at their commit because a synchronous save extending them committed first", (double) metrics.disk.n_saves_superseded
         },
     };
 
@@ -1804,9 +1808,13 @@ std::string server_task_result_metrics::to_metrics() {
         }, {
             "disk_cache_saves_pending", "Disk prompt cache: asynchronous saves in flight (copied, not committed)", (double) metrics.disk.n_pending
         }, {
-            "disk_cache_last_save_blocking_seconds", "Disk prompt cache: blocking part of the last committed save", metrics.disk.last_save_blocking_us / 1.e6
+            "disk_cache_bytes_pending", "Disk prompt cache: quota charge of the saves in flight (written minus the own files of the entries they replace)", (double) metrics.disk.bytes_pending
         }, {
-            "disk_cache_last_save_seconds", "Disk prompt cache: whole duration of the last committed save (blocking + asynchronous)", metrics.disk.last_save_total_us / 1.e6
+            "disk_cache_last_save_blocking_seconds", "Disk prompt cache: server-loop time of the last committed save (sync: all of it; async: copy incl. staging wait + status refresh + commit)", metrics.disk.last_save_blocking_us / 1.e6
+        }, {
+            "disk_cache_last_save_commit_seconds", "Disk prompt cache: commit part (index, .meta, replacement, quota, cleanup) of the last asynchronous save", metrics.disk.last_save_commit_us / 1.e6
+        }, {
+            "disk_cache_last_save_seconds", "Disk prompt cache: whole duration of the last committed save (save() to the end of its commit, FIFO wait included)", metrics.disk.last_save_total_us / 1.e6
         }, {
             "disk_cache_last_save_state_bytes", "Disk prompt cache: state bytes of the last committed save", (double) metrics.disk.last_save_bytes
         }, {
