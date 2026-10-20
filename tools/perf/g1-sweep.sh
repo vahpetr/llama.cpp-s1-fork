@@ -5,6 +5,7 @@
 # ~/llama.cpp-scratch/handA63/tools); g1-cases.tsv = the P.1 dense shapes at n 512 / 513 / 1024 / 2044 / 2047 / 2048.
 #
 #   g1-sweep.sh tool                         build test-vk-gemm-class against $G1_BUILD (no rpath: LD_LIBRARY_PATH picks the libs)
+#   (cfg everywhere: B:BM:BN:WM:WN:PAD | 1 table | off/base = 0 | def = unset; G1_EXTRA_ENV=VAR=val adds one env, e.g. a negative control)
 #   g1-sweep.sh perf  <tag> <cfg|off>        test-backend-ops perf -o MUL_MAT on the P.1 shapes (n 512 / 2048) with
 #                                            GGML_VK_PERF_LOGGER=1; cfg = B:BM:BN:WM:WN:PAD (sweep mode) | 1 (table) | off
 #   g1-sweep.sh class <tag> <cfg|off|base>   byte classifier on tools/perf/g1-cases.tsv (+ [vk-dispatch] kernel names);
@@ -28,18 +29,19 @@ gpu() {  # gpu <tag> <libdir> <env...> -- <cmd...>
     while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=(-e "$1"); shift; done; shift
     flock "$HOME/piagent-tuning/.gpu.lock" timeout -k 30 30m docker run --rm --init --name "g1s-$tag-$$" --user "$U" \
         --device /dev/dri --group-add "$GV" --group-add "$GR" -v "$S:/src:ro" -v "$L:/logs" -v "$lib:/lib-under-test:ro" \
-        -e HOME=/tmp -e LD_LIBRARY_PATH=/lib-under-test -e GGML_VK_DISABLE_MMQ_CM1=1 "${envs[@]}" -w /logs "$IMG" \
+        -e HOME=/tmp -e LD_LIBRARY_PATH=/lib-under-test -e GGML_VK_DISABLE_MMQ_CM1=1 "${envs[@]}" ${G1_EXTRA_ENV:+-e "$G1_EXTRA_ENV"} -w /logs "$IMG" \
         nice -n 10 "$@"
 }
-cfgenv() { [ "$1" = off ] || [ "$1" = base ] && echo GGML_VK_DENSE_TILE_G1=0 || echo "GGML_VK_DENSE_TILE_G1=$1"; }
+cfgenv() {  # off / base = knob 0; def = knob unset (the code default); else the knob value
+    case "$1" in off|base) echo GGML_VK_DENSE_TILE_G1=0 ;; def) echo G1_KNOB_UNSET=1 ;; *) echo "GGML_VK_DENSE_TILE_G1=$1" ;; esac; }
 
 case "${1:-}" in
 tool)
     docker run --rm --user "$U" -v "$S:/src" -w /src "$IMG" g++ -O2 -std=c++17 -Iggml/include tools/perf/test-vk-gemm-class.cpp \
         -L"${BUILD#$S/}" -lggml -lggml-base -lggml-cpu -o "${BUILD#$S/}/test-vk-gemm-class" && echo "tool ok" ;;
 perf)
-    tag=$2 cfg=$3
-    gpu "$tag" "$BUILD" GGML_VK_PERF_LOGGER=1 "$(cfgenv "$cfg")" -- /lib-under-test/test-backend-ops perf -o MUL_MAT -b Vulkan0 \
+    tag=$2 cfg=$3; lib=$BUILD; [ "$cfg" = base ] && lib=$BASE_BUILD
+    gpu "$tag" "$lib" GGML_VK_PERF_LOGGER=1 "$(cfgenv "$cfg")" -- /lib-under-test/test-backend-ops perf -o MUL_MAT -b Vulkan0 \
         -p "$SHAPES" > "$L/perf-$tag.log" 2>&1
     echo "perf $tag cfg=$cfg rc=$? g1_lines=$(grep -c 'dense_tile_g1' "$L/perf-$tag.log") invalid=$(grep -c 'invalid for' "$L/perf-$tag.log")" ;;
 class)
@@ -101,5 +103,5 @@ for t in tags:
         print(f"{t}\t{k[0]}\t{k[1]}\t{k[2]}\t{k[3]}\t{bm:.1f}\t{cv:.1f}\t{v:.1f}\t{100 * (v - bm) / bm:+.2f}\t{2 * k[1] * k[2] * k[3] / v / 1e6:.2f}")
 PY
     ;;
-*) sed -n 2,19p "$0"; exit 2 ;;
+*) sed -n 2,22p "$0"; exit 2 ;;
 esac

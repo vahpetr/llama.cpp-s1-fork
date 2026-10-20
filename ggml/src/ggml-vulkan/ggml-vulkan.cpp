@@ -2609,8 +2609,8 @@ static bool ggml_vk_dense_tile_b2_xl() {
 // fragments, WARP, the shader and the K loop are the base l tile's. Every output element still accumulates the same BK blocks
 // of the same fragments in the same K order (only which workgroup / warp owns it changes) -> EXACT by construction; the byte
 // classifier checks it per shape (tools/perf/g1-sweep.sh).
-//   GGML_VK_DENSE_TILE_G1 unset / 0 : off (the v62 plan, default until the s1 A/B rules)
-//   GGML_VK_DENSE_TILE_G1 = 1       : the built-in table (ggml_vk_dense_tile_g1_rules) - the balkon sweep's exact winners
+//   GGML_VK_DENSE_TILE_G1 unset / 1 : the built-in table (ggml_vk_dense_tile_g1_table) - the balkon sweep's exact winners
+//   GGML_VK_DENSE_TILE_G1 = 0       : off (the v62 plan)
 //   GGML_VK_DENSE_TILE_G1 = B:BM:BN:WM:WN:PAD : sweep mode - this one tile (slot l) for EVERY eligible shape
 // Read once (static); AMD coopmat1 (RADV) only, like B2.
 struct vk_g1_tile {
@@ -2639,15 +2639,31 @@ static bool ggml_vk_g1_parse_tile(const char * s, vk_g1_tile & t) {
 }
 
 // [TAG_DENSE_TILE_G1] the built-in table (GGML_VK_DENSE_TILE_G1=1): slot tiles + shape rules, first match wins.
+// Balkon 780M sweep (contrib 0265; 66 valid tiles x 17 shapes at pad 4, then pads 0/1/2/4/8 on the two winners - pad 2 best,
+// odd pads 2-4x slower, pad 0 +20 %): the 2-warp tiles win on every large-m shape.
+//   slot l = BM 64 x BN 128, 2 warps of WM 64 x WN 64 (block 128): q4_K / q6_K m >= 2048, k >= 2560 (10240 / 12288 / 6144 x 2560,
+//            2560 x 6144, q6_K 10240 x 2560)
+//   slot m = BM 128 x BN 64, 2 warps of WM 64 x WN 64 (block 128): q5_0 m >= 2048, k <= 640 (10240 x 320)
+// NOT in the table: m <= 384 (the HC 320 x 10240 shapes) - slot l's tile there is exactly the B2 hc tile, refuted on gfx1151
+// (b3-interim run4: q4_K 320 x 10240 137 -> 356 ms per ubatch) although the 780M wins with it; n < 512 (untested widths).
 static void ggml_vk_dense_tile_g1_table(vk_g1_plan & p) {
-    GGML_UNUSED(p);
+    p.tile[0] = { 128,  64, 128, 64, 64, 2 };
+    p.tile[1] = { 128, 128,  64, 64, 64, 2 };
+    p.rules = {
+        { 2048, UINT32_MAX, 2560, UINT32_MAX, 512, GGML_TYPE_Q4_K, 0 },
+        { 2048, UINT32_MAX, 2560, UINT32_MAX, 512, GGML_TYPE_Q6_K, 0 },
+        { 2048, UINT32_MAX,    0,        640, 512, GGML_TYPE_Q5_0, 1 },
+    };
 }
 
 static const vk_g1_plan & ggml_vk_dense_tile_g1_plan() {
     static const vk_g1_plan plan = [] {
         vk_g1_plan p;
         const char * s = getenv("GGML_VK_DENSE_TILE_G1");
-        if (s == nullptr || *s == '\0' || strcmp(s, "0") == 0) {
+        if (s == nullptr || *s == '\0') {
+            s = "1";   // default on: the built-in table
+        }
+        if (strcmp(s, "0") == 0) {
             return p;
         }
         if (strchr(s, ':') != nullptr) {
