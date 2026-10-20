@@ -4592,6 +4592,8 @@ struct vk_fa_tuning_params {
 static bool ggml_vk_fa_cm1_sfpv_alias(const vk_fa_tuning_params & params, bool f32acc, ggml_type k_type, bool dense_rows) {
     return dense_rows && ggml_vk_fa_sfpv_alias() && params.path == FA_COOPMAT1 && f32acc && k_type != GGML_TYPE_BF16;
 }
+// Twin of the kernel-side fold `V_CHUNK = flag && row_tiles == 1 && !INDEXED && SHMEM_STAGING == 0`
+// (flash_attn_cm1.comp) - keep both; get_fa_pipeline_state logs when they disagree.
 static bool ggml_vk_fa_cm1_v_chunk(const vk_fa_tuning_params & params, ggml_type v_type, bool dense_rows) {
     return dense_rows && ggml_vk_fa_v_chunk() && params.path == FA_COOPMAT1 && params.block_rows == 16 &&
            !params.shmem_staging && v_type == GGML_TYPE_F16;
@@ -4823,6 +4825,13 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
                      vis_flags;
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
+
+    // [TAG_FA1] the kernel folds V_CHUNK off for these pipelines (see ggml_vk_fa_cm1_v_chunk): the bit would only make
+    // a distinct pipeline that is byte-identical to the legacy layout
+    if ((flags & 32768) && (params.block_rows != 16 || params.shmem_staging || indexed)) {
+        VK_LOG_DEBUG("get_fa_pipeline_state: V_CHUNK set on a pipeline the kernel folds it off for (Br=" << params.block_rows
+                     << ", shmem_staging=" << params.shmem_staging << ", indexed=" << indexed << ")");
+    }
 
     return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type, vis_n_swa};
 }
