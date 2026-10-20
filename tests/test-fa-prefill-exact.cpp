@@ -4,7 +4,9 @@
 //
 // Prints one line per case with an FNV-1a 64 hash of the output bytes, so two builds (or two knob
 // settings of one build) can be compared bit for bit:   diff <(base --hash) <(cand --hash)
-// The inputs are a pure function of (case, --seed), never of the device or the build.
+// The inputs are a pure function of (case, --seed), never of the device or the build - for one C++ standard
+// library: they come from std::normal_distribution, whose algorithm is implementation-defined, so hashes are
+// comparable only between binaries built against the same libstdc++ (the same build image).
 //
 // usage: test-fa-prefill-exact [--device NAME] [--kv a,b,c] [--nb a,b] [--types q8_0,f16] [--mask vis,plane]
 //                              [--reps N] [--warmup N] [--seed S] [--extra]
@@ -34,6 +36,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -75,7 +78,9 @@ struct result {
 result run_case(ggml_backend_t be, const fa_case & c, uint32_t seed, int reps, int warmup) {
     result r;
     const int64_t n_kv = c.n_kv, nb = c.nb;
-    const int64_t nb_pad = (nb + 63) / 64 * 64; // llama pads the mask rows to GGML_KQ_MASK_PAD
+    // the plane has exactly nb rows, as llama allocates the KQ mask (src/llama-graph.cpp): an odd batch then takes
+    // the shader's nem1 bounds-check branch the way production does
+    const int64_t nem1 = nb;
 
     ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
@@ -96,7 +101,7 @@ result run_case(ggml_backend_t be, const fa_case & c, uint32_t seed, int reps, i
         toks  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, nb, 1);
         out = ggml_flash_attn_ext_vis(ctx, q, k, v, cells, toks, scale, 0.0f, 0.0f, true, false, 0, 0);
     } else {
-        m   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, nb_pad, 1, 1);
+        m   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, nem1, 1, 1);
         out = ggml_flash_attn_ext(ctx, q, k, v, m, scale, 0.0f, 0.0f);
     }
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
@@ -154,7 +159,7 @@ result run_case(ggml_backend_t be, const fa_case & c, uint32_t seed, int reps, i
         }
         ggml_backend_tensor_set(toks, td.data(), 0, td.size() * sizeof(int32_t));
     } else {
-        std::vector<float> mf((size_t) (n_kv * nb_pad), -INFINITY);
+        std::vector<float> mf((size_t) (n_kv * nem1), -INFINITY);
         for (int64_t t = 0; t < nb; ++t)
             for (int64_t j = 0; j <= p0 + t; ++j) mf[(size_t) (t * n_kv + j)] = 0.0f;
         std::vector<ggml_fp16_t> mh(mf.size());
@@ -243,8 +248,8 @@ int main(int argc, char ** argv) {
             for (const auto & kn : std::vector<std::pair<int64_t, int64_t>>{
                      { 4133, 2048 }, { 8192, 77 }, { 8200, 512 }, { 2048, 2048 }, { 32768, 64 },
                      { 32768, 1 }, { 32768, 6 }, { 32769, 5 } }) {
-                cases.push_back({ kn.first, kn.second, t, true });
-                cases.push_back({ kn.first, kn.second, t, false });
+                if (do_vis)   cases.push_back({ kn.first, kn.second, t, true });
+                if (do_plane) cases.push_back({ kn.first, kn.second, t, false });
             }
         }
     }
@@ -253,13 +258,13 @@ int main(int argc, char ** argv) {
     std::vector<float> last_vis;
     uint64_t last_vis_hash = 0;
     for (const fa_case & c : cases) {
-        const result r = run_case(be, c, seed, reps, warmup);
+        result r = run_case(be, c, seed, reps, warmup);
         printf("FA1 kv=%" PRId64 " nb=%" PRId64 " type=%s mask=%s hash=%016" PRIx64 " ok=%d",
                c.n_kv, c.nb, ggml_type_name(c.type), c.vis ? "vis" : "plane", r.hash, (int) r.ok);
         if (reps > 0) printf(" ms_min=%.3f ms_med=%.3f", r.t_min, r.t_med);
         if (!r.ok) ++fails;
         if (c.vis) {
-            last_vis = r.out;
+            last_vis = std::move(r.out);
             last_vis_hash = r.hash;
         } else if (do_vis && !last_vis.empty()) {
             // the case before this plane case is its vis twin (same inputs)
