@@ -1045,6 +1045,10 @@ struct vk_device_struct {
     bool mul_mat_b2_l[GGML_TYPE_COUNT];
     bool mul_mat_b2_m[GGML_TYPE_COUNT];
     bool mul_mat_b2_s[GGML_TYPE_COUNT];
+    // [TAG_DENSE_TILE_G1] the dense quantized-A coopmat1 matmul shaders with the G1 tile slots (l / m / s = three
+    // configurable BM x BN x warps x LDS-pad tiles, BK / fragments / WARP of the AMD coopmat1 l tile); "..._g1" in the logs.
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_g1[GGML_TYPE_COUNT];
+    bool mul_mat_g1[3][GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_matmul_split_k_reduce;
@@ -2596,6 +2600,119 @@ static bool ggml_vk_dense_tile_b2(const vk_device & device) {
 static bool ggml_vk_dense_tile_b2_xl() {
     static const bool on = ggml_vk_env_bool("GGML_VK_DENSE_TILE_B2_XL", false);
     return on;
+}
+
+// [TAG_DENSE_TILE_G1] G1 (plan 2026-10-18 row 2.5): the dense coopmat1 tile plan of the production prefill GEMMs as a sweepable
+// set. Where the base plan picks the AMD coopmat1 l tile with split_k == 1 (split_k decided on the BASE pipeline, so the K
+// partition never changes), a q4_K / q5_0 / q6_K x f32 dense matmul may take one of three G1 tile slots (l / m / s). A slot is
+// BLOCK_SIZE (warps x WARP), BM, BN, WM, WN and the LDS row pad (spec constant SHMEM_STRIDE_PAD); BK, the TM x TN x TK
+// fragments, WARP, the shader and the K loop are the base l tile's. Every output element still accumulates the same BK blocks
+// of the same fragments in the same K order (only which workgroup / warp owns it changes) -> EXACT by construction; the byte
+// classifier checks it per shape (tools/perf/g1-sweep.sh).
+//   GGML_VK_DENSE_TILE_G1 unset / 0 : off (the v62 plan, default until the s1 A/B rules)
+//   GGML_VK_DENSE_TILE_G1 = 1       : the built-in table (ggml_vk_dense_tile_g1_rules) - the balkon sweep's exact winners
+//   GGML_VK_DENSE_TILE_G1 = B:BM:BN:WM:WN:PAD : sweep mode - this one tile (slot l) for EVERY eligible shape
+// Read once (static); AMD coopmat1 (RADV) only, like B2.
+struct vk_g1_tile {
+    uint32_t block = 0, bm = 0, bn = 0, wm = 0, wn = 0, pad = 0;
+};
+struct vk_g1_rule {
+    // a shape matches when m in [m_lo, m_hi], k in [k_lo, k_hi], n >= n_lo and the A type is in types (0 = any)
+    uint32_t m_lo, m_hi, k_lo, k_hi, n_lo;
+    ggml_type type;   // GGML_TYPE_COUNT = any of q4_K / q5_0 / q6_K
+    int slot;         // 0 = l, 1 = m, 2 = s
+};
+struct vk_g1_plan {
+    bool on = false;
+    bool sweep = false;
+    vk_g1_tile tile[3];
+    std::vector<vk_g1_rule> rules;
+};
+
+static bool ggml_vk_g1_parse_tile(const char * s, vk_g1_tile & t) {
+    unsigned v[6];
+    if (sscanf(s, "%u:%u:%u:%u:%u:%u", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) {
+        return false;
+    }
+    t.block = v[0]; t.bm = v[1]; t.bn = v[2]; t.wm = v[3]; t.wn = v[4]; t.pad = v[5];
+    return true;
+}
+
+// [TAG_DENSE_TILE_G1] the built-in table (GGML_VK_DENSE_TILE_G1=1): slot tiles + shape rules, first match wins.
+static void ggml_vk_dense_tile_g1_table(vk_g1_plan & p) {
+    GGML_UNUSED(p);
+}
+
+static const vk_g1_plan & ggml_vk_dense_tile_g1_plan() {
+    static const vk_g1_plan plan = [] {
+        vk_g1_plan p;
+        const char * s = getenv("GGML_VK_DENSE_TILE_G1");
+        if (s == nullptr || *s == '\0' || strcmp(s, "0") == 0) {
+            return p;
+        }
+        if (strchr(s, ':') != nullptr) {
+            if (!ggml_vk_g1_parse_tile(s, p.tile[0])) {
+                GGML_LOG_WARN("ggml_vulkan: dense_tile_g1: cannot parse GGML_VK_DENSE_TILE_G1=%s (want B:BM:BN:WM:WN:PAD) - off\n", s);
+                return p;
+            }
+            p.on = true;
+            p.sweep = true;
+            p.rules.push_back({ 0, UINT32_MAX, 0, UINT32_MAX, 0, GGML_TYPE_COUNT, 0 });
+            GGML_LOG_INFO("ggml_vulkan: dense_tile_g1: sweep tile %u:%u:%u:%u:%u:%u for every eligible shape\n",
+                          p.tile[0].block, p.tile[0].bm, p.tile[0].bn, p.tile[0].wm, p.tile[0].wn, p.tile[0].pad);
+            return p;
+        }
+        if (atoi(s) == 0) {
+            return p;
+        }
+        // the built-in table (filled from the balkon sweep; see contrib 0261)
+        p.on = true;
+        ggml_vk_dense_tile_g1_table(p);
+        GGML_LOG_INFO("ggml_vulkan: dense_tile_g1: table on (%zu rules)\n", p.rules.size());
+        return p;
+    }();
+    return plan;
+}
+
+static bool ggml_vk_dense_tile_g1_device(const vk_device & device) {
+    return ggml_vk_dense_tile_g1_plan().on && device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support &&
+           !device->coopmat2 && device->driver_id != vk::DriverId::eAmdProprietary;
+}
+
+// the G1 slot of a dense matmul m x k (n columns, A type t), or -1
+static int ggml_vk_dense_tile_g1_slot(ggml_type t, uint32_t m, uint32_t n, uint32_t k) {
+    for (const vk_g1_rule & r : ggml_vk_dense_tile_g1_plan().rules) {
+        if (m >= r.m_lo && m <= r.m_hi && k >= r.k_lo && k <= r.k_hi && n >= r.n_lo && (r.type == GGML_TYPE_COUNT || r.type == t)) {
+            return r.slot;
+        }
+    }
+    return -1;
+}
+
+// a G1 tile is valid for mul_mm.comp (coopmat1) when the warps tile BM x BN exactly, each warp tile is whole fragments, and
+// every A / B load pass stays inside the tile (BM, BN multiples of the per-pass row stride, aligned and unaligned B)
+static bool ggml_vk_g1_tile_valid(const vk_device & device, const vk_g1_tile & t, const std::vector<uint32_t> & base, ggml_type type) {
+    const uint32_t bk = base[3], tm = base[7], tn = base[8], warp = base[10];
+    const uint32_t lva = type == GGML_TYPE_Q6_K ? 2 : 4;   // LOAD_VEC_A of q6_K / (q4_K, q5_0) (vulkan-shaders-gen.cpp)
+    const uint32_t lvb = device->fp16 ? 8 : 4;              // aligned LOAD_VEC_B
+    if (t.block == 0 || t.bm == 0 || t.bn == 0 || t.wm == 0 || t.wn == 0 || warp == 0 || t.pad > 32) {
+        return false;
+    }
+    if (t.block % warp != 0 || t.block > device->properties.limits.maxComputeWorkGroupInvocations) {
+        return false;
+    }
+    if (t.bm % t.wm != 0 || t.bn % t.wn != 0 || t.wm % tm != 0 || t.wn % tn != 0 || (t.bm / t.wm) * (t.bn / t.wn) != t.block / warp) {
+        return false;
+    }
+    if ((t.block * lva) % bk != 0 || t.bm % (t.block * lva / bk) != 0) {
+        return false;
+    }
+    if ((t.block * 2) % bk != 0 || t.bn % (t.block * 2 / bk) != 0 || (t.block * lvb) % bk != 0 || t.bn % (t.block * lvb / bk) != 0) {
+        return false;
+    }
+    const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
+    const uint32_t shmem = (t.bm + t.bn) * (bk + 2 * t.pad) * type_size + tm * tn * (t.block / warp) * (uint32_t) sizeof(float);
+    return shmem <= device->properties.limits.maxComputeSharedMemorySize;
 }
 
 // GGML_VK_DISABLE_FUSION_PATTERNS=name1,name2,... disables individual graph-fusion patterns by
@@ -5155,10 +5272,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                           l_warptile_mmqid_int_k, m_warptile_mmqid_int_k, s_warptile_mmqid_int_k,
                           l_warptile_mmqidb1, m_warptile_mmqidb1, s_warptile_mmqidb1,   // [TAG_MMID_TILE_B1]
                           l_warptile_mmqt16, m_warptile_mmqt16, s_warptile_mmqt16,      // [TAG_INJECT_TILE_M16]
-                          l_warptile_mmqb2, m_warptile_mmqb2, s_warptile_mmqb2;         // [TAG_DENSE_TILE_B2]
+                          l_warptile_mmqb2, m_warptile_mmqb2, s_warptile_mmqb2,         // [TAG_DENSE_TILE_B2]
+                          l_warptile_mmqg1, m_warptile_mmqg1, s_warptile_mmqg1;         // [TAG_DENSE_TILE_G1]
     std::array<uint32_t, 3> l_mmqidb1_wg_denoms, m_mmqidb1_wg_denoms, s_mmqidb1_wg_denoms;  // [TAG_MMID_TILE_B1]
     std::array<uint32_t, 3> l_mmqt16_wg_denoms, m_mmqt16_wg_denoms, s_mmqt16_wg_denoms;     // [TAG_INJECT_TILE_M16]
     std::array<uint32_t, 3> l_mmqb2_wg_denoms, m_mmqb2_wg_denoms, s_mmqb2_wg_denoms;        // [TAG_DENSE_TILE_B2]
+    std::array<uint32_t, 3> l_mmqg1_wg_denoms, m_mmqg1_wg_denoms, s_mmqg1_wg_denoms;        // [TAG_DENSE_TILE_G1]
+    uint32_t g1_pad[3] = { 4, 4, 4 };                                                      // [TAG_DENSE_TILE_G1]
     std::array<uint32_t, 3> l_wg_denoms, m_wg_denoms, s_wg_denoms,
                             l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms,
                             l_mmq_wg_denoms_k, m_mmq_wg_denoms_k, s_mmq_wg_denoms_k,
@@ -5334,6 +5454,22 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_mmqb2_wg_denoms = { l_warptile_mmqb2[1], l_warptile_mmqb2[2], 1 };
         m_mmqb2_wg_denoms = { m_warptile_mmqb2[1], m_warptile_mmqb2[2], 1 };
         s_mmqb2_wg_denoms = s_mmq_wg_denoms;
+        // [TAG_DENSE_TILE_G1] the G1 slots: the AMD coopmat1 l tile with BLOCK_SIZE / BM / BN / WM / WN from the plan (BK,
+        // WMITER, TM / TN / TK, WARP unchanged); an unset slot keeps the l tile (never created: mul_mat_g1 false)
+        {
+            std::vector<uint32_t> * g1w[3] = { &l_warptile_mmqg1, &m_warptile_mmqg1, &s_warptile_mmqg1 };
+            std::array<uint32_t, 3> * g1d[3] = { &l_mmqg1_wg_denoms, &m_mmqg1_wg_denoms, &s_mmqg1_wg_denoms };
+            for (int sl = 0; sl < 3; ++sl) {
+                const vk_g1_tile & gt = ggml_vk_dense_tile_g1_plan().tile[sl];
+                *g1w[sl] = l_warptile_mmq;
+                if (gt.block != 0) {
+                    (*g1w[sl])[0] = gt.block; (*g1w[sl])[1] = gt.bm; (*g1w[sl])[2] = gt.bn;
+                    (*g1w[sl])[4] = gt.wm;    (*g1w[sl])[5] = gt.wn;
+                    g1_pad[sl] = gt.pad;
+                }
+                *g1d[sl] = { (*g1w[sl])[1], (*g1w[sl])[2], 1 };
+            }
+        }
         if (ggml_vk_mmid_tile_b1(device)) {
             l_warptile_mmqidb1 = m_warptile_mmq;
             l_warptile_mmqidb1[0] = m_warptile_mmq[0] * 2;   // block size: twice the warps
@@ -5387,6 +5523,25 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             device->mul_mat_b2_l[i] = ggml_vk_dense_tile_b2(device) && ggml_vk_dense_tile_b2_xl() && b2_type && device->mul_mat_l[i] && ggml_vk_matmul_shmem_support(device, l_warptile_mmqb2, false, t, true);
             device->mul_mat_b2_m[i] = ggml_vk_dense_tile_b2(device) && b2_type && device->mul_mat_l[i] && ggml_vk_matmul_shmem_support(device, m_warptile_mmqb2, false, t, true);
             device->mul_mat_b2_s[i] = false;
+            // [TAG_DENSE_TILE_G1] a G1 slot exists for q4_K / q5_0 / q6_K where the l tile is available, the slot is set and
+            // its tile is valid for mul_mm.comp (ggml_vk_g1_tile_valid: warp layout, load passes, shmem with its pad)
+            {
+                const std::vector<uint32_t> * g1w[3] = { &l_warptile_mmqg1, &m_warptile_mmqg1, &s_warptile_mmqg1 };
+                for (int sl = 0; sl < 3; ++sl) {
+                    const vk_g1_tile & gt = ggml_vk_dense_tile_g1_plan().tile[sl];
+                    device->mul_mat_g1[sl][i] = ggml_vk_dense_tile_g1_device(device) && b2_type && device->mul_mat_l[i] &&
+                                                gt.block != 0 && ggml_vk_g1_tile_valid(device, gt, l_warptile_mmq, t) &&
+                                                (*g1w[sl])[0] == gt.block;
+                    if (gt.block != 0 && ggml_vk_dense_tile_g1_device(device) && b2_type && !device->mul_mat_g1[sl][i]) {
+                        static bool warned[3] = { false, false, false };
+                        if (!warned[sl]) {
+                            warned[sl] = true;
+                            GGML_LOG_WARN("ggml_vulkan: dense_tile_g1: slot %d tile %u:%u:%u:%u:%u:%u invalid for %s - not created\n", sl,
+                                          gt.block, gt.bm, gt.bn, gt.wm, gt.wn, gt.pad, ggml_type_name(t));
+                        }
+                    }
+                }
+            }
 
             // The q8_1 mmq path has its own (larger) shmem layout, check it separately.
             // K-quants use the _int_k warptiles, others use _int.
@@ -5894,6 +6049,40 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         if (*pp && ((*pp)->name.size() < sfx.size() || (*pp)->name.compare((*pp)->name.size() - sfx.size(), sfx.size(), sfx) != 0)) {
                             (*pp)->name += sfx;
                         }
+                    }
+                }
+            }
+        }
+        // [TAG_DENSE_TILE_G1] the same dense shaders on the G1 slots (l / m / s = the three plan tiles), with the slot's LDS pad
+        // as SHMEM_STRIDE_PAD (spec constant 12; APPLY_SLM_A_RESHAPE 13 stays false), renamed "..._g1" for the logs
+#define CREATE_MM_G1_ONE(TYPE, PIPE, NAMELC, F16ACC, SL, SLOT, ALIGNED, ANAME) \
+        if (device->mul_mat_g1[SLOT][TYPE]) { \
+            std::vector<uint32_t> spec = SL ## _warptile_mmqg1; \
+            spec.push_back(ALIGNED); spec.push_back(g1_pad[SLOT]); spec.push_back(0u); \
+            ggml_vk_create_pipeline(device, PIPE, #NAMELC #F16ACC ANAME #SL, NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants), SL ## _mmqg1_wg_denoms, spec, ALIGNED ? l_align : 1, false, true); \
+        }
+#define CREATE_MM_G1(TYPE, NAMELC, F16ACC, ACC) \
+        CREATE_MM_G1_ONE(TYPE, device->pipeline_dequant_mul_mat_mat_g1[TYPE].ACC->l,   NAMELC, F16ACC, l, 0, 0u, "_") \
+        CREATE_MM_G1_ONE(TYPE, device->pipeline_dequant_mul_mat_mat_g1[TYPE].ACC->m,   NAMELC, F16ACC, m, 1, 0u, "_") \
+        CREATE_MM_G1_ONE(TYPE, device->pipeline_dequant_mul_mat_mat_g1[TYPE].ACC->s,   NAMELC, F16ACC, s, 2, 0u, "_") \
+        CREATE_MM_G1_ONE(TYPE, device->pipeline_dequant_mul_mat_mat_g1[TYPE].ACC->a_l, NAMELC, F16ACC, l, 0, 1u, "_aligned_") \
+        CREATE_MM_G1_ONE(TYPE, device->pipeline_dequant_mul_mat_mat_g1[TYPE].ACC->a_m, NAMELC, F16ACC, m, 1, 1u, "_aligned_") \
+        CREATE_MM_G1_ONE(TYPE, device->pipeline_dequant_mul_mat_mat_g1[TYPE].ACC->a_s, NAMELC, F16ACC, s, 2, 1u, "_aligned_")
+#define CREATE_MM2_G1(TYPE, NAMELC) \
+        if (device->coopmat_acc_f16_support) { CREATE_MM_G1(TYPE, NAMELC, _f16acc, f16acc) } \
+        if (device->coopmat_acc_f32_support) { CREATE_MM_G1(TYPE, NAMELC, , f32acc) }
+        CREATE_MM2_G1(GGML_TYPE_Q4_K, matmul_q4_k_f32)
+        CREATE_MM2_G1(GGML_TYPE_Q5_0, matmul_q5_0_f32)
+        CREATE_MM2_G1(GGML_TYPE_Q6_K, matmul_q6_k_f32)
+#undef CREATE_MM2_G1
+#undef CREATE_MM_G1
+#undef CREATE_MM_G1_ONE
+        for (ggml_type tg1 : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K }) {
+            for (vk_matmul_pipeline * mp : { &device->pipeline_dequant_mul_mat_mat_g1[tg1].f16acc, &device->pipeline_dequant_mul_mat_mat_g1[tg1].f32acc }) {
+                for (vk_pipeline * pp : { &(*mp)->l, &(*mp)->m, &(*mp)->s, &(*mp)->a_l, &(*mp)->a_m, &(*mp)->a_s }) {
+                    const std::string sfx = "_g1";   // load_shaders runs once per requested pipeline: rename once
+                    if (*pp && ((*pp)->name.size() < sfx.size() || (*pp)->name.compare((*pp)->name.size() - sfx.size(), sfx.size(), sfx) != 0)) {
+                        (*pp)->name += sfx;
                     }
                 }
             }
@@ -11144,6 +11333,29 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                 pipeline = al ? tw->a_l : tw->l;
             } else if (ne01 <= 384 && ne11 >= 128 && ctx->device->mul_mat_b2_m[src0->type] && (al ? tw->a_m : tw->m)) {
                 pipeline = al ? tw->a_m : tw->m;
+            }
+        }
+    }
+
+    // [TAG_DENSE_TILE_G1] GGML_VK_DENSE_TILE_G1 (default off): where the base plan picked the coopmat1 l tile with split_k == 1
+    // (split_k decided on the BASE pipeline), the plan's rule for (type, m, n, k) names a G1 slot; same eligibility as B2
+    // (quantized A q4_K / q5_0 / q6_K, f32 B kernel, no q8_1, no conversion pass, no row ids, no 64-bit indexing swap).
+    // Same shader, BK, fragments and per-element K order as the l tile -> EXACT.
+    if (split_k == 1 && !quantize_y && !qx_needs_dequant && !qy_needs_dequant && !x_non_contig && !y_non_contig && !row_ids &&
+        src1->type == GGML_TYPE_F32 && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q6_K) &&
+        ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
+        (pipeline == mmp->l || pipeline == mmp->a_l)) {
+        const int sl = ggml_vk_dense_tile_g1_slot(src0->type, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) ne10);
+        if (sl >= 0 && ctx->device->mul_mat_g1[sl][src0->type]) {
+            const vk_matmul_pipeline2 & g1 = ctx->device->pipeline_dequant_mul_mat_mat_g1[src0->type];
+            const vk_matmul_pipeline2 & base = ctx->device->pipeline_dequant_mul_mat_mat[src0->type];
+            const vk_matmul_pipeline tw = mmp == base.f16acc ? g1.f16acc : mmp == base.f32acc ? g1.f32acc : nullptr;
+            if (tw) {
+                const bool al = pipeline == mmp->a_l;
+                const vk_pipeline p = sl == 0 ? (al ? tw->a_l : tw->l) : sl == 1 ? (al ? tw->a_m : tw->m) : (al ? tw->a_s : tw->s);
+                if (p) {
+                    pipeline = p;
+                }
             }
         }
     }

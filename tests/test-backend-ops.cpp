@@ -12189,6 +12189,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2048, 256, 2560, {1, 1}, {1, 1}));
 
+    // [TAG_DENSE_TILE_G1] the G1 production dense shapes (P.1 profile, m x k) vs the CPU at partial-tile widths: run with
+    // GGML_VK_DENSE_TILE_G1=1 (table) or =B:BM:BN:WM:WN:PAD (sweep) and GGML_VK_DISABLE_MMQ_CM1=1 to reach the _g1 tiles
+    for (int64_t n : { 513, 2047 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, GGML_TYPE_F32, 10240, n,   320, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  2560, n,  6144, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 12288, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1}));
+    }
+
     // [TAG_INJECT_TILE_M16] the qwen4exp hc inject GEMM (m = 4, k = 4 x 2560) and the m 16 / 17 edges of the BM 16 tile vs the CPU
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
         for (int64_t m : { 4, 16, 17 }) {
@@ -13819,6 +13830,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  6144, n,  2560, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, GGML_TYPE_F32, 10240, n,   320, {1, 1}, {1, 1}));
+    }
+    // [TAG_DENSE_TILE_G1] G1: the P.1 dense prefill GEMMs (docs/verification/2026-10-15-e0-gemm-screen.md §3, m x k) at a
+    // full 2048 ubatch and at n 512; tools/perf/g1-sweep.sh perf runs them (-p on these shapes) once per tile config
+    for (int64_t n : { 512, 2048 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, GGML_TYPE_F32, 10240, n,   320, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  2560, n,  6144, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  6144, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 10240, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 12288, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1}));
     }
     // [TAG_B4_CONCAT_COST] B4 sizing: the GDN conv-input concat (state | x^T) and its ssm_conv at a 2048-token
     // ubatch (10240 channels, kernel 4), and the QSA chunk concat chain (left-deep, 9 chunks of ~228 rows of a
