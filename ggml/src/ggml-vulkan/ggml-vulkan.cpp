@@ -920,6 +920,7 @@ struct vk_device_struct {
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
     uint32_t subgroup_max_size;
+    uint32_t subgroup_max_workgroup_subgroups = 0;  // maxComputeWorkgroupSubgroups (0 = unknown: no subgroup size control)
     bool subgroup_require_full_support;
 
     // floor(log2(maxComputeWorkGroupInvocations))
@@ -1307,6 +1308,7 @@ struct vk_device_struct {
     uint32_t qsa_score_kreuse_max_wg;
     // [TAG_MMID_PRECAST_B] GGML_VK_MMID_PRECAST_B (default on)
     bool mmid_precast_b;
+    bool mmid_tile_g2a_logged = false;  // [TAG_MMID_TILE_G2A] proof line printed for this device
     // split a dim-0 concat with a transposed src1 into copy + tiled transpose-copy
     // (default on, GGML_VK_CONCAT_TRANSPOSE=0 turns it off)
     bool concat_transpose;
@@ -2561,6 +2563,36 @@ static bool ggml_vk_mmid_tile_b1(const vk_device & device) {
     static const bool on = ggml_vk_env_bool("GGML_VK_MMID_TILE_BM128", true);
     return on && device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && !device->coopmat2 &&
            device->driver_id != vk::DriverId::eAmdProprietary;
+}
+
+// [TAG_MMID_TILE_G2A] GGML_VK_MMID_TILE_G2A (default on, =0 off): where the B1 tile applies, its warp layout becomes
+// 8 warps of WM 64 x WN 16 and its LDS row pad G2A_PAD words (see ggml_vk_load_shaders). Read once (static).
+static constexpr uint32_t G2A_PAD = 2;
+// [TAG_MM_WARPTILE_EXT] extended mul_mm warptile layout (shared with G1): elements 0..10 as every warptile (BLOCK, BM, BN, BK,
+// WM, WN, WMITER, TM, TN, TK, WARP), then 11 = a placeholder ggml_vk_mul_mm_spec overwrites with ALIGNED, 12 = SHMEM_STRIDE_PAD
+// (FLOAT_TYPEV2 units), 13 = APPLY_SLM_A_RESHAPE. Any other length is the plain layout. The layout says nothing about the
+// pipeline: its name suffix, a pinned subgroup size and the B-load clamp travel with the tile that owns them (vk_mm_tile_meta,
+// registered per warptile object in ggml_vk_load_shaders).
+static constexpr size_t VK_MM_WARPTILE_SIZE     = 11;
+static constexpr size_t VK_MM_WARPTILE_EXT_SIZE = 14;
+static bool ggml_vk_mm_warptile_ext(const std::vector<uint32_t> & wt) { return wt.size() == VK_MM_WARPTILE_EXT_SIZE; }
+
+// what a tile carries besides its spec constants: the pipeline name suffix, the requiredSubgroupSize to pin (0 = none) and
+// whether it relies on the mul_mat_id per-tile row clamp of mul_mm.comp (BLOCK * LOAD_VEC_B / BK > BN is legal only then)
+struct vk_mm_tile_meta {
+    const char * sfx = "";
+    uint32_t     req_sg = 0;
+    bool         mmid_b_clamp = false;
+};
+
+// a requiredSubgroupSize of w is usable for a full-subgroup compute pipeline (hoisted from the QSA top-k setup)
+static bool ggml_vk_wave_ok(const vk_device & device, uint32_t w) {
+    return device->subgroup_size_control && device->subgroup_require_full_support &&
+           device->subgroup_min_size <= w && w <= device->subgroup_max_size;
+}
+static bool ggml_vk_mmid_tile_g2a(const vk_device & device) {
+    static const bool on = ggml_vk_env_bool("GGML_VK_MMID_TILE_G2A", true);
+    return on && ggml_vk_mmid_tile_b1(device);
 }
 
 // [TAG_FA1] coopmat1 flash attention shared-memory layouts (flash_attn_cm1.comp Flags 16384 / 32768): the kernel is
@@ -4919,7 +4951,9 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
     // Needs to stay aligned with ggml_vk_mul_mm_spec.
     const bool intel_shmem_stride_pad_zero = device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
                                               device->driver_id == vk::DriverId::eIntelProprietaryWindows;
-    const uint32_t bank_conflict_offset = intel_shmem_stride_pad_zero ? 0 : (device->coopmat_support ? 8 : 1);
+    // [TAG_MMID_TILE_G2A] an extended warptile carries its own SHMEM_STRIDE_PAD (in FLOAT_TYPEV2 = 2-element units)
+    const uint32_t bank_conflict_offset = ggml_vk_mm_warptile_ext(warptile) ? 2 * warptile[12] :
+                                          intel_shmem_stride_pad_zero ? 0 : (device->coopmat_support ? 8 : 1);
     const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
     const uint32_t warps = warptile[0] / warptile[10];
 
@@ -5221,6 +5255,33 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     uint32_t l_align, m_align, s_align;
 
+    // [TAG_MM_WARPTILE_EXT] per-tile pipeline metadata (name suffix, pinned subgroup size, mul_mat_id B-load clamp), keyed by
+    // the warptile object a CREATE_MM line passes; an unregistered tile = no suffix, no pin, no clamp (the pre-G2A behaviour)
+    std::unordered_map<const std::vector<uint32_t> *, vk_mm_tile_meta> mm_tile_meta;
+    const auto mm_tile = [&mm_tile_meta](const std::vector<uint32_t> & wt) -> vk_mm_tile_meta {
+        const auto it = mm_tile_meta.find(&wt);
+        return it == mm_tile_meta.end() ? vk_mm_tile_meta{} : it->second;
+    };
+    // review r2 item 3: the B tile load writes columns loadc_b + l < BLOCK * LOAD_VEC_B / BK of buf_b[BN]; beyond BN it is
+    // only safe in the mul_mat_id shader's per-tile row clamp. LOAD_VEC_B <= 8; the f32 / f16 A shaders hard-code BK 32.
+    bool mm_tile_warned = false;
+    const auto mm_tile_check = [&](const std::vector<uint32_t> & wt, ggml_type type, bool mul_mat_id, const char * name) {
+        const uint32_t bk = (type == GGML_TYPE_F32 || type == GGML_TYPE_F16) ? 32u : wt[3];
+        if (wt[0] * 8 / bk <= wt[2]) {
+            return;
+        }
+        const vk_mm_tile_meta m = mm_tile(wt);
+        if (mul_mat_id && m.mmid_b_clamp) {
+            return;
+        }
+        // a registered (extended) tile must never reach a pipeline without the clamp; a plain tile only warns (fail open as before)
+        GGML_ASSERT(!ggml_vk_mm_warptile_ext(wt) && m.sfx[0] == '\0' && "an extended / registered warptile reached a pipeline without the mul_mat_id B-load clamp");
+        if (!mm_tile_warned) {
+            mm_tile_warned = true;
+            GGML_LOG_WARN("ggml_vulkan: %s: tile block %u x LOAD_VEC_B / BK %u exceeds BN %u (B load past the tile)\n", name, wt[0], bk, wt[2]);
+        }
+    };
+
     // int8 coopmat1 MMQ (upstream #27952). RDNA3.5 preferred wave32 here
     const bool cm1_use_wave32 = device->vendor_id == VK_VENDOR_ID_AMD &&
                                 device->subgroup_size_control &&
@@ -5395,6 +5456,39 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             l_mmqidb1_wg_denoms = { l_warptile_mmqidb1[1], l_warptile_mmqidb1[2], 1 };
         }
 
+        // [TAG_MMID_TILE_G2A] on top of B1: the coopmat1 mul_mat_id l tile becomes 8 warps of WM 64 x WN 16 over the same
+        // BM 128 x BN 64 (2 warps along M, 4 along N instead of 2 x 2 of WM 64 x WN 32) and its shared-memory row stride
+        // BK / 2 + SHMEM_STRIDE_PAD = 16 + G2A_PAD 32-bit words instead of 16 + 4. With ~40 rows per expert (2048 tokens x
+        // 10 of 512 experts) a WN 16 warp column past the expert's rows skips its MACs ([TAG_MMID_SKIP]) at 16-row instead of
+        // 32-row granularity; the stride only moves where an element sits in LDS. Unchanged: BK, the TM / TN / TK coopmat
+        // fragments, WMITER, WARP, the block's BM x BN, the K loop and every element's coopMatMulAdd sequence (a fragment's
+        // result depends on its own A rows / B columns only), so each output keeps its bits. Block 512 relies on the per-tile
+        // row clamp in mul_mm.comp (its B load columns run to 127 > BN; registered as mmid_b_clamp). The 8-warp layout assumes
+        // wave64 like B1 and every cm1 pipeline: the pipelines pin requiredSubgroupSize 64 where the device allows it
+        // (ggml_vk_wave_ok), and then the 8 subgroups must fit maxComputeWorkgroupSubgroups (VUID 02757) or the B1 tile stays.
+        // GGML_VK_MMID_TILE_G2A=0 keeps the B1 tile.
+        const bool g2a_pin = ggml_vk_wave_ok(device, 64);
+        if (ggml_vk_mmid_tile_g2a(device) && l_warptile_mmqidb1.size() == VK_MM_WARPTILE_SIZE &&
+            l_warptile_mmqidb1[1] == 128 && l_warptile_mmqidb1[2] == 64 &&
+            l_warptile_mmqidb1[10] == 64 && l_warptile_mmqidb1[7] == 16 && l_warptile_mmqidb1[8] == 16 &&
+            (!g2a_pin || device->subgroup_max_workgroup_subgroups >= 512 / 64) &&
+            device->properties.limits.maxComputeWorkGroupInvocations >= 512 &&
+            device->properties.limits.maxComputeWorkGroupSize[0] >= 512) {
+            l_warptile_mmqidb1[0] = 512;  // BLOCK_SIZE: 8 warps
+            l_warptile_mmqidb1[4] = 64;   // WM
+            l_warptile_mmqidb1[5] = 16;   // WN
+            l_warptile_mmqidb1.push_back(0u);       // 11: ALIGNED placeholder (ggml_vk_mul_mm_spec)
+            l_warptile_mmqidb1.push_back(G2A_PAD);  // 12: SHMEM_STRIDE_PAD
+            l_warptile_mmqidb1.push_back(0u);       // 13: APPLY_SLM_A_RESHAPE = false (the shader default)
+            mm_tile_meta[&l_warptile_mmqidb1] = vk_mm_tile_meta{ "_g2a", g2a_pin ? 64u : 0u, true };
+            if (!device->mmid_tile_g2a_logged) {    // proof line, once per device
+                device->mmid_tile_g2a_logged = true;
+                GGML_LOG_WARN("ggml_vulkan: %s mmid_tile_g2a: on (mul_mat_id l tile BM 128 x BN 64, 512 threads, WM 64 x WN 16, "
+                              "LDS pad %u, subgroup %s, pipelines *_l_g2a; GGML_VK_MMID_TILE_G2A)\n", device->name.c_str(), G2A_PAD,
+                              g2a_pin ? "64 pinned" : "driver default");
+            }
+        }
+
         const bool use_cm1_int = device->mmq_cm1;
 
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
@@ -5427,7 +5521,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // the quantized types the byte classifier covers (ggml_vk_b1_classified_type); every other type keeps the
             // upstream plan (on AMD: no l tile), incl. F32 / F16 / BF16 and the dequant-to-f16 fallback (review B1 I1)
             if (ggml_vk_mmid_tile_b1(device) && device->mul_mat_id_m[i] && ggml_vk_b1_classified_type(t)) {
-                device->mul_mat_id_l[i] = ggml_vk_matmul_shmem_support(device, l_warptile_mmqidb1, true, t);
+                // [TAG_MMID_TILE_G2A] review m4: the shader's coopmat_stage is TM * TN * NUM_WARPS (exact_stage), and an extended
+                // warptile brings its real pad
+                device->mul_mat_id_l[i] = ggml_vk_matmul_shmem_support(device, l_warptile_mmqidb1, true, t, true);
             }
             // [TAG_INJECT_TILE_M16] q4_K / q8_0 only, where the s tile itself is available
             device->mul_mat_t16_l[i] = device->mul_mat_t16_m[i] = false;
@@ -5730,6 +5826,20 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif
 
     auto const &ggml_vk_mul_mm_spec = [&device](std::vector<uint32_t> spec, bool aligned) {
+        // [TAG_MM_WARPTILE_EXT] the extended layout carries its own ids 12 / 13; any other length is the plain layout
+        // (a length other than 11 is reported once and cut to the 11 plain elements)
+        if (ggml_vk_mm_warptile_ext(spec)) {
+            spec[11] = aligned ? 1u : 0u;  // constantID=11: ALIGNED; 12 / 13 are the warptile's own
+            return spec;
+        }
+        if (spec.size() != VK_MM_WARPTILE_SIZE) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                GGML_LOG_WARN("ggml_vulkan: mul_mm warptile of %zu elements treated as the plain 11-element layout\n", spec.size());
+            }
+            spec.resize(VK_MM_WARPTILE_SIZE);
+        }
         spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
         if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
             device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
@@ -5856,18 +5966,30 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->coopmat_support) {
         // Create 6 variants, {s,m,l}x{unaligned,aligned}
 #define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
-        if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true);   \
-        if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true);   \
-        if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true);   \
-        if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true);   \
-        if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true);   \
-        if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true);   \
+        if (device->mul_mat ## ID ## _l[TYPE]) { \
+            mm_tile_check(l_ ## WARPTILE, TYPE, std::string(#ID) == "_id", #NAMELC #F16ACC "_l"); \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->l, std::string(#NAMELC #F16ACC "_l") + mm_tile(l_ ## WARPTILE).sfx, NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true, mm_tile(l_ ## WARPTILE).req_sg); \
+        } \
+        if (device->mul_mat ## ID ## _m[TYPE]) { \
+            mm_tile_check(m_ ## WARPTILE, TYPE, std::string(#ID) == "_id", #NAMELC #F16ACC "_m"); \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->m, std::string(#NAMELC #F16ACC "_m") + mm_tile(m_ ## WARPTILE).sfx, NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true, mm_tile(m_ ## WARPTILE).req_sg); \
+        } \
+        if (device->mul_mat ## ID ## _s[TYPE]) { \
+            mm_tile_check(s_ ## WARPTILE, TYPE, std::string(#ID) == "_id", #NAMELC #F16ACC "_s"); \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->s, std::string(#NAMELC #F16ACC "_s") + mm_tile(s_ ## WARPTILE).sfx, NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true, mm_tile(s_ ## WARPTILE).req_sg); \
+        } \
+        if (device->mul_mat ## ID ## _l[TYPE]) { \
+            mm_tile_check(l_ ## WARPTILE, TYPE, std::string(#ID) == "_id", #NAMELC #F16ACC "_aligned_l"); \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_l, std::string(#NAMELC #F16ACC "_aligned_l") + mm_tile(l_ ## WARPTILE).sfx, NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, mm_tile(l_ ## WARPTILE).req_sg); \
+        } \
+        if (device->mul_mat ## ID ## _m[TYPE]) { \
+            mm_tile_check(m_ ## WARPTILE, TYPE, std::string(#ID) == "_id", #NAMELC #F16ACC "_aligned_m"); \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_m, std::string(#NAMELC #F16ACC "_aligned_m") + mm_tile(m_ ## WARPTILE).sfx, NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true, mm_tile(m_ ## WARPTILE).req_sg); \
+        } \
+        if (device->mul_mat ## ID ## _s[TYPE]) { \
+            mm_tile_check(s_ ## WARPTILE, TYPE, std::string(#ID) == "_id", #NAMELC #F16ACC "_aligned_s"); \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_s, std::string(#NAMELC #F16ACC "_aligned_s") + mm_tile(s_ ## WARPTILE).sfx, NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, mm_tile(s_ ## WARPTILE).req_sg); \
+        } \
 
         // Create 2 variants, {f16,f32} accumulator
 #define CREATE_MM2(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
@@ -8097,6 +8219,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         if (device->subgroup_size_control) {
             device->subgroup_min_size = subgroup_size_control_props.minSubgroupSize;
             device->subgroup_max_size = subgroup_size_control_props.maxSubgroupSize;
+            device->subgroup_max_workgroup_subgroups = subgroup_size_control_props.maxComputeWorkgroupSubgroups;
             device_extensions.push_back("VK_EXT_subgroup_size_control");
         }
 
@@ -8531,10 +8654,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
             }();
             device->qsa_topk_cpt = qsa_topk_cpt_env;
             const bool sg_ops = device->subgroup_basic && device->subgroup_ballot && device->subgroup_arithmetic;
-            const auto wave_ok = [&](uint32_t w) {
-                return device->subgroup_size_control && device->subgroup_require_full_support &&
-                       device->subgroup_min_size <= w && w <= device->subgroup_max_size;
-            };
+            const auto wave_ok = [&](uint32_t w) { return ggml_vk_wave_ok(device, w); };
             const uint32_t wave = qsa_topk_wave_env != 0 ? qsa_topk_wave_env : wave_ok(64) ? 64u : 32u;
             const bool sg_size = wave_ok(wave);
             device->qsa_topk_wave = wave;
