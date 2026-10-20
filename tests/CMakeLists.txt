@@ -166,6 +166,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-qsa-census-inc-whole-blocks PROPERTIES ENVIRONMENT "LLAMA_QSA_WHOLE_BLOCKS=1")
     llama_build(test-kq-vis-fill-bench.cpp)     # [TAG_KQVIS_PROF] CPU microbench of the KQ mask vs metadata fills (not a ctest)
     llama_build(test-vk-graph-order.cpp)        # [TAG_HC_MIX_TAIL] fusion/dispatch order through ggml_backend_sched + graph_optimize on a GPU (not a ctest)
+    llama_build(test-fa-prefill-exact.cpp)      # [TAG_FA1] FLASH_ATTN_EXT output hash + timing at the Flash-Next prefill shapes, for build-vs-build bit identity (not a ctest)
     llama_build_and_test(test-kq-vis-fill-equiv.cpp) # [TAG_KQ_VIS_FILL] randomized fill equivalence vs the pre-P3-F1 fill
     target_compile_definitions(test-kq-vis-fill-equiv PRIVATE LLAMA_KV_CELLS_H_PATH="${PROJECT_SOURCE_DIR}/src/llama-kv-cells.h") # its rebase tripwire
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
