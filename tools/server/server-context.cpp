@@ -1652,6 +1652,20 @@ public:
             res.disk.n_deep_ckpts   = disk_cache->n_deep_ckpts();
             res.disk.n_blocks       = disk_cache->n_blocks();
             res.disk.bytes_on_disk  = disk_cache->total_bytes();
+            // [TAG_DISK_ASYNC_SAVE]
+            res.disk.save_async_us         = disk_cache->save_async_us;
+            res.disk.save_copy_us          = disk_cache->save_copy_us;
+            res.disk.save_wait_us          = disk_cache->save_wait_us;
+            res.disk.bytes_copied          = disk_cache->bytes_copied;
+            res.disk.n_saves_async         = disk_cache->n_saves_async;
+            res.disk.n_saves_async_failed  = disk_cache->n_saves_async_failed;
+            res.disk.n_pending             = disk_cache->n_pending();
+            res.disk.last_save_blocking_us = disk_cache->last_save_blocking_us;
+            res.disk.last_save_total_us    = disk_cache->last_save_total_us;
+            res.disk.last_save_bytes       = disk_cache->last_save_bytes;
+            res.disk.last_save_written     = disk_cache->last_save_written;
+            res.disk.last_load_us          = disk_cache->last_load_us;
+            res.disk.last_load_bytes       = disk_cache->last_load_bytes;
         }
 
         return res;
@@ -1683,6 +1697,13 @@ public:
                 if (!slot.disk_save(*disk_cache)) {
                     SLT_WRN(slot, "disk cache: the %d tokens were not saved before %s\n", slot.prompt.n_tokens(), why);
                 }
+            }
+        }
+        // [TAG_DISK_ASYNC_SAVE] every background save committed before the contexts go; a slot whose save failed in the
+        //   background (its disk_save() returned true when the copy was queued) is reported here
+        for (const int32_t id : disk_cache->drain()) { // ids deduplicated; slot ids are their indices
+            if (id >= 0 && id < (int32_t) slots.size()) {
+                SLT_WRN(slots[id], "disk cache: the background save before %s failed, the conversation is not on disk\n", why);
             }
         }
     }
@@ -2684,6 +2705,8 @@ private:
                 params_base.cache_disk_ckpt_ratio, params_base.checkpoint_min_step, params_base.cache_disk_ckpt_max);
             disk_cache->live_refs = [this]() { return live_deep_refs(); };
             disk_cache->ckpt_sem_max = params_base.cache_disk_ckpt_semantic; // [TAG_SEMANTIC_CKPT]
+            disk_cache->on_async_done = [this]() { queue_tasks.wake(); }; // [TAG_DISK_ASYNC_SAVE] commit on an idle loop
+            disk_cache->set_async((uint64_t) params_base.cache_disk_async_mib << 20); // [TAG_DISK_ASYNC_SAVE]
             disk_cache->adopt_keys = string_split<std::string>(params_base.cache_disk_adopt, ',');
             disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types) +
                                       "/" + common_speculative_state_schema(spec.get()));
@@ -3011,6 +3034,12 @@ private:
             const size_t n_slot   = ret->prompt.tokens.size();
             const size_t lcp_slot = reuse ? ret->prompt.tokens.get_common_prefix(task.tokens) : 0;
             const size_t margin   = 1024; // below this a load does not pay for itself
+
+            // [TAG_DISK_ASYNC_SAVE] this conversation's own save still in flight (it left this or another slot just
+            //   now): wait for its commit, so the lookup finds it instead of re-processing the prompt
+            if (reuse) {
+                disk_cache->await_pending(task.tokens, lcp_slot + margin);
+            }
 
             const bool will_load = reuse && disk_cache->find(task.tokens, lcp_slot + margin, ret->n_ctx, nullptr) >= 0;
 
@@ -4784,6 +4813,10 @@ private:
                 } break;
             case SERVER_TASK_TYPE_METRICS:
                 {
+                    if (disk_cache) {
+                        disk_cache->poll(); // [TAG_DISK_ASYNC_SAVE] finished background saves show as committed
+                    }
+
                     int n_processing_slots = 0;
 
                     for (server_slot & slot : slots) {
@@ -5548,6 +5581,10 @@ private:
 
     void update_slots() {
         slots_invalidated.clear();
+
+        if (disk_cache) {
+            disk_cache->poll(); // [TAG_DISK_ASYNC_SAVE] commit the background saves that finished
+        }
 
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;

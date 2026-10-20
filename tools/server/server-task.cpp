@@ -1705,6 +1705,18 @@ std::string server_task_result_metrics::to_metrics() {
             "disk_cache_save_seconds_total", "Disk prompt cache: time spent saving (blocks the server loop)", metrics.disk.save_us / 1.e6
         }, {
             "disk_cache_load_seconds_total", "Disk prompt cache: time spent loading", metrics.disk.load_us / 1.e6
+        }, {
+            "disk_cache_save_async_seconds_total", "Disk prompt cache: asynchronous part of the saves (block hashing + writing on the workers, after the device copy)", metrics.disk.save_async_us / 1.e6
+        }, {
+            "disk_cache_save_copy_seconds_total", "Disk prompt cache: device -> host copy of the saved states (part of the blocking time)", metrics.disk.save_copy_us / 1.e6
+        }, {
+            "disk_cache_save_wait_seconds_total", "Disk prompt cache: blocking time spent waiting for staging room (--cache-disk-async)", metrics.disk.save_wait_us / 1.e6
+        }, {
+            "disk_cache_bytes_copied_total", "Disk prompt cache: state bytes copied off the device by saves", (double) metrics.disk.bytes_copied
+        }, {
+            "disk_cache_saves_async_total", "Disk prompt cache: saves committed through the asynchronous path", (double) metrics.disk.n_saves_async
+        }, {
+            "disk_cache_saves_async_failed_total", "Disk prompt cache: asynchronous saves that failed in the background (files removed)", (double) metrics.disk.n_saves_async_failed
         },
     };
 
@@ -1789,6 +1801,20 @@ std::string server_task_result_metrics::to_metrics() {
             "disk_cache_blocks", "Disk prompt cache: stored 4 MiB state blocks", (double) metrics.disk.n_blocks
         }, {
             "disk_cache_bytes", "Disk prompt cache: bytes on disk", (double) metrics.disk.bytes_on_disk
+        }, {
+            "disk_cache_saves_pending", "Disk prompt cache: asynchronous saves in flight (copied, not committed)", (double) metrics.disk.n_pending
+        }, {
+            "disk_cache_last_save_blocking_seconds", "Disk prompt cache: blocking part of the last committed save", metrics.disk.last_save_blocking_us / 1.e6
+        }, {
+            "disk_cache_last_save_seconds", "Disk prompt cache: whole duration of the last committed save (blocking + asynchronous)", metrics.disk.last_save_total_us / 1.e6
+        }, {
+            "disk_cache_last_save_state_bytes", "Disk prompt cache: state bytes of the last committed save", (double) metrics.disk.last_save_bytes
+        }, {
+            "disk_cache_last_save_written_bytes", "Disk prompt cache: bytes the last committed save wrote", (double) metrics.disk.last_save_written
+        }, {
+            "disk_cache_last_load_seconds", "Disk prompt cache: duration of the last load", metrics.disk.last_load_us / 1.e6
+        }, {
+            "disk_cache_last_load_bytes", "Disk prompt cache: state bytes of the last load", (double) metrics.disk.last_load_bytes
         },
     };
 

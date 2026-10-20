@@ -1300,3 +1300,312 @@ def test_slot_restore_checkpoints_draft_kv_type_change(swa_server, ctkd_restore)
     })
     assert res.status_code == 200
     assert res.body["timings"]["prompt_n"] == n_live
+
+
+# [TAG_DISK_ASYNC_SAVE] (SC2) the asynchronous disk-cache save (--cache-disk-async N MiB): the server loop copies the
+#   state off the device, workers hash / write the blocks, the loop commits. Compared with the synchronous path
+#   (--cache-disk-async 0) byte by byte, and exercised with a save in flight against a lookup of its conversation, two saves
+#   of one slot in flight, an idle server, an injected background failure and shutdown. LLAMA_DISK_ASYNC_TEST_DELAY_MS
+#   slows every background block task, LLAMA_DISK_ASYNC_TEST_FAIL_MAPS=N makes the first N map writes throw.
+#   Model: LFM2-350M (hybrid: checkpoints / .ck files; 128k training context - the server caps the slot context at it),
+#   also as the draft (every entry has a .dft stream)
+DC_MODEL_URL = "https://huggingface.co/LiquidAI/LFM2-350M-GGUF/resolve/main/LFM2-350M-Q8_0.gguf"
+DC_WORDS = ("apple river stone cloud garden lantern window forest silver morning candle harbor meadow thunder "
+            "pencil violet copper island marble whisper orchard falcon velvet canyon").split()
+
+
+def dc_server(tag, async_mib, env=None, n_ctx=16384, n_slots=1):
+    import shutil
+    cache_dir = os.path.abspath(os.path.join("./tmp", f"sc2-{tag}"))
+    if os.path.isdir(cache_dir):
+        shutil.rmtree(cache_dir)
+    srv = ServerPreset.tinyllama2()
+    srv.model_hf_repo = None
+    srv.model_file = download_file(DC_MODEL_URL)
+    srv.model_draft = srv.model_file
+    srv.spec_type = "draft-simple"
+    srv.spec_draft_n_min = 1
+    srv.spec_draft_n_max = 8
+    srv.n_slots = n_slots
+    srv.kv_unified = n_slots > 1
+    srv.slot_save_path = "./tmp"
+    srv.n_ctx = n_ctx
+    srv.n_batch = 1024
+    srv.temperature = 0.0
+    srv.server_metrics = True
+    srv.extra_args = ["--cache-disk", cache_dir, "--cache-disk-gib", "1", "--cache-disk-min-tokens", "1",
+                      "--cache-ram", "0",  # as the s1 / balkon profiles: no RAM tier between the slot and the disk
+                      "--cache-disk-async", str(async_mib)]
+    srv.env = env
+    return srv, cache_dir
+
+
+def dc_text(seed, n_words):
+    import random
+    rnd = random.Random(seed)
+    return " ".join(rnd.choice(DC_WORDS) for _ in range(n_words))
+
+
+def dc_complete(srv, prompt, n=8, slot=0):
+    res = srv.make_request("POST", "/completion", data={
+        "prompt": prompt, "n_predict": n, "id_slot": slot, "cache_prompt": True, "temperature": 0.0,
+        "return_tokens": True})
+    assert res.status_code == 200
+    return res.body
+
+
+def dc_metrics(srv):
+    res = srv.make_request("GET", "/metrics")  # a task through the loop: finished background saves are committed
+    assert res.status_code == 200
+    out = {}
+    for line in res.body.splitlines() if isinstance(res.body, str) else []:
+        if line.startswith("llamacpp:"):
+            k, v = line.split(" ", 1)
+            out[k[len("llamacpp:"):]] = float(v)
+    return out
+
+
+def dc_status(srv, through_loop=True):
+    if through_loop:
+        dc_metrics(srv)
+    res = srv.make_request("GET", "/disk-cache")
+    assert res.status_code == 200
+    return res.body
+
+
+def dc_settle(srv, tries=1200):
+    for _ in range(tries):
+        if dc_metrics(srv)["disk_cache_saves_pending"] == 0:
+            return dc_status(srv)
+        time.sleep(0.05)
+    assert False, "saves still pending"
+
+
+def dc_snapshot(cache_dir):
+    """the namespace by content: entries keyed by n_tokens (ids are random) -> sha of .tok / .aux / .tgt / .dft; the
+    block store as {name: sha}; no .tmp file may be left"""
+    import glob, hashlib, json as js
+    d = glob.glob(os.path.join(cache_dir, "ns-*"))
+    assert len(d) == 1, d
+    ns = d[0]
+    sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+    entries = {}
+    for meta in glob.glob(os.path.join(ns, "*.meta")):
+        eid = os.path.basename(meta)[:-5]
+        m = js.load(open(meta))
+        files = {ext: (sha(os.path.join(ns, eid + ext)) if os.path.exists(os.path.join(ns, eid + ext)) else None)
+                 for ext in (".tok", ".aux", ".tgt", ".dft")}
+        files["bytes"] = m["bytes"]
+        files["draft_cover"] = m["draft_cover"]
+        entries[m["n_tokens"]] = files
+    blk = {os.path.basename(p): sha(p) for p in glob.glob(os.path.join(ns, "blk", "*"))}
+    tmp = glob.glob(os.path.join(ns, "**", "*.tmp"), recursive=True)
+    return entries, blk, tmp
+
+
+DC_A = "Archive A. " + dc_text(1, 3000)
+DC_B = "Archive B. " + dc_text(2, 3000)
+DC_A_MORE = " Then " + dc_text(3, 600)
+
+
+def dc_scenario(srv, n_slots):
+    """A -> B (A saved) -> A grown (A loaded, B saved) -> B (A grown re-saved). With two slots X sits in slot 1 first
+    and is erased after A's first save, so A comes back at another cell offset"""
+    outs = []
+    if n_slots > 1:
+        dc_complete(srv, "Archive X. " + dc_text(9, 1500), slot=1)
+    outs.append(dc_complete(srv, DC_A)["tokens"])
+    if n_slots > 1:
+        assert srv.make_request("POST", "/slots/1?action=erase").status_code == 200
+    outs.append(dc_complete(srv, DC_B)["tokens"])
+    r = dc_complete(srv, DC_A + DC_A_MORE)
+    outs.append(r["tokens"])
+    loaded_a = r["timings"]["cache_n"]
+    r = dc_complete(srv, DC_B + " and so on")
+    outs.append(r["tokens"])
+    return outs, loaded_a, r["timings"]["cache_n"]
+
+
+# staging 1 MiB: every block waits for the previous one (back-pressure); n_slots 2: the cells move between the saves
+@pytest.mark.parametrize("staging_mib,n_slots", [(2048, 1), (1, 1), (2048, 2)])
+def test_disk_async_save_identical_to_sync(staging_mib, n_slots):
+    global server
+    res = {}
+    for mode, mib in (("sync", 0), ("async", staging_mib)):
+        server, cache_dir = dc_server(f"ident-{mode}-{staging_mib}-{n_slots}", mib, n_ctx=16384 * n_slots, n_slots=n_slots)
+        server.start()
+        outs, loaded_a, loaded_b = dc_scenario(server, n_slots)
+        st = dc_settle(server)
+        m = dc_metrics(server)
+        server.stop()
+        res[mode] = (outs, loaded_a, loaded_b, dc_snapshot(cache_dir), st, m)
+        print(f"{mode}: loaded A {loaded_a} B {loaded_b}, saves {st['saves']}, async {st['saves_async']}, written "
+              f"{st['bytes_written']}, re-save written {m['disk_cache_last_save_written_bytes']:.0f} of "
+              f"{m['disk_cache_last_save_state_bytes']:.0f}, blocks {len(res[mode][3][1])}")
+    s, a = res["sync"], res["async"]
+    assert s[0] == a[0], "continuations differ"
+    assert s[1] == a[1] and s[2] == a[2] and s[1] > 0 and s[2] > 0, "the loads differ / did not happen"
+    assert s[3][0] == a[3][0], "entries differ (.tok / .aux / .tgt / .dft content)"
+    assert s[3][1] == a[3][1], "block stores differ"
+    assert not s[3][2] and not a[3][2], "a .tmp file was left"
+    assert s[4]["saves"] == a[4]["saves"] and s[4]["bytes_written"] == a[4]["bytes_written"]
+    assert a[4]["saves_async"] == a[4]["saves"] and s[4]["saves_async"] == 0 and a[4]["saves_async_failed"] == 0
+    assert a[4]["save_async"] > 0 and s[4]["save_async"] == 0
+    assert a[5]["disk_cache_last_save_seconds"] >= a[5]["disk_cache_last_save_blocking_seconds"] > 0
+
+
+@pytest.mark.parametrize("n_slots", [1, 2])
+def test_disk_save_delta_resave(n_slots):
+    """[TAG_DISK_DELTA_REL] a conversation re-saved after it grew writes only the changed 4 MiB blocks (its K / V ranges
+    of ~11k rows x 1 KiB span 3 blocks), on both paths - with two slots in one pool its cells sit at another offset at
+    the re-save than at the first save (X erased in between), which the v63 tensor-aligned cut turned into a rewrite"""
+    global server
+    res = {}
+    for mode, mib in (("sync", 0), ("async", 2048)):
+        server, cache_dir = dc_server(f"delta-{mode}-{n_slots}", mib, n_ctx=32768 * n_slots, n_slots=n_slots)
+        server.start()
+        a = "Archive A. " + dc_text(22, 9000)
+        b = "Archive B. " + dc_text(23, 2000)
+        if n_slots > 1:
+            dc_complete(server, "Archive X. " + dc_text(21, 1500), slot=1)
+        dc_complete(server, a)
+        if n_slots > 1:
+            assert server.make_request("POST", "/slots/1?action=erase").status_code == 200
+        dc_complete(server, b)  # the first save of A
+        first = dc_settle(server)["last_save_written"]
+        r = dc_complete(server, a + " Then " + dc_text(24, 200))  # A loaded (elsewhere), grows; B saved
+        assert r["timings"]["cache_n"] > 5000, r["timings"]
+        dc_complete(server, b + " x")  # the re-save of A
+        dc_settle(server)
+        m = dc_metrics(server)
+        res[mode] = (m["disk_cache_last_save_state_bytes"], m["disk_cache_last_save_written_bytes"], r["tokens"], first)
+        assert dc_complete(server, a + " Then " + dc_text(24, 200) + " end")["timings"]["cache_n"] > 5000
+        server.stop()
+        print(f"{mode} np {n_slots}: first save written {first}, re-save state {res[mode][0]:.0f} written "
+              f"{res[mode][1]:.0f} ({100.0 * res[mode][1] / res[mode][0]:.1f} %)")
+    assert res["sync"][2] == res["async"][2]
+    assert abs(res["sync"][1] - res["async"][1]) < 1e4  # the same blocks written (/metrics prints %g)
+    for mode in res:
+        assert res[mode][1] < 0.3 * res[mode][0], f"{mode}: the re-save rewrote unchanged blocks"
+
+
+def test_disk_async_save_in_flight_lookup_and_second_save():
+    """A's save still in flight when A comes back: the lookup waits for it and loads it (no re-processing); two saves of
+    the same slot in flight at once, committed in order"""
+    global server
+    server, _ = dc_server("inflight", 2048, env={"LLAMA_DISK_ASYNC_TEST_DELAY_MS": "1500"})
+    server.start()
+    short_b = "Archive B. " + dc_text(2, 200)  # a short turn: A's save is still running when it returns
+    dc_complete(server, DC_A)
+    dc_complete(server, short_b)
+    m = dc_metrics(server)
+    assert m["disk_cache_saves_pending"] >= 1 and m["disk_cache_entries"] == 0, m
+    r = dc_complete(server, DC_A + DC_A_MORE)  # waits for A's save, then loads it
+    assert r["timings"]["cache_n"] >= 3000, r["timings"]
+    dc_complete(server, "Archive C. " + dc_text(4, 200))  # C evicts A+ (a long save)
+    dc_complete(server, "Archive D. " + dc_text(5, 200))  # D evicts C: two saves of slot 0 in flight
+    assert dc_metrics(server)["disk_cache_saves_pending"] >= 2
+    st = dc_settle(server)
+    # A (its tokens incl. the 8 generated ones are no prefix of A+: kept), B, A+, C; D is in the slot
+    assert len(st["entries"]) == 4 and st["saves_async_failed"] == 0
+    got = dc_complete(server, DC_A + DC_A_MORE + " end")
+    assert got["timings"]["cache_n"] >= 3000, got["timings"]
+    server.stop()
+
+
+def test_disk_async_save_commits_on_an_idle_server():
+    """(review C1) a background save that finishes while no request comes is committed by the woken server loop"""
+    global server
+    server, _ = dc_server("idle", 2048, env={"LLAMA_DISK_ASYNC_TEST_DELAY_MS": "300"})
+    server.start()
+    dc_complete(server, DC_A)
+    dc_complete(server, "Archive B. " + dc_text(2, 200))  # A's save starts; then the server is idle
+    t0 = time.time()
+    st = dc_status(server, through_loop=False)
+    assert st["n_entries"] == 0
+    while time.time() - t0 < 30:  # GET /disk-cache is not a task: only the wake commits
+        st = dc_status(server, through_loop=False)
+        if st["n_entries"] == 1:
+            break
+        time.sleep(0.1)
+    waited = time.time() - t0
+    print(f"committed after {waited:.1f} s, pending {st['saves_pending']}")
+    assert st["n_entries"] == 1 and st["saves_pending"] == 0
+    # the background part: 300 ms per block over the workers (the server's min(4, cores / 4)); the commit follows within 2 s
+    n_workers = min(4, max(1, (os.cpu_count() or 1) // 4))
+    assert waited < 2.0 + 0.3 * st["n_blocks"] / n_workers + 1.0
+    server.stop()
+
+
+@pytest.mark.parametrize("hook", ["LLAMA_DISK_ASYNC_TEST_FAIL_MAPS", "LLAMA_DISK_ASYNC_TEST_FAIL_META"])
+def test_disk_async_save_background_failure(hook):
+    """(review C2, r2 C2) a save that fails in the background - a map write that throws on a worker, or its .meta at
+    the commit - is committed as a failure: its files and fresh blocks go (the block inventory matches the files), the
+    staging and job accounting stay consistent (later saves do not block, the drain at exit does not hang)"""
+    import glob
+    global server
+    server, cache_dir = dc_server(f"fail-{hook[-4:].lower()}", 64, env={hook: "1"})
+    server.start()
+    dc_complete(server, DC_A)
+    dc_complete(server, DC_B)  # A's save fails
+    st = dc_settle(server)
+    assert st["saves_async_failed"] == 1 and st["n_entries"] == 0, st
+    blk_files = lambda: len(glob.glob(os.path.join(glob.glob(os.path.join(cache_dir, "ns-*"))[0], "blk", "*.blk")))
+    assert st["n_blocks"] == blk_files() == 0, (st["n_blocks"], blk_files())
+    r = dc_complete(server, DC_A + " again")  # nothing to load; B's save works
+    assert r["timings"]["cache_n"] < 100
+    st = dc_settle(server)
+    assert st["saves_async_failed"] == 1 and st["saves_async"] == 1 and st["n_entries"] == 1
+    assert st["n_blocks"] == blk_files()
+    t0 = time.time()
+    server.stop()  # save on exit + drain
+    assert time.time() - t0 < 5
+    entries, blk, tmp = dc_snapshot(cache_dir)
+    assert len(entries) == 2 and not tmp  # B and the last A, no file of the failed save
+    server.start()
+    st = dc_status(server)
+    assert st["n_entries"] == 2 and st["n_blocks"] == len(blk)  # no unreferenced block was left on disk
+    server.stop()
+
+
+def test_disk_async_save_before_sleep():
+    """(review r2 C1) the idle sleep saves every slot with saves in flight and one worker: a worker that finishes
+    wakes the server loop while the loop holds the task mutex in the sleeping callback - no deadlock, both saves land"""
+    global server
+    server, cache_dir = dc_server("sleep", 2048, n_ctx=32768, n_slots=2,
+                                  env={"LLAMA_DISK_ASYNC_TEST_THREADS": "1", "LLAMA_DISK_ASYNC_TEST_DELAY_MS": "20"})
+    server.sleep_idle_seconds = 1
+    server.start()
+    dc_complete(server, DC_A, slot=0)
+    dc_complete(server, DC_B, slot=1)
+    t0 = time.time()
+    slept = False
+    while time.time() - t0 < 30:
+        res = server.make_request("GET", "/props", timeout=5)
+        if res.status_code == 200 and res.body.get("is_sleeping"):
+            slept = True
+            break
+        time.sleep(0.2)
+    print(f"asleep after {time.time() - t0:.1f} s")
+    assert slept, "the server did not reach the sleeping state (pre-sleep save deadlocked?)"
+    t1 = time.time()
+    server.stop()
+    assert time.time() - t1 < 5
+    entries, blk, tmp = dc_snapshot(cache_dir)
+    assert len(entries) == 2 and not tmp
+
+
+def test_disk_async_save_at_shutdown():
+    """a save in flight when the server stops: save_on_exit drains it - the entry is on disk and loads after a restart"""
+    global server
+    server, cache_dir = dc_server("shutdown", 2048, env={"LLAMA_DISK_ASYNC_TEST_DELAY_MS": "40"})
+    server.start()
+    dc_complete(server, DC_A)
+    dc_complete(server, DC_B)  # A in flight; B stays in the slot (saved on exit)
+    server.stop()
+    entries, blk, tmp = dc_snapshot(cache_dir)
+    assert len(entries) == 2 and not tmp
+    server.start()
+    assert dc_complete(server, DC_A + " again")["timings"]["cache_n"] >= 3000
+    assert dc_complete(server, DC_B + " again")["timings"]["cache_n"] >= 3000
+    server.stop()
