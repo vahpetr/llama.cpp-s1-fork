@@ -1737,6 +1737,10 @@ public:
             res.disk.last_save_written     = disk_cache->last_save_written;
             res.disk.last_load_us          = disk_cache->last_load_us;
             res.disk.last_load_bytes       = disk_cache->last_load_bytes;
+            res.disk.bytes_pending         = disk_cache->pending_bytes();
+            res.disk.last_save_commit_us   = disk_cache->last_save_commit_us;
+            res.disk.n_save_backpressure   = disk_cache->n_save_backpressure;
+            res.disk.n_saves_superseded    = disk_cache->n_saves_superseded;
         }
 
         return res;
@@ -1758,6 +1762,15 @@ public:
 
     // [TAG_DISK_PROMPT_CACHE] best-effort: a failed save is logged and the conversation is lost (also used before
     //   the idle sleep frees the contexts, [TAG_SLEEP_SAVE])
+    // [TAG_DISK_ASYNC_SAVE] (review r3 I5, r4 6) one warning per failed background save, named by its entry: the slot it
+    //   was copied from usually holds another conversation by the time the failure is committed
+    void report_disk_lost(const std::vector<server_disk_lost> & lost, const char * when) {
+        for (const auto & l : lost) {
+            SRV_WRN("disk cache: the background save of entry %s (%zu tokens, copied from slot %d) failed (committed %s), "
+                    "that conversation is not on disk\n", l.id.c_str(), l.n_tokens, l.id_slot, when);
+        }
+    }
+
     void save_all_slots(const char * why) {
         if (!disk_cache || sleeping || ctx_tgt == nullptr) {
             return;
@@ -1772,11 +1785,7 @@ public:
         }
         // [TAG_DISK_ASYNC_SAVE] every background save committed before the contexts go; a slot whose save failed in the
         //   background (its disk_save() returned true when the copy was queued) is reported here
-        for (const int32_t id : disk_cache->drain()) { // ids deduplicated; slot ids are their indices
-            if (id >= 0 && id < (int32_t) slots.size()) {
-                SLT_WRN(slots[id], "disk cache: the background save before %s failed, the conversation is not on disk\n", why);
-            }
-        }
+        report_disk_lost(disk_cache->drain(), (std::string("before ") + why).c_str());
     }
 
 private:
@@ -2777,6 +2786,7 @@ private:
             disk_cache->live_refs = [this]() { return live_deep_refs(); };
             disk_cache->ckpt_sem_max = params_base.cache_disk_ckpt_semantic; // [TAG_SEMANTIC_CKPT]
             disk_cache->on_async_done = [this]() { queue_tasks.wake(); }; // [TAG_DISK_ASYNC_SAVE] commit on an idle loop
+            disk_cache->set_test_hooks(params_base.cache_disk_test); // [TAG_DISK_ASYNC_SAVE]
             disk_cache->set_async((uint64_t) params_base.cache_disk_async_mib << 20); // [TAG_DISK_ASYNC_SAVE]
             disk_cache->adopt_keys = string_split<std::string>(params_base.cache_disk_adopt, ',');
             disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types) +
@@ -2787,7 +2797,8 @@ private:
         } else if (disk_cache) {
             disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types) +
                                       "/" + common_speculative_state_schema(spec.get()));
-            disk_cache->revalidate(cache_compat_key(server_disk_cache_fingerprint(params_base, cache_n_ctx_seq())));
+            report_disk_lost(disk_cache->revalidate(cache_compat_key(server_disk_cache_fingerprint(params_base, cache_n_ctx_seq()))),
+                             "at the namespace check");
             cache_compat_publish();
         }
 
@@ -3109,7 +3120,7 @@ private:
             // [TAG_DISK_ASYNC_SAVE] this conversation's own save still in flight (it left this or another slot just
             //   now): wait for its commit, so the lookup finds it instead of re-processing the prompt
             if (reuse) {
-                disk_cache->await_pending(task.tokens, lcp_slot + margin);
+                report_disk_lost(disk_cache->await_pending(task.tokens, lcp_slot + margin), "before a lookup");
             }
 
             const bool will_load = reuse && disk_cache->find(task.tokens, lcp_slot + margin, ret->n_ctx, nullptr) >= 0;
@@ -4885,7 +4896,7 @@ private:
             case SERVER_TASK_TYPE_METRICS:
                 {
                     if (disk_cache) {
-                        disk_cache->poll(); // [TAG_DISK_ASYNC_SAVE] finished background saves show as committed
+                        report_disk_lost(disk_cache->poll(), "at /metrics"); // [TAG_DISK_ASYNC_SAVE] finished saves committed
                     }
 
                     int n_processing_slots = 0;
@@ -5654,7 +5665,7 @@ private:
         slots_invalidated.clear();
 
         if (disk_cache) {
-            disk_cache->poll(); // [TAG_DISK_ASYNC_SAVE] commit the background saves that finished
+            report_disk_lost(disk_cache->poll(), "on the server loop"); // [TAG_DISK_ASYNC_SAVE] finished saves committed
         }
 
 #ifdef DEBUG_TIMINGS

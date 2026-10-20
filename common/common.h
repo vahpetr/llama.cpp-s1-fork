@@ -675,6 +675,7 @@ struct common_params {
     int32_t     cache_disk_ckpt_max   = 32;    // deep checkpoints kept per conversation
     int32_t     cache_disk_ckpt_semantic = 16; // [TAG_SEMANTIC_CKPT] message-boundary checkpoints kept on top (0 = off)
     int32_t     cache_disk_async_mib  = 0;     // [TAG_DISK_ASYNC_SAVE] host staging of the asynchronous save, MiB (0 = synchronous)
+    bool        cache_disk_test       = false; // [TAG_DISK_ASYNC_SAVE] honour LLAMA_DISK_ASYNC_TEST hooks (tests only)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

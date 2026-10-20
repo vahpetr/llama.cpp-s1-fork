@@ -1305,8 +1305,9 @@ def test_slot_restore_checkpoints_draft_kv_type_change(swa_server, ctkd_restore)
 # [TAG_DISK_ASYNC_SAVE] (SC2) the asynchronous disk-cache save (--cache-disk-async N MiB): the server loop copies the
 #   state off the device, workers hash / write the blocks, the loop commits. Compared with the synchronous path
 #   (--cache-disk-async 0) byte by byte, and exercised with a save in flight against a lookup of its conversation, two saves
-#   of one slot in flight, an idle server, an injected background failure and shutdown. LLAMA_DISK_ASYNC_TEST_DELAY_MS
-#   slows every background block task, LLAMA_DISK_ASYNC_TEST_FAIL_MAPS=N makes the first N map writes throw.
+#   of one slot in flight, an idle server, an injected background failure and shutdown. The server's test hooks
+#   (LLAMA_DISK_ASYNC_TEST=key=value,... with --cache-disk-test; keys in server-disk-cache.cpp) slow or fail the
+#   background work: dc_server(hooks={...}).
 #   Model: LFM2-350M (hybrid: checkpoints / .ck files; 128k training context - the server caps the slot context at it),
 #   also as the draft (every entry has a .dft stream)
 DC_MODEL_URL = "https://huggingface.co/LiquidAI/LFM2-350M-GGUF/resolve/main/LFM2-350M-Q8_0.gguf"
@@ -1314,10 +1315,11 @@ DC_WORDS = ("apple river stone cloud garden lantern window forest silver morning
             "pencil violet copper island marble whisper orchard falcon velvet canyon").split()
 
 
-def dc_server(tag, async_mib, env=None, n_ctx=16384, n_slots=1):
+def dc_server(tag, async_mib, env=None, n_ctx=16384, n_slots=1, fresh=True, hooks=None):
+    """hooks: the server's LLAMA_DISK_ASYNC_TEST keys (server-disk-cache.cpp), passed with --cache-disk-test"""
     import shutil
     cache_dir = os.path.abspath(os.path.join("./tmp", f"sc2-{tag}"))
-    if os.path.isdir(cache_dir):
+    if fresh and os.path.isdir(cache_dir):
         shutil.rmtree(cache_dir)
     srv = ServerPreset.tinyllama2()
     srv.model_hf_repo = None
@@ -1336,7 +1338,13 @@ def dc_server(tag, async_mib, env=None, n_ctx=16384, n_slots=1):
     srv.extra_args = ["--cache-disk", cache_dir, "--cache-disk-gib", "1", "--cache-disk-min-tokens", "1",
                       "--cache-ram", "0",  # as the s1 / balkon profiles: no RAM tier between the slot and the disk
                       "--cache-disk-async", str(async_mib)]
-    srv.env = env
+    srv.env = dict(env or {})
+    if hooks is None and "LLAMA_DISK_ASYNC_TEST" not in srv.env:
+        hooks = {}
+    if hooks is not None:
+        hooks = {"check_pins": "1", **hooks}  # (review r11 6) cached vs freshly derived pins after every commit
+        srv.extra_args.append("--cache-disk-test")
+        srv.env["LLAMA_DISK_ASYNC_TEST"] = ",".join(f"{k}={v}" for k, v in hooks.items())
     return srv, cache_dir
 
 
@@ -1376,7 +1384,9 @@ def dc_status(srv, through_loop=True):
 def dc_settle(srv, tries=1200):
     for _ in range(tries):
         if dc_metrics(srv)["disk_cache_saves_pending"] == 0:
-            return dc_status(srv)
+            st = dc_status(srv)
+            assert st.get("pin_check_failures", 0) == 0, "the cached pin set differed from a fresh derivation"
+            return st
         time.sleep(0.05)
     assert False, "saves still pending"
 
@@ -1493,7 +1503,7 @@ def test_disk_async_save_in_flight_lookup_and_second_save():
     """A's save still in flight when A comes back: the lookup waits for it and loads it (no re-processing); two saves of
     the same slot in flight at once, committed in order"""
     global server
-    server, _ = dc_server("inflight", 2048, env={"LLAMA_DISK_ASYNC_TEST_DELAY_MS": "1500"})
+    server, _ = dc_server("inflight", 2048, hooks={"delay_ms": "1500"})
     server.start()
     short_b = "Archive B. " + dc_text(2, 200)  # a short turn: A's save is still running when it returns
     dc_complete(server, DC_A)
@@ -1516,7 +1526,9 @@ def test_disk_async_save_in_flight_lookup_and_second_save():
 def test_disk_async_save_commits_on_an_idle_server():
     """(review C1) a background save that finishes while no request comes is committed by the woken server loop"""
     global server
-    server, _ = dc_server("idle", 2048, env={"LLAMA_DISK_ASYNC_TEST_DELAY_MS": "300"})
+    n_workers = 2  # explicit (review r3 I6): the bound below does not depend on the host's cores / affinity
+    server, _ = dc_server("idle", 2048, hooks={"delay_ms": "300",
+                                             "threads": str(n_workers)})
     server.start()
     dc_complete(server, DC_A)
     dc_complete(server, "Archive B. " + dc_text(2, 200))  # A's save starts; then the server is idle
@@ -1531,20 +1543,540 @@ def test_disk_async_save_commits_on_an_idle_server():
     waited = time.time() - t0
     print(f"committed after {waited:.1f} s, pending {st['saves_pending']}")
     assert st["n_entries"] == 1 and st["saves_pending"] == 0
-    # the background part: 300 ms per block over the workers (the server's min(4, cores / 4)); the commit follows within 2 s
-    n_workers = min(4, max(1, (os.cpu_count() or 1) // 4))
+    # the background part: 300 ms per block over the workers; the commit follows within 2 s
     assert waited < 2.0 + 0.3 * st["n_blocks"] / n_workers + 1.0
     server.stop()
 
 
-@pytest.mark.parametrize("hook", ["LLAMA_DISK_ASYNC_TEST_FAIL_MAPS", "LLAMA_DISK_ASYNC_TEST_FAIL_META"])
+def test_disk_async_test_hooks_need_the_flag():
+    """(review r7 5) LLAMA_DISK_ASYNC_TEST is honoured only with --cache-disk-test: a leaked variable (here a 1 MiB quota)
+    leaves the cache as configured"""
+    global server
+    server, _ = dc_server("hooksoff", 2048, env={"LLAMA_DISK_ASYNC_TEST": "quota_mib=1,threads=1"})
+    server.start()
+    assert dc_status(server, through_loop=False)["quota_bytes"] == 1 << 30  # --cache-disk-gib 1
+    server.stop()
+    server, _ = dc_server("hookson", 2048, hooks={"quota_mib": "1"})
+    server.start()
+    assert dc_status(server, through_loop=False)["quota_bytes"] == 1 << 20
+    server.stop()
+
+
+def test_disk_async_enqueue_failure_leaves_no_phantom_task():
+    """(review r10 2) a block task whose queue insertion fails (hook fail_enqueue: std::bad_alloc) fails its save without a
+    phantom task: later saves still commit in order and the exit drain does not hang"""
+    global server
+    server, _ = dc_server("enqfail", 2048, hooks={"fail_enqueue": "3"})
+    server.start()
+    dc_complete(server, DC_A)
+    dc_complete(server, DC_B)  # A's save: its 3rd block's enqueue throws
+    st = dc_settle(server)
+    assert st["saves_async_failed"] == 1 and st["n_entries"] == 0, st
+    dc_complete(server, "Archive C. " + dc_text(8, 50))  # B's save commits after the failed one
+    st = dc_settle(server)
+    assert st["saves_async"] == 1 and st["n_entries"] == 1
+    t0 = time.time()
+    server.stop()
+    assert time.time() - t0 < 5
+
+
+def test_disk_sync_fallback_shares_blocks_with_a_save_in_flight():
+    """(review r12 1, r13 7) the synchronous fallback writes blocks on the workers' claims and never waits for them: two
+    sibling conversations share ~7.5k tokens of prefix (whole blocks); slot 0's save is in flight, slot 1's runs
+    synchronously (max_jobs 1). Run 1: the worker is slow per block; run 2: the worker's first block write (a shared
+    block) is held 6 s while marked "being written" - the synchronous save does not wait for it (the request returns
+    well inside the hold) and writes that block once more (bytes_written_twice). Both runs: every block file intact,
+    the block set equals an all-synchronous control run, bytes_written = the control's + bytes_written_twice, both
+    entries load after a restart"""
+    import glob
+    global server
+    shared = DC_A + DC_B
+    p0 = shared + " Sibling one " + dc_text(41, 100)
+    p1 = shared + " Sibling two " + dc_text(42, 100)
+
+    def run(tag, async_mib, hooks):
+        global server
+        server, cache_dir = dc_server(tag, async_mib, n_ctx=32768, n_slots=2, hooks=hooks)
+        server.start()
+        dc_complete(server, p0, slot=0)
+        dc_complete(server, p1, slot=1)
+        dc_complete(server, "Archive X. " + dc_text(43, 50), slot=0)  # (async runs) job 1: sibling one
+        t0 = time.monotonic()
+        dc_complete(server, "Archive Y. " + dc_text(44, 50), slot=1)  # (async runs) sibling two: synchronous
+        waited = time.monotonic() - t0
+        st = dc_settle(server)
+        server.stop()
+        ns = glob.glob(os.path.join(cache_dir, "ns-*"))[0]
+        blk = {os.path.basename(f): os.path.getsize(f) for f in glob.glob(os.path.join(ns, "blk", "*"))}
+        return st, blk, waited
+
+    ctl, ctl_blk, _ = run("syncshare-ctl", 0, None)
+    for tag, hooks in (("syncshare", {"max_jobs": "1", "threads": "1", "delay_ms": "150", "finalize_delay_job1_ms": "6000"}),
+                       ("syncshare-held", {"max_jobs": "1", "threads": "1", "hold_write_job1_ms": "6000"})):
+        st, blk, waited = run(tag, 2048, hooks)
+        twice = st["bytes_written_twice"]
+        print(f"{tag}: sync request {waited:.1f} s, saves {st['saves']} async {st['saves_async']} backpressure "
+              f"{st['save_backpressure']} written {st['bytes_written']} (control {ctl['bytes_written']}, twice {twice}), "
+              f"blocks {len(blk)} (control {len(ctl_blk)})")
+        assert st["save_backpressure"] == 1 and st["saves_async"] == 1 and st["saves"] == 2 and st["saves_async_failed"] == 0
+        for name, size in blk.items():
+            assert ".tmp" not in name, f"a temp block file was left: {name}"
+            assert size == int(name[:-4].rsplit("-", 1)[1]), f"block {name} is truncated"
+        assert blk == ctl_blk, "the block set differs from the synchronous control"
+        assert st["bytes_written"] == ctl["bytes_written"] + twice, "bytes counted twice or skipped vs the control"
+        if tag == "syncshare-held":
+            assert waited < 6.0 - 2.5, "the synchronous save waited for the held worker write"
+            assert 0 < twice <= 4 << 20, "the held block was not written by the synchronous save"
+        else:
+            assert twice <= 4 << 20
+        server, _ = dc_server(tag, 2048, n_ctx=32768, n_slots=2, fresh=False)
+        server.start()
+        for prompt in (p0, p1):
+            assert dc_complete(server, prompt + " end", slot=0)["timings"]["cache_n"] >= 7000
+        server.stop()
+
+
+def test_disk_async_save_superseded_by_a_sync_extension():
+    """(review r12 2, r13 1) A is registered; A+ (slot 0) is in flight with a held end and pins A; A++ (slot 1, extends
+    A+) is saved synchronously and commits first: A+ is superseded at once (it stops pinning, so A++'s commit replaces
+    A) and dropped at its commit - only A++ is registered of the three"""
+    global server
+    server, _ = dc_server("supersede", 2048, n_ctx=32768, n_slots=2,
+                          hooks={"max_jobs": "1", "finalize_delay_job3_ms": "5000"})
+    server.start()
+    o1 = dc_complete(server, DC_A, slot=0)["content"]
+    dc_complete(server, "Archive Z. " + dc_text(50, 50), slot=0)  # job 1: A
+    n_a = [e["n_tokens"] for e in dc_settle(server)["entries"]]
+    a_plus = DC_A + o1 + DC_A_MORE
+    o2 = dc_complete(server, a_plus, slot=0)["content"]  # job 2: Archive Z
+    dc_settle(server)
+    a_pp = a_plus + o2 + " Later " + dc_text(51, 200)
+    dc_complete(server, a_pp, slot=1)
+    dc_complete(server, "Archive X. " + dc_text(52, 50), slot=0)  # job 3: A+ (held)
+    dc_complete(server, "Archive Y. " + dc_text(53, 50), slot=1)  # A++: synchronous, commits first
+    st = dc_settle(server)
+    long_entries = sorted(e["n_tokens"] for e in st["entries"] if e["n_tokens"] > 1000)
+    print(f"A {n_a}, entries {[(e['id'], e['n_tokens']) for e in st['entries']]} saves {st['saves']} "
+          f"superseded {st['saves_superseded']}")
+    assert st["saves_superseded"] == 1 and st["saves_async_failed"] == 0
+    assert len(long_entries) == 1 and long_entries[0] > max(n_a), st["entries"]
+    assert dc_complete(server, a_pp + " end", slot=0)["timings"]["cache_n"] >= 3000
+    server.stop()
+
+
+def test_disk_async_superseded_save_commits_when_its_extension_is_gone():
+    """(review r14 1) A+ (slot 0) is in flight with a held end; A++ (slot 1) is saved synchronously and supersedes it;
+    under a tight quota a later synchronous save evicts A++ before A+ commits - A+ then commits normally (it is not
+    dropped: nothing else holds that conversation)"""
+    global server
+    server, _ = dc_server("supersede-evicted", 2048, n_ctx=32768, n_slots=2,
+                          hooks={"max_jobs": "1", "finalize_delay_job1_ms": "45000", "quota_mib": "150"})
+    server.start()
+    a_plus = DC_A + DC_A_MORE
+    o = dc_complete(server, a_plus, slot=0)["content"]
+    a_pp = a_plus + o + " Later " + dc_text(57, 200)
+    dc_complete(server, a_pp, slot=1)
+    dc_complete(server, "Archive X. " + dc_text(58, 50), slot=0)  # job 1: A+ (held)
+    dc_complete(server, "Archive Y. " + dc_text(59, 50), slot=1)  # A++: synchronous, supersedes A+
+    n_app = max(e["n_tokens"] for e in dc_status(server)["entries"])
+    dc_complete(server, DC_B, slot=1)                              # (Archive Y saved synchronously)
+    dc_complete(server, "Archive W. " + dc_text(60, 50), slot=1)  # DC_B saved synchronously: evicts A++
+    mid = dc_status(server)
+    st = dc_settle(server)
+    print(f"A++ {n_app}; before A+ commits {[(e['id'], e['n_tokens']) for e in mid['entries']]}; "
+          f"after {[(e['id'], e['n_tokens']) for e in st['entries']]}; superseded {st['saves_superseded']}, "
+          f"evictions {st.get('evictions')}")
+    assert n_app not in [e["n_tokens"] for e in mid["entries"]], "A++ was not evicted before A+ committed"
+    assert st["saves_superseded"] == 0 and st["saves_async_failed"] == 0
+    long_entries = [e["n_tokens"] for e in st["entries"] if e["n_tokens"] > 4000 and e["n_tokens"] < n_app]
+    assert len(long_entries) == 1, st["entries"]  # A+
+    assert dc_complete(server, a_plus + " end", slot=0)["timings"]["cache_n"] >= 4000
+    server.stop()
+
+
+def test_disk_async_superseded_save_neither_delays_a_lookup_nor_blocks_an_exact_save():
+    """(review r14 2, 3) A+ (slot 0) is in flight with a held end and superseded by A++ (slot 1, synchronous): an exact
+    save of A+'s tokens (slot 2) is not taken for "already in flight" (it is registered), and a request continuing A++
+    does not wait for the superseded save (it loads A++ well inside the hold)"""
+    global server
+    server, _ = dc_server("supersede-lookup", 2048, n_ctx=32768, n_slots=3,
+                          hooks={"max_jobs": "1", "finalize_delay_job1_ms": "30000"})
+    server.start()
+    a_plus = DC_A + DC_A_MORE
+    o = dc_complete(server, a_plus, slot=0)["content"]
+    assert dc_complete(server, a_plus, slot=2)["content"] == o
+    a_pp = a_plus + o + " Later " + dc_text(61, 200)
+    dc_complete(server, a_pp, slot=1)
+    dc_complete(server, "Archive X. " + dc_text(62, 50), slot=0)  # job 1: A+ (held)
+    dc_complete(server, "Archive Y. " + dc_text(63, 50), slot=1)  # A++: synchronous, supersedes A+
+    dc_complete(server, "Archive V. " + dc_text(64, 50), slot=2)  # exactly A+'s tokens: saved synchronously
+    mid = dc_status(server)
+    t0 = time.monotonic()
+    r = dc_complete(server, a_pp + " More " + dc_text(65, 20), slot=1)
+    waited = time.monotonic() - t0
+    st = dc_settle(server)
+    long_mid = sorted(e["n_tokens"] for e in mid["entries"] if e["n_tokens"] > 4000)
+    print(f"entries while A+ is held {long_mid}; lookup {waited:.1f} s, cache_n {r['timings']['cache_n']}; "
+          f"after {sorted(e['n_tokens'] for e in st['entries'] if e['n_tokens'] > 4000)}, superseded {st['saves_superseded']}")
+    assert len(long_mid) == 2, "the exact save of A+'s tokens was skipped"
+    assert waited < 30.0 - 20.0, "the lookup waited for the superseded save"
+    assert r["timings"]["cache_n"] >= long_mid[1] - 16
+    assert st["saves_superseded"] == 1 and st["saves_async_failed"] == 0
+    assert sorted(e["n_tokens"] for e in st["entries"] if e["n_tokens"] > 4000) == long_mid
+    server.stop()
+
+
+def test_disk_async_shorter_save_after_a_longer_entry_is_kept():
+    """(review r13 1) A++ registered in an earlier session; A+ saved asynchronously now: a longer entry that existed
+    before the save is no reason to drop it (as the synchronous path) - both are registered, nothing superseded"""
+    global server
+    server, _ = dc_server("nosupersede", 2048, n_ctx=32768, n_slots=1)
+    server.start()
+    a_plus = DC_A + DC_A_MORE
+    o = dc_complete(server, a_plus)["content"]
+    a_pp = a_plus + o + " Later " + dc_text(54, 200)
+    dc_complete(server, a_pp)
+    dc_complete(server, "Archive X. " + dc_text(55, 50))  # A++
+    st0 = dc_settle(server)
+    server.stop()
+    server, _ = dc_server("nosupersede", 2048, n_ctx=32768, n_slots=1, fresh=False)
+    server.start()
+    dc_complete(server, a_plus)
+    dc_complete(server, "Archive Y. " + dc_text(56, 50))  # A+ (async)
+    st = dc_settle(server)
+    long0 = sorted(e["n_tokens"] for e in st0["entries"] if e["n_tokens"] > 1000)
+    long1 = sorted(e["n_tokens"] for e in st["entries"] if e["n_tokens"] > 1000)
+    print(f"before {long0}, after {long1}, saves_async {st['saves_async']}, superseded {st['saves_superseded']}")
+    assert st["saves_superseded"] == 0 and st["saves_async"] >= 1
+    assert len(long1) == 2 and long1[1] == long0[-1] and long1[0] < long1[1], (long0, long1)
+    server.stop()
+
+
+def test_disk_async_backpressure_with_a_stalled_oldest_save():
+    """(review r10 4, r11 1-2) with 2 saves in flight (the oldest held 8 s at its end) the next save runs synchronously:
+    the loop does not wait for the in-flight saves (the request returns well inside the stall), the save is counted as
+    backpressure, the entry the in-flight A+ save extends (A) stays pinned under quota pressure (80 MiB, LFM2: prompt
+    checkpoints on every entry), and after a restart every committed entry is complete (no checkpoint file of an
+    unregistered save was collected)"""
+    global server
+    server, cache_dir = dc_server("bp", 2048, hooks={"finalize_delay_job2_ms": "8000", "quota_mib": "80"})
+    server.start()
+    o = dc_complete(server, DC_A)["content"]
+    a_plus = DC_A + o + DC_A_MORE
+    dc_complete(server, "Archive B. " + dc_text(2, 3000))  # job 1: A
+    st = dc_settle(server)
+    id_a = [e["id"] for e in st["entries"]]
+    assert len(id_a) == 1
+    r = dc_complete(server, a_plus)                        # A loaded; job 2: B (held 8 s)
+    assert r["timings"]["cache_n"] >= 3000, r["timings"]
+    dc_complete(server, "Archive C. " + dc_text(3, 200))   # job 3: A+ (pins A)
+    assert dc_metrics(server)["disk_cache_saves_pending"] == 2
+    t0 = time.time()
+    dc_complete(server, "Archive D. " + dc_text(4, 200))   # C's save: 2 in flight -> synchronous
+    waited = time.time() - t0
+    st = dc_status(server)
+    print(f"4th request took {waited:.1f} s, pending {st['saves_pending']}, backpressure {st['save_backpressure']}, "
+          f"entries {[(e['id'], e['n_tokens']) for e in st['entries']]}, evictions {st['evictions']}")
+    assert st["save_backpressure"] == 1
+    assert waited < 8.0 - 3.0, "the synchronous fallback waited for the held in-flight save (8 s stall)"
+    assert id_a[0] in [e["id"] for e in st["entries"]], "A (pinned by A+'s save in flight) was evicted"
+    st = dc_settle(server)
+    ids = [e["id"] for e in st["entries"]]
+    print(f"settled: entries {[(e['id'], e['n_tokens']) for e in st['entries']]}, evictions {st['evictions']}")
+    assert st["saves_async"] == 3 and st["saves_async_failed"] == 0 and st["saves"] == 4
+    assert id_a[0] not in ids and any(e["n_tokens"] > 4000 for e in st["entries"]), "A+ did not replace A"
+    server.stop()  # (the slot's D conversation is saved on exit)
+    import glob
+    metas = glob.glob(os.path.join(cache_dir, "ns-*", "*.meta"))
+    server, _ = dc_server("bp", 2048, fresh=False)  # the default quota: the start evicts nothing
+    server.start()
+    st = dc_status(server)
+    print(f"restart: {len(metas)} committed entries on disk, {st['n_entries']} loaded")
+    assert st["n_entries"] == len(metas), "an entry was dropped as incomplete at the restart (missing checkpoint file?)"
+    server.stop()
+
+def test_disk_async_save_idle_commit_stress():
+    """(review r3 C1) 200 x (a turn that replaces the slot's conversation - its save starts - then idle): every
+    background save is committed by the woken loop with no further task. No quota is set, nothing is evicted. The wake is
+    lock-free and can be late by up to the loop's 1 s wait (never lost): the per-iteration bound = 2 s + the save's new
+    blocks x the per-block delay over the workers + 1 s; "slow" iterations are collected, a save that never commits
+    fails after 30 s of waiting for it (the request time not included; review r9 8)"""
+    global server
+    delay_s, n_workers = 0.02, 2
+    server, _ = dc_server("stress", 2048, hooks={"delay_ms": str(int(delay_s * 1000)),
+                                               "threads": str(n_workers)})
+    server.start()
+    worst, slow = 0.0, []
+    n_blocks = dc_status(server, through_loop=False)["n_blocks"]
+    for i in range(201):
+        dc_complete(server, f"Note {i}. " + dc_text(1000 + i, 300), n=1)
+        if i == 0:
+            continue
+        t0 = time.time()
+        while True:
+            st = dc_status(server, through_loop=False)
+            if st["saves"] == i and st["saves_pending"] == 0:
+                break
+            assert time.time() - t0 < 30, f"iteration {i}: save never committed ({st['saves']} saves, {st['saves_pending']} pending)"
+            time.sleep(0.01)
+        waited = time.time() - t0
+        new_blocks = max(1, st["n_blocks"] - n_blocks)
+        n_blocks = st["n_blocks"]
+        bound = 2.0 + delay_s * 2 * new_blocks / n_workers + 1.0  # x2: target + draft streams claim each block
+        if waited > bound:
+            slow.append((i, round(waited, 2), round(bound, 2)))
+        worst = max(worst, waited)
+    print(f"200 idle commits, worst {worst:.2f} s, slow {slow}")
+    assert not slow, f"saves committed, but slower than the bound: {slow}"
+    server.stop()
+
+
+def test_disk_async_failed_commits_leave_no_orphan_block():
+    """(review r6 1) two saves share prefix blocks: J1 (slot 0) writes them and fails at its end while J2 (slot 1) holds
+    claims on them, then J2's commit fails (.meta) - the shared blocks J1 wrote and J2 inherited go with J2's failure
+    (no block file outside the inventory, none on disk)"""
+    import glob
+    global server
+    server, cache_dir = dc_server("orphan", 2048, n_ctx=32768, n_slots=2,
+                                  hooks={"delay_ms": "50", "threads": "2",
+                                       # J1's end lags its blocks by 4 s: J2 claims the shared blocks before J1 commits;
+                                       #   J2's by 12 s: still in flight when J1's failure is observed (review r7 6)
+                                       "finalize_delay_job1_ms": "4000", "finalize_delay_job2_ms": "12000",
+                                       "fail_job": "1", "fail_meta": "1"})
+    server.start()
+    shared = DC_A + DC_B  # ~7.5k tokens: past one 4 MiB block of each K / V range (4096 rows of 1 KiB)
+    dc_complete(server, shared + " tail one", slot=0)
+    dc_complete(server, shared + " tail two, longer", slot=1)  # the same prefix: the same leading blocks
+    dc_complete(server, "Archive C. " + dc_text(8, 50), slot=0)  # J1: slot 0's conversation (fails at its end)
+    dc_complete(server, "Archive D. " + dc_text(9, 50), slot=1)  # J2: slot 1's (claims J1's blocks; .meta fails)
+    blk_files = lambda: glob.glob(os.path.join(cache_dir, "ns-*", "blk", "*.blk"))
+    t0 = time.time()
+    while dc_status(server, through_loop=False)["saves_async_failed"] < 1:
+        assert time.time() - t0 < 60, "J1 never committed"
+        time.sleep(0.02)
+    st = dc_status(server, through_loop=False)
+    print(f"after J1's failure: pending {st['saves_pending']} files {len(blk_files())} (J2 holds the shared ones)")
+    assert st["saves_pending"] >= 1, "J2 finished before J1's failure: the shared claim was not exercised"
+    assert len(blk_files()) > 0, "no block survived J1's failure: the two saves share no block (nothing to test)"
+    st = dc_settle(server)
+    blk = blk_files()
+    print(f"failed {st['saves_async_failed']} entries {st['n_entries']} inventory {st['n_blocks']} files {len(blk)}")
+    assert st["saves_async_failed"] == 2 and st["n_entries"] == 0
+    assert st["n_blocks"] == 0 and len(blk) == 0, "a block of the failed saves was left on disk"
+    server.stop()
+
+
+def test_disk_async_quota_pins_replaced_prefix():
+    """(review r4 1) while a save of A+ is in flight, the entry A it will replace is pinned: an enforce() run by an
+    earlier save's commit (over quota) evicts neither A nor, in a cascade, anything else it cannot free; A+ then
+    commits and replaces A"""
+    global server
+    server, _ = dc_server("pin", 2048, hooks={"delay_ms": "400", "threads": "1",
+                                            "quota_mib": "70"})
+    server.start()
+    a_out = dc_complete(server, DC_A)["content"]
+    a_plus = DC_A + a_out + DC_A_MORE                    # the conversation continues: A (with its answer) is a prefix
+    dc_complete(server, DC_B)                            # A saved; B in the slot
+    st = dc_settle(server)
+    id_a = [e["id"] for e in st["entries"]]
+    assert len(id_a) == 1, st["entries"]
+    saves0 = st["saves"]
+    dc_complete(server, a_plus)                          # A loaded; B saved (job 1, slow)
+    dc_complete(server, "Archive C. " + dc_text(8, 50))  # A+ saved (job 2, replaces A: pinned)
+    # job 1 commits while job 2 is in flight: A + B are over the 70 MiB quota, A is pinned
+    t0 = time.time()
+    while True:
+        st = dc_status(server, through_loop=False)
+        if st["saves"] == saves0 + 1:
+            break  # B committed (review r5 7: by the save count, not a token window)
+        assert time.time() - t0 < 120, f"B's save never committed ({st['saves']} saves)"
+        time.sleep(0.05)
+    id_b = [e["id"] for e in st["entries"] if e["id"] not in id_a]
+    print(f"after B's commit: pending {st['saves_pending']} entries {[e['n_tokens'] for e in st['entries']]} "
+          f"evictions {st['evictions']} bytes {st['bytes_on_disk']} pending bytes {st['bytes_pending']}")
+    assert st["saves_pending"] >= 1, "A+'s save finished too early for the check"
+    assert id_a[0] in [e["id"] for e in st["entries"]], "the pinned prefix entry was evicted"
+    assert st["evictions"] == 0, "enforce() evicted while only pinned / protected entries could free the charge"
+    st = dc_settle(server)
+    ids = [e["id"] for e in st["entries"]]
+    assert id_a[0] not in ids and len(set(ids) - set(id_a) - set(id_b)) == 1, st["entries"]  # A+ replaced A
+    assert dc_complete(server, a_plus + " end")["timings"]["cache_n"] >= 3000
+    server.stop()
+
+
+def test_disk_async_continuation_charge():
+    """(review r5 1) a continuation save (A+ replacing A) is charged what it writes minus A's own files - not minus A's
+    logical size, which made its charge 0 while its blocks were being written"""
+    global server
+    server, _ = dc_server("contq", 2048, hooks={"delay_ms": "300", "threads": "1"})
+    server.start()
+    a_out = dc_complete(server, DC_A)["content"]
+    a_plus = DC_A + a_out + DC_A_MORE
+    dc_complete(server, DC_B)       # A saved
+    dc_settle(server)
+    dc_complete(server, a_plus)     # A loaded, B saved
+    dc_settle(server)
+    dc_complete(server, "Archive C. " + dc_text(8, 50))  # A+ saved (replaces A), slow
+    peak, t0 = 0.0, time.time()
+    while True:
+        m = dc_metrics(server)
+        if m["disk_cache_saves_pending"] == 0:
+            break
+        peak = max(peak, m["disk_cache_bytes_pending"])
+        assert time.time() - t0 < 120, "the save never committed"
+        time.sleep(0.1)
+    print(f"continuation save: peak bytes_pending {peak:.0f}, written {m['disk_cache_last_save_written_bytes']:.0f}")
+    assert peak > 0, "the continuation save was charged nothing while writing"
+    server.stop()
+
+
+def test_disk_async_chained_saves_keep_the_middle_entry():
+    """(review r5 2) A+ (slot 0) and A++ (slot 1, extends A+) are saved back to back; when A+'s save commits, the new
+    A+ entry is handed to A++'s save in flight (pinned): a deep-checkpoint enforce() while A++ is still writing does not
+    evict it (quota 1 MiB: everything evictable would go); A++'s save then fails (injected)"""
+    global server
+    server, _ = dc_server("chain", 2048, n_ctx=32768, n_slots=2,
+                          hooks={"delay_ms": "700", "threads": "1",
+                               "quota_mib": "1", "fail_job": "2"})
+    server.extra_args += ["--ctx-checkpoints", "1", "--checkpoint-min-step", "64"]
+    server.start()
+    a_plus = DC_A + DC_A_MORE
+    o1 = dc_complete(server, a_plus, slot=0)["content"]                 # slot 0: A+
+    dc_complete(server, a_plus + o1 + " Later " + dc_text(31, 200), slot=1)  # slot 1: A++ (extends A+)
+    dc_complete(server, "Archive C. " + dc_text(8, 50), slot=0)         # job 1: A+
+    dc_complete(server, "Archive D. " + dc_text(9, 50), slot=1)         # job 2: A++ (fails at its end)
+    t0 = time.time()
+    while True:
+        st = dc_status(server, through_loop=False)
+        if st["saves"] == 1:
+            break
+        assert time.time() - t0 < 120, "A+'s save never committed"
+        time.sleep(0.05)
+    id_ap = st["entries"][0]["id"]
+    deep0 = st["n_deep_ckpts"]
+    dc_complete(server, "Archive E. " + dc_text(10, 3000), slot=0)      # spills deep checkpoints: enforce()
+    st = dc_status(server, through_loop=False)
+    print(f"after E: pending {st['saves_pending']} failed {st['saves_async_failed']} deep {deep0} -> {st['n_deep_ckpts']} "
+          f"entries {[e['id'] for e in st['entries']]} evictions {st['evictions']}")
+    assert st["saves_async_failed"] == 0 and st["saves_pending"] >= 1, "A++'s save finished before the check"
+    assert id_ap in [e["id"] for e in st["entries"]], "A+ was evicted while A++'s save (which replaces it) was in flight"
+    assert st["n_deep_ckpts"] > deep0, "no deep checkpoint was stored meanwhile (the enforce() path was not exercised)"
+    st = dc_settle(server)  # A++'s failure commits (A+ is then an ordinary entry again: the 1 MiB quota may take it)
+    assert st["saves_async_failed"] == 1
+    server.stop()
+
+
+def test_disk_async_deep_checkpoint_quota_counts_in_flight():
+    """(review r4 2, r9 9) a deep checkpoint stored while a save is in flight enforces the quota with the in-flight charge:
+    the disk total alone is under the quota, total + the save's written bytes is over it -> an unrelated entry goes
+    before that save commits. Deterministic: B's save (the 3rd) writes its blocks at once and then holds its end for
+    40 s; the long checkpoint-spilling prefill (D) starts only after bytes_pending shows B's bytes"""
+    global server
+    # quota 55 MiB: A + Q + checkpoints (~48 MB) fit, + B's ~44 MB charge does not
+    server, _ = dc_server("deepq", 2048, hooks={"threads": "1", "finalize_delay_job3_ms": "40000", "quota_mib": "55"})
+    server.extra_args += ["--ctx-checkpoints", "1", "--checkpoint-min-step", "64"]
+    server.start()
+    dc_complete(server, DC_A)
+    dc_complete(server, "Archive Q. " + dc_text(7, 50))  # A saved (~46 MiB on disk)
+    dc_settle(server)
+    dc_complete(server, DC_B)                            # Q saved; B in the slot
+    st = dc_settle(server)
+    ev0, deep0, saves0 = st["evictions"], st["n_deep_ckpts"], st["saves"]
+    dc_complete(server, "Archive C. " + dc_text(9, 50))  # B saved (job 3: in flight for 40 s)
+    t0 = time.time()
+    while True:
+        m = dc_metrics(server)
+        if m["disk_cache_bytes_pending"] >= 7 * 2**20:
+            break
+        assert time.time() - t0 < 30, f"B's blocks were not written ({m['disk_cache_bytes_pending']:.0f} pending bytes)"
+        time.sleep(0.1)
+    assert m["disk_cache_saves_pending"] >= 1
+    dc_complete(server, "Archive D. " + dc_text(10, 3000))  # D's prefill spills checkpoints: deep_put -> enforce
+    st = dc_status(server, through_loop=False)
+    print(f"after D: pending {st['saves_pending']} pending bytes {st['bytes_pending']} bytes {st['bytes_on_disk']} "
+          f"deep {deep0} -> {st['n_deep_ckpts']} evictions {ev0} -> {st['evictions']} entries {[e['n_tokens'] for e in st['entries']]}")
+    assert st["saves_pending"] >= 1, "B's save finished before the check"
+    # no save was committed since ev0 (B is in flight, C / D are in the slot): the only enforce() runs are the
+    #   deep-checkpoint store's (C's and D's prefills spill checkpoints)
+    #   (the deep-checkpoint count itself may not grow: the evicted entries' checkpoints are collected)
+    assert st["saves"] == saves0, "a commit ran enforce() meanwhile"
+    assert st["evictions"] > ev0, "the deep-checkpoint path did not apply the in-flight charge"
+    server.stop()
+
+
+def test_disk_async_branch_commit_keeps_the_shared_prefix():
+    """(review r9 10) A' and A+ both extend the stored A (two slots). A' commits while A+'s save is still in flight: A is
+    pinned by A+, so A''s commit does not replace it; A+'s save then fails - A is still on disk (it was erased before)"""
+    global server
+    server, _ = dc_server("branch", 2048, n_ctx=32768, n_slots=2,
+                          hooks={"finalize_delay_job3_ms": "3000", "finalize_delay_job4_ms": "1000", "fail_job": "4"})
+    server.start()
+    o = dc_complete(server, DC_A, slot=0)["content"]
+    a = DC_A + o
+    dc_complete(server, "Archive Q. " + dc_text(7, 50), slot=0)          # job 1: A
+    st = dc_settle(server)
+    id_a = [e["id"] for e in st["entries"]]
+    assert len(id_a) == 1
+    r = dc_complete(server, a + " Plus " + dc_text(31, 100), slot=1)      # slot 1 loads A -> A+
+    assert r["timings"]["cache_n"] >= 3000, r["timings"]
+    r = dc_complete(server, a + " Prime " + dc_text(32, 100), slot=0)     # slot 0 loads A -> A' (job 2: Q)
+    assert r["timings"]["cache_n"] >= 3000, r["timings"]
+    dc_settle(server)
+    dc_complete(server, "Archive R. " + dc_text(8, 50), slot=0)           # job 3: A' (ends after 3 s)
+    dc_complete(server, "Archive S. " + dc_text(9, 50), slot=1)           # job 4: A+ (fails), submitted before job 3 commits
+    st = dc_settle(server)
+    ids = [e["id"] for e in st["entries"]]
+    print(f"entries {[(e['id'], e['n_tokens']) for e in st['entries']]} failed {st['saves_async_failed']}")
+    assert st["saves_async_failed"] == 1
+    assert id_a[0] in ids, "A' commit replaced A although A+'s save (which extends A) was in flight - and A+ failed"
+    server.stop()
+
+
+def test_disk_async_save_failure_frees_own_copies_of_adopted_blocks():
+    """(review r3 I4, r7 1) a re-save of an adopted conversation writes own-store copies of blocks the index already holds
+    from the adopt source; when that save fails on a worker, those own copies are unlinked too (the source stays).
+    The conversation is longer than one 4 MiB block per K / V range (4096 rows of 1 KiB) - a shorter one has no block
+    in common with its continuation (its single partial block changes), so no own copy of an adopted block is written
+    and the case is not exercised (r1-r7 of this test: own blocks 0 for that reason)"""
+    import glob
+    global server
+    # namespace 1: another identity (an unregistered LLAMA_* env is semantic) saves A synchronously
+    server, cache_dir = dc_server("adopt", 0, env={"LLAMA_SC2_ADOPT_PROBE": "1"})
+    server.start()
+    long_a = DC_A + DC_B       # ~7.5k tokens: whole blocks the continuation shares
+    a_out = dc_complete(server, long_a)["content"]
+    dc_complete(server, "Archive Q. " + dc_text(7, 50))  # A saved
+    key_src = dc_status(server)["key"]
+    server.stop()
+    # namespace 2 adopts it; its first save (A grown, evicted) fails in the map write
+    server, _ = dc_server("adopt", 2048, hooks={"fail_maps": "1"}, fresh=False)
+    server.extra_args += ["--cache-disk-adopt", key_src]
+    server.start()
+    st = dc_status(server)
+    assert st["key"] != key_src and any(a["key"] == key_src for a in st["adopt"]), st["adopt"]
+    a_plus = long_a + a_out + DC_A_MORE
+    r = dc_complete(server, a_plus)  # loads the adopted entry
+    assert r["timings"]["cache_n"] >= 7000, r["timings"]
+    dc_complete(server, "Archive R. " + dc_text(8, 50))  # the re-save of A+ (own copies of shared blocks + new) fails
+    st = dc_settle(server)
+    assert st["saves_async_failed"] == 1 and st["saves_async"] == 0, st
+    own_blk = glob.glob(os.path.join(cache_dir, "ns-" + st["key"], "blk", "*.blk"))
+    src_blk = glob.glob(os.path.join(cache_dir, "ns-" + key_src, "blk", "*.blk"))
+    print(f"own blocks {len(own_blk)}, source blocks {len(src_blk)}")
+    assert len(own_blk) == 0 and len(src_blk) > 0
+    # the adopted entry still loads
+    assert dc_complete(server, a_plus + " end")["timings"]["cache_n"] >= 7000
+    server.stop()
+
+
+@pytest.mark.parametrize("hook", ["fail_maps", "fail_meta"])
 def test_disk_async_save_background_failure(hook):
     """(review C2, r2 C2) a save that fails in the background - a map write that throws on a worker, or its .meta at
     the commit - is committed as a failure: its files and fresh blocks go (the block inventory matches the files), the
     staging and job accounting stay consistent (later saves do not block, the drain at exit does not hang)"""
     import glob
     global server
-    server, cache_dir = dc_server(f"fail-{hook[-4:].lower()}", 64, env={hook: "1"})
+    server, cache_dir = dc_server(f"fail-{hook[-4:]}", 64, hooks={hook: "1"})
     server.start()
     dc_complete(server, DC_A)
     dc_complete(server, DC_B)  # A's save fails
@@ -1573,7 +2105,7 @@ def test_disk_async_save_before_sleep():
     wakes the server loop while the loop holds the task mutex in the sleeping callback - no deadlock, both saves land"""
     global server
     server, cache_dir = dc_server("sleep", 2048, n_ctx=32768, n_slots=2,
-                                  env={"LLAMA_DISK_ASYNC_TEST_THREADS": "1", "LLAMA_DISK_ASYNC_TEST_DELAY_MS": "20"})
+                                  hooks={"threads": "1", "delay_ms": "20"})
     server.sleep_idle_seconds = 1
     server.start()
     dc_complete(server, DC_A, slot=0)
@@ -1598,7 +2130,7 @@ def test_disk_async_save_before_sleep():
 def test_disk_async_save_at_shutdown():
     """a save in flight when the server stops: save_on_exit drains it - the entry is on disk and loads after a restart"""
     global server
-    server, cache_dir = dc_server("shutdown", 2048, env={"LLAMA_DISK_ASYNC_TEST_DELAY_MS": "40"})
+    server, cache_dir = dc_server("shutdown", 2048, hooks={"delay_ms": "40"})
     server.start()
     dc_complete(server, DC_A)
     dc_complete(server, DC_B)  # A in flight; B stays in the slot (saved on exit)
