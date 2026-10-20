@@ -1789,6 +1789,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_CKPT_SEMANTIC").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-async"}, "N",
+        string_format("disk prompt cache: asynchronous save with N MiB of host staging - the server loop only copies the "
+                      "slot state off the device, worker threads hash the 4 MiB blocks and write the new ones; a save "
+                      "waits for them only when N MiB are not written yet. 0 = synchronous save (default: %d)",
+                      params.cache_disk_async_mib),
+        [](common_params & params, int value) {
+            params.cache_disk_async_mib = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_ASYNC").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

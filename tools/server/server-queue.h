@@ -2,6 +2,7 @@
 
 #include "server-task.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -18,6 +19,7 @@ private:
     bool running  = false;
     bool sleeping = false;
     bool req_stop_sleeping = false;
+    std::atomic<bool> req_wake{false}; // [TAG_DISK_ASYNC_SAVE] wake(): one more update_slots() pass without a task
     int64_t time_last_task = 0;
 
     // queues
@@ -73,6 +75,13 @@ public:
         std::unique_lock<std::mutex> lock(mutex_tasks);
         return sleeping;
     }
+
+    // [TAG_DISK_ASYNC_SAVE] run one more processing pass (update_slots) even without a task, e.g. to commit a background
+    //   disk-cache save that finished on an idle server. Safe from any thread at any time: it takes no lock (the loop
+    //   holds mutex_tasks across the sleeping-state callbacks, which drain the disk-cache workers that call this); a
+    //   notify that races the loop's predicate check is caught by the loop's 1 s wait timeout. Does not reset the
+    //   idle-sleep timer and does not end a sleep (nothing is in flight then: the pre-sleep save drains)
+    void wake();
 
     // end the start_loop routine
     void terminate();
