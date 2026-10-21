@@ -7,7 +7,8 @@
 #     (P(EOS) at a mid-code stop 0.021 on IQ3_S-hc8, 0.001 on IQ3_S-hc8-o8).
 # Context: one pool of 917 504 cells shared by 5 slots (--kv-unified), any single slot can grow to the whole pool;
 # YaRN x4 over 262 144 + QSA above 64k. GTT ~73 GiB of a 78 GiB limit (interpolated from measured 786k and 1M pools),
-# decode ~15-16 t/s, prefill ~140 t/s at 1.7k (measured).
+# decode ~15-16 t/s, prefill ~140 t/s at 1.7k (measured 2026-10-10); on v63k 27.8 t/s on a short chat reply (free GPU), GTT 75 479 MiB
+# after the v64k switch.
 #
 #   deploy/balkon/setup-hands.sh        # downloads + checks the weights, pulls the image, starts this file, smoke-tests it
 #   or by hand: docker compose -f docker-compose.hands.yml up -d   (MODELS_DIR / SLOTS_DIR / LLAMA_S1_IMAGE override the defaults)
@@ -20,7 +21,7 @@ services:
       context: ../..
       dockerfile: .devops/vulkan.Dockerfile
       target: server
-    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v63k}   # prebuilt; `docker compose build` builds the same thing from this tree
+    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v64k}   # prebuilt; `docker compose build` builds the same thing from this tree
     container_name: llama-s1-hands
     restart: unless-stopped
     stop_grace_period: 90s            # on SIGTERM the server writes its slots to the disk prompt cache
@@ -130,7 +131,7 @@ services:
       - "0.125"
       - "--cache-disk-ckpt-max"
       - "32"
-      # Upgrading from v59k or older: v60 changed the saved-state format, so the disk-cache key is new (v61k keeps v60k's key). To keep the stored
+      # Upgrading from v59k or older: v60 changed the saved-state format, so the disk-cache key is new (v61k-v64k keep v60k's key). To keep the stored
       # conversations, uncomment the next two lines with the OLD key (the ns-<key> directory name in /slots/prompt-cache/hands,
       # or "key" in GET /disk-cache of the old server): read-only, text entries load, image entries are refused, new saves go
       # to the new namespace (docs/s1/DEPLOY.md). Required when upgrading: a namespace that is NOT adopted is deleted by the
@@ -146,6 +147,8 @@ services:
       - "5"
       - "--spec-draft-p-min"
       - "0.7"
+      - "--spec-draft-sampling"
+      - "probabilistic"                 # v64 default: at T > 0 the draft is sampled and verified by rejection sampling; T = 0 unchanged. My 40-task coding bench with it: 39/40 (38/40 before). `greedy` restores v63k's drafting
       - "--reasoning-format"
       - "deepseek"
       - "--reasoning"

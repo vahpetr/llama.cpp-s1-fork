@@ -6,7 +6,10 @@
 # Measured (prod v52/v53 numerics, 2026-10-09): GTT 102.7 GiB flat at every depth, decode 35.5 t/s at 1M and 44.7 t/s at 524k,
 # cold fill 0 -> 1M in 1.09 h. v60 (2026-10-16): cold fill 0 -> 1M in 44 min (oracle probe), GTT after load 105 414 MiB
 # (102.9 GiB); decode on v60 not re-measured yet (docs/s1/BENCHMARKS.md section 0). v61 (2026-10-17): cold fill 0 -> 1M in
-# 41.8 min (oracle probe), GTT after load 105 495 MiB; same disk-cache key as v60 (section 0a). Needs the 110 GiB GTT host setting (docs/s1/HOST-TUNING.md); with less GTT use the 524k file.
+# 41.8 min (oracle probe), GTT after load 105 495 MiB; same disk-cache key as v60 (section 0a). v63 (2026-10-21): cold fill 0 -> 1M in
+# 41.4 min (llama-server), same key (section 0c). v64 (2026-10-21): kernel package, fresh 32k / 72k prompt +7 / +8 % (section 2c),
+# GTT after load 105 495 MiB, same key; the one compose change is --spec-draft-sampling probabilistic below. Needs the 110 GiB GTT host
+# setting (docs/s1/HOST-TUNING.md); with less GTT use the 524k file.
 #
 #   deploy/s1/setup-brain.sh        # downloads + checks the weights, pulls the image, starts this file, smoke-tests it
 #   or by hand: docker compose -f docker-compose.brain-1m.yml up -d   (MODELS_DIR / SLOTS_DIR / LLAMA_S1_IMAGE override the defaults)
@@ -20,7 +23,7 @@ services:
       context: ../..
       dockerfile: .devops/vulkan.Dockerfile
       target: server
-    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v63}   # prebuilt; `docker compose build` builds the same thing from this tree
+    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v64}   # prebuilt; `docker compose build` builds the same thing from this tree
     container_name: llama-s1-brain-1m
     restart: unless-stopped
     stop_grace_period: 90s            # on SIGTERM the server writes its slot to the disk prompt cache (a few seconds at 1M)
@@ -160,7 +163,7 @@ services:
       - --cache-disk-ckpt-max
       - "32"                            # per conversation (113 MiB each for this model)
       # --- upgrading from v59 or older: keep the stored conversations (docs/s1/DEPLOY.md, "Upgrading from v59") ---
-      # v60 changed the saved-state format (v61 keeps v60's), so its disk-cache key (the ns-<key> directory under the --cache-disk dir) is new and
+      # v60 changed the saved-state format (v61-v64 keep v60's), so its disk-cache key (the ns-<key> directory under the --cache-disk dir) is new and
       # it starts with an empty namespace. To keep reading the old one, uncomment the next two lines and put the OLD key there:
       # the ns-<key> directory name of the old version, or "key" in GET /disk-cache of the old server (16 hex digits). It is
       # opened read-only: text conversations load, ones with images are refused (re-prefilled once), new saves go to the new
@@ -180,6 +183,8 @@ services:
       - "5"
       - --spec-draft-p-min
       - "0.7"                           # stop drafting when the head is unsure
+      - --spec-draft-sampling
+      - probabilistic                   # v64 default: at T > 0 the draft is sampled and verified by rejection sampling; T = 0 unchanged (greedy = v63). `greedy` restores v63's drafting; images before v63 do not know the flag
       - --reasoning-format
       - deepseek
       - --reasoning
