@@ -4,11 +4,12 @@ All numbers are measured on my two boxes, single runs unless a range is given. "
 build; v53 = fork `prod-v11-stage6` @ f0fa8ddf1, v54 = v53 + webui and logging changes, v55 = v54 + webui
 changes only, v56 = v55 + webui changes only, v57 = v56 + webui changes only, v58 = v57 + webui
 changes only, v59 = v58 + a server backend-sampling guard and webui changes; same numerics, gated: G6 same-key,
-bit-identical to v58; v60 = v59 + patches 0227-0240, EXACT against v59, see section 0; v61 = this tree's HEAD = v60 +
-patches 0241-0243, EXACT against v60 and the v59 reference, see section 0a).
+bit-identical to v58; v60 = v59 + patches 0227-0240, EXACT against v59, see section 0; v61 = v60 +
+patches 0241-0243, EXACT against v60 and the v59 reference, see section 0a; v62 = v61 + patches 0244-0251, numbers = v61,
+section 0b; v63 = this tree's HEAD = v62 + patches 0252-0259, EXACT against the v59 reference, see section 0c).
 Run-to-run noise on the speed track is about ±1.5 %.
 
-Latest build: **v61 (2026-10-17)**. Its numbers against v60 are in section 0a (with the version lineage table at its end),
+Latest build: **v63 (2026-10-21)**, section 0c. v61's numbers against v60 are in section 0a (with the version lineage table at its end),
 the v60-vs-v59 package is section 0, and both have a v61 column below. Sections 1 and 2 are the v52/v53 suite baselines (older,
 slower at depth) with a v61 column where v61 was measured; "not re-measured" marks the rows that need a new server run.
 
@@ -147,6 +148,7 @@ three fixed requests (a 32k prompt, a chat, a needle) gave the same tokens and a
 | v60 | 2026-10-16 | patches 0227-0240: prefill kernels (B1, B3, B4, B4c), QSA score epilogue (A1) and f16 pooled-key mirror (A2a), mat-vec hoist (C1), KQ visibility mirror (C2), indexer cell-ext restore (0239) | EXACT (oracle above) | new: adopts the v59 namespace read-only (docs/s1/DEPLOY.md) |
 | v61 | 2026-10-17 | patches 0241-0243: QSA score GEMM key-tile-major dispatch (A2b), QSA select without key rows (A3), test / comment polish | EXACT (section 0a) | same as v60 (the v59 adopt stays) |
 | v62 | 2026-10-19 | contrib 0244-0251 at rev e4af0a6ca: correctness and diagnostics, `--spec-draft-n-ubatch` ships unset | numbers = v61 (section 0b) | same as v61 |
+| v63 | 2026-10-21 | contrib 0252-0259 at rev 8c1a468aa: MUL_MAT_ID skip + prepass tile list (U3), semantic disk checkpoints + `cache_pin` (SC1), checkpoints and MTP draft state in `/slots` files (U5), `--spec-draft-sampling` (U7, ships greedy) | EXACT (section 0c) | same as v62 |
 
 ## 0b. v62 (2026-10-19): correctness release, numbers = v61
 
@@ -155,6 +157,43 @@ v62 = v61 + patches 0244-0251 (correctness and diagnostics; `--spec-draft-n-ubat
 are unchanged by design, so every v61 number below stands for v62. Slot save identity (u1-server-ab, llama-server): the saved
 bytes are identical v61 <-> v62 at 262k and 1M; save 527 -> 549 ms at 262k and 2 269 -> 2 316 ms at 1M (noise band).
 Source: docs/releases/v62-regressions.md in the piagent repo.
+
+## 0c. v63 (2026-10-21): MoE matmul, semantic checkpoints, warm draft after a slot restore
+
+v63 = v62 + patches 0252-0259 (rev `8c1a468aa`): the MUL_MAT_ID padding skip and the tile list from the expert-count prepass
+(0253 / 0254, upstream #25483 / #29998), checkpoints at message boundaries kept on disk plus the `cache_pin` request field
+(0255 / 0256), context checkpoints and the MTP draft state in the `/slots` save file (0257 / 0258, upstream #26004 / #30574),
+slot-file checkpoints kept out of the deep store (0259), and `--spec-draft-sampling` (0252, upstream #27694; ships at its
+default, greedy). Knobs: KNOBS.md, "v63 package".
+
+Class: EXACT. The full S0.1 oracle gate (2026-10-20 11:56 -> 2026-10-21 04:36, 16.7 h, the 1M production configuration minus the
+vision projector, one slot, text corpus) against the v59 reference: 1 502 logit positions and 224 state points identical,
+ordered selected ids identical, with the A2b / A3 off arms as for v61 and a MUL_MAT_ID section (the shipped library has no
+negative-control marker; 22 of 22 skip unit cases pass). 96 PASS, 4 INFO, 0 FAIL. GTT peak of the gate (score-capture pass)
+106 095 MiB, as on v61 (106 095; v60 106 357).
+
+Measured with llama-server and the full compose on s1 (1M brain profile), one measurement unit on 2026-10-21, single runs; the
+"v62" values come from the v62 image in the same unit. These rows are not comparable to section 2a (other driver and corpus).
+
+| metric | v63 | v62 / reference | note |
+|---|---|---|---|
+| cold fill 0 -> 1 046 528 in 65 536-token steps | 41.6 min | (v61 probe fill 41.8 min, section 0a) | GTT peak 105 659 MiB over the fill |
+| decode band at 1M after restoring a v61-format slot file (greedy, 128 tokens) | 18.62 ms/tok median (worst 19.13), acceptance 0.968 | 18.58 ms/tok (worst 19.20), acceptance 0.968 | same file, same tokens on both: unchanged |
+| decode band at 1M straight after the fill (continuous, greedy) | 24.65 ms/tok median, acceptance 0.723 | not run on v62 | one sample, a different text position from the row above |
+| `/slots` file at 1M | 18.35 GB (+2.6 GiB: checkpoints + draft state) | 15.55 GB (v61 / v62 format) | save 3.7 s; restore 4.1 s (same process and after a restart); the v61-format file restores in 3.8 s (v63) / 4.4 s (v62) |
+| `/slots` restore at 32k | 95 ms (same process), 190-197 ms (new process) | 116 ms (v62 reading the v63 file) | file 910 MB vs 601 MB in the v62 format |
+| decode after a 32k slot restore, 128 tokens | 18.3 ms/tok, acceptance 0.94 (warm draft from the file) | 24.4-33.5 ms/tok, acceptance 0.50-0.62 (cold draft: a v62-format file on v63, or v62 on a v63 file) | the 0257 / 0258 effect; the 0.62 run is on another text |
+| fresh 32k prompt | 69.79 s greedy / 68.98 s pi sampling | 72.85 / 72.07 s | -4.2 / -4.3 %, one sample each |
+| branch turn that diverges after a message boundary, `--cache-disk-ckpt-semantic` 16 vs 0 (one session, 5 turns + 3 branches) | TTFT 1.84 s (643 prompt tokens processed) | 4.86 s at 0 (2 054 processed) | the other two branches: no gain (4.13 vs 4.20 s, 6.15 vs 5.99 s; their RAM checkpoint was within the min step); full turns equal; 8 saves wrote 4 406 vs 4 645 MiB |
+| conversation saved on exit, adopted after a restart (49 070 tokens) | save 785 ms (640 MiB), load 672 ms (1 357 MiB) | - | |
+| MUL_MAT_ID kernel test, q4_K, 2 048 / 512 rows | -8.0 / -20.6 % | v62 | no shape slower; the end-to-end 1M timings of the same probe run (a3-run6) unchanged |
+
+`--spec-draft-sampling probabilistic`: functional checks only (at T = 0 the same ids as greedy, T > 0 -> T = 0 -> T > 0,
+cancel, grammar, end of generation); its decode band was not measured, so v63 ships greedy.
+
+Compatibility: same disk-cache key as v62 (both read each other's entries). A v62 server restoring a v63 `/slots` file reads
+the target state and skips the appendices: the restore is correct, but the draft starts cold (32k: 33.5 ms/tok, acceptance 0.50,
+until the draft context warms up again), so a rollback to v62 is safe and only slower for the first rounds after a restore.
 
 ## 1. 524k profile baseline - suite runs 2026-10-09 21:50 and 2026-10-10 02:30 (image v53; v54-v61 keep these numerics,
 v60/v61 gated EXACT on the 1M oracle; their speed gains at depth are in sections 0 and 0a)
