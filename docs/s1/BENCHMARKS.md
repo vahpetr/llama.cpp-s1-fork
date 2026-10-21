@@ -170,7 +170,10 @@ Class: EXACT. The full S0.1 oracle gate (2026-10-20 11:56 -> 2026-10-21 04:36, 1
 vision projector, one slot, text corpus) against the v59 reference: 1 502 logit positions and 224 state points identical,
 ordered selected ids identical, with the A2b / A3 off arms as for v61 and a MUL_MAT_ID section (the shipped library has no
 negative-control marker; 22 of 22 skip unit cases pass). 96 PASS, 4 INFO, 0 FAIL. GTT peak of the gate (score-capture pass)
-106 095 MiB, as on v61 (106 095; v60 106 357).
+106 095 MiB, as on v61 (106 095; v60 106 357). Inside the gate the A3 on/off wall ratio on the decode-like tails at 262k is 1.061 (v62: 0.999), but the absolute A3-on tails are unchanged vs v62 (v63/v62 = 1.006; prompt 8k 0.966): the A3-off path got 5.3 % faster with the MUL_MAT_ID skip (0253 / 0254; off arm v63/v62 = 0.947), so the shipped A3-on configuration did not regress, and the release accepted the ratio on that basis.
+
+Images: `vahpetr/llama-cpp-s1-fork:v63` = `:v63k` = `:latest`, `sha256:d16b1cdc9139573f07c380f6a5fc6913866348bb6a121593c2e52c76f538a5d4`; in production since
+2026-10-21 06:32 on the s1 brain and 06:38 on the balkon hands (local build `flash-next:vulkan-v63k`, image id `f82fdd2a4091`).
 
 Measured with llama-server and the full compose on s1 (1M brain profile), one measurement unit on 2026-10-21, single runs; the
 "v62" values come from the v62 image in the same unit. These rows are not comparable to section 2a (other driver and corpus).
@@ -335,7 +338,8 @@ loads at 6.8 GB/s cold, 8.8-10 GB/s from page cache. For comparison, re-prefill 
 | IQ3_XXS-hc8 | 2026-10-07 | 18 t/s | 129 t/s | 40-task agent coding bench 38/40 (Qwen3.6-35B-A3B on the same box: 35/40, decode 31, prefill 343); wall per task 510 vs 632 s |
 | IQ3_XXS-hc8, 400k context | 2026-10-07 | 13.3 t/s | 72.6 t/s | needles at 399k found |
 | IQ3_S-hc8-o8 (the compose) | 2026-10-10 | ~15-16 t/s | ~140 t/s at 1.7k | early end-of-reply P(EOS) 0.001 vs 0.090 on IQ3_XXS-hc8 |
-| IQ3_S-hc8-o8, image v61k (the compose since 2026-10-17) | 2026-10-17 | 24.3 t/s on one short chat reply (deploy smoke, draft 183/189) | not re-measured | disk-cache restore of a stored 6 584-token entry: PASS (prompt_n 4, cache_n 6 580); v61's levers act on the QSA indexer above 64k only |
+| IQ3_S-hc8-o8, image v61k (the compose 2026-10-17 to 2026-10-21) | 2026-10-17 | 24.3 t/s on one short chat reply (deploy smoke, draft 183/189) | not re-measured | disk-cache restore of a stored 6 584-token entry: PASS (prompt_n 4, cache_n 6 580); v61's levers act on the QSA indexer above 64k only |
+| IQ3_S-hc8-o8, image v63k `f82fdd2a4091` (the compose since 2026-10-21 06:38) | 2026-10-21 | 20.9 t/s on one short chat reply (deploy smoke, draft 183/189) - contaminated: a GPU test container ran on the same 780M during the smoke; re-measure pending, no regression claimed either way | not re-measured | disk-cache restore of the stored 6 584-token entry: PASS (prompt_n 4, cache_n 6 580) |
 
 QSA on the 780M at 128k: +48 % prefill, +68 % decode vs dense. `-ub 4096`, forced MMVQ and int8 MMQ: no gain.
 
