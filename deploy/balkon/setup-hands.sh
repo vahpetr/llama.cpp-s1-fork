@@ -170,7 +170,7 @@ if want up; then
         die "another llama-s1 container is running; stop it first (docker ps)"
     fi
     run docker compose -f "$COMPOSE" up -d
-    info "expected: GTT after load ~75.4 GiB of a 78 GiB limit (v60k; not re-measured on v63k); decode ~15-16 t/s, prefill ~140 t/s on short prompts"
+    info "expected: GTT after load ~75.4 GiB of a 78 GiB limit (v60k; not re-measured on v63k); ~28 t/s on a short chat reply (v63k), prefill ~140 t/s on short prompts"
     if [ "$DRY_RUN" = 0 ]; then
         wait_health "$PORT" 1200
         smoke "$PORT"

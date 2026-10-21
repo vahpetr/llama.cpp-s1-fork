@@ -59,7 +59,7 @@ and ignores the new appendices: the result is correct, but the draft starts cold
 - `GET /disk-cache` `deep_semantic` counts newly written semantic checkpoint files only; an existing file re-tagged as
   semantic is not counted.
 - The 524k profile was not re-measured on v63.
-- Hands throughput: The hands deploy smoke gave 20.9 t/s on one short chat reply (draft 183/189; v61k: 24.3) while a GPU test container was running on the same 780M, so that number is contaminated and shows neither a regression nor its absence; re-measure pending.
+- Hands throughput (resolved): re-measured on a free 780M at 06:57 with the smoke request (max_tokens 256, temperature 0, thinking off), three runs: 27.8 / 28.0 / 27.7 t/s, draft 184/186, prompt 189-224 ms (v62k smoke 2026-10-19: 25.8 t/s; v61k: 24.3). The deploy smoke's 20.9 t/s ran next to a GPU test container on the same GPU and is not used.
 
 ## v61 - 2026-10-17
 
