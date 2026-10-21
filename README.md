@@ -11,6 +11,55 @@ decoding. This fork runs it with a **1 048 576-token context in one slot at 35-6
 Everything here was measured on my two boxes. Numbers, dates and image versions: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md).
 Deploying it, upgrading and rolling back: [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md). Flags and knobs: [docs/s1/KNOBS.md](docs/s1/KNOBS.md).
 
+## What v63 adds (2026-10-21)
+
+v63 is v62 plus eight patches (0252-0259), revision `8c1a468aa`. Every new flag runs at its default, so the composes do not
+change:
+
+- **0253 / 0254: MUL_MAT_ID work skip and the prepass tile list** (upstream #25483 / #29998). In an expert matmul tile, the
+  invocations and coopmat warps whose B columns are not rows of the expert skip their loads and multiply-adds, and the matmul_id
+  shaders read their (expert, tile) list from the expert-count prepass instead of a binary search. EXACT; the MUL_MAT_ID kernel
+  test on q4_K is -8.0 / -20.6 % at 2 048 / 512 rows, no shape slower.
+- **0255 / 0256: semantic deep checkpoints and `cache_pin`.** The disk cache keeps recurrent checkpoints at message boundaries
+  (user turn starts, the end of the system prompt, of a tool result, of a turn's input) on top of the depth schedule
+  (`--cache-disk-ckpt-semantic`, default 16), so a branch after such a boundary restores close to it; a request can pin one
+  checkpoint per conversation with `cache_pin: {"tokens": N}`.
+- **0257 / 0258: context checkpoints and the MTP draft state in `/slots` save files** (upstream #26004 / #30574). A restored
+  slot drafts warm instead of starting with an empty draft context. A 1M slot file restores in 4.1 s (18.35 GB, +2.6 GiB for
+  the checkpoints and the draft state); after a 32k restore, decode runs at 18.3 ms/tok with the warm draft against 24-34 ms/tok
+  with a cold one.
+- 0259: checkpoints restored from a slot file never enter the disk cache's deep store or become a pin.
+- **0252: `--spec-draft-sampling greedy|probabilistic`** (upstream #27694): at T > 0 the draft can be sampled and verified by
+  rejection sampling. It ships at its default, greedy (byte-identical to v62); its decode band is not measured yet.
+
+The package is EXACT under the full S0.1 oracle gate (16.7 h, finished 2026-10-21 04:36; the 1M production configuration minus
+the vision projector, one slot, text corpus): bit-identical to the v59 reference at 1 502 logit positions and 224 state points,
+ordered selected ids identical, the A2b / A3 off arms and a MUL_MAT_ID section as well; 96 PASS, 4 INFO, 0 FAIL. The disk-cache
+key is v62's (and v60's / v61's): an install on v62 switches by changing the image. A v62 server restores a v63 slot file
+correctly but with a cold draft, so a rollback to v62 is safe and only slower for the first rounds after a restore.
+Release notes: [docs/s1/RELEASE-NOTES.md](docs/s1/RELEASE-NOTES.md).
+
+1M brain profile, llama-server with the full compose on s1, one measurement unit on 2026-10-21, single runs; the v62 values come
+from the v62 image in the same unit (BENCHMARKS.md section 0c; not comparable to the S0.2 rows of section 2a):
+
+| metric | v62 | v63 | change |
+|---|---|---|---|
+| decode after a 32k `/slots` restore, 128 tokens | 24.4-33.5 ms/tok, acceptance 0.50-0.62 (cold draft) | **18.3 ms/tok, acceptance 0.94** | warm draft from the file |
+| decode band at 1M after restoring the same v61-format slot file | 18.58 ms/tok, acceptance 0.968 | 18.62 ms/tok, acceptance 0.968 | unchanged |
+| `/slots` file at 1M | 15.55 GB | 18.35 GB | save 3.7 s, restore 4.1 s |
+| cold fill 0 -> 1M, 65 536-token steps | (v61 probe: 41.8 min) | 41.6 min | GTT peak 105 659 MiB over the fill |
+| fresh 32k prompt, greedy / pi sampling | 72.85 / 72.07 s | 69.79 / 68.98 s | -4.2 / -4.3 %, one sample each |
+| branch turn after a message boundary, TTFT, `--cache-disk-ckpt-semantic` 0 vs 16 | 4.86 s | **1.84 s** | one branch of three; the other two unchanged |
+| GTT, llama-server with the vision projector, after load | 105 414 MiB | 105 495 MiB | +81 MiB; bar 109 216 |
+
+## What v62 adds (2026-10-19)
+
+v62 is v61 plus patches 0244-0251, a correctness and diagnostics release: a flash-attention Q8_0-K out-of-bounds read
+(upstream #29988), TOP_K (#30107), an in-place mul_mat stride (#28956), state-restore hardening, server slot fixes, the
+`GGML_VK_BUF_LOG` knob and `--spec-draft-n-ubatch` (shipped unset). It passed the short oracle gate and the full oracle tripwire
+the night after, both EXACT; the 1M brain is bit-identical to v61 and every v61 number stands for v62 (BENCHMARKS.md section 0b).
+Same disk-cache key as v61.
+
 ## What v61 adds (2026-10-17)
 
 v61 is v60 plus three patches. Two are speed levers for the QSA indexer at depth, both on by default (no compose change):
@@ -232,19 +281,19 @@ checks their sha256; (hands only) re-encodes the BF16 hyper-connection weights a
 `tools/s1/gguf_hc_q8.py`; pulls the image (or builds it with `BUILD=1`); starts the compose file and smoke-tests it.
 `--dry-run` shows every step first. Which weights and why: [docs/s1/WEIGHTS.md](docs/s1/WEIGHTS.md). I redistribute no weights;
 they come from their authors' Hugging Face repos.
-The published image `vahpetr/llama-cpp-s1-fork:v61` = `:v61k` = `:latest` (one digest,
-`sha256:46fc98c6f86902b220309e172691758e9806eaf2fc411a640d4ac2f5595b7c63`) is built from my `prod-v11-stage8-pkg8` revision
-(v61 = `7a438f3ba`; `:v60` / `:v60k` stay as the rollback, v60 = `845c6fbcd`, digest
-`sha256:794113766af1129c65e9541bcc4b9b3bac4d378fa38b38cd4d7c5f00fbf7a0d1`); this `s1-public` branch adds docs, deploy files,
-`tools/s1` and comment scrubs on top.
-Upgrading from v60: same disk-cache key, change the image only. Upgrading an install with stored conversations from v59: the
+The published image `vahpetr/llama-cpp-s1-fork:v63` = `:v63k` = `:latest` (one digest,
+`sha256:d16b1cdc9139573f07c380f6a5fc6913866348bb6a121593c2e52c76f538a5d4`) is built from my `prod-v11-stage9-pkg2` revision
+(v63 = `8c1a468aa`; `:v62` / `:v62k` stay as the rollback, v62 = `e4af0a6ca`, digest
+`sha256:4281527a03092d87200d14d18222f060aecea6b47468379a6ec24a7ac9d52a96`; `:v61` = `7a438f3ba` and `:v60` = `845c6fbcd` are
+older rollbacks with the same key); this `s1-public` branch adds docs, deploy files, `tools/s1` and comment scrubs on top.
+Upgrading from v60, v61 or v62: same disk-cache key, change the image only. Upgrading an install with stored conversations from v59: the
 disk-cache key changes, see [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md), section 4 (one `--cache-disk-adopt` line).
 My production draft head is a vocabulary-pruned variant built from my own traffic, so the public setup uses dzannotti's
 full-vocabulary head, and the decode numbers above are an upper bound for it.
 
-First start on s1: GTT after load ~105 500 MiB (1M, v61; v60 105 414, ~106 000 MiB after the first requests on v60, bar
-109 216) or ~94 500 MiB (524k, v59; v60 adds the f16 mirror, not measured there); the first long prompt fills at ~550 t/s
-falling to ~357 t/s near 1M (v61; v60 ~330 t/s).
+First start on s1: GTT after load 105 495 MiB (1M, v63 = v62 + 81 MiB; 105 519 after the smoke requests, bar 109 216) or
+~94 500 MiB (524k, v59; not re-measured on v60-v63); the first long prompt fills at ~550 t/s falling to ~357 t/s near 1M
+(v61 probe; a cold 1M fill takes 41.6 min on v63).
 
 ## Known limitations
 
@@ -255,8 +304,8 @@ falling to ~357 t/s near 1M (v61; v60 ~330 t/s).
 - **Two slots give no extra throughput** on these boxes (-15 % total, measured). A second slot is for concurrency only.
 - **After a checkpoint rewind** (disk cache, branch, copy) the continuation can differ from a fresh prefill at near-tie tokens:
   the same math in a different batch composition. The state itself is verified, the text is not guaranteed byte-identical.
-- **Pre-v60 disk-cache entries with images are not loaded by v60 / v61** (they may carry the defect 0239 fixes); text entries
-  are. A rollback to v59 does not see conversations saved by v60 or v61 (v60 and v61 share one key).
+- **Pre-v60 disk-cache entries with images are not loaded by v60-v63** (they may carry the defect 0239 fixes); text entries
+  are. A rollback to v59 does not see conversations saved by v60-v63 (v60 to v63 share one key).
 - One model load per GPU at a time; a build or a second load next to a loaded 1M model has run my box out of memory.
 - Single-user setups. No multi-tenant hardening beyond upstream's.
 
