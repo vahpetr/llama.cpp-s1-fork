@@ -52,6 +52,8 @@ from the v62 image in the same unit (BENCHMARKS.md section 0c; not comparable to
 | branch turn after a message boundary, TTFT, `--cache-disk-ckpt-semantic` 0 vs 16 | 4.86 s | **1.84 s** | one branch of three; the other two unchanged |
 | GTT, llama-server with the vision projector, after load | 105 414 MiB | 105 495 MiB | +81 MiB; bar 109 216 |
 
+Server rows on the S0.2 corpus (llama-server, the same driver and token positions as the v61 run; 2026-10-21, single runs; BENCHMARKS.md section 2b), v61 -> v63: cold prompt 128k 427.4 -> 439.8 t/s (+2.9 %), 65k fill steps ->262k / ->524k / ->1M 483 / 425 / 352 -> 495 / 434 / 358 t/s (+2 %), cold fill 0 -> 1M 0.70 -> 0.69 h; decode at depth 25.80 / 21.05 / 19.93 ms/tok at 32k / 262k / 1M (= v61, same accepted drafts); TTFT at 1M + 256 new tokens 1 592 -> 1 449 ms warm and 1 886 -> 1 728 ms median after a slot restore (-8 %, on the prompt side); slot file at 1M 14.48 -> 17.09 GiB (+18 %: draft state + checkpoints), save 3.9 -> 4.0 s; server GTT over the fill 105 627 MiB (= v61).
+
 ## What v62 adds (2026-10-19)
 
 v62 is v61 plus patches 0244-0251, a correctness and diagnostics release: a flash-attention Q8_0-K out-of-bounds read
