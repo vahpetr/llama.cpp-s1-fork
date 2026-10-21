@@ -69,6 +69,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <string_view>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -2562,10 +2563,16 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
 
 // [TAG_MMID_TILE_B1] GGML_VK_MMID_TILE_BM128 (default on, =0 off): the coopmat1 mul_mat_id l tile = BM 128 x BN 64 on AMD
 // RDNA (see ggml_vk_load_shaders). Read once (static).
-static bool ggml_vk_mmid_tile_b1(const vk_device & device) {
+// The candidates are the AMD coopmat1 devices; ggml_vk_mmid_tile_b1_off says why a candidate has no B1 tile (nullptr = it has).
+static bool ggml_vk_mmid_tile_b1_candidate(const vk_device & device) {
+    return device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && !device->coopmat2;
+}
+static const char * ggml_vk_mmid_tile_b1_off(const vk_device & device) {
     static const bool on = ggml_vk_env_bool("GGML_VK_MMID_TILE_BM128", true);
-    return on && device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && !device->coopmat2 &&
-           device->driver_id != vk::DriverId::eAmdProprietary;
+    return !on ? "GGML_VK_MMID_TILE_BM128=0" : device->driver_id == vk::DriverId::eAmdProprietary ? "AMD proprietary driver" : nullptr;
+}
+static bool ggml_vk_mmid_tile_b1(const vk_device & device) {
+    return ggml_vk_mmid_tile_b1_candidate(device) && ggml_vk_mmid_tile_b1_off(device) == nullptr;
 }
 
 // [TAG_MMID_TILE_G2A] GGML_VK_MMID_TILE_G2A (default on, =0 off): where the B1 tile applies, its warp layout becomes
@@ -2588,21 +2595,19 @@ struct vk_mm_tile_meta {
     bool         mmid_b_clamp = false;
 };
 
-// [TAG_MM_WARPTILE_EXT] an LDS row stride of BK / 2 + pad f16vec2 words (4 B; the _cm1 mul_mm shaders are always built with fp16) is the stride of the coopmat1 coopMatLoads of the 16x16 f16 fragments (mul_mm.comp).
-// VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986 wants that stride aligned to min(16 B, the natural row alignment) = 16 B; with BK 32: pad 0 / 4 / 8 = 64 / 80 / 96 B conform, pad 2 / 6 = 72 / 88 B do not.
-// RADV handles 72 B (balkon 780M: bit-identical byte classifier; on the 8-warp G2A tile pad 2 is -10 ... -19 % at n 2048 vs the B1 tile where pad 4 is -3 ... +2 %), so a non-conformant stride is RADV-only by design; every other driver (AMDVLK / LLPC, ...) keeps the tile without it.
-// Shared by every tile that sets SHMEM_STRIDE_PAD (G2A, G1).
+// [TAG_MM_WARPTILE_EXT] LDS row stride of the _cm1 mul_mm shaders (always fp16: f16vec2 words of 4 B); VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986
+// wants it 16-B aligned, a non-conformant stride is RADV-only by design (pads and measurements: contrib 0262 README). _cm1 (coopmat1) pipelines only.
 static uint32_t ggml_vk_mm_stride_bytes(uint32_t bk, uint32_t pad) {
     return (bk / 2 + pad) * 4u;  // f16vec2
 }
 static bool ggml_vk_mm_stride_pad_ok(const vk_device & device, uint32_t bk, uint32_t pad) {
+    GGML_ASSERT(device->coopmat_support && "the 4-B word is the _cm1 (fp16) shaders' f16vec2; a scalar fp32 tile needs its own rule");
     GGML_ASSERT(bk % 8 == 0);
     return ggml_vk_mm_stride_bytes(bk, pad) % 16 == 0 || device->driver_id == vk::DriverId::eMesaRadv;
 }
 
-// [TAG_MMID_TILE_G2A] the G2A LDS row pad: GGML_VK_MMID_TILE_G2A_PAD = 0 / 2 / 4 / 6 / 8 (any other value is ignored with a warning); default 2 (72 B stride, the measured lever) on RADV, else 4 (80 B, conformant).
-// A GGML_VULKAN_VALIDATE build (which enables the validation layer itself) defaults to 4, so its validation runs exercise the conformant layout, not the shipped RADV one (pad 2; its correctness evidence is the oracle gate on the real image).
-// A non-conformant pad stays RADV-only (ggml_vk_mm_stride_pad_ok). *src says where the value came from (for the proof line). Env read once (static).
+// [TAG_MMID_TILE_G2A] G2A LDS row pad: GGML_VK_MMID_TILE_G2A_PAD (0/2/4/6/8), else 2 on RADV / 4 elsewhere / 4 in a GGML_VULKAN_VALIDATE build
+// (see contrib 0262 README). *src names the source for the proof line. Env read once (static).
 static uint32_t ggml_vk_mmid_tile_g2a_pad(const vk_device & device, const char ** src) {
     static const int env = [] {
         const char * v = getenv("GGML_VK_MMID_TILE_G2A_PAD");
@@ -5258,10 +5263,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const auto it = mm_tile_meta.find(&wt);
         return it == mm_tile_meta.end() ? vk_mm_tile_meta{} : it->second;
     };
-    // The mul_mm loaders run `for (l = 0; l < BM|BN; l += loadstride)` and write rows / columns loadc + l, loadc < loadstride = BLOCK * LOAD_VEC_EFF * LOAD_VEC_BATCH / BK; they stay inside the tile only if loadstride <= BM|BN and divides it.
-    // On the B side a larger reach is safe only in the mul_mat_id shader's per-tile row clamp (a registered mmid_b_clamp tile on an _id pipeline).
-    // LOAD_VEC as vulkan-shaders-gen.cpp builds the _cm1 mul_mm shaders (always with fp16): aligned B 4 for BF16 A, else 8; aligned A per type (f32 / f16 8, bf16 4); unaligned B and f32 / f16 / bf16 A 1 x 2, quant A unchanged; the f32 / f16 A shaders hard-code BK 32.
-    // The tiles are device-constant, so the checks run on the first ggml_vk_load_shaders call per device only.
+    // The mul_mm loaders stay inside the tile only if loadstride = BLOCK * LOAD_VEC_EFF * BATCH / BK is <= BM|BN and divides it; on B a larger reach is
+    // safe only for a registered mmid_b_clamp tile on an _id pipeline. LOAD_VEC as vulkan-shaders-gen.cpp builds _cm1 (table: contrib 0262 README). Once per device.
     const bool mm_check_tiles = !device->mm_tiles_checked.exchange(true);
     const auto mm_load_vec_a = [](ggml_type type, bool aligned) -> uint32_t {
         switch (type) {
@@ -5471,45 +5474,32 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             l_mmqidb1_wg_denoms = { l_warptile_mmqidb1[1], l_warptile_mmqidb1[2], 1 };
         }
 
-        // [TAG_MMID_TILE_G2A] on top of B1: the coopmat1 mul_mat_id l tile becomes 8 warps of WM 64 x WN 16 over the same
-        // BM 128 x BN 64 (2 warps along M, 4 along N instead of 2 x 2 of WM 64 x WN 32) and its shared-memory row stride
-        // BK / 2 + SHMEM_STRIDE_PAD = 16 + pad (2 on RADV) 32-bit words instead of 16 + 4. With ~40 rows per expert (2048 tokens x
-        // 10 of 512 experts) a WN 16 warp column past the expert's rows skips its MACs ([TAG_MMID_SKIP]) at 16-row instead of
-        // 32-row granularity; the stride only moves where an element sits in LDS. Unchanged: BK, the TM / TN / TK coopmat
-        // fragments, WMITER, WARP, the block's BM x BN, the K loop and every element's coopMatMulAdd sequence (a fragment's
-        // result depends on its own A rows / B columns only), so each output keeps its bits. Block 512 relies on the per-tile
-        // row clamp in mul_mm.comp (its B load columns run to 127 > BN; registered as mmid_b_clamp). The 8-warp layout is only
-        // correct with a real subgroup size of 64 (warp_i = gl_SubgroupID, warp_c = gl_SubgroupID / 2, ballots_sh[8],
-        // storestride = WARP / TM), so G2A requires the pin: requiredSubgroupSize 64 must be usable (ggml_vk_wave_ok) and the 8 subgroups must fit
-        // maxComputeWorkgroupSubgroups (VUID 02757); without the pin the B1 tile stays. GGML_VK_MMID_TILE_G2A=0 keeps the B1 tile.
-        // One proof line per device either way: "on (...)" or "off (<reason>)", so a gate grep tells off from the knob.
-        if (ggml_vk_mmid_tile_b1(device)) {
+        // [TAG_MMID_TILE_G2A] B1 tile -> 8 warps of WM 64 x WN 16 + LDS pad (EXACT: same BK, fragments, K loop; block 512 relies on the per-tile row
+        // clamp in mul_mm.comp; needs a real wave64 pin). One proof line per AMD coopmat1 device: "on (...)" or "off (<reason>; <tile that stays>)".
+        if (ggml_vk_mmid_tile_b1_candidate(device)) {
             const uint32_t g2a_block = 512;
             const char *   pad_src = "";
             const uint32_t g2a_pad = ggml_vk_mmid_tile_g2a_pad(device, &pad_src);
-            GGML_ASSERT(l_warptile_mmqidb1.size() == VK_MM_WARPTILE_SIZE);
-            const uint32_t g2a_sg = l_warptile_mmqidb1[10];
-            const char *   off = nullptr;
-            if (!ggml_vk_mmid_tile_g2a_knob()) {
-                off = "GGML_VK_MMID_TILE_G2A=0";
-            } else if (l_warptile_mmqidb1[1] != 128 || l_warptile_mmqidb1[2] != 64 || l_warptile_mmqidb1[7] != 16 ||
-                       l_warptile_mmqidb1[8] != 16) {
-                off = "B1 tile is not BM 128 x BN 64 with 16 x 16 fragments";
-            } else if (g2a_sg != 64) {
-                off = "WARP != 64";
-            } else if (!ggml_vk_wave_ok(device, g2a_sg)) {
-                off = "no requiredSubgroupSize 64 pin";
-            } else if (device->subgroup_max_workgroup_subgroups < g2a_block / g2a_sg) {
-                off = "maxComputeWorkgroupSubgroups < 8";
-            } else if (device->properties.limits.maxComputeWorkGroupInvocations < g2a_block ||
-                       device->properties.limits.maxComputeWorkGroupSize[0] < g2a_block) {
-                off = "workgroup limits < 512";
-            } else if (!ggml_vk_mm_stride_pad_ok(device, l_warptile_mmqidb1[3], g2a_pad)) {
-                off = "non-conformant LDS pad off RADV";
-            }
-            uint32_t stride_b = 0;
+            const char * const b1_off = ggml_vk_mmid_tile_b1_off(device);
+            const char * const stays  = b1_off != nullptr ? "the upstream mul_mat_id tiles stay" : "the B1 tile stays";
+            const auto & wt = l_warptile_mmqidb1;
+            const char * const off = [&]() -> const char * {
+                if (b1_off != nullptr)                    { return b1_off; }
+                if (!ggml_vk_mmid_tile_g2a_knob())        { return "GGML_VK_MMID_TILE_G2A=0"; }
+                if (wt.size() != VK_MM_WARPTILE_SIZE)     { return "B1 tile is not the 11-element layout"; }
+                if (wt[1] != 128 || wt[2] != 64 || wt[7] != 16 || wt[8] != 16) { return "B1 tile is not BM 128 x BN 64 with 16 x 16 fragments"; }
+                if (wt[10] != 64)                         { return "WARP != 64"; }
+                if (!ggml_vk_wave_ok(device, wt[10]))     { return "no requiredSubgroupSize 64 pin"; }
+                if (device->subgroup_max_workgroup_subgroups < g2a_block / wt[10]) { return "maxComputeWorkgroupSubgroups < 8"; }
+                if (device->properties.limits.maxComputeWorkGroupInvocations < g2a_block ||
+                    device->properties.limits.maxComputeWorkGroupSize[0] < g2a_block) { return "workgroup limits < 512"; }
+                if (!ggml_vk_mm_stride_pad_ok(device, wt[3], g2a_pad)) { return "non-conformant LDS pad off RADV"; }
+                return nullptr;
+            }();
+            uint32_t stride_b = 0, g2a_sg = 0;
             if (off == nullptr) {
-                stride_b = ggml_vk_mm_stride_bytes(l_warptile_mmqidb1[3], g2a_pad);
+                g2a_sg   = l_warptile_mmqidb1[10];
+                stride_b = ggml_vk_mm_stride_bytes(l_warptile_mmqidb1[3], g2a_pad);  // coopmat1 device: checked by ggml_vk_mm_stride_pad_ok
                 l_warptile_mmqidb1[0] = g2a_block;  // BLOCK_SIZE: 8 warps
                 l_warptile_mmqidb1[4] = 64;         // WM
                 l_warptile_mmqidb1[5] = 16;         // WN
@@ -5526,7 +5516,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                   device->name.c_str(), g2a_block, g2a_pad, stride_b, pad_src,
                                   stride_b % 16 == 0 ? "16-B aligned" : "not 16-B aligned, RADV only", g2a_sg);
                 } else {
-                    GGML_LOG_WARN("ggml_vulkan: %s mmid_tile_g2a: off (%s; the B1 tile stays)\n", device->name.c_str(), off);
+                    GGML_LOG_WARN("ggml_vulkan: %s mmid_tile_g2a: off (%s; %s)\n", device->name.c_str(), off, stays);
                 }
             }
         }
@@ -5628,10 +5618,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->mul_mat_id_l_int[i] = false;
             }
         }
-    }
-    // [TAG_MMID_TILE_G2A] a device without the B1 tile (GGML_VK_MMID_TILE_BM128=0, coopmat2, the AMD proprietary driver, non-AMD) still gets its proof line
-    if (!device->mmid_tile_g2a_logged.exchange(true)) {
-        GGML_LOG_WARN("ggml_vulkan: %s mmid_tile_g2a: off (B1 tile off)\n", device->name.c_str());
     }
 
     if (!device->pipeline_matmul_f32) {
