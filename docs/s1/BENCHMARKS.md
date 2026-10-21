@@ -339,7 +339,7 @@ loads at 6.8 GB/s cold, 8.8-10 GB/s from page cache. For comparison, re-prefill 
 | IQ3_XXS-hc8, 400k context | 2026-10-07 | 13.3 t/s | 72.6 t/s | needles at 399k found |
 | IQ3_S-hc8-o8 (the compose) | 2026-10-10 | ~15-16 t/s | ~140 t/s at 1.7k | early end-of-reply P(EOS) 0.001 vs 0.090 on IQ3_XXS-hc8 |
 | IQ3_S-hc8-o8, image v61k (the compose 2026-10-17 to 2026-10-21) | 2026-10-17 | 24.3 t/s on one short chat reply (deploy smoke, draft 183/189) | not re-measured | disk-cache restore of a stored 6 584-token entry: PASS (prompt_n 4, cache_n 6 580); v61's levers act on the QSA indexer above 64k only |
-| IQ3_S-hc8-o8, image v63k `f82fdd2a4091` (the compose since 2026-10-21 06:38) | 2026-10-21 | 20.9 t/s on one short chat reply (deploy smoke, draft 183/189) - contaminated: a GPU test container ran on the same 780M during the smoke; re-measure pending, no regression claimed either way | not re-measured | disk-cache restore of the stored 6 584-token entry: PASS (prompt_n 4, cache_n 6 580) |
+| IQ3_S-hc8-o8, image v63k `f82fdd2a4091` (the compose since 2026-10-21 06:38) | 2026-10-21 | 27.8 / 28.0 / 27.7 t/s on one short chat reply (the smoke request: max_tokens 256, temperature 0, thinking off; 3 runs, free GPU, 06:57; draft 184/186, prompt 189-224 ms); v62k smoke 2026-10-19: 25.8 t/s. The deploy smoke's 20.9 t/s ran next to a GPU test container on the same 780M and is not used | not re-measured | disk-cache restore of the stored 6 584-token entry: PASS (prompt_n 4, cache_n 6 580) |
 
 QSA on the 780M at 128k: +48 % prefill, +68 % decode vs dense. `-ub 4096`, forced MMVQ and int8 MMQ: no gain.
 
