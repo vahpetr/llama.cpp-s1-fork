@@ -7,7 +7,8 @@ from upstream PR #27742 and an MTP draft graph. Upstream back-ports are marked a
 Status column:
 - **deployed (vNN)**: in my builds from image vNN on (my production line), still in this tree.
 - **v60**: in this tree since v60 (in production 2026-10-16 to 2026-10-17); "v60, on" / "v60, off" = the default of its knob.
-- **v61**: in this tree (HEAD = v61, in production since 2026-10-17); "v61, on" = on by default.
+- **v61**: in this tree since v61 (in production 2026-10-17 to 2026-10-19); "v61, on" = on by default.
+- **v63**: in this tree (HEAD = v63, released 2026-10-21); "v63, on" / "v63, off" = the default of its knob.
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
 - **in tree, off**: compiled in, off unless you set its knob (docs/s1/KNOBS.md).
@@ -240,6 +241,15 @@ records and upstream status live in my private repo; ask if you want one.
 | 0241 | vulkan: QSA_SCORE planes of >= 2 N tiles run on `*_qsa_kr` twins whose workgroups are numbered key tile major, so the query tiles of a chunk read each pooled-key tile back to back (A2b); same per-tile program, same bits; s1 kernel test median 0.877x per call over 16 shapes | v61, on (EXACT) |
 | 0242 | tests: test-cell-ext-restore uses a private temp dir per run; comments use neutral wording | v61, no code change |
 | 0243 | vulkan: QSA top-k select (cell form, v2) without per-cell key rows: the key is computed from the score bits and the visibility with integer instructions; no key region in the scratch (A3); s1 select per QSA layer at 1M 7.616 -> 6.097 s | v61, on (EXACT) |
+| 0244-0251 | v62: correctness and diagnostics (incl. `GGML_VK_BUF_LOG`, `--spec-draft-n-ubatch`, unset); numbers = v61 (BENCHMARKS.md section 0b) | v62 |
+| 0252 | server + common: `--spec-draft-sampling greedy\|probabilistic` (upstream #27694 port): at T > 0 the draft is sampled from a draft sampler at the request's temperature and seed and the target verifies by rejection sampling; stateful samplers keep sample-and-match (U7) | v63, off (greedy = byte-identical) |
+| 0253 | vulkan: MUL_MAT_ID coopmat1 skips the B loads and the K loop of warps whose columns are not rows of the expert (upstream #25483 cherry-pick); test-only negative-control build option `GGML_VULKAN_MMID_SKIP_NEGCTL` + `test-mmid-skip` (U3) | v63, on (EXACT) |
+| 0254 | vulkan: matmul_id shaders read the (expert, tile) list written by the expert-count prepass instead of a binary search; duplicate ids, hoisting in rounds of 512 experts (upstream #29998 port); `test_mul_mat_id_dup` (U3) | v63, on (EXACT) |
+| 0255 | server: recurrent checkpoints at message boundaries are kept in the disk cache on top of the depth schedule (`--cache-disk-ckpt-semantic`, default 16) (SC1) | v63, on (EXACT) |
+| 0256 | server: `cache_pin: {"tokens": N}` request field - a pinned checkpoint per conversation, never thinned (SC1) | v63, request field (EXACT without it) |
+| 0257 | server: the slot's context checkpoints in the `/slots` save file (upstream #26004 cherry-pick + a fork appendix with the state descriptors and the disk-cache namespace identity) (U5) | v63 (EXACT) |
+| 0258 | server + llama: the live MTP draft state in the `/slots` save file, streamed in 16 MiB pieces; a restore drafts warm; provenance bits keep a shifted or foreign state out of the disk cache (upstream #30574 port) (U5) | v63 (EXACT) |
+| 0259 | server: checkpoints restored from a slot file never enter the disk cache's deep store or the conversation save, and never become a pin | v63 (EXACT) |
 
 **0227-0240 apply order** on v59 (`a1b6c324e`): 0227, 0228, 0229, 0230, 0231, 0232, **0234, 0233**, 0235, 0236, 0237, 0238,
 0239, 0240 (0233 sits on 0234). Applied with a strict `git am` in that order they reproduce the v60 tree (`845c6fbcd`,
@@ -249,3 +259,8 @@ package's, plus each patch's own unit and op tests.
 **0241-0243 apply order** on v60 (`845c6fbcd`): 0242, 0241, 0243. Applied with a strict `git am` in that order they reproduce the
 v61 tree (`7a438f3ba`, `prod-v11-stage8-pkg8`). 0241 and 0242 touch disjoint files, so their order does not matter. The gate
 covered the package as a whole, plus an off arm per lever.
+
+**0252-0259 apply order** on v62 (`e4af0a6ca`): 0253, 0254, 0255, 0256, 0257, 0258, 0252, 0259 (the order of the package
+commits); a strict `git am` of 0252 -> 0259 in number order gives the same tree (`5414224ae`, rev `8c1a468aa`,
+`prod-v11-stage9-pkg2`). The full oracle gate covered the package as a whole (docs/s1/BENCHMARKS.md section 0c), plus each
+patch's own unit and server tests; `--spec-draft-sampling probabilistic` was not in the gated configuration.
