@@ -41,6 +41,22 @@ section 0c):
 | fresh 32k prompt | 72.85 s | 69.79 s | -4.2 %, one sample |
 | branch after a message boundary, TTFT (semantic checkpoints 16 vs 0) | 4.86 s at 0 | 1.84 s | one branch of three; the other two unchanged |
 
+**Server rows** (llama-server, 1M profile on s1, the S0.2 corpus with the same driver and token positions as the v61 run of
+2026-10-18; run of 2026-10-21, single runs, noise +-1.5 %; BENCHMARKS.md section 2b):
+
+| metric | v61 | v63 | change |
+|---|---|---|---|
+| cold prompt 128k / prefill 72k | 427.4 / 377.2 t/s | 439.8 / 384.1 t/s | +2.9 / +1.8 % |
+| 65k fill steps ->262k / ->524k / ->1M; whole fill 0 -> 1M | 483 / 425 / 352 t/s; 0.70 h | 495 / 434 / 358 t/s; 0.69 h | +2.4 / +2.1 / +1.9 %; -1.4 % |
+| decode at depth, draft on, worst window, 32k / 262k / 1M | 25.83 / 21.04 / 19.92 ms/tok | 25.80 / 21.05 / 19.93 ms/tok | unchanged (same accepted drafts) |
+| TTFT at 1M + 256 new tokens, warm / median after a slot restore | 1 592 / 1 886 ms | 1 449 / 1 728 ms | -9.0 / -8.3 % (prompt side) |
+| `/slots` save at 262k / 1M | 3.72 / 14.48 GiB in 1.4 / 3.9 s | 4.71 / 17.09 GiB in 1.7 / 4.0 s | +27 / +18 % bytes (draft state + checkpoints) |
+| server GTT at load / over the 1M fill | 105 825 / 105 627 MiB | 105 519 / 105 627 MiB | -306 / 0 MiB |
+
+The prefill rows are the MUL_MAT_ID skip; decode is unchanged by design; the TTFT gain is in the prompt processing on both the
+warm and the restored request (the warm draft from the slot file pays after the first token); the slot files grow by what they
+now carry.
+
 **Class: EXACT.** The full S0.1 oracle gate on gfx1151 (1M production configuration minus the vision projector, one slot,
 text corpus; 16.7 h, finished 2026-10-21 04:36): bit-identical to the v59 reference at 1 502 logit positions and 224 state
 points, with the ordered QSA selected ids, at verify widths 1-6 in full and the last 6 positions of widths 7-9, depths 8k ->
