@@ -8,7 +8,8 @@ Status column:
 - **deployed (vNN)**: in my builds from image vNN on (my production line), still in this tree.
 - **v60**: in this tree since v60 (in production 2026-10-16 to 2026-10-17); "v60, on" / "v60, off" = the default of its knob.
 - **v61**: in this tree since v61 (in production 2026-10-17 to 2026-10-19); "v61, on" = on by default.
-- **v63**: in this tree (HEAD = v63, released 2026-10-21; in production since 2026-10-21 06:32 s1 / 06:38 balkon); "v63, on" / "v63, off" = the default of its knob.
+- **v63**: in this tree since v63 (released 2026-10-21; in production 2026-10-21 06:32 to 22:12); "v63, on" / "v63, off" = the default of its knob.
+- **v64**: in this tree (HEAD = v64, released 2026-10-21; in production since 2026-10-21 22:12 s1 / 22:16 balkon); "v64, on" = on by default.
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
 - **in tree, off**: compiled in, off unless you set its knob (docs/s1/KNOBS.md).
@@ -242,7 +243,7 @@ records and upstream status live in my private repo; ask if you want one.
 | 0242 | tests: test-cell-ext-restore uses a private temp dir per run; comments use neutral wording | v61, no code change |
 | 0243 | vulkan: QSA top-k select (cell form, v2) without per-cell key rows: the key is computed from the score bits and the visibility with integer instructions; no key region in the scratch (A3); s1 select per QSA layer at 1M 7.616 -> 6.097 s | v61, on (EXACT) |
 | 0244-0251 | v62: correctness and diagnostics (incl. `GGML_VK_BUF_LOG`, `--spec-draft-n-ubatch`, unset); numbers = v61 (BENCHMARKS.md section 0b) | v62 |
-| 0252 | server + common: `--spec-draft-sampling greedy\|probabilistic` (upstream #27694 port): at T > 0 the draft is sampled from a draft sampler at the request's temperature and seed and the target verifies by rejection sampling; stateful samplers keep sample-and-match (U7) | v63, off (greedy = byte-identical) |
+| 0252 | server + common: `--spec-draft-sampling greedy\|probabilistic` (upstream #27694 port): at T > 0 the draft is sampled from a draft sampler at the request's temperature and seed and the target verifies by rejection sampling; stateful samplers keep sample-and-match (U7) | v63, off (greedy = byte-identical); probabilistic in the composes since v64 (T = 0 unchanged) |
 | 0253 | vulkan: MUL_MAT_ID coopmat1 skips the B loads and the K loop of warps whose columns are not rows of the expert (upstream #25483 cherry-pick); test-only negative-control build option `GGML_VULKAN_MMID_SKIP_NEGCTL` + `test-mmid-skip` (U3) | v63, on (EXACT) |
 | 0254 | vulkan: matmul_id shaders read the (expert, tile) list written by the expert-count prepass instead of a binary search; duplicate ids, hoisting in rounds of 512 experts (upstream #29998 port); `test_mul_mat_id_dup` (U3) | v63, on (EXACT) |
 | 0255 | server: recurrent checkpoints at message boundaries are kept in the disk cache on top of the depth schedule (`--cache-disk-ckpt-semantic`, default 16) (SC1) | v63, on (EXACT) |
@@ -250,6 +251,9 @@ records and upstream status live in my private repo; ask if you want one.
 | 0257 | server: the slot's context checkpoints in the `/slots` save file (upstream #26004 cherry-pick + a fork appendix with the state descriptors and the disk-cache namespace identity) (U5) | v63 (EXACT) |
 | 0258 | server + llama: the live MTP draft state in the `/slots` save file, streamed in 16 MiB pieces; a restore drafts warm; provenance bits keep a shifted or foreign state out of the disk cache (upstream #30574 port) (U5) | v63 (EXACT) |
 | 0259 | server: checkpoints restored from a slot file never enter the disk cache's deep store or the conversation save, and never become a pin | v63 (EXACT) |
+| 0262 | vulkan: MUL_MAT_ID coopmat1 l tile (the 0232 BM 128 x BN 64 tile; q4_K / q5_0 / q8_0 / q6_K / iq3_s) runs 8 warps of WM 64 x WN 16 with LDS pad 2 (a 72-B stride, RADV only; `GGML_VK_MMID_TILE_G2A_PAD`) instead of 4 warps of 64 x 32 with pad 4; a generic 14-element warptile carrier (name suffix, pinned subgroup size, B-load clamp) with per-device tile-reach checks; the shader's per-tile row count clamped to BN; 90 new MUL_MAT_ID test cases (duplicate ids, hot routes) (G2a); 780M n 2048 q4_K / q5_0 / q8_0 -17 / -15 / -12 %, s1 MUL_MAT_ID node -4.1 % at 32k | v64, on (EXACT) |
+| 0263 | vulkan: coopmat1 flash-attention shared-memory layouts for dense prefill: the P.V staging aliased onto the softmax staging (`GGML_VK_FA_SFPV_ALIAS`) and the dead-column V staged per 16-row chunk (`GGML_VK_FA_V_CHUNK`); 31 -> 21 KiB of LDS at head size 256, 4 -> 6 workgroups per WGP; `tests/test-fa-prefill-exact` (FA1); 780M 8k / 32k / 64k -13 / -18 / -17 %, s1 FLASH_ATTN_EXT node -16.5 % at 32k | v64, on (EXACT) |
+| 0265 | vulkan: dense coopmat1 GEMM tile table for the prefill shapes (q4_K / q6_K m >= 2048 k >= 2560 -> BM 64 x BN 128, q5_0 m >= 2048 k <= 640 -> BM 128 x BN 64; 2 warps, LDS pad 4, subgroup 64 pinned; `GGML_VK_DENSE_TILE_G1` with a sweep mode; a WARN proof line); `tools/perf/g1-sweep.sh` and the byte classifier `tools/perf/test-vk-gemm-class.cpp` (G1); 780M large q4_K shapes -31 ... -38 %, s1 G1-eligible MUL_MAT node -4.1 % at 32k (mixed per shape) | v64, on (EXACT) |
 
 **0227-0240 apply order** on v59 (`a1b6c324e`): 0227, 0228, 0229, 0230, 0231, 0232, **0234, 0233**, 0235, 0236, 0237, 0238,
 0239, 0240 (0233 sits on 0234). Applied with a strict `git am` in that order they reproduce the v60 tree (`845c6fbcd`,
@@ -264,3 +268,9 @@ covered the package as a whole, plus an off arm per lever.
 commits); a strict `git am` of 0252 -> 0259 in number order gives the same tree (`5414224ae`, rev `8c1a468aa`,
 `prod-v11-stage9-pkg2`). The full oracle gate covered the package as a whole (docs/s1/BENCHMARKS.md section 0c), plus each
 patch's own unit and server tests; `--spec-draft-sampling probabilistic` was not in the gated configuration.
+
+**0262 / 0263 / 0265 apply order** on v63 (`8c1a468aa`): 0263, 0262, 0265. Applied with a strict `git am` in that order they
+reproduce the v64 tree (`6f39b1652`, rev `c5b3462ed`, `prod-v11-stage9-pkg3`). The three were gated as one package on the short
+tier of the oracle (docs/s1/BENCHMARKS.md section 0d; the deep tripwire the night after re-ran the control arms), plus each
+kernel's byte classifier against the v63 build and its op tests; 0252's probabilistic mode is on in the v64 composes but was
+not part of the gated (greedy) configuration.
