@@ -5,7 +5,10 @@ One entry per published image. Older versions (v52-v59) are summarised in the li
 
 ## v63 - 2026-10-21
 
-Images: `vahpetr/llama-cpp-s1-fork:v63` = `:v63k` = `:latest`, revision `8c1a468aa` (`prod-v11-stage9-pkg2`).
+Images: `vahpetr/llama-cpp-s1-fork:v63` = `:v63k` = `:latest` (one digest,
+`sha256:d16b1cdc9139573f07c380f6a5fc6913866348bb6a121593c2e52c76f538a5d4`), revision `8c1a468aa` (`prod-v11-stage9-pkg2`).
+In production since 2026-10-21 06:32 (s1 brain) / 06:38 (balkon hands; the local balkon build `flash-next:vulkan-v63k`,
+image id `f82fdd2a4091`).
 Rollback: `:v62` / `:v62k` (`e4af0a6ca`). v62 (2026-10-19) was a correctness and diagnostics release with v61's numbers
 (patches 0244-0251, BENCHMARKS.md section 0b).
 
@@ -43,7 +46,7 @@ text corpus; 16.7 h, finished 2026-10-21 04:36): bit-identical to the v59 refere
 points, with the ordered QSA selected ids, at verify widths 1-6 in full and the last 6 positions of widths 7-9, depths 8k ->
 1M, and restore / replay histories; the A2b / A3 off arms and a MUL_MAT_ID section as well. Gate: 96 PASS, 4 INFO, 0 FAIL.
 GTT peak 106 095 MiB (score-capture pass; v61 106 095, v60 106 357). Not covered: multi-slot stream offsets,
-`--spec-draft-sampling probabilistic`. No claim for other model families.
+`--spec-draft-sampling probabilistic`. No claim for other model families. Inside the gate the A3 on/off wall ratio on the decode-like tails at 262k is 1.061 (v62: 0.999), but the absolute A3-on tails are unchanged vs v62 (v63/v62 = 1.006; prompt 8k 0.966): the A3-off path got 5.3 % faster with the MUL_MAT_ID skip (0253 / 0254; off arm v63/v62 = 0.947), so the shipped A3-on configuration did not regress, and the release accepted the ratio on that basis.
 
 **Disk cache and slot files: same key as v62.** v63 reads v62's disk-cache entries and v62 reads v63's. v63 restores v62 /
 v61-format `/slots` files (with a cold draft, as v62 did). A v62 server restoring a v63 `/slots` file reads the target state
@@ -56,6 +59,7 @@ and ignores the new appendices: the result is correct, but the draft starts cold
 - `GET /disk-cache` `deep_semantic` counts newly written semantic checkpoint files only; an existing file re-tagged as
   semantic is not counted.
 - The 524k profile was not re-measured on v63.
+- Hands throughput: The hands deploy smoke gave 20.9 t/s on one short chat reply (draft 183/189; v61k: 24.3) while a GPU test container was running on the same 780M, so that number is contaminated and shows neither a regression nor its absence; re-measure pending.
 
 ## v61 - 2026-10-17
 

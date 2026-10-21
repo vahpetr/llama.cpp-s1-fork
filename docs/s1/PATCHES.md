@@ -8,7 +8,7 @@ Status column:
 - **deployed (vNN)**: in my builds from image vNN on (my production line), still in this tree.
 - **v60**: in this tree since v60 (in production 2026-10-16 to 2026-10-17); "v60, on" / "v60, off" = the default of its knob.
 - **v61**: in this tree since v61 (in production 2026-10-17 to 2026-10-19); "v61, on" = on by default.
-- **v63**: in this tree (HEAD = v63, released 2026-10-21); "v63, on" / "v63, off" = the default of its knob.
+- **v63**: in this tree (HEAD = v63, released 2026-10-21; in production since 2026-10-21 06:32 s1 / 06:38 balkon); "v63, on" / "v63, off" = the default of its knob.
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
 - **in tree, off**: compiled in, off unless you set its knob (docs/s1/KNOBS.md).
