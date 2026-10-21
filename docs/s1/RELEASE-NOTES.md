@@ -3,12 +3,79 @@
 One entry per published image. Older versions (v52-v59) are summarised in the lineage table of
 [BENCHMARKS.md](BENCHMARKS.md), section 0; every change is a numbered row in [PATCHES.md](PATCHES.md).
 
+## v64 - 2026-10-21
+
+Images: `vahpetr/llama-cpp-s1-fork:v64` = `:v64k` = `:latest` (one digest,
+`sha256:b3c12a3a7f680d9d1683edbc1b5728b285766618bfacb9aa2159d9eed891ff28`), revision `c5b3462ed` (`prod-v11-stage9-pkg3`).
+In production since 2026-10-21 22:12 (s1 brain; local build `flash-next:vulkan-v64`, image id `bb175dd1070a`) / 22:16
+(balkon hands; `flash-next:vulkan-v64k`, image id `7e8d8fe2bbe9`). Rollback: `:v63` / `:v63k` (`8c1a468aa`), same key and
+slot-file format; the v63 image accepts the v64 composes' `--spec-draft-sampling` line (the flag exists there, off by default),
+so a rollback compose keeps it unless you remove the two lines.
+
+**What it is.** v63 plus three kernel patches (0262, 0263, 0265: ggml-vulkan and tests only, no server change), on by their
+code defaults, and one compose change: `--spec-draft-sampling probabilistic` (0252, in the code since v63) is set in every
+compose with a draft model.
+
+- Flash attention (0263, FA1): two shared-memory layouts for the coopmat1 kernel on dense multi-row dispatches - the P.V
+  staging aliased onto the softmax staging (disjoint lifetimes) and the dead-column V staged per 16-row chunk; 31 -> 21 KiB
+  of LDS at head size 256, 4 -> 6 workgroups per WGP on RDNA3. Decode, verify and the indexed QSA path keep their pipelines.
+  Knobs `GGML_VK_FA_SFPV_ALIAS`, `GGML_VK_FA_V_CHUNK`.
+- Expert GEMMs (0262, G2a): v60's BM 128 x BN 64 `mul_mat_id` tile runs 8 warps of 64 x 16 instead of 4 of 64 x 32, with an
+  LDS row pad of 2 (a 72-byte stride; conflict-free but not 16-byte aligned, so RADV only by design - `_PAD=4` is the
+  conformant layout and gives no gain). Same fragments, same K loop, same bits. Knob `GGML_VK_MMID_TILE_G2A`; startup line
+  `mmid_tile_g2a: on (...)`.
+- Dense GEMMs (0265, G1): a 3-rule tile table for the large prefill matmuls (q4_K / q6_K m >= 2048 k >= 2560 -> BM 64 x BN
+  128; q5_0 m >= 2048 k <= 640 -> BM 128 x BN 64; 2 warps, LDS pad 4, subgroup 64 pinned); the hyper-connection shapes stay on
+  the base tile. Knob `GGML_VK_DENSE_TILE_G1`; startup line `dense_tile_g1: table on (3 rules) (...)`.
+- Probabilistic draft sampling as the compose default (0252; rulings R134 / R135): at T > 0 the MTP draft is sampled at the
+  request's temperature and verified by rejection sampling; a T = 0 request is unchanged (greedy, bit-identical).
+
+**Measured** (1M profile on s1; the kernel A/B = one image with the three knobs off and on, llama-server, 2026-10-21; details
+in BENCHMARKS.md sections 0d and 2c):
+
+| metric | v63 kernels | v64 | change |
+|---|---|---|---|
+| prefill, fresh 32k / 72k prompt (cold, 2 reps per arm) | 467.5 / 385.6 t/s | 500.9 / 417.3 t/s | +7.15 / +8.22 % |
+| node time of one cold 32k request under the perf logger: FLASH_ATTN_EXT / MUL_MAT_ID / G1-eligible MUL_MAT / all nodes | 19.39 / 16.14 / 17.62 / 68.45 s | 16.20 / 15.48 / 16.89 / 63.83 s | -16.5 / -4.1 / -4.1 / -6.8 % (attribution, not a timing run) |
+| identity, kernels off vs on | 32 greedy tokens + top-8 logprobs at 32k, the first token at 72k | identical | |
+| decode at 32k, live server, 256 tokens x 3, T = 0 / pi's thinking card / pi's instruct card (both runs with the probabilistic flag) | 22.07 / 22.51 / 22.91 ms/tok | 21.27 / 21.68 / 22.28 ms/tok | -3.6 / -3.7 / -2.7 %, same accepted / drafted counts |
+| GTT, llama-server with the projector, after load / after the smoke requests | 105 495 / 105 519 MiB (v63) | 105 495 / 105 519 MiB | unchanged (the v63 live level before the switch was 105 414) |
+| 780M kernel tests (balkon): G2a MUL_MAT_ID n 2048, FA1 8k-64k, G1 large q4_K shapes | | -12 ... -18 %, -13 ... -18 %, -31 ... -38 % | the G1 gains did not transfer shape for shape to gfx1151 (section 2c) |
+| hands `:v64k`, one short chat reply | 27.8 t/s (v63k, free GPU) | 24.6 t/s (the deploy smoke right after the restart) | re-measure pending; 40-task coding bench with the probabilistic draft 39/40 (references 38/40) |
+
+**Class: EXACT on the short gate tier, by ruling.** For this release the S0.1 oracle ran its short tier (R133 / R137), not the
+full 16.7 h run of v63: the candidate passes (1M production configuration minus the vision projector, one slot, text corpus)
+are complete and bit-identical to the v59 reference - 558 logit positions and 81 state points, ordered selected ids, with the
+score and dispatch captures compared as extra evidence; the per-lever control arms (production-eligibility rows, not the
+candidate's check) were cut and are re-run by the deep tripwire the night after the release, with an automatic rollback to v63
+on any difference (result not in this text). On top: each kernel's byte classifier against the v63 build (G1 48/48, G2a 42/42 +
+27/27 + 90/90 duplicate-id / hot-route cases, FA1 44/44 hashes), `test-backend-ops` MUL_MAT 1139 / MUL_MAT_ID 1058 /
+FLASH_ATTN_EXT 5253, three negative controls, the A/B identity above, and on the live server three fixed greedy requests
+identical to v63 (top-5 logprobs equal). Not covered: multi-slot stream offsets, probabilistic drafting (the gate runs greedy),
+FA1 under the QSA masks beyond 64k and the 72-byte stride on gfx1151 beyond the short case set. The full oracle and the pair
+gate for probabilistic draft sampling return at v67. No claim for other model families.
+
+**Disk cache and slot files: same key and format as v63.** v64 reads v63's entries and v63 reads v64's (13 of 13 same-key
+checks); slot files restore warm in both directions. The draft-sampling flag is not part of the key. Switching v63 <-> v64 is
+an image change; the v64 composes add the flag, the v63 composes on the v64 image keep greedy drafting.
+
+**Known open items.**
+
+- Probabilistic draft sampling: the live probe around the switch is not an off -> on comparison (both runs had the flag), so
+  the flag's own decode effect at T > 0 on the brain is unmeasured; the off -> on comparison and the distribution check (pair
+  gate) are scheduled (v67 / the next measurement window). Greedy outputs are unaffected.
+- The G1 table on gfx1151: under the perf logger q5_0 10240 x 320 is -19 % and q4_K 2560 x 6144 -8 %, but q4_K 12288 x 2560
+  +8 %, 6144 x 2560 +5 % and q6_K 10240 x 2560 +3 % (net -4.1 % on the eligible nodes); a per-rule re-cut is open.
+- The S0.2 server rows (128k, the 65k fill steps, decode bands at depth, TTFT at 1M, slot saves) and the 524k profile are not
+  measured on v64 yet.
+- Hands throughput: the post-restart smoke (24.6 t/s) is below the v63k free-GPU value (27.8); a free-GPU re-measure is pending.
+
 ## v63 - 2026-10-21
 
 Images: `vahpetr/llama-cpp-s1-fork:v63` = `:v63k` = `:latest` (one digest,
 `sha256:d16b1cdc9139573f07c380f6a5fc6913866348bb6a121593c2e52c76f538a5d4`), revision `8c1a468aa` (`prod-v11-stage9-pkg2`).
-In production since 2026-10-21 06:32 (s1 brain) / 06:38 (balkon hands; the local balkon build `flash-next:vulkan-v63k`,
-image id `f82fdd2a4091`).
+In production from 2026-10-21 06:32 (s1 brain) / 06:38 (balkon hands; the local balkon build `flash-next:vulkan-v63k`,
+image id `f82fdd2a4091`) to 22:12 / 22:16 (v64).
 Rollback: `:v62` / `:v62k` (`e4af0a6ca`). v62 (2026-10-19) was a correctness and diagnostics release with v61's numbers
 (patches 0244-0251, BENCHMARKS.md section 0b).
 
