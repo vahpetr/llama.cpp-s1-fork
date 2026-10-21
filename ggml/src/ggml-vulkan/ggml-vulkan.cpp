@@ -1308,8 +1308,7 @@ struct vk_device_struct {
     uint32_t qsa_score_kreuse_max_wg;
     // [TAG_MMID_PRECAST_B] GGML_VK_MMID_PRECAST_B (default on)
     bool mmid_precast_b;
-    // [TAG_MMID_TILE_G2A] / [TAG_MM_WARPTILE_EXT] once-per-device flags, set with exchange() (ggml_vk_load_shaders runs per
-    // lazily requested pipeline; review r4 item 6)
+    // [TAG_MMID_TILE_G2A] / [TAG_MM_WARPTILE_EXT] once-per-device flags, set with exchange() (ggml_vk_load_shaders runs per lazily requested pipeline)
     std::atomic<bool> mmid_tile_g2a_logged{false};  // the on / off proof line is printed
     std::atomic<bool> mm_tile_warned{false};        // the plain-tile load-reach warning is printed
     std::atomic<bool> mm_tiles_checked{false};      // the CREATE_MM tile reach checks ran (they are device-constant)
@@ -2589,47 +2588,34 @@ struct vk_mm_tile_meta {
     bool         mmid_b_clamp = false;
 };
 
-// [TAG_MM_WARPTILE_EXT] review r3 F1 / r4 item 9: an LDS row stride of BK / 2 + pad FLOAT_TYPEV2 words is the stride of the
-// coopmat1 coopMatLoads of the 16x16 f16 fragments (mul_mm.comp). VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986 wants that
-// stride aligned to min(16 B, the natural row alignment) = 16 B; with BK 32 and f16vec2 words: pad 0 / 4 / 8 = 64 / 80 / 96 B
-// conform, pad 2 / 6 = 72 / 88 B do not. RADV handles 72 B (balkon 780M: bit-identical classifier, and on the 8-warp G2A tile
-// pad 2 is -10 ... -18 % at n 2048 vs base where pad 4 is -1 ... +2 %), so a non-conformant stride is RADV-only by design;
-// every other driver (AMDVLK / LLPC, ...) keeps the tile without it. Shared by every tile that sets SHMEM_STRIDE_PAD (G2A, G1).
-static uint32_t ggml_vk_mm_stride_bytes(const vk_device & device, uint32_t bk, uint32_t pad) {
-    return (bk / 2 + pad) * (device->fp16 ? 4u : 8u);  // FLOAT_TYPEV2 = f16vec2 or vec2
+// [TAG_MM_WARPTILE_EXT] an LDS row stride of BK / 2 + pad f16vec2 words (4 B; the _cm1 mul_mm shaders are always built with fp16) is the stride of the coopmat1 coopMatLoads of the 16x16 f16 fragments (mul_mm.comp).
+// VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986 wants that stride aligned to min(16 B, the natural row alignment) = 16 B; with BK 32: pad 0 / 4 / 8 = 64 / 80 / 96 B conform, pad 2 / 6 = 72 / 88 B do not.
+// RADV handles 72 B (balkon 780M: bit-identical byte classifier; on the 8-warp G2A tile pad 2 is -10 ... -19 % at n 2048 vs the B1 tile where pad 4 is -3 ... +2 %), so a non-conformant stride is RADV-only by design; every other driver (AMDVLK / LLPC, ...) keeps the tile without it.
+// Shared by every tile that sets SHMEM_STRIDE_PAD (G2A, G1).
+static uint32_t ggml_vk_mm_stride_bytes(uint32_t bk, uint32_t pad) {
+    return (bk / 2 + pad) * 4u;  // f16vec2
 }
 static bool ggml_vk_mm_stride_pad_ok(const vk_device & device, uint32_t bk, uint32_t pad) {
     GGML_ASSERT(bk % 8 == 0);
-    return ggml_vk_mm_stride_bytes(device, bk, pad) % 16 == 0 || device->driver_id == vk::DriverId::eMesaRadv;
+    return ggml_vk_mm_stride_bytes(bk, pad) % 16 == 0 || device->driver_id == vk::DriverId::eMesaRadv;
 }
 
-// a Khronos validation layer is active: compiled in (GGML_VULKAN_VALIDATE) or requested through the loader environment
-static bool ggml_vk_validation_requested() {
-#ifdef GGML_VULKAN_VALIDATE
-    return true;
-#else
-    for (const char * var : { "VK_INSTANCE_LAYERS", "VK_LOADER_LAYERS_ENABLE" }) {
-        const char * v = getenv(var);
-        if (v != nullptr && strstr(v, "validation") != nullptr) {
-            return true;
-        }
-    }
-    return false;
-#endif
-}
-
-// [TAG_MMID_TILE_G2A] review r4 item 1: the G2A LDS row pad. GGML_VK_MMID_TILE_G2A_PAD = 0 / 2 / 4 / 6 / 8 overrides it (any other
-// value is ignored with a warning); default 2 (72 B stride, the measured lever) on RADV, else 4 (80 B, conformant), and 4
-// whenever a validation layer is active so validation runs stay free of the known VUID 08986 report. A non-conformant pad stays
-// RADV-only (ggml_vk_mm_stride_pad_ok). *src says where the value came from (for the proof line). Env read once (static).
+// [TAG_MMID_TILE_G2A] the G2A LDS row pad: GGML_VK_MMID_TILE_G2A_PAD = 0 / 2 / 4 / 6 / 8 (any other value is ignored with a warning); default 2 (72 B stride, the measured lever) on RADV, else 4 (80 B, conformant).
+// A GGML_VULKAN_VALIDATE build (which enables the validation layer itself) defaults to 4, so its validation runs exercise the conformant layout, not the shipped RADV one (pad 2; its correctness evidence is the oracle gate on the real image).
+// A non-conformant pad stays RADV-only (ggml_vk_mm_stride_pad_ok). *src says where the value came from (for the proof line). Env read once (static).
 static uint32_t ggml_vk_mmid_tile_g2a_pad(const vk_device & device, const char ** src) {
     static const int env = [] {
         const char * v = getenv("GGML_VK_MMID_TILE_G2A_PAD");
         if (v == nullptr) {
             return -1;
         }
-        if (v[0] >= '0' && v[0] <= '8' && (v[0] - '0') % 2 == 0 && v[1] == '\0') {
-            return v[0] - '0';
+        char * end = nullptr;
+        const long x = strtol(v, &end, 10);
+        while (end != v && isspace((unsigned char) *end)) {
+            ++end;
+        }
+        if (end != v && *end == '\0' && x >= 0 && x <= 8 && x % 2 == 0) {
+            return (int) x;
         }
         GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMID_TILE_G2A_PAD=%s ignored (accepted: 0, 2, 4, 6, 8)\n", v);
         return -1;
@@ -2638,13 +2624,15 @@ static uint32_t ggml_vk_mmid_tile_g2a_pad(const vk_device & device, const char *
         *src = "GGML_VK_MMID_TILE_G2A_PAD";
         return (uint32_t) env;
     }
-    if (ggml_vk_validation_requested()) {
-        *src = "default under a validation layer";
-        return 4;
-    }
+#ifdef GGML_VULKAN_VALIDATE
+    GGML_UNUSED(device);
+    *src = "default in a GGML_VULKAN_VALIDATE build";
+    return 4;
+#else
     const bool radv = device->driver_id == vk::DriverId::eMesaRadv;
     *src = radv ? "default on RADV" : "default off RADV";
     return radv ? 2 : 4;
+#endif
 }
 
 // a requiredSubgroupSize of w is usable for a full-subgroup compute pipeline (hoisted from the QSA top-k setup)
@@ -5324,16 +5312,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const auto it = mm_tile_meta.find(&wt);
         return it == mm_tile_meta.end() ? vk_mm_tile_meta{} : it->second;
     };
-    // review r2 item 3 / r4 items 2, 8, 11: the mul_mm loaders run `for (l = 0; l < BM|BN; l += loadstride)` and write rows /
-    // columns loadc + l, loadc < loadstride = BLOCK * LOAD_VEC_EFF * LOAD_VEC_BATCH / BK; they stay inside the tile only if
-    // loadstride <= BM|BN and divides it. On the B side a larger reach is safe only in the mul_mat_id shader's per-tile row clamp
-    // (a registered mmid_b_clamp tile). LOAD_VEC as vulkan-shaders-gen.cpp builds the coopmat1 mul_mm shaders (aligned: B 4 for
-    // BF16 A, else 8 (4 without fp16); A per type; unaligned: B 1 x 2, f32 / f16 / bf16 A 1 x 2, quant A unchanged); the f32 /
-    // f16 A shaders hard-code BK 32. The tiles are device-constant, so the checks run on the first ggml_vk_load_shaders call only.
+    // The mul_mm loaders run `for (l = 0; l < BM|BN; l += loadstride)` and write rows / columns loadc + l, loadc < loadstride = BLOCK * LOAD_VEC_EFF * LOAD_VEC_BATCH / BK; they stay inside the tile only if loadstride <= BM|BN and divides it.
+    // On the B side a larger reach is safe only in the mul_mat_id shader's per-tile row clamp (a registered mmid_b_clamp tile on an _id pipeline).
+    // LOAD_VEC as vulkan-shaders-gen.cpp builds the _cm1 mul_mm shaders (always with fp16): aligned B 4 for BF16 A, else 8; aligned A per type (f32 / f16 8, bf16 4); unaligned B and f32 / f16 / bf16 A 1 x 2, quant A unchanged; the f32 / f16 A shaders hard-code BK 32.
+    // The tiles are device-constant, so the checks run on the first ggml_vk_load_shaders call per device only.
     const bool mm_check_tiles = !device->mm_tiles_checked.exchange(true);
-    const auto mm_load_vec_a = [&device](ggml_type type, bool aligned) -> uint32_t {
+    const auto mm_load_vec_a = [](ggml_type type, bool aligned) -> uint32_t {
         switch (type) {
-            case GGML_TYPE_F32: case GGML_TYPE_F16: return aligned ? (device->fp16 ? 8u : 4u) : 2u;
+            case GGML_TYPE_F32: case GGML_TYPE_F16: return aligned ? 8u : 2u;
             case GGML_TYPE_BF16: return aligned ? 4u : 2u;
             case GGML_TYPE_Q1_0: case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_1: case GGML_TYPE_IQ1_S:
             case GGML_TYPE_IQ1_M: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S: return 8u;
@@ -5348,7 +5334,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             return;
         }
         const uint32_t bk = (type == GGML_TYPE_F32 || type == GGML_TYPE_F16) ? 32u : wt[3];
-        const uint32_t vec_b = aligned ? (type == GGML_TYPE_BF16 ? 4u : device->fp16 ? 8u : 4u) : 2u;
+        const uint32_t vec_b = aligned ? (type == GGML_TYPE_BF16 ? 4u : 8u) : 2u;
         const uint32_t vec_a = mm_load_vec_a(type, aligned);
         const uint32_t ls_a = wt[0] * vec_a / bk, ls_b = wt[0] * vec_b / bk;
         const bool a_ok = ls_a > 0 && ls_a <= wt[1] && wt[1] % ls_a == 0;
@@ -5548,21 +5534,20 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // result depends on its own A rows / B columns only), so each output keeps its bits. Block 512 relies on the per-tile
         // row clamp in mul_mm.comp (its B load columns run to 127 > BN; registered as mmid_b_clamp). The 8-warp layout is only
         // correct with a real subgroup size of 64 (warp_i = gl_SubgroupID, warp_c = gl_SubgroupID / 2, ballots_sh[8],
-        // storestride = WARP / TM), so G2A requires the pin (review r3 F2/F7, = the r2 rule): requiredSubgroupSize 64 must be
-        // usable (ggml_vk_wave_ok) and the 8 subgroups must fit maxComputeWorkgroupSubgroups (VUID 02757); without the pin
-        // the B1 tile stays. GGML_VK_MMID_TILE_G2A=0 keeps the B1 tile.
-        // review r4 items 1, 5, 7, 10: one subgroup size (the B1 tile's WARP), the pad from ggml_vk_mmid_tile_g2a_pad, and a
-        // proof line once per device either way: "on (...)" or "off (<reason>)" so a gate grep tells off from the knob.
+        // storestride = WARP / TM), so G2A requires the pin: requiredSubgroupSize 64 must be usable (ggml_vk_wave_ok) and the 8 subgroups must fit
+        // maxComputeWorkgroupSubgroups (VUID 02757); without the pin the B1 tile stays. GGML_VK_MMID_TILE_G2A=0 keeps the B1 tile.
+        // One proof line per device either way: "on (...)" or "off (<reason>)", so a gate grep tells off from the knob.
         if (ggml_vk_mmid_tile_b1(device)) {
-            const uint32_t g2a_sg = l_warptile_mmqidb1.size() > 10 ? l_warptile_mmqidb1[10] : 0;
             const uint32_t g2a_block = 512;
             const char *   pad_src = "";
             const uint32_t g2a_pad = ggml_vk_mmid_tile_g2a_pad(device, &pad_src);
+            GGML_ASSERT(l_warptile_mmqidb1.size() == VK_MM_WARPTILE_SIZE);
+            const uint32_t g2a_sg = l_warptile_mmqidb1[10];
             const char *   off = nullptr;
             if (!ggml_vk_mmid_tile_g2a_knob()) {
                 off = "GGML_VK_MMID_TILE_G2A=0";
-            } else if (l_warptile_mmqidb1.size() != VK_MM_WARPTILE_SIZE || l_warptile_mmqidb1[1] != 128 ||
-                       l_warptile_mmqidb1[2] != 64 || l_warptile_mmqidb1[7] != 16 || l_warptile_mmqidb1[8] != 16) {
+            } else if (l_warptile_mmqidb1[1] != 128 || l_warptile_mmqidb1[2] != 64 || l_warptile_mmqidb1[7] != 16 ||
+                       l_warptile_mmqidb1[8] != 16) {
                 off = "B1 tile is not BM 128 x BN 64 with 16 x 16 fragments";
             } else if (g2a_sg != 64) {
                 off = "WARP != 64";
@@ -5576,8 +5561,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             } else if (!ggml_vk_mm_stride_pad_ok(device, l_warptile_mmqidb1[3], g2a_pad)) {
                 off = "non-conformant LDS pad off RADV";
             }
-            const uint32_t stride_b = l_warptile_mmqidb1.size() > 3 ? ggml_vk_mm_stride_bytes(device, l_warptile_mmqidb1[3], g2a_pad) : 0;
+            uint32_t stride_b = 0;
             if (off == nullptr) {
+                stride_b = ggml_vk_mm_stride_bytes(l_warptile_mmqidb1[3], g2a_pad);
                 l_warptile_mmqidb1[0] = g2a_block;  // BLOCK_SIZE: 8 warps
                 l_warptile_mmqidb1[4] = 64;         // WM
                 l_warptile_mmqidb1[5] = 16;         // WN
@@ -5631,8 +5617,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // the quantized types the byte classifier covers (ggml_vk_b1_classified_type); every other type keeps the
             // upstream plan (on AMD: no l tile), incl. F32 / F16 / BF16 and the dequant-to-f16 fallback (review B1 I1)
             if (ggml_vk_mmid_tile_b1(device) && device->mul_mat_id_m[i] && ggml_vk_b1_classified_type(t)) {
-                // [TAG_MMID_TILE_G2A] review m4: the shader's coopmat_stage is TM * TN * NUM_WARPS (exact_stage), and an extended
-                // warptile brings its real pad
+                // [TAG_MMID_TILE_G2A] the shader's coopmat_stage is TM * TN * NUM_WARPS (exact_stage), and an extended warptile brings its real pad
                 device->mul_mat_id_l[i] = ggml_vk_matmul_shmem_support(device, l_warptile_mmqidb1, true, t, true);
             }
             // [TAG_INJECT_TILE_M16] q4_K / q8_0 only, where the s tile itself is available
@@ -5697,6 +5682,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->mul_mat_id_l_int[i] = false;
             }
         }
+    }
+    // [TAG_MMID_TILE_G2A] a device without the B1 tile (GGML_VK_MMID_TILE_BM128=0, coopmat2, the AMD proprietary driver, non-AMD) still gets its proof line
+    if (!device->mmid_tile_g2a_logged.exchange(true)) {
+        GGML_LOG_WARN("ggml_vulkan: %s mmid_tile_g2a: off (B1 tile off)\n", device->name.c_str());
     }
 
     if (!device->pipeline_matmul_f32) {
@@ -5936,8 +5925,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif
 
     auto const &ggml_vk_mul_mm_spec = [&device](std::vector<uint32_t> spec, bool aligned) {
-        // [TAG_MM_WARPTILE_EXT] exactly the plain (11) or the extended (14) layout (review r4 item 3); the extended one carries
-        // its own ids 12 / 13. Anything else aborts (the 12-element cm1-int tiles never come here).
+        // [TAG_MM_WARPTILE_EXT] exactly the plain (11) or the extended (14) layout; the extended one carries its own ids 12 / 13. Anything else aborts (the 12-element cm1-int tiles never come here).
         GGML_ASSERT(spec.size() == VK_MM_WARPTILE_SIZE || spec.size() == VK_MM_WARPTILE_EXT_SIZE);
         if (ggml_vk_mm_warptile_ext(spec)) {
             spec[11] = aligned ? 1u : 0u;  // constantID=11: ALIGNED; 12 / 13 are the warptile's own
@@ -6070,27 +6058,27 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // Create 6 variants, {s,m,l}x{unaligned,aligned}
 #define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
         if (device->mul_mat ## ID ## _l[TYPE]) { \
-            mm_tile_check(l_ ## WARPTILE, TYPE, sizeof(#ID) > 1, false, #NAMELC #F16ACC "_l"); \
+            mm_tile_check(l_ ## WARPTILE, TYPE, std::string_view(#ID) == "_id", false, #NAMELC #F16ACC "_l"); \
             ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->l, std::string(#NAMELC #F16ACC "_l") + mm_tile(l_ ## WARPTILE).sfx, NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true, mm_tile(l_ ## WARPTILE).req_sg); \
         } \
         if (device->mul_mat ## ID ## _m[TYPE]) { \
-            mm_tile_check(m_ ## WARPTILE, TYPE, sizeof(#ID) > 1, false, #NAMELC #F16ACC "_m"); \
+            mm_tile_check(m_ ## WARPTILE, TYPE, std::string_view(#ID) == "_id", false, #NAMELC #F16ACC "_m"); \
             ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->m, std::string(#NAMELC #F16ACC "_m") + mm_tile(m_ ## WARPTILE).sfx, NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true, mm_tile(m_ ## WARPTILE).req_sg); \
         } \
         if (device->mul_mat ## ID ## _s[TYPE]) { \
-            mm_tile_check(s_ ## WARPTILE, TYPE, sizeof(#ID) > 1, false, #NAMELC #F16ACC "_s"); \
+            mm_tile_check(s_ ## WARPTILE, TYPE, std::string_view(#ID) == "_id", false, #NAMELC #F16ACC "_s"); \
             ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->s, std::string(#NAMELC #F16ACC "_s") + mm_tile(s_ ## WARPTILE).sfx, NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true, mm_tile(s_ ## WARPTILE).req_sg); \
         } \
         if (device->mul_mat ## ID ## _l[TYPE]) { \
-            mm_tile_check(l_ ## WARPTILE, TYPE, sizeof(#ID) > 1, true, #NAMELC #F16ACC "_aligned_l"); \
+            mm_tile_check(l_ ## WARPTILE, TYPE, std::string_view(#ID) == "_id", true, #NAMELC #F16ACC "_aligned_l"); \
             ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_l, std::string(#NAMELC #F16ACC "_aligned_l") + mm_tile(l_ ## WARPTILE).sfx, NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, mm_tile(l_ ## WARPTILE).req_sg); \
         } \
         if (device->mul_mat ## ID ## _m[TYPE]) { \
-            mm_tile_check(m_ ## WARPTILE, TYPE, sizeof(#ID) > 1, true, #NAMELC #F16ACC "_aligned_m"); \
+            mm_tile_check(m_ ## WARPTILE, TYPE, std::string_view(#ID) == "_id", true, #NAMELC #F16ACC "_aligned_m"); \
             ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_m, std::string(#NAMELC #F16ACC "_aligned_m") + mm_tile(m_ ## WARPTILE).sfx, NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true, mm_tile(m_ ## WARPTILE).req_sg); \
         } \
         if (device->mul_mat ## ID ## _s[TYPE]) { \
-            mm_tile_check(s_ ## WARPTILE, TYPE, sizeof(#ID) > 1, true, #NAMELC #F16ACC "_aligned_s"); \
+            mm_tile_check(s_ ## WARPTILE, TYPE, std::string_view(#ID) == "_id", true, #NAMELC #F16ACC "_aligned_s"); \
             ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_s, std::string(#NAMELC #F16ACC "_aligned_s") + mm_tile(s_ ## WARPTILE).sfx, NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, mm_tile(s_ ## WARPTILE).req_sg); \
         } \
 
