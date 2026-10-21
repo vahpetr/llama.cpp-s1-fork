@@ -12234,6 +12234,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
     }
 
+    // [TAG_MMID_TILE_G2A] the 8-warp mul_mat_id l tile (the B1-classified types, m > 64) with duplicate ids and hot routes whose
+    // per-expert rows cross BN 64, and n_as > 512
+    for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_S}) {
+        for (int n_as : {512, 513, 1025}) {
+            for (int n : {65, 513, 2047}) {
+                test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, n_as, 10, false, 128, n, 256));
+                test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, n_as, 10, false, 128, n, 256, MMID_ROUTER_SKEWED));
+            }
+        }
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
