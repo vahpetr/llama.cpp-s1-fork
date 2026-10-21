@@ -11,6 +11,63 @@ decoding. This fork runs it with a **1 048 576-token context in one slot at 35-6
 Everything here was measured on my two boxes. Numbers, dates and image versions: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md).
 Deploying it, upgrading and rolling back: [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md). Flags and knobs: [docs/s1/KNOBS.md](docs/s1/KNOBS.md).
 
+## What v64 adds (2026-10-21)
+
+v64 is v63 plus three kernel patches (0262, 0263, 0265; revision `c5b3462ed`, `prod-v11-stage9-pkg3`) and one compose change:
+v63's `--spec-draft-sampling probabilistic` is now on in every compose that has a draft model. The three kernels are on by their
+defaults (no new environment). All three are host-side tile and shared-memory layout choices for AMD coopmat1 on RADV; the
+per-output math of the shaders is unchanged:
+
+- **0263, FA1: flash-attention shared-memory layouts.** The coopmat1 flash-attention kernel at head size 256 was bound by its
+  LDS footprint on RDNA3 (31 KiB per workgroup = 4 workgroups per WGP while the registers allow more). Two layout changes,
+  both on dense multi-row dispatches only (prefill; decode, verify and the indexed QSA path keep their pipelines): the P.V
+  staging shares the storage of the softmax staging (disjoint lifetimes), and the dead-column V is staged per 16-row chunk;
+  31 -> 21 KiB, 4 -> 6 workgroups per WGP. Knobs `GGML_VK_FA_SFPV_ALIAS`, `GGML_VK_FA_V_CHUNK`.
+- **0262, G2a: the expert-GEMM tile with 8 warps.** v60's B1 `mul_mat_id` tile (BM 128 x BN 64; q4_K / q5_0 / q8_0 / q6_K /
+  iq3_s experts) runs 8 warps of 64 x 16 instead of 4 warps of 64 x 32, with an LDS row pad of 2 instead of 4 (a 72-byte
+  stride: conflict-free but not 16-byte aligned, so RADV only; `GGML_VK_MMID_TILE_G2A_PAD=4` is the conformant layout). Same
+  fragments, same K loop, same bits. Knob `GGML_VK_MMID_TILE_G2A`; startup line `mmid_tile_g2a: on (...)`.
+- **0265, G1: a tile table for the large dense GEMMs.** Three rules pick a 2-warp tile for the dense coopmat1 matmuls of a
+  prefill ubatch (q4_K / q6_K with m >= 2048 and k >= 2560 -> BM 64 x BN 128; q5_0 with m >= 2048 and k <= 640 -> BM 128 x BN
+  64; LDS pad 4, subgroup 64 pinned); the hyper-connection shapes (m = 320) stay on the base tile. Knob
+  `GGML_VK_DENSE_TILE_G1`; startup line `dense_tile_g1: table on (3 rules) (...)`.
+- **0252 on by default: probabilistic draft sampling.** At T > 0 the MTP draft is sampled at the request's temperature and
+  verified by rejection sampling; a T = 0 request is unchanged (greedy, bit-identical). The composes carry
+  `--spec-draft-sampling probabilistic`; the code is v63's.
+
+Gate: the short tier of my S0.1 oracle (1M production configuration minus the vision projector, one slot, text corpus) by
+ruling, not the full 16.7 h run of v63: the candidate passes are complete and EXACT against the v59 reference (558 logit
+positions and 81 state points identical, ordered selected ids identical; the score and dispatch captures compared as extra
+evidence), the per-lever control arms were cut and re-run by the deep tripwire the night after the release (with an automatic
+rollback to v63 on any difference; its result is not in this text). On top of it: each kernel's byte classifier against the
+v63 build (G1 48/48, G2a 42/42 + 27/27 + 90/90 duplicate-id / hot-route cases, FA1 44/44 hashes), `test-backend-ops` (MUL_MAT
+1139/1139, MUL_MAT_ID 1058/1058, FLASH_ATTN_EXT 5253/5253), three negative controls, and the identity check of the A/B unit
+below (32 greedy tokens with top-8 logprobs at 32k, the first token at 72k, kernels off vs on). The full oracle and the
+pair gate for probabilistic draft sampling return at v67. Same disk-cache key as v60-v63: an install on v63 switches by
+changing the image and the compose. Release notes: [docs/s1/RELEASE-NOTES.md](docs/s1/RELEASE-NOTES.md).
+
+1M brain profile, llama-server with the full compose on s1, one A/B unit on 2026-10-21 on one image (the v64 kernels switched
+off = the v63 kernels, and on = the v64 default; BENCHMARKS.md section 2c), plus the live probes around the switch:
+
+| metric | v63 kernels | v64 kernels | change | method |
+|---|---|---|---|---|
+| prefill, fresh 32k prompt | 467.5 t/s | **500.9 t/s** | +7.15 % | 2 reps per arm, cold (`cache_prompt false`) |
+| prefill, fresh 72k prompt | 385.6 t/s | **417.3 t/s** | +8.22 % | 2 reps per arm; above 64k the QSA layers run the indexed path, which FA1 leaves alone |
+| warm-up prompt 66k (incl. the pipeline compiles) | 367 t/s | 401 t/s | +9 % | one per arm visit |
+| node time, one cold 32k request under the perf logger: FLASH_ATTN_EXT / MUL_MAT_ID / G1-eligible MUL_MAT / all nodes | 19.39 / 16.14 / 17.62 / 68.45 s | 16.20 / 15.48 / 16.89 / 63.83 s | -16.5 / -4.1 / -4.1 / -6.8 % | per-node barriers: attribution, not a timing run; the three levers touch disjoint ops |
+| identity, kernels off vs on | 32 greedy tokens + top-8 logprobs at 32k, the first token at 72k | identical | PASS | within-arm and cross-arm |
+| decode at 32k, 256 tokens, live server, a neutral (T = 0) sampler / pi's thinking card / pi's instruct card, both runs with `--spec-draft-sampling probabilistic` | 22.07 / 22.51 / 22.91 ms/tok | 21.27 / 21.68 / 22.28 ms/tok | -3.6 / -3.7 / -2.7 % | probe-u7, 3 reps each, before (v63 image) and after the switch; the same accepted / drafted counts rep for rep |
+| GTT, llama-server with the vision projector, after load | 105 414 MiB (v63 live level just before the switch) | 105 495 MiB (105 519 after the smoke requests) | +81 MiB; = v63's own after-load value | deploy smoke; bar 109 216 |
+| hands (780M, `:v64k`), one short chat reply | 27.8 t/s (v63k, free GPU) | 24.6 t/s (the deploy smoke right after the restart) | re-measure pending | 40-task coding bench with the probabilistic draft: 39/40 (reference 38/40) |
+
+On the probabilistic draft: `--spec-draft-sampling probabilistic` is the compose default since v64 (my rulings R134 / R135);
+greedy outputs are unaffected (T = 0 is bit-identical; the EXACT gate ran greedy). The decode-at-32k row above is not an
+off -> on comparison of the flag: both probes ran with the flag on (the v63 server had been restarted on the already-committed
+compose before the switch), so it shows the kernel package at sampled requests only. The off -> on decode comparison at T > 0
+and the distribution check (the pair gate) are scheduled (v67 / the next measurement window); the hands' 40-task coding bench
+holds 39/40 with the flag. The S0.2 server rows (section 2b's basis: 128k, the 65k fill steps, decode bands at depth, TTFT at
+1M) are not measured on v64 yet.
+
 ## What v63 adds (2026-10-21)
 
 v63 is v62 plus eight patches (0252-0259), revision `8c1a468aa`. Every new flag runs at its default, so the composes do not
@@ -226,8 +283,9 @@ The full list (240 numbered changes, including upstream back-ports): [docs/s1/PA
 ## What is hardware-specific and what is not
 
 - **Vulkan / RDNA3 and RDNA3.5:** the new kernels (QSA top-k radix select, indexed and metadata flash attention, KQ mask, GDN and
-  hyper-connection fusions), the MoE `mul_mat_id` changes (row-id hoisting up to 512 experts, compact grid, tile choice), flash
-  attention coopmat1 tiles with RDNA3 signed-zero handling, UMA readback. They should help any RADV GPU with cooperative
+  hyper-connection fusions), the MoE `mul_mat_id` changes (row-id hoisting up to 512 experts, compact grid, tile choice, the
+  v64 8-warp tile), the v64 dense GEMM tile table and flash-attention shared-memory layouts, flash attention coopmat1 tiles
+  with RDNA3 signed-zero handling, UMA readback. They should help any RADV GPU with cooperative
   matrices on a large MoE; I measured them on gfx1151 and gfx1103 only.
 - **Generic (libllama / server / webui, any backend):** the QSA model logic and memory, graph and plan cache, disk prompt cache,
   GTT admission (reads an AMD sysfs file; the path is a knob), the webui, the speculative-decoding fixes, the logs.
@@ -237,11 +295,14 @@ The full list (240 numbered changes, including upstream back-ports): [docs/s1/PA
 
 ### Other models
 
-Which v60-era levers can help another model:
+Which v60-v64 levers can help another model:
 
 | lever | patches / knob | scope |
 |---|---|---|
 | B1: MoE expert GEMMs, f16 pre-cast of B + BM 128 x BN 64 tile | 0231, 0232 | generic: any `mul_mat_id` on AMD coopmat1 with q4_K / q5_0 / q8_0 / q6_K / iq3_s experts |
+| G2a: the B1 tile with 8 warps and a 72-byte LDS stride (v64) | 0262, `GGML_VK_MMID_TILE_G2A` | generic: the same `mul_mat_id` cases as B1; RADV only by design (`GGML_VK_MMID_TILE_G2A_PAD=4` = the conformant layout, measured as no gain) |
+| FA1: flash-attention shared-memory layouts (v64) | 0263, `GGML_VK_FA_SFPV_ALIAS` / `GGML_VK_FA_V_CHUNK` | generic: dense multi-row flash attention on AMD coopmat1; the LDS saving was measured at head size 256 only |
+| G1: dense GEMM tile table (v64) | 0265, `GGML_VK_DENSE_TILE_G1` | generic by shape: dense q4_K / q6_K matmuls with m >= 2048, k >= 2560 and q5_0 with m >= 2048, k <= 640 at n >= 512 on AMD coopmat1 with subgroup 64; the 780M gains did not transfer shape for shape to gfx1151 (BENCHMARKS.md section 2c) |
 | B4: GDN conv input without the concat pass | 0228 | generic fusion (CONCAT + SSM_CONV); fires where a model's graph has that shape. On Qwen3.6-35B-A3B it does not fire (probe, 2026-10-17) |
 | B4c: 16 x 16 tile for m <= 16 matmuls | 0234 | generic: dense matmul with m <= 16, q4_K / q8_0 weights, AMD coopmat1 |
 | C1: mat-vec unpack hoist | 0236 | generic: mat-vec at 2-8 columns (speculative verify widths), MMVQ q4_0 / q5_0 / q8_0 / q4_K and f32 x f32 |
@@ -283,19 +344,22 @@ checks their sha256; (hands only) re-encodes the BF16 hyper-connection weights a
 `tools/s1/gguf_hc_q8.py`; pulls the image (or builds it with `BUILD=1`); starts the compose file and smoke-tests it.
 `--dry-run` shows every step first. Which weights and why: [docs/s1/WEIGHTS.md](docs/s1/WEIGHTS.md). I redistribute no weights;
 they come from their authors' Hugging Face repos.
-The published image `vahpetr/llama-cpp-s1-fork:v63` = `:v63k` = `:latest` (one digest,
-`sha256:d16b1cdc9139573f07c380f6a5fc6913866348bb6a121593c2e52c76f538a5d4`) is built from my `prod-v11-stage9-pkg2` revision
-(v63 = `8c1a468aa`; `:v62` / `:v62k` stay as the rollback, v62 = `e4af0a6ca`, digest
-`sha256:4281527a03092d87200d14d18222f060aecea6b47468379a6ec24a7ac9d52a96`; `:v61` = `7a438f3ba` and `:v60` = `845c6fbcd` are
-older rollbacks with the same key); this `s1-public` branch adds docs, deploy files, `tools/s1` and comment scrubs on top.
-Upgrading from v60, v61 or v62: same disk-cache key, change the image only. Upgrading an install with stored conversations from v59: the
+The published image `vahpetr/llama-cpp-s1-fork:v64` = `:v64k` = `:latest` (one digest,
+`sha256:b3c12a3a7f680d9d1683edbc1b5728b285766618bfacb9aa2159d9eed891ff28`) is built from my `prod-v11-stage9-pkg3` revision
+(v64 = `c5b3462ed`; `:v63` / `:v63k` stay as the rollback, v63 = `8c1a468aa`, digest
+`sha256:d16b1cdc9139573f07c380f6a5fc6913866348bb6a121593c2e52c76f538a5d4`; `:v62` = `e4af0a6ca`, `:v61` = `7a438f3ba` and
+`:v60` = `845c6fbcd` are older rollbacks with the same key); this `s1-public` branch adds docs, deploy files, `tools/s1` and
+comment scrubs on top.
+Upgrading from v60-v63: same disk-cache key, change the image and take the v64 compose (one added flag; the old compose works
+too and keeps greedy drafting). Upgrading an install with stored conversations from v59: the
 disk-cache key changes, see [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md), section 4 (one `--cache-disk-adopt` line).
 My production draft head is a vocabulary-pruned variant built from my own traffic, so the public setup uses dzannotti's
 full-vocabulary head, and the decode numbers above are an upper bound for it.
 
-First start on s1: GTT after load 105 495 MiB (1M, v63 = v62 + 81 MiB; 105 519 after the smoke requests, bar 109 216) or
-~94 500 MiB (524k, v59; not re-measured on v60-v63); the first long prompt fills at ~550 t/s falling to ~357 t/s near 1M
-(v61 probe; a cold 1M fill takes 41.6 min on v63).
+First start on s1: GTT after load 105 495 MiB (1M, v64 = v63; 105 519 after the smoke requests, bar 109 216) or
+~94 500 MiB (524k, v59; not re-measured on v60-v64); the first long prompt fills at ~550 t/s on 8k (v61 probe), 501 t/s on a
+fresh 32k prompt (v64 A/B), falling to ~358 t/s near 1M (v63 S0.2 rows; the v64 fill steps are not measured yet; a cold 1M
+fill takes 41.4 min on v63).
 
 ## Known limitations
 
@@ -306,8 +370,10 @@ First start on s1: GTT after load 105 495 MiB (1M, v63 = v62 + 81 MiB; 105 519 a
 - **Two slots give no extra throughput** on these boxes (-15 % total, measured). A second slot is for concurrency only.
 - **After a checkpoint rewind** (disk cache, branch, copy) the continuation can differ from a fresh prefill at near-tie tokens:
   the same math in a different batch composition. The state itself is verified, the text is not guaranteed byte-identical.
-- **Pre-v60 disk-cache entries with images are not loaded by v60-v63** (they may carry the defect 0239 fixes); text entries
-  are. A rollback to v59 does not see conversations saved by v60-v63 (v60 to v63 share one key).
+- **Pre-v60 disk-cache entries with images are not loaded by v60-v64** (they may carry the defect 0239 fixes); text entries
+  are. A rollback to v59 does not see conversations saved by v60-v64 (v60 to v64 share one key).
+- **Probabilistic draft sampling (v64 composes) is not gated** beyond its unit tests, the 40-task hands bench and the live
+  probe above; its decode effect on the brain is unmeasured. `--spec-draft-sampling greedy` restores v63's drafting.
 - One model load per GPU at a time; a build or a second load next to a loaded 1M model has run my box out of memory.
 - Single-user setups. No multi-tenant hardening beyond upstream's.
 
