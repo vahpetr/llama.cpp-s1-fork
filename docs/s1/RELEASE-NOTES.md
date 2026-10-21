@@ -3,6 +3,60 @@
 One entry per published image. Older versions (v52-v59) are summarised in the lineage table of
 [BENCHMARKS.md](BENCHMARKS.md), section 0; every change is a numbered row in [PATCHES.md](PATCHES.md).
 
+## v63 - 2026-10-21
+
+Images: `vahpetr/llama-cpp-s1-fork:v63` = `:v63k` = `:latest`, revision `8c1a468aa` (`prod-v11-stage9-pkg2`).
+Rollback: `:v62` / `:v62k` (`e4af0a6ca`). v62 (2026-10-19) was a correctness and diagnostics release with v61's numbers
+(patches 0244-0251, BENCHMARKS.md section 0b).
+
+**What it is.** v62 plus patches 0252-0259. No new setting in the composes: every new flag runs at its default
+(KNOBS.md, "v63 package").
+
+- MoE matmul (0253, 0254; upstream #25483, #29998): in a MUL_MAT_ID tile, invocations and coopmat warps whose B columns are
+  not rows of the expert skip their loads and multiply-adds; the matmul_id shaders read their (expert, tile) list from the
+  expert-count prepass instead of a binary search; duplicate expert ids and more than 512 experts are handled. A test-only
+  negative-control build option (`GGML_VULKAN_MMID_SKIP_NEGCTL`) proves the gate's test catches a broken skip.
+- Disk cache (0255, 0256): recurrent checkpoints at message boundaries (user turn starts, the end of the system prompt, of a tool
+  result or of a turn's input) are kept per conversation on top of the depth schedule (`--cache-disk-ckpt-semantic`, default
+  16), so a branch after such a boundary restores close to it; a request can pin a checkpoint at N prompt tokens
+  (`cache_pin: {"tokens": N}`).
+- Slot files (0257, 0258, 0259; upstream #26004, #30574): `/slots` save files carry the slot's context checkpoints and the live
+  MTP draft state, so a restored slot drafts warm instead of starting with an empty draft context; checkpoints restored from a
+  file never enter the disk cache's deep store or become a pin.
+- Speculative decoding (0252, upstream #27694): `--spec-draft-sampling probabilistic` samples the draft at T > 0 and verifies
+  by rejection sampling. Off by default (greedy, byte-identical to v62); not measured on the brain yet.
+
+**Measured** (llama-server, 1M profile on s1, one measurement unit on 2026-10-21, single runs; details in BENCHMARKS.md
+section 0c):
+
+| metric | v62 | v63 | change |
+|---|---|---|---|
+| decode after a 32k `/slots` restore | 24.4-33.5 ms/tok, acceptance 0.50-0.62 (cold draft) | 18.3 ms/tok, acceptance 0.94 | warm draft from the file |
+| decode band at 1M after a slot restore (same v61-format file) | 18.58 ms/tok, acceptance 0.968 | 18.62 ms/tok, acceptance 0.968 | unchanged |
+| `/slots` file at 1M | 15.55 GB | 18.35 GB | +2.6 GiB; save 3.7 s, restore 4.1 s |
+| cold fill 0 -> 1M | (v61 probe: 41.8 min) | 41.6 min | |
+| fresh 32k prompt | 72.85 s | 69.79 s | -4.2 %, one sample |
+| branch after a message boundary, TTFT (semantic checkpoints 16 vs 0) | 4.86 s at 0 | 1.84 s | one branch of three; the other two unchanged |
+
+**Class: EXACT.** The full S0.1 oracle gate on gfx1151 (1M production configuration minus the vision projector, one slot,
+text corpus; 16.7 h, finished 2026-10-21 04:36): bit-identical to the v59 reference at 1 502 logit positions and 224 state
+points, with the ordered QSA selected ids, at verify widths 1-6 in full and the last 6 positions of widths 7-9, depths 8k ->
+1M, and restore / replay histories; the A2b / A3 off arms and a MUL_MAT_ID section as well. Gate: 96 PASS, 4 INFO, 0 FAIL.
+GTT peak 106 095 MiB (score-capture pass; v61 106 095, v60 106 357). Not covered: multi-slot stream offsets,
+`--spec-draft-sampling probabilistic`. No claim for other model families.
+
+**Disk cache and slot files: same key as v62.** v63 reads v62's disk-cache entries and v62 reads v63's. v63 restores v62 /
+v61-format `/slots` files (with a cold draft, as v62 did). A v62 server restoring a v63 `/slots` file reads the target state
+and ignores the new appendices: the result is correct, but the draft starts cold, so decode is slower until it warms up (32k:
+33.5 ms/tok, acceptance 0.50). Switching v62 <-> v63 is an image change.
+
+**Known open items.**
+
+- `--spec-draft-sampling probabilistic`: the decode band on the brain at pi's sampling settings is not measured.
+- `GET /disk-cache` `deep_semantic` counts newly written semantic checkpoint files only; an existing file re-tagged as
+  semantic is not counted.
+- The 524k profile was not re-measured on v63.
+
 ## v61 - 2026-10-17
 
 Images: `vahpetr/llama-cpp-s1-fork:v61` = `:v61k` = `:latest`
