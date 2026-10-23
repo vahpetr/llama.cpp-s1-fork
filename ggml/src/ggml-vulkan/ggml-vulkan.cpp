@@ -3086,6 +3086,20 @@ static bool ggml_vk_sched_prof_enabled() {
 // vetoed, so neither ever appears with a vetoed:/disabled: prefix.
 // [TAG_HC_MIX_TAIL] overlap:multi_add_scale counts multi_adds whose trailing SCALE matched but whose destination
 // overlapped a stream source: they ran as the plain multi_add (+ SCALE), so they also show in multi_add=.
+// [TAG_VK_BUFFER_ALIGN] the buffer type's tensor placement: max(device minStorageBufferOffsetAlignment, GGML_VK_BUFFER_ALIGN)
+// (default 256; a value that is not a power of two, or not above the device minimum, keeps the device minimum). Shared by
+// ggml_backend_vk_buffer_type_get_alignment and the startup proof line.
+static size_t ggml_vk_buffer_align_knob() {
+    static const size_t align_env = [] { const char * e = getenv("GGML_VK_BUFFER_ALIGN"); return e ? (size_t) atoll(e) : (size_t) 256; }();
+    return align_env;
+}
+
+static size_t ggml_vk_buffer_align(const vk_device & device) {
+    const size_t align_env = ggml_vk_buffer_align_knob();
+    const size_t dev = device->properties.limits.minStorageBufferOffsetAlignment;
+    return align_env > dev && (align_env & (align_env - 1)) == 0 ? align_env : dev;
+}
+
 static bool ggml_vk_fusion_count_enabled() {
     static const bool enabled = ggml_vk_env_bool("GGML_VK_FUSION_COUNT", false);
     return enabled;
@@ -9021,6 +9035,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
         }
 
         ggml_vk_load_shaders(device);
+
+        // [TAG_VK_BUFFER_ALIGN] the proof line (WARN: the server drops ggml INFO lines)
+        GGML_LOG_WARN("ggml_vulkan: %s buffer_align: %zu B (GGML_VK_BUFFER_ALIGN=%zu, device minimum %zu; tensor placement of the "
+                      "Vulkan buffer type)\n", device->name.c_str(), ggml_vk_buffer_align(device), ggml_vk_buffer_align_knob(),
+                      (size_t) device->properties.limits.minStorageBufferOffsetAlignment);
 
         // [TAG_QSA_SCORE_KREUSE] the proof line
         if (device->coopmat_support && !device->coopmat2) {
@@ -20266,7 +20285,10 @@ static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backe
 
 static size_t ggml_backend_vk_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
-    return ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    // Place tensors at least 256 B apart. RADV's minStorageBufferOffsetAlignment is 4, so ggml-alloc packed compute tensors
+    // at 4 B and every tensor after an odd-sized one started off a cache line (27B: all of them at 8 mod 256; +3.0% pp2048
+    // with 256). GGML_VK_BUFFER_ALIGN=N (a power of two, >= the device minimum) overrides.
+    return ggml_vk_buffer_align(ctx->device);
 }
 
 static size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
