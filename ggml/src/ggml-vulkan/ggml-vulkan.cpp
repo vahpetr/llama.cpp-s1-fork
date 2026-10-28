@@ -964,15 +964,17 @@ struct vk_device_struct {
     uint32_t qsa_topk_cpt = 8;   // cells per invocation per tile: tile = 256 * qsa_topk_cpt cells
     // [TAG_QSA_TOPK_ONEPASS] GGML_VK_QSA_TOPK_ONEPASS=1 (default off; v2 only): the cell form as sample -> one filter pass ->
     // exact select of the candidates (topk_qsa_onepass.comp), v2 per row where the candidates do not fit. Gated per
-    // dispatch by depth: n_kv >= qsa_topk_op_min_kv for selections of >= VK_QSA_TOPK_ONEPASS_DEC_ROWS rows (prefill chunks),
-    // n_kv >= qsa_topk_op_min_kv_dec below that (decode / verify / draft; GGML_VK_QSA_TOPK_ONEPASS_MIN_KV / _MIN_KV_DECODE).
+    // dispatch: n_kv >= qsa_topk_op_min_kv and rows * n_kv >= qsa_topk_op_min_cells (GGML_VK_QSA_TOPK_ONEPASS_MIN_KV /
+    // _MIN_CELLS); the fallback grid is qsa_topk_op_fbx x qsa_topk_op_fby workgroups (_FBX / _FBY, diagnostic).
     bool qsa_topk_onepass = false;
     uint32_t qsa_topk_op_min_kv = 0;
-    uint32_t qsa_topk_op_min_kv_dec = 0;
+    uint64_t qsa_topk_op_min_cells = 0;
+    uint32_t qsa_topk_op_fbx = 0;
+    uint32_t qsa_topk_op_fby = 0;
     vk_buffer qsa_topk_op_stats;  // host-visible counters (rows, under, over, candidates), created at the first dispatch
     std::mutex qsa_topk_op_mutex; // the stats readers (synchronize, free) and the buffer's creation
-    uint32_t qsa_topk_op_last[4] = {};   // the counters as last read (32-bit, read as deltas)
-    uint64_t qsa_topk_op_tot[4]  = {};
+    uint32_t qsa_topk_op_last[40] = {};  // the counters as last read (32-bit, read as deltas; layout in topk_qsa_onepass.comp)
+    uint64_t qsa_topk_op_tot[40]  = {};
     uint64_t qsa_topk_op_next_log = 1024;
     uint64_t qsa_topk_op_logged   = 0;
 
@@ -2070,15 +2072,16 @@ struct vk_op_topk_onepass_push_constants {
 };
 // candidates per row (the shader's CAP); the sample / select passes hold up to CAP keys in LDS
 static constexpr uint32_t VK_QSA_TOPK_ONEPASS_CAP = 8192;
-// fallback passes: a grid of FBX rows x FBY tiles, both looped over (none listed = every workgroup exits at once); 512
-// workgroups keep a fallback row's passes as wide as the GPU, and the empty passes cheap
-static constexpr uint32_t VK_QSA_TOPK_ONEPASS_FBX = 8;
-static constexpr uint32_t VK_QSA_TOPK_ONEPASS_FBY = 64;
-// the depth gates (balkon 780M timings, contrib report handT): prefill chunks (>= DEC_ROWS rows) from MIN_KV cells, decode /
-// verify / draft selections from MIN_KV_DEC
-static constexpr uint32_t VK_QSA_TOPK_ONEPASS_DEC_ROWS   = 8;
-static constexpr uint32_t VK_QSA_TOPK_ONEPASS_MIN_KV     = 65536;
-static constexpr uint32_t VK_QSA_TOPK_ONEPASS_MIN_KV_DEC = 131072;
+// fallback passes: a grid of FBX rows x FBY tiles, both looped over (none listed = every workgroup exits at once). s1 sweep
+// (8x64 / 16x128 / 32x256 / 128x512): 16x128 = 2048 workgroups is the widest grid whose empty passes cost nothing measurable
+// (1M x 128 2.44 / 2.45 / 2.51 / 2.98 ms) while an all-fallback 262k x 128 selection runs at 1.05x v2 (8x64: 1.21x)
+static constexpr uint32_t VK_QSA_TOPK_ONEPASS_FBX = 16;
+static constexpr uint32_t VK_QSA_TOPK_ONEPASS_FBY = 128;
+// the gates (s1 gfx1151 timings, handT report "s1 retune"): onepass costs a fixed ~0.1 ms more than v2 per selection and
+// saves ~0.04 ms per 1M cell-rows, so it runs from rows * n_kv >= MIN_CELLS (1.25 Mi: 6 rows from ~210k cells, 128 rows
+// from the MIN_KV floor, a single row never below 1.25M), never below MIN_KV cells (LLAMA_QSA_MIN_KV's 65536)
+static constexpr uint32_t VK_QSA_TOPK_ONEPASS_MIN_KV    = 65536;
+static constexpr uint64_t VK_QSA_TOPK_ONEPASS_MIN_CELLS = 1310720;
 
 // [TAG_QSA_TOPK_V2] tile = 256 invocations x qsa_topk_cpt cells (spec constant 2 of the shader); default
 // cells per invocation (GGML_VK_QSA_TOPK_CPT overrides it, diagnostic)
@@ -9152,8 +9155,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
             const uint32_t op_lds = VK_QSA_TOPK_ONEPASS_CAP * 4 + 2048;
             const bool     op_lds_ok = device->properties.limits.maxComputeSharedMemorySize >= op_lds;
             device->qsa_topk_onepass     = op_req && device->qsa_topk_v2 && op_lds_ok;
-            device->qsa_topk_op_min_kv     = env_u32("GGML_VK_QSA_TOPK_ONEPASS_MIN_KV", VK_QSA_TOPK_ONEPASS_MIN_KV);
-            device->qsa_topk_op_min_kv_dec = env_u32("GGML_VK_QSA_TOPK_ONEPASS_MIN_KV_DECODE", VK_QSA_TOPK_ONEPASS_MIN_KV_DEC);
+            device->qsa_topk_op_min_kv    = env_u32("GGML_VK_QSA_TOPK_ONEPASS_MIN_KV", VK_QSA_TOPK_ONEPASS_MIN_KV);
+            device->qsa_topk_op_min_cells = env_u32("GGML_VK_QSA_TOPK_ONEPASS_MIN_CELLS", (uint32_t) VK_QSA_TOPK_ONEPASS_MIN_CELLS);
+            device->qsa_topk_op_fbx       = std::max<uint32_t>(1, env_u32("GGML_VK_QSA_TOPK_ONEPASS_FBX", VK_QSA_TOPK_ONEPASS_FBX));
+            device->qsa_topk_op_fby       = std::max<uint32_t>(1, env_u32("GGML_VK_QSA_TOPK_ONEPASS_FBY", VK_QSA_TOPK_ONEPASS_FBY));
 #ifdef GGML_VULKAN_QSA_TOPK_ONEPASS_NEGCTL
             const char * op_negctl = " NEGATIVE-CONTROL BUILD: the onepass select takes the highest-id ties";
 #else
@@ -9162,11 +9167,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
             const char * op_why = !op_req ? "GGML_VK_QSA_TOPK_ONEPASS unset/0" :
                                   !device->qsa_topk_v2 ? "needs v2 for the fallback" :
                                   !op_lds_ok ? "maxComputeSharedMemorySize too small" : "GGML_VK_QSA_TOPK_ONEPASS=1";
-            GGML_LOG_WARN("ggml_vulkan: %s qsa_topk: onepass %s (%s; sample <= %u cells, candidates <= %u per row, n_kv >= %u "
-                          "at >= %u rows, >= %u below, k <= %u, cell form; v2 per row on c < k or overflow)%s\n",
+            GGML_LOG_WARN("ggml_vulkan: %s qsa_topk: onepass %s (%s; sample <= %u cells, candidates <= %u per row, n_kv >= %u and "
+                          "rows x n_kv >= %llu, k <= %u, cell form; v2 per row on c < k or overflow, fallback grid %u x %u)%s\n",
                           device->name.c_str(), device->qsa_topk_onepass ? "on" : "off", op_why, VK_QSA_TOPK_ONEPASS_CAP,
-                          VK_QSA_TOPK_ONEPASS_CAP, device->qsa_topk_op_min_kv, VK_QSA_TOPK_ONEPASS_DEC_ROWS,
-                          device->qsa_topk_op_min_kv_dec, VK_QSA_TOPK_ONEPASS_CAP / 2, op_negctl);
+                          VK_QSA_TOPK_ONEPASS_CAP, device->qsa_topk_op_min_kv, (unsigned long long) device->qsa_topk_op_min_cells,
+                          VK_QSA_TOPK_ONEPASS_CAP / 2, device->qsa_topk_op_fbx, device->qsa_topk_op_fby, op_negctl);
         }
 
         // [TAG_QSA_SCORE_KREUSE] read before the pipelines are declared (=0: the kr twins are never created).
@@ -17600,14 +17605,13 @@ static bool ggml_vk_qsa_topk_nokeys(const vk_device & device, bool blocks, bool 
     return device->qsa_topk_v2 && device->qsa_topk_nokeys && !blocks && vis;
 }
 
-// [TAG_QSA_TOPK_ONEPASS] whether a selection takes topk_qsa_onepass.comp: the cell form at n_kv >= the depth gate of its row
-// count (MIN_KV for prefill chunks, MIN_KV_DECODE below DEC_ROWS rows: the onepass passes cost a fixed ~0.1 ms more than
-// v2's on the 780M, which a single row earns back from ~100-130k cells on), k <= CAP / 2 and k <= n_kv. width == 0 asks for
-// the scratch reservation, where k is not known (the region is then reserved for any k). The dispatch adds the
-// expected-candidates test (ggml_vk_qsa_topk_onepass_plan).
+// [TAG_QSA_TOPK_ONEPASS] whether a selection takes topk_qsa_onepass.comp: the cell form at n_kv >= MIN_KV with
+// rows * n_kv >= MIN_CELLS (VK_QSA_TOPK_ONEPASS_MIN_CELLS: the fixed cost against the per-cell saving), k <= CAP / 2 and
+// k <= n_kv. width == 0 asks for the scratch reservation, where k is not known (the region is then reserved for any k). The
+// dispatch adds the expected-candidates test (ggml_vk_qsa_topk_onepass_plan).
 static bool ggml_vk_qsa_topk_onepass(const vk_device & device, bool blocks, int64_t n_kv, size_t nrows, uint32_t width) {
-    const uint32_t min_kv = nrows >= VK_QSA_TOPK_ONEPASS_DEC_ROWS ? device->qsa_topk_op_min_kv : device->qsa_topk_op_min_kv_dec;
-    return device->qsa_topk_onepass && !blocks && n_kv >= (int64_t) std::max<uint32_t>(min_kv, 1u) &&
+    return device->qsa_topk_onepass && !blocks && n_kv >= (int64_t) std::max<uint32_t>(device->qsa_topk_op_min_kv, 1u) &&
+           (uint64_t) nrows * (uint64_t) n_kv >= device->qsa_topk_op_min_cells &&
            (width == 0 || (width <= VK_QSA_TOPK_ONEPASS_CAP / 2 && (int64_t) width <= n_kv));
 }
 
@@ -17823,9 +17827,9 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
             if (!ctx->device->qsa_topk_op_stats) {
                 std::lock_guard<std::mutex> lock(ctx->device->qsa_topk_op_mutex);
                 if (!ctx->device->qsa_topk_op_stats) {
-                    vk_buffer b = ggml_vk_create_buffer_check(ctx->device, 64,
+                    vk_buffer b = ggml_vk_create_buffer_check(ctx->device, 256,
                                                               vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-                    memset(b->ptr, 0, 64);
+                    memset(b->ptr, 0, 256);
                     ctx->device->qsa_topk_op_stats = b;
                 }
             }
@@ -17856,7 +17860,7 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
                 ggml_vk_sync_buffers(ctx, subctx);
             }
             const vk_op_topk_radix_v2_fb_push_constants pcf { pc2, op_off + 2 * nrows };
-            const std::array<uint32_t, 3> el_fb { std::min(nrows, VK_QSA_TOPK_ONEPASS_FBX), std::min(n_tiles_c, VK_QSA_TOPK_ONEPASS_FBY), 1 };
+            const std::array<uint32_t, 3> el_fb { std::min(nrows, ctx->device->qsa_topk_op_fbx), std::min(n_tiles_c, ctx->device->qsa_topk_op_fby), 1 };
             for (uint32_t pass = 0; pass < 6; ++pass) {
                 vk_pipeline & pl = fb_pl[pass];
                 ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
@@ -20711,9 +20715,13 @@ static void ggml_vk_qsa_topk_onepass_stats(const vk_device & device, bool final)
     }
     std::lock_guard<std::mutex> lock(device->qsa_topk_op_mutex);
     volatile uint32_t * w = (volatile uint32_t *) device->qsa_topk_op_stats->ptr;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 40; ++i) {
         const uint32_t v = w[i];
-        device->qsa_topk_op_tot[i] += (uint32_t) (v - device->qsa_topk_op_last[i]);
+        if (i == 5) { // a running max, not a count
+            device->qsa_topk_op_tot[i] = std::max<uint64_t>(device->qsa_topk_op_tot[i], v);
+        } else {
+            device->qsa_topk_op_tot[i] += (uint32_t) (v - device->qsa_topk_op_last[i]);
+        }
         device->qsa_topk_op_last[i] = v;
     }
     const uint64_t rows = device->qsa_topk_op_tot[0];
@@ -20723,10 +20731,22 @@ static void ggml_vk_qsa_topk_onepass_stats(const vk_device & device, bool final)
     const uint64_t under = device->qsa_topk_op_tot[1];
     const uint64_t over  = device->qsa_topk_op_tot[2];
     const uint64_t done  = rows - under - over;
-    GGML_LOG_WARN("ggml_vulkan: qsa_topk onepass: rows %llu, fallback %llu (%.4f %%: under %llu, over %llu), candidates/row %.1f%s\n",
+    // log2 histograms as "bucket:count" for the non-empty buckets (bucket b = [2^b, 2^(b+1)))
+    const auto hist = [&](int base) {
+        std::string h;
+        for (int b = 0; b < 16; ++b) {
+            if (device->qsa_topk_op_tot[base + b]) {
+                h += (h.empty() ? "" : " ") + std::to_string(b) + ":" + std::to_string(device->qsa_topk_op_tot[base + b]);
+            }
+        }
+        return h.empty() ? std::string("-") : h;
+    };
+    GGML_LOG_WARN("ggml_vulkan: qsa_topk onepass: rows %llu, fallback %llu (%.4f %%: under %llu, over %llu), candidates/row %.1f; "
+                  "sample-predicted overflow %llu, max c %llu, log2 c [%s], log2 sample estimate [%s]%s\n",
                   (unsigned long long) rows, (unsigned long long) (under + over), 100.0 * (double) (under + over) / (double) rows,
                   (unsigned long long) under, (unsigned long long) over,
-                  done ? (double) device->qsa_topk_op_tot[3] / (double) done : 0.0, final ? " (final)" : "");
+                  done ? (double) device->qsa_topk_op_tot[3] / (double) done : 0.0, (unsigned long long) device->qsa_topk_op_tot[4],
+                  (unsigned long long) device->qsa_topk_op_tot[5], hist(8).c_str(), hist(24).c_str(), final ? " (final)" : "");
     device->qsa_topk_op_logged = rows;
     while (device->qsa_topk_op_next_log <= rows) {
         device->qsa_topk_op_next_log *= 2;

@@ -20,11 +20,13 @@
 // (topk_radix_select_v2.comp) over the rows this file could not finish:
 //   0 sample  one workgroup per row: the keys of n_sample cells (runs of SRUN at the block spacing, the runs `stride`
 //             apart on average; approximate keys, see sample_key) in registers, the j_sample-th largest of them by v2's
-//             radix rule (8-bit digits top-down, the bucket whose suffix count reaches the rank) -> tau. It also zeroes
-//             the row's candidate counter and (row 0) the fallback count.
+//             radix rule (8-bit digits top-down, the bucket whose suffix count reaches the rank) -> tau. It sets the
+//             row's candidate counter to 0, or to CAP + 1 when the sampled keys >= tau promise > 2 CAP candidates (a huge
+//             tie group at tau: the row is v2's from the start), and zeroes (row 0) the fallback count.
 //   1 filter  (rows, tiles) workgroups, v2's tile: every cell's exact key ONCE (held in registers); key >= tau appends
 //             (key, id) to the row's candidate list - one atomicAdd per workgroup on the row's counter, written while
-//             pos < CAP. The counter keeps counting past CAP, so an overflow is seen exactly.
+//             pos < CAP. The counter keeps counting past CAP, so an overflow is seen exactly; a workgroup finding its
+//             row's counter already past CAP skips the tile (the row is v2's anyway).
 //   2 select  one workgroup per row: c = the counter. c < k or c > CAP: the row is appended to the fallback list (v2
 //             computes it). Else T and the number of ties to take are radix-selected among the c candidate keys (in
 //             registers, same rule), the composites (key > T: id; key == T: 1 << 31 | id) are compacted into LDS, sorted
@@ -39,8 +41,10 @@
 //
 // Scratch (uint offsets from op_off, inside the bound prealloc_x after v2's region):
 //   tau[nrows] | cnt[nrows] | fb[1 + nrows] (count, rows) | cand[nrows][CAP][2] (key, id)
-// stats (binding 7, host-visible): [0] rows selected here or sent back, [1] fallback c < k, [2] fallback c > CAP,
-// [3] candidates summed over the rows finished here (read as 32-bit deltas at synchronize).
+// stats (binding 7, host-visible, read as 32-bit deltas at synchronize): [0] rows selected here or sent back, [1] fallback
+// c < k, [2] fallback c > CAP, [3] candidates summed over the rows finished here, [4] rows the sample marked overflowed,
+// [5] max c seen by the select, [8..23] log2 histogram of c at the select, [24..39] log2 histogram of the sample's
+// candidate estimate (n_ge * n_kv / n_sample).
 // ONEPASS_NEGCTL (cmake -DGGML_VULKAN_QSA_TOPK_ONEPASS_NEGCTL=ON, tests only) takes the HIGHEST-id ties in descending
 // order instead, so the ordered-ids tests must FAIL on every row whose tie group is cut or holds two taken ties.
 #if defined(QSA_TOPK_NOKEYS) && !defined(QSA_VIS)
@@ -113,6 +117,7 @@ shared uint hist[RADIX];
 shared uint sh_scan[NWAVES];
 shared uint sh_bucket;
 shared uint sh_above;
+shared uint sh_heq;           // reg_select: the count of the chosen bin of the last round (= keys equal to T)
 shared uint sh_n;
 
 // v2's f2ui, unchanged
@@ -254,11 +259,13 @@ uvec2 reg_select(const uint keys[PER], const uint n, uint desired, const uint li
         if (suffix >= desired && suffix - hv < desired) {
             sh_bucket = lin;
             sh_above  = suffix - hv;
+            sh_heq    = hv;
         }
         // unreachable while desired <= n (v2's fall-through)
         if (lin == 0 && total < desired) {
             sh_bucket = 0;
             sh_above  = total;
+            sh_heq    = 0;
         }
         barrier();
         prefix  |= sh_bucket << shift;
@@ -309,21 +316,35 @@ void sample_pass(const uint row, const uint lin) {
     [[unroll]] for (uint q = 0; q < PER; ++q) {
         keys[q] = sample_key(row, q * WG + lin);
     }
-    if (lin == 0) {
-        scratch[cnt_off() + row] = 0u;
-        if (row == 0u) {
-            scratch[fb_off()] = 0u;
-        }
+    if (lin == 0 && row == 0u) {
+        scratch[fb_off()] = 0u;
     }
     const uvec2 st = reg_select(keys, p.n_sample, p.j_sample, lin);
+    // predicted overflow: the sampled keys >= tau (the j - st.y above tau's tie group taken, plus the whole group) scaled
+    // to the row promise more than 2 CAP candidates - the row is marked overflowed (cnt = CAP + 1) now, so the filter skips
+    // it and the select hands it to v2 (a wrong prediction costs time, never an id)
+    const uint  n_ge = p.j_sample - st.y + sh_heq;
+    const bool  over = float(n_ge) * float(p.ncols) > 2.0 * float(CAP) * float(p.n_sample);
     if (lin == 0) {
         scratch[tau_off() + row] = st.x;
+        scratch[cnt_off() + row] = over ? CAP + 1u : 0u;
+        if (over) {
+            atomicAdd(stats[4], 1u);
+        }
+        const uint est = uint(min(float(n_ge) * float(p.ncols) / float(p.n_sample), 4.0e9));
+        atomicAdd(stats[24u + min(uint(findMSB(max(est, 1u))), 15u)], 1u);
     }
 }
 
 // the tile's keys stay in registers (CPT per invocation); the workgroup's candidates take ONE atomicAdd on the row's
 // counter (a per-subgroup atomic in every chunk serialized the chunks behind the returned value)
 void filter_pass(const uint row, const uint tile, const uint lin) {
+    // a row already past CAP (predicted by the sample, or filled by earlier workgroups of this pass) goes to v2 whatever this
+    // tile holds: skip it. cnt only grows during the pass, so a value read here - however stale - is <= the final count: a
+    // skip happens only on a row whose final count exceeds CAP, i.e. a fallback row, and a row that ends <= CAP lost nothing
+    if (scratch[cnt_off() + row] > CAP) {
+        return;
+    }
     const uint tau  = scratch[tau_off() + row];
     const uint base = tile * (WG * CPT);
     const uint cand = cand_off() + row * CAP * 2u;
@@ -390,6 +411,10 @@ void lds_sort(const uint P, const uint lin) {
 
 void select_pass(const uint row, const uint lin) {
     const uint c = scratch[cnt_off() + row];
+    if (lin == 0) {
+        atomicMax(stats[5], c);
+        atomicAdd(stats[8u + min(uint(findMSB(max(c, 1u))), 15u)], 1u);
+    }
     if (c < p.k || c > CAP) {
         // fewer candidates than k (tau above T) or more than the list holds: v2 computes this row
         if (lin == 0) {
