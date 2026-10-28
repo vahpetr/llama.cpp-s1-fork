@@ -1,0 +1,492 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+#include "types.glsl"
+
+// [TAG_QSA_TOPK_ONEPASS] (plan 2.7.2 #2, GGML_VK_QSA_TOPK_ONEPASS=1, default off) the QSA indexer selection's cell form
+// (FORM 0 of topk_radix_select_v2.comp: GGML_OP_QSA_TOP_K / ggml_qsa_top_k_vis with n_sel == 0, and the topk_qsa fusion)
+// with ONE pass over the cells instead of v2's six.
+//
+// Output contract - v2's (= v1's), byte for byte, ids AND order:
+//   key = the variant's v2 key (keyed: f2ui(score + mask); QSA_TOPK_NOKEYS: the integer cell_key), T = the k-th largest
+//   key of the row, ids = every cell with key > T ascending, then the lowest-id cells with key == T ascending, until k.
+//
+// Three passes (PASS), one dispatch each, a full barrier between them, then v2's six passes in the QSA_TOPK_FB build
+// (topk_radix_select_v2.comp) over the rows this file could not finish:
+//   0 sample  one workgroup per row: the keys of n_sample cells (runs of SRUN at the block spacing, the runs `stride`
+//             apart on average; approximate keys, see sample_key) in registers, the j_sample-th largest of them by v2's
+//             radix rule (8-bit digits top-down, the bucket whose suffix count reaches the rank) -> tau. It also zeroes
+//             the row's candidate counter and (row 0) the fallback count.
+//   1 filter  (rows, tiles) workgroups, v2's tile: every cell's exact key ONCE (held in registers); key >= tau appends
+//             (key, id) to the row's candidate list - one atomicAdd per workgroup on the row's counter, written while
+//             pos < CAP. The counter keeps counting past CAP, so an overflow is seen exactly.
+//   2 select  one workgroup per row: c = the counter. c < k or c > CAP: the row is appended to the fallback list (v2
+//             computes it). Else T and the number of ties to take are radix-selected among the c candidate keys (in
+//             registers, same rule), the composites (key > T: id; key == T: 1 << 31 | id) are compacted into LDS, sorted
+//             ascending (bitonic) and the first k written, low 31 bits = the id.
+// Why the result is v2's: c >= k means at least k cells have key >= tau, so T >= tau and every cell with key >= T is a
+// candidate - T, the above count and the tie group over the candidates are the row's. The sorted composites are the
+// above class ascending, then the ties ascending: v2's emit, truncated to k. The order the candidates arrived in (atomics)
+// never reaches the output, and tau only decides how many rows fall back - never an id. The filter's keys are v2's bits:
+// f2ui(gather) is v2's code unchanged (plane / metadata keyed variants), and the nokeys key cell_key_flat is v2's cell_key
+// with the loads made unconditional (same predicate, same score bits for every visible cell; see there). v2's key
+// helpers are copied unchanged (f2ui, f2ui_u, gather, qsa_vis_mask, kq_vis.glsl).
+//
+// Scratch (uint offsets from op_off, inside the bound prealloc_x after v2's region):
+//   tau[nrows] | cnt[nrows] | fb[1 + nrows] (count, rows) | cand[nrows][CAP][2] (key, id)
+// stats (binding 7, host-visible): [0] rows selected here or sent back, [1] fallback c < k, [2] fallback c > CAP,
+// [3] candidates summed over the rows finished here (read as 32-bit deltas at synchronize).
+// ONEPASS_NEGCTL (cmake -DGGML_VULKAN_QSA_TOPK_ONEPASS_NEGCTL=ON, tests only) takes the HIGHEST-id ties in descending
+// order instead, so the ordered-ids tests must FAIL on every row whose tie group is cut or holds two taken ties.
+#if defined(QSA_TOPK_NOKEYS) && !defined(QSA_VIS)
+#error "QSA_TOPK_NOKEYS is the metadata (QSA_VIS) form only"
+#endif
+
+#define RADIX 256u
+#define WG    256u
+#define CAP   8192u          // candidates per row (ggml-vulkan.cpp VK_QSA_TOPK_ONEPASS_CAP)
+#define PER   (CAP / WG)     // candidates per invocation in the select pass, sample keys per invocation
+#define SRUN  4u             // sample run length (n_sample is a multiple of it, ggml_vk_qsa_topk_onepass_plan)
+
+layout(constant_id = 0) const uint PASS       = 0;  // 0 sample, 1 filter, 2 select
+layout(constant_id = 1) const uint NWAVES     = 4;  // WG / subgroup size (the pipeline requires that size)
+layout(constant_id = 2) const uint CPT        = 8;  // filter: cells per invocation per tile (v2's tile = WG*CPT cells)
+layout(constant_id = 3) const uint LDS_N      = 1;  // keys held in LDS: CAP for the sample / select passes, 1 for the filter
+layout(constant_id = 4) const uint VIS_CAUSAL = 1;
+layout(constant_id = 5) const uint NK_CHECK   = 0;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer A  {float     data_a[];};   // QSA block scores (strides in sb_blk/sb_tps)
+layout (binding = 1) writeonly buffer D  {int       data_d[];};   // [k, nrows] selected cell ids
+layout (binding = 2) readonly  buffer CB {int       cell_blk[];}; // cell->block map [n_kv, n_stream]
+#ifdef QSA_VIS
+layout (binding = 3) readonly  buffer VC {int   data_vc[];};
+layout (binding = 5) readonly  buffer VT {ivec4 data_vt[];};
+#else
+layout (binding = 3) readonly  buffer M  {float16_t mask[];};     // raw f16 kq_mask [n_kv, n_tps, n_stream]
+#endif
+layout (binding = 4) buffer S {uint scratch[];};
+#ifdef QSA_TOPK_NOKEYS
+layout (binding = 0) readonly buffer AU {uint data_au[];};
+layout (binding = 6) buffer NKF {uint nk_flag[];};
+#endif
+layout (binding = 7) buffer ST {uint stats[];};
+
+layout (push_constant) uniform parameter {
+    uint ncols;
+    uint k;
+    uint nrows;
+    uint n_tps;
+    uint n_blocks;
+    uint n_stream;
+    uint sb_blk;
+    uint sb_tps;
+    uint n_tiles;   // filter tiles over the cells
+    uint op_off;    // the onepass region (uints)
+    uint n_sample;  // sampled cells per row (<= CAP, <= ncols)
+    uint j_sample;  // rank of tau among them (1 = the largest)
+    uint stride;    // sample stride (n_sample * stride <= ncols)
+} p;
+
+#ifdef QSA_VIS
+int kqv_cell_load(uint idx) {
+    return data_vc[idx];
+}
+
+#include "kq_vis.glsl"
+
+// v2's qsa_vis_mask, unchanged
+float qsa_vis_mask(uint s, uint t, uint i) {
+    return kqv_value(s * 4u * p.ncols, p.ncols, i, data_vt[s * p.n_tps + t],
+                     (VIS_CAUSAL != 0u ? KQV_FLAG_CAUSAL : 0u) | KQV_FLAG_F16, 0);
+}
+#endif
+
+shared uint sk[LDS_N];        // sample keys (PASS 0); candidate keys, then the sorted composites (PASS 2)
+shared uint hist[RADIX];
+shared uint sh_scan[NWAVES];
+shared uint sh_bucket;
+shared uint sh_above;
+shared uint sh_n;
+
+// v2's f2ui, unchanged
+uint f2ui(float x) {
+    uint y = floatBitsToUint(x);
+    if (y == 0x80000000u) {
+        y = 0u;
+    }
+    if ((y & 0x80000000u) != 0u) {
+        y ^= 0xFFFFFFFFu;
+    } else {
+        y |= 0x80000000u;
+    }
+    return y;
+}
+
+#ifdef QSA_TOPK_NOKEYS
+// v2's f2ui_u, unchanged
+uint f2ui_u(uint y) {
+    if (y == 0x80000000u) {
+        y = 0u;
+    }
+    if ((y & 0x80000000u) != 0u) {
+        y ^= 0xFFFFFFFFu;
+    } else {
+        y |= 0x80000000u;
+    }
+    return y;
+}
+
+// [TAG_QSA_TOPK_ONEPASS] v2's cell_key (topk_radix_select_v2.comp) with every load but the causal-tie planes unconditional
+// (the block index clamped into range for the cells whose score is not used): the same predicate as kqv_visible - seq
+// bit, then p0 > pos, then at p0 == pos the x / y order - and the same score bits for every visible cell, so
+// cell_key_flat(row, i) == cell_key(row, i) whenever cell_blk holds a valid block for the visible cells (the op's
+// contract; cell_key itself reads out of range otherwise). The CHECK word is raised for the same cells (visible, in the
+// one pass over every cell). Branch-free, so the CPT keys of an invocation are gathered together (filter -18 % at 1M).
+uint cell_key_flat(uint row, uint i) {
+    const uint  t     = row % p.n_tps;
+    const uint  s     = row / p.n_tps;
+    const ivec4 tk    = data_vt[s * p.n_tps + t];
+    const uint  cbase = s * 4u * p.ncols;
+    const uint  sm    = uint(data_vc[cbase + p.ncols + i]);
+    const int   p0    = data_vc[cbase + i];
+    const uint  block = min(uint(cell_blk[s * p.ncols + i]), p.n_blocks - 1u);
+    const uint  bits  = data_au[s * p.n_blocks * p.n_tps + block * p.sb_blk + t * p.sb_tps];
+    bool vis = (sm & uint(tk.y)) != 0u;
+    if (VIS_CAUSAL != 0u) {
+        vis = vis && p0 <= tk.x;
+        if (vis && p0 == tk.x) {
+            const int x0 = data_vc[cbase + 2u * p.ncols + i];
+            const int y0 = data_vc[cbase + 3u * p.ncols + i];
+            vis = !(y0 > tk.w || (y0 == tk.w && x0 > tk.z));
+        }
+    }
+    if (NK_CHECK != 0u && PASS == 1u && vis) {
+        const uint e = (bits >> 23) & 0xFFu;
+        const uint m = bits & 0x7FFFFFu;
+        const uint f = (e == 0u && m != 0u ? 1u : 0u) | (e == 0xFFu && m != 0u ? 2u : 0u) | (bits == 0x7F800000u ? 4u : 0u);
+        if (f != 0u) {
+            atomicOr(nk_flag[0], f);
+        }
+    }
+    return vis ? f2ui_u(bits) : 0x007FFFFFu;
+}
+#else
+// v2's gather, unchanged: score[cell_blk[i,s], t, s] + mask[i,t,s], one f32 add
+float gather(uint row, uint i) {
+    const uint t = row % p.n_tps;
+    const uint s = row / p.n_tps;
+    const uint block = uint(cell_blk[s * p.ncols + i]);
+    const float a = data_a[s * p.n_blocks * p.n_tps + block * p.sb_blk + t * p.sb_tps];
+#ifdef QSA_VIS
+    const float m = qsa_vis_mask(s, t, i);
+#else
+    const float m = float(mask[(s * p.n_tps + t) * p.ncols + i]);
+#endif
+    return a + m;
+}
+#endif
+
+// the key v2's pass 0 computes for this variant (the filter's; nokeys: cell_key_flat == cell_key)
+uint filter_key(uint row, uint i) {
+#ifdef QSA_TOPK_NOKEYS
+    return cell_key_flat(row, i);
+#else
+    return f2ui(gather(row, i));
+#endif
+}
+
+uint tau_off()  { return p.op_off; }
+uint cnt_off()  { return p.op_off + p.nrows; }
+uint fb_off()   { return p.op_off + 2u * p.nrows; }
+uint cand_off() { return p.op_off + 3u * p.nrows + 1u; }
+
+// the `desired`-th largest of n keys (1 <= desired <= n): (T, how many keys == T it takes), v2's rule - four rounds of
+// 8-bit digits, top byte first; in round r, scanning the bins top-down, the first bin whose running count reaches
+// `desired` (v2's resolve() on an LDS histogram; bins numbered by lin, subgroup-major like v2's). The keys stay in
+// registers: element q of this invocation is key j = q * WG + lin (valid while j < n), so a pass using it holds 1 KiB of
+// LDS (occupancy) and reads no LDS per key.
+uvec2 reg_select(const uint keys[PER], const uint n, uint desired, const uint lin) {
+    uint prefix = 0;
+    [[unroll]] for (uint r = 0; r < 4; ++r) {
+        const uint shift   = 24u - 8u * r;
+        const uint hi_mask = r == 0 ? 0u : (0xFFFFFFFFu << (shift + 8u));
+        hist[lin] = 0u;
+        barrier();
+        [[unroll]] for (uint q = 0; q < PER; ++q) {
+            const uint key = keys[q];
+            if (q * WG + lin < n && (key & hi_mask) == prefix) {
+                // v2's equal-digit aggregation: the lanes sharing the first active lane's digit add once (round 0 puts
+                // similar scores into a handful of bins)
+                const uint d  = (key >> shift) & (RADIX - 1u);
+                const uint ld = subgroupBroadcastFirst(d);
+                if (d == ld) {
+                    const uint cnt = subgroupBallotBitCount(subgroupBallot(true));
+                    if (subgroupElect()) {
+                        atomicAdd(hist[d], cnt);
+                    }
+                } else {
+                    atomicAdd(hist[d], 1u);
+                }
+            }
+        }
+        barrier();
+        const uint hv   = hist[lin];
+        const uint incl = subgroupInclusiveAdd(hv);
+        if (gl_SubgroupInvocationID == gl_SubgroupSize - 1) {
+            sh_scan[gl_SubgroupID] = incl;
+        }
+        barrier();
+        uint below = 0;
+        uint total = 0;
+        [[unroll]] for (uint w = 0; w < NWAVES; ++w) {
+            const uint v = sh_scan[w];
+            below += w < gl_SubgroupID ? v : 0u;
+            total += v;
+        }
+        const uint suffix = total - (below + incl) + hv;
+        if (suffix >= desired && suffix - hv < desired) {
+            sh_bucket = lin;
+            sh_above  = suffix - hv;
+        }
+        // unreachable while desired <= n (v2's fall-through)
+        if (lin == 0 && total < desired) {
+            sh_bucket = 0;
+            sh_above  = total;
+        }
+        barrier();
+        prefix  |= sh_bucket << shift;
+        desired -= sh_above;
+        barrier(); // hist, sh_scan, sh_bucket and sh_above are rewritten by the next round
+    }
+    return uvec2(prefix, desired);
+}
+
+// the sample's key: v2's key up to the causal tie refinement (x / y planes at p0 == pos are not read: such a cell counts as
+// visible) - tau only steers how many rows fall back, never an id, so the sample need not be exact. Every load is
+// unconditional on a clamped index and the loop is unrolled, so all PER gathers of an invocation are in flight together
+// (the exact key's lazy loads made this pass a chain of 32 dependent gathers).
+uint sample_key(const uint row, const uint j) {
+    const uint t = row % p.n_tps;
+    const uint s = row / p.n_tps;
+#ifdef QSA_VIS
+    const ivec4 tk    = data_vt[s * p.n_tps + t];
+    const uint  cbase = s * 4u * p.ncols;
+#endif
+    {
+        // SRUN consecutive samples share a run (one per 4-cell block of the deployed layout while stride >= 4), the runs
+        // stride * SRUN cells apart: a run's scores sit in one cache line, so the pass reads ~1/SRUN of the score lines an
+        // iid stride would (at 1M cells an iid stride touches every line of the row - the filter's whole score traffic)
+        const bool ok = j < p.n_sample;
+        const uint sp = min(p.stride, 4u);
+        const uint i  = ok ? (j / SRUN) * (SRUN * p.stride) + (j % SRUN) * sp : 0u;
+        const uint b  = min(uint(cell_blk[s * p.ncols + i]), p.n_blocks - 1u);
+        const uint ai = s * p.n_blocks * p.n_tps + b * p.sb_blk + t * p.sb_tps;
+#ifdef QSA_VIS
+        const uint sm  = uint(data_vc[cbase + p.ncols + i]);
+        const int  p0  = data_vc[cbase + i];
+        const bool vis = (sm & uint(tk.y)) != 0u && (VIS_CAUSAL == 0u || p0 <= tk.x);
+#ifdef QSA_TOPK_NOKEYS
+        const uint key = vis ? f2ui_u(data_au[ai]) : 0x007FFFFFu;
+#else
+        const uint key = vis ? f2ui(data_a[ai]) : 0x007FFFFFu;
+#endif
+#else
+        const uint key = f2ui(data_a[ai] + float(mask[(s * p.n_tps + t) * p.ncols + i]));
+#endif
+        return key;
+    }
+}
+
+void sample_pass(const uint row, const uint lin) {
+    uint keys[PER];
+    [[unroll]] for (uint q = 0; q < PER; ++q) {
+        keys[q] = sample_key(row, q * WG + lin);
+    }
+    if (lin == 0) {
+        scratch[cnt_off() + row] = 0u;
+        if (row == 0u) {
+            scratch[fb_off()] = 0u;
+        }
+    }
+    const uvec2 st = reg_select(keys, p.n_sample, p.j_sample, lin);
+    if (lin == 0) {
+        scratch[tau_off() + row] = st.x;
+    }
+}
+
+// the tile's keys stay in registers (CPT per invocation); the workgroup's candidates take ONE atomicAdd on the row's
+// counter (a per-subgroup atomic in every chunk serialized the chunks behind the returned value)
+void filter_pass(const uint row, const uint tile, const uint lin) {
+    const uint tau  = scratch[tau_off() + row];
+    const uint base = tile * (WG * CPT);
+    const uint cand = cand_off() + row * CAP * 2u;
+    uint keys[CPT];
+    uint mine = 0;
+    [[unroll]] for (uint c = 0; c < CPT; ++c) {
+        const uint i = base + c * WG + lin;
+        keys[c] = 0u;
+        if (i < p.ncols) {
+            keys[c] = filter_key(row, i);
+            mine += keys[c] >= tau ? 1u : 0u;
+        }
+    }
+    const uint incl = subgroupInclusiveAdd(mine);
+    if (gl_SubgroupInvocationID == gl_SubgroupSize - 1) {
+        sh_scan[gl_SubgroupID] = incl;
+    }
+    barrier();
+    uint below = 0;
+    uint total = 0;
+    [[unroll]] for (uint w = 0; w < NWAVES; ++w) {
+        const uint v = sh_scan[w];
+        below += w < gl_SubgroupID ? v : 0u;
+        total += v;
+    }
+    if (total == 0u) {
+        return; // uniform: nothing of this tile reaches tau
+    }
+    if (lin == 0) {
+        sh_n = atomicAdd(scratch[cnt_off() + row], total);
+    }
+    barrier();
+    uint pos = sh_n + below + incl - mine;
+    [[unroll]] for (uint c = 0; c < CPT; ++c) {
+        const uint i = base + c * WG + lin;
+        if (i < p.ncols && keys[c] >= tau) {
+            if (pos < CAP) {
+                scratch[cand + 2u * pos]      = keys[c];
+                scratch[cand + 2u * pos + 1u] = i;
+            }
+            pos++;
+        }
+    }
+}
+
+// ascending bitonic sort of sk[0..P), P a power of two <= CAP (uniform)
+void lds_sort(const uint P, const uint lin) {
+    for (uint size = 2u; size <= P; size <<= 1u) {
+        for (uint stride = size >> 1u; stride > 0u; stride >>= 1u) {
+            for (uint t = lin; t < (P >> 1u); t += WG) {
+                const uint i = 2u * t - (t & (stride - 1u));
+                const uint j = i + stride;
+                const uint a = sk[i];
+                const uint b = sk[j];
+                if ((a > b) == ((i & size) == 0u)) {
+                    sk[i] = b;
+                    sk[j] = a;
+                }
+            }
+            barrier();
+        }
+    }
+}
+
+void select_pass(const uint row, const uint lin) {
+    const uint c = scratch[cnt_off() + row];
+    if (c < p.k || c > CAP) {
+        // fewer candidates than k (tau above T) or more than the list holds: v2 computes this row
+        if (lin == 0) {
+            const uint slot = atomicAdd(scratch[fb_off()], 1u);
+            scratch[fb_off() + 1u + slot] = row;
+            atomicAdd(stats[0], 1u);
+            atomicAdd(stats[c < p.k ? 1u : 2u], 1u);
+        }
+        return;
+    }
+    const uint cand = cand_off() + row * CAP * 2u;
+    // this invocation's candidates (key, id) in registers: unconditional loads (the list is CAP long), all in flight
+    uint ck[PER];
+    uint ci[PER];
+    [[unroll]] for (uint q = 0; q < PER; ++q) {
+        const uint j = q * WG + lin;
+        ck[q] = scratch[cand + 2u * j];
+        ci[q] = scratch[cand + 2u * j + 1u];
+    }
+    const uvec2 st = reg_select(ck, c, p.k, lin);
+    const uint  T  = st.x;
+
+    // the composites of this invocation's candidates
+    uint comp[PER];
+    [[unroll]] for (uint q = 0; q < PER; ++q) {
+        const uint j = q * WG + lin;
+        uint v = 0xFFFFFFFFu;
+        if (j < c) {
+            const uint key = ck[q];
+            if (key >= T) {
+                const uint id = ci[q];
+#ifdef ONEPASS_NEGCTL
+                // NEGATIVE CONTROL BUILD ONLY: the ties ranked by descending id (the wrong ones are taken, in the wrong order)
+                v = key > T ? id : (0x80000000u | (0x7FFFFFFFu - id));
+#else
+                v = key > T ? id : (0x80000000u | id);
+#endif
+            }
+        }
+        comp[q] = v;
+    }
+    if (lin == 0) {
+        sh_n = 0u;
+    }
+    barrier();
+    [[unroll]] for (uint q = 0; q < PER; ++q) {
+        const bool  keep = comp[q] != 0xFFFFFFFFu;
+        const uvec4 b    = subgroupBallot(keep);
+        const uint  n    = subgroupBallotBitCount(b);
+        if (n != 0u) {
+            uint pos0 = 0;
+            if (subgroupElect()) {
+                pos0 = atomicAdd(sh_n, n);
+            }
+            pos0 = subgroupBroadcastFirst(pos0);
+            if (keep) {
+                sk[pos0 + subgroupBallotExclusiveBitCount(b)] = comp[q];
+            }
+        }
+    }
+    barrier();
+    const uint n_sel = sh_n; // above + every tie: >= k
+    uint P = 1u;
+    while (P < n_sel) {
+        P <<= 1u;
+    }
+    for (uint j = n_sel + lin; j < P; j += WG) {
+        sk[j] = 0xFFFFFFFFu;
+    }
+    barrier();
+    lds_sort(P, lin);
+    const uint row_out = row * p.k;
+    for (uint j = lin; j < p.k; j += WG) {
+        const uint v = sk[j];
+#ifdef ONEPASS_NEGCTL
+        data_d[row_out + j] = int((v & 0x80000000u) != 0u ? 0x7FFFFFFFu - (v & 0x7FFFFFFFu) : v);
+#else
+        data_d[row_out + j] = int(v & 0x7FFFFFFFu);
+#endif
+    }
+    if (lin == 0) {
+        atomicAdd(stats[0], 1u);
+        atomicAdd(stats[3], c);
+    }
+}
+
+void main() {
+    const uint lin  = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+    const uint tile = gl_WorkGroupID.y;
+    for (uint row = gl_WorkGroupID.x; row < p.nrows; row += gl_NumWorkGroups.x) {
+        if (PASS == 0) {
+            sample_pass(row, lin);
+        } else if (PASS == 1) {
+            filter_pass(row, tile, lin);
+        } else {
+            select_pass(row, lin);
+        }
+        barrier(); // the next row reuses the LDS
+    }
+}

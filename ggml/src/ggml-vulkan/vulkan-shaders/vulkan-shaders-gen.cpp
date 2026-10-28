@@ -1115,6 +1115,26 @@ void process_shaders() {
 #else
     string_to_spv("topk_radix_select_v2_vis_nk_f32", "topk_radix_select_v2.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}, {"QSA_TOPK_NOKEYS", "1"}});
 #endif
+    // [TAG_QSA_TOPK_ONEPASS] the single-pass cell-form selection (three variants: plane, metadata, metadata without the key
+    // rows) and v2's cell form as its per-row fallback (QSA_TOPK_FB: the rows come from the onepass fallback list); the
+    // negative-control build takes the highest-id ties (tests only)
+    {
+#ifdef GGML_VULKAN_QSA_TOPK_ONEPASS_NEGCTL
+        const std::pair<std::string, std::string> op_negctl = {"ONEPASS_NEGCTL", "1"};
+#else
+        const std::pair<std::string, std::string> op_negctl = {"ONEPASS_NEGCTL_OFF", "1"};
+#endif
+        string_to_spv("topk_qsa_onepass_f32", "topk_qsa_onepass.comp", {{"A_TYPE", "float"}, op_negctl});
+        string_to_spv("topk_qsa_onepass_vis_f32", "topk_qsa_onepass.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}, op_negctl});
+        string_to_spv("topk_qsa_onepass_vis_nk_f32", "topk_qsa_onepass.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}, {"QSA_TOPK_NOKEYS", "1"}, op_negctl});
+    }
+    string_to_spv("topk_radix_select_v2_fb_f32", "topk_radix_select_v2.comp", {{"A_TYPE", "float"}, {"QSA_TOPK_FB", "1"}});
+    string_to_spv("topk_radix_select_v2_vis_fb_f32", "topk_radix_select_v2.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}, {"QSA_TOPK_FB", "1"}});
+#ifdef GGML_VULKAN_QSA_TOPK_NOKEYS_NEGCTL
+    string_to_spv("topk_radix_select_v2_vis_nk_fb_f32", "topk_radix_select_v2.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}, {"QSA_TOPK_NOKEYS", "1"}, {"QSA_TOPK_NOKEYS_NEGCTL", "1"}, {"QSA_TOPK_FB", "1"}});
+#else
+    string_to_spv("topk_radix_select_v2_vis_nk_fb_f32", "topk_radix_select_v2.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}, {"QSA_TOPK_NOKEYS", "1"}, {"QSA_TOPK_FB", "1"}});
+#endif
     string_to_spv("qsa_bias_f32", "qsa_bias.comp", {}); // [TAG_QSA_COMPACT_BIAS]
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
