@@ -9203,9 +9203,16 @@ static vk_device ggml_vk_get_device(size_t idx) {
                       (size_t) device->properties.limits.minStorageBufferOffsetAlignment);
 
         // [TAG_VK_UMA_BULK_READ] the proof line: ggml_vk_buffer_read_2d reads a host-visible UMA buffer directly only from a
-        //   HOST_CACHED mapping or for <= 64 KiB; bulk reads of write-combined memory take the device copy path (no knob)
-        GGML_LOG_WARN("ggml_vulkan: %s uma_bulk_read: %s\n", device->name.c_str(), device->uma ?
-                      "copy path (direct CPU read only from HOST_CACHED mappings or for <= 64 KiB; no knob)" : "n/a (not a UMA device)");
+        //   HOST_CACHED mapping or for <= 64 KiB; bulk reads of write-combined memory take the device copy path (no knob).
+        //   The async readback (ggml_vk_buffer_read_2d_async) has the same HOST_CACHED gate with two A/B overrides, named here
+        //   when set so the line does not claim more than holds: GGML_VK_ASYNC_READ_UMA=1 reads uncached mappings directly,
+        //   GGML_VK_ASYNC_READ_COPYBUF=1 always copies (and wins over the former). Unset: the line is the v65 text.
+        const char * uma_async = !device->uma ? "" :
+                                 vk_async_read_copybuf ? "; async reads: always the copy path (GGML_VK_ASYNC_READ_COPYBUF=1)" :
+                                 vk_async_read_uma_force ? "; async reads: DIRECT from uncached mappings too (GGML_VK_ASYNC_READ_UMA=1 override)" : "";
+        GGML_LOG_WARN("ggml_vulkan: %s uma_bulk_read: %s%s\n", device->name.c_str(), device->uma ?
+                      "copy path (direct CPU read only from HOST_CACHED mappings or for <= 64 KiB; no knob)" : "n/a (not a UMA device)",
+                      uma_async);
 
         // [TAG_VK_GET_ROWS_FLAT] the proof line
         if (ggml_vk_get_rows_flat_knob() > 0) {
