@@ -20720,8 +20720,22 @@ static const char * ggml_backend_vk_name(ggml_backend_t backend) {
     return ctx->name.c_str();
 }
 
+// [TAG_QSA_TOPK_ONEPASS] a counters line goes to stderr as ONE raw write: through the log callback (common log: prefix and an
+// asynchronous writer) it could interleave with the [qsa-ids] dump lines that parsers read from the same stream
+static void ggml_vk_qsa_topk_onepass_emit(const char * line, int n, size_t cap) {
+    if (n <= 0) {
+        return;
+    }
+    const size_t len = std::min((size_t) n, cap - 1);
+    fwrite(line, 1, len, stderr);
+    if (line[len - 1] != '\n') {
+        fputc('\n', stderr); // truncated
+    }
+    fflush(stderr);
+}
+
 // [TAG_QSA_TOPK_ONEPASS] the onepass counters (32-bit words the select pass bumps, read as deltas so the host never writes
-// them): a WARN line at every doubling of the rows (1024, 2048, ...) and, with `final`, one more if anything changed since
+// them): a line at every doubling of the rows (1024, 2048, ...) and, with `final`, one more if anything changed since
 static void ggml_vk_qsa_topk_onepass_stats(const vk_device & device, bool final) {
     if (!device->qsa_topk_onepass || !device->qsa_topk_op_stats) {
         return;
@@ -20755,10 +20769,12 @@ static void ggml_vk_qsa_topk_onepass_stats(const vk_device & device, bool final)
                 device->qsa_topk_op_backoff.store(device->qsa_topk_op_backoff_len, std::memory_order_relaxed);
                 device->qsa_topk_op_backoffs++;
                 if ((device->qsa_topk_op_backoffs & (device->qsa_topk_op_backoffs - 1)) == 0) { // 1st, 2nd, 4th, ... time
-                    GGML_LOG_WARN("ggml_vulkan: qsa_topk onepass: backoff #%llu: %llu of %llu rows fell back - v2 for the next %u "
-                                  "synchronizations\n", (unsigned long long) device->qsa_topk_op_backoffs,
-                                  (unsigned long long) device->qsa_topk_op_win_fb, (unsigned long long) device->qsa_topk_op_win_rows,
-                                  device->qsa_topk_op_backoff_len);
+                    char line[256];
+                    const int n = snprintf(line, sizeof(line), "ggml_vulkan: qsa_topk onepass: backoff #%llu: %llu of %llu rows fell "
+                                           "back - v2 for the next %u synchronizations\n", (unsigned long long) device->qsa_topk_op_backoffs,
+                                           (unsigned long long) device->qsa_topk_op_win_fb, (unsigned long long) device->qsa_topk_op_win_rows,
+                                           device->qsa_topk_op_backoff_len);
+                    ggml_vk_qsa_topk_onepass_emit(line, n, sizeof(line));
                 }
                 device->qsa_topk_op_backoff_len = std::min<uint32_t>(2 * device->qsa_topk_op_backoff_len, 1024);
             } else {
@@ -20783,13 +20799,16 @@ static void ggml_vk_qsa_topk_onepass_stats(const vk_device & device, bool final)
         }
         return h.empty() ? std::string("-") : h;
     };
-    GGML_LOG_WARN("ggml_vulkan: qsa_topk onepass: rows %llu, fallback %llu (%.4f %%: under %llu, over %llu), candidates/row %.1f; "
-                  "sample-predicted overflow %llu, max c %llu, log2 c [%s], log2 sample estimate [%s], backoffs %llu%s\n",
-                  (unsigned long long) rows, (unsigned long long) (under + over), 100.0 * (double) (under + over) / (double) rows,
-                  (unsigned long long) under, (unsigned long long) over,
-                  done ? (double) device->qsa_topk_op_tot[3] / (double) done : 0.0, (unsigned long long) device->qsa_topk_op_tot[4],
-                  (unsigned long long) device->qsa_topk_op_tot[5], hist(8).c_str(), hist(24).c_str(),
-                  (unsigned long long) device->qsa_topk_op_backoffs, final ? " (final)" : "");
+    char line[2048];
+    const int n = snprintf(line, sizeof(line), "ggml_vulkan: qsa_topk onepass: rows %llu, fallback %llu (%.4f %%: under %llu, over %llu), "
+                           "candidates/row %.1f; sample-predicted overflow %llu, max c %llu, log2 c [%s], log2 sample estimate [%s], "
+                           "backoffs %llu%s\n",
+                           (unsigned long long) rows, (unsigned long long) (under + over), 100.0 * (double) (under + over) / (double) rows,
+                           (unsigned long long) under, (unsigned long long) over,
+                           done ? (double) device->qsa_topk_op_tot[3] / (double) done : 0.0, (unsigned long long) device->qsa_topk_op_tot[4],
+                           (unsigned long long) device->qsa_topk_op_tot[5], hist(8).c_str(), hist(24).c_str(),
+                           (unsigned long long) device->qsa_topk_op_backoffs, final ? " (final)" : "");
+    ggml_vk_qsa_topk_onepass_emit(line, n, sizeof(line));
     device->qsa_topk_op_logged = rows;
     while (device->qsa_topk_op_next_log <= rows) {
         device->qsa_topk_op_next_log *= 2;
@@ -20800,8 +20819,9 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
-    ggml_vk_qsa_topk_onepass_stats(ctx->device, true); // [TAG_QSA_TOPK_ONEPASS]
-    ggml_vk_cleanup(ctx);
+    ggml_vk_cleanup(ctx); // waits for this context's submitted work (ggml_vk_synchronize)
+    // [TAG_QSA_TOPK_ONEPASS] the final counters only now: before the cleanup a selection still in flight would be missed
+    ggml_vk_qsa_topk_onepass_stats(ctx->device, true);
 
     delete ctx;
     delete backend;
