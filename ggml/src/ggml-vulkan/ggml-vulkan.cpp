@@ -977,6 +977,13 @@ struct vk_device_struct {
     uint64_t qsa_topk_op_tot[40]  = {};
     uint64_t qsa_topk_op_next_log = 1024;
     uint64_t qsa_topk_op_logged   = 0;
+    // backoff (GGML_VK_QSA_TOPK_ONEPASS_BACKOFF, default on): a window of >= 512 selected rows of which more than half fell
+    // back sends the selections to v2 for qsa_topk_op_backoff synchronizations (16, doubling while it repeats, <= 1024)
+    bool     qsa_topk_op_backoff_on = true;
+    std::atomic<uint32_t> qsa_topk_op_backoff {0};
+    uint32_t qsa_topk_op_backoff_len = 16;
+    uint64_t qsa_topk_op_win_rows = 0, qsa_topk_op_win_fb = 0;
+    uint64_t qsa_topk_op_backoffs = 0;
 
     bool coopmat2;
     bool coopmat2_bf16_support {};
@@ -9125,6 +9132,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->qsa_topk_op_min_cells = env_u32("GGML_VK_QSA_TOPK_ONEPASS_MIN_CELLS", (uint32_t) VK_QSA_TOPK_ONEPASS_MIN_CELLS);
             device->qsa_topk_op_fbx       = std::max<uint32_t>(1, env_u32("GGML_VK_QSA_TOPK_ONEPASS_FBX", VK_QSA_TOPK_ONEPASS_FBX));
             device->qsa_topk_op_fby       = std::max<uint32_t>(1, env_u32("GGML_VK_QSA_TOPK_ONEPASS_FBY", VK_QSA_TOPK_ONEPASS_FBY));
+            device->qsa_topk_op_backoff_on = ggml_vk_env_bool("GGML_VK_QSA_TOPK_ONEPASS_BACKOFF", true);
 #ifdef GGML_VULKAN_QSA_TOPK_ONEPASS_NEGCTL
             const char * op_negctl = " NEGATIVE-CONTROL BUILD: the onepass select takes the highest-id ties";
 #else
@@ -9134,10 +9142,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
                                   !device->qsa_topk_v2 ? "needs v2 for the fallback" :
                                   !op_lds_ok ? "maxComputeSharedMemorySize too small" : "GGML_VK_QSA_TOPK_ONEPASS=1";
             GGML_LOG_WARN("ggml_vulkan: %s qsa_topk: onepass %s (%s; sample <= %u cells, candidates <= %u per row, n_kv >= %u and "
-                          "rows x n_kv >= %llu, k <= %u, cell form; v2 per row on c < k or overflow, fallback grid %u x %u)%s\n",
+                          "rows x n_kv >= %llu, k <= %u, cell form; v2 per row on c < k or overflow, fallback grid %u x %u, backoff %s)%s\n",
                           device->name.c_str(), device->qsa_topk_onepass ? "on" : "off", op_why, VK_QSA_TOPK_ONEPASS_CAP,
                           VK_QSA_TOPK_ONEPASS_CAP, device->qsa_topk_op_min_kv, (unsigned long long) device->qsa_topk_op_min_cells,
-                          VK_QSA_TOPK_ONEPASS_CAP / 2, device->qsa_topk_op_fbx, device->qsa_topk_op_fby, op_negctl);
+                          VK_QSA_TOPK_ONEPASS_CAP / 2, device->qsa_topk_op_fbx, device->qsa_topk_op_fby,
+                          device->qsa_topk_op_backoff_on ? "on" : "off", op_negctl);
         }
 
         // [TAG_QSA_SCORE_KREUSE] read before the pipelines are declared (=0: the kr twins are never created).
@@ -17516,6 +17525,10 @@ static bool ggml_vk_qsa_topk_nokeys(const vk_device & device, bool blocks, bool 
 // k <= n_kv. width == 0 asks for the scratch reservation, where k is not known (the region is then reserved for any k). The
 // dispatch adds the expected-candidates test (ggml_vk_qsa_topk_onepass_plan).
 static bool ggml_vk_qsa_topk_onepass(const vk_device & device, bool blocks, int64_t n_kv, size_t nrows, uint32_t width) {
+    // width == 0 (the reservation) ignores the backoff: the region stays reserved, so leaving it never regrows prealloc_x
+    if (width != 0 && device->qsa_topk_op_backoff.load(std::memory_order_relaxed) != 0) {
+        return false;
+    }
     return device->qsa_topk_onepass && !blocks && n_kv >= (int64_t) std::max<uint32_t>(device->qsa_topk_op_min_kv, 1u) &&
            (uint64_t) nrows * (uint64_t) n_kv >= device->qsa_topk_op_min_cells &&
            (width == 0 || (width <= VK_QSA_TOPK_ONEPASS_CAP / 2 && (int64_t) width <= n_kv));
@@ -20618,6 +20631,7 @@ static void ggml_vk_qsa_topk_onepass_stats(const vk_device & device, bool final)
     }
     std::lock_guard<std::mutex> lock(device->qsa_topk_op_mutex);
     volatile uint32_t * w = (volatile uint32_t *) device->qsa_topk_op_stats->ptr;
+    const uint64_t rows0 = device->qsa_topk_op_tot[0], fb0 = device->qsa_topk_op_tot[1] + device->qsa_topk_op_tot[2];
     for (int i = 0; i < 40; ++i) {
         const uint32_t v = w[i];
         if (i == 5) { // a running max, not a count
@@ -20628,6 +20642,34 @@ static void ggml_vk_qsa_topk_onepass_stats(const vk_device & device, bool final)
         device->qsa_topk_op_last[i] = v;
     }
     const uint64_t rows = device->qsa_topk_op_tot[0];
+    // [TAG_QSA_TOPK_ONEPASS] backoff: inputs whose rows mostly fall back (a tie group at tau of > 2 CAP cells, e.g. the T6M
+    // tiny fixture: every row) pay the onepass passes on top of v2 (+22 % there); a window of >= 512 rows with more than half
+    // fallen back sends the selections to v2 for backoff_len synchronizations, then onepass is tried again. Only the path
+    // changes - both give the same ids - so the decision may depend on history.
+    if (device->qsa_topk_op_backoff_on) {
+        const uint32_t b = device->qsa_topk_op_backoff.load(std::memory_order_relaxed);
+        if (b > 0) {
+            device->qsa_topk_op_backoff.store(b - 1, std::memory_order_relaxed);
+        }
+        device->qsa_topk_op_win_rows += rows - rows0;
+        device->qsa_topk_op_win_fb   += device->qsa_topk_op_tot[1] + device->qsa_topk_op_tot[2] - fb0;
+        if (device->qsa_topk_op_win_rows >= 512) {
+            if (2 * device->qsa_topk_op_win_fb > device->qsa_topk_op_win_rows) {
+                device->qsa_topk_op_backoff.store(device->qsa_topk_op_backoff_len, std::memory_order_relaxed);
+                device->qsa_topk_op_backoffs++;
+                if ((device->qsa_topk_op_backoffs & (device->qsa_topk_op_backoffs - 1)) == 0) { // 1st, 2nd, 4th, ... time
+                    GGML_LOG_WARN("ggml_vulkan: qsa_topk onepass: backoff #%llu: %llu of %llu rows fell back - v2 for the next %u "
+                                  "synchronizations\n", (unsigned long long) device->qsa_topk_op_backoffs,
+                                  (unsigned long long) device->qsa_topk_op_win_fb, (unsigned long long) device->qsa_topk_op_win_rows,
+                                  device->qsa_topk_op_backoff_len);
+                }
+                device->qsa_topk_op_backoff_len = std::min<uint32_t>(2 * device->qsa_topk_op_backoff_len, 1024);
+            } else {
+                device->qsa_topk_op_backoff_len = 16;
+            }
+            device->qsa_topk_op_win_rows = device->qsa_topk_op_win_fb = 0;
+        }
+    }
     if (rows == 0 || rows == device->qsa_topk_op_logged || (!final && rows < device->qsa_topk_op_next_log)) {
         return;
     }
@@ -20645,11 +20687,12 @@ static void ggml_vk_qsa_topk_onepass_stats(const vk_device & device, bool final)
         return h.empty() ? std::string("-") : h;
     };
     GGML_LOG_WARN("ggml_vulkan: qsa_topk onepass: rows %llu, fallback %llu (%.4f %%: under %llu, over %llu), candidates/row %.1f; "
-                  "sample-predicted overflow %llu, max c %llu, log2 c [%s], log2 sample estimate [%s]%s\n",
+                  "sample-predicted overflow %llu, max c %llu, log2 c [%s], log2 sample estimate [%s], backoffs %llu%s\n",
                   (unsigned long long) rows, (unsigned long long) (under + over), 100.0 * (double) (under + over) / (double) rows,
                   (unsigned long long) under, (unsigned long long) over,
                   done ? (double) device->qsa_topk_op_tot[3] / (double) done : 0.0, (unsigned long long) device->qsa_topk_op_tot[4],
-                  (unsigned long long) device->qsa_topk_op_tot[5], hist(8).c_str(), hist(24).c_str(), final ? " (final)" : "");
+                  (unsigned long long) device->qsa_topk_op_tot[5], hist(8).c_str(), hist(24).c_str(),
+                  (unsigned long long) device->qsa_topk_op_backoffs, final ? " (final)" : "");
     device->qsa_topk_op_logged = rows;
     while (device->qsa_topk_op_next_log <= rows) {
         device->qsa_topk_op_next_log *= 2;
