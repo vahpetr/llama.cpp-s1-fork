@@ -90,7 +90,7 @@ services:
       - LLAMA_GTT_ONCE_MIB=1200         # one-time first-use growth allowed before the slope applies
       - LLAMA_GTT_SLACK_PCT=0
       - LLAMA_GTT_ADMISSION_MAX_WAIT_S=300   # after 300 s of waiting the request gets HTTP 503
-      - LLAMA_GTT_USED_PATH=${LLAMA_GTT_USED_PATH:-/sys/class/drm/card1/device/mem_info_gtt_used}   # card index may differ
+      - LLAMA_GTT_USED_PATH=${LLAMA_GTT_USED_PATH:-/sys/bus/pci/devices/0000:bd:00.0/mem_info_gtt_used}   # my GPU; setup-brain.sh sets yours (docs/s1/DEPLOY.md, "GPU sysfs paths")
     volumes:
       - ${MODELS_DIR:-./models}:/models:ro
       - ${SLOTS_DIR:-./slots}:/slots

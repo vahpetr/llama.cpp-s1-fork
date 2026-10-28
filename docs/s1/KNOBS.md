@@ -95,7 +95,7 @@ against the code for this table.
 | `LLAMA_GTT_ADMISSION_MIB=N` | 0 (off) | before a prefill chunk grows GTT past N MiB, the slot waits | SCHED | GTT - 3424 |
 | `LLAMA_GTT_SLOPE_B_PER_CELL`, `LLAMA_GTT_STAGING_B_PER_CELL`, `LLAMA_GTT_STAGING_STEP_MIB`, `LLAMA_GTT_ONCE_MIB`, `LLAMA_GTT_SLACK_PCT` | 18432, 2048, auto, 0, = grow slack | the admission's growth model | SCHED | 256, 0, -, 1200, 0 |
 | `LLAMA_GTT_ADMISSION_MAX_WAIT_S` | 600 | then HTTP 503 | SCHED | 300 |
-| `LLAMA_GTT_USED_PATH` | auto | sysfs file with GTT used bytes | SCHED | card1 |
+| `LLAMA_GTT_USED_PATH` | auto | sysfs file with GTT used bytes; use the stable `/sys/bus/pci/devices/<bdf>/mem_info_gtt_used`, never `/sys/class/drm/cardN/...` (the index can change at a reboot; [DEPLOY.md](DEPLOY.md) "GPU sysfs paths"); start log must say `headroom admission on` | SCHED | `/sys/bus/pci/devices/0000:bd:00.0/mem_info_gtt_used` |
 | `LLAMA_GTT_CONCURRENT_RESERVE_MIB`, `LLAMA_GTT_HOLES_FULL_CHUNK` | 0, 0 | multi-slot admission reserve | SCHED | - |
 | `LLAMA_PLE_PREFETCH=0` | on | madvise(WILLNEED) on the PLE rows of each ubatch | EXACT | - |
 | `LLAMA_PLE_HOIST=1` | 0 | PLE gather as the first node (measured -3.5 % prefill) | EXACT | - |
