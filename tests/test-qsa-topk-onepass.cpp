@@ -2,7 +2,7 @@
 // on a GPU. One child per arm (GGML_VK_QSA_TOPK_ONEPASS is read once at device init):
 //   off:    GGML_VK_QSA_TOPK_ONEPASS=0                    (v2, the deployed kernel)
 //   on:     =1 with the default gates                     (what a deployment with the knob runs)
-//   on_all: =1 + GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 + _MIN_KV_DECODE=1 (every admissible shape on the onepass kernel)
+//   on_all: =1 + GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 + _MIN_CELLS=1 (every admissible shape on the onepass kernel)
 // Each child runs the same case list on synthetic score planes - the metadata form (the deployed path; nokeys when the
 // device has it) and the plane form (keyed), depths 2 051 .. 1 048 576 cells, 1 / 6 / 64 x 2 streams / 128 rows, k 2051 and
 // 2048, modes: distinct (4-cell blocks = duplicate keys), fine ties (ReLU zeros + 1024 levels), census (dead blocks, +1e9
@@ -96,12 +96,14 @@ static std::vector<op_case> make_cases() {
         }
         v.push_back({ n, 6, 1, 2051, M_DISTINCT, true, false });
     }
-    // the gate's neighbourhood (default MIN_KV / MIN_KV_DECODE)
+    // the gate's neighbourhood (default MIN_KV / MIN_CELLS)
     for (int64_t n : { 49152, 98304, 196608 }) {
         for (int64_t r : { 1, 6, 128 }) {
             v.push_back({ n, r, 1, 2051, M_DISTINCT, false, false });
         }
     }
+    // a whole 2048-row ubatch in one dispatch (LLAMA_QSA_CHUNK off; ~0.6 GiB of planes)
+    v.push_back({ 262144, 2048, 1, 2051, M_DISTINCT, false, false });
     return v;
 }
 
@@ -280,7 +282,8 @@ static int child(const std::string & dir, int reps) {
         ggml_backend_free(probe);
     }
     const auto cases = make_cases();
-    const int R = 4;
+    // GGML_TEST_ONEPASS_R=<n>: copies of the op per graph (default 4; 16 = the 16 chunk selections of a 2048-row ubatch)
+    const int R = getenv("GGML_TEST_ONEPASS_R") ? std::max(1, atoi(getenv("GGML_TEST_ONEPASS_R"))) : 4;
     std::vector<uint32_t> keys, tmp;
     std::vector<int32_t> ref;
     // GGML_TEST_ONEPASS_CASES=i,j,... runs those cases only (timing probes; the parent's PASS needs every case)
@@ -451,7 +454,7 @@ int main(int argc, char ** argv) {
     const char * arms[3][2] = {
         { "off",    "GGML_VK_QSA_TOPK_ONEPASS=0" },
         { "on",     "GGML_VK_QSA_TOPK_ONEPASS=1" },
-        { "on_all", "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_KV_DECODE=1" },
+        { "on_all", "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_CELLS=1" },
     };
     std::vector<arm_view> v;
     for (const auto & arm : arms) {
