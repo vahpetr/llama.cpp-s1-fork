@@ -44,7 +44,7 @@ see "The image" in deploy/README.md (`BUILD=1` in the setup scripts does it). Bu
    `docker compose -f deploy/s1/docker-compose.brain-1m.yml up -d`. `MODELS_DIR`, `SLOTS_DIR` and `LLAMA_S1_IMAGE` override
    the defaults.
 6. **The admission bar.** `LLAMA_GTT_ADMISSION_MIB` defaults to 109 216 = GTT size - 3 424 MiB on my box; the setup script
-   computes it from yours. Check `LLAMA_GTT_USED_PATH` points at your GPU's `card` index.
+   computes it from yours and sets `LLAMA_GTT_USED_PATH` to your GPU's stable PCI path (see "GPU sysfs paths" below).
 
 What to expect on v64 (1M profile): GTT 105 495 MiB after load and 105 519 MiB peak after the smoke requests (llama-server with the
 vision projector; the same values as v63; the v63 live level just before the switch was 105 414); 105 659 MiB peak over a full
@@ -177,12 +177,16 @@ curl -s $P/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Reply with one word: ready"}],"max_tokens":16,"temperature":0}' \
   | python3 -c 'import sys, json; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
 curl -s $P/disk-cache | python3 -c 'import sys, json; d = json.load(sys.stdin); print(d["key"], d["n_entries"], d["adopt"], d["legacy_unmarked"])'
-echo "GTT used: $(( $(cat /sys/class/drm/card1/device/mem_info_gtt_used) / 1048576 )) MiB"   # your card index may differ
+echo "GTT used: $(( $(cat /sys/bus/pci/drivers/amdgpu/*/mem_info_gtt_used | head -1) / 1048576 )) MiB"
+docker logs llama-s1-brain-1m 2>&1 | grep -E 'headroom admission (on|disabled)'   # must say "on", never "disabled"
 docker logs llama-s1-brain-1m 2>&1 | grep -E 'n_ctx *=|qsa_score_epilogue: |mmvq_hoist: |kq_vis_mirror = |qsa_pooled_f16_mirror: |qsa_score_kreuse: |nokeys |mmid_tile_g2a: |dense_tile_g1: |legacy unmarked states'
 docker inspect llama-s1-brain-1m --format '{{.Args}}' | grep -o -- '--spec-draft-sampling [a-z]*'   # v64 composes: probabilistic
 ```
 
 - `n_ctx` 1048576 (or 525312; the hands report 917504).
+- Admission: exactly `admission: GTT headroom admission on: bar = <N> MiB, ...` and no `headroom admission disabled` line. A
+  `GTT usage not readable (path = '...') - headroom admission disabled` line means `LLAMA_GTT_USED_PATH` points at a file that
+  does not exist (see "GPU sysfs paths"); the server still serves, it just stops protecting GTT on long prompts.
 - The v60 startup lines: `qsa_score_epilogue: on`, `mmvq_hoist: on from 2 columns`, `kq_vis_mirror = on` (target and draft on the
   brain), `qsa_pooled_f16_mirror: on`; from v61 also `qsa_score_kreuse: on (...)` and `qsa_topk: v2 ...; nokeys on`; from v64
   also `mmid_tile_g2a: on (... LDS pad 2 = 72 B stride (default on RADV; not 16-B aligned, RADV only) ...)` and
@@ -200,6 +204,14 @@ docker inspect llama-s1-brain-1m --format '{{.Args}}' | grep -o -- '--spec-draft
 - **Debug output is off:** no `[spec-ids]`, `[vk-dispatch]`, `[qsa-score]` or `MISMATCH` lines unless you set those knobs.
 
 ## 7. Things that bite
+
+- **GPU sysfs paths.** Never hard-code `/sys/class/drm/cardN/...`: the card index follows the probe order at boot and changed on my
+  s1 after an ordinary reboot (card1 -> card0). The server kept its old `LLAMA_GTT_USED_PATH`, could not read GTT, logged
+  `headroom admission disabled` once at start and ran two days without admission. Use the PCI address, which is stable:
+  `/sys/bus/pci/devices/<bdf>/` (same files as `cardN/device/`) or the driver dir `/sys/bus/pci/drivers/amdgpu/<bdf>/`. Find it
+  with `readlink -f /sys/class/drm/card*/device` (the last path component, e.g. `0000:bd:00.0`) or `ls -d /sys/bus/pci/drivers/amdgpu/0000:*`.
+  This covers `LLAMA_GTT_USED_PATH`, `mem_info_gtt_*` reads in scripts and `power_dpm_force_performance_level`
+  ([HOST-TUNING.md](HOST-TUNING.md), "Host settings (Strix Halo)"). After every start check the admission line (section 6).
 
 - One model load per GPU. A second model, or a build, next to the loaded 1M brain has run my 128 GB box out of memory.
 - Never point a test server at your production `--cache-disk` directory; give every experiment its own directory.
