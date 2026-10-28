@@ -119,6 +119,7 @@ shared uint sh_bucket;
 shared uint sh_above;
 shared uint sh_heq;           // reg_select: the count of the chosen bin of the last round (= keys equal to T)
 shared uint sh_n;
+shared uint sh_skip;          // filter: the row's counter was past CAP (read once by lin 0, so the skip is uniform)
 
 // v2's f2ui, unchanged
 uint f2ui(float x) {
@@ -341,9 +342,15 @@ void sample_pass(const uint row, const uint lin) {
 void filter_pass(const uint row, const uint tile, const uint lin) {
     // a row already past CAP (predicted by the sample, or filled by earlier workgroups of this pass) goes to v2 whatever this
     // tile holds: skip it. cnt only grows during the pass, so a value read here - however stale - is <= the final count: a
-    // skip happens only on a row whose final count exceeds CAP, i.e. a fallback row, and a row that ends <= CAP lost nothing
-    if (scratch[cnt_off() + row] > CAP) {
-        return;
+    // skip happens only on a row whose final count exceeds CAP, i.e. a fallback row, and a row that ends <= CAP lost nothing.
+    // One invocation reads the counter (atomically: other workgroups grow it) and shares the verdict, so the whole workgroup
+    // takes the same branch - a per-invocation read could disagree and return some invocations before the barriers below.
+    if (lin == 0) {
+        sh_skip = atomicAdd(scratch[cnt_off() + row], 0u) > CAP ? 1u : 0u;
+    }
+    barrier();
+    if (sh_skip != 0u) {
+        return; // uniform
     }
     const uint tau  = scratch[tau_off() + row];
     const uint base = tile * (WG * CPT);
