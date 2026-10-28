@@ -69,6 +69,9 @@
 // the keyed kernel's. The scratch keeps only the histograms and the tile records (hist_off = 0).
 // QSA_TOPK_NOKEYS_NEGCTL (cmake -DGGML_VULKAN_QSA_TOPK_NOKEYS_NEGCTL=ON, tests only) ranks the ties of each subgroup
 // ballot of the emit in reverse, so the ordered-ids tests must FAIL.
+// [TAG_QSA_TOPK_ONEPASS] QSA_TOPK_FB (the FORM 0 variants only) is this kernel as the per-row fallback of
+// topk_qsa_onepass.comp: the rows come from that list (push constant fb_off) instead of 0..nrows-1 and the tiles are looped
+// over (grid y may be smaller than n_tiles); nothing else changes.
 #if defined(QSA_TOPK_NOKEYS) && !defined(QSA_VIS)
 #error "QSA_TOPK_NOKEYS is the metadata (QSA_VIS) form only"
 #endif
@@ -127,6 +130,9 @@ layout (push_constant) uniform parameter {
     uint rec2_off;  // FORM 1: cell-tile records
     uint bits_off;  // FORM 1: block bitmaps
     uint nw;        // FORM 1: words per bitmap (covers n_tiles * WG * CPT blocks)
+#ifdef QSA_TOPK_FB
+    uint fb_off;    // [TAG_QSA_TOPK_ONEPASS] the fallback list: scratch[fb_off] = count, then the rows
+#endif
 } p;
 
 #ifdef QSA_VIS
@@ -719,8 +725,19 @@ void cell_emit_pass(const uint row, const uint tile, const uint lin) {
 
 void main() {
     const uint lin  = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+#ifdef QSA_TOPK_FB
+    // [TAG_QSA_TOPK_ONEPASS] the fallback build: only the rows topk_qsa_onepass.comp's select pass sent back, in the
+    // order it listed them, and the tiles looped over as well, so the grid stays small (with no row listed every
+    // workgroup exits at once). Each (row, tile) of a pass depends on that row's earlier passes alone, so neither order
+    // matters; the barrier below separates the LDS uses of consecutive (row, tile) units as it separates rows.
+    const uint n_fb = scratch[p.fb_off];
+    for (uint r = gl_WorkGroupID.x; r < n_fb; r += gl_NumWorkGroups.x) {
+    for (uint tile = gl_WorkGroupID.y; tile < p.n_tiles; tile += gl_NumWorkGroups.y) {
+        const uint row = scratch[p.fb_off + 1u + r];
+#else
     const uint tile = gl_WorkGroupID.y;
     for (uint row = gl_WorkGroupID.x; row < p.nrows; row += gl_NumWorkGroups.x) {
+#endif
         if (PASS <= 3) {
             hist_pass(row, tile, lin);
         } else if (PASS == 4) {
@@ -738,4 +755,7 @@ void main() {
         }
         barrier(); // the next row reuses the LDS
     }
+#ifdef QSA_TOPK_FB
+    }
+#endif
 }

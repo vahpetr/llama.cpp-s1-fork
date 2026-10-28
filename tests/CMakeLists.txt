@@ -255,6 +255,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # both arms and compares the dumped ordered ids byte for byte; not a ctest - needs a Vulkan device, SKIP otherwise.
     # A -DGGML_VULKAN_QSA_TOPK_NOKEYS_NEGCTL=ON build is its negative control.
     llama_build(test-qsa-topk-nokeys.cpp)
+    # [TAG_QSA_TOPK_ONEPASS] the single-pass QSA selection, knob off vs on vs on with the gates opened: the ordered ids of every
+    # case against the contract reference and byte for byte across the arms, ms per op, fallback counters; not a ctest - needs
+    # a Vulkan device, SKIP otherwise. A -DGGML_VULKAN_QSA_TOPK_ONEPASS_NEGCTL=ON build is its negative control.
+    llama_build(test-qsa-topk-onepass.cpp)
     # [TAG_MMID_SKIP] the mul_mat_id padding skip (#25483) over the partial-tile MUL_MAT_ID cases (runs test-backend-ops); not a
     # ctest - needs a Vulkan device, SKIP otherwise. A -DGGML_VULKAN_MMID_SKIP_NEGCTL=ON build is its negative control.
     llama_build(test-mmid-skip.cpp)
