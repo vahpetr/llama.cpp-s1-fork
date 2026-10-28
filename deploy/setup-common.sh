@@ -71,9 +71,12 @@ GTT_TOTAL_MIB=0
 # check_gtt NEEDED_MIB: read the GTT limit the amdgpu driver reports (falls back to ttm.pages_limit)
 check_gtt() {
     local need="$1" f bytes pages
-    for f in /sys/class/drm/card*/device/mem_info_gtt_total; do
+    # the amdgpu driver dir first: the path handed to the server must survive a reboot, and /sys/class/drm/cardN does not
+    # (my s1 went card1 -> card0 at a reboot and the server silently ran with headroom admission disabled for two days)
+    for f in /sys/bus/pci/drivers/amdgpu/*/mem_info_gtt_total /sys/class/drm/card*/device/mem_info_gtt_total; do
         [ -r "$f" ] || continue
         bytes=$(cat "$f"); GTT_TOTAL_MIB=$(( bytes / 1048576 ))
+        case "$f" in /sys/bus/pci/drivers/amdgpu/*) f="/sys/bus/pci/devices/$(basename "$(dirname "$f")")/mem_info_gtt_total";; esac
         GTT_USED_PATH="${f%_total}_used"
         break
     done

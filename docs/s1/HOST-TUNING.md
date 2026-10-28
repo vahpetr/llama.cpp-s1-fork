@@ -41,11 +41,9 @@ Note: another file in `/etc/sysctl.d` that sorts later (mine was `99-perf.conf`)
 Swap: 64 GiB of swap files. The model never swaps; swap is there so a one-off job (a 32 GB logits dump once) does not take the
 box down.
 
-GPU clock: a oneshot systemd unit pins the DPM level to high at boot (+3 % prefill, decode unchanged):
-
-```
-echo high > /sys/class/drm/card1/device/power_dpm_force_performance_level     # card index may differ
-```
+GPU clock: DPM level `high` while the GPU is busy, `auto` when idle - see
+[Host settings (Strix Halo): GPU clock governor](#host-settings-strix-halo-gpu-clock-governor) below. (Until 2026-10-28 a
+oneshot unit pinned `high` at boot for good.)
 
 Resilience *(my setup, worth copying)*:
 - `sshd`: `OOMScoreAdjust=-1000`, `MemoryLow=1G` in a drop-in, so an out-of-memory event never takes SSH with it.
@@ -83,6 +81,84 @@ vm.swappiness = 10
 Swap: 128 GiB (a 96 GiB file + a 32 GiB partition) *(my setup; more than needed)*.
 
 Threads: use the 8 physical cores (`-t 8`); 16 threads with SMT measured slower.
+
+## Host settings (Strix Halo): GPU clock governor
+
+`power_dpm_force_performance_level=high` keeps the iGPU at its top shader/memory clock instead of letting the default `auto`
+governor ramp it per burst. On s1 (gfx1151, llama-server, paired off/on A/B 2026-10-28) `high` measured
+**prefill +2.6 % at a 32k prompt and +3.2 % at 72k**; decode did not move in an earlier A/B (2026-09-07). Leaving `high` on all the
+time costs about **+15-20 W at idle**, so I do not pin it any more: a tiny governor switches to `high` as soon as the GPU is
+busy and back to `auto` after 120 s idle. The same script runs on balkon (780M); I have not measured the gain there.
+
+`/usr/local/sbin/amdgpu-dpm-governor.sh` (picks the first amdgpu PCI device, or set `DEV=/sys/bus/pci/devices/<addr>`):
+
+```sh
+#!/bin/sh
+# amdgpu DPM governor (piagent R138b, 2026-10-28): 'high' while the GPU is busy, 'auto' after IDLE_S seconds of idle.
+# Installed on s1 (gfx1151, 0000:bd:00.0) and balkon (780M, 0000:c5:00.0) as /usr/local/sbin/amdgpu-dpm-governor.sh
+# + scripts/host/amdgpu-dpm-governor.service. Polls gpu_busy_percent every POLL_S s; logs transitions to the journal.
+# The level is re-read every poll, so a level forced from outside (scripts/bench/dpm-high.sh) also returns to auto
+# after IDLE_S idle seconds. Measured on s1 (AB64 20261028-114936): high = prefill +2.6 % @32k / +3.2 % @72k;
+# forcing high at idle costs ~ +15-20 W, hence the idle fallback.
+# Rollback: systemctl disable --now amdgpu-dpm-governor; echo auto > $DEV/power_dpm_force_performance_level
+if [ -z "${DEV:-}" ]; then
+  for f in /sys/bus/pci/devices/*/power_dpm_force_performance_level; do [ -e "$f" ] && { DEV=${f%/*}; break; }; done
+fi
+CTL=${DEV:-/nonexistent}/power_dpm_force_performance_level; BUSY=${DEV:-/nonexistent}/gpu_busy_percent
+POLL_S=${POLL_S:-1}; IDLE_S=${IDLE_S:-120}; BUSY_PCT=${BUSY_PCT:-10}
+[ -w "$CTL" ] && [ -r "$BUSY" ] || { echo "amdgpu-dpm-governor: $CTL or $BUSY not usable" >&2; exit 1; }
+idle=0
+echo "amdgpu-dpm-governor: start on $DEV (current $(cat "$CTL"), busy>=${BUSY_PCT}% -> high, idle ${IDLE_S}s -> auto)"
+while :; do
+  b=$(cat "$BUSY" 2>/dev/null || echo 0); cur=$(cat "$CTL" 2>/dev/null || echo unknown)
+  if [ "$b" -ge "$BUSY_PCT" ] 2>/dev/null; then
+    idle=0
+    if [ "$cur" != high ]; then echo high > "$CTL" && echo "amdgpu-dpm-governor: busy ${b}% -> high (was $cur)"; fi
+  else
+    idle=$((idle + POLL_S))
+    if [ "$cur" != auto ] && [ "$idle" -ge "$IDLE_S" ]; then echo auto > "$CTL" && echo "amdgpu-dpm-governor: idle ${IDLE_S}s -> auto (was $cur)"; fi
+  fi
+  sleep "$POLL_S"
+done
+```
+
+`/etc/systemd/system/amdgpu-dpm-governor.service`, then `sudo systemctl daemon-reload && sudo systemctl enable --now amdgpu-dpm-governor`:
+
+```ini
+[Unit]
+Description=amdgpu DPM governor: high while busy, auto after idle (piagent R138b)
+After=multi-user.target
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/amdgpu-dpm-governor.sh
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+```
+
+Check: `journalctl -u amdgpu-dpm-governor` shows the `start on …` line and a `busy N% -> high` line at the next GPU load;
+`cat /sys/bus/pci/devices/*/power_dpm_force_performance_level` reads `high` under load and `auto` two minutes after it.
+
+The 1 s poll reacts within a second, which is noise for a long prefill but not for a sub-second micro-benchmark. My benchmark
+and test wrappers therefore also force `high` right before they start (one line, no failure if it cannot):
+
+```sh
+echo high | sudo -n tee /sys/bus/pci/devices/<addr>/power_dpm_force_performance_level >/dev/null
+```
+
+with a sudoers drop-in (`/etc/sudoers.d/power-dpm`, check it with `sudo visudo -cf` before installing) so it needs no password:
+
+```
+<user> ALL=(root) NOPASSWD: /usr/bin/tee /sys/bus/pci/devices/<addr>/power_dpm_force_performance_level
+```
+
+The governor re-reads the level every poll, so a level forced this way also returns to `auto` after the idle timeout.
+
+Rollback: `sudo systemctl disable --now amdgpu-dpm-governor` and
+`echo auto | sudo tee /sys/bus/pci/devices/<addr>/power_dpm_force_performance_level` (or `high` to pin it for good, as before).
+If you keep an older boot-time "pin high" unit, the governor still works (it drops to `auto` after the first idle period),
+but the unit is redundant.
 
 ## Docker
 
