@@ -1,7 +1,8 @@
 // [TAG_QSA_TOPK_ONEPASS] (plan 2.7.2 #2) the single-pass QSA indexer selection, knob off vs on, the ordered ids bit for bit,
 // on a GPU. One child per arm (GGML_VK_QSA_TOPK_ONEPASS is read once at device init):
 //   off:    GGML_VK_QSA_TOPK_ONEPASS=0                    (v2, the deployed kernel)
-//   on:     =1 with the default gates                     (what a deployment with the knob runs)
+//   on:     =1 with the default gates                     (what a deployment with the knob runs; backoff off in both on arms,
+//           so the path of every case is the gate's, not the history's)
 //   on_all: =1 + GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 + _MIN_CELLS=1 (every admissible shape on the onepass kernel)
 // Each child runs the same case list on synthetic score planes - the metadata form (the deployed path; nokeys when the
 // device has it) and the plane form (keyed), depths 2 051 .. 1 048 576 cells, 1 / 6 / 64 x 2 streams / 128 rows, k 2051 and
@@ -453,8 +454,8 @@ int main(int argc, char ** argv) {
     const auto cases = make_cases();
     const char * arms[3][2] = {
         { "off",    "GGML_VK_QSA_TOPK_ONEPASS=0" },
-        { "on",     "GGML_VK_QSA_TOPK_ONEPASS=1" },
-        { "on_all", "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_CELLS=1" },
+        { "on",     "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_ONEPASS_BACKOFF=0" },
+        { "on_all", "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_CELLS=1 GGML_VK_QSA_TOPK_ONEPASS_BACKOFF=0" },
     };
     std::vector<arm_view> v;
     for (const auto & arm : arms) {
