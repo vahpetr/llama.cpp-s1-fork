@@ -9158,7 +9158,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 }
                 return (uint32_t) v;
             };
-            const bool     op_req = ggml_vk_env_bool("GGML_VK_QSA_TOPK_ONEPASS", false);
+            // default ON on gfx1151 (Strix Halo: RADV names it STRIX_HALO / GFX1151), OFF elsewhere; an explicit 0/1 always wins
+            const char *   op_env = getenv("GGML_VK_QSA_TOPK_ONEPASS");
+            const bool     op_env_set = op_env != nullptr && *op_env != '\0';
+            const std::string op_dev = device->properties.deviceName.data();
+            const bool     op_gfx1151 = device->vendor_id == VK_VENDOR_ID_AMD &&
+                                        (op_dev.find("STRIX_HALO") != std::string::npos || op_dev.find("GFX1151") != std::string::npos ||
+                                         op_dev.find("gfx1151") != std::string::npos);
+            const bool     op_req = ggml_vk_env_bool("GGML_VK_QSA_TOPK_ONEPASS", op_gfx1151);
             const uint32_t op_lds = VK_QSA_TOPK_ONEPASS_CAP * 4 + 2048;
             const bool     op_lds_ok = device->properties.limits.maxComputeSharedMemorySize >= op_lds;
             device->qsa_topk_onepass     = op_req && device->qsa_topk_v2 && op_lds_ok;
@@ -9172,12 +9179,15 @@ static vk_device ggml_vk_get_device(size_t idx) {
 #else
             const char * op_negctl = "";
 #endif
-            const char * op_why = !op_req ? "GGML_VK_QSA_TOPK_ONEPASS unset/0" :
-                                  !device->qsa_topk_v2 ? "needs v2 for the fallback" :
-                                  !op_lds_ok ? "maxComputeSharedMemorySize too small" : "GGML_VK_QSA_TOPK_ONEPASS=1";
-            GGML_LOG_WARN("ggml_vulkan: %s qsa_topk: onepass %s (%s; sample <= %u cells, candidates <= %u per row, n_kv >= %u and "
+            const char * op_src = op_env_set ? (op_req ? "GGML_VK_QSA_TOPK_ONEPASS=1" : "GGML_VK_QSA_TOPK_ONEPASS=0")
+                                             : (op_gfx1151 ? "default on gfx1151; GGML_VK_QSA_TOPK_ONEPASS unset"
+                                                           : "default off: not gfx1151; GGML_VK_QSA_TOPK_ONEPASS unset");
+            const char * op_why = !op_req ? "" :
+                                  !device->qsa_topk_v2 ? "; needs v2 for the fallback" :
+                                  !op_lds_ok ? "; maxComputeSharedMemorySize too small" : "";
+            GGML_LOG_WARN("ggml_vulkan: %s qsa_topk: onepass %s (%s%s; sample <= %u cells, candidates <= %u per row, n_kv >= %u and "
                           "rows x n_kv >= %llu, k <= %u, cell form; v2 per row on c < k or overflow, fallback grid %u x %u, backoff %s)%s\n",
-                          device->name.c_str(), device->qsa_topk_onepass ? "on" : "off", op_why, VK_QSA_TOPK_ONEPASS_CAP,
+                          device->name.c_str(), device->qsa_topk_onepass ? "on" : "off", op_src, op_why, VK_QSA_TOPK_ONEPASS_CAP,
                           VK_QSA_TOPK_ONEPASS_CAP, device->qsa_topk_op_min_kv, (unsigned long long) device->qsa_topk_op_min_cells,
                           VK_QSA_TOPK_ONEPASS_CAP / 2, device->qsa_topk_op_fbx, device->qsa_topk_op_fby,
                           device->qsa_topk_op_backoff_on ? "on" : "off", op_negctl);

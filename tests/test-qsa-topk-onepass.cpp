@@ -1,6 +1,6 @@
 // [TAG_QSA_TOPK_ONEPASS] (plan 2.7.2 #2) the single-pass QSA indexer selection, knob off vs on, the ordered ids bit for bit,
 // on a GPU. One child per arm (GGML_VK_QSA_TOPK_ONEPASS is read once at device init):
-//   off:    GGML_VK_QSA_TOPK_ONEPASS=0                    (v2, the deployed kernel)
+//   off:    GGML_VK_QSA_TOPK_ONEPASS=0                    (v2; set explicitly: unset = the device default, ON on gfx1151)
 //   on:     =1 with the default gates                     (what a deployment with the knob runs; backoff off in both on arms,
 //           so the path of every case is the gate's, not the history's)
 //   on_all: =1 + GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 + _MIN_CELLS=1 (every admissible shape on the onepass kernel)
