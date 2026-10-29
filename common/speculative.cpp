@@ -1504,7 +1504,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
-// [TAG_B68_DRAFT_KNOBS] strict env readers for the v68 draft-side knobs (halogen H3): a plain decimal only; anything
+// [TAG_B68_DRAFT_KNOBS] strict env readers for the v68 draft-side knobs (halogen H1/H3/H5): a plain decimal only; anything
 //   else (or out of range) -> WARN and the knob stays off. read once per draft-mtp instance, a WARN proof line when set.
 static bool spec_env_flag(const char * name) {
     const char * s = getenv(name);
@@ -1517,6 +1517,22 @@ static bool spec_env_flag(const char * name) {
     }
     SPC_WRN("invalid %s='%s' (0 or 1) - stays off\n", name, s);
     return false;
+}
+
+static float spec_env_prob(const char * name) {
+    const char * s = getenv(name);
+    if (s == nullptr) {
+        return 0.0f;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const float v = (*s >= '0' && *s <= '9') ? strtof(s, &end) : -1.0f;
+    if (end != nullptr && end != s && *end == '\0' && errno == 0 && v >= 0.0f && v < 1.0f) {
+        SPC_WRN("%s=%g: on\n", name, (double) v);
+        return v;
+    }
+    SPC_WRN("invalid %s='%s' (a decimal in [0, 1)) - stays off\n", name, s);
+    return 0.0f;
 }
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
@@ -1554,7 +1570,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // [TAG_B68_DRAFT_KNOBS] all off by default (= v67). They only shorten a draft, never change a drafted token:
     //   H3 LLAMA_SPEC_DRAFT_STOP_EOG=1   the chain ends after a drafted end-of-generation token (the verifier never
     //                                    accepts a draft token after an EOG, [TAG_UP29638], so the tail was pure waste)
+    //   H1 LLAMA_SPEC_DRAFT_P_CHAIN=x    the chain ends when the product of the head's top-1 probabilities over the
+    //                                    positions drafted so far (incl. this one) drops below x (gates the chain, not
+    //                                    only each token as --spec-draft-p-min does)
     bool  stop_eog = false;
+    float p_chain  = 0.0f;
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1677,6 +1697,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         stop_eog = spec_env_flag("LLAMA_SPEC_DRAFT_STOP_EOG");
+        p_chain  = spec_env_prob("LLAMA_SPEC_DRAFT_P_CHAIN");
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1948,6 +1969,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // [TAG_B68_DRAFT_KNOBS] H3 the end-of-generation test
         const llama_vocab * vocab_dft = llama_model_get_vocab(llama_get_model(ctx_dft));
+        // [TAG_B68_DRAFT_KNOBS] H1 running product of the top-1 probabilities per sequence
+        std::vector<float> p_run(n_seq, 1.0f);
 
         int i = 0;
 
@@ -2009,6 +2032,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     n_drafting--;
 
                     continue;
+                }
+
+                // [TAG_B68_DRAFT_KNOBS] H1: gate the chain on its cumulative confidence (same stop as p_min: the token
+                //   at this position is not drafted)
+                if (p_chain > 0.0f) {
+                    p_run[seq_id] *= cur_p->data[0].p;
+                    if (p_run[seq_id] < p_chain) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
                 }
 
                 common_sampler_accept(smpl, id, true);
