@@ -2304,6 +2304,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * w_down,
                     ggml_tensor * w_up,
                     ggml_tensor * w_inject,
+                    ggml_tensor * w_down_inject, // [TAG_MERGE_ROWS] [w_down | w_inject] in one weight, can be null
                     ggml_tensor ** inject,
                             int   il);
 

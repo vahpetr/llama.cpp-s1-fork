@@ -35,7 +35,12 @@ void main() {
             continue;
         }
 
+#ifdef SCALE_NC
+        // [TAG_MERGE_ROWS] strided source (src0_idx), contiguous destination; the same value expression
+        const float y = float(FLOAT_TYPE(data_a[get_aoffset() + src0_idx(idx)]) * FLOAT_TYPE(p.param1) + FLOAT_TYPE(p.param2));
+#else
         const float y = float(FLOAT_TYPE(data_a[get_aoffset() + idx]) * FLOAT_TYPE(p.param1) + FLOAT_TYPE(p.param2));
+#endif
         data_d[get_doffset() + idx] = D_TYPE(op_silu(y));
         idx += num_threads;
     }

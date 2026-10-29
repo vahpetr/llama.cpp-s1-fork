@@ -971,6 +971,9 @@ void process_shaders() {
 
     string_to_spv("scale_f32", "scale.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     string_to_spv("scale_silu_f32", "scale_silu.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    // [TAG_MERGE_ROWS] strided-source twins (the contiguous variants above are unchanged)
+    string_to_spv("scale_nc_f32", "scale.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"SCALE_NC", "1"}});
+    string_to_spv("scale_silu_nc_f32", "scale_silu.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"SCALE_NC", "1"}});
 
     string_to_spv("pad_f32", "pad.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("pad_reflect_1d_f32", "pad_reflect_1d.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
@@ -1170,8 +1173,10 @@ void process_shaders() {
     string_to_spv("col2im_1d_bf16", "col2im_1d.comp", {{"DATA_A_BF16", "1"}, {"A_TYPE", "uint16_t"},  {"D_TYPE", "uint16_t"}});
 
     string_to_spv("hc_combine_f32", "hc_combine.comp", {});
+    string_to_spv("hc_combine_strided_f32", "hc_combine.comp", {{"HC_INJ_STRIDED", "1"}});   // [TAG_MERGE_ROWS]
 
     string_to_spv("add_softplus_mul_f32", "add_softplus_mul.comp", {});
+    string_to_spv("add_softplus_mul_strided_f32", "add_softplus_mul.comp", {{"ALPHA_STRIDED", "1"}});   // [TAG_MERGE_ROWS]
 
     string_to_spv("snake_f32",  "snake.comp", {{"DATA_A_F32", "1"},  {"A_TYPE", "float"},     {"D_TYPE", "float"}});
     string_to_spv("snake_f16",  "snake.comp", {{"DATA_A_F16", "1"},  {"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});

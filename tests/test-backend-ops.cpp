@@ -3521,6 +3521,39 @@ struct test_scale : public test_case {
     }
 };
 
+// [TAG_MERGE_ROWS] GGML_OP_SCALE (+ the SILU of build_hc_mix) over a row view of a wider tensor: the qwen4exp merged
+// projection output cut at row `offs` (strided at ne1 >= 2)
+struct test_scale_rows : public test_case {
+    const std::array<int64_t, 4> ne;   // the view
+    const int64_t ne0_full;
+    const int64_t offs;
+    const bool silu;
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, ne0_full, offs, silu);
+    }
+
+    test_scale_rows(std::array<int64_t, 4> ne = {320, 6, 1, 1}, int64_t ne0_full = 324, int64_t offs = 0, bool silu = false)
+        : ne(ne), ne0_full(ne0_full), offs(offs), silu(silu) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0_full, ne[1], ne[2], ne[3]);
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * v = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], offs*ggml_element_size(a));
+        ggml_set_name(v, "view");
+
+        ggml_tensor * out = ggml_scale(ctx, v, 0.25f);
+        if (silu) {
+            out = ggml_silu(ctx, out);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SCALE + GGML_UNARY_OP_TANH + GGML_OP_SCALE
 struct test_softcap : public test_case {
     const ggml_type type;
@@ -12044,6 +12077,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f));
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {100, 10, 10, 10}, 2.0f, 1.0f));
+    // [TAG_MERGE_ROWS] row views of the merged hc down | inject output: lo (offs 0) and inject (offs 320), nt 1..8 and wider
+    for (int64_t nt : {1, 2, 5, 6, 8, 9, 64}) {
+        for (bool silu : {false, true}) {
+            test_cases.emplace_back(new test_scale_rows({320, nt, 1, 1}, 324, 0,   silu));
+        }
+        test_cases.emplace_back(new test_scale_rows({4, nt, 1, 1}, 324, 320, false));
+        test_cases.emplace_back(new test_scale_rows({48, nt, 1, 1}, 96, 48, false));
+    }
+    test_cases.emplace_back(new test_scale_rows({16, 3, 2, 2}, 40, 7, true));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
 

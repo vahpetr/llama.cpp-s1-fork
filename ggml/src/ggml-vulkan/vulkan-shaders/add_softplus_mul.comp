@@ -38,6 +38,9 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout (push_constant) uniform parameter {
     uint32_t ne0;   // elements per row (num_v_heads)
     uint32_t ne;    // total elements = ne0 * nrows
+#ifdef ALPHA_STRIDED
+    uint32_t a_nb1; // [TAG_MERGE_ROWS] alpha's row stride in elements (a row view of the merged beta | alpha output)
+#endif
 } p;
 
 // UNARY(SOFTPLUS) exactly as unary.comp defines it
@@ -54,7 +57,11 @@ void main() {
 
     const uint32_t i0 = fastmod(idx, p.ne0);
 
+#ifdef ALPHA_STRIDED
+    const float biased = data_a[((idx - i0) / p.ne0) * p.a_nb1 + i0] + data_b[i0];   // ADD
+#else
     const float biased = data_a[idx] + data_b[i0];   // ADD
+#endif
     const float sp     = op_softplus(biased);        // UNARY(SOFTPLUS)
 
     data_d[idx] = sp * data_c[i0];                   // MUL
