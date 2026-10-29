@@ -1620,6 +1620,7 @@ struct vk_mat_mat_id_push_constants {
     uint32_t n_experts;
     uint32_t hoist_row_ids;
     uint32_t mmid_compact;
+    uint32_t mmid_scale;   // [TAG_MMID_SCALE_EPI] mul_mm.comp only (binding 5); mmq / coopmat2 never read it
 };
 struct vk_mat_vec_id_push_constants {
     uint32_t ncols;
@@ -6348,6 +6349,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     };
 
     const int mul_mat_id_param_count = 5;
+    // [TAG_MMID_SCALE_EPI] the mul_mm.comp mul_mat_id pipelines (coopmat1 and scalar) bind a 6th buffer: the routing weights of
+    // the fused MUL_MAT_ID + MUL (binding 5, aliased to D when unfused); mmq / coopmat2 keep 5
+    const int mul_mat_id_mm_param_count = 6;
+#define MM_PARAMS(PC, ID) (std::string_view(#ID) == "_id" ? mul_mat_id_mm_param_count : (PC))
 
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
     if (device->coopmat2) {
@@ -6472,27 +6477,27 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
         if (device->mul_mat ## ID ## _l[TYPE]) { \
             mm_tile_check(l_ ## WARPTILE, TYPE, std::string_view(#ID) == "_id", false, #NAMELC #F16ACC "_l"); \
-            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->l, cm1_name(std::string(#NAMELC #F16ACC "_l") + mm_tile(l_ ## WARPTILE).sfx), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true, mm_tile(l_ ## WARPTILE).req_sg); \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->l, cm1_name(std::string(#NAMELC #F16ACC "_l") + mm_tile(l_ ## WARPTILE).sfx), CM1_SPV(NAMELC ## F16ACC), "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true, mm_tile(l_ ## WARPTILE).req_sg); \
         } \
         if (device->mul_mat ## ID ## _m[TYPE]) { \
             mm_tile_check(m_ ## WARPTILE, TYPE, std::string_view(#ID) == "_id", false, #NAMELC #F16ACC "_m"); \
-            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->m, cm1_name(std::string(#NAMELC #F16ACC "_m") + mm_tile(m_ ## WARPTILE).sfx), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true, mm_tile(m_ ## WARPTILE).req_sg); \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->m, cm1_name(std::string(#NAMELC #F16ACC "_m") + mm_tile(m_ ## WARPTILE).sfx), CM1_SPV(NAMELC ## F16ACC), "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true, mm_tile(m_ ## WARPTILE).req_sg); \
         } \
         if (device->mul_mat ## ID ## _s[TYPE]) { \
             mm_tile_check(s_ ## WARPTILE, TYPE, std::string_view(#ID) == "_id", false, #NAMELC #F16ACC "_s"); \
-            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->s, cm1_name(std::string(#NAMELC #F16ACC "_s") + mm_tile(s_ ## WARPTILE).sfx), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true, mm_tile(s_ ## WARPTILE).req_sg); \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->s, cm1_name(std::string(#NAMELC #F16ACC "_s") + mm_tile(s_ ## WARPTILE).sfx), CM1_SPV(NAMELC ## F16ACC), "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true, mm_tile(s_ ## WARPTILE).req_sg); \
         } \
         if (device->mul_mat ## ID ## _l[TYPE]) { \
             mm_tile_check(l_ ## WARPTILE, TYPE, std::string_view(#ID) == "_id", true, #NAMELC #F16ACC "_aligned_l"); \
-            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_l, cm1_name(std::string(#NAMELC #F16ACC "_aligned_l") + mm_tile(l_ ## WARPTILE).sfx), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, mm_tile(l_ ## WARPTILE).req_sg); \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_l, cm1_name(std::string(#NAMELC #F16ACC "_aligned_l") + mm_tile(l_ ## WARPTILE).sfx), CM1_SPV(NAMELC ## F16ACC), "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, mm_tile(l_ ## WARPTILE).req_sg); \
         } \
         if (device->mul_mat ## ID ## _m[TYPE]) { \
             mm_tile_check(m_ ## WARPTILE, TYPE, std::string_view(#ID) == "_id", true, #NAMELC #F16ACC "_aligned_m"); \
-            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_m, cm1_name(std::string(#NAMELC #F16ACC "_aligned_m") + mm_tile(m_ ## WARPTILE).sfx), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true, mm_tile(m_ ## WARPTILE).req_sg); \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_m, cm1_name(std::string(#NAMELC #F16ACC "_aligned_m") + mm_tile(m_ ## WARPTILE).sfx), CM1_SPV(NAMELC ## F16ACC), "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true, mm_tile(m_ ## WARPTILE).req_sg); \
         } \
         if (device->mul_mat ## ID ## _s[TYPE]) { \
             mm_tile_check(s_ ## WARPTILE, TYPE, std::string_view(#ID) == "_id", true, #NAMELC #F16ACC "_aligned_s"); \
-            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_s, cm1_name(std::string(#NAMELC #F16ACC "_aligned_s") + mm_tile(s_ ## WARPTILE).sfx), CM1_SPV(NAMELC ## F16ACC), "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, mm_tile(s_ ## WARPTILE).req_sg); \
+            ggml_vk_create_pipeline2(device, device-> PIPELINE_NAME ->a_s, cm1_name(std::string(#NAMELC #F16ACC "_aligned_s") + mm_tile(s_ ## WARPTILE).sfx), CM1_SPV(NAMELC ## F16ACC), "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, mm_tile(s_ ## WARPTILE).req_sg); \
         } \
 
         // Create 2 variants, {f16,f32} accumulator
@@ -6714,32 +6719,32 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // Selects dot2 SPIR-V variant at runtime when device->dot2_f16 is true
 #define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _len : NAMELC ## F16ACC ## _len), (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _data : NAMELC ## F16ACC ## _data), "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _len : NAMELC ## F16ACC ## _len), (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _data : NAMELC ## F16ACC ## _data), "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _len : NAMELC ## F16ACC ## _len), (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _data : NAMELC ## F16ACC ## _data), "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _len : NAMELC ## F16ACC ## _len), (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _data : NAMELC ## F16ACC ## _data), "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _len : NAMELC ## F16ACC ## _len), (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _data : NAMELC ## F16ACC ## _data), "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _len : NAMELC ## F16ACC ## _len), (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _data : NAMELC ## F16ACC ## _data), "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _len : NAMELC ## F16ACC ## _len), (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _data : NAMELC ## F16ACC ## _data), "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _len : NAMELC ## F16ACC ## _len), (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _data : NAMELC ## F16ACC ## _data), "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _len : NAMELC ## F16ACC ## _len), (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _data : NAMELC ## F16ACC ## _data), "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _len : NAMELC ## F16ACC ## _len), (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _data : NAMELC ## F16ACC ## _data), "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _len : NAMELC ## F16ACC ## _len), (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _data : NAMELC ## F16ACC ## _data), "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _len : NAMELC ## F16ACC ## _len), (device->dot2_f16 ? NAMELC ## _dot2 ## F16ACC ## _data : NAMELC ## F16ACC ## _data), "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
 
         // bf16 scalar path promotes to f32, no dot2 variant
 #define CREATE_MM_NODOT2(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _len, NAMELC ## F16ACC ## _data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _len, NAMELC ## F16ACC ## _data, "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _len, NAMELC ## F16ACC ## _data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _len, NAMELC ## F16ACC ## _data, "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _len, NAMELC ## F16ACC ## _data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _len, NAMELC ## F16ACC ## _data, "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _len, NAMELC ## F16ACC ## _data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _len, NAMELC ## F16ACC ## _data, "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _len, NAMELC ## F16ACC ## _data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _len, NAMELC ## F16ACC ## _data, "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _len, NAMELC ## F16ACC ## _data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _len, NAMELC ## F16ACC ## _data, "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
 
 #define CREATE_MMQ(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
         if (device->mul_mat ## ID ## _l_int[TYPE]) { \
@@ -6914,17 +6919,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // Create 6 variants, {s,m,l}x{unaligned,aligned}
 #define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _fp32_len, NAMELC ## F16ACC ## _fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _fp32_len, NAMELC ## F16ACC ## _fp32_data, "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _fp32_len, NAMELC ## F16ACC ## _fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _fp32_len, NAMELC ## F16ACC ## _fp32_data, "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _fp32_len, NAMELC ## F16ACC ## _fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _fp32_len, NAMELC ## F16ACC ## _fp32_data, "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _fp32_len, NAMELC ## F16ACC ## _fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _fp32_len, NAMELC ## F16ACC ## _fp32_data, "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _fp32_len, NAMELC ## F16ACC ## _fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _fp32_len, NAMELC ## F16ACC ## _fp32_data, "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _fp32_len, NAMELC ## F16ACC ## _fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _fp32_len, NAMELC ## F16ACC ## _fp32_data, "main", MM_PARAMS(PARAMCOUNT, ID), sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
 
 #define CREATE_MMQ(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
         if (device->mul_mat ## ID ## _l_int[TYPE]) \
@@ -11544,14 +11549,18 @@ static void ggml_vk_matmul_id(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
-        uint32_t padded_n, bool hoist_row_ids, bool mmid_compact, uint32_t mmid_tile_bound) {
+        uint32_t padded_n, bool hoist_row_ids, bool mmid_compact, uint32_t mmid_tile_bound, const vk_subbuffer * scale = nullptr) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
                                               nei0, nei1, nbi1, ne11, padded_n, n_as, uint32_t(hoist_row_ids),
-                                              uint32_t(mmid_compact) };
+                                              uint32_t(mmid_compact), uint32_t(scale != nullptr) };
+    // [TAG_MMID_SCALE_EPI] the mul_mm.comp pipelines take a 6th buffer (the fused MUL's weights; D when unfused)
+    GGML_ASSERT(scale == nullptr || pipeline->parameter_count == 6);
+    const bool six = pipeline->parameter_count == 6;
+    const vk_subbuffer & w = scale ? *scale : d;
 
     // The default grid is one (M-tile, N-tile) pair per expert: { m, nei1, n_as } becomes
     // { ceil(m/BM), ceil(nei1/BN), n_as } workgroups.  Only ceil(count_e / BN) of an expert's
@@ -11580,14 +11589,23 @@ static void ggml_vk_matmul_id(
         // The workgroup counts moved from { m/BM, 1, bound } (v62) to { m/BM, bound, 1 }, so the [vk-fusion-count] sig of
         // every graph with a MUL_MAT_ID changes by design: re-baseline a check that compares it with v62 (numerics unchanged,
         // each workgroup still derives only (expert, ic, ir)).
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc,
-                                  { m, tiles_y * pipeline->wg_denoms[1], tiles_z });
+        if (six) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, w }, pc,
+                                      { m, tiles_y * pipeline->wg_denoms[1], tiles_z });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc,
+                                      { m, tiles_y * pipeline->wg_denoms[1], tiles_z });
+        }
     } else {
         // The 3-D grid (GGML_VK_MMID_COMPACT=0, hoisting off, or past the compact limits) covers ceil(nei1 / BN) tiles per
         // expert: with duplicate expert ids in a token's row an expert can hold more than nei1 rows and the rest are silently
         // lost (the v62 behaviour; real top-k routing never repeats an id). GGML_VK_MMID_COMPACT=0 is not valid for a router
         // that repeats ids.
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
+        if (six) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, w }, pc, { m, nei1, n_as });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
+        }
     }
 }
 
@@ -13289,7 +13307,52 @@ static void ggml_vk_expert_occ_drain(ggml_backend_vk_context * ctx) {
     ctx->expert_occ_pending.clear();
 }
 
-static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+// [TAG_MMID_SCALE_EPI] GGML_VK_MMID_SCALE_EPILOGUE (default on, =0 off): MUL_MAT_ID + MUL on the GEMM (prefill) path, the routing
+// weight applied in the mul_mm.comp tile store (port of Nathanw1014 30d8bb02b / 3b8d43efa). EXACT: the unfused pair stores the
+// f32 float(acc) and the MUL rounds float(acc) * w once; the epilogue computes the same single f32 multiply. Read once (static).
+static bool ggml_vk_mmid_scale_epi_knob() {
+    static const bool on = ggml_vk_env_bool("GGML_VK_MMID_SCALE_EPILOGUE", true);
+    return on;
+}
+
+// [TAG_MMID_SCALE_EPI] the MUL_MAT_ID GEMM path takes the q8_1 (mmq) pipelines - which have no scale epilogue - exactly when this holds:
+// the quantize_y decision of ggml_vk_mul_mat_id_q_f16 (non-coopmat2 terms; the fusion is refused on coopmat2)
+static bool ggml_vk_mmid_gemm_uses_q8_1(const ggml_backend_vk_context * ctx, const ggml_tensor * mmid) {
+    const ggml_tensor * src0 = mmid->src[0];
+    const ggml_tensor * src1 = mmid->src[1];
+    const ggml_tensor * ids  = mmid->src[2];
+    const bool y_non_contig = (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) || !ggml_vk_dim01_contiguous(src1);
+    bool q = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig &&
+             (src1->ne[1] * src1->ne[0]) % 4 == 0;
+    if (q && ctx->device->mmq_cm1 &&
+        !ggml_vk_mmq_int8_allowed(ctx->device->mmq_int8_ops, ctx->device->mmq_int8_min_n, GGML_VK_MMQ_INT8_OP_MUL_MAT_ID, ids->ne[1])) {
+        q = false;
+    }
+    return q && ggml_vk_get_mul_mat_mat_id_pipeline(const_cast<ggml_backend_vk_context *>(ctx), src0->type, GGML_TYPE_Q8_1,
+                                                    (ggml_prec) mmid->op_params[0]) != nullptr;
+}
+
+// [TAG_MMID_SCALE_EPI] why MUL_MAT_ID + MUL is not fused on the GEMM path (nullptr = fusable): the weights must be f32 [1, n_used,
+// n_tokens] contiguous and aligned (indexed token * nei0 + slot), the MUL's output the MUL_MAT_ID's layout
+static const char * ggml_vk_mmid_mul_gemm_nofuse(const ggml_backend_vk_context * ctx, const ggml_tensor * mmid, const ggml_tensor * mul) {
+    const ggml_tensor * scale = mul->src[1];
+    if (!ggml_vk_mmid_scale_epi_knob()) { return "gemm_knob_off"; }
+    if (ctx->device->coopmat2)          { return "gemm_cm2"; }
+    if (scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || mmid->type != GGML_TYPE_F32) { return "gemm_type"; }
+    if (!ggml_is_contiguous(scale) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(mmid)) { return "gemm_noncontig"; }
+    if (get_misalign_bytes(ctx, scale) != 0) { return "gemm_misalign"; }
+    if (scale->ne[0] != 1 || scale->ne[1] != mmid->ne[1] || scale->ne[2] != mmid->ne[2] || scale->ne[3] != 1 || mmid->ne[3] != 1 ||
+        mmid->src[2]->ne[0] != mmid->ne[1] || mmid->src[2]->ne[1] != mmid->ne[2]) {
+        return "gemm_scale_shape";
+    }
+    if (ggml_vk_mmid_gemm_uses_q8_1(ctx, mmid)) { return "gemm_q8_1"; }
+    return nullptr;
+}
+
+// scale / out ([TAG_MMID_SCALE_EPI], fused MUL_MAT_ID + MUL): scale = the MUL's per-(slot, token) weights, out = the MUL node (D is
+// written there); dst stays the MUL_MAT_ID node (shapes, prec)
+static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+                                     const ggml_tensor * scale = nullptr, ggml_tensor * out = nullptr) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -13343,7 +13406,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     static const bool enable_mmid_compact = ggml_vk_env_bool("GGML_VK_MMID_COMPACT", true);
     bool mmid_compact = enable_mmid_compact && hoist_row_ids;
 
-    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    ggml_tensor * dout = out ? out : dst;   // [TAG_MMID_SCALE_EPI]
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dout->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
     ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
     ggml_backend_vk_buffer_context * ids_buf_ctx = (ggml_backend_vk_buffer_context *)ids->buffer->context;
@@ -13582,7 +13646,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
-    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
+    const uint64_t d_buf_offset = vk_tensor_offset(dout) + dout->view_offs;
     GGML_ASSERT(d_D != nullptr);
     vk_buffer d_X;
     uint64_t x_buf_offset = 0;
@@ -13730,6 +13794,14 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ggml_vk_dispatch_log(ctx, "mm_id", src0, src1, dst, ne01, nei1, ne10, 1, (int64_t) n_as, (int64_t) nei0, pipeline, 1, false, quantize_y);
     }
 
+    // [TAG_MMID_SCALE_EPI] the fused MUL's weights (binding 5 of the mul_mm.comp pipelines); ggml_vk_can_fuse admits the fusion
+    // only where this path runs mul_mm.comp (no q8_1, no coopmat2)
+    vk_subbuffer scale_buf {};
+    if (scale != nullptr) {
+        GGML_ASSERT(!quantize_y && !ctx->device->coopmat2 && pipeline->parameter_count == 6);
+        scale_buf = ggml_vk_tensor_subbuffer(ctx, scale);
+    }
+
     // compute
     ggml_vk_matmul_id(
         ctx, subctx, pipeline,
@@ -13738,7 +13810,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ne01, ne21, ne10, ne10, stride_b_y, ne01,
         stride_batch_x, stride_batch_y, ne20*ne21,
         n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, padded_n, hoist_row_ids, mmid_compact,
-        mmid_tile_bound
+        mmid_tile_bound, scale ? &scale_buf : nullptr
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
@@ -14009,6 +14081,10 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
     VK_LOG_DEBUG("ggml_vk_mul_mat_id(" << src0 << ", " << src1 << ", " << src2 << ", " << dst << ")");
     if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx);
+    } else if (ctx->num_additional_fused_ops == 1 && cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL) {
+        // [TAG_MMID_SCALE_EPI] MUL_MAT_ID + MUL on the GEMM path: the routing weights are applied in the tile store
+        ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+        ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, mul->src[1], mul);
     } else {
         ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst);
     }
@@ -21493,9 +21569,9 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
         if (mmid != mul->src[0]) {
             return false;
         }
-        // mat-vec only
+        // [TAG_MMID_SCALE_EPI] the GEMM path: the mul_mm.comp tile-store epilogue
         if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
-            return false;
+            return ggml_are_same_shape(mul, mmid) && ggml_vk_mmid_mul_gemm_nofuse(ctx, mmid, mul) == nullptr;
         }
         // shaders assume the types match
         if (mmid->type != scale->type) {
@@ -21620,7 +21696,8 @@ static const char * ggml_vk_mmid_mul_nofuse_reason(const ggml_backend_vk_context
         return "mmid_is_src1";
     }
     if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
-        return "not_matvec";
+        // [TAG_MMID_SCALE_EPI] the GEMM path has its own conditions
+        return ggml_vk_mmid_mul_gemm_nofuse(ctx, mmid, mul);
     }
     const ggml_tensor * scale = mul->src[1];
     if (mmid->type != scale->type) {
