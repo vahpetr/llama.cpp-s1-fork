@@ -1504,6 +1504,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// [TAG_B68_DRAFT_KNOBS] strict env readers for the v68 draft-side knobs (halogen H3): a plain decimal only; anything
+//   else (or out of range) -> WARN and the knob stays off. read once per draft-mtp instance, a WARN proof line when set.
+static bool spec_env_flag(const char * name) {
+    const char * s = getenv(name);
+    if (s == nullptr) {
+        return false;
+    }
+    if ((s[0] == '0' || s[0] == '1') && s[1] == '\0') {
+        SPC_WRN("%s=%c: %s\n", name, s[0], s[0] == '1' ? "on" : "off");
+        return s[0] == '1';
+    }
+    SPC_WRN("invalid %s='%s' (0 or 1) - stays off\n", name, s);
+    return false;
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -1535,6 +1550,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // starts (upstream #28333, opt-in); 0 / unset = the fork's old behaviour (the previous request's last row). Default
     // off since the up1 gate 2026-09-30: with it on, drafted census rows oracle_unresolved 10 -> 12 vs v35 (R46)
     bool carrier_zero = false;
+
+    // [TAG_B68_DRAFT_KNOBS] all off by default (= v67). They only shorten a draft, never change a drafted token:
+    //   H3 LLAMA_SPEC_DRAFT_STOP_EOG=1   the chain ends after a drafted end-of-generation token (the verifier never
+    //                                    accepts a draft token after an EOG, [TAG_UP29638], so the tail was pure waste)
+    bool  stop_eog = false;
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1655,6 +1675,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
         }
+
+        stop_eog = spec_env_flag("LLAMA_SPEC_DRAFT_STOP_EOG");
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1924,6 +1946,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // [TAG_B68_DRAFT_KNOBS] H3 the end-of-generation test
+        const llama_vocab * vocab_dft = llama_model_get_vocab(llama_get_model(ctx_dft));
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -1998,7 +2023,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // dp.n_max is the caller's per-sequence cap (context space left, adaptive draft length, ...)
                 if ((params.n_max <= (int) result.size()) ||
-                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
+                    (dp.n_max > 0 && dp.n_max <= (int) result.size()) ||
+                    (stop_eog && llama_vocab_is_eog(vocab_dft, id))) { // [TAG_B68_DRAFT_KNOBS] H3: the EOG is kept
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
