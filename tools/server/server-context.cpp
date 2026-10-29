@@ -6032,6 +6032,12 @@ private:
                             if (dpr.result_q == nullptr && server_spec_n_max_greedy() > 0) {
                                 dpr.n_max = std::min(dpr.n_max > 0 ? dpr.n_max : n_draft_max, server_spec_n_max_greedy());
                             }
+                            // [TAG_B68_DRAFT_KNOBS] H2 judges the round against the depth the drafter was really allowed
+                            //   (after the greedy cap): recorded before the cap, a capped T = 0 round never reached the
+                            //   requested depth, so the auto depth could only ratchet down
+                            if (slot.spec_depth_req > 0) {
+                                slot.spec_depth_req = dpr.n_max;
+                            }
                         }
                         // [TAG_SPEC_DRAFT_POLICY] a tput cooldown probe is kept as drafted (false on every other path)
                         common_speculative_get_draft_params(spec.get(), slot.id).keep_short = n_tput > 0 && slot.spec_tput_probe;
@@ -7451,12 +7457,18 @@ private:
                     const size_t n_fresh_acc    = n_matched > n_committed_in
                                                 ? std::min(n_matched - n_committed_in, n_fresh_draft) : 0;
                     if (n_fresh_draft > 0) {
+                        const int depth_prev = slot.spec_depth_cur;
                         if (n_fresh_acc == n_fresh_draft) {
                             if ((int) n_fresh_draft >= slot.spec_depth_req) {
-                                slot.spec_depth_cur = slot.spec_depth_req + 1; // clamped to n-max at the next round
+                                // clamped to n-max at the next round; a greedy-capped req never lowers the depth
+                                slot.spec_depth_cur = std::max(slot.spec_depth_cur, slot.spec_depth_req) + 1;
                             }
                         } else {
                             slot.spec_depth_cur = std::max(server_spec_depth_min(), slot.spec_depth_req - 1);
+                        }
+                        if (trace > 0 && slot.spec_depth_cur != depth_prev) {
+                            SLT_INF(slot, "auto draft depth: %d -> %d (allowed %d, fresh accepted %zu/%zu)\n",
+                                    depth_prev, slot.spec_depth_cur, slot.spec_depth_req, n_fresh_acc, n_fresh_draft);
                         }
                     }
                     slot.spec_depth_req = 0;
