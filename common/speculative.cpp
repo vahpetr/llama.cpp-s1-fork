@@ -1573,9 +1573,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     //   H1 LLAMA_SPEC_DRAFT_P_CHAIN=x    the chain ends when the product of the head's top-1 probabilities over the
     //                                    positions drafted so far (incl. this one) drops below x (gates the chain, not
     //                                    only each token as --spec-draft-p-min does)
-    //   H5 LLAMA_SPEC_DRAFT_Q_STOP=x     sampled (U7 rejection) rounds only: a draw whose draft probability q(x) < x is
-    //                                    dropped and ends the chain (the target samples that position itself, so the
-    //                                    rejection sampler stays distribution-exact)
+    //   H5 LLAMA_SPEC_DRAFT_Q_STOP=x     sampled (U7 rejection) rounds only: the chain ends at a position whose top-1
+    //                                    draft probability is < x, decided before / independent of the draw (the
+    //                                    target samples that position itself; rejection sampling stays exact)
     bool  stop_eog = false;
     float p_chain  = 0.0f;
     float q_stop   = 0.0f;
@@ -2050,20 +2050,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
                 }
 
-                // [TAG_B68_DRAFT_KNOBS] H5: a sampled round drops an unlikely draw and ends the chain
-                if (q_stop > 0.0f && dp.result_q) {
-                    float q_id = 0.0f;
-                    for (size_t k = 0; k < cur_p->size; ++k) {
-                        if (cur_p->data[k].id == id) {
-                            q_id = cur_p->data[k].p;
-                            break;
-                        }
-                    }
-                    if (q_id < q_stop) {
-                        drafting[seq_id] = false;
-                        n_drafting--;
-                        continue;
-                    }
+                // [TAG_B68_DRAFT_KNOBS] H5: a sampled round ends the chain when the head's top-1 probability at this
+                //   position is below x. The stop is decided from the distribution alone, not from the realised draw
+                //   (a stop on q(draw) < x kept draws from q restricted to q >= x but verified them against the full q,
+                //   which biased the output), so every kept position proposes the full q: distribution-exact
+                if (q_stop > 0.0f && dp.result_q && cur_p->data[0].p < q_stop) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    continue;
                 }
 
                 common_sampler_accept(smpl, id, true);
