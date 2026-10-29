@@ -6162,10 +6162,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif
             }
 
-            // [TAG_CM1_MANUAL_FRAG] until a pipeline is compiled, every walk renames it: the registration walk runs before the
-            // layout probe, so the cm1 mul_mm names ("_cml" or not) follow device->coopmat_rdna3_layout from the walk after it on
-            // (ggml_vk_get_device re-walks right after the probe; the compiling walk also takes the SPIR-V, CM1_SPV)
-            if (!pipeline->compiled && !pipeline->compile_pending) {
+            // [TAG_CM1_MANUAL_FRAG] the registration walk runs before the layout probe, so a cm1 mul_mm pipeline registered under
+            // its "_cml" name takes the manual-build name in the one re-walk ggml_vk_get_device makes right after a passing probe
+            // (single-threaded device init, before any context exists; the compiling walk also takes the SPIR-V, CM1_SPV). The
+            // name is written only when it differs: after init every walk finds it equal, so the lazy walks other context threads
+            // run (ggml_pipeline_request_descriptor_sets, without device->mutex) never write a std::string another thread reads.
+            if (!pipeline->compiled && !pipeline->compile_pending && pipeline->name != name) {
                 pipeline->name = name;
             }
 
