@@ -1236,6 +1236,9 @@ struct server_slot {
         if (n_draft_total > 0) {
             const float  draft_ratio  = (float) n_draft_accepted / n_draft_total;
             const double mean_acc_len = n_draft_verif_steps > 0 ? 1.0 + (double) n_draft_accepted / (double) n_draft_verif_steps : 1.0;
+            if (stats.n_draft_post_eog > 0) {
+                SLT_INF(*this, "draft tokens after a drafted EOG = %" PRIu64 " (never acceptable; LLAMA_SPEC_DRAFT_STOP_EOG=1 ends the chain there)\n", stats.n_draft_post_eog);
+            }
             if (stats.n_replay_mismatch > 0) {
                 SLT_INF(*this, "replay mismatches = %" PRIu64 " (committed tokens kept; would have livelocked before)\n", stats.n_replay_mismatch);
             }
@@ -6018,6 +6021,13 @@ private:
             auto & ckpt  = slot.spec_ckpt;
 
             slot.stats.n_draft_tokens += draft.size();
+            // [TAG_B68_DRAFT_KNOBS] H3 measurement: tokens drafted after a drafted EOG (the verifier never takes them)
+            for (size_t k = 0; k + 1 < draft.size(); ++k) {
+                if (llama_vocab_is_eog(vocab, draft[k])) {
+                    slot.stats.n_draft_post_eog += draft.size() - 1 - k;
+                    break;
+                }
+            }
 
             if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
                 // [TAG_SPEC_DRAFT_POLICY] what the drafter attempted (a drafter that does not report it: the request)

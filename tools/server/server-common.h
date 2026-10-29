@@ -370,6 +370,7 @@ struct server_slot_stats {
     uint64_t n_draft_tokens      = 0;
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
+    uint64_t n_draft_post_eog    = 0; // [TAG_B68_DRAFT_KNOBS] draft tokens proposed after a drafted EOG (never acceptable)
     uint64_t n_replay_mismatch  = 0; // committed tokens the replay after a checkpoint restore re-sampled differently (kept anyway)
 
     // speculative round kinds: every generation decode of a slot is exactly one of these (counted where the batch is built)
