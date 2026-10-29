@@ -13380,8 +13380,9 @@ static const char * ggml_vk_mmid_mul_gemm_nofuse(const ggml_backend_vk_context *
 }
 
 // scale / out ([TAG_MMID_SCALE_EPI], fused MUL_MAT_ID + MUL): scale = the MUL's per-(slot, token) weights, out = the MUL node (D is
-// written there); dst stays the MUL_MAT_ID node (shapes, prec)
-static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+// written there); dst stays the MUL_MAT_ID node (shapes, prec). Returns false when a scale was passed but the chosen pipeline cannot
+// apply it: D was then written to dst unscaled and the caller dispatches the MUL itself.
+static bool ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
                                      const ggml_tensor * scale = nullptr, ggml_tensor * out = nullptr) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -13436,8 +13437,6 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     static const bool enable_mmid_compact = ggml_vk_env_bool("GGML_VK_MMID_COMPACT", true);
     bool mmid_compact = enable_mmid_compact && hoist_row_ids;
 
-    ggml_tensor * dout = out ? out : dst;   // [TAG_MMID_SCALE_EPI]
-    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dout->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
     ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
     ggml_backend_vk_buffer_context * ids_buf_ctx = (ggml_backend_vk_buffer_context *)ids->buffer->context;
@@ -13548,6 +13547,25 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
+
+    // [TAG_MMID_SCALE_EPI] ggml_vk_can_fuse admitted the fusion on ggml_vk_mmid_gemm_uses_q8_1, a mirror of the pipeline choice
+    // above. Should the two ever disagree (q8_1, coopmat2, a pipeline without binding 5), the unfused GEMM writes dst and the
+    // caller runs the MUL (one WARN per process) instead of an assert. GGML_VK_MMID_SCALE_EPI_TEST_FALLBACK=1 (test hook, default
+    // unset) takes this path for every fused pair (tests/test-mmid-scale-epi).
+    static const bool scale_test_fallback = ggml_vk_env_bool("GGML_VK_MMID_SCALE_EPI_TEST_FALLBACK", false);
+    const bool scale_requested = scale != nullptr;
+    if (scale != nullptr && (scale_test_fallback || quantize_y || ctx->device->coopmat2 || pipeline->parameter_count != 6)) {
+        static std::atomic<bool> warned { false };
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("ggml_vulkan: mmid_scale_epi: fallback, MUL_MAT_ID + MUL as the unfused GEMM + MUL (%s; pipeline %s)\n",
+                          scale_test_fallback ? "test hook GGML_VK_MMID_SCALE_EPI_TEST_FALLBACK" : "the GEMM pipeline has no scale epilogue",
+                          pipeline->name.c_str());
+        }
+        scale = nullptr;
+        out = nullptr;
+    }
+    ggml_tensor * dout = out ? out : dst;   // [TAG_MMID_SCALE_EPI]
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dout->buffer->context;
 
     // [TAG_MMID_COMPACT] The compact grid runs one workgroup per (expert, N-tile) pair that holds
     // rows (count_experts.comp lists them, see its layout comment), so its extent is a bound on
@@ -13824,11 +13842,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ggml_vk_dispatch_log(ctx, "mm_id", src0, src1, dst, ne01, nei1, ne10, 1, (int64_t) n_as, (int64_t) nei0, pipeline, 1, false, quantize_y);
     }
 
-    // [TAG_MMID_SCALE_EPI] the fused MUL's weights (binding 5 of the mul_mm.comp pipelines); ggml_vk_can_fuse admits the fusion
-    // only where this path runs mul_mm.comp (no q8_1, no coopmat2)
+    // [TAG_MMID_SCALE_EPI] the fused MUL's weights (binding 5 of the mul_mm.comp pipelines; checked against the pipeline above)
     vk_subbuffer scale_buf {};
     if (scale != nullptr) {
-        GGML_ASSERT(!quantize_y && !ctx->device->coopmat2 && pipeline->parameter_count == 6);
         scale_buf = ggml_vk_tensor_subbuffer(ctx, scale);
     }
 
@@ -13850,6 +13866,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ctx->prealloc_y_need_sync = true;
     }
     ctx->prealloc_split_k_need_sync = true;
+    return scale != nullptr || !scale_requested;
 }
 
 static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -14103,6 +14120,8 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
     return ggml_vk_use_mul_mat_vec_id(cgraph->nodes[node_idx]);
 }
 
+static void ggml_vk_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -14114,7 +14133,11 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
     } else if (ctx->num_additional_fused_ops == 1 && cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL) {
         // [TAG_MMID_SCALE_EPI] MUL_MAT_ID + MUL on the GEMM path: the routing weights are applied in the tile store
         ggml_tensor * mul = cgraph->nodes[node_idx + 1];
-        ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, mul->src[1], mul);
+        if (!ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, mul->src[1], mul)) {
+            // the GEMM pipeline took no scale (see ggml_vk_mul_mat_id_q_f16): dst holds the unscaled product, run the MUL
+            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_mul(ctx, subctx, mul->src[0], mul->src[1], mul);
+        }
     } else {
         ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst);
     }

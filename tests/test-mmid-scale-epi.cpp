@@ -6,7 +6,10 @@
 // and z[i] must equal the f32 product y[i] * w[slot, token] computed on the host (IEEE single rounding, the separate MUL's op),
 // bit for bit, for every element. The FNV-1a of z is printed per case, so the knob-off arm (GGML_VK_MMID_SCALE_EPILOGUE=0: the
 // separate MUL dispatch) can be compared byte for byte with the default arm; run with GGML_VK_FUSION_COUNT=1 to see that the
-// default arm fused (mul_mat_id_mul=1 lines). Shapes: the production expert GEMMs (gate/up 640 x 2560 q4_K / q6_K / iq3_s, down
+// default arm fused (mul_mat_id_mul=1 lines). Fallback arm (GGML_VK_MMID_SCALE_EPI_TEST_FALLBACK=1, a test hook): the pair is still
+// fused at graph level but the GEMM dispatcher refuses the scale, as it would should its pipeline choice disagree with the
+// ggml_vk_can_fuse mirror (ggml_vk_mmid_gemm_uses_q8_1) - it must run the unfused GEMM + MUL (one "mmid_scale_epi: fallback" WARN),
+// never assert, and print the default arm's hashes. Shapes: the production expert GEMMs (gate/up 640 x 2560 q4_K / q6_K / iq3_s, down
 // 2560 x 640 q5_0 / q8_0; top-10, broadcast B for gate/up; 32 experts, not 512, to bound host RAM) at n = 65 / 512 / 2048 and the
 // f32 / f16 A paths.
 // Not a ctest: needs a Vulkan device (SKIP otherwise).
