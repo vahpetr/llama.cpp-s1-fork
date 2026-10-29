@@ -263,7 +263,7 @@ static int server_env_int(const char * name, int lo, int hi) {
 }
 
 // H2 LLAMA_SPEC_DRAFT_DEPTH_AUTO=d0: per-slot draft depth from the acceptance history, starting at d0: +1 after a round
-//   whose full-depth draft was accepted whole, -1 (floor LLAMA_SPEC_DRAFT_DEPTH_MIN, default 2) after a rejection;
+//   whose full-depth draft was accepted whole, -1 (floor LLAMA_SPEC_DRAFT_DEPTH_MIN, default 2, and --spec-draft-n-min) after a rejection;
 //   bounded by --spec-draft-n-max; restarts at d0 with every request. H5 LLAMA_SPEC_DRAFT_N_MAX_GREEDY=n: rounds verified
 //   by sample-and-match (T = 0, or no U7 candidates) draft at most n tokens, so --spec-draft-n-max can be raised for the
 //   sampled (U7) rounds alone.
@@ -6007,7 +6007,10 @@ private:
                             if (slot.spec_depth_cur <= 0) {
                                 slot.spec_depth_cur = server_spec_depth_auto();
                             }
-                            slot.spec_depth_cur = std::max(1, std::min(slot.spec_depth_cur, n_cfg));
+                            // floor at --spec-draft-n-min: the drafter throws away a draft shorter than n_min, so a
+                            // lower auto depth would silently turn speculation off instead of cheapening it
+                            const int n_floor = std::max(1, std::min(params_base.speculative.draft.n_min, n_cfg));
+                            slot.spec_depth_cur = std::max(n_floor, std::min(slot.spec_depth_cur, n_cfg));
                             n_draft_req         = std::min(n_draft_req, slot.spec_depth_cur);
                             slot.spec_depth_req = n_draft_req;
                         }
