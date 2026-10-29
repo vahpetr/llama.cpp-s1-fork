@@ -1504,7 +1504,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
-// [TAG_B68_DRAFT_KNOBS] strict env readers for the v68 draft-side knobs (halogen H1/H3/H5): a plain decimal only; anything
+// [TAG_B68_DRAFT_KNOBS] strict env readers for the v68 draft-side knobs (halogen H1/H3/H5b): a plain decimal only; anything
 //   else (or out of range) -> WARN and the knob stays off. read once per draft-mtp instance, a WARN proof line when set.
 static bool spec_env_flag(const char * name) {
     const char * s = getenv(name);
@@ -1585,7 +1585,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     //   H1 LLAMA_SPEC_DRAFT_P_CHAIN=x    the chain ends when the product of the head's top-1 probabilities over the
     //                                    positions drafted so far (incl. this one) drops below x (gates the chain, not
     //                                    only each token as --spec-draft-p-min does)
-    //   H5 LLAMA_SPEC_DRAFT_Q_STOP=x     sampled (U7 rejection) rounds only: the chain ends at a position whose top-1
+    //   H5b LLAMA_SPEC_DRAFT_Q_STOP=x    sampled (U7 rejection) rounds only: the chain ends at a position whose top-1
     //                                    draft probability is < x, decided before / independent of the draw (the
     //                                    target samples that position itself; rejection sampling stays exact)
     bool  stop_eog = false;
@@ -2062,7 +2062,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
                 }
 
-                // [TAG_B68_DRAFT_KNOBS] H5: a sampled round ends the chain when the head's top-1 probability at this
+                // [TAG_B68_DRAFT_KNOBS] H5b: a sampled round ends the chain when the head's top-1 probability at this
                 //   position is below x. The stop is decided from the distribution alone, not from the realised draw
                 //   (a stop on q(draw) < x kept draws from q restricted to q >= x but verified them against the full q,
                 //   which biased the output), so every kept position proposes the full q: distribution-exact

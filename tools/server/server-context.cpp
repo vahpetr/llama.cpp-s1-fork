@@ -264,7 +264,7 @@ static int server_env_int(const char * name, int lo, int hi) {
 
 // H2 LLAMA_SPEC_DRAFT_DEPTH_AUTO=d0: per-slot draft depth from the acceptance history, starting at d0: +1 after a round
 //   whose full-depth draft was accepted whole, -1 (floor LLAMA_SPEC_DRAFT_DEPTH_MIN, default 2, and --spec-draft-n-min) after a rejection;
-//   bounded by --spec-draft-n-max; restarts at d0 with every request. H5 LLAMA_SPEC_DRAFT_N_MAX_GREEDY=n: rounds verified
+//   bounded by --spec-draft-n-max; restarts at d0 with every request. H5a LLAMA_SPEC_DRAFT_N_MAX_GREEDY=n: rounds verified
 //   by sample-and-match (T = 0, or no U7 candidates) draft at most n tokens, so --spec-draft-n-max can be raised for the
 //   sampled (U7) rounds alone.
 static int server_spec_depth_auto() {
@@ -6031,7 +6031,7 @@ private:
                                            &slot.spec_draft_q : nullptr;
                             dpr.temp     = slot.task->params.sampling.temp;
                             dpr.seed     = slot.task->params.sampling.seed;
-                            // [TAG_B68_DRAFT_KNOBS] H5 a round verified by sample-and-match keeps the greedy depth
+                            // [TAG_B68_DRAFT_KNOBS] H5a a round verified by sample-and-match keeps the greedy depth
                             if (dpr.result_q == nullptr && server_spec_n_max_greedy() > 0) {
                                 dpr.n_max = std::min(dpr.n_max > 0 ? dpr.n_max : n_draft_max, server_spec_n_max_greedy());
                             }
