@@ -34,6 +34,35 @@ layout (binding = 6) readonly buffer R_I {uvec2 rope_data_i[];}; // indices for 
 
 layout (constant_id = 1) const bool do_multiply = false;
 
+#if RMS_NORM_EXT
+// [TAG_RMS_NORM_EXT] fused tails of RMS_NORM (+ MUL), compiled as a separate SPIR-V (rms_norm_ext_f32) so the
+// rms_norm_f32 / rms_norm_mul_f32 / rms_norm_mul_rope_* binaries are byte-unchanged. The reduction and the
+// normalised product are the same source lines as those pipelines; only the store differs.
+//   do_post_scale (RMS_NORM + SCALE, the GDN q/k l2 norm): the normalised value is rounded to f32 as the
+//     RMS_NORM store did, then scale.comp's expression y * param1 + param2 runs on it, with the SCALE's factor
+//     in p.param2 and its bias (bits) in p.param3 (the matcher requires bias == 0, so a contraction of the
+//     multiply-add into an FMA cannot change a bit; the add is kept so a -0 product still becomes +0 as in
+//     scale.comp).
+//   do_multiply2 (RMS_NORM + MUL + MUL, the GDN gated output norm): the RMS_NORM_MUL product is rounded to f32
+//     as its store did, then multiplied by the second operand (binding 3), as mul.comp does. mul2_sigmoid:
+//     binding 3 holds the SIGMOID's *input* and op_sigmoid (unary.comp, character for character, as in
+//     mul.comp MUL_SIGMOID_B) is applied on the load: RMS_NORM + MUL + SIGMOID + MUL in one dispatch. The
+//     destination is contiguous (the matcher requires it; d_offset is computed from ne below), so the dst
+//     stride slots p.nb21..nb23 carry the second operand's row / channel / sample strides (elements).
+layout (constant_id = 2) const bool do_post_scale = false;
+layout (constant_id = 3) const bool do_multiply2 = false;
+layout (constant_id = 4) const bool mul2_sigmoid = false;
+layout (binding = 3) readonly buffer C {float data_c[];};
+
+float load_c(uint idx) {
+    const float x = data_c[idx];
+    if (mul2_sigmoid) {
+        return 1.0f / (1.0f + exp(-x));
+    }
+    return x;
+}
+#endif
+
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
@@ -85,6 +114,32 @@ void rms_norm(uint num_iters) {
     const FLOAT_TYPE mean = sum / FLOAT_TYPE(ncols);
     const FLOAT_TYPE scale = inversesqrt(mean + FLOAT_TYPE(p.param1));
 
+#if RMS_NORM_EXT
+    if (do_post_scale) {
+        const float bias = intBitsToFloat(p.param3);
+        [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+            if (col >= ncols) {
+                continue;
+            }
+            const float y = float(scale * FLOAT_TYPE(data_a[a_offset + col]));
+            data_d[d_offset + col] = D_TYPE(FLOAT_TYPE(y) * FLOAT_TYPE(p.param2) + FLOAT_TYPE(bias));
+        }
+        return;
+    }
+    if (do_multiply2) {
+        const uint c_offset = samp*p.nb23 + channel*p.nb22 + row*p.nb21;
+        [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+            if (col >= ncols) {
+                continue;
+            }
+            const float n = ncols > p.ne10 ?
+                float(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)])) :
+                float(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
+            data_d[d_offset + col] = D_TYPE(n * load_c(c_offset + col));
+        }
+        return;
+    }
+#endif
     if (do_multiply) {
         if (ncols > p.ne10) {
             [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
