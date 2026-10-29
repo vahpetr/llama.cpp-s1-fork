@@ -422,7 +422,8 @@ Each n-gram implementation has its own parameter:
 
 ### Draft-chain knobs for `draft-mtp` (fork, environment, all off by default)
 
-Each knob only changes how many tokens are drafted, never which token is drafted at a position: a rejection-sampled
+Each knob only changes how many tokens are drafted, never which token is drafted at a position, and no stop looks at
+the token drawn at the position it stops: a rejection-sampled
 (`--spec-draft-sampling probabilistic`) round stays distribution-exact, and T = 0 (greedy accept-if-equal) output is
 identical as long as the target's logits do not depend on the verify-batch width. On the Vulkan qwen4exp build they
 can (near-tie flips on long prose after ~100 tokens when the draft length changes in every round, e.g.
@@ -436,7 +437,7 @@ off); a set knob prints a WARN proof line at start.
 | `LLAMA_SPEC_DRAFT_P_CHAIN=x` | the chain ends when the product of the head's top-1 probabilities over the positions drafted so far drops below `x` (`--spec-draft-p-min` gates each position on its own) |
 | `LLAMA_SPEC_DRAFT_DEPTH_AUTO=d0` | server: per-slot depth from the acceptance history, start `d0`, +1 after a full-depth draft accepted whole, -1 after a rejection (floor `LLAMA_SPEC_DRAFT_DEPTH_MIN`, default 2), at most `--spec-draft-n-max`; inactive under `--spec-draft-policy tput` / `--spec-draft-n-max-adaptive` |
 | `LLAMA_SPEC_DRAFT_N_MAX_GREEDY=n` | server: rounds verified by sample-and-match (T = 0) draft at most `n` tokens, so `--spec-draft-n-max` can be raised for the rejection-sampled rounds alone |
-| `LLAMA_SPEC_DRAFT_Q_STOP=x` | rejection-sampled rounds: a draw whose draft probability is below `x` is dropped and ends the chain (the target samples that position itself) |
+| `LLAMA_SPEC_DRAFT_Q_STOP=x` | rejection-sampled rounds: the chain ends at a position whose top-1 draft probability is below `x` (the target samples that position itself). The stop depends on the draft distribution only, never on the drawn token, so every drafted position proposes its full `q` and the rejection sampler stays distribution-exact (a stop on the drawn token's own probability would bias the output towards common tokens) |
 
 The response `timings` carry `draft_n_post_eog` (tokens drafted after a drafted EOG) when it is non-zero; the slot's
 `print_timing` block prints the same count.
