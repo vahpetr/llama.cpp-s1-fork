@@ -1,6 +1,8 @@
 // [TAG_QSA_TOPK_NOKEYS] (Program v8.1 A3 = P.2b, contrib 0242) the QSA selection without the key rows, knob off vs on, the
 // ordered ids bit for bit, on a GPU. Runs test-backend-ops (next to this binary) twice on the first Vulkan device:
-//   off: GGML_VK_QSA_TOPK_NOKEYS=0 (the keyed v2 passes)    on: =1 + GGML_VK_QSA_TOPK_NOKEYS_CHECK=1
+//   off: GGML_VK_QSA_TOPK_NOKEYS=0 (the keyed v2 passes)    on: =1 + GGML_VK_QSA_TOPK_NOKEYS_CHECK=1 + GGML_VK_QSA_TOPK_NOKEYS_MIN_ROWS=1
+//   (contrib 0285 made GGML_VK_QSA_TOPK_NOKEYS_MIN_ROWS default 9: 1..8-row selections keep the keyed path; this test is about
+//   the nokeys kernel, so the on arm forces MIN_ROWS=1 and dispatches nokeys on every case, the negative control included)
 // over the QSA_TOP_K_NOKEYS family (decode / verify rows 1..9, the 128-query chunk and a ragged 100-row tail chunk, depths
 // 65 536 / 67 583 / 262 145 cells, two streams, k 2051, fewer visible cells than k, the tie / domain modes: distinct,
 // ReLU-tied quantized, dead blocks + boost, all equal, signed zeros, the normal boundary, ties across tiles), each case
@@ -97,7 +99,7 @@ int main(int argc, char ** argv) {
     const std::string base = std::string(tmp && *tmp ? tmp : "/tmp") + "/test-qsa-topk-nokeys-" + std::to_string((long long) getpid());
 
     const arm_result off = run_arm(tbo, "GGML_VK_QSA_TOPK_NOKEYS=0", base + "-off", extra);
-    const arm_result on  = run_arm(tbo, "GGML_VK_QSA_TOPK_NOKEYS=1 GGML_VK_QSA_TOPK_NOKEYS_CHECK=1", base + "-on", extra);
+    const arm_result on  = run_arm(tbo, "GGML_VK_QSA_TOPK_NOKEYS=1 GGML_VK_QSA_TOPK_NOKEYS_CHECK=1 GGML_VK_QSA_TOPK_NOKEYS_MIN_ROWS=1", base + "-on", extra);
     if (off.total <= 0 || on.total <= 0) {
         bool any_vk = false;
         for (const auto & l : on.lines) { any_vk = any_vk || l.find("Vulkan0") != std::string::npos; }
