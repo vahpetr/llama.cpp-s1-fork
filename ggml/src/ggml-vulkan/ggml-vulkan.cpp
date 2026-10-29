@@ -964,8 +964,7 @@ struct vk_device_struct {
     // default 9 was a prod no-op and left the 1..8-row harness arms without nokeys dispatch (R145). Path only: both forms
     // select the same ids in the same order.
     uint32_t qsa_topk_nokeys_min_rows = 1;
-    vk_buffer qsa_topk_nk_flag;   // the CHECK word (host-visible, 16 B), created at the first NOKEYS dispatch
-    bool qsa_topk_nk_warned = false;
+    // the CHECK word lives in each context (ggml_backend_vk_context::qsa_topk_nk_flag), like the onepass counters
     uint32_t qsa_topk_wave = 0;
     uint32_t qsa_topk_cpt = 8;   // cells per invocation per tile: tile = 256 * qsa_topk_cpt cells
     // [TAG_QSA_TOPK_ONEPASS] GGML_VK_QSA_TOPK_ONEPASS=1 (default off; v2 only): the cell form as sample -> one filter pass ->
@@ -3556,6 +3555,11 @@ struct ggml_backend_vk_context {
     // (as deltas against qsa_topk_op_last) only after ggml_vk_synchronize / ggml_vk_cleanup of this context
     vk_buffer qsa_topk_op_stats;
     uint32_t  qsa_topk_op_last[40] = {};
+    // [TAG_QSA_TOPK_NOKEYS] this context's CHECK word (host-visible, 16 B), created at its first NOKEYS dispatch, written only
+    // by its own command buffers and read + cleared only at its own synchronization (a device-global word could be read and
+    // cleared by context B while context A's selections were still in flight, and the warning attributed to the wrong context)
+    vk_buffer qsa_topk_nk_flag;
+    bool      qsa_topk_nk_warned = false;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -18170,15 +18174,12 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
         // [TAG_QSA_TOPK_NOKEYS] no key rows: the histograms start the scratch
         const bool     nokeys    = ggml_vk_qsa_topk_nokeys(ctx->device, n_sel > 0, vis, nrows);
         const uint64_t hist_off  = nokeys ? 0 : (uint64_t) nrows * n_kv;
-        if (nokeys && !ctx->device->qsa_topk_nk_flag) {
-            static std::mutex nk_flag_mutex;
-            std::lock_guard<std::mutex> lock(nk_flag_mutex);
-            if (!ctx->device->qsa_topk_nk_flag) {
-                vk_buffer b = ggml_vk_create_buffer_check(ctx->device, 16,
-                                                          vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-                memset(b->ptr, 0, 16);
-                ctx->device->qsa_topk_nk_flag = b;
-            }
+        if (nokeys && !ctx->qsa_topk_nk_flag) {
+            // per context (see ggml_backend_vk_context::qsa_topk_nk_flag); the context is used by one thread at a time
+            vk_buffer b = ggml_vk_create_buffer_check(ctx->device, 16,
+                                                      vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+            memset(b->ptr, 0, 16);
+            ctx->qsa_topk_nk_flag = b;
         }
         const uint64_t rec_off   = hist_off + (uint64_t) nrows * 4 * 256;
         const uint64_t rec2_off  = rec_off + (uint64_t) nrows * 2 * n_tiles_c;
@@ -18224,7 +18225,7 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
             };
             const vk_subbuffer st_buf   { ctx->qsa_topk_op_stats, 0, ctx->qsa_topk_op_stats->size };
             const vk_subbuffer toks_buf = vis ? ggml_vk_tensor_subbuffer(ctx, vis_toks) : st_buf;
-            const vk_subbuffer nk_buf   = nokeys ? vk_subbuffer { ctx->device->qsa_topk_nk_flag, 0, ctx->device->qsa_topk_nk_flag->size } : st_buf;
+            const vk_subbuffer nk_buf   = nokeys ? vk_subbuffer { ctx->qsa_topk_nk_flag, 0, ctx->qsa_topk_nk_flag->size } : st_buf;
             vk_pipeline * op_pl = nokeys ? ctx->device->pipeline_topk_op_qsa_vis_nk
                                 : vis    ? ctx->device->pipeline_topk_op_qsa_vis : ctx->device->pipeline_topk_op_qsa;
             vk_pipeline * fb_pl = nokeys ? ctx->device->pipeline_topk_v2_qsa_vis_nk_fb
@@ -18290,7 +18291,7 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
                     { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
                       ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
                       scratch_buf, ggml_vk_tensor_subbuffer(ctx, vis_toks),
-                      vk_subbuffer { ctx->device->qsa_topk_nk_flag, 0, ctx->device->qsa_topk_nk_flag->size } }, pc2, elements2);
+                      vk_subbuffer { ctx->qsa_topk_nk_flag, 0, ctx->qsa_topk_nk_flag->size } }, pc2, elements2);
             } else if (vis) {
                 ggml_vk_dispatch_pipeline(ctx, subctx, pl,
                     { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
@@ -21220,6 +21221,7 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
     // [TAG_QSA_TOPK_ONEPASS] the final counters only now: before the cleanup a selection still in flight would be missed
     ggml_vk_qsa_topk_onepass_stats(ctx, true);
     ggml_vk_destroy_buffer(ctx->qsa_topk_op_stats); // [TAG_QSA_TOPK_ONEPASS] this context's counters, read above
+    ggml_vk_destroy_buffer(ctx->qsa_topk_nk_flag);  // [TAG_QSA_TOPK_NOKEYS] this context's CHECK word
 
     delete ctx;
     delete backend;
@@ -21535,13 +21537,13 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
 
     // [TAG_QSA_TOPK_NOKEYS] GGML_VK_QSA_TOPK_NOKEYS_CHECK=1: the work is done, the CHECK word says whether a NOKEYS selection
     // saw a visible cell whose score is outside the integer key's domain (diagnostic, not a guarantee)
-    if (ctx->device->qsa_topk_nokeys_check && ctx->device->qsa_topk_nk_flag) {
-        volatile uint32_t * w = (volatile uint32_t *) ctx->device->qsa_topk_nk_flag->ptr;
+    if (ctx->device->qsa_topk_nokeys_check && ctx->qsa_topk_nk_flag) {
+        volatile uint32_t * w = (volatile uint32_t *) ctx->qsa_topk_nk_flag->ptr;
         const uint32_t f = w[0];
-        if (f != 0 && !ctx->device->qsa_topk_nk_warned) {
-            ctx->device->qsa_topk_nk_warned = true;
+        if (f != 0 && !ctx->qsa_topk_nk_warned) {
+            ctx->qsa_topk_nk_warned = true;
             GGML_LOG_WARN("ggml_vulkan: qsa_topk nokeys CHECK: visible cells with out-of-domain scores (%s%s%s) - the integer key "
-                          "is not proven equal to the keyed f2ui(score + mask) for them (warned once)\n",
+                          "is not proven equal to the keyed f2ui(score + mask) for them (warned once per context)\n",
                           (f & 1u) ? "subnormal " : "", (f & 2u) ? "NaN " : "", (f & 4u) ? "+inf" : "");
         }
         w[0] = 0;
