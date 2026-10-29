@@ -857,6 +857,14 @@ static bool ggml_vk_lightning_indexer_k_type_supported(ggml_type type) {
     return std::find(lightning_indexer_k_types.begin(), lightning_indexer_k_types.end(), type) != lightning_indexer_k_types.end();
 }
 
+// [TAG_CM1_MANUAL_FRAG] the verdict of ggml_vk_check_coopmat_rdna3_layout (one proof line per device names it)
+enum class vk_cm1_manual_frag {
+    off_default,        // GGML_VK_CM1_MANUAL_FRAG unset / 0: the coopMatLoad _cml build, the probe is not run
+    off_no_probe,       // =1, but no probe pipeline on this device (not AMD RDNA3 + RADV with wave32 + wave64 coopmat)
+    off_probe_failed,   // =1, the probe ran and the layout is not the expected gfx11 one
+    on,                 // =1 and the probe passed at wave32 + wave64: the manual-fragment build
+};
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     mutable std::shared_mutex pinned_memory_mutex;
@@ -1369,7 +1377,8 @@ struct vk_device_struct {
     // [TAG_CM1_MANUAL_FRAG] the gfx11 fragment-layout probe (wave32, wave64) and its verdict: true = the coopmat1 mul_mm
     // pipelines take the BUF_MANUAL build, false = the coopMatLoad "_cml" twins (ggml_vk_check_coopmat_rdna3_layout)
     vk_pipeline pipeline_coopmat_layout_check[2];
-    bool coopmat_rdna3_layout = false;
+    bool coopmat_rdna3_layout = false;   // = (cm1_manual_frag == vk_cm1_manual_frag::on)
+    vk_cm1_manual_frag cm1_manual_frag = vk_cm1_manual_frag::off_default;
     std::atomic<bool> mm_tile_warned{false};        // the plain-tile load-reach warning is printed
     std::atomic<bool> mm_tiles_checked{false};      // the CREATE_MM tile reach checks ran (they are device-constant)
     // split a dim-0 concat with a transposed src1 into copy + tiled transpose-copy
@@ -8290,12 +8299,17 @@ static void ggml_vk_ctx_end(vk_context& ctx);
 // coopMatLoad "_cml" twins. GGML_VK_CM1_MANUAL_FRAG (default 0 = the coopMatLoad _cml build; =1 = the manual build where this
 // probe passes): balkon 780M 2026-10-29, both with the register prefetch, coopMatLoad was 3..9 % faster on every dense prefill
 // shape (the 2-warp wave64 G1 tiles included) and within -3..+3 % on the mul_mat_id ones (contrib 0298 README). EXACT either way.
-static bool ggml_vk_check_coopmat_rdna3_layout(vk_device & device) {
-    if (!ggml_vk_env_bool("GGML_VK_CM1_MANUAL_FRAG", false)) {
-        return false;
+static bool ggml_vk_cm1_manual_frag_knob() {
+    static const bool on = ggml_vk_env_bool("GGML_VK_CM1_MANUAL_FRAG", false);
+    return on;
+}
+
+static vk_cm1_manual_frag ggml_vk_check_coopmat_rdna3_layout(vk_device & device) {
+    if (!ggml_vk_cm1_manual_frag_knob()) {
+        return vk_cm1_manual_frag::off_default;
     }
     if (!device->pipeline_coopmat_layout_check[0] || !device->pipeline_coopmat_layout_check[1]) {
-        return false;
+        return vk_cm1_manual_frag::off_no_probe;
     }
     float ref[256];
     for (uint32_t r = 0; r < 16; r++) {
@@ -8363,7 +8377,7 @@ static bool ggml_vk_check_coopmat_rdna3_layout(vk_device & device) {
 
     device->device.destroyDescriptorPool(pool);
     ggml_vk_destroy_buffer(buf);
-    return ok;
+    return ok ? vk_cm1_manual_frag::on : vk_cm1_manual_frag::off_probe_failed;
 }
 
 static vk_device ggml_vk_get_device(size_t idx) {
@@ -9505,16 +9519,30 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         // [TAG_CM1_MANUAL_FRAG] needs the queues and the fence; before any matmul compiles (lazy compile on first request),
         // after the registration walk above. One proof line per device (WARN: the server drops ggml INFO lines).
-        device->coopmat_rdna3_layout = ggml_vk_check_coopmat_rdna3_layout(device);
+        device->cm1_manual_frag = ggml_vk_check_coopmat_rdna3_layout(device);
+        device->coopmat_rdna3_layout = device->cm1_manual_frag == vk_cm1_manual_frag::on;
         if (device->coopmat_rdna3_layout) {
             ggml_vk_load_shaders(device);   // re-walk: the registered cm1 mul_mm pipelines take their manual-build names
         }
-        GGML_LOG_WARN("ggml_vulkan: %s cm1_manual_frag: %s\n", device->name.c_str(), device->coopmat_rdna3_layout ?
-                      "on (GGML_VK_CM1_MANUAL_FRAG=1, gfx11 fragment layout verified at wave32 + wave64: coopmat1 mul_mm A/B "
-                      "fragments from 32-bit LDS reads)" :
-                      ggml_vk_env_bool("GGML_VK_CM1_MANUAL_FRAG", false) ?
-                      "off (GGML_VK_CM1_MANUAL_FRAG=1 but the layout probe was not run or failed: coopMatLoad _cml mul_mm pipelines)" :
-                      "off (default: coopMatLoad _cml mul_mm pipelines; GGML_VK_CM1_MANUAL_FRAG=1 = the manual-fragment build)");
+        const char * cm1_frag_line = "?";
+        switch (device->cm1_manual_frag) {
+            case vk_cm1_manual_frag::on:
+                cm1_frag_line = "on (GGML_VK_CM1_MANUAL_FRAG=1, gfx11 fragment layout verified at wave32 + wave64: coopmat1 mul_mm A/B "
+                                "fragments from 32-bit LDS reads)";
+                break;
+            case vk_cm1_manual_frag::off_probe_failed:
+                cm1_frag_line = "off (GGML_VK_CM1_MANUAL_FRAG=1 but the layout probe failed, see the layout WARN above: coopMatLoad _cml "
+                                "mul_mm pipelines)";
+                break;
+            case vk_cm1_manual_frag::off_no_probe:
+                cm1_frag_line = "off (GGML_VK_CM1_MANUAL_FRAG=1 but no layout probe on this device, not AMD RDNA3 + RADV with wave32 + "
+                                "wave64 coopmat: coopMatLoad _cml mul_mm pipelines)";
+                break;
+            case vk_cm1_manual_frag::off_default:
+                cm1_frag_line = "off (default: coopMatLoad _cml mul_mm pipelines; GGML_VK_CM1_MANUAL_FRAG=1 = the manual-fragment build)";
+                break;
+        }
+        GGML_LOG_WARN("ggml_vulkan: %s cm1_manual_frag: %s\n", device->name.c_str(), cm1_frag_line);
 
         device->idx = idx;
 
