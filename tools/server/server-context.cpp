@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cerrno>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -242,6 +243,35 @@ static bool server_spec_trace_ids() {
         return v;
     }();
     return on;
+}
+
+// [TAG_B68_DRAFT_KNOBS] strict integer env knob in [lo, hi]; unset / invalid -> 0 (off), read once with a proof line
+static int server_env_int(const char * name, int lo, int hi) {
+    const char * s = getenv(name);
+    if (s == nullptr) {
+        return 0;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const long v = (*s >= '0' && *s <= '9') ? strtol(s, &end, 10) : -1;
+    if (end != nullptr && end != s && *end == '\0' && errno == 0 && v >= lo && v <= hi) {
+        SRV_WRN("%s=%ld: on\n", name, v);
+        return (int) v;
+    }
+    SRV_WRN("invalid %s='%s' (an integer in [%d, %d]) - stays off\n", name, s, lo, hi);
+    return 0;
+}
+
+// H2 LLAMA_SPEC_DRAFT_DEPTH_AUTO=d0: per-slot draft depth from the acceptance history, starting at d0: +1 after a round
+//   whose full-depth draft was accepted whole, -1 (floor LLAMA_SPEC_DRAFT_DEPTH_MIN, default 2) after a rejection;
+//   bounded by --spec-draft-n-max; restarts at d0 with every request.
+static int server_spec_depth_auto() {
+    static const int v = server_env_int("LLAMA_SPEC_DRAFT_DEPTH_AUTO", 1, 64);
+    return v;
+}
+static int server_spec_depth_min() {
+    static const int v = [] { const int m = server_env_int("LLAMA_SPEC_DRAFT_DEPTH_MIN", 1, 64); return m > 0 ? m : 2; }();
+    return v;
 }
 
 // Replay after a checkpoint restore (partial draft acceptance on a context that cannot seq_rm partially).
@@ -793,6 +823,12 @@ struct server_slot {
 
     static constexpr float SPEC_ACC_EMA_ALPHA = 1.0f/32.0f;
 
+    // [TAG_B68_DRAFT_KNOBS] H2 the current auto depth (0 = not started; restarts at every request so that a seeded
+    //   T > 0 request replays exactly - the depth changes how the rejection sampler consumes its RNG) and the depth
+    //   requested in the round being verified
+    int spec_depth_cur = 0;
+    int spec_depth_req = 0;
+
     // Update the per-position conditional acceptance from one verification round.
     //
     // Called once per verified round with that round's FRESH draft tail only: n_draft is the
@@ -916,6 +952,8 @@ struct server_slot {
         spec_acc_ema.clear();
         spec_acc_nobs.clear();
         spec_n_max_last    = 0;
+        spec_depth_cur     = 0; // [TAG_B68_DRAFT_KNOBS] H2 restarts per request: a seeded T > 0 request replays exactly
+        spec_depth_req     = 0;
         spec_cost_t_tok    = 0.0f;
         spec_cost_t_dec    = 0.0f;
         spec_cost_n_kv     = 0;
@@ -5956,6 +5994,18 @@ private:
                             metrics.spec_adaptive_measured = measured ? 1 : 0;
                         }
 
+                        // [TAG_B68_DRAFT_KNOBS] H2 auto depth (only when neither tput nor the cost model decides)
+                        slot.spec_depth_req = 0;
+                        if (n_tput <= 0 && !params_base.speculative.draft.n_max_adaptive && server_spec_depth_auto() > 0) {
+                            const int n_cfg = std::min(n_draft_max, common_speculative_n_max(spec.get()));
+                            if (slot.spec_depth_cur <= 0) {
+                                slot.spec_depth_cur = server_spec_depth_auto();
+                            }
+                            slot.spec_depth_cur = std::max(1, std::min(slot.spec_depth_cur, n_cfg));
+                            n_draft_req         = std::min(n_draft_req, slot.spec_depth_cur);
+                            slot.spec_depth_req = n_draft_req;
+                        }
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_req,
@@ -7381,6 +7431,25 @@ private:
                     } else {
                     slot.spec_acc_update(n_fresh_draft, n_fresh_acc, common_speculative_n_max(spec.get()));
                     }
+                }
+
+                // [TAG_B68_DRAFT_KNOBS] H2: adapt the slot's depth from this round's fresh tail
+                if (slot.spec_depth_req > 0) {
+                    const size_t n_committed_in = std::min(slot.spec_n_committed, n_draft);
+                    const size_t n_fresh_draft  = n_draft - n_committed_in;
+                    const size_t n_matched      = accepted.size() - 1;
+                    const size_t n_fresh_acc    = n_matched > n_committed_in
+                                                ? std::min(n_matched - n_committed_in, n_fresh_draft) : 0;
+                    if (n_fresh_draft > 0) {
+                        if (n_fresh_acc == n_fresh_draft) {
+                            if ((int) n_fresh_draft >= slot.spec_depth_req) {
+                                slot.spec_depth_cur = slot.spec_depth_req + 1; // clamped to n-max at the next round
+                            }
+                        } else {
+                            slot.spec_depth_cur = std::max(server_spec_depth_min(), slot.spec_depth_req - 1);
+                        }
+                    }
+                    slot.spec_depth_req = 0;
                 }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
