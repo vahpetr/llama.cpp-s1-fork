@@ -975,9 +975,10 @@ struct vk_device_struct {
     uint64_t qsa_topk_op_min_cells = 0;
     uint32_t qsa_topk_op_fbx = 0;
     uint32_t qsa_topk_op_fby = 0;
-    vk_buffer qsa_topk_op_stats;  // host-visible counters (rows, under, over, candidates), created at the first dispatch
-    std::mutex qsa_topk_op_mutex; // the stats readers (synchronize, free) and the buffer's creation
-    uint32_t qsa_topk_op_last[40] = {};  // the counters as last read (32-bit, read as deltas; layout in topk_qsa_onepass.comp)
+    // the counter words live in each context (ggml_backend_vk_context::qsa_topk_op_stats): a context reads only its own words,
+    // after its own synchronization, so every writer of what it reads has completed (astra v66 Important: device-global words
+    // read at context B's sync could still be bumped by context A's pending selections, and the backoff consumed them)
+    std::mutex qsa_topk_op_mutex; // the device-wide totals / backoff state below, shared by every context's reader
     uint64_t qsa_topk_op_tot[40]  = {};
     uint64_t qsa_topk_op_next_log = 1024;
     uint64_t qsa_topk_op_logged   = 0;
@@ -3493,6 +3494,11 @@ struct ggml_backend_vk_context {
     size_t prealloc_size_qsa_hint {};
     bool prealloc_x_qsa_presized {};
     bool prealloc_x_qsa_range_warned {};
+    // [TAG_QSA_TOPK_ONEPASS] this context's host-visible onepass counters (rows, under, over, candidates; layout in
+    // topk_qsa_onepass.comp), created at its first onepass dispatch, written only by its own command buffers and read
+    // (as deltas against qsa_topk_op_last) only after ggml_vk_synchronize / ggml_vk_cleanup of this context
+    vk_buffer qsa_topk_op_stats;
+    uint32_t  qsa_topk_op_last[40] = {};
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -17875,20 +17881,18 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
             // [TAG_QSA_TOPK_ONEPASS] sample -> filter -> select (topk_qsa_onepass.comp), then v2's six cell-form passes over the
             // rows the select pass listed (QSA_TOPK_FB; with none listed every workgroup exits at once). The histograms the
             // fallback needs were zeroed above; the onepass region needs no fill (the sample pass zeroes the counters).
-            if (!ctx->device->qsa_topk_op_stats) {
-                std::lock_guard<std::mutex> lock(ctx->device->qsa_topk_op_mutex);
-                if (!ctx->device->qsa_topk_op_stats) {
-                    vk_buffer b = ggml_vk_create_buffer_check(ctx->device, 256,
-                                                              vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-                    memset(b->ptr, 0, 256);
-                    ctx->device->qsa_topk_op_stats = b;
-                }
+            if (!ctx->qsa_topk_op_stats) {
+                // per context (see ggml_backend_vk_context::qsa_topk_op_stats); the context is used by one thread at a time
+                vk_buffer b = ggml_vk_create_buffer_check(ctx->device, 256,
+                                                          vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+                memset(b->ptr, 0, 256);
+                ctx->qsa_topk_op_stats = b;
             }
             const uint32_t op_off = (uint32_t) end_off;
             const vk_op_topk_onepass_push_constants pco {
                 n_kv, width, nrows, n_tps, n_blocks, n_stream, sb_blk, sb_tps, n_tiles_c, op_off, op_sample, op_j, op_stride,
             };
-            const vk_subbuffer st_buf   { ctx->device->qsa_topk_op_stats, 0, ctx->device->qsa_topk_op_stats->size };
+            const vk_subbuffer st_buf   { ctx->qsa_topk_op_stats, 0, ctx->qsa_topk_op_stats->size };
             const vk_subbuffer toks_buf = vis ? ggml_vk_tensor_subbuffer(ctx, vis_toks) : st_buf;
             const vk_subbuffer nk_buf   = nokeys ? vk_subbuffer { ctx->device->qsa_topk_nk_flag, 0, ctx->device->qsa_topk_nk_flag->size } : st_buf;
             vk_pipeline * op_pl = nokeys ? ctx->device->pipeline_topk_op_qsa_vis_nk
@@ -20773,22 +20777,25 @@ static void ggml_vk_qsa_topk_onepass_emit(const char * line, int n, size_t cap) 
 }
 
 // [TAG_QSA_TOPK_ONEPASS] the onepass counters (32-bit words the select pass bumps, read as deltas so the host never writes
-// them): a line at every doubling of the rows (1024, 2048, ...) and, with `final`, one more if anything changed since
-static void ggml_vk_qsa_topk_onepass_stats(const vk_device & device, bool final) {
-    if (!device->qsa_topk_onepass || !device->qsa_topk_op_stats) {
+// them): a line at every doubling of the rows (1024, 2048, ...) and, with `final`, one more if anything changed since.
+// Called only after this context's work has completed (ggml_vk_synchronize, ggml_vk_cleanup) and reads only this context's
+// words, so no writer of them is still pending; the device-wide totals and the backoff aggregate the contexts' deltas.
+static void ggml_vk_qsa_topk_onepass_stats(ggml_backend_vk_context * ctx, bool final) {
+    const vk_device & device = ctx->device;
+    if (!device->qsa_topk_onepass || !ctx->qsa_topk_op_stats) {
         return;
     }
     std::lock_guard<std::mutex> lock(device->qsa_topk_op_mutex);
-    volatile uint32_t * w = (volatile uint32_t *) device->qsa_topk_op_stats->ptr;
+    volatile uint32_t * w = (volatile uint32_t *) ctx->qsa_topk_op_stats->ptr;
     const uint64_t rows0 = device->qsa_topk_op_tot[0], fb0 = device->qsa_topk_op_tot[1] + device->qsa_topk_op_tot[2];
     for (int i = 0; i < 40; ++i) {
         const uint32_t v = w[i];
         if (i == 5) { // a running max, not a count
             device->qsa_topk_op_tot[i] = std::max<uint64_t>(device->qsa_topk_op_tot[i], v);
         } else {
-            device->qsa_topk_op_tot[i] += (uint32_t) (v - device->qsa_topk_op_last[i]);
+            device->qsa_topk_op_tot[i] += (uint32_t) (v - ctx->qsa_topk_op_last[i]);
         }
-        device->qsa_topk_op_last[i] = v;
+        ctx->qsa_topk_op_last[i] = v;
     }
     const uint64_t rows = device->qsa_topk_op_tot[0];
     // [TAG_QSA_TOPK_ONEPASS] backoff: inputs whose rows mostly fall back (a tie group at tau of > 2 CAP cells, e.g. the T6M
@@ -20859,7 +20866,8 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
 
     ggml_vk_cleanup(ctx); // waits for this context's submitted work (ggml_vk_synchronize)
     // [TAG_QSA_TOPK_ONEPASS] the final counters only now: before the cleanup a selection still in flight would be missed
-    ggml_vk_qsa_topk_onepass_stats(ctx->device, true);
+    ggml_vk_qsa_topk_onepass_stats(ctx, true);
+    ggml_vk_destroy_buffer(ctx->qsa_topk_op_stats); // [TAG_QSA_TOPK_ONEPASS] this context's counters, read above
 
     delete ctx;
     delete backend;
@@ -21186,7 +21194,7 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
         }
         w[0] = 0;
     }
-    ggml_vk_qsa_topk_onepass_stats(ctx->device, false); // [TAG_QSA_TOPK_ONEPASS]
+    ggml_vk_qsa_topk_onepass_stats(ctx, false); // [TAG_QSA_TOPK_ONEPASS]
 
     ggml_vk_graph_cleanup(ctx);
 }
