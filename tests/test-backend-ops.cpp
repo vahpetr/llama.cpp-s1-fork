@@ -13879,6 +13879,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640, MMID_ROUTER_SKEWED));
     }
 
+    // [TAG_CM1_PREFETCH] the coopmat1 loader rewrite (register prefetch, 8-wide q6_K / q8_0 / q5_0 loaders, q4_K / q5_K scale
+    // cache): the K-quant expert / dense shapes the blocks above and below do not cover (q6_K / q5_K gate/up, q5_K dense)
+    for (int64_t n : { 512, 2048 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 512, 10, true, 640, n, 2560, MMID_ROUTER_SKEWED));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 512, 10, true, 640, n, 2560, MMID_ROUTER_SKEWED));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 10240, n,  2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  2560, n,  6144, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, n,  2560, {1, 1}, {1, 1}));
+    }
+
     // [TAG_HC_INJECT_GEMM] B4 item 3: the qwen4exp hc_mix GEMMs of one prefill ubatch (n = 2048 tokens,
     // k = hc_dim = 10240) at the brain's hc weight types - the m = 4 inject projection (the N-parallel
     // question) next to the m = 320 down projection and the m = 10240 up projection (k = 320) for scale
