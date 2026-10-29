@@ -22979,6 +22979,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+            // RMS_NORM_MUL_SIGMOID_MUL (2) / RMS_NORM_MUL_MUL (1) / none (0): evaluated once per RMS_NORM node
+            const int rms_norm_mul2 = cgraph->nodes[i]->op == GGML_OP_RMS_NORM ? ggml_vk_can_fuse_rms_norm_mul2(ctx, cgraph, i) : 0;
             if (num_adds && !vk_fusion_veto(ctx, "multi_add")) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
@@ -23056,13 +23058,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "RMS_NORM_SCALE";
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (ggml_vk_can_fuse_rms_norm_mul2(ctx, cgraph, i) == 2 &&
+            } else if (rms_norm_mul2 == 2 &&
                        !vk_fusion_veto(ctx, "rms_norm_mul_sigmoid_mul")) {
                 ctx->num_additional_fused_ops = 3;
                 ctx->fused_rms_norm_mul2 = 2;
                 fusion_string = "RMS_NORM_MUL_SIGMOID_MUL";
                 std::fill_n(op_srcs_fused_elementwise, 4, true);
-            } else if (ggml_vk_can_fuse_rms_norm_mul2(ctx, cgraph, i) == 1 &&
+            } else if (rms_norm_mul2 == 1 &&
                        !vk_fusion_veto(ctx, "rms_norm_mul_mul")) {
                 ctx->num_additional_fused_ops = 2;
                 ctx->fused_rms_norm_mul2 = 1;
