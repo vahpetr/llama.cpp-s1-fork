@@ -4458,6 +4458,151 @@ struct test_qsa_pool_mean_fuse : public test_case {
     }
 };
 
+// [TAG_RMS_NORM_EXT] the qwen4exp GDN norm tails the Vulkan backend fuses into one rms_norm_ext dispatch:
+//   kind 0 RMS_NORM_SCALE            scale(rms_norm(x, eps/n), 1/sqrt(n) [, bias])  (build_gdn_l2_norm)
+//   kind 1 RMS_NORM_MUL_SIGMOID_MUL  mul(mul(rms_norm(x), gamma), sigmoid(z))       (build_norm_gated)
+//   kind 2 RMS_NORM_MUL_MUL          mul(mul(rms_norm(x), gamma), g)
+// v: x is a column slice of a wider tensor (the GDN q/k views); gv: z / g is a token-strided view (the merged qkvz
+// row view); gamma_ne0 < ne0: the gamma broadcasts along dim 0 (fastmod path). exact: arm A as the model emits it,
+// arm B with the intermediates flagged as outputs (sep 1: the first one only = today's RMS_NORM_MUL + SIGMOID_MUL;
+// sep 2: all = every op separate), concat(A - B, B - A) compared bitwise (max 0) - a -0 / +0 or NaN mismatch shows -
+// with +/-0 and wide-exponent inputs; otherwise arm A against the CPU (NMSE).
+struct test_rms_norm_fuse_ext : public test_case {
+    const int kind;
+    const std::array<int64_t, 4> ne;
+    const bool v;
+    const bool gv;
+    const int64_t gamma_ne0;
+    const float bias;
+    const int sep;
+    const bool exact;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        static const char * names[] = { "RMS_NORM_SCALE", "RMS_NORM_MUL_SIGMOID_MUL", "RMS_NORM_MUL_MUL" };
+        return std::string(names[kind]) + (exact ? "_EXACT" : "");
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(ne, v, gv, gamma_ne0, bias, sep, exact);
+    }
+
+    double max_nmse_err() override { return exact ? 0.0 : 1e-6; }
+    double max_err() override { return exact ? 0.0 : max_nmse_err(); }
+    double max_err(ggml_backend_t backend) override { GGML_UNUSED(backend); return max_err(); }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!exact) {
+            return nmse(a, b, n);
+        }
+        size_t bad = 0;
+        for (size_t i = 0; i < n; i++) {
+            bad += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        }
+        return (double) bad;
+    }
+
+    test_rms_norm_fuse_ext(int kind = 0, std::array<int64_t, 4> ne = {128, 16, 9, 1}, bool v = false, bool gv = false,
+                           int64_t gamma_ne0 = 0, float bias = 0.0f, int sep = 1, bool exact = true)
+        : kind(kind), ne(ne), v(v), gv(gv), gamma_ne0(gamma_ne0 ? gamma_ne0 : ne[0]), bias(bias), sep(sep), exact(exact) {}
+
+    ggml_tensor * arm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * gamma, ggml_tensor * z, bool mark) {
+        const float n = (float) ne[0];
+        ggml_tensor * r = ggml_rms_norm(ctx, x, kind == 0 ? 1e-6f / n : 1e-6f);
+        if (mark && (kind == 0 || sep >= 2)) {
+            ggml_set_output(r);
+        }
+        ggml_tensor * y;
+        if (kind == 0) {
+            y = ggml_scale_bias(ctx, r, 1.0f / sqrtf(n), bias);
+        } else {
+            ggml_tensor * m = ggml_mul(ctx, r, gamma);
+            if (mark) {
+                ggml_set_output(m);
+            }
+            ggml_tensor * g = z;
+            if (kind == 1) {
+                g = ggml_sigmoid(ctx, z);
+                if (mark && sep >= 2) {
+                    ggml_set_output(g);
+                }
+            }
+            y = ggml_mul(ctx, m, g);
+        }
+        if (gf && mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, y);
+        }
+        return y;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x;
+        if (v) {
+            ggml_tensor * big = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] * 3, ne[1], ne[2], ne[3]);
+            ggml_set_name(big, "big");
+            x = ggml_view_4d(ctx, big, ne[0], ne[1], ne[2], ne[3], big->nb[1], big->nb[2], big->nb[3], ne[0] * sizeof(float));
+        } else {
+            x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_name(x, "x");
+        }
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, gamma_ne0);
+        ggml_set_name(gamma, "gamma");
+        ggml_tensor * z = nullptr;
+        if (kind != 0) {
+            if (gv) {
+                ggml_tensor * zbig = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0] * ne[1] * 2, ne[2], ne[3]);
+                ggml_set_name(zbig, "zbig");
+                z = ggml_view_4d(ctx, zbig, ne[0], ne[1], ne[2], ne[3], ne[0] * sizeof(float), zbig->nb[1], zbig->nb[2], 0);
+            } else {
+                z = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+                ggml_set_name(z, "z");
+            }
+        }
+
+        // test-backend-ops runs the graph without ggml_vk_graph_optimize, so a strided z's VIEW node would sit between
+        // the MUL and the SIGMOID (the order the model emits; the optimizer moves it in front of the RMS_NORM): expand
+        // it first, so the fused path with the strided operand is what arm A exercises
+        if (gv && gf && mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, z);
+        }
+        ggml_tensor * a = arm(ctx, x, gamma, z, false);
+        if (!exact) {
+            ggml_set_name(a, "out");
+            return a;
+        }
+        ggml_tensor * b = arm(ctx, x, gamma, z, true);
+        ggml_tensor * d0 = ggml_sub(ctx, a, b);
+        ggml_tensor * d1 = ggml_sub(ctx, b, a);
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_1d(ctx, d0, ggml_nelements(d0)),
+                                             ggml_reshape_1d(ctx, d1, ggml_nelements(d1)), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0x5bd1e995u ^ (uint32_t) (kind*7 + ne[0]*31 + ne[1]*131 + ne[2]*17 + v*3 + gv*5 + sep*11 + exact));
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        std::uniform_int_distribution<int> ex(-12, 12);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->type != GGML_TYPE_F32) {
+                continue;
+            }
+            const bool is_z = strcmp(t->name, "z") == 0 || strcmp(t->name, "zbig") == 0;
+            std::vector<float> vals(ggml_nelements(t));
+            for (auto & e : vals) {
+                // wide exponents, so the f32 rounding of each intermediate matters; z stays in the sigmoid's range
+                e = is_z ? 8.0f * u(rng) : ldexpf(u(rng), ex(rng));
+                if (exact && (rng() & 31) == 0) {
+                    e = (rng() & 1) ? -0.0f : 0.0f;
+                }
+            }
+            ggml_backend_tensor_set(t, vals.data(), 0, vals.size() * sizeof(float));
+        }
+    }
+};
+
 // [TAG_CONV_INPUT_SPLIT] the qwen4exp GDN conv input: concat(state, transpose(x), dim 0) -> ssm_conv (-> + bias)
 // (-> silu), with x [nr, n_t, n_s] as the qkv projection leaves it. The Vulkan backend reads the conv window from
 // state | x without writing the concat (concat_ssm_conv*). exact: arm A as the model emits it, arm B with the
@@ -11357,6 +11502,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (int64_t kw : { 0, 1, 5 }) {
                     test_cases.emplace_back(new test_conv_tail(sc, 10240, n_t, n_s, kw));
                 }
+            }
+        }
+    }
+
+    // [TAG_RMS_NORM_EXT] the GDN norm tails: production head shapes (128 x 16 / 48 heads), partial rows (100, 33),
+    // multi-iteration rows (600, 1027), odd row / channel counts, strided x / z, broadcast gamma, a nonzero SCALE bias
+    // (not fused: the unfused chain must still match), sep 1 (vs today's dispatches) and sep 2 (vs all ops separate)
+    for (bool exact : { true, false }) {
+        for (int sep : { 1, 2 }) {
+            if (!exact && sep == 2) {
+                continue;
+            }
+            if (sep == 1) {   // RMS_NORM_SCALE has one intermediate: sep 2 would be the same graph
+                test_cases.emplace_back(new test_rms_norm_fuse_ext(0, {128, 16, 9, 1}, false, false, 0, 0.0f, sep, exact));
+                test_cases.emplace_back(new test_rms_norm_fuse_ext(0, {128, 16, 7, 2}, true,  false, 0, 0.0f, sep, exact));
+                test_cases.emplace_back(new test_rms_norm_fuse_ext(0, {100, 3, 5, 2},  false, false, 0, 0.0f, sep, exact));
+                test_cases.emplace_back(new test_rms_norm_fuse_ext(0, {33, 5, 3, 1},   true,  false, 0, 0.0f, sep, exact));
+                test_cases.emplace_back(new test_rms_norm_fuse_ext(0, {1027, 3, 2, 1}, false, false, 0, 0.0f, sep, exact));
+                test_cases.emplace_back(new test_rms_norm_fuse_ext(0, {128, 16, 9, 1}, false, false, 0, 0.25f, sep, exact));
+            }
+            for (int kind : { 1, 2 }) {
+                test_cases.emplace_back(new test_rms_norm_fuse_ext(kind, {128, 48, 9, 1}, false, false, 0,  0.0f, sep, exact));
+                test_cases.emplace_back(new test_rms_norm_fuse_ext(kind, {128, 48, 7, 1}, false, true,  0,  0.0f, sep, exact));
+                test_cases.emplace_back(new test_rms_norm_fuse_ext(kind, {128, 16, 5, 2}, true,  true,  0,  0.0f, sep, exact));
+                test_cases.emplace_back(new test_rms_norm_fuse_ext(kind, {100, 3, 5, 2},  false, false, 0,  0.0f, sep, exact));
+                test_cases.emplace_back(new test_rms_norm_fuse_ext(kind, {128, 7, 3, 1},  false, true,  32, 0.0f, sep, exact));
+                test_cases.emplace_back(new test_rms_norm_fuse_ext(kind, {600, 3, 3, 1},  true,  false, 0,  0.0f, sep, exact));
+                test_cases.emplace_back(new test_rms_norm_fuse_ext(kind, {1027, 2, 3, 1}, false, true,  0,  0.0f, sep, exact));
             }
         }
     }
