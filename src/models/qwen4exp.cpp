@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-impl.h"
+#include "ggml-backend.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 
@@ -246,6 +247,16 @@ static int64_t qwen4exp_merge_max_n() {
     return n;
 }
 
+// the weight lives in a ggml-vulkan device buffer (the loader merges into device, non-host buffer types only)
+static bool qwen4exp_on_vulkan(const ggml_tensor * w) {
+    if (w->buffer == nullptr) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer));
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0;
+}
+
 // the merged matmul for this ubatch: a converter-merged file has no separate halves, so it always takes it. A load-time
 // merge is skipped while a LoRA adapter is attached: build_lora_mm looks the adapter up by the weight tensor, and no
 // adapter references the container, so the merged matmul would drop the LoRA of both halves
@@ -257,6 +268,11 @@ static bool qwen4exp_use_merged(const ggml_tensor * merged, const ggml_tensor * 
         return true;
     }
     if (loras != nullptr && !loras->empty()) {
+        return false;
+    }
+    // the identity (mat-vec at <= MERGE_MAX_N columns, an M-independent per-row reduction) is a ggml-vulkan property:
+    // a container in another backend's buffer (whose matmuls run there) keeps the two matmuls over the views
+    if (!qwen4exp_on_vulkan(merged)) {
         return false;
     }
     return n_tokens <= qwen4exp_merge_max_n();
