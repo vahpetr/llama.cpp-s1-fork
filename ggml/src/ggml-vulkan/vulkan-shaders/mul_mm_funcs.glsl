@@ -922,6 +922,15 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
 }
 #else
 void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uint ic, const uint _ne1, const uint block, const uint end_k) {
+#if LOAD_VEC_B == 8 || LOAD_VEC_B == 4
+            // [TAG_MMID_SKIP] row_ids holds this tile's rows only (load_row_ids_hoisted / load_row_ids write [0, rows)). On a
+            // multi-pass tile (loadstride_b < BN) an invocation that loads also reaches the columns >= rows, whose row_ids entries
+            // are stale: the aligned loaders skip them (no global B read through a stale row id). Their buf_b columns are never
+            // stored to D (one output column per B column), so the stored products are unchanged; the scalar path below zero-fills.
+            if (ALIGNED != 0 && ic * BN + col >= _ne1) {
+                return;
+            }
+#endif
 #if LOAD_VEC_B == 8
             if (ALIGNED != 0) {
                 // Not supported for b_type bf16 because bf16mat2x4 does not exist

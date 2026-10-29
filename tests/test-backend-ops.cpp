@@ -12484,6 +12484,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
     }
 
+    // [TAG_MMID_SKIP] expert tiles of 20 rows (k 256 aligned): skewed routing puts all n rows on expert 0, so n = 84 / 148 leave 20 rows
+    // in its last BN-64 tile. The 2-pass B loads (loadstride_b < BN, whose second pass lies wholly past the 20 rows): f32 A on the m
+    // tile (block 128, BN 64, BK 16, LOAD_VEC_B 4) and the quantized m tile at m 64 (block 128, BN 64, BK 32, LOAD_VEC_B 8 = the
+    // prefetch fetch_b); f16 A (m tile, 1 pass) and q4_K / q8_0 at m 256 (G2a, 1 partial pass) as controls. The aligned B loads
+    // must not read row_ids past the tile's rows (review a68 finding 3)
+    for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (int64_t m : {64, 256}) {
+            for (int n : {84, 148}) {
+                test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 8, 2, false, m, n, 256, MMID_ROUTER_SKEWED));
+            }
+        }
+    }
+
     // [TAG_MMID_TILE_G2A] the 8-warp mul_mat_id l tile (the B1-classified types, m > 64) with duplicate ids and hot routes whose
     // per-expert rows cross BN 64, and n_as > 512
     for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_S}) {

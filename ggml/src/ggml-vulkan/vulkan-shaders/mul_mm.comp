@@ -541,7 +541,14 @@ void main() {
         }
 // a partial last loader pass (tile edge not a multiple of the load stride, e.g. the G2a block 512 x LOAD_VEC_B 8 > BN 64)
 #define A_IN(l) (BM % loadstride_a == 0 || loadc_a + (l) < BM)
-#define B_IN(l) ((BN % loadstride_b == 0 || loadc_b + (l) < BN) && MM_B_LOADS)
+// [TAG_MMID_SKIP] and, for mul_mat_id, a column that holds a row of this tile: on a multi-pass tile (loadstride_b < BN) a loading
+// invocation also reaches columns >= rows, whose row_ids entries are stale (never stored to D, so skipping them changes no product)
+#ifdef MUL_MAT_ID
+#define B_COL_IN(l) (loadc_b + (l) < rows)
+#else
+#define B_COL_IN(l) true
+#endif
+#define B_IN(l) ((BN % loadstride_b == 0 || loadc_b + (l) < BN) && MM_B_LOADS && B_COL_IN(l))
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
             if (A_IN(l)) fetch_a(pos_a, loadr_a, loadc_a + l, a_lane[l / loadstride_a], a_raw[l / loadstride_a]);
         }
@@ -577,6 +584,7 @@ void main() {
         }
 #undef A_IN
 #undef B_IN
+#undef B_COL_IN
     } else
 #endif
     {

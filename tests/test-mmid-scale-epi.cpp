@@ -11,7 +11,7 @@
 // ggml_vk_can_fuse mirror (ggml_vk_mmid_gemm_uses_q8_1) - it must run the unfused GEMM + MUL (one "mmid_scale_epi: fallback" WARN),
 // never assert, and print the default arm's hashes. Shapes: the production expert GEMMs (gate/up 640 x 2560 q4_K / q6_K / iq3_s, down
 // 2560 x 640 q5_0 / q8_0; top-10, broadcast B for gate/up; 32 experts, not 512, to bound host RAM) at n = 65 / 512 / 2048 and the
-// f32 / f16 A paths.
+// f32 / f16 A paths, plus the rows20 router cases (expert tiles of 20 rows, incl. the multi-pass m-tile B loads).
 // Not a ctest: needs a Vulkan device (SKIP otherwise).
 // usage: test-mmid-scale-epi [seed]
 
@@ -32,6 +32,7 @@ struct epi_case {
     int64_t m, k, n;
     int n_mats, n_used;
     bool bcast;
+    bool rows20 = false;   // the fixed router below instead of the skewed random one
 };
 
 static uint64_t fnv1a(const void * p, size_t n) {
@@ -86,8 +87,16 @@ static int run_case(ggml_backend_t be, const epi_case & c, std::mt19937 & rng, u
         std::vector<int32_t> fi(ggml_nelements(ids));
         std::vector<int32_t> perm(c.n_mats);
         for (int i = 0; i < c.n_mats; i++) { perm[i] = i; }
+        // rows20 (n 200, n_used 2, n_mats 8): slot 0 sends tokens 0..147 to expert 0 (148 rows = 128 + 20: its third BN-64 tile
+        // holds 20 rows) and 148..167 to expert 1 (one tile of 20 rows); slot 1 spreads over 3..7. On a multi-pass B load
+        // (loadstride_b < BN: the f32 m tile, block 128 / BN 64 / BK 16 / LOAD_VEC_B 4, and the quantized m tile at m 64, BK 32 /
+        // LOAD_VEC_B 8) a loading invocation of such a tile also reaches the columns >= 20 (load_b_to_shmem / fetch_b, [TAG_MMID_SKIP])
+        for (int64_t t = 0; c.rows20 && t < c.n; t++) {
+            fi[t * c.n_used + 0] = t < 148 ? 0 : t < 168 ? 1 : 2;
+            fi[t * c.n_used + 1] = 3 + (int) (t % 5);
+        }
         // a skewed router: half of the tokens draw from the first 16 experts (deep, multi-tile experts), the rest from all
-        for (int64_t t = 0; t < c.n; t++) {
+        for (int64_t t = 0; !c.rows20 && t < c.n; t++) {
             const int pool = (t % 2 == 0 && c.n_mats > 16 && c.n_used <= 16) ? 16 : c.n_mats;
             for (int s = 0; s < c.n_used; s++) {
                 std::uniform_int_distribution<int> pick(s, pool - 1);
@@ -157,6 +166,14 @@ int main(int argc, char ** argv) {
     cases.push_back({ GGML_TYPE_F32, 256, 512, 300, 32, 4, false });
     cases.push_back({ GGML_TYPE_F16, 256, 512, 300, 32, 4, false });
     cases.push_back({ GGML_TYPE_Q4_K, 768, 2048, 512, 128, 8, false });   // the test-backend-ops MUL_MAT_ID_FUSION shape
+    // rows20: tiles of 20 rows (n 200, k aligned) - m 256: f16 (m tile, 1-pass B load), f32 (m tile, 2-pass), q4_K / q8_0 / iq3_s
+    // (G2a l tile); m 64: q4_K / q8_0 (quantized m tile, 2-pass with LOAD_VEC_B 8)
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S }) {
+        cases.push_back({ t, 256, 512, 200, 8, 2, false, true });
+    }
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
+        cases.push_back({ t, 64, 512, 200, 8, 2, false, true });
+    }
 
     std::mt19937 rng(seed);
     int n_fail = 0, n_err = 0;
@@ -164,8 +181,8 @@ int main(int argc, char ** argv) {
         uint64_t h = 0;
         size_t nd = 0;
         const int rc = run_case(be, c, rng, &h, &nd);
-        printf("[mmid-scale-epi] type=%s m=%" PRId64 " k=%" PRId64 " n=%" PRId64 " n_mats=%d n_used=%d bcast=%d diff=%zu hash=%016" PRIx64 " %s\n",
-               ggml_type_name(c.type_a), c.m, c.k, c.n, c.n_mats, c.n_used, (int) c.bcast, nd, h,
+        printf("[mmid-scale-epi] type=%s m=%" PRId64 " k=%" PRId64 " n=%" PRId64 " n_mats=%d n_used=%d bcast=%d%s diff=%zu hash=%016" PRIx64 " %s\n",
+               ggml_type_name(c.type_a), c.m, c.k, c.n, c.n_mats, c.n_used, (int) c.bcast, c.rows20 ? " router=rows20" : "", nd, h,
                rc == 0 ? "EXACT" : rc == 1 ? "DIFFERS" : "ERROR");
         n_fail += rc == 1;
         n_err  += rc == 2;
