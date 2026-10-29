@@ -24135,6 +24135,25 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
     }
+
+    // [TAG_RMS_NORM_EXT] GGML_VK_GRAPH_ORDER_LOG=1 (default off, read once): the optimised node order, one stderr line
+    // "[vk-order] nodes=N OP,OP,..." (UNARY as its unary op) the first time each node count is seen, so a fusion's
+    // adjacency can be checked on a real graph without a debugger. No effect on the order or on any result.
+    static const bool order_log = ggml_vk_env_bool("GGML_VK_GRAPH_ORDER_LOG", false);
+    if (order_log) {
+        static std::mutex order_log_mutex;
+        static std::set<int> order_log_seen;
+        std::lock_guard<std::mutex> lock(order_log_mutex);
+        if (order_log_seen.insert(graph->n_nodes).second) {
+            std::string line = "[vk-order] nodes=" + std::to_string(graph->n_nodes) + " ";
+            for (int i = 0; i < graph->n_nodes; ++i) {
+                const ggml_tensor * n = graph->nodes[i];
+                line += i ? "," : "";
+                line += n->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(n)) : ggml_op_name(n->op);
+            }
+            fprintf(stderr, "%s\n", line.c_str());
+        }
+    }
 }
 
 static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
