@@ -1080,6 +1080,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+            max_n_tensors += hparams.n_layer_all*4; // [TAG_MERGE_ROWS] one extra view tensor per merge_rows pair (<= 4 per layer)
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
             }
@@ -1342,6 +1343,95 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     return tensor;
+}
+
+// [TAG_MERGE_ROWS] see llama-model-loader.h. The container is the tensor create_tensor made for `a` (renamed, widened
+// to both row blocks): it precedes b in its context (a was created first), so ggml_backend_alloc_ctx_tensors_from_buft
+// allocates it before it initialises the views (b, then the new view for a, both after it in the context). The views are leaves (op NONE): a graph
+// that reads them as weights gets no extra VIEW node. load_all_data finds the views by their file names and uploads
+// each into its rows of the container (ggml_backend_tensor_set writes through view_src); the container has no file
+// weight and is skipped there. The weight bytes are those of the two file tensors, unchanged.
+ggml_tensor * llama_model_loader::merge_rows(ggml_tensor *& a, ggml_tensor *& b, const std::string & name) {
+    if (a == nullptr || b == nullptr || files.empty()) {
+        return nullptr;
+    }
+    if (a->type != b->type || a->ne[0] != b->ne[0] || ggml_n_dims(a) > 2 || ggml_n_dims(b) > 2 ||
+        a->view_src != nullptr || b->view_src != nullptr || a->data != nullptr || b->data != nullptr) {
+        return nullptr;
+    }
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || a->nb[1] != b->nb[1]) {
+        return nullptr;
+    }
+    const size_t offs_b = ggml_nbytes(a);
+    if (offs_b % 256 != 0) {
+        return nullptr;
+    }
+    // both in the same buffer-type context
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_type_t buft = nullptr;
+    for (auto & [ctx_buft, ctx_ptr] : ctx_map) {
+        if (ggml_get_tensor(ctx_ptr.get(), a->name) == a) {
+            ctx  = ctx_ptr.get();
+            buft = ctx_buft;
+            break;
+        }
+    }
+    if (ctx == nullptr || ggml_get_tensor(ctx, b->name) != b) {
+        return nullptr;
+    }
+    // the container (the old a) must precede b in the context: the allocator initialises a view only after its source
+    {
+        bool b_after_a = false;
+        for (ggml_tensor * t = ggml_get_next_tensor(ctx, a); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == b) {
+                b_after_a = true;
+                break;
+            }
+        }
+        if (!b_after_a) {
+            return nullptr;
+        }
+    }
+    // device memory only: host buffer types may be mapped from the file or repacked on upload
+    if (ggml_backend_buft_is_host(buft)) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return nullptr;
+    }
+    if (use_mmap) {
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        if (props.caps.buffer_from_host_ptr && buft == ggml_backend_dev_buffer_type(dev)) {
+            return nullptr;
+        }
+    }
+
+    const std::string name_a = a->name;
+    const int64_t n_a = a->ne[1];
+
+    // the old `a` becomes the container
+    ggml_tensor * container = a;
+    container->ne[1] = n_a + b->ne[1];
+    for (int i = 2; i < GGML_MAX_DIMS; ++i) {
+        container->nb[i] = container->nb[i - 1] * container->ne[i - 1];
+    }
+    ggml_set_name(container, name.c_str());
+
+    // b: a leaf view at row n_a
+    b->view_src  = container;
+    b->view_offs = offs_b;
+
+    // a: a new leaf view at row 0, after b in the context
+    ggml_tensor * va = ggml_new_tensor_2d(ctx, container->type, container->ne[0], n_a);
+    va->view_src  = container;
+    va->view_offs = 0;
+    ggml_set_name(va, name_a.c_str());
+
+    a = va;
+    merged.push_back({ container, va, b });
+    return container;
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {

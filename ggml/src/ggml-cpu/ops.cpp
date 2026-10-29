@@ -4569,7 +4569,9 @@ static void ggml_compute_forward_scale_f32(
 
     const ggml_tensor * src0 = dst->src[0];
 
-    GGML_ASSERT(ggml_is_contiguous(src0));
+    // [TAG_MERGE_ROWS] the rows may be strided (a row view of a merged qwen4exp matmul output): row i1 is at i1*nb01,
+    // which holds whenever the elements of a row are contiguous and the higher dims are packed over the rows
+    GGML_ASSERT(src0->nb[0] == sizeof(float) && ggml_is_contiguous_1(src0));
     GGML_ASSERT(ggml_is_contiguous(dst));
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
 

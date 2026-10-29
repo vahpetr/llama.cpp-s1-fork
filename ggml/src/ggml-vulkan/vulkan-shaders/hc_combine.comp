@@ -19,7 +19,7 @@
 //
 //   data_a residual [ne0, ne1, ne2]  contiguous f32
 //   data_b block    [ne0, ne2]       contiguous f32, broadcast over ne1
-//   data_c inject   [ne1, ne2]       contiguous f32, broadcast over ne0
+//   data_c inject   [ne1, ne2]       contiguous f32, broadcast over ne0 (HC_INJ_STRIDED: rows inj_nb1 elements apart)
 //   data_d out      [ne0, ne1, ne2]  contiguous f32
 layout (binding = 0) readonly  buffer A {float data_a[];};
 layout (binding = 1) readonly  buffer B {float data_b[];};
@@ -34,6 +34,9 @@ layout (push_constant) uniform parameter {
     uint32_t ne2;
     float    s1;
     float    s2;
+#ifdef HC_INJ_STRIDED
+    uint32_t inj_nb1;   // [TAG_MERGE_ROWS] inject's row stride in elements (a row view of the merged hc down | inject output)
+#endif
 } p;
 
 // SCALE(inject, s1) -> UNARY(SIGMOID) -> SCALE(., s2), one f32 rounding per step
@@ -54,7 +57,11 @@ void main() {
     const uint32_t t   = i12 / p.ne1;
     const uint32_t idx = i12 * p.ne0 + i0;
 
+#ifdef HC_INJ_STRIDED
+    const float w = hc_weight(t * p.inj_nb1 + (i12 - t * p.ne1));
+#else
     const float w = hc_weight(i12);
+#endif
 
     // MUL(repeat(block), w) and ADD(residual, .) as two separately rounded steps
     precise float bw  = data_b[t * p.ne0 + i0] * w;

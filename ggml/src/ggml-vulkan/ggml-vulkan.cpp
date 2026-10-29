@@ -1134,6 +1134,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_scale_f32;
     // [TAG_HC_MIX_TAIL] SCALE + UNARY(SILU)
     vk_pipeline pipeline_scale_silu_f32;
+    // [TAG_MERGE_ROWS] strided-source twins of scale / scale_silu (a row view of a merged qwen4exp matmul output)
+    vk_pipeline pipeline_scale_nc_f32;
+    vk_pipeline pipeline_scale_silu_nc_f32;
     vk_pipeline pipeline_log[2];
     vk_pipeline pipeline_tri[2];
     vk_pipeline pipeline_diag[2];
@@ -1267,6 +1270,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_out_prod_f32;
     vk_pipeline pipeline_hc_combine_f32;
     vk_pipeline pipeline_add_softplus_mul_f32;
+    // [TAG_MERGE_ROWS] row-strided inject / alpha (row views of the merged hc down | inject and beta | alpha outputs)
+    vk_pipeline pipeline_hc_combine_strided_f32;
+    vk_pipeline pipeline_add_softplus_mul_strided_f32;
     vk_pipeline pipeline_snake_f32;
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;
@@ -2197,6 +2203,22 @@ struct vk_op_hc_combine_push_constants {
 struct vk_op_add_softplus_mul_push_constants {
     uint32_t ne0;
     uint32_t ne;
+};
+
+// [TAG_MERGE_ROWS] the strided variants: the contiguous layout plus the row stride (elements) of inject / alpha
+struct vk_op_hc_combine_strided_push_constants {
+    uint32_t ne0;
+    uint32_t ne1;
+    uint32_t ne2;
+    float    s1;
+    float    s2;
+    uint32_t inj_nb1;
+};
+
+struct vk_op_add_softplus_mul_strided_push_constants {
+    uint32_t ne0;
+    uint32_t ne;
+    uint32_t a_nb1;
 };
 
 struct vk_op_pool1d_push_constants {
@@ -3176,6 +3198,15 @@ static bool ggml_vk_fusion_count_enabled() {
     return enabled;
 }
 
+// [TAG_MERGE_ROWS] GGML_VK_DISPATCH_COUNT=1 (default off, read once): one stderr line per graph,
+//   [vk-dispatch-count] graph nodes=N dispatches=M
+// the compute dispatches ggml_vk_dispatch_pipeline recorded for that graph (every shader launch: fused or not, incl. the
+// q8_1 quantize / dequant staging). A separate line so the [vk-fusion-count] format the gates parse stays as it was.
+static bool ggml_vk_dispatch_count_enabled() {
+    static const bool enabled = ggml_vk_env_bool("GGML_VK_DISPATCH_COUNT", false);
+    return enabled;
+}
+
 // GGML_VK_FUSION_COUNT: the per-graph tally. Keys are the lower-case fusion_string of the match
 // site, optionally prefixed (with "vetoed:" for a match the overlap veto undid).
 static void ggml_vk_fusion_count_add(std::map<std::string, int> & counts, const char * prefix, const char * fusion_string) {
@@ -3565,6 +3596,8 @@ struct ggml_backend_vk_context {
     // (op, fused pattern, applied misalignment) and once per dispatch (pipeline name + workgroup
     // counts, which is where the shader and the split_k/rows-per-wg choice show up).
     uint64_t fusion_sig {};
+    // [TAG_MERGE_ROWS] GGML_VK_DISPATCH_COUNT: dispatches recorded for the current graph
+    uint32_t dispatch_count {};
     // GGML_VK_FUSION_COUNT: matches GGML_VK_DISABLE_FUSION_PATTERNS vetoed in the current graph,
     // reported as disabled:<name>=<count> so a bisect arm can be proven to have acted
     std::map<std::string, int> fusion_count_disabled;
@@ -7482,6 +7515,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_scale_f32, "scale_f32", scale_f32_len, scale_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_scale_silu_f32, "scale_silu_f32", scale_silu_f32_len, scale_silu_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_scale_nc_f32, "scale_nc_f32", scale_nc_f32_len, scale_nc_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_scale_silu_nc_f32, "scale_silu_nc_f32", scale_silu_nc_f32_len, scale_silu_nc_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_log[0], "log_f32", log_f32_len, log_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_log[1], "log_f16", log_f16_len, log_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -7800,6 +7835,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_hc_combine_f32, "hc_combine_f32", hc_combine_f32_len, hc_combine_f32_data, "main", 4, sizeof(vk_op_hc_combine_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_add_softplus_mul_f32, "add_softplus_mul_f32", add_softplus_mul_f32_len, add_softplus_mul_f32_data, "main", 4, sizeof(vk_op_add_softplus_mul_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_hc_combine_strided_f32, "hc_combine_strided_f32", hc_combine_strided_f32_len, hc_combine_strided_f32_data, "main", 4, sizeof(vk_op_hc_combine_strided_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_add_softplus_mul_strided_f32, "add_softplus_mul_strided_f32", add_softplus_mul_strided_f32_len, add_softplus_mul_strided_f32_data, "main", 4, sizeof(vk_op_add_softplus_mul_strided_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32,  "snake_f32",  snake_f32_len,  snake_f32_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f16,  "snake_f16",  snake_f16_len,  snake_f16_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
@@ -10475,6 +10512,9 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
         std::cerr << "(" << buffer.buffer << ", " << buffer.offset << ", " << buffer.range << "), ";
     }
     std::cerr << "}, (" << wg0 << "," << wg1 << "," << wg2 << "))");
+    if (ggml_vk_dispatch_count_enabled()) {
+        ctx->dispatch_count++;
+    }
     if (ggml_vk_fusion_count_enabled()) {
         // GGML_VK_FUSION_COUNT numerics signature: which shader ran, and over how many workgroups.
         // The workgroup counts are where an offset-dependent decision that changes the arithmetic
@@ -14652,6 +14692,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_SCALE:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            // [TAG_MERGE_ROWS] a strided source takes the src0_idx() twin; contiguous sources keep the original pipelines
+            if (!ggml_is_contiguous(src0)) {
+                return ctx->fused_scale_silu ? ctx->device->pipeline_scale_silu_nc_f32 : ctx->device->pipeline_scale_nc_f32;
+            }
             return ctx->fused_scale_silu ? ctx->device->pipeline_scale_silu_f32 : ctx->device->pipeline_scale_f32;
         }
         return nullptr;
@@ -18486,9 +18530,6 @@ static void ggml_vk_add_softplus_mul_dispatch_fused(ggml_backend_vk_context * ct
     const ggml_tensor * bias  = add->src[1];
     const ggml_tensor * scale = mul->src[1];
 
-    vk_pipeline pipeline = ctx->device->pipeline_add_softplus_mul_f32;
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-
     vk_op_add_softplus_mul_push_constants pc{};
     pc.ne0 = static_cast<uint32_t>(mul->ne[0]);
     pc.ne  = static_cast<uint32_t>(ggml_nelements(mul));
@@ -18499,6 +18540,20 @@ static void ggml_vk_add_softplus_mul_dispatch_fused(ggml_backend_vk_context * ct
     vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, mul);
 
     std::array<uint32_t, 3> elements = { pc.ne, 1, 1 };
+
+    if (!ggml_is_contiguous(alpha)) {
+        // [TAG_MERGE_ROWS] row-strided alpha: the same three steps, alpha read at row * a_nb1 + i0
+        vk_pipeline pipeline = ctx->device->pipeline_add_softplus_mul_strided_f32;
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        const vk_op_add_softplus_mul_strided_push_constants pcs = {
+            pc.ne0, pc.ne, static_cast<uint32_t>(alpha->nb[1] / sizeof(float)),
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a_buf, b_buf, c_buf, d_buf }, pcs, elements);
+        return;
+    }
+
+    vk_pipeline pipeline = ctx->device->pipeline_add_softplus_mul_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a_buf, b_buf, c_buf, d_buf }, pc, elements);
 }
 
@@ -18515,9 +18570,6 @@ static void ggml_vk_hc_combine_dispatch_fused(ggml_backend_vk_context * ctx, vk_
     const ggml_tensor * inject   = scale1->src[0];
     const ggml_tensor * residual = add->src[0];
 
-    vk_pipeline pipeline = ctx->device->pipeline_hc_combine_f32;
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-
     vk_op_hc_combine_push_constants pc{};
     pc.ne0 = static_cast<uint32_t>(add->ne[0]);
     pc.ne1 = static_cast<uint32_t>(add->ne[1]);
@@ -18531,6 +18583,20 @@ static void ggml_vk_hc_combine_dispatch_fused(ggml_backend_vk_context * ctx, vk_
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, add);
 
     std::array<uint32_t, 3> elements = { pc.ne0, pc.ne1 * pc.ne2, 1 };
+
+    if (!ggml_is_contiguous(inject)) {
+        // [TAG_MERGE_ROWS] row-strided inject: the same expression, inject read at t * inj_nb1 + c
+        vk_pipeline pipeline = ctx->device->pipeline_hc_combine_strided_f32;
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        const vk_op_hc_combine_strided_push_constants pcs = {
+            pc.ne0, pc.ne1, pc.ne2, pc.s1, pc.s2, static_cast<uint32_t>(inject->nb[1] / sizeof(float)),
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { res_buf, blk_buf, inj_buf, dst_buf }, pcs, elements);
+        return;
+    }
+
+    vk_pipeline pipeline = ctx->device->pipeline_hc_combine_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { res_buf, blk_buf, inj_buf, dst_buf }, pc, elements);
 }
 
@@ -21887,7 +21953,14 @@ static bool ggml_vk_can_fuse_add_softplus_mul(ggml_backend_vk_context * ctx, con
     if (!ggml_are_same_shape(alpha, add) || !ggml_are_same_shape(add, unary) || !ggml_are_same_shape(unary, mul)) {
         return false;
     }
-    if (!ggml_is_contiguous(alpha) || !ggml_is_contiguous(mul)) {
+    if (!ggml_is_contiguous(mul)) {
+        return false;
+    }
+    // [TAG_MERGE_ROWS] alpha may instead be row-strided (a row view of the merged beta | alpha output): unit element
+    // stride, rows a whole number of elements apart, the higher dims packed over the rows (add_softplus_mul_strided)
+    if (!ggml_is_contiguous(alpha) &&
+        (alpha->nb[0] != sizeof(float) || alpha->nb[1] % sizeof(float) != 0 ||
+         alpha->nb[2] != alpha->nb[1] * alpha->ne[1] || alpha->nb[3] != alpha->nb[2] * alpha->ne[2])) {
         return false;
     }
     // ssm_dt / ssm_a: one value per row element, broadcast over every row
@@ -21982,9 +22055,12 @@ static bool ggml_vk_can_fuse_hc_combine(ggml_backend_vk_context * ctx, const str
         reshape->ne[2] != add->ne[2] || reshape->ne[3] != 1) {
         return false;
     }
-    // the shader indexes every buffer linearly
-    if (!ggml_is_contiguous(add) || !ggml_is_contiguous(residual) ||
-        !ggml_is_contiguous(block) || !ggml_is_contiguous(inject)) {
+    // the shader indexes every buffer linearly; inject may instead be row-strided ([TAG_MERGE_ROWS]: a row view of the
+    // merged hc down | inject output), read by hc_combine_strided at t * inj_nb1 + c
+    if (!ggml_is_contiguous(add) || !ggml_is_contiguous(residual) || !ggml_is_contiguous(block)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(inject) && (inject->nb[0] != sizeof(float) || inject->nb[1] % sizeof(float) != 0)) {
         return false;
     }
     return true;
@@ -22261,7 +22337,9 @@ static bool ggml_vk_can_fuse_scale_silu(ggml_backend_vk_context * ctx, const str
     if (ggml_get_op_params_f32(scale, 1) != 0.0f) {
         return false;
     }
-    if (!ggml_are_same_shape(x, silu) || !ggml_is_contiguous(x) || !ggml_is_contiguous(silu)) {
+    // [TAG_MERGE_ROWS] x may be strided (a row view of the merged hc down | inject output): scale_silu_nc reads it through
+    // src0_idx(); the destination is indexed linearly
+    if (!ggml_are_same_shape(x, silu) || !ggml_is_contiguous(silu)) {
         return false;
     }
     return true;
@@ -22428,6 +22506,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->fusion_count_get_rows_flat = 0;
     ctx->fusion_sig = vk_fnv1a_seed;
     ctx->fusion_count_disabled.clear();
+    ctx->dispatch_count = 0;
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -22991,6 +23070,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                  (unsigned long long) ggml_vk_fnv1a(ctx->fusion_sig, &add_rms, sizeof(add_rms)));
         line += sig;
         fprintf(stderr, "%s\n", line.c_str());
+    }
+    if (ggml_vk_dispatch_count_enabled()) {
+        fprintf(stderr, "[vk-dispatch-count] graph nodes=%d dispatches=%u\n", cgraph->n_nodes, ctx->dispatch_count);
     }
 
     if (prof) {
@@ -24457,7 +24539,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_FILL:
             return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
         case GGML_OP_SCALE:
-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+            // [TAG_MERGE_ROWS] a strided source runs on scale_nc (src0_idx); the destination is always contiguous
+            return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
         case GGML_OP_PAD:
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_ROLL:

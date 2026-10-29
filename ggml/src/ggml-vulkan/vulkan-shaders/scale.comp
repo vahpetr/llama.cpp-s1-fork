@@ -18,7 +18,13 @@ void main() {
             continue;
         }
 
+#ifdef SCALE_NC
+        // [TAG_MERGE_ROWS] a strided source (a row view of a merged matmul output): src0_idx() walks its strides; the
+        // destination is contiguous. The value expression is the contiguous variant's, character for character.
+        data_d[get_doffset() + idx] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + src0_idx(idx)]) * FLOAT_TYPE(p.param1) + FLOAT_TYPE(p.param2));
+#else
         data_d[get_doffset() + idx] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + idx]) * FLOAT_TYPE(p.param1) + FLOAT_TYPE(p.param2));
+#endif
         idx += num_threads;
     }
 }

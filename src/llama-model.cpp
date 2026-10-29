@@ -33,6 +33,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <set>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1672,8 +1673,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             output->type == GGML_TYPE_NVFP4 &&
             (output_s || output_in_s)));
     // populate tensors_by_name
+    // [TAG_MERGE_ROWS] the merge_rows containers are not file tensors and stay out; each pair's view of `a` (appended to
+    // the context later) is listed in the container's slot, which is where create_tensor put `a`. So the list - names,
+    // order and buffer types, which the disk-cache placement key hashes (placement_desc) - is the one the separate
+    // tensors gave.
+    std::map<const ggml_tensor *, ggml_tensor *> merged_a_of_container;
+    std::set<const ggml_tensor *> merged_a;
+    for (const auto & m : ml.merged) {
+        merged_a_of_container[m.container] = m.a;
+        merged_a.insert(m.a);
+    }
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
+            if (merged_a.count(cur)) {
+                continue;
+            }
+            auto it = merged_a_of_container.find(cur);
+            if (it != merged_a_of_container.end()) {
+                tensors_by_name.emplace_back(ggml_get_name(it->second), it->second);
+                continue;
+            }
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }

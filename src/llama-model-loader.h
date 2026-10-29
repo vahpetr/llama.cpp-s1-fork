@@ -121,6 +121,16 @@ struct llama_model_loader {
 
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
+    // [TAG_MERGE_ROWS] load-time row merges (merge_rows): each container holds [a | b] in one allocation and the file
+    // tensors a and b are leaf views of it (op NONE, view_src = container). The containers are not file tensors: they
+    // are left out of the model's tensors_by_name, where the view of a takes the container's place (a's original slot).
+    struct merged_rows {
+        ggml_tensor * container;
+        ggml_tensor * a;
+        ggml_tensor * b;
+    };
+    std::vector<merged_rows> merged;
+
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
     std::string first_tensor_moved_name;
@@ -194,6 +204,14 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // [TAG_MERGE_ROWS] turn two freshly created 2D weights that read the same input (a created before b, same
+    // type, same ne0, same buffer type) into row views of one [ne0, ne1(a) + ne1(b)] container named `name`, so one
+    // MUL_MAT can compute both. Returns the container, or nullptr (a and b left exactly as created) when the pair
+    // cannot be merged: different context / type / width, b's offset not a multiple of 256 bytes, a host or mmap
+    // host-pointer buffer type (the mmap / repack paths place every file tensor themselves), or no files (virtual
+    // model). On success `a` is replaced by a new view tensor of the same name and the old one becomes the container.
+    ggml_tensor * merge_rows(ggml_tensor *& a, ggml_tensor *& b, const std::string & name);
 
     void done_getting_tensors(bool partial = false) const;
 
