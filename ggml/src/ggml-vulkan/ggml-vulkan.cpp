@@ -22092,6 +22092,13 @@ static bool ggml_vk_can_fuse_hc_combine(ggml_backend_vk_context * ctx, const str
     if (!ggml_is_contiguous(inject) && (inject->nb[0] != sizeof(float) || inject->nb[1] % sizeof(float) != 0)) {
         return false;
     }
+    // the shader applies no per-tensor offset, so reject misaligned bindings ([TAG_MERGE_ROWS]: the inject row view of
+    // the merged output starts n_lo * 4 B into it)
+    for (const ggml_tensor * t : { residual, block, inject, add }) {
+        if (get_misalign_bytes(ctx, t) != 0) {
+            return false;
+        }
+    }
     return true;
 }
 
