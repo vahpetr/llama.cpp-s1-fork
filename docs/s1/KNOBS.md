@@ -125,6 +125,24 @@ against the code for this table.
 | `GGML_VK_BUF_LOG=1` | 0 | 0244 (v62 62.1, `[TAG_VK_BUF_LOG]`): one INFO line per Vulkan buffer allocation, `[vk-buf] <device> kind=device\|host\|other size=<B> (<MiB>) type=<memory type index> heap=<heap> flags=<VkMemoryPropertyFlags> wc=<0\|1> import=<0\|1>`; kind device = `ggml_vk_create_buffer_device` (weights, KV / recurrent / pool buffers, preallocs), host = pinned host memory, other = staging / aux; wc=1 = host-visible without HOST_CACHED (write-combined for CPU reads). Prints only (the #30049 read-path change is parked, R129) | DIAG | - |
 | `GGML_SCHED_PROFILE=1`, `GGML_GET_ROWS_STATS=1\|2` | 0 | host-side scheduler timers, get_rows census | DIAG | - |
 
+## v67 / v68 candidate - qwen4exp load-time projection merges (0290) and the device gate (0313, 0314)
+
+0290 (v67) merges the projection pairs that read the same input (hc down | inject, beta | alpha, qkv | z) at load into one
+container and runs the merged matmul for ubatches of at most `LLAMA_QWEN4EXP_MERGE_MAX_N` tokens (decode, MTP draft and
+verify). That is bit-identical only where a mat-vec row is computed the same way whatever the matrix row count; 0313 (v68
+candidate) takes the merged matmul only on devices whose backend reports that property: ggml-vulkan on AMD + RADV (gfx1151,
+780M, verified). On other GPUs (NVIDIA, Intel, AMDVLK / AMD proprietary) the containers run as two matmuls over their views,
+the kernels of the unmerged build, with one WARN `qwen4exp merge: merged matmul off on <device>`; **from 0313 on non-AMD
+users no longer need `LLAMA_QWEN4EXP_MERGE=0`** (on a v67 build without 0313 they should set it). The load log line
+`qwen4exp merge_rows: hc A/B, ba C/D, qkvz E/F` counts the merged pairs at load and is unchanged by the gate (one line for
+the trunk, one for the MTP head).
+
+| knob | default | effect | class | prod |
+|---|---|---|---|---|
+| `LLAMA_QWEN4EXP_MERGE=0\|hc,ba,qkvz` | unset = all three | 0290: which pairs merge at load (`0` = none: the load and every graph are the unmerged build's); 0313 adds the device gate above on top of it | EXACT on AMD + RADV | - |
+| `LLAMA_QWEN4EXP_MERGE_MAX_N=N` | 8 | 0290: the largest ubatch that takes the merged matmul (8 = ggml-vulkan's mat-vec column limit); larger values are a negative control (the merged GEMM is not identical) | DIAG | - |
+| `GGML_VK_QSA_TOPK_NOKEYS_CHECK=1` | off | 0243 debug word; since 0314 one word per backend context (read and cleared at that context's synchronize, warned once per context) instead of one per device | DIAG | - |
+
 ## v64 package - patches 0262, 0263, 0265
 
 All three are in v64 and none is set in my composes: the "default" column is what v64 runs. On by default, EXACT as part of the
