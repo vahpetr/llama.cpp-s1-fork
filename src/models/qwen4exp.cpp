@@ -199,6 +199,9 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
 // ubatches keep the two matmuls over the views - the very kernels of the separate tensors (the GEMM tile, split_k and
 // the G1 tile table depend on M). LLAMA_QWEN4EXP_MERGE_MAX_N=<n> raises the bound (a negative control for the exactness
 // tests: above 8 the merged GEMM is not guaranteed identical).
+// The merged matmul runs only on a device whose backend reports that M-invariance (ggml-vulkan
+// "ggml_backend_dev_mat_vec_m_invariant" = AMD + RADV, verified on gfx1151 / 780M; R146): on other drivers M can switch
+// the mat-vec dispatch class (NVIDIA LARGE -> SUBGROUP), so they keep the two matmuls over the views.
 //
 // Every consumer keeps its node: the merged output is cut into views (no cont, no reshape), and at n_tokens >= 2 those
 // views are row-strided. The Vulkan fusions that read them (scale_silu, hc_combine, add_softplus_mul) and the plain
@@ -247,14 +250,31 @@ static int64_t qwen4exp_merge_max_n() {
     return n;
 }
 
-// the weight lives in a ggml-vulkan device buffer (the loader merges into device, non-host buffer types only)
+// the weight lives in a ggml-vulkan device buffer (the loader merges into device, non-host buffer types only) of a device
+// whose backend reports the mat-vec M-invariance (ggml-vulkan "ggml_backend_dev_mat_vec_m_invariant": AMD + RADV, R146;
+// on other drivers the dispatch class can depend on M, so the graph keeps the two matmuls over the views - the kernels of
+// the unmerged build - and LLAMA_QWEN4EXP_MERGE=0 is not needed there)
 static bool qwen4exp_on_vulkan(const ggml_tensor * w) {
     if (w->buffer == nullptr) {
         return false;
     }
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer));
     ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
-    return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0;
+    if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "Vulkan") != 0) {
+        return false;
+    }
+    using m_invariant_fn = bool (*)(ggml_backend_dev_t);
+    auto * fn = (m_invariant_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_mat_vec_m_invariant");
+    const bool ok = fn != nullptr && fn(dev);
+    if (!ok) {
+        static std::atomic<bool> warned { false };
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN("%s: qwen4exp merge: merged matmul off on %s (mat-vec M-invariance not verified for this device; "
+                           "the merged containers run as two matmuls over their views = the unmerged kernels)\n", __func__,
+                           ggml_backend_dev_description(dev));
+        }
+    }
+    return ok;
 }
 
 // the merged matmul for this ubatch: a converter-merged file has no separate halves, so it always takes it. A load-time

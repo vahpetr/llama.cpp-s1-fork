@@ -25009,10 +25009,28 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// [TAG_MERGE_ROWS] capability for the model code (qwen4exp load-time projection merges, contrib 0290): true where the
+// mat-vec dispatch (n <= mul_mat_vec_max_cols) of an M-row matrix is verified to compute each output row with the same
+// pipeline and the same per-row reduction whatever M is, so a [a | b] container gives bit-identical rows to a and b alone.
+// Verified on AMD + RADV only (gfx1151 / 780M: D-gate 262k/1M, e2e dumps, test-qwen4exp-merge; astra v67 (a)): elsewhere
+// M can change the dispatch class (NVIDIA: LARGE -> SUBGROUP, see ggml_vk_get_dequantize_mul_mat_vec) = another
+// reduction order. Like onepass (R141), the verified device class only (R146).
+static bool ggml_backend_vk_dev_mat_vec_m_invariant(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_vk_reg()) {
+        return false;
+    }
+    const ggml_backend_vk_device_context * dctx = (const ggml_backend_vk_device_context *) dev->context;
+    const vk_device device = ggml_vk_get_device(dctx->device);
+    return device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eMesaRadv;
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_fa_kv_ids") == 0) { // [TAG_QSA_INDEXED_FA] FLASH_ATTN_EXT reads src[5]
         return (void *) ggml_backend_vk_reg_get_proc_address;
+    }
+    if (strcmp(name, "ggml_backend_dev_mat_vec_m_invariant") == 0) { // [TAG_MERGE_ROWS] bool (*)(ggml_backend_dev_t)
+        return (void *) ggml_backend_vk_dev_mat_vec_m_invariant;
     }
     return NULL;
 }
