@@ -538,6 +538,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_HC_ATTN_DOWN_INJECT,                    "blk.%d.hc_attn_down_inject" },
     { LLM_TENSOR_HC_FFN_DOWN_INJECT,                     "blk.%d.hc_ffn_down_inject" },
     { LLM_TENSOR_ATTN_QKV_GATE,                          "blk.%d.attn_qkv_gate" },
+    // upstream #31028 (2280f0fd1) name and layout: conversion/qwen4exp.py writes torch.cat([ssm_beta, ssm_alpha], dim=0),
+    // i.e. [n_embd, 2*n_v_heads] = all beta rows then all alpha rows (not the grouped qwen3next ssm_ba)
     { LLM_TENSOR_SSM_BETA_ALPHA_CAT,                     "blk.%d.ssm_beta_alpha" },
     { LLM_TENSOR_PLE_KEY,                                "blk.%d.ple_key" },
     { LLM_TENSOR_PLE_VALUE,                              "blk.%d.ple_value" },
