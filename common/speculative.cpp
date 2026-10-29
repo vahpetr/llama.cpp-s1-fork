@@ -1573,8 +1573,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     //   H1 LLAMA_SPEC_DRAFT_P_CHAIN=x    the chain ends when the product of the head's top-1 probabilities over the
     //                                    positions drafted so far (incl. this one) drops below x (gates the chain, not
     //                                    only each token as --spec-draft-p-min does)
+    //   H5 LLAMA_SPEC_DRAFT_Q_STOP=x     sampled (U7 rejection) rounds only: a draw whose draft probability q(x) < x is
+    //                                    dropped and ends the chain (the target samples that position itself, so the
+    //                                    rejection sampler stays distribution-exact)
     bool  stop_eog = false;
     float p_chain  = 0.0f;
+    float q_stop   = 0.0f;
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1698,6 +1702,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         stop_eog = spec_env_flag("LLAMA_SPEC_DRAFT_STOP_EOG");
         p_chain  = spec_env_prob("LLAMA_SPEC_DRAFT_P_CHAIN");
+        q_stop   = spec_env_prob("LLAMA_SPEC_DRAFT_Q_STOP");
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -2039,6 +2044,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (p_chain > 0.0f) {
                     p_run[seq_id] *= cur_p->data[0].p;
                     if (p_run[seq_id] < p_chain) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+                }
+
+                // [TAG_B68_DRAFT_KNOBS] H5: a sampled round drops an unlikely draw and ends the chain
+                if (q_stop > 0.0f && dp.result_q) {
+                    float q_id = 0.0f;
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        if (cur_p->data[k].id == id) {
+                            q_id = cur_p->data[k].p;
+                            break;
+                        }
+                    }
+                    if (q_id < q_stop) {
                         drafting[seq_id] = false;
                         n_drafting--;
                         continue;
