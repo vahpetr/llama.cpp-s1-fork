@@ -433,11 +433,11 @@ off); a set knob prints a WARN proof line at start.
 
 | variable | effect |
 |---|---|
-| `LLAMA_SPEC_DRAFT_STOP_EOG=1` | the chain ends after a drafted end-of-generation token (kept in the draft); the verifier never accepts a token after an EOG, so the tail was wasted draft steps and verify rows |
-| `LLAMA_SPEC_DRAFT_P_CHAIN=x` | the chain ends when the product of the head's top-1 probabilities over the positions drafted so far drops below `x` (`--spec-draft-p-min` gates each position on its own) |
-| `LLAMA_SPEC_DRAFT_DEPTH_AUTO=d0` | server: per-slot depth from the acceptance history, start `d0`, +1 after a full-depth draft accepted whole, -1 after a rejection (floor `LLAMA_SPEC_DRAFT_DEPTH_MIN`, default 2, and never below `--spec-draft-n-min`), at most `--spec-draft-n-max`; inactive under `--spec-draft-policy tput` / `--spec-draft-n-max-adaptive` |
-| `LLAMA_SPEC_DRAFT_N_MAX_GREEDY=n` | server: rounds verified by sample-and-match (T = 0) draft at most `n` tokens, so `--spec-draft-n-max` can be raised for the rejection-sampled rounds alone |
-| `LLAMA_SPEC_DRAFT_Q_STOP=x` | rejection-sampled rounds: the chain ends at a position whose top-1 draft probability is below `x` (the target samples that position itself). The stop depends on the draft distribution only, never on the drawn token, so every drafted position proposes its full `q` and the rejection sampler stays distribution-exact (a stop on the drawn token's own probability would bias the output towards common tokens) |
+| `LLAMA_SPEC_DRAFT_STOP_EOG=1` (H3) | the chain ends after a drafted end-of-generation token (kept in the draft); the verifier never accepts a token after an EOG, so the tail was wasted draft steps and verify rows |
+| `LLAMA_SPEC_DRAFT_P_CHAIN=x` (H1) | the chain ends when the product of the head's top-1 probabilities over the positions drafted so far drops below `x` (`--spec-draft-p-min` gates each position on its own) |
+| `LLAMA_SPEC_DRAFT_DEPTH_AUTO=d0` (H2) | server: per-slot depth from the acceptance history, start `d0`, +1 after a full-depth draft accepted whole, -1 after a rejection (floor `LLAMA_SPEC_DRAFT_DEPTH_MIN`, default 2, and never below `--spec-draft-n-min`), at most `--spec-draft-n-max`; inactive under `--spec-draft-policy tput` / `--spec-draft-n-max-adaptive` |
+| `LLAMA_SPEC_DRAFT_N_MAX_GREEDY=n` (H5a) | server: rounds verified by sample-and-match (T = 0) draft at most `n` tokens, so `--spec-draft-n-max` can be raised for the rejection-sampled rounds alone |
+| `LLAMA_SPEC_DRAFT_Q_STOP=x` (H5b) | rejection-sampled rounds: the chain ends at a position whose top-1 draft probability is below `x` (the target samples that position itself). The stop depends on the draft distribution only, never on the drawn token, so every drafted position proposes its full `q` and the rejection sampler stays distribution-exact (a stop on the drawn token's own probability would bias the output towards common tokens) |
 
 The response `timings` carry `draft_n_post_eog` (tokens drafted after a drafted EOG) when it is non-zero; the slot's
 `print_timing` block prints the same count.
