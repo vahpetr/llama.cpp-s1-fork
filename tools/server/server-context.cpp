@@ -7430,15 +7430,16 @@ private:
                 // success and no failure, and the EMA converged to 1.0 - i.e. always draft n-max -
                 // no matter how badly the draft model was doing.  A fold round's fresh tail was
                 // dropped for the same reason.
+                // this round's fresh tail, shared by the adaptive / tput estimator and the H2 auto depth below
+                const size_t n_committed_in = std::min(slot.spec_n_committed, n_draft);
+                const size_t n_fresh_draft  = n_draft - n_committed_in;
+                const size_t n_matched      = accepted.size() - 1;
+                const size_t n_fresh_acc    = n_matched > n_committed_in
+                                            ? std::min(n_matched - n_committed_in, n_fresh_draft)
+                                            : 0;
+
                 if (params_base.speculative.draft.n_max_adaptive ||
                         params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
-                    const size_t n_committed_in = std::min(slot.spec_n_committed, n_draft);
-                    const size_t n_fresh_draft  = n_draft - n_committed_in;
-                    const size_t n_matched      = accepted.size() - 1;
-                    const size_t n_fresh_acc    = n_matched > n_committed_in
-                                                ? std::min(n_matched - n_committed_in, n_fresh_draft)
-                                                : 0;
-
                     if (params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {
                         // [TAG_SPEC_DRAFT_POLICY] a drafter that stopped short (p_min exit) failed at the next position
                         const bool short_draft = n_committed_in == 0 && n_fresh_draft > 0 &&
@@ -7454,11 +7455,6 @@ private:
 
                 // [TAG_B68_DRAFT_KNOBS] H2: adapt the slot's depth from this round's fresh tail
                 if (slot.spec_depth_req > 0) {
-                    const size_t n_committed_in = std::min(slot.spec_n_committed, n_draft);
-                    const size_t n_fresh_draft  = n_draft - n_committed_in;
-                    const size_t n_matched      = accepted.size() - 1;
-                    const size_t n_fresh_acc    = n_matched > n_committed_in
-                                                ? std::min(n_matched - n_committed_in, n_fresh_draft) : 0;
                     if (n_fresh_draft > 0) {
                         const int depth_prev = slot.spec_depth_cur;
                         if (n_fresh_acc == n_fresh_draft) {
