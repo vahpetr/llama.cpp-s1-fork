@@ -958,6 +958,10 @@ struct vk_device_struct {
     // rows (A3); GGML_VK_QSA_TOPK_NOKEYS_CHECK=1: flag out-of-domain scores (subnormal / NaN / +inf) of visible cells
     bool qsa_topk_nokeys = false;
     bool qsa_topk_nokeys_check = false;
+    // GGML_VK_QSA_TOPK_NOKEYS_MIN_ROWS (default 9): a selection of fewer rows (decode-like: 1..8) keeps the key rows - there
+    // the per-pass re-derivation costs more than the key store saves (balkon 780M v2: 1 row +58..69 %, 6 rows +5..9 %);
+    // 0 / 1 = nokeys at every row count (the v66 path choice). Path only: both forms select the same ids in the same order.
+    uint32_t qsa_topk_nokeys_min_rows = 9;
     vk_buffer qsa_topk_nk_flag;   // the CHECK word (host-visible, 16 B), created at the first NOKEYS dispatch
     bool qsa_topk_nk_warned = false;
     uint32_t qsa_topk_wave = 0;
@@ -9126,6 +9130,16 @@ static vk_device ggml_vk_get_device(size_t idx) {
             // [TAG_QSA_TOPK_NOKEYS] read before the pipelines are declared (off: the nk pipelines are never created)
             device->qsa_topk_nokeys       = device->qsa_topk_v2 && ggml_vk_env_bool("GGML_VK_QSA_TOPK_NOKEYS", true);
             device->qsa_topk_nokeys_check = device->qsa_topk_nokeys && ggml_vk_env_bool("GGML_VK_QSA_TOPK_NOKEYS_CHECK", false);
+            if (const char * s = getenv("GGML_VK_QSA_TOPK_NOKEYS_MIN_ROWS"); s != nullptr && *s != 0) {
+                char * end = nullptr;
+                const unsigned long v = strtoul(s, &end, 10);
+                if (end != nullptr && *end == 0 && v <= UINT32_MAX) {
+                    device->qsa_topk_nokeys_min_rows = (uint32_t) v;
+                } else {
+                    GGML_LOG_WARN("ggml_vulkan: GGML_VK_QSA_TOPK_NOKEYS_MIN_ROWS=%s is not a row count: the default %u\n", s,
+                                  device->qsa_topk_nokeys_min_rows);
+                }
+            }
             const char * why = device->qsa_topk_v2 ? "" :
                                qsa_topk_sel == 1 ? " (GGML_VK_QSA_TOPK=v1)" :
                                !sg_ops ? " (v2 unsupported: subgroup basic/ballot/arithmetic)" :
@@ -9137,11 +9151,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
 #endif
             GGML_LOG_WARN("ggml_vulkan: %s qsa_topk: %s%s (QSA select kernel; v2 = distributed radix select, tile %u cells, wg 256, "
                           "wave %u; subgroup %u..%u, full %d); nokeys %s%s (GGML_VK_QSA_TOPK_NOKEYS: the metadata cell form "
-                          "without the key rows)%s\n",
+                          "without the key rows; from %u rows, GGML_VK_QSA_TOPK_NOKEYS_MIN_ROWS)%s\n",
                           device->name.c_str(), device->qsa_topk_v2 ? "v2" : "v1", why, 256 * device->qsa_topk_cpt,
                           device->qsa_topk_wave, device->subgroup_min_size, device->subgroup_max_size,
                           device->subgroup_require_full_support ? 1 : 0, device->qsa_topk_nokeys ? "on" : "off",
-                          device->qsa_topk_nokeys_check ? " + CHECK" : "", nk_negctl);
+                          device->qsa_topk_nokeys_check ? " + CHECK" : "", std::max<uint32_t>(device->qsa_topk_nokeys_min_rows, 1u),
+                          nk_negctl);
 
             // [TAG_QSA_TOPK_ONEPASS] read before the pipelines are declared (off: the onepass / fallback pipelines are never
             // created). Needs v2 (the fallback) and LDS for CAP keys + the histogram.
@@ -17630,9 +17645,11 @@ static size_t ggml_vk_qsa_topk_v2_row_extra(const vk_device & device, int64_t n_
 // tile records ([TAG_QSA_TOPK_V2]: 4 KiB + 16 B per tile per row, 0.5 % more at n_kv 262144; the block form +6.25 %
 // for its bitmaps). One definition for all three
 // callers below - the pattern dispatch, the op dispatch and the reserve-time hint - so they cannot drift.
-// [TAG_QSA_TOPK_NOKEYS] the metadata variant's cell form on v2 with qsa_topk_nokeys keeps no key rows
-static bool ggml_vk_qsa_topk_nokeys(const vk_device & device, bool blocks, bool vis) {
-    return device->qsa_topk_v2 && device->qsa_topk_nokeys && !blocks && vis;
+// [TAG_QSA_TOPK_NOKEYS] the metadata variant's cell form on v2 with qsa_topk_nokeys keeps no key rows - from
+// qsa_topk_nokeys_min_rows rows on (nrows = n_tps * n_stream; the reservation, the dispatch and the fusion count all ask with
+// the selection's own rows, so the scratch layout cannot drift between them)
+static bool ggml_vk_qsa_topk_nokeys(const vk_device & device, bool blocks, bool vis, size_t nrows) {
+    return device->qsa_topk_v2 && device->qsa_topk_nokeys && !blocks && vis && nrows >= device->qsa_topk_nokeys_min_rows;
 }
 
 // [TAG_QSA_TOPK_ONEPASS] whether a selection takes topk_qsa_onepass.comp: the cell form at n_kv >= MIN_KV with
@@ -17675,7 +17692,7 @@ static size_t ggml_vk_qsa_scratch_bytes(const vk_device & device, int64_t n_kv, 
                                         bool blocks = false, bool vis = false) {
     const size_t nrows = (size_t) n_tps * (size_t) n_stream;
     // [TAG_QSA_TOPK_NOKEYS] no key rows: the histograms and the tile records only
-    size_t bytes = ggml_vk_qsa_topk_nokeys(device, blocks, vis) ? 0 : (size_t) n_kv * nrows * sizeof(float);
+    size_t bytes = ggml_vk_qsa_topk_nokeys(device, blocks, vis, nrows) ? 0 : (size_t) n_kv * nrows * sizeof(float);
     if (device->qsa_topk_v2) {
         bytes += nrows * ggml_vk_qsa_topk_v2_row_extra(device, n_kv, blocks) * sizeof(uint32_t);
         // [TAG_QSA_TOPK_ONEPASS] + the onepass region (8.4 MiB at 128 rows)
@@ -17815,7 +17832,7 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
         const uint32_t n_tiles_c = (uint32_t) CEIL_DIV(n_kv, tile);
         const uint32_t n_tiles   = n_sel > 0 ? (uint32_t) CEIL_DIV(n_blocks, tile) : n_tiles_c; // the selection domain
         // [TAG_QSA_TOPK_NOKEYS] no key rows: the histograms start the scratch
-        const bool     nokeys    = ggml_vk_qsa_topk_nokeys(ctx->device, n_sel > 0, vis);
+        const bool     nokeys    = ggml_vk_qsa_topk_nokeys(ctx->device, n_sel > 0, vis, nrows);
         const uint64_t hist_off  = nokeys ? 0 : (uint64_t) nrows * n_kv;
         if (nokeys && !ctx->device->qsa_topk_nk_flag) {
             static std::mutex nk_flag_mutex;
@@ -22875,7 +22892,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ggml_vk_fusion_count_add(fusion_counts, "", "topk_qsa_op");
                 // [TAG_QSA_TOPK_NOKEYS] topk_qsa_nokeys=<count>: the QSA_TOP_K nodes that run without the key rows
                 const ggml_tensor * qn = cgraph->nodes[i];
-                if (ggml_vk_qsa_topk_nokeys(ctx->device, ggml_get_op_params_i32(qn, 0) == 1, ggml_get_op_params_i32(qn, 2) == 1)) {
+                if (ggml_vk_qsa_topk_nokeys(ctx->device, ggml_get_op_params_i32(qn, 0) == 1, ggml_get_op_params_i32(qn, 2) == 1,
+                                            (size_t) (qn->src[0]->ne[1] * qn->src[0]->ne[2]))) {
                     ggml_vk_fusion_count_add(fusion_counts, "", "topk_qsa_nokeys");
                 }
             }
