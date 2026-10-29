@@ -1519,19 +1519,31 @@ static bool spec_env_flag(const char * name) {
     return false;
 }
 
+// a probability knob: a plain decimal DIGITS[.DIGITS] in [0, 1) (no sign, exponent, hex, inf/nan or spaces); 0 = off
 static float spec_env_prob(const char * name) {
     const char * s = getenv(name);
     if (s == nullptr) {
         return 0.0f;
     }
-    char * end = nullptr;
-    errno = 0;
-    const float v = (*s >= '0' && *s <= '9') ? strtof(s, &end) : -1.0f;
-    if (end != nullptr && end != s && *end == '\0' && errno == 0 && v >= 0.0f && v < 1.0f) {
-        SPC_WRN("%s=%g: on\n", name, (double) v);
+    const char * c = s;
+    while (*c >= '0' && *c <= '9') {
+        ++c;
+    }
+    bool plain = c != s;
+    if (plain && *c == '.') {
+        const char * f = ++c;
+        while (*c >= '0' && *c <= '9') {
+            ++c;
+        }
+        plain = c != f;
+    }
+    plain = plain && *c == '\0';
+    const float v = plain ? strtof(s, nullptr) : -1.0f;
+    if (plain && v >= 0.0f && v < 1.0f) {
+        SPC_WRN("%s=%g: %s\n", name, (double) v, v > 0.0f ? "on" : "off");
         return v;
     }
-    SPC_WRN("invalid %s='%s' (a decimal in [0, 1)) - stays off\n", name, s);
+    SPC_WRN("invalid %s='%s' (a plain decimal in [0, 1)) - stays off\n", name, s);
     return 0.0f;
 }
 
