@@ -56,6 +56,12 @@ layout (binding = 0) readonly buffer A_SCALAR {uint16_t data_a_scalar[];};
 #endif
 #if defined(A_TYPE_PACKED16)
 layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16[];};
+#if defined(COOPMAT) && (defined(DATA_A_Q6_K) || defined(DATA_A_Q3_K) || defined(DATA_A_Q8_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K))
+// [TAG_CM1_PREFETCH] dword / u16 views of A for the register-prefetch and 8-wide loaders (block sizes 210 / 110 / 34 / 22 bytes are
+// only 2-byte aligned, so those loaders fetch whole dwords plus one u16 and shift; see mul_mm_funcs.glsl)
+layout (binding = 0) readonly buffer A_U32 {uint data_a_u32[];};
+layout (binding = 0) readonly buffer A_U16 {uint16_t data_a_u16[];};
+#endif
 #endif
 #if defined(A_TYPE_PACKED32)
 layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
@@ -149,9 +155,12 @@ layout (constant_id = 3) const uint BK = 16;  // Assumed to be 32 if working wit
 #ifdef COOPMAT
 layout(constant_id = 12) const uint SHMEM_STRIDE_PAD = 4;
 layout(constant_id = 13) const bool APPLY_SLM_A_RESHAPE = false;
+// [TAG_CM1_PREFETCH] GGML_VK_CM1_PREFETCH (default on, =0 off): the register-prefetch K loop of the aligned pipelines
+layout(constant_id = 14) const bool CM1_PREFETCH = true;
 #else
 const uint SHMEM_STRIDE_PAD = 1;
 const bool APPLY_SLM_A_RESHAPE = false;
+const bool CM1_PREFETCH = false;
 #endif
 #define SHMEM_STRIDE (BK / 2 + SHMEM_STRIDE_PAD)
 
@@ -174,6 +183,16 @@ const bool APPLY_SLM_A_RESHAPE = false;
 shared BUF_T buf_a[BM * SHMEM_STRIDE];
 shared BUF_T buf_b[BN * SHMEM_STRIDE];
 
+#if defined(COOPMAT) && (defined(DATA_A_Q5_K) || defined(DATA_A_Q4_K))
+// [TAG_CM1_PREFETCH] (port of Nathanw1014 a25126d5e / 5bcf36dd9 / e68dd31db) per tile row, the 8 sub-block (d, m) pairs of the
+// current superblock, refilled at each superblock boundary (and at the first K block), so the q4_K / q5_K loaders - the fused one
+// and the register-prefetch one - skip the 6-bit scale decode. EXACT: the pair is the fused loader's own f32 d = dm.x * sc and
+// m = -dm.y * mbyte (same operands, same single rounding each); the f16-pair cache of e68dd31db is NOT ported (it rounds d and m
+// to 11 bits). 8 B x 8 x BM of LDS (ggml_vk_matmul_shmem_support counts it).
+#define SCACHE_DM 1
+shared vec2 scache_dm[BM * 8];
+#endif
+
 #define NUM_WARPS (BLOCK_SIZE / WARP)
 
 #ifdef COOPMAT
@@ -191,6 +210,65 @@ uint a_row_of(const uint idx_m) {
 
 #include "mul_mm_id_funcs.glsl"
 #include "mul_mm_funcs.glsl"
+
+#ifdef COOPMAT
+// [TAG_CM1_PREFETCH] the coopmat state lives at file scope so the K-block body (fragment loads + WMMAs) is one function for both
+// K loops (register prefetch and fused loaders); same fragments, same coopMatMulAdd order as before
+const uint cm_rows = WM / TM;
+const uint cm_cols = WN / TN;
+coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a;
+coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b;
+coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> cm_sums[cm_rows * cm_cols];
+uint cm_warp_r, cm_warp_c;
+
+void mm_compute_tile() {
+#if defined(QSA_SCORE_KREUSE) && defined(QSA_KREUSE_NEGCTL)
+    // [TAG_QSA_SCORE_KREUSE] NEGATIVE CONTROL BUILD ONLY (cmake -DGGML_VULKAN_QSA_KREUSE_NEGCTL=ON, never a shipped
+    // pipeline): the kr twins run the TK steps of each K block in reverse - the same products, another summation
+    // order - so tests/test-qsa-score-kreuse must see every kr plane differ
+    for (int i = int(BK) - int(TK); i >= 0; i -= int(TK)) {
+#else
+    [[unroll]] for (uint i = 0; i < BK; i += TK) {
+#endif
+        [[unroll]] for (uint cm_row = 0; cm_row < cm_rows; cm_row++) {
+            // Load from shared into cache
+#if defined(BUF_MANUAL)
+            // [TAG_CM1_MANUAL_FRAG] gfx11 layout: an A lane L holds row L % 16 with its 16 k as elements 0..15, a B lane
+            // L holds column L % 16 with its 16 k as elements 0..15 (lanes >= 16 repeat lanes 0..15, wave32 and wave64);
+            // both tiles keep k contiguous in packed f16 pairs (with APPLY_SLM_A_RESHAPE the 8 pairs of one TK step of a
+            // row are contiguous too), so a fragment is eight 32-bit LDS reads per lane
+            {
+                const uint base = a_shmem_index(cm_warp_r * WM + cm_row * TM + gl_SubgroupInvocationID % 16, i / 2);
+                [[unroll]] for (uint e = 0; e < 8; e++) {
+                    const FLOAT_TYPEV2 v = FROM_BUF(buf_a[base + e]);
+                    cache_a[2 * e]     = v.x;
+                    cache_a[2 * e + 1] = v.y;
+                }
+            }
+#else
+            coopMatLoad(cache_a, buf_a, a_shmem_index(cm_warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
+#endif
+
+            [[unroll]] for (uint cm_col = 0; cm_col < cm_cols; cm_col++) {
+#if defined(BUF_MANUAL)
+                {
+                    const uint base = (cm_warp_c * WN + cm_col * TN + gl_SubgroupInvocationID % 16) * SHMEM_STRIDE + i / 2;
+                    [[unroll]] for (uint e = 0; e < 8; e++) {
+                        const FLOAT_TYPEV2 v = FROM_BUF(buf_b[base + e]);
+                        cache_b[2 * e]     = v.x;
+                        cache_b[2 * e + 1] = v.y;
+                    }
+                }
+#else
+                coopMatLoad(cache_b, buf_b, (cm_warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+#endif
+
+                cm_sums[cm_col * cm_rows + cm_row] = coopMatMulAdd(cache_a, cache_b, cm_sums[cm_col * cm_rows + cm_row]);
+            }
+        }
+    }
+}
+#endif
 
 void main() {
 #ifdef MUL_MAT_ID
@@ -373,10 +451,9 @@ void main() {
 #endif
 
 #ifdef COOPMAT
-    coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a;
-    coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b;
-    coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums[cms_per_row * cms_per_col];
-
+#define sums cm_sums
+    cm_warp_r = warp_r;
+    cm_warp_c = warp_c;
     [[unroll]] for (uint i = 0; i < cms_per_row * cms_per_col; i++) {
         sums[i] = coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
     }
@@ -395,13 +472,116 @@ void main() {
     }
 #endif
 
+#ifdef MUL_MAT_ID
+    // [TAG_MMID_SKIP] only the invocations whose B load column holds a row of this tile load B; warps whose WN columns lie wholly
+    // past the rows skip the MACs (both unchanged from the fused loop; the prefetch loop applies the same two guards)
+#define MM_B_LOADS (gl_LocalInvocationID.x < required_work_items)
+#define MM_COMPUTE (warp_c < required_warp_c)
+#else
+#define MM_B_LOADS true
+#define MM_COMPUTE true
+#endif
+#if defined(SCACHE_DM)
+    // [TAG_CM1_PREFETCH] refill all 8 sub-block (d, m) pairs per row at each superblock boundary and at the first K block (a split-k
+    // slice may start inside a superblock); reads at the current pos_a. The previous K block's trailing barrier orders it after
+    // every reader of the old pairs, its own barrier before every reader of the new ones.
+#define SCACHE_REFILL(blk) if (((blk) & 255) == 0 || (blk) == start_k) { \
+            for (uint x = gl_LocalInvocationID.x; x < BM * 8; x += gl_WorkGroupSize.x) { \
+                const uint r  = x / 8; \
+                const uint is = x % 8; \
+                const uint idx = pos_a + r * (p.stride_a / LOAD_VEC_A); \
+                const uint ib = idx / 64; \
+ \
+                const vec2 loadd = vec2(data_a[ib].dm); \
+                const uvec3 scales = uvec3(data_a_packed32[ib].scales[0], \
+                                           data_a_packed32[ib].scales[1], \
+                                           data_a_packed32[ib].scales[2]); \
+                const uint scalesoffs = (is & 3) * 8; \
+                const uint scidx0 = (is < 4) ? 0 : 2; \
+                const uint scidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2; \
+                const uint mbidx0 = (is < 4) ? 1 : 2; \
+                const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4; \
+                const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2; \
+                const uint8_t sc    = uint8_t(((scales[scidx0] >> scalesoffs) & 0xF) | ((scales[0] >> scidxshift1) & 0x30)); \
+                const uint8_t mbyte = uint8_t(((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30)); \
+ \
+                scache_dm[x] = vec2(loadd.x * sc, -loadd.y * mbyte); \
+            } \
+            barrier(); \
+        }
+#else
+#define SCACHE_REFILL(blk)
+#endif
+
+#if defined(A_PREFETCH) && defined(B_PREFETCH)
+    // [TAG_CM1_PREFETCH] (port of Nathanw1014 e68dd31db + b67b9c13b + f2f4d6874) register double-buffer of the next K tile, aligned
+    // pipelines only: fetch_a / fetch_b issue the global loads of tile t+1 into registers before the WMMAs of tile t, and
+    // store_a_raw / store_b_raw dequantise / convert them into LDS one iteration later. Each LDS word receives the value the
+    // fused loader writes (same dequant expression on the same bits), the K blocks, fragments and coopMatMulAdd order are
+    // unchanged -> the products are the fused loop's bit for bit. GGML_VK_CM1_PREFETCH=0 (spec constant) = the fused loop.
+    if (ALIGNED != 0 && CM1_PREFETCH) {
+        const uint NA_RAW = (BM + loadstride_a - 1) / loadstride_a;
+        const uint NB_RAW = (BN + loadstride_b - 1) / loadstride_b;
+        A_RAW_T a_raw[NA_RAW];
+        B_TYPE b_raw[NB_RAW];
+        // lane-invariant parts of the tile addressing, computed once
+        uint a_lane[NA_RAW];
+        uint a_sidx[NA_RAW];
+        uint b_sidx[NB_RAW];
+        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
+            a_lane[l / loadstride_a] = a_lane_off(loadr_a, loadc_a + l);
+            a_sidx[l / loadstride_a] = a_shmem_index(loadc_a + l, loadr_a * LOAD_VEC_A / 2);
+        }
+        [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+            b_sidx[l / loadstride_b] = (loadc_b + l) * SHMEM_STRIDE + loadr_b * LOAD_VEC_B / 2;
+        }
+// a partial last loader pass (tile edge not a multiple of the load stride, e.g. the G2a block 512 x LOAD_VEC_B 8 > BN 64)
+#define A_IN(l) (BM % loadstride_a == 0 || loadc_a + (l) < BM)
+#define B_IN(l) ((BN % loadstride_b == 0 || loadc_b + (l) < BN) && MM_B_LOADS)
+        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
+            if (A_IN(l)) fetch_a(pos_a, loadr_a, loadc_a + l, a_lane[l / loadstride_a], a_raw[l / loadstride_a]);
+        }
+        a_fetch_all = false;   // see A_REUSE (mul_mm_funcs.glsl)
+        [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+            if (B_IN(l)) fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]);
+        }
+        for (uint block = start_k; block < end_k; block += BK) {
+            // pos_a / pos_b point at the tile held in the raw registers; SCACHE_REFILL reads at pos_a
+            SCACHE_REFILL(block)
+            [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
+                if (A_IN(l)) store_a_raw(pos_a, loadr_a, loadc_a + l, a_sidx[l / loadstride_a], a_raw[l / loadstride_a]);
+            }
+            [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+                if (B_IN(l)) store_b_raw(b_sidx[l / loadstride_b], b_raw[l / loadstride_b]);
+            }
+            // past the last tile the fetch re-reads the last tile (in bounds, never stored), which keeps the raw registers
+            // free of a loop-carried select
+            const bool more = block + BK < end_k;
+            pos_a += more ? BK / LOAD_VEC_A_EFF : 0;
+            pos_b += more ? BK / LOAD_VEC_B_EFF : 0;
+            [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
+                if (A_IN(l)) fetch_a(pos_a, loadr_a, loadc_a + l, a_lane[l / loadstride_a], a_raw[l / loadstride_a]);
+            }
+            [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+                if (B_IN(l)) fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]);
+            }
+            barrier();
+            if (MM_COMPUTE) {
+                mm_compute_tile();
+            }
+            barrier();
+        }
+#undef A_IN
+#undef B_IN
+    } else
+#endif
+    {
     for (uint block = start_k; block < end_k; block += BK) {
+        SCACHE_REFILL(block)
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
         }
-        #ifdef MUL_MAT_ID
-        if (gl_LocalInvocationID.x < required_work_items) {
-        #endif
+        if (MM_B_LOADS) {
         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
 #if !defined(MUL_MAT_ID)
             load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
@@ -409,9 +589,7 @@ void main() {
             load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
 #endif
         }
-        #ifdef MUL_MAT_ID
         }
-        #endif
 
         barrier();
 
@@ -419,57 +597,9 @@ void main() {
         pos_b += BK / LOAD_VEC_B_EFF;
 
 #ifdef COOPMAT
-#ifdef MUL_MAT_ID
-        if (warp_c < required_warp_c) {
-#endif
-#if defined(QSA_SCORE_KREUSE) && defined(QSA_KREUSE_NEGCTL)
-        // [TAG_QSA_SCORE_KREUSE] NEGATIVE CONTROL BUILD ONLY (cmake -DGGML_VULKAN_QSA_KREUSE_NEGCTL=ON, never a shipped
-        // pipeline): the kr twins run the TK steps of each K block in reverse - the same products, another summation
-        // order - so tests/test-qsa-score-kreuse must see every kr plane differ
-        for (int i = int(BK) - int(TK); i >= 0; i -= int(TK)) {
-#else
-        [[unroll]] for (uint i = 0; i < BK; i += TK) {
-#endif
-            [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
-                // Load from shared into cache
-#if defined(BUF_MANUAL)
-                // [TAG_CM1_MANUAL_FRAG] gfx11 layout: an A lane L holds row L % 16 with its 16 k as elements 0..15, a B lane
-                // L holds column L % 16 with its 16 k as elements 0..15 (lanes >= 16 repeat lanes 0..15, wave32 and wave64);
-                // both tiles keep k contiguous in packed f16 pairs (with APPLY_SLM_A_RESHAPE the 8 pairs of one TK step of a
-                // row are contiguous too), so a fragment is eight 32-bit LDS reads per lane
-                {
-                    const uint base = a_shmem_index(warp_r * WM + cm_row * TM + gl_SubgroupInvocationID % 16, i / 2);
-                    [[unroll]] for (uint e = 0; e < 8; e++) {
-                        const FLOAT_TYPEV2 v = FROM_BUF(buf_a[base + e]);
-                        cache_a[2 * e]     = v.x;
-                        cache_a[2 * e + 1] = v.y;
-                    }
-                }
-#else
-                coopMatLoad(cache_a, buf_a, a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
-#endif
-
-                [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
-#if defined(BUF_MANUAL)
-                    {
-                        const uint base = (warp_c * WN + cm_col * TN + gl_SubgroupInvocationID % 16) * SHMEM_STRIDE + i / 2;
-                        [[unroll]] for (uint e = 0; e < 8; e++) {
-                            const FLOAT_TYPEV2 v = FROM_BUF(buf_b[base + e]);
-                            cache_b[2 * e]     = v.x;
-                            cache_b[2 * e + 1] = v.y;
-                        }
-                    }
-#else
-                    coopMatLoad(cache_b, buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
-#endif
-
-                    sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b, sums[cm_col * cms_per_row + cm_row]);
-                }
-            }
+        if (MM_COMPUTE) {
+            mm_compute_tile();
         }
-#ifdef MUL_MAT_ID
-        }
-#endif
 #else
         [[unroll]] for (uint i = 0; i < BK / BK_STEP; i++) {
             // Load from shared into cache
@@ -508,6 +638,7 @@ void main() {
 #endif
 
         barrier();
+    }
     }
 
 #if defined(ACC_TYPE_MAX)

@@ -608,6 +608,11 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         std::string data_a_key = "DATA_A_" + to_uppercase(tname);
         // For aligned matmul loads
         std::string load_vec_a = (coopmat2 || tname == "f32" || tname == "f16" || tname == "bf16") ? load_vec : load_vec_quant;
+        // [TAG_CM1_PREFETCH] KHR coopmat q6_K / q3_K / q8_0 / q5_0: 8 k-values per lane per load (whole-dword fetches + register
+        // prefetch, mul_mm_funcs.glsl; port of Nathanw1014 e68dd31db). The host mirrors this in mm_load_vec_a / ggml_vk_g1_tile_valid.
+        if (coopmat && (tname == "q6_k" || tname == "q3_k" || tname == "q8_0" || tname == "q5_0")) {
+            load_vec_a = "8";
+        }
 
         const std::map<std::string, std::string> float_type_dict = {
             {"FLOAT_TYPE",   FLOAT_TYPE(1, tname)},

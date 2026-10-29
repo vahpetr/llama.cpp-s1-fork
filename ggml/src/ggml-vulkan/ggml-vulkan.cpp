@@ -2750,6 +2750,12 @@ static bool ggml_vk_wave_ok(const vk_device & device, uint32_t w) {
     return device->subgroup_size_control && device->subgroup_require_full_support &&
            device->subgroup_min_size <= w && w <= device->subgroup_max_size;
 }
+// [TAG_CM1_PREFETCH] GGML_VK_CM1_PREFETCH (default on, =0 off): the register-prefetch K loop of the aligned coopmat1 mul_mm
+// pipelines (mul_mm.comp spec constant 14; off = the fused loaders). Read once (static).
+static bool ggml_vk_cm1_prefetch_knob() {
+    static const bool on = ggml_vk_env_bool("GGML_VK_CM1_PREFETCH", true);
+    return on;
+}
 static bool ggml_vk_mmid_tile_g2a_knob() {
     static const bool on = ggml_vk_env_bool("GGML_VK_MMID_TILE_G2A", true);
     return on;
@@ -2957,7 +2963,7 @@ static std::vector<uint32_t> ggml_vk_g1_warptile(const std::vector<uint32_t> & b
 static bool ggml_vk_g1_tile_valid(const vk_device & device, const vk_g1_tile & t, const std::vector<uint32_t> & base, ggml_type type) {
     const uint32_t bk = base[3], tm = base[7], tn = base[8];
     const uint32_t warp = 64;   // the G1 pipelines pin requiredSubgroupSize 64 (ggml_vk_dense_tile_g1_off)
-    const uint32_t lva = type == GGML_TYPE_Q6_K ? 2 : 4;   // LOAD_VEC_A of q6_K / (q4_K, q5_0) (vulkan-shaders-gen.cpp)
+    const uint32_t lva = type == GGML_TYPE_Q4_K ? 4 : 8;   // _cm1 LOAD_VEC_A of q4_K / (q6_K, q5_0: the 8-wide loaders) (vulkan-shaders-gen.cpp)
     // aligned LOAD_VEC_B of the _cm1 mul_mm shaders: always built with fp16, so 8 whatever device->fp16 / GGML_VK_DISABLE_F16
     // says (4 only for a BF16 A, which never takes a G1 tile) - the value mm_tile_check uses at pipeline creation, so a custom
     // tile that would fail there fails here (warning, base tile kept) instead of aborting (astra pkg3)
@@ -5341,7 +5347,11 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
                                                  warptile[7] * warptile[8] / warps * (uint32_t) sizeof(float);
     const uint32_t ballots_sh = mul_mat_id ? (warps * 4 * sizeof(uint32_t)) : 0;
 
-    const uint32_t total_size = load_bufs + mmid_row_ids + coopmat_stage + lut_size + ballots_sh;
+    // [TAG_CM1_PREFETCH] the coopmat1 q4_K / q5_K per-row scale cache: BM x 8 (d, m) f32 pairs (mul_mm.comp scache_dm)
+    const uint32_t scache = device->coopmat_support && (src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q5_K) ?
+                            warptile[1] * 8 * 2 * (uint32_t) sizeof(float) : 0;
+
+    const uint32_t total_size = load_bufs + mmid_row_ids + coopmat_stage + lut_size + ballots_sh + scache;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
     VK_LOG_DEBUG("ggml_vk_matmul_shmem_support(warptile=(" << warptile[0] << "," << warptile[1] << "," << warptile[2] << "), "
@@ -5650,7 +5660,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             case GGML_TYPE_BF16: return aligned ? 4u : 2u;
             case GGML_TYPE_Q1_0: case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_1: case GGML_TYPE_IQ1_S:
             case GGML_TYPE_IQ1_M: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S: return 8u;
-            case GGML_TYPE_Q2_0: case GGML_TYPE_Q5_0: case GGML_TYPE_Q8_0: case GGML_TYPE_Q2_K: case GGML_TYPE_Q4_K:
+            // [TAG_CM1_PREFETCH] the 8-wide _cm1 loaders (vulkan-shaders-gen.cpp)
+            case GGML_TYPE_Q5_0: case GGML_TYPE_Q8_0: case GGML_TYPE_Q3_K: case GGML_TYPE_Q6_K: return 8u;
+            case GGML_TYPE_Q2_0: case GGML_TYPE_Q2_K: case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ4_NL:
             case GGML_TYPE_MXFP4: case GGML_TYPE_NVFP4: return 4u;
             default: return 2u;
@@ -6318,14 +6330,20 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         GGML_ASSERT(spec.size() == VK_MM_WARPTILE_SIZE || spec.size() == VK_MM_WARPTILE_EXT_SIZE);
         if (ggml_vk_mm_warptile_ext(spec)) {
             spec[11] = aligned ? 1u : 0u;  // constantID=11: ALIGNED; 12 / 13 are the warptile's own
-            return spec;
+        } else {
+            spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
+            if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
+                device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
+                spec.push_back(0u);  // constantID=12: SHMEM_STRIDE_PAD = 0
+                spec.push_back(1u);  // constantID=13: APPLY_SLM_A_RESHAPE = true
+            } else {
+                spec.push_back(4u);  // constantID=12: SHMEM_STRIDE_PAD = 4, the shader default (so that id 14 can follow)
+                spec.push_back(0u);  // constantID=13: APPLY_SLM_A_RESHAPE = false, the shader default
+            }
         }
-        spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
-        if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
-            device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
-            spec.push_back(0u);  // constantID=12: SHMEM_STRIDE_PAD = 0
-            spec.push_back(1u);  // constantID=13: APPLY_SLM_A_RESHAPE = true
-        }
+        // [TAG_CM1_PREFETCH] constantID=14: CM1_PREFETCH (GGML_VK_CM1_PREFETCH, default on); ids 12..14 exist in the coopmat1
+        // builds only, the scalar builds ignore the entries
+        spec.push_back(ggml_vk_cm1_prefetch_knob() ? 1u : 0u);
         return spec;
     };
 
