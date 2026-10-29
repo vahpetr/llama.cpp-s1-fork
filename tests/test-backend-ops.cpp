@@ -3528,13 +3528,14 @@ struct test_scale_rows : public test_case {
     const int64_t ne0_full;
     const int64_t offs;
     const bool silu;
+    const float bias;
 
     std::string vars() override {
-        return VARS_TO_STR4(ne, ne0_full, offs, silu);
+        return VARS_TO_STR5(ne, ne0_full, offs, silu, bias);
     }
 
-    test_scale_rows(std::array<int64_t, 4> ne = {320, 6, 1, 1}, int64_t ne0_full = 324, int64_t offs = 0, bool silu = false)
-        : ne(ne), ne0_full(ne0_full), offs(offs), silu(silu) {}
+    test_scale_rows(std::array<int64_t, 4> ne = {320, 6, 1, 1}, int64_t ne0_full = 324, int64_t offs = 0, bool silu = false, float bias = 0.0f)
+        : ne(ne), ne0_full(ne0_full), offs(offs), silu(silu), bias(bias) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0_full, ne[1], ne[2], ne[3]);
@@ -3544,7 +3545,7 @@ struct test_scale_rows : public test_case {
         ggml_tensor * v = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], offs*ggml_element_size(a));
         ggml_set_name(v, "view");
 
-        ggml_tensor * out = ggml_scale(ctx, v, 0.25f);
+        ggml_tensor * out = bias != 0.0f ? ggml_scale_bias(ctx, v, 0.25f, bias) : ggml_scale(ctx, v, 0.25f);
         if (silu) {
             out = ggml_silu(ctx, out);
         }
@@ -12086,6 +12087,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_scale_rows({48, nt, 1, 1}, 96, 48, false));
     }
     test_cases.emplace_back(new test_scale_rows({16, 3, 2, 2}, 40, 7, true));
+    // bias != 0 over a strided source (the CPU reference's bias branch must step the source by nb01)
+    test_cases.emplace_back(new test_scale_rows({320, 6, 1, 1}, 324, 0, false, 1.5f));
+    test_cases.emplace_back(new test_scale_rows({48, 9, 1, 1}, 96, 48, false, -0.75f));
+    test_cases.emplace_back(new test_scale_rows({16, 3, 2, 2}, 40, 7, false, 0.5f));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
 
