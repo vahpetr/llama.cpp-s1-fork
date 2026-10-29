@@ -958,10 +958,12 @@ struct vk_device_struct {
     // rows (A3); GGML_VK_QSA_TOPK_NOKEYS_CHECK=1: flag out-of-domain scores (subnormal / NaN / +inf) of visible cells
     bool qsa_topk_nokeys = false;
     bool qsa_topk_nokeys_check = false;
-    // GGML_VK_QSA_TOPK_NOKEYS_MIN_ROWS (default 9): a selection of fewer rows (decode-like: 1..8) keeps the key rows - there
-    // the per-pass re-derivation costs more than the key store saves (balkon 780M v2: 1 row +58..69 %, 6 rows +5..9 %);
-    // 0 / 1 = nokeys at every row count (the v66 path choice). Path only: both forms select the same ids in the same order.
-    uint32_t qsa_topk_nokeys_min_rows = 9;
+    // GGML_VK_QSA_TOPK_NOKEYS_MIN_ROWS (default 1 = nokeys at every row count, the v66 path choice; 0 is the same): a selection
+    // of fewer rows keeps the key rows. At small row counts (decode-like: 1..8) the per-pass re-derivation costs more than the
+    // key store saves (balkon 780M v2: 1 row +58..69 %, 6 rows +5..9 %), but prod selections are >= 64 rows (Q67), so the 0285
+    // default 9 was a prod no-op and left the 1..8-row harness arms without nokeys dispatch (R145). Path only: both forms
+    // select the same ids in the same order.
+    uint32_t qsa_topk_nokeys_min_rows = 1;
     vk_buffer qsa_topk_nk_flag;   // the CHECK word (host-visible, 16 B), created at the first NOKEYS dispatch
     bool qsa_topk_nk_warned = false;
     uint32_t qsa_topk_wave = 0;
