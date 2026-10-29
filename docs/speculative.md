@@ -428,7 +428,7 @@ the token drawn at the position it stops: a rejection-sampled
 identical as long as the target's logits do not depend on the verify-batch width. On the Vulkan qwen4exp build they
 can (near-tie flips on long prose after ~100 tokens when the draft length changes in every round, e.g.
 `--spec-draft-p-min 0.9` or the auto depth); `LLAMA_SPEC_DRAFT_STOP_EOG` only shortens the last round and
-`LLAMA_SPEC_DRAFT_N_MAX_GREEDY` keeps the T = 0 lengths, so those two are the T = 0-safe ones. Parsing is strict (a plain decimal; anything else prints a WARN and leaves the knob
+`LLAMA_SPEC_DRAFT_N_MAX_GREEDY` keeps the T = 0 lengths, so those two are the T = 0-safe ones. Parsing is strict (a plain decimal such as `0.25`, no sign / exponent / hex; an explicit `0` means off; anything else prints a WARN and leaves the knob
 off); a set knob prints a WARN proof line at start.
 
 | variable | effect |
