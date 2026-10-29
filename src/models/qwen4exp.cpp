@@ -246,9 +246,20 @@ static int64_t qwen4exp_merge_max_n() {
     return n;
 }
 
-// the merged matmul for this ubatch: a converter-merged file has no separate halves, so it always takes it
-static bool qwen4exp_use_merged(const ggml_tensor * merged, const ggml_tensor * a, int64_t n_tokens) {
-    return merged != nullptr && (a == nullptr || n_tokens <= qwen4exp_merge_max_n());
+// the merged matmul for this ubatch: a converter-merged file has no separate halves, so it always takes it. A load-time
+// merge is skipped while a LoRA adapter is attached: build_lora_mm looks the adapter up by the weight tensor, and no
+// adapter references the container, so the merged matmul would drop the LoRA of both halves
+static bool qwen4exp_use_merged(const ggml_tensor * merged, const ggml_tensor * a, int64_t n_tokens, const llama_adapter_loras * loras) {
+    if (merged == nullptr) {
+        return false;
+    }
+    if (a == nullptr) {
+        return true;
+    }
+    if (loras != nullptr && !loras->empty()) {
+        return false;
+    }
+    return n_tokens <= qwen4exp_merge_max_n();
 }
 
 void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
@@ -518,7 +529,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // the combine chain read the views as they read the two matmul outputs (row-strided at nt >= 2)
     ggml_tensor * lo  = nullptr;
     ggml_tensor * inj = nullptr;
-    if (inject && qwen4exp_use_merged(w_down_inject, w_down, nt)) {
+    if (inject && qwen4exp_use_merged(w_down_inject, w_down, nt, loras)) {
         const int64_t n_lo = w_down_inject->ne[1] - hc;
         ggml_tensor * li = build_lora_mm(w_down_inject, xn);
         cb(li, "hc_down_inject", il);
@@ -1871,7 +1882,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     // [TAG_MERGE_ROWS] qkv and z read the same input: one matmul, then the qkv rows and the z rows as views (z_2d is
     // then taken with a view, see build_layer_attn_linear)
     const auto & layer = model.layers[il];
-    if (qwen4exp_use_merged(layer.wqkv_z, layer.wqkv, ubatch.n_tokens) && !layer.wqkv_s && !layer.wqkv_gate_s) {
+    if (qwen4exp_use_merged(layer.wqkv_z, layer.wqkv, ubatch.n_tokens, loras) && !layer.wqkv_s && !layer.wqkv_gate_s) {
         ggml_tensor * qkvz = build_lora_mm(layer.wqkv_z, input);
         cb(qkvz, "linear_attn_qkvz", il);
 
@@ -3285,7 +3296,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // [TAG_MERGE_ROWS] beta and alpha read the same input: one matmul, then the beta rows and the alpha rows as views
     const auto & layer = model.layers[il];
     ggml_tensor * ba = nullptr;
-    if (qwen4exp_use_merged(layer.ssm_beta_alpha_cat, layer.ssm_beta, ubatch.n_tokens) && !layer.ssm_beta_s && !layer.ssm_alpha_s) {
+    if (qwen4exp_use_merged(layer.ssm_beta_alpha_cat, layer.ssm_beta, ubatch.n_tokens, loras) && !layer.ssm_beta_s && !layer.ssm_alpha_s) {
         ba = build_lora_mm(layer.ssm_beta_alpha_cat, cur);
         cb(ba, "beta_alpha", il);
     }
