@@ -3352,6 +3352,11 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 
     if (impl == nullptr) {
         GGML_ASSERT(n_accepted == 0);
+        // [TAG_E68_VERIFY_PAD] a padded plain decode before this sequence's first draft: the carry-holding drafters
+        //   (MTP pending_h) still take row 0 of the last batch (no stats)
+        for (auto & impl_other : spec->impls) {
+            impl_other->accept(seq_id, 0, true);
+        }
         return;
     }
 

@@ -301,6 +301,29 @@ static int server_spec_n_max_greedy(int n_min, int n_max) {
     return v;
 }
 
+// [TAG_E68_VERIFY_PAD] LLAMA_SPEC_VERIFY_PAD_N=n (experiment, default 0 = off): every target decode of a generating slot
+//   (verify AND plain-decode rounds) is padded with copies of its last real token to exactly n + 1 rows, all outputs, so
+//   the verify-batch width no longer depends on the draft length (tput / H2 / H3 / p-min / empty draft). The pads are
+//   never verified (the acceptance loop sees only the real draft) and leave the KV like rejected draft tokens. Clamped
+//   to --spec-draft-n-max (output limits n_parallel * (n_max + 1), recurrent rollback depth n_rs_seq = n_max).
+static int server_spec_verify_pad_n(int n_max) {
+    static const int v = [n_max] {
+        const char * name = "LLAMA_SPEC_VERIFY_PAD_N";
+        const int n = server_env_int(name, 1, 64, /*print_on =*/ false);
+        if (n <= 0) {
+            return 0;
+        }
+        const int c = std::min(n, std::max(n_max, 0));
+        if (c < n) {
+            SRV_WRN("%s=%d: on, clamped to n_max %d (every target decode of a generating slot is %d rows wide)\n", name, n, c, c + 1);
+        } else {
+            SRV_WRN("%s=%d: on (every target decode of a generating slot is %d rows wide)\n", name, n, c + 1);
+        }
+        return c;
+    }();
+    return v;
+}
+
 // Replay after a checkpoint restore (partial draft acceptance on a context that cannot seq_rm partially).
 //
 // The leading `n_committed` tokens of `draft` were already sampled AND accepted on this very sampler during the
@@ -618,6 +641,7 @@ struct server_slot {
     // [TAG_UP27694] the round whose committed tokens a replay re-emits was verified by rejection sampling
     bool spec_round_rejection = false;
     size_t spec_n_committed = 0; // number of committed (already-accepted) tokens at the front of spec_draft this round
+    int    spec_n_pad       = 0; // [TAG_E68_VERIFY_PAD] pad rows after the real tokens in this round's target decode
 
     // [TAG_GTT_ADMISSION] (v33 #13) prompt admission state of this slot
     bool    adm_deferred       = false; // the last admission check of the current prompt deferred it
@@ -938,6 +962,7 @@ struct server_slot {
         spec_is_replay = false;
         spec_round_rejection = false;
         spec_n_committed = 0;
+        spec_n_pad = 0;
 
         adm_deferred      = false;
         adm_t_defer_us    = 0;
@@ -1116,8 +1141,15 @@ struct server_slot {
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
-    void handle_last_sampled_token(server_batch & batch) {
+    void handle_last_sampled_token(server_batch & batch, int n_pad_to = 0) {
         bool add_ok = true;
+        // [TAG_E68_VERIFY_PAD] pad rows up to n_pad_to drafted positions (never past the context end)
+        spec_n_pad = 0;
+        if (n_pad_to > 0) {
+            const int room = n_ctx - prompt.n_tokens() - 2 - (int) spec_draft.size();
+            spec_n_pad = std::max(0, std::min(n_pad_to - (int) spec_draft.size(), room));
+        }
+        const llama_token tok_pad = spec_draft.empty() ? sampled : spec_draft.back();
         if (spec_draft.empty()) {
             // no speculative decoding
             stats.n_spec_plain_rounds += 1;
@@ -1128,6 +1160,10 @@ struct server_slot {
                 add_ok &= batch.add(id, inp_embd, prompt.tokens.pos_next(), true, false);
             } else {
                 add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
+            }
+
+            for (int k = 0; k < spec_n_pad; ++k) {
+                add_ok &= batch.add(this->id, tok_pad, prompt.tokens.pos_next() + 1 + k, true, false);
             }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -1156,6 +1192,9 @@ struct server_slot {
             add_ok &= batch.add(id, sampled, pos0++, true, false);
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true, false);
+            }
+            for (int k = 0; k < spec_n_pad; ++k) {
+                add_ok &= batch.add(this->id, tok_pad, pos0++, true, false);
             }
         }
 
@@ -2320,6 +2359,7 @@ private:
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+        server_spec_verify_pad_n(params_base.speculative.draft.n_max); // [TAG_E68_VERIFY_PAD] proof line at start (when set)
 
         const bool has_mmproj = !params.mmproj.path.empty();
 
@@ -6217,7 +6257,7 @@ private:
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
+            slot.handle_last_sampled_token(batch, spec && slot.can_speculate() ? server_spec_verify_pad_n(params_base.speculative.draft.n_max) : 0);
         });
 
         // process in chunks of params.n_batch
@@ -7109,7 +7149,7 @@ private:
             const auto & slot = slots[batch.tokens[i].id_slot];
             GGML_ASSERT(slot.spec_n_committed <= slot.spec_draft.size());
 
-            rs_depth = std::max(rs_depth, (uint32_t) std::min<size_t>(slot.spec_draft.size() - slot.spec_n_committed, rs_depth_max));
+            rs_depth = std::max(rs_depth, (uint32_t) std::min<size_t>(slot.spec_draft.size() - slot.spec_n_committed + slot.spec_n_pad, rs_depth_max));
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
@@ -7310,6 +7350,14 @@ private:
 
             slot.i_batch = -1;
 
+            // [TAG_E68_VERIFY_PAD] a padded plain decode: drop the pad rows (target + draft KV) and point the drafter's
+            //   carry at the real row (process() left it at the last row = a pad)
+            if (slot.spec_n_pad > 0) {
+                slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+                common_speculative_accept(spec.get(), slot.id, 0);
+                slot.spec_n_pad = 0;
+            }
+
             common_sampler_accept(slot.smpl.get(), id, true);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
@@ -7434,7 +7482,7 @@ private:
                             " t_draft_us=%lld t_catchup_us=%lld t_verify_us=%lld n_att=%d\n",
                             slot.task ? slot.task->id : -1, slot.id, (unsigned long long) slot.spec_trace_round++,
                             (int) slot.prompt.n_tokens(), n_draft, std::min(slot.spec_n_committed, n_draft),
-                            (int) slot.spec_is_replay, (int) !synth_probs.empty(), n_draft + 1, accepted.size() - 1,
+                            (int) slot.spec_is_replay, (int) !synth_probs.empty(), n_draft + 1 + (size_t) slot.spec_n_pad, accepted.size() - 1,
                             sd.empty() ? "-" : sd.c_str(), sa.c_str(),
                             (long long) spec_rt.draft_us, (long long) spec_rt.catchup_us, (long long) spec_rt.verify_us, n_att);
                 }
@@ -7511,7 +7559,8 @@ private:
                     slot.spec_depth_req = 0;
                 }
 
-                const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+                const uint32_t n_rollback = slot.spec_draft.size() + slot.spec_n_pad + 1 - accepted.size(); // [TAG_E68_VERIFY_PAD]
+                slot.spec_n_pad = 0;
 
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
