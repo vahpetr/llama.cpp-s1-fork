@@ -372,6 +372,8 @@ struct server_slot_stats {
     uint64_t n_draft_verif_steps = 0;
     uint64_t n_draft_post_eog    = 0; // [TAG_B68_DRAFT_KNOBS] draft tokens proposed after a drafted EOG (never acceptable)
     uint64_t n_draft_eog_rejected = 0; // [TAG_B68_DRAFT_KNOBS] verify rounds whose fresh draft held an EOG the verifier did not accept (a non-terminal round; LLAMA_SPEC_DRAFT_STOP_EOG=1 cuts its width there)
+    uint64_t n_draft_short_discarded     = 0; // [TAG_G68_H3_FIX] drafts the --spec-draft-n-min rule cleared before verification (draft-mtp)
+    uint64_t n_draft_short_eog_discarded = 0; // [TAG_G68_H3_FIX] of them, drafts that held a drafted EOG (0 by construction for sampled rounds with LLAMA_SPEC_DRAFT_STOP_EOG=1)
     uint64_t n_replay_mismatch  = 0; // committed tokens the replay after a checkpoint restore re-sampled differently (kept anyway)
 
     // speculative round kinds: every generation decode of a slot is exactly one of these (counted where the batch is built)

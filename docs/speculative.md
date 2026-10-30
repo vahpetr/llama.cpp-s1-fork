@@ -442,6 +442,10 @@ off); a set knob prints a WARN proof line at start.
 The response `timings` carry `draft_n_post_eog` (tokens drafted after a drafted EOG) and `draft_n_eog_rejected` (verify
 rounds whose fresh draft held an EOG the verifier did not accept, i.e. non-terminal rounds that
 `LLAMA_SPEC_DRAFT_STOP_EOG=1` shortens) when they are non-zero; the slot's `print_timing` block prints the same counts.
+`draft_n_short_discarded` counts drafts that `--spec-draft-n-min` cleared before verification (draft-mtp) and
+`draft_n_short_eog_discarded` those of them that held a drafted EOG (with `n_min <= 1`, the default, both stay 0). In a
+rejection-sampled round any such clear after a stop that depends on earlier draws (p_min, H1) is not
+distribution-exact either; the EOG case is fixed, the counters measure the rest.
 
 ## Statistics
 Each speculative decoding implementation prints statistics.
