@@ -14,6 +14,16 @@ public:
     virtual void write(const void * src, size_t size) = 0;
     virtual void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) = 0;
 
+    // [TAG_DISK_INCR] incremental capture (incremental() true): every KV cache range goes to write_tensor_kv with its
+    //   first `clean` bytes (whole rows) belonging to cells not modified since mod_since() (a llama_kv_mod_clock value;
+    //   0 = no earlier capture: clean is 0, the ranges still arrive there so the caller can record them). Otherwise the
+    //   KV caches call write_tensor only. The stream bytes are the range's bytes either way
+    virtual bool incremental() const { return false; }
+    virtual uint64_t mod_since() const { return 0; }
+    virtual void write_tensor_kv(ggml_tensor * tensor, size_t offset, size_t size, size_t /* clean */) {
+        write_tensor(tensor, offset, size);
+    }
+
     // bytes written so far
     virtual size_t n_bytes() = 0;
 

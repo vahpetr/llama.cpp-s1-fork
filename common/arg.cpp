@@ -1799,6 +1799,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_ASYNC").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-incr"},
+        "disk prompt cache: incremental asynchronous save (needs --cache-disk-async) - the KV-cache blocks whose cells "
+        "were not modified since the slot's last committed save are taken from that save instead of the device; the "
+        "files are byte-identical to the full copy (default: off)",
+        [](common_params & params) {
+            params.cache_disk_incr = true;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_INCR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-disk-test"},
         "disk prompt cache: honour the LLAMA_DISK_ASYNC_TEST=key=value,... test hooks (server tests only; without this "
         "flag the variable is ignored with a warning)",

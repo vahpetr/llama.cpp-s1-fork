@@ -1776,6 +1776,8 @@ public:
             res.disk.last_save_commit_us   = disk_cache->last_save_commit_us;
             res.disk.n_save_backpressure   = disk_cache->n_save_backpressure;
             res.disk.n_saves_superseded    = disk_cache->n_saves_superseded;
+            res.disk.incr_blocks_reused    = disk_cache->incr_blocks_reused; // [TAG_DISK_INCR]
+            res.disk.incr_bytes_skipped    = disk_cache->incr_bytes_skipped;
         }
 
         return res;
@@ -2832,6 +2834,11 @@ private:
             disk_cache->ckpt_sem_max = params_base.cache_disk_ckpt_semantic; // [TAG_SEMANTIC_CKPT]
             disk_cache->on_async_done = [this]() { queue_tasks.wake(); }; // [TAG_DISK_ASYNC_SAVE] commit on an idle loop
             disk_cache->set_test_hooks(params_base.cache_disk_test); // [TAG_DISK_ASYNC_SAVE]
+            // [TAG_DISK_INCR] before set_async (which logs it); the synchronous path ignores it
+            disk_cache->incr = params_base.cache_disk_incr && params_base.cache_disk_async_mib > 0;
+            if (params_base.cache_disk_incr && params_base.cache_disk_async_mib == 0) {
+                SRV_WRN("%s", "--cache-disk-incr ignored: it needs --cache-disk-async N\n");
+            }
             disk_cache->set_async((uint64_t) params_base.cache_disk_async_mib << 20); // [TAG_DISK_ASYNC_SAVE]
             disk_cache->adopt_keys = string_split<std::string>(params_base.cache_disk_adopt, ',');
             disk_cache->set_descriptor(ctx_tgt, ctx_dft, common_speculative_type_name_str(params_base.speculative.types) +

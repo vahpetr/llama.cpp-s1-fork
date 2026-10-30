@@ -155,7 +155,18 @@ struct llama_state_seq_writer {
     std::function<void(const void * src, size_t size)> write;
     // a range of a state tensor (KV rows, recurrent state); the callee reads it with ggml_backend_tensor_get
     std::function<void(struct ggml_tensor * tensor, size_t offset, size_t size)> write_tensor;
+    // [TAG_DISK_INCR] optional incremental capture: with write_tensor_kv set, every KV-cache range (attention / indexer K
+    //   and V rows) arrives there instead, with clean = its leading bytes whose cells were not modified since `since` (a
+    //   llama_state_mod_clock_tick() value taken when an earlier capture began; 0 = none: clean is 0) (whole rows; a callee
+    //   holding the earlier capture's bytes of the same (tensor, offset) range may take those instead of reading the
+    //   device). Recurrent state and everything else still arrive through write_tensor. The stream is unchanged
+    uint64_t since = 0;
+    std::function<void(struct ggml_tensor * tensor, size_t offset, size_t size, size_t clean)> write_tensor_kv;
 };
+
+// [TAG_DISK_INCR] advance the cell modification clock and return the new value: call it right before a capture and keep
+//   the value as the `since` of the next incremental capture of the same sequence (cells modified from now on are newer)
+LLAMA_API uint64_t llama_state_mod_clock_tick(void);
 
 struct llama_state_seq_reader {
     // fill dst with the next size bytes of the stream; return false on failure

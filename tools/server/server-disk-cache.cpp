@@ -1159,6 +1159,8 @@ server_disk_cache::server_disk_cache(std::string dir, uint64_t quota_bytes, int3
 //     max_jobs=N             saves in flight before a new save runs synchronously (default 2)
 //     check_pins=1           after each commit compare the cached pin set with a fresh derivation (pin_check_failures)
 //     quota_mib=N            the quota in MiB instead of --cache-disk-gib
+//     incr_verify=1          [TAG_DISK_INCR] with --cache-disk-incr: copy the blocks the incremental save would reuse and
+//                            compare their keys with the record (incr_verify_mismatch in GET /disk-cache, error log)
 void server_disk_cache::set_test_hooks(bool enabled) {
     const char * v = getenv("LLAMA_DISK_ASYNC_TEST");
     if (!v || !*v) {
@@ -1201,6 +1203,8 @@ void server_disk_cache::set_test_hooks(bool enabled) {
             hooks.check_pins = val != 0;
         } else if (k == "max_jobs") {
             hooks.max_jobs = std::max(1, val);
+        } else if (k == "incr_verify") { // [TAG_DISK_INCR] reuse nothing, compare the recorded keys with the device's
+            hooks.incr_verify = val != 0;
         } else if (k == "quota_mib") {
             quota = (uint64_t) std::max(1, val) << 20;
         } else {
@@ -2301,9 +2305,10 @@ static int file_present(const fs::path & p); // below, with blob_gc()
 
 struct server_disk_save_job {
     struct blk {
-        std::string key;   // set by a worker
+        std::string key;   // set by a worker (an incremental reuse: set at the copy, no task)
         uint64_t    n     = 0;
         bool        fresh = false; // this job wrote the file
+        std::string expect; // [TAG_DISK_INCR] incr_verify hook: the key the reuse would have taken (compared by the worker)
     };
     struct seg {
         blk *                blk_ref = nullptr; // a block, else inline bytes
@@ -2346,6 +2351,18 @@ struct server_disk_save_job {
     bool superseded = false;
     // server thread: save() returned false for it (the copy failed, logged there): its commit reports no loss again
     bool copy_failed = false;
+    // [TAG_DISK_INCR] (server thread) the clock value ticked before this job's copy, and per stream (.tgt, .dft) its KV
+    //   ranges (tensor, offset) -> (size, the blocks cut from it in order): the slot's record once it commits
+    uint64_t incr_since = 0;
+    std::vector<std::map<std::pair<const ggml_tensor *, size_t>, std::pair<uint64_t, std::vector<const blk *>>>> incr_ranges;
+};
+
+// [TAG_DISK_INCR] the last committed asynchronous save of a slot: what an incremental copy may take instead of the device
+struct server_disk_incr_rec {
+    uint64_t    since = 0;  // clock value ticked before that save's copy
+    std::string blk_dir;    // its block store
+    // per stream: KV range (tensor, offset) -> (range size, the keys of its FULL blocks in order)
+    std::vector<std::map<std::pair<const ggml_tensor *, size_t>, std::pair<uint64_t, std::vector<std::string>>>> ranges;
 };
 
 struct server_disk_async {
@@ -2372,6 +2389,8 @@ struct server_disk_async {
     std::vector<std::thread> threads;
 
     std::map<std::string, int> pending; // block keys referenced by jobs in flight (blob_gc keeps them)
+
+    std::atomic<uint64_t> incr_verified{0}, incr_mismatch{0}; // [TAG_DISK_INCR] incr_verify hook (workers)
 
     // block buffers kept for reuse (under mtx): a fresh 4 MiB allocation is a new mapping whose page faults cost as
     //   much as the copy itself; at most POOL_MAX are kept (128 MiB resident between saves)
@@ -2556,6 +2575,14 @@ static void disk_async_block(server_disk_async & as, server_disk_async::task & t
             auto & b = *t.b;
             b.n   = t.n_buf;
             b.key = hash_key(t.buf.get(), t.n_buf);
+            if (!b.expect.empty()) { // [TAG_DISK_INCR] incr_verify hook: the reuse would have produced another stream
+                as.incr_verified++;
+                if (b.expect != b.key) {
+                    as.incr_mismatch++;
+                    DSK_WRN("incremental save verify: a block the incremental copy would reuse changed on the device "
+                            "(recorded %s, device %s) - the record missed a modification\n", b.expect.c_str(), b.key.c_str());
+                }
+            }
             const fs::path fin = fs::path(job.blk_dir) / (b.key + ".blk");
             bool fresh = false;
             int hold_ms = 0; // test hook hold_write_jobK_ms
@@ -2635,6 +2662,10 @@ void server_disk_cache::set_async(uint64_t budget_bytes) {
     }
     as = std::make_unique<server_disk_async>();
     as->budget = budget_bytes;
+    if (incr) {
+        DSK_INF("incremental save (--cache-disk-incr): KV blocks unmodified since the slot's last save are not copied%s\n",
+                hooks.incr_verify ? " (incr_verify: copied and compared)" : "");
+    }
     as->hooks     = hooks; // test hooks (set_test_hooks), copied once
     as->fail_maps = hooks.fail_maps;
     as->pool.reserve(server_disk_async::POOL_MAX);
@@ -2873,6 +2904,7 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
                                          server_disk_cache_entry & e, const server_prompt & prompt, size_t n_ckpts,
                                          uint64_t ckpt_bytes, uint64_t n_ckpt_written, int64_t t_start) {
     uint64_t copy_us = 0, wait_us = 0;
+    uint64_t job_skipped = 0; // [TAG_DISK_INCR] bytes this save took from the slot's last save instead of the device
 
     auto job_up = std::make_unique<server_disk_save_job>();
     server_disk_save_job & job = *job_up;
@@ -2944,20 +2976,12 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
             inl.insert(inl.end(), p, p + size);
             job.n_logical += size;
         };
-        w.write_tensor = [&](ggml_tensor * tensor, size_t offset, size_t size) {
-            if (size < (64u << 10)) { // inline, as save_stream
-                grow_inline(size);
-                const size_t at = inl.size();
-                inl.resize(at + size);
-                const int64_t t_copy = ggml_time_us();
-                ggml_backend_tensor_get(tensor, inl.data() + at, offset, size);
-                copy_us += (uint64_t) (ggml_time_us() - t_copy);
-                job.n_logical += size;
-                return;
-            }
-            flush_inline();
-            job.n_logical += size;
-            size_t pos = offset;
+        // [TAG_DISK_INCR] the blocks of a large range from byte `from` (relative, a multiple of BLOB_BYTES) on; the
+        //   blocks before it were appended by the caller. expect (incr_verify hook): the recorded keys of the blocks the
+        //   reuse skipped, compared by the workers. Returns the blocks it appended (for the slot's next record)
+        const auto copy_blocks = [&](ggml_tensor * tensor, size_t offset, size_t size, size_t from,
+                                     const std::vector<std::string> * expect, std::vector<const server_disk_save_job::blk *> * out) {
+            size_t pos = offset + from;
             const size_t end = offset + size;
             while (pos < end) {
                 // [TAG_DISK_DELTA_REL] blocks are cut at fixed offsets from the START OF THE RANGE (v63: of the tensor),
@@ -2989,6 +3013,15 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
                     copy_us += (uint64_t) (ggml_time_us() - t_copy);
                     job.blocks.emplace_back();
                     t.b = &job.blocks.back();
+                    if (expect) { // [TAG_DISK_INCR]
+                        const size_t kb = (pos - offset) / BLOB_BYTES;
+                        if (kb < expect->size()) {
+                            t.b->expect = (*expect)[kb];
+                        }
+                    }
+                    if (out) {
+                        out->push_back(t.b);
+                    }
                     st.segs.emplace_back();
                     st.segs.back().blk_ref = t.b;
                     job.e.blobs.push_back(""); // filled at commit (key order = map order)
@@ -3008,6 +3041,89 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
                 pos = blk_end;
             }
         };
+        const auto copy_inline = [&](ggml_tensor * tensor, size_t offset, size_t size) {
+            grow_inline(size);
+            const size_t at = inl.size();
+            inl.resize(at + size);
+            const int64_t t_copy = ggml_time_us();
+            ggml_backend_tensor_get(tensor, inl.data() + at, offset, size);
+            copy_us += (uint64_t) (ggml_time_us() - t_copy);
+            job.n_logical += size;
+        };
+        w.write_tensor = [&](ggml_tensor * tensor, size_t offset, size_t size) {
+            if (size < (64u << 10)) { // inline, as save_stream
+                copy_inline(tensor, offset, size);
+                return;
+            }
+            flush_inline();
+            job.n_logical += size;
+            copy_blocks(tensor, offset, size, 0, nullptr, nullptr);
+        };
+        // [TAG_DISK_INCR] --cache-disk-incr: a KV range's leading full blocks whose cells were not modified since the
+        //   slot's last committed save of the same range (same tensor, same offset = same cut) take that save's keys
+        //   (claimed like a worker's present block: the file is in the own store and stays while this job is in
+        //   flight); the device copy starts at the first block that is new, partial or modified. Same bytes, same
+        //   blocks, same map as the full copy
+        const size_t si = job.streams.size() - 1;
+        const server_disk_incr_rec * rec = nullptr;
+        if (incr) {
+            const auto it = incr_recs.find(id_slot);
+            if (it != incr_recs.end() && it->second && it->second->blk_dir == job.blk_dir && si < it->second->ranges.size()) {
+                rec = it->second.get();
+            }
+            w.since = rec ? rec->since : 0;
+            job.incr_ranges.resize(si + 1);
+            w.write_tensor_kv = [&](ggml_tensor * tensor, size_t offset, size_t size, size_t clean) {
+                if (size < (64u << 10)) {
+                    copy_inline(tensor, offset, size);
+                    return;
+                }
+                flush_inline();
+                job.n_logical += size;
+                auto & mine = job.incr_ranges[si][{ tensor, offset }];
+                mine.first = size;
+                const std::vector<std::string> * keys = nullptr;
+                size_t n_reuse = 0;
+                if (rec) {
+                    const auto ir = rec->ranges[si].find({ tensor, offset });
+                    if (ir != rec->ranges[si].end()) {
+                        keys = &ir->second.second;
+                        const uint64_t lim = std::min<uint64_t>({ (uint64_t) clean, ir->second.first, (uint64_t) size });
+                        n_reuse = std::min<size_t>((size_t) (lim / BLOB_BYTES), keys->size());
+                    }
+                }
+                if (n_reuse > 0 && hooks.incr_verify) { // copy everything, the workers compare the reusable blocks' keys
+                    incr_blocks_verify_planned += n_reuse;
+                    const std::vector<std::string> expect(keys->begin(), keys->begin() + n_reuse);
+                    copy_blocks(tensor, offset, size, 0, &expect, &mine.second);
+                    return;
+                }
+                size_t k = 0;
+                for (; k < n_reuse; ++k) {
+                    const std::string & key = (*keys)[k];
+                    {
+                        std::lock_guard<std::mutex> lock(as->mtx);
+                        // a key being written by another job, or gone from the own store: copy from here on
+                        if (as->writing.count(key) || file_present(fs::path(job.blk_dir) / (key + ".blk")) <= 0) {
+                            break;
+                        }
+                        as->pending[key]++; // released at the commit with the job's other keys
+                    }
+                    job.blocks.emplace_back();
+                    auto & b = job.blocks.back();
+                    b.key = key;
+                    b.n   = BLOB_BYTES;
+                    mine.second.push_back(&b);
+                    st.segs.emplace_back();
+                    st.segs.back().blk_ref = &b;
+                    job.e.blobs.push_back("");
+                }
+                incr_blocks_reused += k;
+                incr_bytes_skipped += (uint64_t) k * BLOB_BYTES;
+                job_skipped        += (uint64_t) k * BLOB_BYTES;
+                copy_blocks(tensor, offset, size, k * BLOB_BYTES, nullptr, &mine.second);
+            };
+        }
         try {
             st.n_stream = llama_state_seq_write_cb(ctx, id_slot, 0, w);
             flush_inline();
@@ -3025,6 +3141,9 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
     };
 
     bool ok = false;
+    if (incr) {
+        job.incr_since = llama_state_mod_clock_tick(); // [TAG_DISK_INCR] cells modified from here on are newer than this copy
+    }
     try {
         ok = capture(ctx_tgt, path(job.e.id, ".tgt"), desc_tgt_full);
         if (ok && ctx_dft) {
@@ -3068,8 +3187,10 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
     }
     job.copy_failed = !ok;
     DSK_INF("saving %s: %zu tokens, %.1f MiB copied off the device in %.0f ms (copy %.0f ms, staging wait "
-            "%.0f ms), hashing / writing in the background%s\n", job.e.id.c_str(), job.tokens.size(),
-            job.n_logical / (1024.0 * 1024.0), (job.t_captured - t_start) / 1000.0, copy_us / 1000.0, wait_us / 1000.0,
+            "%.0f ms), hashing / writing in the background%s%s\n", job.e.id.c_str(), job.tokens.size(),
+            (job.n_logical - job_skipped) / (1024.0 * 1024.0), (job.t_captured - t_start) / 1000.0, copy_us / 1000.0,
+            wait_us / 1000.0, incr ? string_format(" (incremental: %.1f MiB of %.1f MiB taken from the slot's last save)",
+            job_skipped / (1024.0 * 1024.0), job.n_logical / (1024.0 * 1024.0)).c_str() : "",
             ok ? "" : " - the copy FAILED, the entry is dropped");
     refresh_status(); // (review r4 5) the counters save() bumped, the copy timings and the save in flight
     // (review r10 3, r11 3) the blocking part ends here: everything save() did on the server loop (the copy with its
@@ -3137,6 +3258,29 @@ void server_disk_cache::commit_job(server_disk_save_job & job, std::vector<serve
         // (review I9, r9 4) the save reported "on disk" when it was queued: the caller reports the loss (once, with when);
         //   (pkg9-fix 4) a failed copy was reported by save_async_begin already (save() returned false)
         lost.push_back({ job.id_slot, id, job.tokens.size() });
+    }
+    if (incr) { // [TAG_DISK_INCR] the slot's record: this save's full blocks, if it committed (its keys stay claimed by its entry)
+        if (ok && !superseded && job.incr_since != 0 && !job.incr_ranges.empty()) {
+            auto rec = std::make_shared<server_disk_incr_rec>();
+            rec->since   = job.incr_since;
+            rec->blk_dir = job.blk_dir;
+            rec->ranges.resize(job.incr_ranges.size());
+            for (size_t si = 0; si < job.incr_ranges.size(); ++si) {
+                for (const auto & [rk, rv] : job.incr_ranges[si]) {
+                    auto & out = rec->ranges[si][rk];
+                    out.first = rv.first;
+                    for (const auto * b : rv.second) {
+                        if (b->n != BLOB_BYTES || b->key.empty()) {
+                            break; // the full blocks only (a range's last block may be partial)
+                        }
+                        out.second.push_back(b->key);
+                    }
+                }
+            }
+            incr_recs[job.id_slot] = std::move(rec);
+        } else if (!superseded) {
+            incr_recs.erase(job.id_slot);
+        }
     }
     // (review I8) per key: this job's references, and whether it wrote the file; a failed job's fresh file goes when
     //   no other job in flight and no entry references it
@@ -4817,6 +4961,11 @@ void server_disk_cache::refresh_status() {
         { "last_save_commit_seconds", last_save_commit_us / 1e6 }, // the commit part of the last async save
         { "pin_check_failures", n_pin_check_failures }, // test hook check_pins
         { "saves_superseded",   n_saves_superseded   }, // async saves dropped: a synchronous save extending them committed first
+        { "incr_blocks_reused", incr_blocks_reused   }, // [TAG_DISK_INCR] blocks taken from the slot's last save, not the device
+        { "incr_bytes_skipped", incr_bytes_skipped   },
+        { "incr_verify_planned", incr_blocks_verify_planned },
+        { "incr_verify_checked", as ? as->incr_verified.load() : 0 },
+        { "incr_verify_mismatch", as ? as->incr_mismatch.load() : 0 },
         { "bytes_written_twice", n_bytes_written_twice }, // the synchronous fallback rewrote a block a worker was writing
         { "saves_async",    n_saves_async       },
         { "saves_async_failed", n_saves_async_failed },
