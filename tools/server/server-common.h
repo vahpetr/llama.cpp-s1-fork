@@ -391,6 +391,10 @@ struct server_slot_stats {
     int64_t  t_spec_catchup_us   = 0; // common_speculative_process (draft catch-up) of the pass's batch views
     int64_t  t_spec_verify_us    = 0; // llama_decode + sync of the pass's batch views (the verify decode)
     int64_t  t_spec_host_us      = 0; // the rest of the pass (round wall - draft - catch-up - verify)
+    // [TAG_T2_HOST_SPLIT] (T2) the host part above by phase, SERVER_SPEC_HS_* order: pre-draft (pass start .. draft call),
+    // post-draft (draft stats + draft KV seq_rm + per-round checkpoints), batch (batch build + render), sample (target
+    // sample-and-accept), seq_rm (the accepted-tail removal / restore), tokens (process_token + streaming)
+    int64_t  t_spec_hs_us[6]     = {};
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set

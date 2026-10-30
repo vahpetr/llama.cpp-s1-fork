@@ -611,6 +611,53 @@ public:
         return (uint32_t) seq_pos[seq_id].size();
     }
 
+    // [TAG_T2_SEQ_RM_COUNTED] (T2 step 1, LLAMA_SPEC_OVERLAP=1) n = the number of cells of seq_id whose position lies
+    //   in [p0, p1), read from seq_pos (every such cell holds exactly one count of its position). Returns false when
+    //   more than max_keys distinct positions lie in the range: the caller then scans as before (walking a long
+    //   map would cost more than the scan it replaces). O(max_keys + log n).
+    bool seq_pos_count_in(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint32_t max_keys, uint32_t & n) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        n = 0;
+        uint32_t n_keys = 0;
+        for (auto it = seq_pos[seq_id].lower_bound(p0); it != seq_pos[seq_id].end() && it->first < p1; ++it) {
+            if (++n_keys > max_keys) {
+                return false;
+            }
+            n += (uint32_t) it->second;
+        }
+
+        return true;
+    }
+
+    // [TAG_T2_SEQ_RM_COUNTED] remove seq_id from its n cells with a position in [p0, p1) (n from seq_pos_count_in):
+    //   exactly the cells the ascending full scan of llama_kv_cache::seq_rm visits, found from the top of the used
+    //   range downwards and stopped once all n are done. A decoding sequence's newest cells sit at the top, so the
+    //   tail of a speculative round costs O(gap + n) instead of O(size()). Every per-cell effect of seq_rm(i) (seq
+    //   bit, seq_lo, seq_pos count, used set, vis_dirty min/max) does not depend on the visiting order. Returns the
+    //   lowest index of a cell that became empty (size() if none) = the cell the ascending scan reports first.
+    uint32_t seq_rm_counted(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint32_t n) {
+        assert(seq_id >= 0);
+        assert(p0 >= 0);
+
+        uint32_t new_head = size();
+
+        for (uint32_t i = n > 0 ? used_max_p1() : 0; i-- > 0 && n > 0; ) {
+            if (!pos_in(i, p0, p1) || !seq_has(i, seq_id)) {
+                continue;
+            }
+            --n;
+            if (seq_rm(i, seq_id)) {
+                new_head = i; // descending: the last one set is the lowest
+            }
+        }
+
+        assert(n == 0);
+
+        return new_head;
+    }
+
     // the maximum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
     llama_pos seq_pos_max(llama_seq_id seq_id) const {

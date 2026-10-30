@@ -446,6 +446,23 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
+// [TAG_T2_SEQ_RM_COUNTED] LLAMA_SPEC_OVERLAP >= 1 (T2 step 1, default 0 = the full scan): a seq_rm of one sequence over
+//   at most this many distinct positions finds its cells from the top of the used range instead of scanning every
+//   cell (2 KV caches x target + MTP draft = 6 scans of 1M cells per speculative round on the 1M profile)
+static constexpr uint32_t LLAMA_KV_SEQ_RM_COUNTED_MAX_KEYS = 256;
+
+static bool llama_kv_seq_rm_counted() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_SPEC_OVERLAP");
+        const bool on = e != nullptr && atoi(e) >= 1;
+        if (on) {
+            LLAMA_LOG_INFO("%s: LLAMA_SPEC_OVERLAP=%s: counted top-down seq_rm (T2 step 1)\n", __func__, e);
+        }
+        return on;
+    }();
+    return v;
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -469,6 +486,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
+        uint32_t n_rm = 0;
+        if (llama_kv_seq_rm_counted() && cells.seq_pos_count_in(seq_id, p0, p1, LLAMA_KV_SEQ_RM_COUNTED_MAX_KEYS, n_rm)) {
+            new_head = cells.seq_rm_counted(seq_id, p0, p1, n_rm); // [TAG_T2_SEQ_RM_COUNTED] the same cells, same head
+        } else {
         for (uint32_t i = 0; i < cells.size(); ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
@@ -479,6 +500,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                     new_head = i;
                 }
             }
+        }
         }
 
         // If we freed up a slot, set head to it so searching can start there.
