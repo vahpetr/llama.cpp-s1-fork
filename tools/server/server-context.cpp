@@ -246,7 +246,7 @@ static bool server_spec_trace_ids() {
 }
 
 // [TAG_B68_DRAFT_KNOBS] strict integer env knob in [lo, hi]; unset / invalid -> 0 (off), read once with a proof line
-static int server_env_int(const char * name, int lo, int hi) {
+static int server_env_int(const char * name, int lo, int hi, bool print_on = true) {
     const char * s = getenv(name);
     if (s == nullptr) {
         return 0;
@@ -255,7 +255,9 @@ static int server_env_int(const char * name, int lo, int hi) {
     errno = 0;
     const long v = (*s >= '0' && *s <= '9') ? strtol(s, &end, 10) : -1;
     if (end != nullptr && end != s && *end == '\0' && errno == 0 && v >= lo && v <= hi) {
-        SRV_WRN("%s=%ld: on\n", name, v);
+        if (print_on) {
+            SRV_WRN("%s=%ld: on\n", name, v);
+        }
         return (int) v;
     }
     SRV_WRN("invalid %s='%s' (an integer in [%d, %d]) - stays off\n", name, s, lo, hi);
@@ -266,7 +268,8 @@ static int server_env_int(const char * name, int lo, int hi) {
 //   whose full-depth draft was accepted whole, -1 (floor LLAMA_SPEC_DRAFT_DEPTH_MIN, default 2, and --spec-draft-n-min) after a rejection;
 //   bounded by --spec-draft-n-max; restarts at d0 with every request. H5a LLAMA_SPEC_DRAFT_N_MAX_GREEDY=n: rounds verified
 //   by sample-and-match (T = 0, or no U7 candidates) draft at most n tokens, so --spec-draft-n-max can be raised for the
-//   sampled (U7) rounds alone.
+//   sampled (U7) rounds alone. The cap is clamped to [--spec-draft-n-min, --spec-draft-n-max]: below n_min the drafter
+//   would throw every capped draft away (speculation silently off at T = 0); the proof line names the clamp.
 static int server_spec_depth_auto() {
     static const int v = server_env_int("LLAMA_SPEC_DRAFT_DEPTH_AUTO", 1, 64);
     return v;
@@ -275,8 +278,26 @@ static int server_spec_depth_min() {
     static const int v = [] { const int m = server_env_int("LLAMA_SPEC_DRAFT_DEPTH_MIN", 1, 64); return m > 0 ? m : 2; }();
     return v;
 }
-static int server_spec_n_max_greedy() {
-    static const int v = server_env_int("LLAMA_SPEC_DRAFT_N_MAX_GREEDY", 1, 64);
+static int server_spec_n_max_greedy(int n_min, int n_max) {
+    static const int v = [n_min, n_max] {
+        const char * name = "LLAMA_SPEC_DRAFT_N_MAX_GREEDY";
+        const int g = server_env_int(name, 1, 64, /*print_on =*/ false);
+        if (g <= 0) {
+            return 0;
+        }
+        int c = std::max(g, n_min);
+        if (n_max > 0) {
+            c = std::min(c, n_max);
+        }
+        if (c > g) {
+            SRV_WRN("%s=%d: on, clamped to n_min %d\n", name, g, c);
+        } else if (c < g) {
+            SRV_WRN("%s=%d: on, clamped to n_max %d\n", name, g, c);
+        } else {
+            SRV_WRN("%s=%d: on\n", name, g);
+        }
+        return c;
+    }();
     return v;
 }
 
@@ -6032,8 +6053,10 @@ private:
                             dpr.temp     = slot.task->params.sampling.temp;
                             dpr.seed     = slot.task->params.sampling.seed;
                             // [TAG_B68_DRAFT_KNOBS] H5a a round verified by sample-and-match keeps the greedy depth
-                            if (dpr.result_q == nullptr && server_spec_n_max_greedy() > 0) {
-                                dpr.n_max = std::min(dpr.n_max > 0 ? dpr.n_max : n_draft_max, server_spec_n_max_greedy());
+                            const int n_greedy = server_spec_n_max_greedy(params_base.speculative.draft.n_min,
+                                                                          params_base.speculative.draft.n_max);
+                            if (dpr.result_q == nullptr && n_greedy > 0) {
+                                dpr.n_max = std::min(dpr.n_max > 0 ? dpr.n_max : n_draft_max, n_greedy);
                             }
                             // [TAG_B68_DRAFT_KNOBS] H2 judges the round against the depth the drafter was really allowed
                             //   (after the greedy cap): recorded before the cap, a capped T = 0 round never reached the
