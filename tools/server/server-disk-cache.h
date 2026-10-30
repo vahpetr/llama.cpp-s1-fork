@@ -106,6 +106,7 @@ struct server_disk_lost {
 };
 
 struct server_disk_async; // [TAG_DISK_ASYNC_SAVE] the worker threads and the jobs in flight (server-disk-cache.cpp)
+struct server_disk_incr_rec; // [TAG_DISK_INCR] a slot's last committed save, for the incremental copy (server-disk-cache.cpp)
 struct server_disk_save_job;
 
 struct server_disk_cache {
@@ -132,6 +133,7 @@ struct server_disk_cache {
     struct test_hooks_t { // the LLAMA_DISK_ASYNC_TEST keys (set_test_hooks)
         int delay_ms = 0, threads = 0, fail_maps = 0, fail_job = -1, finalize_delay_ms = 0, fail_enqueue = 0, max_jobs = 0;
         bool check_pins = false;
+        bool incr_verify = false; // [TAG_DISK_INCR]
         std::map<int, int> finalize_delay_job;
         std::map<int, int> hold_write_job; // hold_write_jobK_ms
     };
@@ -253,6 +255,13 @@ struct server_disk_cache {
     uint64_t last_save_commit_us   = 0; // the commit part (server loop) of the last async save
     uint64_t n_save_backpressure   = 0; // saves run synchronously because two saves (fixed) were in flight
     uint64_t n_saves_superseded    = 0; // async saves dropped: a synchronous save extending them committed first
+    // [TAG_DISK_INCR] --cache-disk-incr (async path only; set before set_async): KV blocks unmodified since the slot's
+    //   last committed save are taken from it instead of the device
+    bool     incr                  = false;
+    std::map<int32_t, std::shared_ptr<server_disk_incr_rec>> incr_recs; // per slot (server thread)
+    uint64_t incr_blocks_reused    = 0;
+    uint64_t incr_bytes_skipped    = 0;
+    uint64_t incr_blocks_verify_planned = 0; // incr_verify hook: blocks copied that the reuse would have skipped
     uint64_t last_load_us          = 0;
     uint64_t last_load_bytes       = 0;
 

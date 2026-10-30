@@ -290,6 +290,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_link_libraries(test-state-portable PRIVATE server-context)
     llama_test(test-state-portable NAME test-state-portable-qsa LABEL mtp)
     set_tests_properties(test-state-portable-qsa PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
+    # [TAG_DISK_INCR] incremental capture: KV rows unmodified since the last capture taken from it give the full stream
+    llama_build_and_test(test-state-incr.cpp LABEL mtp)
+    llama_test(test-state-incr NAME test-state-incr-qsa LABEL mtp)
+    set_tests_properties(test-state-incr-qsa PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
     # [TAG_CELL_EXT_RESTORE] a per-seq restore gives the indexer cache the live cell ext (M-RoPE x/y + token): target
     # save file (with / without PLE) and the MTP draft memory (flags 0 + the PARTIAL_ONLY rollback form, -qsa)
     llama_build_and_test(test-cell-ext-restore.cpp LABEL mtp)

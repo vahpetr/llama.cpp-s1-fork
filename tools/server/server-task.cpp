@@ -1721,6 +1721,10 @@ std::string server_task_result_metrics::to_metrics() {
             "disk_cache_save_backpressure_total", "Disk prompt cache: saves run synchronously because two asynchronous saves (fixed) were in flight", (double) metrics.disk.n_save_backpressure
         }, {
             "disk_cache_saves_superseded_total", "Disk prompt cache: asynchronous saves dropped at their commit because a synchronous save extending them committed first", (double) metrics.disk.n_saves_superseded
+        }, {
+            "disk_cache_incr_blocks_reused_total", "Disk prompt cache: 4 MiB KV blocks an incremental save took from the slot's last save instead of the device (--cache-disk-incr)", (double) metrics.disk.incr_blocks_reused
+        }, {
+            "disk_cache_incr_bytes_skipped_total", "Disk prompt cache: state bytes an incremental save did not copy off the device (--cache-disk-incr)", (double) metrics.disk.incr_bytes_skipped
         },
     };
 

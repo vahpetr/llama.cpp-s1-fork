@@ -944,6 +944,8 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                     ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
                 }
             }
+
+            v_cells[sdst].mod_mark_all(); // [TAG_DISK_INCR] the rows of the destination stream were rewritten now
         }
     }
 
@@ -2800,6 +2802,10 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     const uint32_t v_trans = this->v_trans ? 1 : 0;
     const uint32_t n_layer = layers.size();
 
+    // [TAG_DISK_INCR] a plain capture: write_tensor only, as before
+    const bool     incr      = io.incremental();
+    const uint64_t mod_since = io.mod_since();
+
     io.write(&v_trans, sizeof(v_trans));
     io.write(&n_layer, sizeof(n_layer));
 
@@ -2824,7 +2830,12 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         for (const auto & range : cr.data) {
             const size_t range_size = range.second - range.first;
             const size_t buf_size = range_size * k_size_row;
-            io.write_tensor(k, range.first * k_size_row, buf_size);
+            if (incr) { // [TAG_DISK_INCR] the same bytes; the callee learns which leading rows are unmodified
+                const size_t n_clean = cells.n_unmod_prefix(range.first, range.second, mod_since);
+                io.write_tensor_kv(k, range.first * k_size_row, buf_size, n_clean * k_size_row);
+            } else {
+                io.write_tensor(k, range.first * k_size_row, buf_size);
+            }
         }
     }
 
@@ -2851,7 +2862,12 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             for (const auto & range : cr.data) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * v_size_row;
-                io.write_tensor(v, range.first * v_size_row, buf_size);
+                if (incr) { // [TAG_DISK_INCR]
+                    const size_t n_clean = cells.n_unmod_prefix(range.first, range.second, mod_since);
+                    io.write_tensor_kv(v, range.first * v_size_row, buf_size, n_clean * v_size_row);
+                } else {
+                    io.write_tensor(v, range.first * v_size_row, buf_size);
+                }
             }
         }
     } else {
@@ -2886,7 +2902,12 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                     const size_t range_size = range.second - range.first;
                     const size_t src_offset = (range.first + j * kv_size) * v_size_el;
                     const size_t buf_size = range_size * v_size_el;
-                    io.write_tensor(v, src_offset, buf_size);
+                    if (incr) { // [TAG_DISK_INCR] one element per cell in this row
+                        const size_t n_clean = cells.n_unmod_prefix(range.first, range.second, mod_since);
+                        io.write_tensor_kv(v, src_offset, buf_size, n_clean * v_size_el);
+                    } else {
+                        io.write_tensor(v, src_offset, buf_size);
+                    }
                 }
             }
         }

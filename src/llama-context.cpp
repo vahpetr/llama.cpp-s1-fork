@@ -5923,6 +5923,20 @@ public:
         size_written += size;
     }
 
+    // [TAG_DISK_INCR]
+    bool incremental() const override {
+        return (bool) w.write_tensor_kv;
+    }
+
+    uint64_t mod_since() const override {
+        return w.write_tensor_kv ? w.since : 0;
+    }
+
+    void write_tensor_kv(ggml_tensor * tensor, size_t offset, size_t size, size_t clean) override {
+        w.write_tensor_kv(tensor, offset, size, std::min(clean, size));
+        size_written += size;
+    }
+
     size_t n_bytes() override {
         return size_written;
     }
@@ -5956,6 +5970,10 @@ private:
     size_t size_read = 0;
     std::vector<uint8_t> temp_buffer;
 };
+
+uint64_t llama_state_mod_clock_tick(void) {
+    return llama_kv_mod_clock().fetch_add(1, std::memory_order_relaxed) + 1;
+}
 
 size_t llama_state_seq_write_cb(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags,
                                 const llama_state_seq_writer & writer) {

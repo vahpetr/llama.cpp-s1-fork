@@ -514,6 +514,7 @@ struct server_metrics {
         uint64_t last_save_blocking_us = 0, last_save_total_us = 0, last_save_bytes = 0, last_save_written = 0;
         uint64_t last_load_us = 0, last_load_bytes = 0, bytes_pending = 0, last_save_commit_us = 0, n_save_backpressure = 0,
                  n_saves_superseded = 0;
+        uint64_t incr_blocks_reused = 0, incr_bytes_skipped = 0; // [TAG_DISK_INCR]
     } disk;
 
     // [TAG_B0_RESTORE_LOG] (v33 B0) prompt-checkpoint restores and the common-prefix tokens they re-process

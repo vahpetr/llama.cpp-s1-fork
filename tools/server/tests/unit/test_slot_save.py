@@ -2141,3 +2141,83 @@ def test_disk_async_save_at_shutdown():
     assert dc_complete(server, DC_A + " again")["timings"]["cache_n"] >= 3000
     assert dc_complete(server, DC_B + " again")["timings"]["cache_n"] >= 3000
     server.stop()
+
+
+# [TAG_DISK_INCR] --cache-disk-incr: an asynchronous save of a slot whose KV rows did not change since its last committed
+#   save takes those 4 MiB blocks from that save instead of the device. Scenario: A alone (its prompt checkpoint lands
+#   near A's end); A + B1 continues it; A + B2 diverges after A (2 * lcp < n_slot: A + B1 is saved, the slot rolls back
+#   to A's checkpoint and keeps those cells); A + B3 saves A + B2 - its A blocks were recorded at the previous save and
+#   A's cells are untouched since; a short Z saves A + B3 (reuse once more). f32 K / V (LFM2-350M: 2 KiB rows, a 4 MiB
+#   block = 2048 cells) so A (~4.4k tokens) spans 2 full blocks per range at a CPU-affordable length; no draft model
+#   (the draft memory's ranges are covered by tests/test-state-incr.cpp). Byte identity: the cache directory (entries +
+#   block store) of each arm equals the arm without the flag; the verify arm (test hook incr_verify) copies the
+#   reusable blocks and compares the keys.
+DC_INCR_A = "Archive A. " + dc_text(31, 3500)
+
+
+def dc_incr_server(arm):
+    hooks = {"incr_verify": "1"} if arm == "verify" else {}
+    srv, cache_dir = dc_server(f"incr-{arm}", 2048, n_ctx=16384, hooks=hooks)
+    srv.model_draft = None
+    srv.spec_type = None
+    srv.spec_draft_n_min = None
+    srv.spec_draft_n_max = None
+    srv.extra_args += ["-ctk", "f32", "-ctv", "f32"]
+    if arm != "full":
+        srv.extra_args.append("--cache-disk-incr")
+    return srv, cache_dir
+
+
+def dc_incr_scenario(srv):
+    outs = [dc_complete(srv, DC_INCR_A)["tokens"]]
+    for k, seed in enumerate((32, 33, 34)):
+        r = dc_complete(srv, DC_INCR_A + f" Part {k}. " + dc_text(seed, 4000))
+        outs.append((r["tokens"], r["timings"]["cache_n"]))
+    dc_complete(srv, "Archive Z. " + dc_text(35, 300))  # A + B3 saved
+    return outs
+
+
+def test_disk_incr_save_identical_to_full():
+    global server
+    res = {}
+    for arm in ("full", "incr", "verify"):
+        server, cache_dir = dc_incr_server(arm)
+        server.start()
+        outs = dc_incr_scenario(server)
+        st = dc_settle(server)
+        m = dc_metrics(server)
+        server.stop()
+        res[arm] = (outs, dc_snapshot(cache_dir), st, m)
+        print(f"{arm}: saves {st['saves']}, reused {st.get('incr_blocks_reused')} blocks "
+              f"({st.get('incr_bytes_skipped')} B), verify planned {st.get('incr_verify_planned')} checked "
+              f"{st.get('incr_verify_checked')} mismatch {st.get('incr_verify_mismatch')}, copied "
+              f"{m['disk_cache_bytes_copied_total']:.0f} B, copy {m['disk_cache_save_copy_seconds_total']:.3f} s")
+    f = res["full"]
+    assert f[2]["saves"] >= 3 and f[2]["incr_blocks_reused"] == 0 and f[2]["incr_verify_planned"] == 0
+    for arm in ("incr", "verify"):
+        x = res[arm]
+        assert f[0] == x[0], f"{arm}: continuations differ"
+        assert f[1][0] == x[1][0], f"{arm}: entries differ (.tok / .aux / .tgt content)"
+        assert f[1][1] == x[1][1], f"{arm}: block stores differ"
+        assert not x[1][2], f"{arm}: a .tmp file was left"
+        assert f[2]["saves"] == x[2]["saves"] and x[2]["saves_async_failed"] == 0
+    i, v = res["incr"], res["verify"]
+    assert i[2]["incr_blocks_reused"] > 0, "nothing was reused"
+    assert i[2]["incr_bytes_skipped"] == i[2]["incr_blocks_reused"] * 4 * 1024 * 1024
+    assert abs(i[3]["disk_cache_incr_bytes_skipped_total"] - i[2]["incr_bytes_skipped"]) < 1e4  # /metrics prints %g
+    assert v[2]["incr_blocks_reused"] == 0  # verify copies everything
+    assert v[2]["incr_verify_planned"] == i[2]["incr_blocks_reused"]  # the same blocks were reusable
+    assert v[2]["incr_verify_checked"] == v[2]["incr_verify_planned"] and v[2]["incr_verify_mismatch"] == 0
+
+
+def test_disk_incr_needs_async():
+    """--cache-disk-incr without --cache-disk-async: warned, the synchronous save runs as before"""
+    global server
+    server, _ = dc_server("incr-sync", 0)
+    server.extra_args.append("--cache-disk-incr")
+    server.start()
+    dc_complete(server, DC_A)
+    dc_complete(server, DC_B)
+    st = dc_settle(server)
+    assert st["saves"] >= 1 and st["incr_blocks_reused"] == 0 and st["saves_async"] == 0
+    server.stop()

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -137,6 +138,16 @@ private:
 };
 
 // meta information about KV cells that can be part of multiple sequences at the same time
+// [TAG_DISK_INCR] the cell modification clock: every llama_kv_cells mutator stamps the cells it touches with the current
+//   value; a sequence-state capture ticks it first (llama_state_mod_clock_tick) and records the value, and a later
+//   capture asks for the cells whose stamp is still below that value = not modified (metadata or rows) since the
+//   earlier capture began. One process-wide clock so a value is comparable across caches and contexts (a cache created
+//   after a capture is all-modified for it). Relaxed: the cells are mutated and captured on one thread
+inline std::atomic<uint64_t> & llama_kv_mod_clock() {
+    static std::atomic<uint64_t> clock{1};
+    return clock;
+}
+
 // TODO: add unit tests
 class llama_kv_cells {
 public:
@@ -165,6 +176,9 @@ public:
         has_shift = false;
 
         for (uint32_t i = 0; i < shift.size(); ++i) {
+            if (shift[i] != 0) {
+                mod_mark(i); // [TAG_DISK_INCR] reset_shift follows the K-shift graph: the shifted rows changed now
+            }
             shift[i] = 0;
         }
     }
@@ -180,6 +194,7 @@ public:
         seq.resize(n);
         seq_lo.resize(n);
         used.resize(n);
+        mod.resize(n);
 
         reset();
     }
@@ -728,7 +743,34 @@ public:
         has_shift = true;
     }
 
+    // [TAG_DISK_INCR] the rows of every cell changed now (data written outside the mutators, e.g. a stream copy)
+    void mod_mark_all() const {
+        mod_floor = llama_kv_mod_clock().load(std::memory_order_relaxed);
+    }
+
+    // [TAG_DISK_INCR] the number of leading cells of [i0, i1) not modified since the clock value `since` (0 = none)
+    uint32_t n_unmod_prefix(uint32_t i0, uint32_t i1, uint64_t since) const {
+        if (since == 0 || mod_floor >= since) {
+            return 0;
+        }
+        uint32_t i = i0;
+        while (i < i1 && i < mod.size() && mod[i] < since) {
+            ++i;
+        }
+        return i - i0;
+    }
+
 private:
+    // [TAG_DISK_INCR] per-cell modification stamps (llama_kv_mod_clock); a cell is modified at max(mod[i], mod_floor)
+    mutable std::vector<uint64_t> mod;
+    mutable uint64_t mod_floor = 0;
+
+    void mod_mark(uint32_t i) const {
+        if (i < mod.size()) {
+            mod[i] = llama_kv_mod_clock().load(std::memory_order_relaxed);
+        }
+    }
+
     // [TAG_KQ_VIS_MIRROR]
     struct vis_range_t { uint32_t lo = UINT32_MAX; uint32_t hi = 0; bool all = true; };
     mutable std::array<vis_range_t, 4> vis_dirty;
@@ -736,6 +778,7 @@ private:
     mutable uint32_t vis_used = 0; // live consumers
 
     void vis_mark(uint32_t i) const {
+        mod_mark(i); // [TAG_DISK_INCR] every mutator marks here (or in the two below)
         for (int k = 0; k < n_vis; ++k) {
             vis_dirty[k].lo = std::min(vis_dirty[k].lo, i);
             vis_dirty[k].hi = std::max(vis_dirty[k].hi, i + 1);
@@ -745,12 +788,16 @@ private:
         if (i0 >= i1) {
             return;
         }
+        for (uint32_t i = i0; i < i1; ++i) {
+            mod_mark(i); // [TAG_DISK_INCR]
+        }
         for (int k = 0; k < n_vis; ++k) {
             vis_dirty[k].lo = std::min(vis_dirty[k].lo, i0);
             vis_dirty[k].hi = std::max(vis_dirty[k].hi, i1);
         }
     }
     void vis_mark_all() const {
+        mod_mark_all(); // [TAG_DISK_INCR]
         for (int k = 0; k < n_vis; ++k) {
             vis_dirty[k].all = true;
         }
