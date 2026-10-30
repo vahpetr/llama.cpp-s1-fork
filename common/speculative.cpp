@@ -1988,6 +1988,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const llama_vocab * vocab_dft = llama_model_get_vocab(llama_get_model(ctx_dft));
         // [TAG_B68_DRAFT_KNOBS] H1 running product of the top-1 probabilities per sequence
         std::vector<float> p_run(n_seq, 1.0f);
+        // [TAG_G68_H3_FIX] the chain of this sequence ended at a drafted EOG (H3)
+        std::vector<uint8_t> eog_end(n_seq, 0);
 
         int i = 0;
 
@@ -2086,6 +2088,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if ((params.n_max <= (int) result.size()) ||
                     (dp.n_max > 0 && dp.n_max <= (int) result.size()) ||
                     (stop_eog && llama_vocab_is_eog(vocab_dft, id))) { // [TAG_B68_DRAFT_KNOBS] H3: the EOG is kept
+                    eog_end[seq_id] = stop_eog && llama_vocab_is_eog(vocab_dft, id);
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2133,7 +2136,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             dp.n_kept = (int32_t) dp.result->size();
-            if (!dp.keep_short && dp.result->size() < (size_t) params.n_min) {
+            // [TAG_G68_H3_FIX] a sampled round that ended at a drafted EOG keeps its short draft (+ its full q)
+            if (common_spec_draft_clear_short(dp.result->size(), params.n_min, dp.keep_short, dp.result_q != nullptr, eog_end[seq_id])) {
                 dp.result->clear();
                 if (dp.result_q) {
                     dp.result_q->clear(); // [TAG_UP27694] one candidate set per drafted token
@@ -3725,6 +3729,16 @@ void common_spec_cooldown::observe(int n_proposed, int n_accepted) {
         c      = c_min;
         wait   = c;
     }
+}
+
+bool common_spec_draft_clear_short(size_t n_drafted, int n_min, bool keep_short, bool sampled, bool eog_end) {
+    if (keep_short || n_drafted >= (size_t) std::max(n_min, 0)) {
+        return false;
+    }
+    if (sampled && eog_end) {
+        return false; // [TAG_G68_H3_FIX] distribution-exact: never condition the kept draft on the drawn EOG
+    }
+    return true;
 }
 
 int common_spec_tput_probe_n(int n_min, int n_max) {
