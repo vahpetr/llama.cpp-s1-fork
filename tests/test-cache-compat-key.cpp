@@ -161,6 +161,25 @@ int main() {
         CHECK(server_cache_env_digest({ "LLAMA_KQ_VIS=0" }) != d1);
         CHECK(server_cache_env_digest({ "LLAMA_KQ_VIS=1", "LLAMA_PROBE_DUMMY=1" }) != d1);
     }
+    // [TAG_T2_SEQ_RM_COUNTED] LLAMA_SPEC_OVERLAP is output-exact (class A): unset / =0 / =1 give one env digest, so the
+    //   namespace key of a v69 prod start with OVERLAP=1 is the v68 one; GGML_VK_F32ACC(_SCOPE) changes numerics and
+    //   stays semantic (a start with it set gets its own namespace)
+    {
+        CHECK(server_cache_env_classify("LLAMA_SPEC_OVERLAP") == SERVER_CACHE_ENV_EXACT);
+        const std::string d0 = server_cache_env_digest({});
+        CHECK(server_cache_env_digest({ "LLAMA_SPEC_OVERLAP=0" }) == d0);
+        CHECK(server_cache_env_digest({ "LLAMA_SPEC_OVERLAP=1" }) == d0);
+        const std::string dk = server_cache_env_digest({ "LLAMA_KQ_VIS=1" });
+        CHECK(server_cache_env_digest({ "LLAMA_KQ_VIS=1", "LLAMA_SPEC_OVERLAP=1" }) == dk);
+        CHECK(server_cache_env_classify("GGML_VK_F32ACC") == SERVER_CACHE_ENV_SEMANTIC);
+        CHECK(server_cache_env_classify("GGML_VK_F32ACC_SCOPE") == SERVER_CACHE_ENV_SEMANTIC);
+        CHECK(server_cache_env_digest({ "GGML_VK_F32ACC=1" }) != d0);
+        CHECK(server_cache_env_digest({ "GGML_VK_F32ACC=1", "LLAMA_SPEC_OVERLAP=1" }) ==
+              server_cache_env_digest({ "GGML_VK_F32ACC=1" }));
+        CHECK(server_cache_env_digest({ "GGML_VK_F32ACC=1", "GGML_VK_F32ACC_SCOPE=trunk" }) !=
+              server_cache_env_digest({ "GGML_VK_F32ACC=1" }));
+        printf("env registry: LLAMA_SPEC_OVERLAP unset/0/1 = one digest (exact), GGML_VK_F32ACC(_SCOPE) semantic\n");
+    }
 
     // sampled model identity and the memo
     {
