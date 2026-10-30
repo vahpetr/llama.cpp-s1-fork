@@ -168,22 +168,11 @@ const bool CM1_PREFETCH = false;
 #endif
 #define SHMEM_STRIDE (BK / 2 + SHMEM_STRIDE_PAD)
 
-// [TAG_CM1_MANUAL_FRAG] (port of Nathanw1014 e68dd31db / c7daa3e23) the manual coopmat1 build assembles its A/B fragments from
-// 32-bit LDS reads (BUF_MANUAL) in the gfx11 layout that ggml_vk_check_coopmat_rdna3_layout verified on the device; it runs only
-// with GGML_VK_CM1_MANUAL_FRAG=1, the default is the coopMatLoad "_cml" twin of every cm1 mul_mm shader (faster on the 780M). The tiles are then 32-bit words: an f16vec2
-// tile whose halves are consumed separately gets split back into two 16-bit LDS accesses by the optimiser, which is exactly
-// the codegen coopMatLoad produces on RADV. Only the LDS access width changes - the same f16 values reach the same fragment
-// elements, so the products, the K order and the accumulator are the coopMatLoad build's bit for bit.
-#if defined(COOPMAT_MANUAL_FRAG) && defined(COOPMAT) && !defined(DATA_A_BF16)
-#define BUF_MANUAL 1
-#define BUF_T uint
-#define TO_BUF(v)   pack32(float16BitsToUint16(v))
-#define FROM_BUF(u) uint16BitsToFloat16(unpack16(u))
-#else
+// [TAG_CM1_MANUAL_FRAG] removed (R152): the LDS tiles are FLOAT_TYPEV2 again; BUF_T / TO_BUF / FROM_BUF stay as identity
+// macros so the loaders (mul_mm_funcs.glsl) are unchanged
 #define BUF_T FLOAT_TYPEV2
 #define TO_BUF(v)   (v)
 #define FROM_BUF(u) (u)
-#endif
 shared BUF_T buf_a[BM * SHMEM_STRIDE];
 shared BUF_T buf_b[BN * SHMEM_STRIDE];
 
@@ -236,36 +225,10 @@ void mm_compute_tile() {
 #endif
         [[unroll]] for (uint cm_row = 0; cm_row < cm_rows; cm_row++) {
             // Load from shared into cache
-#if defined(BUF_MANUAL)
-            // [TAG_CM1_MANUAL_FRAG] gfx11 layout: an A lane L holds row L % 16 with its 16 k as elements 0..15, a B lane
-            // L holds column L % 16 with its 16 k as elements 0..15 (lanes >= 16 repeat lanes 0..15, wave32 and wave64);
-            // both tiles keep k contiguous in packed f16 pairs (with APPLY_SLM_A_RESHAPE the 8 pairs of one TK step of a
-            // row are contiguous too), so a fragment is eight 32-bit LDS reads per lane
-            {
-                const uint base = a_shmem_index(cm_warp_r * WM + cm_row * TM + gl_SubgroupInvocationID % 16, i / 2);
-                [[unroll]] for (uint e = 0; e < 8; e++) {
-                    const FLOAT_TYPEV2 v = FROM_BUF(buf_a[base + e]);
-                    cache_a[2 * e]     = v.x;
-                    cache_a[2 * e + 1] = v.y;
-                }
-            }
-#else
             coopMatLoad(cache_a, buf_a, a_shmem_index(cm_warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
-#endif
 
             [[unroll]] for (uint cm_col = 0; cm_col < cm_cols; cm_col++) {
-#if defined(BUF_MANUAL)
-                {
-                    const uint base = (cm_warp_c * WN + cm_col * TN + gl_SubgroupInvocationID % 16) * SHMEM_STRIDE + i / 2;
-                    [[unroll]] for (uint e = 0; e < 8; e++) {
-                        const FLOAT_TYPEV2 v = FROM_BUF(buf_b[base + e]);
-                        cache_b[2 * e]     = v.x;
-                        cache_b[2 * e + 1] = v.y;
-                    }
-                }
-#else
                 coopMatLoad(cache_b, buf_b, (cm_warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
-#endif
 
                 cm_sums[cm_col * cm_rows + cm_row] = coopMatMulAdd(cache_a, cache_b, cm_sums[cm_col * cm_rows + cm_row]);
             }

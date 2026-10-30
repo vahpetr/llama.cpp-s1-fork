@@ -446,7 +446,7 @@ void string_to_spv(std::string name, const std::string& source, const std::map<s
     }
 }
 
-void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool coopmat2, bool f16acc, bool dot2 = false, bool manual_frag = true) {
+void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool coopmat2, bool f16acc, bool dot2 = false) {
     std::string load_vec = coopmat2 ? "1" : fp16 ? "8" : "4";
     std::string aligned_b_type_f32 = coopmat2 ? "float" : fp16 ? "mat2x4" : "vec4";
     std::string aligned_b_type_f16 = coopmat2 ? "float16_t" : fp16 ? "f16mat2x4" : "f16vec4";
@@ -480,15 +480,11 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         base_dict["ACC_TYPE_MAX"] = "float16_t(65504.0)";
     }
 
-    // [TAG_CM1_MANUAL_FRAG] KHR coopmat mul_mm builds twice: the A/B fragments assembled from 32-bit LDS reads in the gfx11
-    // layout (mul_mm.comp BUF_MANUAL; GGML_VK_CM1_MANUAL_FRAG=1 + a passing ggml_vk_check_coopmat_rdna3_layout) and the coopMatLoad
-    // "_cml" twin (the default; port of Nathanw1014 c7daa3e23). Only mul_mm.comp sources get the twin.
-    const std::string cm1_sfx = coopmat && !manual_frag ? "_cml" : "";
+    // [TAG_CM1_MANUAL_FRAG] removed (R152): KHR coopmat mul_mm builds once, the coopMatLoad build, which keeps its "_cml"
+    // name suffix (port of Nathanw1014 c7daa3e23); mul_mmq_cm1 keeps its plain name
+    const std::string cm1_sfx = coopmat ? "_cml" : "";
     if (coopmat) {
         base_dict["COOPMAT"] = "1";
-        if (manual_frag) {
-            base_dict["COOPMAT_MANUAL_FRAG"] = "1";
-        }
     }
 #if defined(GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT)
     if (coopmat2) {
@@ -684,9 +680,9 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 #endif
 
         // int8 coopmat1 MMQ (upstream #27952): per-type mul_mmq_cm1.comp, f32 accumulators only
-        if (!f16acc && coopmat && manual_frag && (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0" || tname == "iq4_nl" || tname == "iq4_xs" || tname == "mxfp4"
+        if (!f16acc && coopmat && (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0" || tname == "iq4_nl" || tname == "iq4_xs" || tname == "mxfp4"
                      || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4")) {
-            string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
+            string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
         }
     }
 }
@@ -711,9 +707,6 @@ void process_shaders() {
             // Coopmat, fp32acc and fp16acc
             matmul_shaders(true, matmul_id_type, true, false, false);
             matmul_shaders(true, matmul_id_type, true, false, true);
-            // [TAG_CM1_MANUAL_FRAG] the coopMatLoad "_cml" twins
-            matmul_shaders(true, matmul_id_type, true, false, false, false, false);
-            matmul_shaders(true, matmul_id_type, true, false, true,  false, false);
 #endif
 
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
@@ -723,12 +716,6 @@ void process_shaders() {
 #endif
         }
     }
-
-#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-    // [TAG_CM1_MANUAL_FRAG] one-time device probe of the coopmat fragment layout the BUF_MANUAL matmuls assume
-    // (ggml_vk_check_coopmat_rdna3_layout); built as a coopmat shader (no spirv-opt), name coopmat_layout_check_cm1
-    string_to_spv("coopmat_layout_check", "coopmat_layout_check.comp", {}, true, true, false);
-#endif
 
     for (const bool& fp16 : {false, true}) {
         std::map<std::string, std::string> base_dict;
