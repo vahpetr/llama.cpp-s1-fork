@@ -264,6 +264,26 @@ static int server_env_int(const char * name, int lo, int hi, bool print_on = tru
     return 0;
 }
 
+// [TAG_T2_HOST_SPLIT] LLAMA_SPEC_OVERLAP (T2, default 0): 1 = step 1, the host-phase diet - counted top-down seq_rm in
+//   libllama ([TAG_T2_SEQ_RM_COUNTED]) and no per-round prompt copy for an MTP-only drafter. Output bytes unchanged
+//   (class A). The env being set at all (0 or 1) also prints the per-phase host split next to the round time line.
+static int server_spec_overlap() {
+    static const int v = [] {
+        const int o = server_env_int("LLAMA_SPEC_OVERLAP", 0, 1, /*print_on =*/ false);
+        if (o >= 1) {
+            SRV_WRN("LLAMA_SPEC_OVERLAP=%d: T2 step 1 on (counted seq_rm, no per-round prompt copy for an MTP-only drafter)\n", o);
+        }
+        return o;
+    }();
+    return v;
+}
+static bool server_spec_host_split_print() {
+    static const bool v = getenv("LLAMA_SPEC_OVERLAP") != nullptr;
+    return v;
+}
+enum { SERVER_SPEC_HS_PRE_DRAFT, SERVER_SPEC_HS_POST_DRAFT, SERVER_SPEC_HS_BATCH, SERVER_SPEC_HS_SAMPLE,
+       SERVER_SPEC_HS_SEQ_RM, SERVER_SPEC_HS_TOKENS, SERVER_SPEC_HS_COUNT };
+
 // H2 LLAMA_SPEC_DRAFT_DEPTH_AUTO=d0: per-slot draft depth from the acceptance history, starting at d0: +1 after a round
 //   whose full-depth draft was accepted whole, -1 (floor LLAMA_SPEC_DRAFT_DEPTH_MIN, default 2, and --spec-draft-n-min) after a rejection;
 //   bounded by --spec-draft-n-max; restarts at d0 with every request. H5a LLAMA_SPEC_DRAFT_N_MAX_GREEDY=n: rounds verified
@@ -1343,6 +1363,18 @@ struct server_slot {
             SLT_INF(*this, "round time: %" PRIu64 " rounds, per round draft %.3f ms, catch-up %.3f ms, verify %.3f ms, host %.3f ms\n",
                     stats.n_spec_timed_rounds, stats.t_spec_draft_us/1e3/nr, stats.t_spec_catchup_us/1e3/nr,
                     stats.t_spec_verify_us/1e3/nr, stats.t_spec_host_us/1e3/nr);
+            if (server_spec_host_split_print()) { // [TAG_T2_HOST_SPLIT]
+                const auto & h = stats.t_spec_hs_us;
+                int64_t sum = 0;
+                for (int k = 0; k < SERVER_SPEC_HS_COUNT; ++k) {
+                    sum += h[k];
+                }
+                SLT_INF(*this, "host split (LLAMA_SPEC_OVERLAP=%d): per round pre-draft %.3f, post-draft %.3f, batch %.3f, sample %.3f, "
+                        "seq_rm %.3f, tokens %.3f, other %.3f ms\n", server_spec_overlap(),
+                        h[SERVER_SPEC_HS_PRE_DRAFT]/1e3/nr, h[SERVER_SPEC_HS_POST_DRAFT]/1e3/nr, h[SERVER_SPEC_HS_BATCH]/1e3/nr,
+                        h[SERVER_SPEC_HS_SAMPLE]/1e3/nr, h[SERVER_SPEC_HS_SEQ_RM]/1e3/nr, h[SERVER_SPEC_HS_TOKENS]/1e3/nr,
+                        (stats.t_spec_host_us - sum)/1e3/nr);
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -1807,6 +1839,9 @@ private:
     //   the sequence (2 KiB x n_past on the prod MTP head) in host RAM per checkpoint. Off for a draft whose
     //   memory is recurrent (FULL/RS: it cannot be rewound) or shared with the target (ctx_other).
     bool ckpt_skip_dft = false;
+
+    // [TAG_T2_HOST_SPLIT] every configured drafter is draft-mtp: nothing reads the per-round prompt copy (spec_prompt)
+    bool spec_prompt_unused = false;
 
     // [TAG_GTT_ADMISSION] (v33, night-1 #13; fix round 1) headroom admission for prefill chunks. OFF unless
     //   LLAMA_GTT_ADMISSION_MIB is set > 0 (the compose sets bar, slope and step per profile). Before a slot's prompt
@@ -2622,6 +2657,13 @@ private:
             bs_support = server_backend_sampling_check(params_nospec);
             SRV_INF("[bs-guard] speculation not loaded: backend_sampling_supported=%d spec_type=none\n",
                     bs_support.supported ? 1 : 0);
+        }
+
+        {
+            const auto & ts = params_base.speculative.types;
+            spec_prompt_unused = spec && !ts.empty() && std::all_of(ts.begin(), ts.end(), [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+            });
         }
 
         if (ctx_dft) {
@@ -5231,6 +5273,9 @@ private:
         int64_t replay_restore_us = 0;
         int64_t restore_us        = 0;
         int64_t ckpt_us           = 0; // tput: the per-round checkpoint save + draft-context restore of a drafting round
+        // [TAG_T2_HOST_SPLIT] the host phases of this pass (timers only) and the end of the post-draft block
+        int64_t hs_us[SERVER_SPEC_HS_COUNT] = {};
+        int64_t t_post_draft_end_us = 0;
     } spec_rt;
 
     // [TAG_SPEC_DRAFT_POLICY] one single-slot pure round -> the cost fits
@@ -5385,6 +5430,9 @@ private:
             st.t_spec_catchup_us   += spec_rt.catchup_us;
             st.t_spec_verify_us    += spec_rt.verify_us;
             st.t_spec_host_us      += t_host;
+            for (int k = 0; k < SERVER_SPEC_HS_COUNT; ++k) { // [TAG_T2_HOST_SPLIT]
+                st.t_spec_hs_us[k] += spec_rt.hs_us[k];
+            }
         }
         metrics.n_spec_timed_rounds += 1;
         metrics.t_spec_draft_us     += spec_rt.draft_us;
@@ -5679,6 +5727,8 @@ private:
             spec_rt.replay_restore_us = 0;
             spec_rt.restore_us        = 0;
             spec_rt.ckpt_us           = 0;
+            std::fill(std::begin(spec_rt.hs_us), std::end(spec_rt.hs_us), 0); // [TAG_T2_HOST_SPLIT]
+            spec_rt.t_post_draft_end_us = 0;
         }
 
         try {
@@ -5686,6 +5736,9 @@ private:
             pre_decode();
             qsa_route_partition(); // [TAG_MULTISLOT] (item 4a) before rendering
             batch.render();
+            if (spec && spec_rt.t_post_draft_end_us > 0) { // [TAG_T2_HOST_SPLIT] batch build + render
+                spec_rt.hs_us[SERVER_SPEC_HS_BATCH] += ggml_time_us() - spec_rt.t_post_draft_end_us;
+            }
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
@@ -5963,7 +6016,13 @@ private:
                             spec_rt.ckpt_us += ggml_time_us() - t_ckpt0;
                         }
 
+                        if (server_spec_overlap() >= 1 && spec_prompt_unused) {
+                            // [TAG_T2_HOST_SPLIT] T2 step 1: the MTP drafter never reads the prompt (dp.prompt only feeds
+                            //   the n-gram drafters) - skip the O(depth) copy (0.23 ms per round at 678k)
+                            slot.spec_prompt.clear();
+                        } else {
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        }
 
                         int n_draft_req = n_draft_max;
 
@@ -6080,6 +6139,7 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             const int64_t t_draft0 = ggml_time_us(); // [TAG_SPEC_ROUND_TIMING]
+            spec_rt.hs_us[SERVER_SPEC_HS_PRE_DRAFT] += t_draft0 - spec_rt.t0_us; // [TAG_T2_HOST_SPLIT]
             // [TAG_MULTISLOT] (item 4a) draft generation homogeneous too: the draft decode steps put one row per drafting
             //   sequence into one ubatch (common/speculative.cpp), so the drafting slots run in the same routing groups
             //   - one common_speculative_draft() per group with only its members' dparams.drafting enabled. The wrapper
@@ -6111,6 +6171,7 @@ private:
         }
 
         // make checkpoints if needed
+        const int64_t t_post_draft0 = ggml_time_us(); // [TAG_T2_HOST_SPLIT]
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
@@ -6214,6 +6275,11 @@ private:
                 spec_rt.ckpt_us += ggml_time_us() - t_ckpt0;
             }
         });
+
+        if (!drafting.empty()) { // [TAG_T2_HOST_SPLIT]
+            spec_rt.t_post_draft_end_us = ggml_time_us();
+            spec_rt.hs_us[SERVER_SPEC_HS_POST_DRAFT] += spec_rt.t_post_draft_end_us - t_post_draft0;
+        }
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -7386,6 +7452,7 @@ private:
                     slot.spec_round_rejection = use_rejection && synth_probs.empty();
                 }
 
+                const int64_t t_sample0 = ggml_time_us(); // [TAG_T2_HOST_SPLIT]
                 std::vector<llama_token> accepted;
                 if (!synth_probs.empty()) {
                     accepted = server_sample_and_accept_synth(
@@ -7412,6 +7479,7 @@ private:
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_view, slot.spec_draft);
                 }
                 slot.spec_i_batch.clear();
+                spec_rt.hs_us[SERVER_SPEC_HS_SAMPLE] += ggml_time_us() - t_sample0; // [TAG_T2_HOST_SPLIT]
 
                 GGML_ASSERT(accepted.size() >= 1);
 
@@ -7534,6 +7602,8 @@ private:
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
                         const int64_t t_restore0 = ggml_time_us(); // [TAG_SPEC_DRAFT_POLICY] the rollback cycle
+                        struct hs_scope { int64_t & acc; int64_t t0; ~hs_scope() { acc += ggml_time_us() - t0; } }
+                            hs_restore { spec_rt.hs_us[SERVER_SPEC_HS_SEQ_RM], t_restore0 }; // [TAG_T2_HOST_SPLIT]
 
                         // this run's own speculative checkpoint: a size mismatch is a bug, not a cache miss
                         if (!ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
@@ -7611,7 +7681,12 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
+            const int64_t t_seq_rm0 = ggml_time_us(); // [TAG_T2_HOST_SPLIT]
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            const int64_t t_tokens0 = ggml_time_us();
+            spec_rt.hs_us[SERVER_SPEC_HS_SEQ_RM] += t_tokens0 - t_seq_rm0;
+            struct hs_scope { int64_t & acc; int64_t t0; ~hs_scope() { acc += ggml_time_us() - t0; } }
+                hs_tokens { spec_rt.hs_us[SERVER_SPEC_HS_TOKENS], t_tokens0 }; // [TAG_T2_HOST_SPLIT] incl. a final response
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
