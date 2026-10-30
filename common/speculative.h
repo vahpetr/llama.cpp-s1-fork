@@ -301,8 +301,11 @@ struct common_spec_cooldown {
 //   keep_short (a tput probe) is never cleared. A sampled (rejection-verified) round whose chain ended at a drafted EOG
 //   (LLAMA_SPEC_DRAFT_STOP_EOG=1) is kept as drafted: clearing it would make "the draft survives" depend on the drawn
 //   token, so the kept drafts would no longer be draws from q (with p = q, first-position EOG probability e and
-//   n_min = n_max = 2 the first-token EOG rate became e^2 instead of e). A greedy round (T = 0) keeps the old rule.
-bool common_spec_draft_clear_short(size_t n_drafted, int n_min, bool keep_short, bool sampled, bool eog_end);
+//   n_min = n_max = 2 the first-token EOG rate became e^2 instead of e). n_cap = the chain's effective length cap
+//   (min of --spec-draft-n-max and the caller's per-sequence cap): when n_cap < n_min no draft can reach n_min, so the
+//   EOG-ended one is cleared like every other (keeping only it made the EOG survive: e = 0.5, n_min 2, cap 1 -> 0.75).
+//   A greedy round (T = 0) keeps the old rule.
+bool common_spec_draft_clear_short(size_t n_drafted, int n_min, int n_cap, bool keep_short, bool sampled, bool eog_end);
 
 // v51 r2 (Hermes): the cooldown probe's length: max(n_min, 1) - the shortest draft the n_min rule keeps - or 0 when it
 //   does not fit n_max (no probe this round). The probe is drafted with keep_short (never cleared by the n_min rule).

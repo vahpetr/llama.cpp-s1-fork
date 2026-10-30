@@ -2137,7 +2137,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             dp.n_kept = (int32_t) dp.result->size();
             // [TAG_G68_H3_FIX] a sampled round that ended at a drafted EOG keeps its short draft (+ its full q)
-            if (common_spec_draft_clear_short(dp.result->size(), params.n_min, dp.keep_short, dp.result_q != nullptr, eog_end[seq_id])) {
+            const int n_cap = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max; // the chain's length cap
+            if (common_spec_draft_clear_short(dp.result->size(), params.n_min, n_cap, dp.keep_short, dp.result_q != nullptr,
+                                              eog_end[seq_id])) {
                 dp.n_short_cleared   = (int32_t) dp.result->size();
                 dp.short_cleared_eog = false;
                 for (const llama_token t : *dp.result) {
@@ -3736,12 +3738,14 @@ void common_spec_cooldown::observe(int n_proposed, int n_accepted) {
     }
 }
 
-bool common_spec_draft_clear_short(size_t n_drafted, int n_min, bool keep_short, bool sampled, bool eog_end) {
+bool common_spec_draft_clear_short(size_t n_drafted, int n_min, int n_cap, bool keep_short, bool sampled, bool eog_end) {
     if (keep_short || n_drafted >= (size_t) std::max(n_min, 0)) {
         return false;
     }
-    if (sampled && eog_end) {
-        return false; // [TAG_G68_H3_FIX] distribution-exact: never condition the kept draft on the drawn EOG
+    if (sampled && eog_end && n_cap >= n_min) {
+        // [TAG_G68_H3_FIX] distribution-exact: never condition the kept draft on the drawn EOG. Only while the cap lets
+        //   a draft reach n_min: below it every non-EOG draft is cleared, so the EOG-ended one is cleared too
+        return false;
     }
     return true;
 }

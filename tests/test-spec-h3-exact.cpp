@@ -6,10 +6,15 @@
 // common_spec_draft_clear_short + the rejection verifier (accept x with min(1, p/q), else the residual (p - q)+; an
 // empty draft = the target samples p). The exact first-token distribution is enumerated over every draft branch, and
 // 200 000 seeded trials repeat it by sampling. The pre-fix arm (= f3cbd94cb) is the same rule with eog_end = false.
+// (pkg9-fix) n_max here is the chain's effective cap, which the caller's per-sequence cap (context left, output limit)
+// can put below n_min: the pkg9 rule (EOG exempt whatever the cap, = n_cap unlimited) is biased there (astra v69: p = q,
+// e = 0.5, n_min 2, cap 1 -> 0.75), the fixed rule (exempt only while cap >= n_min) is not.
 
 #include "speculative.h"
 
 #include <algorithm>
+#include <climits>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -36,11 +41,13 @@ struct setup {
     bool stop_eog;
     bool sampled;      // rejection-verified round (T > 0); false = greedy
     bool prefix;       // pre-fix rule (f3cbd94cb): the EOG end is not exempt
+    bool pkg9 = false; // the pkg9 rule (1d7bcd1c5): the EOG end exempt whatever the cap
 };
 
 // the n_min decision as the drafter makes it
 static bool clears(const setup & s, size_t n, bool eog_end) {
-    return common_spec_draft_clear_short(n, s.n_min, /*keep_short=*/ false, s.sampled, s.prefix ? false : eog_end);
+    return common_spec_draft_clear_short(n, s.n_min, s.pkg9 ? INT32_MAX : s.n_max, /*keep_short=*/ false, s.sampled,
+                                         s.prefix ? false : eog_end);
 }
 
 // first output token given the first drafted token x (rejection sampling)
@@ -184,11 +191,48 @@ int main(int argc, char ** argv) {
         for (size_t n = 0; n <= 8; ++n) for (int n_min = -1; n_min <= 6; ++n_min)
         for (int ks = 0; ks < 2; ++ks) for (int ee = 0; ee < 2; ++ee) {
             const bool old_rule = !ks && n < (size_t) std::max(n_min, 0);
-            same = same && common_spec_draft_clear_short(n, n_min, ks, /*sampled=*/ false, ee) == old_rule;
-            // sampled rounds differ from the old rule only by the EOG exemption
-            same = same && common_spec_draft_clear_short(n, n_min, ks, /*sampled=*/ true, ee) == (old_rule && !ee);
+            for (int n_cap = 0; n_cap <= 8; ++n_cap) {
+                same = same && common_spec_draft_clear_short(n, n_min, n_cap, ks, /*sampled=*/ false, ee) == old_rule;
+                // sampled rounds differ from the old rule only by the EOG exemption, and only while cap >= n_min
+                same = same && common_spec_draft_clear_short(n, n_min, n_cap, ks, /*sampled=*/ true, ee) ==
+                                   (old_rule && !(ee && n_cap >= n_min));
+            }
         }
-        check(same, "T = 0 rule identical to f3cbd94cb; sampled differs only for an EOG end");
+        check(same, "T = 0 rule identical to f3cbd94cb; sampled differs only for an EOG end with cap >= n_min");
+    }
+
+    // 5. (pkg9-fix) effective cap below n_min: the astra v69 case, then every case of 2. with n_min > cap
+    {
+        const dist e = { 0.5, 0.0, 0.5 };
+        setup fix = { e, { e, e }, 2, 1, true, true, false };
+        setup p9 = fix; p9.pkg9 = true;
+        const double x_fix = exact_first(fix)[TOK_EOG];
+        const double x_p9  = exact_first(p9)[TOK_EOG];
+        const double m_fix = mc_first_eog(fix, n_trials, 7);
+        const double m_p9  = mc_first_eog(p9, n_trials, 7);
+        printf("cap < n_min (n_min 2, cap 1): first-token EOG exact fix %.6f pkg9 %.6f | %d seeded trials fix %.5f pkg9 %.5f\n",
+               x_fix, x_p9, n_trials, m_fix, m_p9);
+        check(std::fabs(x_fix - 0.5)  < 1e-12, "cap < n_min: exact fix = e = 0.5");
+        check(std::fabs(x_p9  - 0.75) < 1e-12, "cap < n_min: exact pkg9 rule = 0.75 (the astra v69 bias reproduced)");
+        const double se = std::sqrt(0.25 / n_trials);
+        check(std::fabs(m_fix - 0.5)  < 5 * se, "cap < n_min: sampled fix within 5 sd of 0.5");
+        check(std::fabs(m_p9  - 0.75) < 5 * se, "cap < n_min: sampled pkg9 rule within 5 sd of 0.75");
+
+        const std::vector<dist> ps = { { 0.6, 0.1, 0.3 }, { 0.2, 0.2, 0.6 }, { 0.5, 0.0, 0.5 } };
+        const std::vector<dist> qs = { { 0.3, 0.3, 0.4 }, { 0.7, 0.2, 0.1 }, { 0.5, 0.0, 0.5 } };
+        double max_fix = 0.0, max_p9 = 0.0;
+        int n_cases = 0;
+        for (const auto & p : ps) for (const auto & q0 : qs) for (const auto & q1 : qs)
+        for (int n_max = 1; n_max <= 4; ++n_max) for (int n_min = n_max + 1; n_min <= 6; ++n_min) {
+            setup s = { p, { q0, q1, q0, q1 }, n_min, n_max, true, true, false };
+            max_fix = std::max(max_fix, tv(exact_first(s), p));
+            s.pkg9 = true;
+            max_p9 = std::max(max_p9, tv(exact_first(s), p));
+            n_cases++;
+        }
+        printf("cap < n_min (%d cases): max TV(first token, p) fix %.3g, pkg9 rule %.3g\n", n_cases, max_fix, max_p9);
+        check(max_fix < 1e-12, "cap < n_min, fix: first token ~ p in every case");
+        check(max_p9 > 1e-3,   "cap < n_min, pkg9 rule: biased in some case");
     }
 
     printf("%d ok, %d failed\n", n_ok, n_fail);
