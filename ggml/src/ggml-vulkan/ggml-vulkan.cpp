@@ -938,6 +938,7 @@ struct vk_device_struct {
     bool coopmat_support;
     bool coopmat_acc_f32_support {};
     bool coopmat_acc_f16_support {};
+    bool f32acc_trunk {}; // [TAG_F32ACC] GGML_VK_F32ACC_SCOPE=trunk: f32acc per op, the QSA indexer projections keep f16acc
     bool coopmat_bf16_support {};
     bool coopmat_support_16x16x16_f16acc {};
     bool coopmat_support_16x16x16_f32acc {};
@@ -9154,10 +9155,16 @@ static vk_device ggml_vk_get_device(size_t idx) {
             {
                 static const bool f32acc_knob = [] { const char * e = getenv("GGML_VK_F32ACC"); return e && atoi(e) != 0; }();
                 const bool f32acc_on = f32acc_knob && device->coopmat_support && device->coopmat_acc_f32_support;
-                if (f32acc_on) {
+                // GGML_VK_F32ACC_SCOPE=all (default: the above) | trunk: the f16acc pipelines stay built and each matmul picks its
+                // accumulator - f32 everywhere except MUL_MAT on a "*.indexer.*" weight (the QSA indexer q/k projections that feed
+                // the score; the score GEMM itself - QSA_SCORE / MUL_MAT_ROWS / matmul_f32 - is f32acc in both scopes)
+                static const bool scope_trunk = [] { const char * e = getenv("GGML_VK_F32ACC_SCOPE"); return e && strcmp(e, "trunk") == 0; }();
+                device->f32acc_trunk = f32acc_on && scope_trunk && device->coopmat_acc_f16_support;
+                if (f32acc_on && !device->f32acc_trunk) {
                     device->coopmat_acc_f16_support = false;
                 }
-                GGML_LOG_WARN("ggml_vulkan: Vulkan%zu f32acc: %s\n", idx, f32acc_on ? "on (GGML_VK_F32ACC=1, cm1 matmuls accumulate in f32)" :
+                GGML_LOG_WARN("ggml_vulkan: Vulkan%zu f32acc: %s\n", idx, device->f32acc_trunk ? "on (scope trunk, MUL_MAT on *.indexer.* weights keep f16acc)" :
+                              f32acc_on ? "on (GGML_VK_F32ACC=1, cm1 matmuls accumulate in f32)" :
                               f32acc_knob ? "off (GGML_VK_F32ACC=1 but no cm1 f32-accumulator mode)" : "off (default: f16acc where supported)");
             }
         }
@@ -10430,6 +10437,9 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
     if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_BF16) {
         return ctx->device->pipeline_matmul_id_bf16;
     }
+    if (ctx->device->f32acc_trunk) {
+        prec = GGML_PREC_F32; // [TAG_F32ACC] scope trunk: every MUL_MAT_ID (and its f16-B twin) accumulates in f32
+    }
     if (prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)) {
         if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
             return ctx->device->pipeline_matmul_id_f16_f32.f16acc;
@@ -10491,7 +10501,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
 
     vk_matmul_pipeline2& mmp = ctx->device->pipeline_dequant_mul_mat_mat_id[src0_type];
     // XXX TODO 'prec' is not actually allowed in mul_mat_id.
-    bool prefer_fp16acc = ctx->device->fp16 /*&& prec == GGML_PREC_DEFAULT*/;
+    bool prefer_fp16acc = ctx->device->fp16 && !ctx->device->f32acc_trunk /*&& prec == GGML_PREC_DEFAULT*/;
     bool support_fp16acc = !mmp.f16acc->is_empty();
     bool support_fp32acc = !mmp.f32acc->is_empty();
 
@@ -12013,6 +12023,11 @@ static void ggml_vk_dispatch_log(const ggml_backend_vk_context * ctx, const char
             dst->name);
 }
 
+// [TAG_F32ACC] GGML_VK_F32ACC_SCOPE=trunk: the matmuls that keep f16acc - the QSA indexer q/k projections ("blk.N.indexer.*")
+static bool ggml_vk_f32acc_excluded(const ggml_tensor * src0) {
+    return strstr(src0->name, ".indexer.") != nullptr;
+}
+
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k,
                                   const ggml_tensor * row_ids = nullptr, uint64_t row_ids_a_bytes = 0) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
@@ -12080,11 +12095,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     // Check for mmq first
-    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
+    // [TAG_F32ACC] scope trunk: f32acc unless src0 is a QSA indexer weight (ggml_vk_f32acc_excluded)
+    const ggml_prec prec = ctx->device->f32acc_trunk && !ggml_vk_f32acc_excluded(src0) ? GGML_PREC_F32 : (ggml_prec)dst->op_params[0];
+    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, prec) : nullptr;
 
     if (mmp == nullptr) {
         // Fall back to f16 dequant mul mat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, prec);
         quantize_y = false;
     }
 
@@ -12093,7 +12110,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     if (qx_needs_dequant) {
         // Fall back to dequant + f16 mulmat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, (ggml_prec)dst->op_params[0]);
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, prec);
     }
 
     // Not implemented
@@ -22815,6 +22832,17 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    if (ctx->device->f32acc_trunk) { // [TAG_F32ACC] proof line, once: the first graph that holds excluded matmuls
+        static std::atomic<bool> f32acc_proof {false};
+        int n_ex = 0;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            n_ex += cgraph->nodes[i]->op == GGML_OP_MUL_MAT && ggml_vk_f32acc_excluded(cgraph->nodes[i]->src[0]);
+        }
+        if (n_ex > 0 && !f32acc_proof.exchange(true)) {
+            GGML_LOG_WARN("ggml_vulkan: f32acc: on (scope trunk, excluded %d ops: MUL_MAT src0 *.indexer.*)\n", n_ex);
+        }
+    }
 
     const bool prof = ggml_vk_sched_prof_enabled();
 
