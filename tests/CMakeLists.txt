@@ -302,6 +302,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_test(test-state-restore-corrupt NAME test-state-restore-corrupt-qsa LABEL mtp)
     set_tests_properties(test-state-restore-corrupt-qsa PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV}")
     llama_build_and_test(test-spec-draft-policy.cpp LABEL mtp) # [TAG_SPEC_DRAFT_POLICY] tput draft length rule + cooldown (v51)
+    llama_build_and_test(test-spec-h3-exact.cpp LABEL mtp) # [TAG_G68_H3_FIX] H3 x n_min under rejection sampling: first-token EOG e, not e^2
     # [TAG_GRAPH_CACHE] LLAMA_GRAPH_CACHE off vs K=8 vs K=8 + CHECK: logits / drafts / [qsa-ids] identical, regrow invalidates
     llama_build(test-graph-cache.cpp)
     llama_test(test-graph-cache NAME test-graph-cache LABEL mtp ARGS ${CMAKE_CURRENT_BINARY_DIR})
