@@ -1413,6 +1413,52 @@ def dc_snapshot(cache_dir):
     return entries, blk, tmp
 
 
+def dc_streams(cache_dir):
+    """the state streams by content: n_tokens -> {.tgt / .dft: sha of the concatenation (inline segments + blocks)} -
+    independent of where the blocks are cut (a map lists its segments; a block file is its raw bytes)"""
+    import glob, hashlib, json as js, struct
+    ns = glob.glob(os.path.join(cache_dir, "ns-*"))[0]
+    out = {}
+    for meta in glob.glob(os.path.join(ns, "*.meta")):
+        eid = os.path.basename(meta)[:-5]
+        res = {}
+        for ext in (".tgt", ".dft"):
+            mp = os.path.join(ns, eid + ext)
+            if not os.path.exists(mp):
+                res[ext] = None
+                continue
+            b = open(mp, "rb").read()
+            magic, _ver, n_h = struct.unpack_from("<III", b, 0)
+            assert magic == 0x3350414d, hex(magic)  # MAP3
+            at = 12 + n_h
+            (n_stream,) = struct.unpack_from("<Q", b, at)
+            at += 8
+            h, n = hashlib.sha256(), 0
+            while True:
+                kind = b[at]
+                at += 1
+                if kind == 255:
+                    break
+                if kind == 0:
+                    (k,) = struct.unpack_from("<Q", b, at)
+                    at += 8
+                    h.update(b[at:at + k]); n += k
+                    at += k
+                    (ks,) = struct.unpack_from("<I", b, at)
+                    at += 4 + ks
+                else:
+                    assert kind == 1, kind
+                    (ks,) = struct.unpack_from("<I", b, at)
+                    key = b[at + 4:at + 4 + ks].decode()
+                    at += 4 + ks
+                    blk = open(os.path.join(ns, "blk", key + ".blk"), "rb").read()
+                    h.update(blk); n += len(blk)
+            assert n == n_stream, (mp, n, n_stream)
+            res[ext] = h.hexdigest()
+        out[js.load(open(meta))["n_tokens"]] = res
+    return out
+
+
 DC_A = "Archive A. " + dc_text(1, 3000)
 DC_B = "Archive B. " + dc_text(2, 3000)
 DC_A_MORE = " Then " + dc_text(3, 600)
@@ -1436,7 +1482,10 @@ def dc_scenario(srv, n_slots):
     return outs, loaded_a, r["timings"]["cache_n"]
 
 
-# staging 1 MiB: every block waits for the previous one (back-pressure); n_slots 2: the cells move between the saves
+# staging 1 MiB: every block waits for the previous one (back-pressure); n_slots 2: the cells move between the saves.
+#   [TAG_DISK_DELTA_REL] async 0 cuts the blocks as v68 (aligned within the tensor), async > 0 from the start of the range:
+#   with one slot (ranges at cell 0) both cuts and so every file are the same; with two slots the streams (and .tok / .aux)
+#   are the same, the maps / block files differ by the cut
 @pytest.mark.parametrize("staging_mib,n_slots", [(2048, 1), (1, 1), (2048, 2)])
 def test_disk_async_save_identical_to_sync(staging_mib, n_slots):
     global server
@@ -1448,27 +1497,67 @@ def test_disk_async_save_identical_to_sync(staging_mib, n_slots):
         st = dc_settle(server)
         m = dc_metrics(server)
         server.stop()
-        res[mode] = (outs, loaded_a, loaded_b, dc_snapshot(cache_dir), st, m)
+        res[mode] = (outs, loaded_a, loaded_b, dc_snapshot(cache_dir), st, m, dc_streams(cache_dir))
         print(f"{mode}: loaded A {loaded_a} B {loaded_b}, saves {st['saves']}, async {st['saves_async']}, written "
               f"{st['bytes_written']}, re-save written {m['disk_cache_last_save_written_bytes']:.0f} of "
               f"{m['disk_cache_last_save_state_bytes']:.0f}, blocks {len(res[mode][3][1])}")
     s, a = res["sync"], res["async"]
     assert s[0] == a[0], "continuations differ"
     assert s[1] == a[1] and s[2] == a[2] and s[1] > 0 and s[2] > 0, "the loads differ / did not happen"
-    assert s[3][0] == a[3][0], "entries differ (.tok / .aux / .tgt / .dft content)"
-    assert s[3][1] == a[3][1], "block stores differ"
+    assert s[6] == a[6], "state streams differ"
+    strip = lambda ents: {n: {k: v for k, v in f.items() if k not in (".tgt", ".dft")} for n, f in ents.items()}
+    assert strip(s[3][0]) == strip(a[3][0]), "entries differ (.tok / .aux content)"
+    if n_slots == 1:
+        assert s[3][0] == a[3][0], "entries differ (.tgt / .dft maps)"
+        assert s[3][1] == a[3][1], "block stores differ"
+        assert s[4]["bytes_written"] == a[4]["bytes_written"]
     assert not s[3][2] and not a[3][2], "a .tmp file was left"
-    assert s[4]["saves"] == a[4]["saves"] and s[4]["bytes_written"] == a[4]["bytes_written"]
+    assert s[4]["saves"] == a[4]["saves"]
     assert a[4]["saves_async"] == a[4]["saves"] and s[4]["saves_async"] == 0 and a[4]["saves_async_failed"] == 0
     assert a[4]["save_async"] > 0 and s[4]["save_async"] == 0
     assert a[5]["disk_cache_last_save_seconds"] >= a[5]["disk_cache_last_save_blocking_seconds"] > 0
 
 
+@pytest.mark.skipif("LLAMA_SERVER_V68_BIN_PATH" not in os.environ,
+                    reason="needs a v68 (f3cbd94cb, pre-SC2) llama-server: LLAMA_SERVER_V68_BIN_PATH")
+@pytest.mark.parametrize("n_slots", [1, 2])
+def test_disk_sync_save_bytes_equal_v68(n_slots):
+    """[TAG_DISK_DELTA_REL] --cache-disk-async 0 writes v68's disk bytes: the dc_scenario on a v68 server (f3cbd94cb, no
+    SC2) and on this one with async 0 give the same entries (.tok / .aux / .tgt / .dft maps) and the same block files
+    (names and content) - also in a unified 2-slot pool, where the cells sit away from cell 0 and only the v68
+    tensor-aligned cut gives v68's keys"""
+    global server
+    res = {}
+    for mode in ("v68", "sync"):
+        server, cache_dir = dc_server(f"v68cut-{mode}-{n_slots}", 0, n_ctx=16384 * n_slots, n_slots=n_slots)
+        if mode == "v68":  # no SC2 options / hooks / metrics there
+            server.server_path = os.environ["LLAMA_SERVER_V68_BIN_PATH"]
+            i = server.extra_args.index("--cache-disk-async")
+            del server.extra_args[i:i + 2]
+            server.extra_args.remove("--cache-disk-test")
+            server.env.pop("LLAMA_DISK_ASYNC_TEST", None)
+        server.start()
+        outs, loaded_a, loaded_b = dc_scenario(server, n_slots)
+        if mode == "sync":
+            dc_settle(server)
+        server.stop()
+        res[mode] = (outs, loaded_a, loaded_b, dc_snapshot(cache_dir))
+        print(f"{mode} np {n_slots}: loaded A {loaded_a} B {loaded_b}, entries {len(res[mode][3][0])}, "
+              f"blocks {len(res[mode][3][1])}")
+    v, s = res["v68"], res["sync"]
+    assert v[0] == s[0] and v[1] == s[1] and v[2] == s[2] and v[1] > 0 and v[2] > 0
+    assert v[3][0] == s[3][0], "entries differ from v68 (.tok / .aux / .tgt / .dft)"
+    assert v[3][1] == s[3][1], "block files differ from v68"
+    assert not v[3][2] and not s[3][2]
+
+
 @pytest.mark.parametrize("n_slots", [1, 2])
 def test_disk_save_delta_resave(n_slots):
     """[TAG_DISK_DELTA_REL] a conversation re-saved after it grew writes only the changed 4 MiB blocks (its K / V ranges
-    of ~11k rows x 1 KiB span 3 blocks), on both paths - with two slots in one pool its cells sit at another offset at
-    the re-save than at the first save (X erased in between), which the v63 tensor-aligned cut turned into a rewrite"""
+    of ~11k rows x 1 KiB span 3 blocks) - with two slots in one pool its cells sit at another offset at the re-save than
+    at the first save (X erased in between), which the tensor-aligned cut turns into a rewrite. The asynchronous path
+    (--cache-disk-async > 0) cuts from the start of the range; the synchronous one (async 0) keeps the v68 cut, so its
+    disk bytes are v68's: one slot = the same delta on both paths, two slots = only async writes the delta"""
     global server
     res = {}
     for mode, mib in (("sync", 0), ("async", 2048)):
@@ -1494,9 +1583,12 @@ def test_disk_save_delta_resave(n_slots):
         print(f"{mode} np {n_slots}: first save written {first}, re-save state {res[mode][0]:.0f} written "
               f"{res[mode][1]:.0f} ({100.0 * res[mode][1] / res[mode][0]:.1f} %)")
     assert res["sync"][2] == res["async"][2]
-    assert abs(res["sync"][1] - res["async"][1]) < 1e4  # the same blocks written (/metrics prints %g)
-    for mode in res:
+    if n_slots == 1:
+        assert abs(res["sync"][1] - res["async"][1]) < 1e4  # the same blocks written (/metrics prints %g)
+    for mode in (("sync", "async") if n_slots == 1 else ("async",)):
         assert res[mode][1] < 0.3 * res[mode][0], f"{mode}: the re-save rewrote unchanged blocks"
+    if n_slots > 1:  # async 0 = the v68 cut: the moved cells shift every block, the re-save rewrites the state
+        assert res["sync"][1] > 0.5 * res["sync"][0], "sync (async 0): not the v68 tensor-aligned cut"
 
 
 def test_disk_async_save_in_flight_lookup_and_second_save():

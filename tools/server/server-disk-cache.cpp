@@ -2954,10 +2954,11 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
             const size_t end = offset + size;
             while (pos < end) {
                 // [TAG_DISK_DELTA_REL] blocks are cut at fixed offsets from the START OF THE RANGE (v63: of the tensor),
-                //   in both paths: a sequence's rows are one contiguous cell range in position order, so the same
-                //   prefix gives the same blocks wherever its cells sit - with several slots in a unified pool (or a
-                //   load placed at another free range) the tensor-aligned cut shifted every block and a re-save
-                //   rewrote the whole state. For a range at cell 0 (one slot) both cuts are the same. Only the cut
+                //   here and in the synchronous fallback beside it (async 0 keeps the v68 tensor-aligned cut): a
+                //   sequence's rows are one contiguous cell range in position order, so the same prefix gives the
+                //   same blocks wherever its cells sit - with several slots in a unified pool (or a load placed at
+                //   another free range) the tensor-aligned cut shifted every block and a re-save rewrote the whole
+                //   state. For a range at cell 0 (one slot) both cuts are the same. Only the cut
                 //   moves: the stream (the concatenation) is unchanged, the loader is cut-agnostic
                 const size_t blk_end = std::min(end, offset + ((pos - offset) / BLOB_BYTES + 1) * BLOB_BYTES);
                 const size_t n = blk_end - pos;
@@ -4083,8 +4084,8 @@ void server_disk_cache::deep_gc() {
 //
 // <id>.tgt / <id>.dft = MAP1 magic, then segments: u8 kind (0 = inline bytes: u64 n + bytes; 1 = block: key) until
 // kind 255. The concatenation is exactly the llama_state_seq_write stream, so loading is format-agnostic; only the
-// cutting of tensor ranges into blocks of BLOB_BYTES from the start of each range makes the unchanged part of a growing
-// conversation produce the same blocks again.
+// cutting of tensor ranges into blocks of BLOB_BYTES (--cache-disk-async > 0: from the start of each range; async 0:
+// aligned within the tensor, as v68) makes the unchanged part of a growing conversation produce the same blocks again.
 
 // the own store or the legacy store (whose blocks an unreferenced / damaged state may remove); never an adopt
 //   source's store
@@ -4192,9 +4193,13 @@ bool server_disk_cache::save_stream(llama_context * ctx, int32_t id_slot, const 
         size_t pos = offset;
         const size_t end = offset + size;
         while (ok && pos < end) {
-            // block boundaries are fixed offsets from the start of the range, so the same rows give the same blocks
-            //   every save wherever the sequence's cells sit ([TAG_DISK_DELTA_REL], as the asynchronous path)
-            const size_t blk_end = std::min(end, offset + ((pos - offset) / BLOB_BYTES + 1) * BLOB_BYTES);
+            // [TAG_DISK_DELTA_REL] with --cache-disk-async > 0 (as) block boundaries are fixed offsets from the start of
+            //   the range, as the asynchronous path cuts them (the fallback shares its blocks), so the same rows give the
+            //   same blocks wherever the sequence's cells sit. With --cache-disk-async 0 the v68 cut (aligned within the
+            //   tensor): the synchronous path writes v68's maps and blocks byte for byte. Either cut is a dedup choice
+            //   only - the stream (the concatenation) is the same and every loader (v68's included) is cut-agnostic
+            const size_t blk_end = as ? std::min(end, offset + ((pos - offset) / BLOB_BYTES + 1) * BLOB_BYTES)
+                                      : std::min(end, (pos / BLOB_BYTES + 1) * BLOB_BYTES);
             const size_t n = blk_end - pos;
             buf.resize(n);
             const int64_t t_copy = ggml_time_us(); // [TAG_DISK_ASYNC_SAVE] /metrics
