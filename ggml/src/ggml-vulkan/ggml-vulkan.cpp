@@ -9027,7 +9027,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
             // FA (own per-op f32acc), conv2d cm1, MMQ and coopmat2 are not touched.
             {
                 static const bool f32acc_knob = [] { const char * e = getenv("GGML_VK_F32ACC"); return e && atoi(e) != 0; }();
-                const bool f32acc_on = f32acc_knob && device->coopmat_support && device->coopmat_acc_f32_support;
+                // (pkg9-fix 5) never on a coopmat2 device: there the selectors serve cm2 and the f16acc capability is shared
+                const bool f32acc_on = f32acc_knob && !device->coopmat2 && device->coopmat_support && device->coopmat_acc_f32_support;
                 // GGML_VK_F32ACC_SCOPE=all (default: the above) | trunk: the f16acc pipelines stay built and each matmul picks its
                 // accumulator - f32 everywhere except MUL_MAT on a "*.indexer.*" weight (the QSA indexer q/k projections that feed
                 // the score; the score GEMM itself - QSA_SCORE / MUL_MAT_ROWS / matmul_f32 - is f32acc in both scopes)
@@ -9038,6 +9039,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 }
                 GGML_LOG_WARN("ggml_vulkan: Vulkan%zu f32acc: %s\n", idx, device->f32acc_trunk ? "on (scope trunk, MUL_MAT on *.indexer.* weights keep f16acc)" :
                               f32acc_on ? "on (GGML_VK_F32ACC=1, cm1 matmuls accumulate in f32)" :
+                              f32acc_knob && device->coopmat2 ? "off (GGML_VK_F32ACC=1 ignored on a coopmat2 device)" :
                               f32acc_knob ? "off (GGML_VK_F32ACC=1 but no cm1 f32-accumulator mode)" : "off (default: f16acc where supported)");
             }
         }
