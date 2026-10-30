@@ -446,6 +446,10 @@ rounds whose fresh draft held an EOG the verifier did not accept, i.e. non-termi
 `draft_n_short_eog_discarded` those of them that held a drafted EOG (with `n_min <= 1`, the default, both stay 0). In a
 rejection-sampled round any such clear after a stop that depends on earlier draws (p_min, H1) is not
 distribution-exact either; the EOG case is fixed, the counters measure the rest.
+`tests/test-spec-h3-exact` checks the EOG case analytically: a synthetic drafter with `p = q`, first-position EOG
+probability 0.5 and `n_min = n_max = 2` gives a first-token EOG probability of 0.5 with the fix and 0.25 with the old
+rule (exact enumeration + 200 000 seeded trials), the first token follows `p` in 378 `p != q` / `n_min` cases, and
+greedy rounds keep the old rule.
 
 ## Statistics
 Each speculative decoding implementation prints statistics.
