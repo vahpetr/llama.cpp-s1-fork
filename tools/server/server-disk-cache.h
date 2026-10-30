@@ -131,6 +131,7 @@ struct server_disk_cache {
     void set_test_hooks(bool enabled);
     struct test_hooks_t { // the LLAMA_DISK_ASYNC_TEST keys (set_test_hooks)
         int delay_ms = 0, threads = 0, fail_maps = 0, fail_job = -1, finalize_delay_ms = 0, fail_enqueue = 0, max_jobs = 0;
+        int fail_finalize = 0; // (pkg9-fix 4) the N-th finalizer task enqueue throws
         bool check_pins = false;
         std::map<int, int> finalize_delay_job;
         std::map<int, int> hold_write_job; // hold_write_jobK_ms

@@ -1672,6 +1672,26 @@ def test_disk_async_enqueue_failure_leaves_no_phantom_task():
     assert time.time() - t0 < 5
 
 
+def test_disk_async_finalize_enqueue_failure_ends_the_job():
+    """(pkg9-fix 4) a save whose state is all inline (a short prompt: no block task) queues only its finalizer task; when
+    that enqueue fails (hook fail_finalize: std::bad_alloc) the save fails at once (save() false, one warning, no second
+    "background save failed" report), the job is finished on the server thread, later saves commit and the exit drain
+    does not hang"""
+    global server
+    server, _ = dc_server("finfail", 2048, hooks={"fail_finalize": "1"})
+    server.start()
+    dc_complete(server, "Archive S. " + dc_text(31, 6))
+    dc_complete(server, "Archive T. " + dc_text(32, 6))  # S's save: its finalizer enqueue throws
+    st = dc_settle(server)
+    assert st["saves_async_failed"] == 1 and st["n_entries"] == 0, st
+    dc_complete(server, "Archive U. " + dc_text(33, 6))  # T's save commits
+    st = dc_settle(server)
+    assert st["saves_async"] == 1 and st["n_entries"] == 1, st
+    t0 = time.time()
+    server.stop()
+    assert time.time() - t0 < 5
+
+
 def test_disk_sync_fallback_shares_blocks_with_a_save_in_flight():
     """(review r12 1, r13 7) the synchronous fallback writes blocks on the workers' claims and never waits for them: two
     sibling conversations share ~7.5k tokens of prefix (whole blocks); slot 0's save is in flight, slot 1's runs

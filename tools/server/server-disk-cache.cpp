@@ -1154,6 +1154,8 @@ server_disk_cache::server_disk_cache(std::string dir, uint64_t quota_bytes, int3
 //     finalize_delay_jobK_ms=N  the same for the K-th submitted save only (overrides the above)
 //     hold_write_jobK_ms=N   the K-th submitted save's first block write holds N ms while marked "being written"
 //     fail_enqueue=N         the N-th block task enqueue (1-based, all saves) throws std::bad_alloc
+//     fail_finalize=N        the N-th finalizer task enqueue (a save whose blocks were all done - or inline only - at
+//                            the end of its copy; 1-based) throws std::bad_alloc
 //     max_jobs=N             saves in flight before a new save runs synchronously (default 2)
 //     check_pins=1           after each commit compare the cached pin set with a fresh derivation (pin_check_failures)
 //     quota_mib=N            the quota in MiB instead of --cache-disk-gib
@@ -1193,6 +1195,8 @@ void server_disk_cache::set_test_hooks(bool enabled) {
             hooks.hold_write_job[job] = std::max(0, val);
         } else if (k == "fail_enqueue") {
             hooks.fail_enqueue = val;
+        } else if (k == "fail_finalize") {
+            hooks.fail_finalize = val;
         } else if (k == "check_pins") {
             hooks.check_pins = val != 0;
         } else if (k == "max_jobs") {
@@ -2340,6 +2344,8 @@ struct server_disk_save_job {
     // (review r13 1) server thread: a synchronous save that extends this one committed while it was in flight - it no
     //   longer pins anything and its commit drops it
     bool superseded = false;
+    // server thread: save() returned false for it (the copy failed, logged there): its commit reports no loss again
+    bool copy_failed = false;
 };
 
 struct server_disk_async {
@@ -2374,6 +2380,7 @@ struct server_disk_async {
 
     uint64_t n_submitted = 0;  // jobs submitted (server thread)
     uint64_t n_enqueued  = 0;  // block tasks enqueued (test hook fail_enqueue; under mtx)
+    uint64_t n_finalize_enqueued = 0; // finalizer tasks queued at a capture's end (test hook fail_finalize; under mtx)
 
     std::set<std::string>      writing; // keys a worker is writing now
 
@@ -3035,14 +3042,31 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
     save_copy_us += copy_us;
     save_wait_us += wait_us;
     bytes_copied += job.n_logical;
+    bool fin_here = false; // (pkg9-fix 4) the finalizer task could not be queued: the job ends on this thread
     {
         std::lock_guard<std::mutex> lock(as->mtx);
         job.captured = true;
         if (job.n_open == 0) {
-            as->tasks.push_back({ &job, nullptr, {} });
-            as->cv_task.notify_one();
+            // (pkg9-fix 4) an allocation failure of the finalizer task fails the job, which then ends here without
+            //   another allocation: nothing waits for a job that no task would finish (drain / exit cannot hang)
+            try {
+                if (as->hooks.fail_finalize > 0 && (int64_t) ++as->n_finalize_enqueued == as->hooks.fail_finalize) {
+                    throw std::bad_alloc(); // test hook fail_finalize
+                }
+                as->tasks.push_back({ &job, nullptr, {} });
+                as->cv_task.notify_one();
+            } catch (...) {
+                job.ok   = false;
+                fin_here = true;
+            }
         }
     }
+    if (fin_here) {
+        DSK_WRN("%s", "cannot queue the end of an asynchronous save: the save fails\n");
+        ok = false;
+        disk_async_finalize(*as, job); // !job.ok: only releases its staging and marks it done; never throws
+    }
+    job.copy_failed = !ok;
     DSK_INF("saving %s: %zu tokens, %.1f MiB copied off the device in %.0f ms (copy %.0f ms, staging wait "
             "%.0f ms), hashing / writing in the background%s\n", job.e.id.c_str(), job.tokens.size(),
             job.n_logical / (1024.0 * 1024.0), (job.t_captured - t_start) / 1000.0, copy_us / 1000.0, wait_us / 1000.0,
@@ -3109,8 +3133,9 @@ void server_disk_cache::commit_job(server_disk_save_job & job, std::vector<serve
         ok = save_commit(job.e, ok, job.tokens, job.n_ckpts, job.ckpt_bytes, job.n_logical, n_written,
                          job.n_ckpt_written, job.t_start, job.blocking_us, job.t_done, job.t_captured);
     }
-    if (!ok && !superseded) {
-        // (review I9, r9 4) the save reported "on disk" when it was queued: the caller reports the loss (once, with when)
+    if (!ok && !superseded && !job.copy_failed) {
+        // (review I9, r9 4) the save reported "on disk" when it was queued: the caller reports the loss (once, with when);
+        //   (pkg9-fix 4) a failed copy was reported by save_async_begin already (save() returned false)
         lost.push_back({ job.id_slot, id, job.tokens.size() });
     }
     // (review I8) per key: this job's references, and whether it wrote the file; a failed job's fresh file goes when
