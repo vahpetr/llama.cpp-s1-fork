@@ -86,6 +86,9 @@ json server_slot_stats::to_json() const {
         if (n_draft_post_eog > 0) {
             base["draft_n_post_eog"] = n_draft_post_eog; // [TAG_B68_DRAFT_KNOBS]
         }
+        if (n_draft_eog_rejected > 0) {
+            base["draft_n_eog_rejected"] = n_draft_eog_rejected; // [TAG_B68_DRAFT_KNOBS]
+        }
     }
 
     return base;

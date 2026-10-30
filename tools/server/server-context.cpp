@@ -1304,6 +1304,9 @@ struct server_slot {
             if (stats.n_draft_post_eog > 0) {
                 SLT_INF(*this, "draft tokens after a drafted EOG = %" PRIu64 " (never acceptable; LLAMA_SPEC_DRAFT_STOP_EOG=1 ends the chain there)\n", stats.n_draft_post_eog);
             }
+            if (stats.n_draft_eog_rejected > 0) {
+                SLT_INF(*this, "drafted EOG not accepted = %" PRIu64 " rounds (non-terminal; LLAMA_SPEC_DRAFT_STOP_EOG=1 shortens these rounds)\n", stats.n_draft_eog_rejected);
+            }
             if (stats.n_replay_mismatch > 0) {
                 SLT_INF(*this, "replay mismatches = %" PRIu64 " (committed tokens kept; would have livelocked before)\n", stats.n_replay_mismatch);
             }
@@ -7460,6 +7463,17 @@ private:
                 const size_t n_fresh_acc    = n_matched > n_committed_in
                                             ? std::min(n_matched - n_committed_in, n_fresh_draft)
                                             : 0;
+
+                // [TAG_B68_DRAFT_KNOBS] H3 diagnostic: the fresh draft held an EOG and the verifier stopped at or before it
+                //   (the EOG was not accepted, so the round was not the last one)
+                for (size_t k = n_committed_in; k < n_draft; ++k) {
+                    if (llama_vocab_is_eog(vocab, slot.spec_draft[k])) {
+                        if (n_matched <= k) {
+                            slot.stats.n_draft_eog_rejected++;
+                        }
+                        break;
+                    }
+                }
 
                 if (params_base.speculative.draft.n_max_adaptive ||
                         params_base.speculative.draft.policy == COMMON_SPEC_DRAFT_POLICY_TPUT) {

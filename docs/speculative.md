@@ -439,8 +439,9 @@ off); a set knob prints a WARN proof line at start.
 | `LLAMA_SPEC_DRAFT_N_MAX_GREEDY=n` (H5a) | server: rounds verified by sample-and-match (T = 0) draft at most `n` tokens, so `--spec-draft-n-max` can be raised for the rejection-sampled rounds alone. `n` is clamped to `[--spec-draft-n-min, --spec-draft-n-max]` (a cap below `n_min` would make the drafter discard every T = 0 draft); the proof line names it, e.g. `LLAMA_SPEC_DRAFT_N_MAX_GREEDY=2: on, clamped to n_min 3` |
 | `LLAMA_SPEC_DRAFT_Q_STOP=x` (H5b) | rejection-sampled rounds: the chain ends at a position whose top-1 draft probability is below `x` (the target samples that position itself). The stop depends on the draft distribution only, never on the drawn token, so every drafted position proposes its full `q` and the rejection sampler stays distribution-exact (a stop on the drawn token's own probability would bias the output towards common tokens) |
 
-The response `timings` carry `draft_n_post_eog` (tokens drafted after a drafted EOG) when it is non-zero; the slot's
-`print_timing` block prints the same count.
+The response `timings` carry `draft_n_post_eog` (tokens drafted after a drafted EOG) and `draft_n_eog_rejected` (verify
+rounds whose fresh draft held an EOG the verifier did not accept, i.e. non-terminal rounds that
+`LLAMA_SPEC_DRAFT_STOP_EOG=1` shortens) when they are non-zero; the slot's `print_timing` block prints the same counts.
 
 ## Statistics
 Each speculative decoding implementation prints statistics.
