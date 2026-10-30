@@ -76,6 +76,11 @@ struct common_speculative_draft_params {
     int32_t n_attempted = -1;
     int32_t n_kept      = -1;
 
+    // [TAG_G68_H3_FIX] outputs of the last _draft() call (draft-mtp; 0 / false elsewhere, the server zeroes them after
+    //   reading): n_short_cleared = tokens the n_min rule cleared, short_cleared_eog = that cleared draft held an EOG
+    int32_t n_short_cleared   = 0;
+    bool    short_cleared_eog = false;
+
     // [TAG_SPEC_DRAFT_POLICY] (v51 r2, Hermes) input: true = the n_min rule does not clear this draft (a tput cooldown
     //   probe of max(n_min, 1) tokens that stopped early is kept as drafted - a cleared probe would count as a failed
     //   probe and could keep a cooldown alive by itself). false (the default, every other caller): unchanged.

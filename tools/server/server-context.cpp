@@ -1327,6 +1327,9 @@ struct server_slot {
             if (stats.n_draft_eog_rejected > 0) {
                 SLT_INF(*this, "drafted EOG not accepted = %" PRIu64 " rounds (non-terminal; LLAMA_SPEC_DRAFT_STOP_EOG=1 shortens these rounds)\n", stats.n_draft_eog_rejected);
             }
+            if (stats.n_draft_short_discarded > 0) {
+                SLT_INF(*this, "drafts cleared by --spec-draft-n-min = %" PRIu64 " (of them with a drafted EOG = %" PRIu64 ")\n", stats.n_draft_short_discarded, stats.n_draft_short_eog_discarded);
+            }
             if (stats.n_replay_mismatch > 0) {
                 SLT_INF(*this, "replay mismatches = %" PRIu64 " (committed tokens kept; would have livelocked before)\n", stats.n_replay_mismatch);
             }
@@ -6225,6 +6228,16 @@ private:
             auto & ckpt  = slot.spec_ckpt;
 
             slot.stats.n_draft_tokens += draft.size();
+            // [TAG_G68_H3_FIX] drafts the n_min rule cleared (never verified; the drafter reports them, zeroed after reading)
+            {
+                auto & dpc = common_speculative_get_draft_params(spec.get(), slot.id);
+                if (dpc.n_short_cleared > 0) {
+                    slot.stats.n_draft_short_discarded++;
+                    slot.stats.n_draft_short_eog_discarded += dpc.short_cleared_eog ? 1 : 0;
+                }
+                dpc.n_short_cleared   = 0;
+                dpc.short_cleared_eog = false;
+            }
             // [TAG_B68_DRAFT_KNOBS] H3 measurement: tokens drafted after a drafted EOG (the verifier never takes them)
             for (size_t k = 0; k + 1 < draft.size(); ++k) {
                 if (llama_vocab_is_eog(vocab, draft[k])) {

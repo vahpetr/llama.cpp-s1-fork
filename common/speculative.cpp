@@ -2138,6 +2138,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             dp.n_kept = (int32_t) dp.result->size();
             // [TAG_G68_H3_FIX] a sampled round that ended at a drafted EOG keeps its short draft (+ its full q)
             if (common_spec_draft_clear_short(dp.result->size(), params.n_min, dp.keep_short, dp.result_q != nullptr, eog_end[seq_id])) {
+                dp.n_short_cleared   = (int32_t) dp.result->size();
+                dp.short_cleared_eog = false;
+                for (const llama_token t : *dp.result) {
+                    dp.short_cleared_eog = dp.short_cleared_eog || llama_vocab_is_eog(vocab_dft, t);
+                }
                 dp.result->clear();
                 if (dp.result_q) {
                     dp.result_q->clear(); // [TAG_UP27694] one candidate set per drafted token
