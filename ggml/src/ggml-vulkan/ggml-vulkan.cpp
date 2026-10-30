@@ -9146,6 +9146,20 @@ static vk_device ggml_vk_get_device(size_t idx) {
             if (getenv("GGML_VK_DISABLE_BFLOAT16")) {
                 device->coopmat_bf16_support = false;
             }
+            // [TAG_F32ACC] GGML_VK_F32ACC=1: f32 accumulator for every KHR coopmat (cm1) matmul - dense mul_mm and
+            // MUL_MAT_ID, quantized and f16 A, all tile twins - by dropping the f16-accumulator mode, so the selectors
+            // (ggml_vk_get_mul_mat_mat{,_id}_pipeline) take .f32acc and CREATE_MM2 builds no f16acc variants. Port of the
+            // knob in nathan e68dd31db (default on for RADV there); default OFF here = the f16acc selection unchanged.
+            // FA (own per-op f32acc), conv2d cm1, MMQ and coopmat2 are not touched.
+            {
+                static const bool f32acc_knob = [] { const char * e = getenv("GGML_VK_F32ACC"); return e && atoi(e) != 0; }();
+                const bool f32acc_on = f32acc_knob && device->coopmat_support && device->coopmat_acc_f32_support;
+                if (f32acc_on) {
+                    device->coopmat_acc_f16_support = false;
+                }
+                GGML_LOG_WARN("ggml_vulkan: Vulkan%zu f32acc: %s\n", idx, f32acc_on ? "on (GGML_VK_F32ACC=1, cm1 matmuls accumulate in f32)" :
+                              f32acc_knob ? "off (GGML_VK_F32ACC=1 but no cm1 f32-accumulator mode)" : "off (default: f16acc where supported)");
+            }
         }
 
         if (device->coopmat_support) {
