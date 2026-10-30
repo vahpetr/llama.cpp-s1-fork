@@ -7464,11 +7464,12 @@ private:
                                             ? std::min(n_matched - n_committed_in, n_fresh_draft)
                                             : 0;
 
-                // [TAG_B68_DRAFT_KNOBS] H3 diagnostic: the fresh draft held an EOG and the verifier stopped at or before it
-                //   (the EOG was not accepted, so the round was not the last one)
+                // [TAG_B68_DRAFT_KNOBS] H3 diagnostic: the fresh draft held an EOG that the verifier did not take (it stopped
+                //   before it, or sampled another token there), so the round was not the last one. A matched EOG ends the
+                //   accepted list as the target's own token (accepted[k] == draft[k], n_matched == k): terminal, not counted
                 for (size_t k = n_committed_in; k < n_draft; ++k) {
                     if (llama_vocab_is_eog(vocab, slot.spec_draft[k])) {
-                        if (n_matched <= k) {
+                        if (n_matched < k || (n_matched == k && accepted[k] != slot.spec_draft[k])) {
                             slot.stats.n_draft_eog_rejected++;
                         }
                         break;
