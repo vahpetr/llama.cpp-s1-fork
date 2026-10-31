@@ -9037,7 +9037,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 if (f32acc_on && !device->f32acc_trunk) {
                     device->coopmat_acc_f16_support = false;
                 }
-                GGML_LOG_WARN("ggml_vulkan: Vulkan%zu f32acc: %s\n", idx, device->f32acc_trunk ? "on (scope trunk, MUL_MAT on *.indexer.* weights keep f16acc)" :
+                GGML_LOG_WARN("ggml_vulkan: Vulkan%zu f32acc: %s\n", idx, device->f32acc_trunk ? "on (scope trunk, MUL_MAT on *.indexer.* weights keep the default accumulator)" :
                               f32acc_on ? "on (GGML_VK_F32ACC=1, cm1 matmuls accumulate in f32)" :
                               f32acc_knob && device->coopmat2 ? "off (GGML_VK_F32ACC=1 ignored on a coopmat2 device)" :
                               f32acc_knob ? "off (GGML_VK_F32ACC=1 but no cm1 f32-accumulator mode)" : "off (default: f16acc where supported)");
@@ -11880,6 +11880,22 @@ static bool ggml_vk_f32acc_excluded(const ggml_tensor * src0) {
     return strstr(src0->name, ".indexer.") != nullptr;
 }
 
+// [TAG_F32ACC] (f70) the exclusion's runtime proof, once per (src0 type, outcome): an excluded mat-mat dispatch either
+// really keeps an f16acc pipeline (the prec-F32 choice would differ) or is inert - its types have no f16acc variant
+// (BF16 = pipeline_matmul_bf16, F32, MMQ q8_1: f32acc only), so trunk computes it exactly as off and all do. The
+// mat-vec path (n <= mul_mat_vec_max_cols) accumulates in f32 in every scope and never reaches this.
+static void ggml_vk_f32acc_excluded_note(const ggml_tensor * src0, const vk_matmul_pipeline & kept, const vk_matmul_pipeline & f32) {
+    static std::mutex mtx;
+    static std::set<int> seen;
+    const bool hit = kept != f32;
+    std::lock_guard<std::mutex> guard(mtx);
+    if (seen.insert((int) src0->type * 2 + (int) hit).second) {
+        GGML_LOG_WARN("ggml_vulkan: f32acc: scope trunk exclusion %s on %s (src0 %s)\n",
+                      hit ? "HIT: keeps the f16acc pipeline" : "INERT: no f16acc variant for this type, same pipeline as off/all",
+                      src0->name, ggml_type_name(src0->type));
+    }
+}
+
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k,
                                   const ggml_tensor * row_ids = nullptr, uint64_t row_ids_a_bytes = 0) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
@@ -11948,12 +11964,15 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     // Check for mmq first
     // [TAG_F32ACC] scope trunk: f32acc unless src0 is a QSA indexer weight (ggml_vk_f32acc_excluded)
-    const ggml_prec prec = ctx->device->f32acc_trunk && !ggml_vk_f32acc_excluded(src0) ? GGML_PREC_F32 : (ggml_prec)dst->op_params[0];
+    const bool f32acc_excl = ctx->device->f32acc_trunk && ggml_vk_f32acc_excluded(src0);
+    const ggml_prec prec = ctx->device->f32acc_trunk && !f32acc_excl ? GGML_PREC_F32 : (ggml_prec)dst->op_params[0];
     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, prec) : nullptr;
+    ggml_type mm_a = src0->type, mm_b = GGML_TYPE_Q8_1; // the types of the selector call that produced mmp
 
     if (mmp == nullptr) {
         // Fall back to f16 dequant mul mat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, prec);
+        mm_b = y_non_contig ? f16_type : src1->type;
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, mm_a, mm_b, prec);
         quantize_y = false;
     }
 
@@ -11962,7 +11981,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     if (qx_needs_dequant) {
         // Fall back to dequant + f16 mulmat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, prec);
+        mm_a = f16_type; mm_b = y_f32_kernel ? GGML_TYPE_F32 : f16_type;
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, mm_a, mm_b, prec);
+    }
+    if (f32acc_excl) {
+        ggml_vk_f32acc_excluded_note(src0, mmp, ggml_vk_get_mul_mat_mat_pipeline(ctx, mm_a, mm_b, GGML_PREC_F32));
     }
 
     // Not implemented
@@ -22692,7 +22715,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             n_ex += cgraph->nodes[i]->op == GGML_OP_MUL_MAT && ggml_vk_f32acc_excluded(cgraph->nodes[i]->src[0]);
         }
         if (n_ex > 0 && !f32acc_proof.exchange(true)) {
-            GGML_LOG_WARN("ggml_vulkan: f32acc: on (scope trunk, excluded %d ops: MUL_MAT src0 *.indexer.*)\n", n_ex);
+            // (f70) a name match only - whether the match changes a pipeline is the per-dispatch HIT / INERT line
+            GGML_LOG_WARN("ggml_vulkan: f32acc: on (scope trunk, %d MUL_MAT nodes match src0 *.indexer.* in this graph; "
+                          "per-type HIT/INERT at dispatch)\n", n_ex);
         }
     }
 
