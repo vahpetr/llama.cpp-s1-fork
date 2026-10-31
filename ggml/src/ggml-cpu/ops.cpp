@@ -11732,11 +11732,23 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // per-seq stride in floats (seq s starts at state + s * seq_in_stride)
     const int64_t state_in_seq_stride = src_state->nb[3] / sizeof(float);
 
-    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+    // commit by replay (ggml_gated_delta_net_set_replay): a replayed prefix from the stash, the state after token tc
+    //   written, the inputs of the tokens after tc kept in the other half of the sequence's stash slot
+    const ggml_tensor * stash = dst->src[7];
+    const bool replay = stash != nullptr;
+    GGML_ASSERT(!replay || K == 1);
+    const int32_t * ctl = replay ? (const int32_t *) dst->src[8]->data : nullptr;
+    const int64_t st_row = replay ? stash->ne[0] : 0;
+    const int64_t st_w   = replay ? stash->ne[1] : 0;
+    const int64_t st_v   = nek0 * nek1;
+    const int64_t st_g   = st_v + S_v * H;
+    const int64_t st_b   = st_g + neg0 * H;
+
+    const int64_t per_thread = S_v + (K > 1 || replay ? S_v * S_v : 0);
     const int ith = params->ith;
 
     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
-    float * state_work  = K > 1 ? (delta + S_v) : nullptr;
+    float * state_work  = K > 1 || replay ? (delta + S_v) : nullptr;
 
     // output layout: [attn_scores | new_states]
     // attn_scores: S_v * H * n_tokens * n_seqs    floats
@@ -11774,7 +11786,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
         // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
         // For K>1, work in scratch and copy out per-token when the slot is in range.
-        float * s_out = (K > 1)
+        float * s_out = (K > 1 || replay)
             ? state_work
             : state_out_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
 
@@ -11786,13 +11798,34 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
 
-        for (int64_t t = 0; t < n_tokens; t++) {
-            const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
-            const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
-            const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
+        // the replay control of this sequence (see ggml.h); without replay: no prefix, the final state, no stash
+        const int64_t n_prefix = replay ? ctl[iv3 * 4 + 0] : 0;
+        const int64_t n_defer  = replay ? ctl[iv3 * 4 + 2] : 0;
+        const int64_t tc       = n_defer < 0 ? -1 : n_tokens - 1 - n_defer;
+        const int64_t t_end    = n_defer < 0 ? 0 : n_tokens;
+        float * state_dst      = state_out_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        const float * st_rd    = nullptr;
+        float *       st_wr    = nullptr;
+        if (replay) {
+            GGML_ASSERT(n_prefix >= 0 && n_prefix <= st_w && n_defer <= std::min<int64_t>(n_tokens, st_w));
+            const int64_t half = ctl[iv3 * 4 + 1];
+            const int64_t slot = ctl[iv3 * 4 + 3];
+            GGML_ASSERT((half == 0 || half == 1) && slot >= 0 && 2 * slot + 1 < stash->ne[2]);
+            st_rd = (const float *) stash->data + (2 * slot + half) * st_w * st_row;
+            st_wr = (float *) stash->data + (2 * slot + 1 - half) * st_w * st_row;
+            if (tc == -1 && n_prefix == 0) {
+                memcpy(state_dst, s_out, S_v * S_v * sizeof(float));
+            }
+        }
 
-            const float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
-            const float * g_d    =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
+        for (int64_t t = -n_prefix; t < t_end; t++) {
+            const float * row = t < 0 ? st_rd + (t + n_prefix) * st_row : nullptr;
+            const float * q_d = t < 0 ? nullptr : (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
+            const float * k_d = t < 0 ? row + ik1 * nek0 : (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
+            const float * v_d = t < 0 ? row + st_v + iv1 * S_v : (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
+
+            const float beta_val = t < 0 ? row[st_b + iv1] : *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
+            const float * g_d    = t < 0 ? row + st_g + iv1 * neg0 : (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
 
             // state is stored transposed: s_out[j*S_v + i] = S[i][j]
             // so row j of s_out = column j of S (contiguous access)
@@ -11820,6 +11853,25 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
             for (int64_t j = 0; j < S_v; ++j) {
                 ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
+            }
+
+            if (replay) {
+                // a deferred token keeps its inputs for the next pass (k once per key head)
+                if (t > tc) {
+                    float * row_w = st_wr + (t - tc - 1) * st_row;
+                    if (iv1 < nek1) {
+                        memcpy(row_w + iv1 * nek0, k_d, nek0 * sizeof(float));
+                    }
+                    memcpy(row_w + st_v + iv1 * S_v, v_d, S_v * sizeof(float));
+                    memcpy(row_w + st_g + iv1 * neg0, g_d, neg0 * sizeof(float));
+                    row_w[st_b + iv1] = beta_val;
+                }
+                if (t == tc) {
+                    memcpy(state_dst, s_out, S_v * S_v * sizeof(float));
+                }
+                if (t < 0) {
+                    continue; // a replayed token has no output
+                }
             }
 
             // attn_out[j] = sum_i S[i][j] * q[i] = dot(row j of M, q)

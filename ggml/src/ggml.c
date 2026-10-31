@@ -6807,6 +6807,22 @@ struct ggml_tensor * ggml_gated_delta_net_ext(
     return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, dst_state->ne[2], dst_state);
 }
 
+void ggml_gated_delta_net_set_replay(
+        struct ggml_tensor  * gdn,
+        struct ggml_tensor  * stash,
+        struct ggml_tensor  * ctl) {
+    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(gdn, 0) == 1);
+    const struct ggml_tensor * k = gdn->src[1];
+    const struct ggml_tensor * v = gdn->src[2];
+    const struct ggml_tensor * g = gdn->src[3];
+    GGML_ASSERT(stash->type == GGML_TYPE_F32 && ggml_is_contiguous(stash) && stash->ne[2] % 2 == 0 && stash->ne[3] == 1);
+    GGML_ASSERT(stash->ne[0] == k->ne[0]*k->ne[1] + v->ne[0]*v->ne[1] + g->ne[0]*v->ne[1] + v->ne[1]);
+    GGML_ASSERT(ctl->type == GGML_TYPE_I32 && ggml_is_contiguous(ctl) && ctl->ne[0] == 4 && ctl->ne[1] == v->ne[3]);
+    GGML_ASSERT(v->ne[3] == k->ne[3]); // one key sequence per sequence: the stash slot keeps the k the sequence used
+    gdn->src[7] = stash;
+    gdn->src[8] = ctl;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(

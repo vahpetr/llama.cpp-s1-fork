@@ -36,6 +36,10 @@ layout(push_constant) uniform Parameters {
     // packed (legacy) output: binding 7 aliases DstBuf, so_off = attn size, so1 = H*S_V*S_V, so2 = so1*n_seqs
     // direct store:           binding 7 is the destination view, so_off = its misalignment in floats
     uint so_off, so1, so2;
+#if GDN_REPLAY
+    // commit by replay (ggml_gated_delta_net_set_replay): W rows per stash half, row = floats per token row
+    uint st_w, st_row;
+#endif
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -46,6 +50,12 @@ layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf     { FLOAT_TYPE data_dst[];       };
 layout(binding = 7)           buffer DstStateBuf { FLOAT_TYPE data_dst_state[]; };
+#if GDN_REPLAY
+// stash: token rows k [S_V*neq1], v [S_V*H], g [H or S_V*H], beta [H]; (slot c, half h) = plane c*2 + h of st_w rows
+layout(binding = 8)           buffer StashBuf    { FLOAT_TYPE data_stash[];     };
+// per sequence { n_prefix, read_half, n_defer, slot }, see ggml.h
+layout(binding = 9) readonly  buffer CtlBuf      { int        data_ctl[];       };
+#endif
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -122,6 +132,65 @@ void main() {
 
     uint attn_off = (seq_id * n_tokens * H + head_id) * S_V;
 
+#if GDN_REPLAY
+    // one loop over the replayed prefix (t < 0, inputs from the stash) and the window (t >= 0, the op's inputs): the
+    //   state update below is the same code for both. The state written to the cache is the one after token tc
+    const int  n_prefix  = data_ctl[seq_id * 4 + 0];
+    const uint read_half = uint(data_ctl[seq_id * 4 + 1]);
+    const int  n_defer   = data_ctl[seq_id * 4 + 2];
+    const uint slot      = uint(data_ctl[seq_id * 4 + 3]);
+    const int  tc        = n_defer < 0 ? -1 : int(n_tokens) - 1 - n_defer; // n_defer < 0: commit only, no window
+    const int  t_end     = n_defer < 0 ? 0 : int(n_tokens);
+    const uint st_v      = S_V * neq1;
+    const uint st_g      = st_v + S_V * H;
+    const uint st_b      = st_g + (KDA == 0 ? 1u : S_V) * H;
+    const uint st_rd     = ((slot * 2u + read_half) * st_w) * st_row;
+    const uint st_wr     = ((slot * 2u + (1u - read_half)) * st_w) * st_row;
+    const uint state_dst = state_out_base;
+
+    if (tc == -1 && n_prefix == 0) {
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            data_dst_state[state_dst + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+        }
+    }
+
+    for (int ti = -n_prefix; ti < t_end; ti++) {
+        FLOAT_TYPE k_reg[ROWS_PER_LANE];
+        FLOAT_TYPE q_reg[ROWS_PER_LANE];
+        FLOAT_TYPE g_raw[ROWS_PER_LANE];
+        FLOAT_TYPE v_val;
+        FLOAT_TYPE beta_val;
+        if (ti < 0) {
+            const uint row = st_rd + uint(ti + n_prefix) * st_row;
+            beta_val = data_stash[row + st_b + head_id];
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                const uint i = r * LANES_PER_COLUMN + lane;
+                k_reg[r] = data_stash[row + iq1 * S_V + i];
+                q_reg[r] = FLOAT_TYPE(0);
+                g_raw[r] = KDA == 0 ? data_stash[row + st_g + head_id] : data_stash[row + st_g + head_id * S_V + i];
+            }
+            v_val = data_stash[row + st_v + head_id * S_V + col];
+        } else {
+            const uint t = uint(ti);
+            const uint q_off = iq3 * sq3 + t * sq2 + iq1 * sq1;
+            const uint k_off = q_off;
+            const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
+            const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
+            beta_val = FLOAT_TYPE(data_beta[gb_off]);
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                const uint i = r * LANES_PER_COLUMN + lane;
+                k_reg[r] = FLOAT_TYPE(data_k[k_off + i]);
+                q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
+                g_raw[r] = KDA == 0 ? FLOAT_TYPE(data_g[gb_off]) : FLOAT_TYPE(data_g[gb_off * S_V + i]);
+            }
+            v_val = FLOAT_TYPE(data_v[v_off + col]);
+        }
+
+        FLOAT_TYPE g_exp[ROWS_PER_LANE];
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            g_exp[r] = exp(g_raw[r]);
+        }
+#else
     for (uint t = 0; t < n_tokens; t++) {
         const uint q_off = iq3 * sq3 + t * sq2 + iq1 * sq1;
         const uint k_off = q_off;
@@ -152,6 +221,7 @@ void main() {
         }
 
         const FLOAT_TYPE v_val = FLOAT_TYPE(data_v[v_off + col]);
+#endif
 
         FLOAT_TYPE kv_shard = 0.0;
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
@@ -168,6 +238,46 @@ void main() {
         }
         FLOAT_TYPE attn_col = reduce_partial(attn_partial);
 
+#if GDN_REPLAY
+        if (ti >= 0) {
+            if (lane == 0) {
+                data_dst[attn_off + col] = attn_col * scale;
+            }
+            attn_off += S_V * H;
+        }
+
+        // a deferred token keeps its inputs (k once per key head, g / beta once per head) for the next pass
+        if (ti > tc) {
+            const uint row = st_wr + uint(ti - tc - 1) * st_row;
+            if (col == 0) {
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    const uint i = r * LANES_PER_COLUMN + lane;
+                    if (head_id < neq1) {
+                        data_stash[row + head_id * S_V + i] = k_reg[r];
+                    }
+                    if (KDA != 0) {
+                        data_stash[row + st_g + head_id * S_V + i] = g_raw[r];
+                    }
+                }
+                if (lane == 0) {
+                    if (KDA == 0) {
+                        data_stash[row + st_g + head_id] = g_raw[0];
+                    }
+                    data_stash[row + st_b + head_id] = beta_val;
+                }
+            }
+            if (lane == 0) {
+                data_stash[row + st_v + head_id * S_V + col] = v_val;
+            }
+        }
+
+        if (ti == tc) {
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                data_dst_state[state_dst + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+            }
+        }
+    }
+#else
         if (lane == 0) {
             data_dst[attn_off + col] = attn_col * scale;
         }
@@ -184,4 +294,5 @@ void main() {
             }
         }
     }
+#endif
 }
