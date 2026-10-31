@@ -2397,6 +2397,9 @@ struct server_disk_async {
     std::vector<std::thread> threads;
 
     std::map<std::string, int> pending; // block keys referenced by jobs in flight (blob_gc keeps them)
+    // (sc3fix 4) pending keys whose own-store file blob_drop_copy() removed (damaged) while claimed: a claimant that did
+    //   not write the file again commits as a failure unless the file is back by then; forgotten with the last claim
+    std::set<std::string> dropped;
 
     std::atomic<uint64_t> incr_verified{0}, incr_mismatch{0}; // [TAG_DISK_INCR] incr_verify hook (workers)
 
@@ -2537,6 +2540,7 @@ static void disk_async_pending_release(server_disk_async & as, const std::string
     auto it = as.pending.find(key);
     if (it != as.pending.end() && (it->second -= n) <= 0) {
         as.pending.erase(it);
+        as.dropped.erase(key); // (sc3fix 4)
     }
 }
 
@@ -3233,6 +3237,19 @@ void server_disk_cache::commit_job(server_disk_save_job & job, std::vector<serve
         //   save_commit: its own-store copy loop must see them as own
         std::lock_guard<std::mutex> lock(as->mtx);
         GGML_ASSERT(job.e.blobs.size() == job.blocks.size());
+        // (sc3fix 4) a claimed key whose file blob_drop_copy() removed (damaged) since: the entry would reference a
+        //   missing block - the save fails unless the file was written again meanwhile (same key = same bytes)
+        for (const auto & b : job.blocks) {
+            if (!as->dropped.empty() && as->dropped.count(b.key) && file_present(fs::path(job.blk_dir) / (b.key + ".blk")) <= 0) {
+                DSK_WRN("asynchronous save of %s: its block %s was dropped as damaged while the save was in flight - the save fails\n",
+                        job.e.id.c_str(), b.key.c_str());
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (ok) {
+        std::lock_guard<std::mutex> lock(as->mtx);
         size_t i = 0;
         for (const auto & b : job.blocks) {
             job.e.blobs[i++] = b.key;
@@ -4315,6 +4332,12 @@ std::string server_disk_cache::blob_path(const std::string & key) const {
 void server_disk_cache::blob_drop_copy(const std::string & key) {
     std::error_code ec;
     if (blob_writable(key)) {
+        if (as) { // (sc3fix 4) a save in flight may hold a claim on it: its commit re-checks the file
+            std::lock_guard<std::mutex> lock(as->mtx);
+            if (as->pending.count(key)) {
+                as->dropped.insert(key);
+            }
+        }
         fs::remove(blob_path(key), ec);
     }
     if (!blk_own.erase(key) && !blk_legacy.erase(key)) {
