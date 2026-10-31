@@ -3283,26 +3283,33 @@ void server_disk_cache::commit_job(server_disk_save_job & job, std::vector<serve
     }
     if (incr) { // [TAG_DISK_INCR] the slot's record: this save's full blocks, if it committed (its keys stay claimed by its entry)
         if (ok && !superseded && job.incr_since != 0 && !job.incr_ranges.empty()) {
-            if (hooks.fail_incr_rec > 0 && (int64_t) ++n_incr_rec_hook == hooks.fail_incr_rec) {
-                throw std::bad_alloc(); // test hook fail_incr_rec: the record's allocation
-            }
-            auto rec = std::make_shared<server_disk_incr_rec>();
-            rec->since   = job.incr_since;
-            rec->blk_dir = job.blk_dir;
-            rec->ranges.resize(job.incr_ranges.size());
-            for (size_t si = 0; si < job.incr_ranges.size(); ++si) {
-                for (const auto & [rk, rv] : job.incr_ranges[si]) {
-                    auto & out = rec->ranges[si][rk];
-                    out.first = rv.first;
-                    for (const auto * b : rv.second) {
-                        if (b->n != BLOB_BYTES || b->key.empty()) {
-                            break; // the full blocks only (a range's last block may be partial)
+            // (sc3fix 3) the entry is published already: the record is optional - a failure to build it drops the slot's
+            //   record (the next save copies everything) and the commit goes on to release the claims
+            try {
+                if (hooks.fail_incr_rec > 0 && (int64_t) ++n_incr_rec_hook == hooks.fail_incr_rec) {
+                    throw std::bad_alloc(); // test hook fail_incr_rec: the record's allocation
+                }
+                auto rec = std::make_shared<server_disk_incr_rec>();
+                rec->since   = job.incr_since;
+                rec->blk_dir = job.blk_dir;
+                rec->ranges.resize(job.incr_ranges.size());
+                for (size_t si = 0; si < job.incr_ranges.size(); ++si) {
+                    for (const auto & [rk, rv] : job.incr_ranges[si]) {
+                        auto & out = rec->ranges[si][rk];
+                        out.first = rv.first;
+                        for (const auto * b : rv.second) {
+                            if (b->n != BLOB_BYTES || b->key.empty()) {
+                                break; // the full blocks only (a range's last block may be partial)
+                            }
+                            out.second.push_back(b->key);
                         }
-                        out.second.push_back(b->key);
                     }
                 }
+                incr_recs[job.id_slot] = std::move(rec);
+            } catch (...) {
+                incr_recs.erase(job.id_slot);
+                DSK_WRN("%s", "incremental save: cannot record the committed save, the next save of the slot copies everything\n");
             }
-            incr_recs[job.id_slot] = std::move(rec);
         } else if (!superseded) {
             incr_recs.erase(job.id_slot);
         }
