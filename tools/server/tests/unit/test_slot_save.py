@@ -2471,7 +2471,8 @@ def test_disk_drop_of_a_claimed_block_fails_the_claimant():
     is registered with a missing block (every later load of it fails)"""
     global server
     server, cache_dir = dc_server("dropclaim", 2048, n_ctx=32768, n_slots=2,
-                                  hooks={"finalize_delay_job3_ms": "15000", "hold_write_job4_ms": "30000"})
+                                  hooks={"finalize_delay_job3_ms": "15000", "hold_write_job4_ms": "30000",
+                                         "threads": "1"})
     server.model_draft = None
     server.spec_type = None
     server.spec_draft_n_min = None
@@ -2496,7 +2497,9 @@ def test_disk_drop_of_a_claimed_block_fails_the_claimant():
     assert 0 < lo <= hi, (lo, hi)
     dc_complete(server, t_q[:(lo + hi) // 2], n=1, slot=1)  # no save (slot 1 was empty), no job number taken
     # job 4 = slot 1's own save before its load (shares A's blocks): its first block write is held past job 3's commit,
-    #   so k0 is not written back before job 3 commits (else job 3 commits normally - the after2 run)
+    #   so k0 is not written back before job 3 commits (else job 3 commits normally - the after2 run); one worker
+    #   (threads=1): job 4's block tasks run in order, the held first one is block 0 = k0 (after3: with 4 workers the
+    #   hold took another block and k0 was written back at once)
     r = dc_complete(server, a3, slot=0)  # job 2 saves Z1; A loaded from E1
     assert r["timings"]["cache_n"] >= 4000, r["timings"]
     n_sub = st["saves"]
