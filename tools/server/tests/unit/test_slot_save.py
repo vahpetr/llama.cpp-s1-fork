@@ -2485,7 +2485,17 @@ def test_disk_drop_of_a_claimed_block_fails_the_claimant():
     ns, ents = dc_entry_blocks(cache_dir)
     e1 = max(ents, key=lambda n: n if ents[n] else -1)
     k0 = ents[e1][0]
-    r = dc_complete(server, DC_INCR_A + " Part 3. " + dc_text(53, 200), slot=0)  # job 2 saves Z1; A loaded from E1
+    # slot 1 must load E1 while job 3 is in flight: a lookup waits for an in-flight save sharing more than the slot's
+    # LCP + 1024 with its prompt (await_pending), so slot 1 first holds a prefix of A + B1 long enough that job 3
+    # (A + B3) is not waited for, short enough that E1 still clearly beats the slot (find: > LCP + 1024)
+    a3 = DC_INCR_A + " Part 3. " + dc_text(53, 200)
+    tok = lambda t: server.make_request("POST", "/tokenize", data={"content": t, "add_special": True}).body["tokens"]
+    lcp = lambda a, b: next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+    t_ab1, t_q = tok(ab1), tok(ab1 + " more")
+    lo, hi = lcp(tok(a3), t_q) - 1024, lcp(t_ab1, t_q) - 1024 - 1
+    assert 0 < lo <= hi, (lo, hi)
+    dc_complete(server, t_q[:(lo + hi) // 2], n=1, slot=1)  # no save (slot 1 was empty), no job number taken
+    r = dc_complete(server, a3, slot=0)  # job 2 saves Z1; A loaded from E1
     assert r["timings"]["cache_n"] >= 4000, r["timings"]
     n_sub = st["saves"]
     dc_complete(server, "Archive Z2. " + dc_text(54, 50), slot=0)  # the save of A + B3 (claims k0), its end held
