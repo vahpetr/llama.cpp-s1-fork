@@ -3109,25 +3109,38 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
                 size_t k = 0;
                 for (; k < n_reuse; ++k) {
                     const std::string & key = (*keys)[k];
-                    {
-                        std::lock_guard<std::mutex> lock(as->mtx);
-                        // a key being written by another job, or gone from the own store: copy from here on
-                        if (as->writing.count(key) || file_present(fs::path(job.blk_dir) / (key + ".blk")) <= 0) {
-                            break;
-                        }
-                        as->pending[key]++; // released at the commit with the job's other keys
-                    }
+                    // (sc3fix 2) every allocation before the claim: a throw leaves no claim behind (the job fails, its
+                    //   key-less records are skipped by the commit); after the claim only non-throwing steps - the key
+                    //   moves into the record, whose key the commit releases
                     if (hooks.fail_incr_alloc > 0 && (int64_t) ++n_incr_alloc_hook == hooks.fail_incr_alloc) {
                         throw std::bad_alloc(); // test hook fail_incr_alloc: the block record's allocation
                     }
+                    std::string key_rec = key;
+                    const fs::path fin = fs::path(job.blk_dir) / (key + ".blk");
                     job.blocks.emplace_back();
                     auto & b = job.blocks.back();
-                    b.key = key;
-                    b.n   = BLOB_BYTES;
                     mine.second.push_back(&b);
                     st.segs.emplace_back();
                     st.segs.back().blk_ref = &b;
                     job.e.blobs.push_back("");
+                    bool claimed = false;
+                    {
+                        std::lock_guard<std::mutex> lock(as->mtx);
+                        // a key being written by another job, or gone from the own store: copy from here on
+                        if (!as->writing.count(key) && file_present(fin) > 0) {
+                            as->pending[key]++; // released at the commit with the job's other keys
+                            claimed = true;
+                        }
+                    }
+                    if (!claimed) {
+                        job.e.blobs.pop_back();
+                        st.segs.pop_back();
+                        mine.second.pop_back();
+                        job.blocks.pop_back();
+                        break;
+                    }
+                    b.key.swap(key_rec);
+                    b.n = BLOB_BYTES;
                 }
                 incr_blocks_reused += k;
                 incr_bytes_skipped += (uint64_t) k * BLOB_BYTES;
