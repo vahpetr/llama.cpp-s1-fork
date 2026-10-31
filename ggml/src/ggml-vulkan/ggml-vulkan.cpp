@@ -984,7 +984,7 @@ struct vk_device_struct {
     uint64_t qsa_topk_op_tot[48]  = {}; // [0..40) onepass, [40..48) v3 ([TAG_QSA_TOPK_V3])
     uint64_t qsa_topk_op_next_log = 1024;
     uint64_t qsa_topk_op_logged   = 0;
-    // [TAG_QSA_TOPK_V3] GGML_VK_QSA_TOPK_V3=1 (default off; needs onepass + nokeys): the onepass selection of the nokeys cell form
+    // [TAG_QSA_TOPK_V3] GGML_VK_QSA_TOPK_V3 (default on gfx1151, off elsewhere; needs onepass + nokeys): the onepass selection of the nokeys cell form
     // over the blocks (topk_qsa_v3.comp: a block = one key weighted by its cells visible to the row), same gates, same
     // fallback list and backoff as onepass; its own counters line (stats words 40..47)
     bool     qsa_topk_v3 = false;
@@ -9365,7 +9365,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
             // (the only form it implements)
             const char * v3_env     = getenv("GGML_VK_QSA_TOPK_V3");
             const bool   v3_env_set = v3_env != nullptr && *v3_env != '\0';
-            const bool   v3_req     = ggml_vk_env_bool("GGML_VK_QSA_TOPK_V3", false);
+            // default ON on gfx1151 (like onepass, 0275), OFF elsewhere; an explicit 0/1 always wins
+            const bool   v3_req     = ggml_vk_env_bool("GGML_VK_QSA_TOPK_V3", op_gfx1151);
             device->qsa_topk_v3     = v3_req && device->qsa_topk_onepass && device->qsa_topk_nokeys;
 #if defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 1
             const char * v3_mut = " MUTANT BUILD M-B1: a block with p0 == min pos counted FULL";
@@ -9379,7 +9380,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
             GGML_LOG_WARN("ggml_vulkan: %s qsa_topk: v3 %s (%s%s; block-weighted onepass of the nokeys cell form, <= %u cells per "
                           "block, onepass's gates / fallback / backoff)%s\n",
                           device->name.c_str(), device->qsa_topk_v3 ? "on" : "off",
-                          v3_env_set ? (v3_req ? "GGML_VK_QSA_TOPK_V3=1" : "GGML_VK_QSA_TOPK_V3=0") : "default off; GGML_VK_QSA_TOPK_V3 unset",
+                          v3_env_set ? (v3_req ? "GGML_VK_QSA_TOPK_V3=1" : "GGML_VK_QSA_TOPK_V3=0")
+                                     : (op_gfx1151 ? "default on gfx1151; GGML_VK_QSA_TOPK_V3 unset"
+                                                   : "default off: not gfx1151; GGML_VK_QSA_TOPK_V3 unset"),
                           !v3_req ? "" : !device->qsa_topk_onepass ? "; needs onepass" : !device->qsa_topk_nokeys ? "; needs nokeys" : "",
                           VK_QSA_TOPK_V3_MAXC, v3_mut);
         }
