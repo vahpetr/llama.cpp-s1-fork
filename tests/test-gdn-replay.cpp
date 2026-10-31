@@ -690,6 +690,59 @@ static int run_model(const common_params & params, llama_model * model) {
         // seq_cp of a sequence with deferred tokens (astra's reproducer: defer A 4 rows -> cp A -> B -> roll A back 1 ->
         //   save B): ON commits A first, so B and A read the same committed row and A's rollback is refused (OFF
         //   accepts it and moves the shared cell's position - a planes-path quirk, not compared). Then seq_keep(A)
+        // rollback -> seq_cp (v70.1 item 2): A defers 4 tokens and rolls 2 back (R / P rollback pending), then A -> B. ON
+        //   materialises S, R and P of the rolled-back position before sharing: B == A on ON, A == A on OFF (the planes
+        //   path gives B its plane 0 = the pre-rollback state - not compared). B is then dropped in both
+        if (n_seq > 1) {
+            const llama_seq_id A = 1, B = 3;
+            std::vector<llama_seq_id> one = { A };
+            std::vector<llama_pos> pa = pos;
+            expect(decode_window(off, one, pa, 5, 4, n_vocab, 190, lo) && decode_window(on, one, pa, 5, 4, n_vocab, 190, ln) && lo == ln,
+                   "rb-cp: window of A", 190);
+            pos[A] += 3;
+            const bool r_off = llama_memory_seq_rm(llama_get_memory(off), A, pos[A], -1);
+            const bool r_on  = llama_memory_seq_rm(llama_get_memory(on),  A, pos[A], -1);
+            expect(r_off && r_on, "rb-cp: rollback of A by 2", 190);
+            for (llama_context * c : { off, on }) {
+                llama_memory_seq_rm(llama_get_memory(c), B, -1, -1);
+                llama_memory_seq_cp(llama_get_memory(c), A, B, -1, -1);
+            }
+            const auto a_off = seq_state(off, A), a_on = seq_state(on, A), b_on = seq_state(on, B);
+            expect(!a_off.empty() && a_on == a_off, "rb-cp: A bytes (ON == OFF)", 190);
+            expect(b_on == a_on, "rb-cp: B bytes == A bytes (ON: S, R, P of the rolled-back position)", 190);
+            // A and the copy go on with the same tokens: same logits (ON)
+            {
+                std::vector<float> la, lb;
+                llama_batch ba = llama_batch_init(3, 0, 1), bb = llama_batch_init(3, 0, 1);
+                for (int j = 0; j < 3; ++j) {
+                    common_batch_add(ba, (llama_token) (1000 + 7 * j) % n_vocab, pos[A] + j, { A }, true);
+                    common_batch_add(bb, (llama_token) (1000 + 7 * j) % n_vocab, pos[A] + j, { B }, true);
+                }
+                llama_set_rs_rollback_depth(on, 2);
+                bool ok = llama_decode(on, ba) == 0;
+                for (int i = 0; ok && i < 3; ++i) { const float * l = llama_get_logits_ith(on, i); la.insert(la.end(), l, l + n_vocab); }
+                llama_set_rs_rollback_depth(on, 2);
+                ok = ok && llama_decode(on, bb) == 0;
+                for (int i = 0; ok && i < 3; ++i) { const float * l = llama_get_logits_ith(on, i); lb.insert(lb.end(), l, l + n_vocab); }
+                // info only: B's new tokens sit in other KV cells than A's (attention order), the states above are the check
+                printf("model: rb-cp: A and B logits on the same tokens %s\n", ok && la == lb ? "identical" : "differ (KV cell layout)");
+                llama_batch_free(ba); llama_batch_free(bb);
+                // OFF follows A's tokens too, so the two contexts stay in lockstep for A
+                llama_batch bo = llama_batch_init(3, 0, 1);
+                for (int j = 0; j < 3; ++j) { common_batch_add(bo, (llama_token) (1000 + 7 * j) % n_vocab, pos[A] + j, { A }, true); }
+                llama_set_rs_rollback_depth(off, 2);
+                std::vector<float> lo2;
+                ok = llama_decode(off, bo) == 0;
+                for (int i = 0; ok && i < 3; ++i) { const float * l = llama_get_logits_ith(off, i); lo2.insert(lo2.end(), l, l + n_vocab); }
+                expect(ok && lo2 == la, "rb-cp: A on OFF == A on ON", 191);
+                llama_batch_free(bo);
+                pos[A] += 3;
+            }
+            for (llama_context * c : { off, on }) {
+                llama_memory_seq_rm(llama_get_memory(c), B, -1, -1);
+            }
+        }
+
         if (n_seq > 1) {
             const llama_seq_id A = 2, B = 4;
             std::vector<llama_seq_id> one = { A };
