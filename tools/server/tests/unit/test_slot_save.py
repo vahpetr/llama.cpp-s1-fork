@@ -2463,66 +2463,88 @@ def test_disk_incr_record_failure_finishes_the_commit():
     server.stop()
 
 
-def test_disk_drop_of_a_claimed_block_fails_the_claimant():
-    """(sc3fix 4) a block a save in flight claimed (found present by its worker) turns out corrupt at another load and
-    is dropped (blob_drop_copy): the claimant must not commit an entry that references the dropped file. E1 = A + B1;
-    A + B3 is loaded from E1 and saved (job 3, its end held 15 s) - its first block = E1's first block, claimed; the
-    file is damaged, slot 1 loads E1 (longest prefix) -> corrupt -> dropped; job 3 commits after that. a09430242: job 3
-    is registered with a missing block (every later load of it fails)"""
+def dc_drop_claim_run(tag, damage):
+    """(sc3fix 4) the setup of test_disk_drop_of_a_claimed_block_fails_the_claimant; damage=False = its probe (no drop:
+    job 3 must commit an entry that holds k0). Returns (status after settle, entry blocks, k0, block dir)"""
     global server
-    server, cache_dir = dc_server("dropclaim", 2048, n_ctx=32768, n_slots=2,
-                                  hooks={"finalize_delay_job3_ms": "15000", "hold_write_job4_ms": "30000",
-                                         "threads": "1"})
+    server, cache_dir = dc_server(tag, 2048, n_ctx=32768, n_slots=2, hooks={"finalize_delay_job3_ms": "15000"})
     server.model_draft = None
     server.spec_type = None
     server.spec_draft_n_min = None
     server.spec_draft_n_max = None
     server.start()
+    tok = lambda t: server.make_request("POST", "/tokenize", data={"content": t, "add_special": True}).body["tokens"]
+    lcp = lambda a, b: next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
     ab1 = DC_INCR_A + " Part 1. " + dc_text(51, 200)
+    a3 = DC_INCR_A + " Part 3. " + dc_text(53, 200)
+    t_q = tok(ab1 + " more")
+    # slot 1 (the dropping load) first holds a prefix of A + B1, computed before any entry exists (no load, no save):
+    #   its later lookup must not wait for job 3 (await_pending: an in-flight save sharing > slot LCP + 1024), E1 must
+    #   still beat the slot (find: > LCP + 1024), and the prefix stays under one 4 MiB K block (its pre-load save,
+    #   job 4, cannot write k0 back - the after2 trap)
+    lo, hi = lcp(tok(a3), t_q) - 1024, lcp(tok(ab1), t_q) - 1024 - 1
+    assert 0 < lo <= hi, (lo, hi)
+    n_pre = (lo + hi) // 2
+    assert n_pre * 1024 < 4 << 20, n_pre
+    dc_complete(server, t_q[:n_pre], n=1, slot=1)
+    # (a) E1 = A + B1, saved completely by job 1: k0 (its first block = A's first 4096 K rows) is a file on disk
     dc_complete(server, DC_INCR_A, slot=0)
     dc_complete(server, ab1, slot=0)
     dc_complete(server, "Archive Z1. " + dc_text(52, 50), slot=0)  # job 1 saves A + B1 (E1)
-    st = dc_settle(server)
+    dc_settle(server)
     ns, ents = dc_entry_blocks(cache_dir)
     e1 = max(ents, key=lambda n: n if ents[n] else -1)
     k0 = ents[e1][0]
-    # slot 1 must load E1 while job 3 is in flight: a lookup waits for an in-flight save sharing more than the slot's
-    # LCP + 1024 with its prompt (await_pending), so slot 1 first holds a prefix of A + B1 long enough that job 3
-    # (A + B3) is not waited for, short enough that E1 still clearly beats the slot (find: > LCP + 1024)
-    a3 = DC_INCR_A + " Part 3. " + dc_text(53, 200)
-    tok = lambda t: server.make_request("POST", "/tokenize", data={"content": t, "add_special": True}).body["tokens"]
-    lcp = lambda a, b: next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
-    t_ab1, t_q = tok(ab1), tok(ab1 + " more")
-    lo, hi = lcp(tok(a3), t_q) - 1024, lcp(t_ab1, t_q) - 1024 - 1
-    assert 0 < lo <= hi, (lo, hi)
-    dc_complete(server, t_q[:(lo + hi) // 2], n=1, slot=1)  # no save (slot 1 was empty), no job number taken
-    # job 4 = slot 1's own save before its load (shares A's blocks): its first block write is held past job 3's commit,
-    #   so k0 is not written back before job 3 commits (else job 3 commits normally - the after2 run); one worker
-    #   (threads=1): job 4's block tasks run in order, the held first one is block 0 = k0 (after3: with 4 workers the
-    #   hold took another block and k0 was written back at once)
-    r = dc_complete(server, a3, slot=0)  # job 2 saves Z1; A loaded from E1
-    assert r["timings"]["cache_n"] >= 4000, r["timings"]
-    n_sub = st["saves"]
-    dc_complete(server, "Archive Z2. " + dc_text(54, 50), slot=0)  # the save of A + B3 (claims k0), its end held
+    p = os.path.join(ns, "blk", k0 + ".blk")
+    assert os.path.exists(p)
+    # (b) slot 0 loads E1 for A + B3 (rolled back to a checkpoint past 4096: rows 0..4095 are E1's bytes), job 3 saves
+    #   it: its worker finds k0 present and CLAIMS it (no write; the probe arm shows job 3's entry holds k0)
+    r = dc_complete(server, a3, slot=0)  # job 2 saves Z1
+    assert r["timings"]["cache_n"] >= 4096, r["timings"]
+    dc_complete(server, "Archive Z2. " + dc_text(54, 50), slot=0)  # job 3 saves A + B3, its end held 15 s
     time.sleep(3)  # its blocks are hashed / claimed by now (no per-block delay)
     st = dc_status(server, through_loop=False)
-    assert st["saves_pending"] >= 1, "the A + B3 save is not in flight"
-    p = os.path.join(ns, "blk", k0 + ".blk")
-    with open(p, "r+b") as f:  # damage E1's first block (same size)
-        f.seek(100)
-        b = f.read(16)
-        f.seek(100)
-        f.write(bytes(x ^ 0xFF for x in b))
-    r = dc_complete(server, ab1 + " more", slot=1)  # E1 is the longest prefix: its load meets the damaged block
+    assert st["saves_pending"] >= 1 and st["async_claims"] >= 1, "the A + B3 save is not in flight"
+    print(f"job 3 in flight: claims {st['async_claims']}, k0 {k0}")
+    assert os.path.exists(p), "k0 is not on disk while job 3 holds its claim"
+    if damage:
+        with open(p, "r+b") as f:  # (c) damage k0 (same size)
+            f.seek(100)
+            b = f.read(16)
+            f.seek(100)
+            f.write(bytes(x ^ 0xFF for x in b))
+    # E1 is the longest prefix: slot 1 loads it (no wait for job 3); damaged -> k0 dropped while job 3 claims it
+    r = dc_complete(server, t_q, slot=1)
     st = dc_status(server, through_loop=False)
-    print(f"slot 1 cache_n {r['timings']['cache_n']}, load failures {st['load_failures']}, saves {n_sub} -> {st['saves']}")
-    assert st["load_failures"] >= 1, "the damaged block was not met"
-    assert not os.path.exists(p), "the damaged block was not dropped"
+    print(f"slot 1 cache_n {r['timings']['cache_n']}, load failures {st['load_failures']}, pending {st['saves_pending']}")
+    assert st["saves_pending"] >= 1, "job 3 committed before the drop (slot 1 waited for it)"
+    if damage:
+        assert st["load_failures"] >= 1, "the damaged block was not met"
+        assert not os.path.exists(p), "the damaged block was not dropped"
     st = dc_settle(server)
-    print(f"failed {st['saves_async_failed']} claims {st['async_claims']} entries {st['n_entries']}")
+    ns, ents = dc_entry_blocks(cache_dir)
+    print(f"failed {st['saves_async_failed']} claims {st['async_claims']} entries {sorted(ents)}")
+    return st, ents, k0, ns
+
+
+def test_disk_drop_claim_probe():
+    """(sc3fix 4) the drop test's setup without the damage: job 3 (A + B3) commits an entry that holds k0, so in the
+    drop test k0 is a block job 3 claimed (found present), not one it wrote"""
+    st, ents, k0, _ = dc_drop_claim_run("dropclaim-probe", damage=False)
+    assert st["saves_async_failed"] == 0
+    assert any(n > 4629 and k0 in keys for n, keys in ents.items()), f"no A + B3 entry holds k0: {sorted(ents)}"
+    server.stop()
+
+
+def test_disk_drop_of_a_claimed_block_fails_the_claimant():
+    """(sc3fix 4) a block a save in flight claimed (found present by its worker) turns out corrupt at another load and
+    is dropped (blob_drop_copy): the claimant must not commit an entry that references the dropped file. E1 = A + B1
+    saved completely (k0 = its first block); job 3 = A + B3 loaded from E1 claims k0 (its end held 15 s); k0 is damaged,
+    slot 1 loads E1 -> corrupt -> dropped; job 3 commits after that and must fail. a09430242: job 3 is registered with
+    a missing block (every later load of it fails)"""
+    st, ents, k0, ns = dc_drop_claim_run("dropclaim", damage=True)
     assert st["async_claims"] == 0
     assert st["saves_async_failed"] >= 1, "job 3 committed although its claimed block was dropped"
-    ns, ents = dc_entry_blocks(cache_dir)
     for n, keys in ents.items():
         for k in keys:
             assert os.path.exists(os.path.join(ns, "blk", k + ".blk")), f"entry {n} references the dropped block {k}"
