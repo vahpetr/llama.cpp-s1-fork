@@ -680,6 +680,7 @@ static int run_model(const common_params & params, llama_model * model) {
                 for (llama_context * c : { off, on, off2, on2 }) {
                     llama_memory_seq_rm(llama_get_memory(c), s, pos[s] + 2, -1);
                 }
+                pos[s] += 2; // the live contexts keep 2 of the 4 tokens
                 const auto x = seq_state(off, s);
                 expect(x == seq_state(on, s) && x == seq_state(off2, s) && x == seq_state(on2, s), "round-trip states after a rollback", 100);
                 h_state = h_state * 31 + fnv(x.data(), x.size());
@@ -713,6 +714,7 @@ static int run_model(const common_params & params, llama_model * model) {
             };
             std::vector<llama_seq_id> one = { A };
             for (uint32_t k = 0; k < 6; ++k) {
+                fprintf(stderr, "model: np%u ondev round %u\n", n_seq, k);
                 std::vector<llama_pos> pa = pos;
                 expect(decode_window(off, one, pa, 4, 3, n_vocab, 300 + k, lo) && decode_window(on, one, pa, 4, 3, n_vocab, 300 + k, ln) && lo == ln,
                        "ondev: window", 300 + k);
@@ -779,7 +781,18 @@ static int run_model(const common_params & params, llama_model * model) {
             }
             const auto a_off = seq_state(off, A), a_on = seq_state(on, A), b_on = seq_state(on, B);
             expect(!a_off.empty() && a_on == a_off, "rb-cp: A bytes (ON == OFF)", 190);
-            expect(b_on == a_on, "rb-cp: B bytes == A bytes (ON: S, R, P of the rolled-back position)", 190);
+            // B's stream = A's except the sequence ids it carries (the stream header and the attention cells' metadata):
+            //   every differing byte must be A's id in A's stream and B's id in B's
+            {
+                size_t n_id = 0, n_other = 0;
+                for (size_t j = 0; j < std::min(a_on.size(), b_on.size()); ++j) {
+                    if (a_on[j] != b_on[j]) {
+                        (a_on[j] == (uint8_t) A && b_on[j] == (uint8_t) B ? n_id : n_other)++;
+                    }
+                }
+                expect(a_on.size() == b_on.size() && n_other == 0 && n_id > 0, "rb-cp: B bytes == A bytes but the sequence ids (ON: S, R, P of the rolled-back position)", 190);
+                fprintf(stderr, "model: rb-cp: %zu bytes, %zu sequence-id bytes differ, %zu other\n", a_on.size(), n_id, n_other);
+            }
             // A and the copy go on with the same tokens: same logits (ON)
             {
                 std::vector<float> la, lb;
