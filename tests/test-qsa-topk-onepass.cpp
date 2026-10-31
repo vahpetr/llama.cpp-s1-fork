@@ -147,6 +147,9 @@ static std::vector<op_case> make_cases() {
     v.push_back({ 262144,     128, 1, 2051, M_TIED2040, false, MAP_BLK4 });
     v.push_back({ 262144,     128, 1, 2051, M_TIED2049, false, MAP_BLK4 });
     v.push_back({ 1048576,    6,   1, 2051, M_TIED2040, false, MAP_PERM4 });
+    // [TAG_QSA_TOPK_V3] GGML_VK_QSA_TOPK_V3_MIN_ROWS witnesses: verify-like 2-row selections (decode 1 row: the cases above)
+    v.push_back({ 1048576,    2,   1, 2051, M_DISTINCT, false, MAP_BLK4 });
+    v.push_back({ 262144,     2,   1, 2051, M_HOT,      false, MAP_BLK4 });
     return v;
 }
 
@@ -389,7 +392,9 @@ static int child(const std::string & dir, int reps) {
     }
     for (size_t i = 0; i < cases.size(); ++i) {
         if (!run[i]) { continue; }
-        const op_case & c = cases[i];
+        // GGML_TEST_ONEPASS_NTPS=<n> (timing probes): every case with n rows per stream instead (decode 1, verify 2)
+        op_case c = cases[i];
+        if (getenv("GGML_TEST_ONEPASS_NTPS")) { c.n_tps = std::max(1, atoi(getenv("GGML_TEST_ONEPASS_NTPS"))); }
         printf("[op] begin %zu\n", i);   // the parent attributes the counter lines from here on to this case
         const op_inputs in = make_inputs(c);
         // a backend per case: its free prints the onepass counters ("(final)"), so the parent sees per-case deltas
@@ -572,7 +577,7 @@ int main(int argc, char ** argv) {
         { "on",     "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_V3=0 GGML_VK_QSA_TOPK_ONEPASS_BACKOFF=0" },
         { "on_all", "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_V3=0 GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_CELLS=1 GGML_VK_QSA_TOPK_ONEPASS_BACKOFF=0" },
         { "v3",     "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_V3=1 GGML_VK_QSA_TOPK_ONEPASS_BACKOFF=0" },
-        { "v3_all", "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_V3=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_CELLS=1 GGML_VK_QSA_TOPK_ONEPASS_BACKOFF=0" },
+        { "v3_all", "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_V3=1 GGML_VK_QSA_TOPK_V3_MIN_ROWS=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_CELLS=1 GGML_VK_QSA_TOPK_ONEPASS_BACKOFF=0" },
     };
     const size_t n_arms = 5;
     // GGML_TEST_ONEPASS_ARMS=<n>: run the first n arms only (timing probes)
@@ -691,8 +696,19 @@ int main(int argc, char ** argv) {
         if (n_run == n_arms && v[2].c[i].path == "onepass_nokeys" && v[4].c[i].path != "v3") {
             ok = false; printf("  v3_all arm did not dispatch v3 on case %zu (%s)\n", i, v[4].c[i].path.c_str());
         }
-        if (n_run == n_arms && v[1].c[i].path == "onepass_nokeys" && v[3].c[i].path != "v3") {
-            ok = false; printf("  v3 arm did not dispatch v3 on case %zu (%s)\n", i, v[3].c[i].path.c_str());
+        // the v3 arm keeps the default GGML_VK_QSA_TOPK_V3_MIN_ROWS (16): fewer rows stay on onepass; v3_all sets it to 1
+        const int64_t c_rows = c.n_tps*c.n_stream;
+        const char *  want3  = c_rows >= 16 ? "v3" : "onepass_nokeys";
+        if (n_run == n_arms && v[1].c[i].path == "onepass_nokeys" && v[3].c[i].path != want3) {
+            ok = false; printf("  v3 arm dispatched %s on case %zu, want %s\n", v[3].c[i].path.c_str(), i, want3);
+        }
+        if (n_run == n_arms && c_rows <= 2 && !c.plane && v[2].c[i].path == "onepass_nokeys") {
+            // MIN_ROWS witness: a decode / verify selection takes onepass by default (v3 arm, where its gate admits onepass)
+            // and v3 with MIN_ROWS=1 (v3_all)
+            n_fb_forced++;
+            const bool w_ok = v[4].c[i].path == "v3" && (v[1].c[i].path != "onepass_nokeys" || v[3].c[i].path == "onepass_nokeys");
+            n_fb_forced_ok += w_ok;
+            if (!w_ok) { printf("  MIN_ROWS witness failed on case %zu (v3 %s, v3_all %s)\n", i, v[3].c[i].path.c_str(), v[4].c[i].path.c_str()); }
         }
         const bool v3c = v[4].c[i].path == "v3";
         if (v3c && (c.mode == M_EQUAL || c.mode == M_COARSE || c.mode == M_SPARSE)) {
