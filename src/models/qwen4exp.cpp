@@ -3401,8 +3401,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         }
     }
 
-    // [TAG_GDN_REPLAY] with the commit by replay (gdn_ctl) S has no rollback planes: its rows are the cells themselves
-    ggml_tensor * state = inp->gdn_ctl ?
+    // [TAG_GDN_REPLAY] with the commit by replay (s_copy_s) S has no rollback planes: its rows are the cells themselves
+    ggml_tensor * state = inp->s_copy_s ?
         build_rs(ssm_states_all, inp->s_copy_s_main, inp->s_copy_s_extra, hparams.n_embd_s(), n_seqs,
                  inp->mctx->get_n_rs(), inp->mctx->get_head(), inp->mctx->get_size(), inp->mctx->get_rs_z()) :
         build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);

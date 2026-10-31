@@ -234,6 +234,100 @@ static bool run_case(ggml_backend_t be, int64_t ns, int64_t n, int64_t d, int64_
     return ok;
 }
 
+// a chain of rounds on one backend, as a verification sequence: window r (n_r tokens, n_defer D_r = min(n_r - 1, W)) replays
+//   the p_{r-1} tokens kept by the previous one and defers its own tail; per sequence its own p (distinct prefixes),
+//   halves alternate. Oracle = the planes path of the same backend (K = n_r) from the reference start, memcmp: window
+//   attn, deferred state = plane D_r; the next reference start = plane D_r - p_r. Then a commit-only op (n_next = 0)
+static bool run_chain(ggml_backend_t be, int64_t ns, const std::vector<int64_t> & wins, const std::vector<int64_t> & keep,
+                      int64_t p_final, uint32_t seed) {
+    std::mt19937 rng(seed);
+    const size_t SD = S * S * HV;
+    std::vector<float> ref(SD * ns);
+    {
+        std::uniform_real_distribution<float> u(-0.1f, 0.1f);
+        for (auto & x : ref) { x = u(rng); }
+    }
+    std::vector<int64_t> pk(ns, 0), half(ns), slot(ns);
+    for (int64_t s = 0; s < ns; ++s) { half[s] = s % 2; slot[s] = (s * 3 + 1) % ns; }
+    std::vector<float> live = ref; // the replay path's cell row (deferred), host copy between rounds
+    bool ok = true;
+    const size_t R = wins.size();
+    for (size_t r = 0; r <= R; ++r) {
+        const bool fin = r == R;
+        const int64_t n = fin ? 1 : wins[r];
+        const int64_t d = fin ? -1 : std::min<int64_t>(n - 1, W);
+        window_data w;
+        fill_window(rng, w, n, ns);
+
+        op_graph og;
+        ggml_init_params ip = { 64 * ggml_tensor_overhead() + 4 * ggml_graph_overhead(), nullptr, true };
+        og.ctx = ggml_init(ip);
+        ggml_context * ctx = og.ctx;
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, HK, n, ns);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, HK, n, ns);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, HV, n, ns);
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, HV, n, ns);
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, HV, n, ns);
+        ggml_tensor * st_ref  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, HV, ns);
+        ggml_tensor * st_live = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, HV, ns);
+        ggml_tensor * dst     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, SD, ns, 1);
+        static thread_local std::vector<float> stash_host; // the stash survives the rounds (host copy)
+        ggml_tensor * stash = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ROW, W, 2 * ns);
+        ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, ns);
+        ggml_tensor * A = ggml_gated_delta_net(ctx, q, k, v, g, b, st_ref, fin ? 1 : n);
+        ggml_tensor * B = ggml_gated_delta_net_ext(ctx, q, k, v, g, b, st_live, dst);
+        ggml_gated_delta_net_set_replay(B, stash, c);
+        og.buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+        ggml_backend_buffer_clear(og.buf, 0);
+        if (r == 0) {
+            stash_host.assign(ggml_nelements(stash), 0.0f);
+        }
+        set_f(stash, stash_host);
+        set_f(q, w.q); set_f(k, w.k); set_f(v, w.v); set_f(g, w.g); set_f(b, w.b);
+        set_f(st_ref, ref); set_f(st_live, live);
+        std::vector<int32_t> cv(4 * ns);
+        for (int64_t s = 0; s < ns; ++s) {
+            cv[4*s+0] = (int32_t) pk[s]; cv[4*s+1] = (int32_t) half[s]; cv[4*s+2] = (int32_t) d; cv[4*s+3] = (int32_t) slot[s];
+        }
+        ggml_backend_tensor_set(c, cv.data(), 0, cv.size() * sizeof(int32_t));
+        for (ggml_tensor * t : { A, B }) {
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, t);
+            if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) { return false; }
+        }
+        const std::vector<float> out_live = get_f(dst);
+        stash_host = get_f(stash);
+        auto fail = [&](const char * what) {
+            fprintf(stderr, "chain: %s ns=%lld round %zu (n=%lld d=%lld): %s differs\n", ggml_backend_name(be), (long long) ns, r,
+                    (long long) n, (long long) d, what);
+            ok = false;
+        };
+        if (fin) {
+            // commit only: the state after the kept prefix = the reference start
+            if (memcmp(out_live.data(), ref.data(), ref.size() * sizeof(float)) != 0) { fail("committed state (n_next 0)"); }
+            break;
+        }
+        const size_t NA = S * HV * n * ns;
+        const auto a_ref = get_f(A, 0, NA), a_rep = get_f(B, 0, NA);
+        if (memcmp(a_ref.data(), a_rep.data(), NA * sizeof(float)) != 0) { fail("window attn"); }
+        std::vector<float> next_ref(SD * ns);
+        for (int64_t s = 0; s < ns; ++s) {
+            auto plane = [&](int64_t j) { return get_f(A, NA + (size_t) j * SD * ns + s * SD, SD); };
+            const auto pd = plane(d);
+            if (memcmp(pd.data(), out_live.data() + s * SD, SD * sizeof(float)) != 0) { fail("deferred state vs plane d"); }
+            const int64_t want = r + 1 < R ? keep[r] : p_final;
+            const int64_t p = s == 0 ? std::min<int64_t>(want, d) : (want + s) % (d + 1); // distinct per sequence
+            pk[s] = p;
+            const auto pp = plane(d - p);
+            std::copy(pp.begin(), pp.end(), next_ref.begin() + s * SD);
+            if (d > 0) { half[s] = 1 - half[s]; }
+        }
+        ref  = next_ref;
+        live = out_live;
+    }
+    return ok;
+}
+
 static int run_ops() {
     std::vector<ggml_backend_t> backends;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -272,6 +366,22 @@ static int run_ops() {
             }
         }
     }
+    // the chains: the (next window, kept prefix) pairs (1,5) (6,1) (7,5) inside, (0,1) / (0,5) at the end; >= 3
+    //   deferring rounds per chain (both halves), 1 and 5 sequences, sequence 0 keeps exactly the listed prefix
+    int n_chain = 0, n_chain_fail = 0;
+    for (auto * be : backends) {
+        for (int64_t ns : { 1, 5 }) {
+            for (int64_t pf : { 1, 5 }) {
+                n_chain++;
+                if (!run_chain(be, ns, { 6, 1, 6, 6, 7, 6 }, { 5, 0, 1, 5, 3 }, pf, 1000u + (uint32_t) (ns * 10 + pf))) {
+                    n_chain_fail++;
+                }
+            }
+        }
+    }
+    printf("chain: %d chains (6 windows + commit, both halves), %d failed memcmp\n", n_chain, n_chain_fail);
+    n_fail += n_chain_fail;
+
     printf("ops: %d case-runs on %zu backends (", n_cases, backends.size());
     for (size_t bi = 0; bi < backends.size(); ++bi) { printf("%s%s", bi ? ", " : "", ggml_backend_name(backends[bi])); }
     printf("): %d failed memcmp; worst NMSE vs %s = %.3e (limit 1e-6)\n", n_fail, backends.empty() ? "-" : ggml_backend_name(backends[0]), worst_nmse);
@@ -292,8 +402,10 @@ static int run_perf() {
             continue;
         }
         for (int64_t ns : { 1, 5 }) {
-            for (int64_t n : { 1, 5 }) {
-                const int64_t p = n == 1 ? 0 : 3;
+            for (int64_t n : { 1, 5, 512 }) {
+                const int64_t p  = n == 1 ? 0 : 3;
+                const int64_t K  = std::min<int64_t>(n, 6);
+                const int64_t dd = std::min<int64_t>(n - 1, W);
                 op_graph og;
                 ggml_init_params ip = { 256 * ggml_tensor_overhead() + 4 * ggml_graph_overhead(), nullptr, true };
                 og.ctx = ggml_init(ip);
@@ -304,7 +416,7 @@ static int run_perf() {
                 ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, HV, n, ns);
                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, HV, n, ns);
                 ggml_tensor * st = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, HV, ns);
-                ggml_tensor * planes = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S * S * HV, ns, n);
+                ggml_tensor * planes = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S * S * HV, ns, K);
                 ggml_tensor * S1 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S * S * HV, ns, 1);
                 ggml_tensor * stash = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ROW, W, 2 * ns);
                 ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, ns);
@@ -324,7 +436,7 @@ static int run_perf() {
                 og.buf = ggml_backend_alloc_ctx_tensors(ctx, be);
                 ggml_backend_buffer_clear(og.buf, 0);
                 std::vector<int32_t> cv(4 * ns);
-                for (int64_t s = 0; s < ns; ++s) { cv[4*s] = (int32_t) p; cv[4*s+1] = 0; cv[4*s+2] = (int32_t) (n - 1); cv[4*s+3] = (int32_t) s; }
+                for (int64_t s = 0; s < ns; ++s) { cv[4*s] = (int32_t) p; cv[4*s+1] = 0; cv[4*s+2] = (int32_t) dd; cv[4*s+3] = (int32_t) s; }
                 ggml_backend_tensor_set(c, cv.data(), 0, cv.size() * sizeof(int32_t));
                 double us[3];
                 for (int o = 0; o < 3; ++o) {
@@ -339,7 +451,7 @@ static int run_perf() {
                     us[o] = t[2];
                 }
                 printf("perf %s ns=%lld n=%lld: K=1 %.1f us, planes K=%lld %.1f us, replay p=%lld d=%lld %.1f us (median us per op, 36 ops per graph)\n",
-                        ggml_backend_name(be), (long long) ns, (long long) n, us[0], (long long) n, us[1], (long long) p, (long long) (n - 1), us[2]);
+                        ggml_backend_name(be), (long long) ns, (long long) n, us[0], (long long) K, us[1], (long long) p, (long long) dd, us[2]);
             }
         }
         ggml_backend_free(be);
@@ -402,11 +514,13 @@ static uint64_t fnv(const void * p, size_t n) {
 }
 
 // decode one window per sequence (n tokens each, all outputs), depth n - 1; returns the logits of every output
-static bool decode_window(llama_context * ctx, const std::vector<llama_seq_id> & seqs, std::vector<llama_pos> & pos,
-                          uint32_t n, uint32_t depth, int n_vocab, uint32_t round, std::vector<float> & logits) {
-    llama_batch batch = llama_batch_init((int32_t) (n * seqs.size()), 0, 1);
+static bool decode_window_n(llama_context * ctx, const std::vector<llama_seq_id> & seqs, std::vector<llama_pos> & pos,
+                          const std::vector<uint32_t> & ns, uint32_t depth, int n_vocab, uint32_t round, std::vector<float> & logits) {
+    uint32_t total = 0;
+    for (llama_seq_id s : seqs) { total += ns[s]; }
+    llama_batch batch = llama_batch_init((int32_t) total, 0, 1);
     for (llama_seq_id s : seqs) {
-        for (uint32_t j = 0; j < n; ++j) {
+        for (uint32_t j = 0; j < ns[s]; ++j) {
             const llama_pos p = pos[s] + (llama_pos) j;
             const llama_token t = (llama_token) ((7919u * (uint32_t) p + 104729u * (uint32_t) s + 13u * round + 1) % (uint32_t) n_vocab);
             common_batch_add(batch, t, p, { s }, true);
@@ -423,6 +537,11 @@ static bool decode_window(llama_context * ctx, const std::vector<llama_seq_id> &
     }
     llama_batch_free(batch);
     return ok;
+}
+
+static bool decode_window(llama_context * ctx, const std::vector<llama_seq_id> & seqs, std::vector<llama_pos> & pos,
+                          uint32_t n, uint32_t depth, int n_vocab, uint32_t round, std::vector<float> & logits) {
+    return decode_window_n(ctx, seqs, pos, std::vector<uint32_t>(pos.size(), n), depth, n_vocab, round, logits);
 }
 
 static int run_model(const common_params & params, llama_model * model) {
@@ -458,20 +577,53 @@ static int run_model(const common_params & params, llama_model * model) {
         }
         uint64_t h_state = 1469598103934665603ULL;
         bool done_cp = false;
+        std::vector<uint8_t> ckpt;     // a checkpoint of sequence 1 (np5), restored later while the others stay deferred
+        llama_pos ckpt_pos = 0;
         for (uint32_t round = 1; round <= 40; ++round) {
+            // windows of n tokens, depth n - 1; at np5 every other round unequal lengths per sequence (depth = the
+            //   longest - 1: several ubatches, per-ubatch rollback limits)
             const uint32_t n = 1 + round % 6;
+            std::vector<uint32_t> ns(n_seq, n);
+            uint32_t depth = n - 1;
+            if (n_seq > 1 && round % 2 == 1) {
+                depth = 0;
+                for (llama_seq_id s : seqs) { ns[s] = 1 + (round + 2 * (uint32_t) s) % 6; depth = std::max(depth, ns[s] - 1); }
+            }
             std::vector<llama_pos> p0 = pos;
-            expect(decode_window(off, seqs, p0, n, n - 1, n_vocab, round, lo) &&
-                   decode_window(on,  seqs, p0, n, n - 1, n_vocab, round, ln), "window decode", round);
+            expect(decode_window_n(off, seqs, p0, ns, depth, n_vocab, round, lo) &&
+                   decode_window_n(on,  seqs, p0, ns, depth, n_vocab, round, ln), "window decode", round);
             expect(lo.size() == ln.size() && memcmp(lo.data(), ln.data(), lo.size() * sizeof(float)) == 0, "window logits", round);
-            for (llama_seq_id s : seqs) {
-                const uint32_t rb = (round / 2 + 3 * (uint32_t) s) % n; // 0 .. n - 1 tokens rolled back
-                pos[s] += (llama_pos) (n - rb);
-                if (rb > 0) {
-                    const bool r_off = llama_memory_seq_rm(llama_get_memory(off), s, pos[s], -1);
-                    const bool r_on  = llama_memory_seq_rm(llama_get_memory(on),  s, pos[s], -1);
-                    expect(r_off && r_on, "seq_rm rollback accepted by both", round);
+            // decode -> save -> rollback: a state write (ON: committed into snapshots) must leave the rollback possible
+            if (round % 4 == 1) {
+                for (llama_seq_id s : seqs) {
+                    const auto a = seq_state(off, s), b = seq_state(on, s);
+                    expect(!a.empty() && a == b, "state bytes before the rollback", round);
                 }
+            }
+            for (llama_seq_id s : seqs) {
+                const uint32_t rb = (round / 2 + 3 * (uint32_t) s) % ns[s]; // 0 .. n - 1 tokens rolled back
+                if (rb > 0) {
+                    const bool r_off = llama_memory_seq_rm(llama_get_memory(off), s, pos[s] + (llama_pos) (ns[s] - rb), -1);
+                    const bool r_on  = llama_memory_seq_rm(llama_get_memory(on),  s, pos[s] + (llama_pos) (ns[s] - rb), -1);
+                    expect(r_off == r_on, "seq_rm rollback: same answer from both", round);
+                    expect(r_off || n_seq > 1, "seq_rm rollback accepted (np1)", round);
+                    pos[s] += (llama_pos) (r_off ? ns[s] - rb : ns[s]);
+                } else {
+                    pos[s] += (llama_pos) ns[s];
+                }
+            }
+            // checkpoint fallback (np5): take sequence 1 at round 30, restore it at round 33 after its window while the
+            //   other sequences keep deferred tokens; both contexts get the same bytes
+            if (n_seq > 1 && round == 30) {
+                ckpt = seq_state(on, 1);
+                ckpt_pos = pos[1];
+                expect(!ckpt.empty() && ckpt == seq_state(off, 1), "checkpoint bytes", round);
+            }
+            if (n_seq > 1 && round == 33 && !ckpt.empty()) {
+                for (llama_context * c : { off, on }) {
+                    expect(llama_state_seq_set_data(c, ckpt.data(), ckpt.size(), 1) == ckpt.size(), "checkpoint restore", round);
+                }
+                pos[1] = ckpt_pos;
             }
             // states: every third round per sequence (commits ON), every seventh round the whole context; the
             //   other rounds leave the replay to the next window
@@ -535,6 +687,41 @@ static int run_model(const common_params & params, llama_model * model) {
             llama_free(off2);
             llama_free(on2);
         }
+        // seq_cp of a sequence with deferred tokens (astra's reproducer: defer A 4 rows -> cp A -> B -> roll A back 1 ->
+        //   save B): ON commits A first, so B and A read the same committed row and A's rollback is refused (OFF
+        //   accepts it and moves the shared cell's position - a planes-path quirk, not compared). Then seq_keep(A)
+        if (n_seq > 1) {
+            const llama_seq_id A = 2, B = 4;
+            std::vector<llama_seq_id> one = { A };
+            std::vector<llama_pos> pa = pos;
+            expect(decode_window(off, one, pa, 5, 4, n_vocab, 200, lo) && decode_window(on, one, pa, 5, 4, n_vocab, 200, ln) && lo == ln,
+                   "cp: window of A", 200);
+            pos[A] += 5;
+            for (llama_context * c : { off, on }) {
+                llama_memory_seq_rm(llama_get_memory(c), B, -1, -1);
+                llama_memory_seq_cp(llama_get_memory(c), A, B, -1, -1);
+            }
+            pos[B] = pos[A];
+            const auto b_on = seq_state(on, B);
+            expect(!b_on.empty() && b_on == seq_state(off, B), "cp: B bytes", 200);
+            expect(seq_state(on, A) == seq_state(off, A), "cp: A bytes", 200);
+            expect(!llama_memory_seq_rm(llama_get_memory(on), A, pos[A] - 1, -1), "cp: ON refuses rolling back the copied A", 200);
+            expect(seq_state(on, B) == b_on, "cp: B unchanged after the refused rollback", 200);
+            // both go on from the copy (OFF untouched by the refused step), then keep only A
+            std::vector<llama_seq_id> two = { A, B };
+            std::vector<llama_pos> pb = pos;
+            expect(decode_window(off, two, pb, 3, 2, n_vocab, 201, lo) && decode_window(on, two, pb, 3, 2, n_vocab, 201, ln) && lo == ln,
+                   "cp: A and B go on", 201);
+            pos[A] += 3; pos[B] += 3;
+            for (llama_context * c : { off, on }) {
+                llama_memory_seq_keep(llama_get_memory(c), A);
+            }
+            expect(seq_state(on, A) == seq_state(off, A), "seq_keep: A bytes", 201);
+            std::vector<llama_pos> pc = pos;
+            expect(decode_window(off, one, pc, 4, 3, n_vocab, 202, lo) && decode_window(on, one, pc, 4, 3, n_vocab, 202, ln) && lo == ln,
+                   "seq_keep: next window of A", 202);
+        }
+
         printf("model: np%u: %d checks, %d failed, state hash %016llx\n", n_seq, n_checks, n_fail, (unsigned long long) h_state);
         llama_free(off);
         llama_free(on);
