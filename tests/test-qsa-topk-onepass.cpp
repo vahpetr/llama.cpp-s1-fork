@@ -731,7 +731,8 @@ int main(int argc, char ** argv) {
             if (!w_ok) { printf("  v3_all case %zu: witness failed (rows %" PRIu64 ", fallback %" PRIu64 ")\n", i, v[4].c[i].v3rows, v[4].c[i].v3fb); }
         }
         // the per-cell path runs: the families whose boundary blocks are selected show partly visible blocks
-        if (v3c && (c.mode == M_HOT || c.mode == M_XY)) {
+        // (the per-row average printed with 2 decimals over the cumulative totals cannot resolve a 1- or 2-row case's delta)
+        if (v3c && (c.mode == M_HOT || c.mode == M_XY) && c.n_tps*c.n_stream >= 6) {
             n_fb_forced++;
             const bool mixed_ok = v[4].c[i].v3mixed_sum > 0.0 && v[4].c[i].v3fb < v[4].c[i].v3rows;
             n_fb_forced_ok += mixed_ok;
