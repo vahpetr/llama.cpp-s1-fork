@@ -1,0 +1,674 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// [TAG_QSA_TOPK_V3] (plan 2.9.2 #1, design docs/research/2026-10-31-topk-v3-design.md section 2 "B"; GGML_VK_QSA_TOPK_V3=1,
+// default off) the onepass selection (topk_qsa_onepass.comp) of the metadata cell form without the key rows, done over the
+// BLOCKS: the cells of a block share one score, so a block is one key with a weight = the number of its cells visible to the
+// row. Only the blocks whose cells the row sees in part pay a per-cell visibility test.
+//
+// Output contract - v2's, byte for byte, ids AND order (topk_radix_select_v2.comp, the nokeys cell form):
+//   cell key = visible ? f2ui_u(score bits of the cell's block) : 0x007FFFFF; T = the k-th largest cell key of the row;
+//   ids = every cell with key > T ascending, then the lowest-id cells with key == T ascending, until k.
+//
+// Five passes (PASS), one dispatch each, a full barrier between them, then v2's six passes (QSA_TOPK_FB, the onepass
+// fallback list) over the rows this file could not finish:
+//   5 rows     (first; one workgroup per stream): the stream's token records -> min / max pos, AND / OR of the seq bits.
+//   0 scatter  (cell tiles, streams): every cell with a nonzero seq mask and a block id < n_blocks takes a slot of its
+//              block's list with one atomic on the block's word, which also counts the cells not visible to every row of
+//              the selection's stream and the cells visible to some row (from pass 5's aggregates); > MAXC cells in one block raise the summary flag (every
+//              row of the selection goes to v2). A cell with a zero seq mask is invisible to every row ((sm & tk.y) == 0),
+//              so it never has a key above 0x007FFFFF.
+//   1 classify (block words, streams): per block one byte = cell count (3 bits) | class (2 bits) for the selection's rows:
+//              FULL  every cell visible to every row of the stream: (sm & AND tk.y) != 0 and p0 < min pos (strict: at
+//                    p0 == pos the x / y order decides);
+//              EMPTY no cell visible to any row: (sm & OR tk.y) == 0 or p0 > max pos, for every cell;
+//              CHECK the rest - the row tests each cell (v2's predicate, cell_vis).
+//   2 sample   one workgroup per row: n_sample blocks (runs of SRUN at stride), weight-ranked (FULL / CHECK: the cell
+//              count, EMPTY or key <= 0x007FFFFF: 0): tau = the j_sample-th largest sampled cell key, floored to 0x00800000.
+//              Zeroes the row's candidate count (or CAP + 1: the sample promises > 2 CAP candidate blocks).
+//   3 filter   (rows, block tiles): per block the row's weight w (FULL: count, CHECK: the visible cells, EMPTY: 0) and its
+//              key; w > 0 and key >= tau appends (key, block | w << 29) to the row's list and adds w to the row's weight sum.
+//   4 select   one workgroup per row: c blocks with weight sum W. Fallback to v2 on the summary flag, c > CAP, W < k, or
+//              more than CAP cells at keys >= T. Else T = the k-th largest of the candidates' cell keys (v2's radix rule with
+//              the histogram counting weights), every candidate block with key >= T is expanded into its visible cells as
+//              composites (key > T: id, key == T: 1 << 31 | id), sorted ascending in LDS, the first k written.
+// Why the result is v2's: every candidate key is > 0x007FFFFF and W counts exactly the cells with key >= tau (a block's
+// visible cells, all with the block's key), so W >= k means T >= tau > 0x007FFFFF and every cell with key >= T sits in a
+// candidate block. The weighted histogram over the candidates is v2's histogram over those cells (a block adds w where v2
+// adds 1 per cell), so T is v2's; the expansion emits exactly the visible cells (FULL: all, CHECK: per-cell test), and the
+// sorted composites are v2's emit truncated to k. tau, the sample and the order of the atomics never reach an id.
+//
+// Scratch (uint offsets): op_off: tau[nrows] | cnt[nrows] | fb[1 + nrows] | cand[nrows][CAP][2] (onepass's layout, so the
+// fallback list sits where the QSA_TOPK_FB passes read it); v3_off: wsum[nrows] | flag[4] | ragg[n_stream][4] |
+// bcnt[n_stream * n_blocks] (count | not-all-visible << 8 | some-visible << 20) | list[n_stream * n_blocks][MAXC] | cls[n_stream][nbw] (nbw = ceil(n_blocks / 4) words of 4
+// class bytes). The host zeroes wsum .. bcnt before pass 0.
+// stats (binding 7, after onepass's 40 words): [40] rows selected here or sent back, [41] fallback W < k, [42] fallback
+// c > CAP or > CAP cells at T, [43] fallback summary flag, [44] candidate blocks summed over the finished rows, [45] CHECK
+// blocks met by the filter, [46] of them partly visible (0 < w < count), [47] max c.
+// ONEPASS_NEGCTL takes the highest-id ties (as topk_qsa_onepass.comp). V3_MUTANT (tests only, cmake
+// -DGGML_VULKAN_QSA_TOPK_V3_MUTANT=n): 1 = M-B1 (FULL at p0 <= min pos), 2 = M-B2 (a FULL block weighs MAXC whatever its
+// count), 3 = M-B3 (a CHECK block counted and expanded as FULL: no per-cell test).
+
+#ifndef V3_MUTANT
+#define V3_MUTANT 0
+#endif
+
+#define RADIX 256u
+#define WG    256u
+#define CAP   8192u          // candidate blocks per row = cells expanded in LDS (ggml-vulkan.cpp VK_QSA_TOPK_ONEPASS_CAP)
+#define PER   (CAP / WG)
+#define MAXC  4u             // cells per block in the list (ggml-vulkan.cpp VK_QSA_TOPK_V3_MAXC)
+#define SRUN  8u             // sample run length in blocks (ggml_vk_qsa_topk_v3_plan)
+#define CLS_EMPTY 0u
+#define CLS_FULL  1u
+#define CLS_CHECK 2u
+
+layout(constant_id = 0) const uint PASS       = 0;  // 5 rows, 0 scatter, 1 classify, 2 sample, 3 filter, 4 select
+layout(constant_id = 1) const uint NWAVES     = 4;
+layout(constant_id = 2) const uint CPT        = 8;  // cells (scatter) / blocks (filter) per invocation per tile
+layout(constant_id = 3) const uint LDS_N      = 1;  // CAP for the select, 1 else
+layout(constant_id = 4) const uint VIS_CAUSAL = 1;
+layout(constant_id = 5) const uint NK_CHECK   = 0;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer AU {uint  data_au[];};   // QSA block scores as bits
+layout (binding = 0) readonly  buffer AU4 {uvec4 data_au4[];}; // the same, 4 blocks per element (filter, vec4)
+layout (binding = 1) writeonly buffer D  {int   data_d[];};    // [k, nrows] selected cell ids
+layout (binding = 2) readonly  buffer CB {int   cell_blk[];};  // cell->block map [n_kv, n_stream]
+layout (binding = 3) readonly  buffer VC {int   data_vc[];};   // cell planes [n_kv, 4, n_stream]: pos, seq mask, x, y
+layout (binding = 4) buffer S {uint scratch[];};
+layout (binding = 5) readonly  buffer VT {ivec4 data_vt[];};   // token records {pos, seq bit, x, y}
+layout (binding = 6) buffer NKF {uint nk_flag[];};
+layout (binding = 7) buffer ST {uint stats[];};
+
+layout (push_constant) uniform parameter {
+    uint ncols;
+    uint k;
+    uint nrows;
+    uint n_tps;
+    uint n_blocks;
+    uint n_stream;
+    uint sb_blk;
+    uint sb_tps;
+    uint n_tiles;   // filter tiles over the blocks (WG * CPT blocks)
+    uint op_off;
+    uint n_sample;  // sampled blocks per row
+    uint j_sample;  // rank of tau among their cell weights
+    uint stride;    // sample stride in blocks
+    uint v3_off;
+    uint use_vec4;  // filter: 16-B score loads (sb_blk == 1, n_blocks % 4 == 0, 16-B aligned binding)
+} p;
+
+shared uint sk[LDS_N];
+shared uint hist[RADIX];
+shared uint sh_scan[NWAVES];
+shared uint sh_r0[NWAVES];
+shared uint sh_r1[NWAVES];
+shared uint sh_r2[NWAVES];
+shared uint sh_r3[NWAVES];
+shared uint sh_bucket;
+shared uint sh_above;
+shared uint sh_heq;
+shared uint sh_n;
+shared uint sh_skip;
+
+// v2's f2ui_u, unchanged
+uint f2ui_u(uint y) {
+    if (y == 0x80000000u) {
+        y = 0u;
+    }
+    if ((y & 0x80000000u) != 0u) {
+        y ^= 0xFFFFFFFFu;
+    } else {
+        y |= 0x80000000u;
+    }
+    return y;
+}
+
+uint tau_off()  { return p.op_off; }
+uint cnt_off()  { return p.op_off + p.nrows; }
+uint fb_off()   { return p.op_off + 2u * p.nrows; }
+uint cand_off() { return p.op_off + 3u * p.nrows + 1u; }
+uint nbw()      { return (p.n_blocks + 3u) / 4u; }
+uint wsum_off() { return p.v3_off; }
+uint flag_off() { return p.v3_off + p.nrows; }
+uint ragg_off() { return p.v3_off + p.nrows + 4u; }
+uint bcnt_off() { return ragg_off() + 4u * p.n_stream; }
+uint list_off() { return bcnt_off() + p.n_stream * p.n_blocks; }
+uint cls_off()  { return list_off() + MAXC * p.n_stream * p.n_blocks; }
+
+// v2's visibility of cell i to token tk (kqv_visible: seq bit, then p0 > pos, then at p0 == pos the x / y order)
+bool cell_vis(const uint cbase, const ivec4 tk, const uint i) {
+    const uint sm = uint(data_vc[cbase + p.ncols + i]);
+    bool vis = (sm & uint(tk.y)) != 0u;
+    if (VIS_CAUSAL != 0u && vis) {
+        const int p0 = data_vc[cbase + i];
+        vis = p0 <= tk.x;
+        if (vis && p0 == tk.x) {
+            const int x0 = data_vc[cbase + 2u * p.ncols + i];
+            const int y0 = data_vc[cbase + 3u * p.ncols + i];
+            vis = !(y0 > tk.w || (y0 == tk.w && x0 > tk.z));
+        }
+    }
+    return vis;
+}
+
+uint cls_byte(const uint s, const uint b) {
+    return (scratch[cls_off() + s * nbw() + (b >> 2u)] >> (8u * (b & 3u))) & 0xFFu;
+}
+
+// the row's weight of block b: its cells visible to tk (byte = the block's class byte)
+uint block_weight(const uint s, const ivec4 tk, const uint b, const uint byte) {
+    const uint n   = byte & 7u;
+    const uint cls = (byte >> 3u) & 3u;
+    if (cls == CLS_EMPTY) {
+        return 0u;
+    }
+    if (cls == CLS_FULL) {
+#if V3_MUTANT == 2
+        return MAXC; // MUTANT M-B2: a partial block weighs as a whole one
+#else
+        return n;
+#endif
+    }
+#if V3_MUTANT == 3
+    return n;        // MUTANT M-B3: no per-cell test on a CHECK block
+#else
+    const uint cbase = s * 4u * p.ncols;
+    const uint lb    = list_off() + (s * p.n_blocks + b) * MAXC;
+    uint w = 0u;
+    for (uint j = 0u; j < n; ++j) {
+        w += cell_vis(cbase, tk, scratch[lb + j]) ? 1u : 0u;
+    }
+    return w;
+#endif
+}
+
+// PASS 5 (dispatched first, one workgroup per stream): the stream's token records -> min / max pos, AND / OR of the seq bits
+void rows_pass(const uint s, const uint lin) {
+    int  mn = 0x7FFFFFFF, mx = -0x7FFFFFFF - 1;
+    uint ya = 0xFFFFFFFFu, yo = 0u;
+    for (uint t = lin; t < p.n_tps; t += WG) {
+        const ivec4 tk = data_vt[s * p.n_tps + t];
+        mn = min(mn, tk.x);
+        mx = max(mx, tk.x);
+        ya &= uint(tk.y);
+        yo |= uint(tk.y);
+    }
+    mn = subgroupMin(mn);
+    mx = subgroupMax(mx);
+    ya = subgroupAnd(ya);
+    yo = subgroupOr(yo);
+    if (gl_SubgroupInvocationID == 0u) {
+        sh_r0[gl_SubgroupID] = uint(mn);
+        sh_r1[gl_SubgroupID] = uint(mx);
+        sh_r2[gl_SubgroupID] = ya;
+        sh_r3[gl_SubgroupID] = yo;
+    }
+    barrier();
+    if (lin == 0u) {
+        [[unroll]] for (uint w = 0u; w < NWAVES; ++w) {
+            mn = min(mn, int(sh_r0[w]));
+            mx = max(mx, int(sh_r1[w]));
+            ya &= sh_r2[w];
+            yo |= sh_r3[w];
+        }
+        scratch[ragg_off() + 4u * s + 0u] = uint(mn);
+        scratch[ragg_off() + 4u * s + 1u] = uint(mx);
+        scratch[ragg_off() + 4u * s + 2u] = ya;
+        scratch[ragg_off() + 4u * s + 3u] = yo;
+    }
+}
+
+void scatter_pass(const uint tile, const uint s, const uint lin) {
+    const int  mn = int(scratch[ragg_off() + 4u * s + 0u]);
+    const int  mx = int(scratch[ragg_off() + 4u * s + 1u]);
+    const uint ya = scratch[ragg_off() + 4u * s + 2u];
+    const uint yo = scratch[ragg_off() + 4u * s + 3u];
+    // per cell one atomic on its block's word: + 1 (count, bits 0..7), + 1 << 8 when the cell is NOT visible to every row
+    // of the stream (bits 8..19: (sm & AND tk.y) != 0 and p0 < min pos - strict: at p0 == pos the x / y order decides),
+    // + 1 << 20 when it may be visible to some row (bits 20..31: (sm & OR tk.y) != 0 and p0 <= max pos). A field can only
+    // carry past its width in a block of > MAXC cells, which raises the summary flag (every row to v2).
+    const uint cbase = s * 4u * p.ncols;
+    const uint base  = tile * (WG * CPT);
+    [[unroll]] for (uint c = 0u; c < CPT; ++c) {
+        const uint i = base + c * WG + lin;
+        if (i < p.ncols) {
+            const uint sm = uint(data_vc[cbase + p.ncols + i]);
+            const int  p0 = data_vc[cbase + i];
+            const uint b  = uint(cell_blk[s * p.ncols + i]);
+            if (sm != 0u && b < p.n_blocks) {
+#if V3_MUTANT == 1
+                const bool causal_full = p0 <= mn; // MUTANT M-B1: p0 == min pos counted visible (the x / y order ignored)
+#else
+                const bool causal_full = p0 < mn;
+#endif
+                const bool fv  = (sm & ya) != 0u && (VIS_CAUSAL == 0u || causal_full);
+                const bool ev  = (sm & yo) == 0u || (VIS_CAUSAL != 0u && p0 > mx);
+                const uint add = 1u + (fv ? 0u : (1u << 8u)) + (ev ? 0u : (1u << 20u));
+                const uint slot = atomicAdd(scratch[bcnt_off() + s * p.n_blocks + b], add) & 0xFFu;
+                if (slot < MAXC) {
+                    scratch[list_off() + (s * p.n_blocks + b) * MAXC + slot] = i;
+                } else {
+                    atomicOr(scratch[flag_off()], 1u);
+                }
+            }
+        }
+    }
+}
+
+void classify_pass(const uint wi, const uint s) {
+    if (wi >= nbw()) {
+        return;
+    }
+    uint word = 0u;
+    for (uint q = 0u; q < 4u; ++q) {
+        const uint b = 4u * wi + q;
+        if (b >= p.n_blocks) {
+            break;
+        }
+        const uint v   = scratch[bcnt_off() + s * p.n_blocks + b];
+        const uint n   = min(v & 0xFFu, MAXC); // > MAXC: the flag sends every row to v2
+        const uint nf  = (v >> 8u) & 0xFFFu;   // cells not visible to every row
+        const uint ne  = v >> 20u;             // cells visible to some row
+        const uint cls = (n == 0u || ne == 0u) ? CLS_EMPTY : nf == 0u ? CLS_FULL : CLS_CHECK;
+        word |= (n | (cls << 3u)) << (8u * q);
+    }
+    scratch[cls_off() + s * nbw() + wi] = word;
+}
+
+// the `desired`-th largest of the weighted keys (onepass's reg_select with the histogram adding weights; weight 0 = no
+// key): (T, how many of T's weight it takes); sh_heq = T's whole weight
+uvec2 reg_select_w(const uint keys[PER], const uint wts[PER], uint desired, const uint qn, const uint lin) {
+    uint prefix = 0;
+    [[unroll]] for (uint r = 0; r < 4; ++r) {
+        const uint shift   = 24u - 8u * r;
+        const uint hi_mask = r == 0 ? 0u : (0xFFFFFFFFu << (shift + 8u));
+        hist[lin] = 0u;
+        barrier();
+        [[unroll]] for (uint q = 0; q < PER; ++q) {
+            if (q >= qn) {
+                break; // uniform: no key past qn * WG
+            }
+            const uint key = keys[q];
+            const uint w   = wts[q];
+            if (w != 0u && (key & hi_mask) == prefix) {
+                const uint d  = (key >> shift) & (RADIX - 1u);
+                const uint ld = subgroupBroadcastFirst(d);
+                if (d == ld) {
+                    const uint cnt = subgroupAdd(w);
+                    if (subgroupElect()) {
+                        atomicAdd(hist[d], cnt);
+                    }
+                } else {
+                    atomicAdd(hist[d], w);
+                }
+            }
+        }
+        barrier();
+        const uint hv   = hist[lin];
+        const uint incl = subgroupInclusiveAdd(hv);
+        if (gl_SubgroupInvocationID == gl_SubgroupSize - 1) {
+            sh_scan[gl_SubgroupID] = incl;
+        }
+        barrier();
+        uint below = 0;
+        uint total = 0;
+        [[unroll]] for (uint w = 0; w < NWAVES; ++w) {
+            const uint v = sh_scan[w];
+            below += w < gl_SubgroupID ? v : 0u;
+            total += v;
+        }
+        const uint suffix = total - (below + incl) + hv;
+        if (suffix >= desired && suffix - hv < desired) {
+            sh_bucket = lin;
+            sh_above  = suffix - hv;
+            sh_heq    = hv;
+        }
+        if (lin == 0 && total < desired) {
+            sh_bucket = 0;
+            sh_above  = total;
+            sh_heq    = 0;
+        }
+        barrier();
+        prefix  |= sh_bucket << shift;
+        desired -= sh_above;
+        barrier();
+    }
+    return uvec2(prefix, desired);
+}
+
+// workgroup sum (uniform result)
+uint wg_sum(const uint v) {
+    const uint sv = subgroupAdd(v);
+    if (gl_SubgroupInvocationID == 0u) {
+        sh_scan[gl_SubgroupID] = sv;
+    }
+    barrier();
+    uint total = 0u;
+    [[unroll]] for (uint w = 0; w < NWAVES; ++w) {
+        total += sh_scan[w];
+    }
+    barrier();
+    return total;
+}
+
+void sample_pass(const uint row, const uint lin) {
+    const uint  t     = row % p.n_tps;
+    const uint  s     = row / p.n_tps;
+    const ivec4 tk    = data_vt[s * p.n_tps + t];
+    uint keys[PER];
+    uint wts[PER];
+    const uint qn = (p.n_sample + WG - 1u) / WG;
+    [[unroll]] for (uint q = 0; q < PER; ++q) {
+        keys[q] = 0u;
+        wts[q]  = 0u;
+        if (q >= qn) {
+            continue; // uniform
+        }
+        const uint j  = q * WG + lin;
+        const bool ok = j < p.n_sample;
+        const uint b  = ok ? min((j / SRUN) * (SRUN * p.stride) + (j % SRUN), p.n_blocks - 1u) : 0u;
+        const uint by = cls_byte(s, b);
+        const uint ky = f2ui_u(data_au[s * p.n_blocks * p.n_tps + b * p.sb_blk + t * p.sb_tps]);
+        // the sample's weight = the filter's (the row's visible cells of the block); tau never decides an id
+        keys[q] = ky;
+        wts[q]  = (ok && ky > 0x007FFFFFu) ? block_weight(s, tk, b, by) : 0u;
+    }
+    if (lin == 0 && row == 0u) {
+        scratch[fb_off()] = 0u;
+    }
+    const uvec2 st  = reg_select_w(keys, wts, p.j_sample, qn, lin);
+    const uint  tau = max(st.x, 0x00800000u);
+    // predicted overflow: the sampled blocks at keys >= tau scaled to the row promise more than 2 CAP candidate blocks
+    uint mine = 0u;
+    [[unroll]] for (uint q = 0; q < PER; ++q) {
+        mine += (wts[q] != 0u && keys[q] >= tau) ? 1u : 0u;
+    }
+    const uint nb_ge = wg_sum(mine);
+    const bool over  = float(nb_ge) * float(p.n_blocks) > 2.0 * float(CAP) * float(max(p.n_sample, 1u));
+    if (lin == 0) {
+        scratch[tau_off() + row] = tau;
+        scratch[cnt_off() + row] = over ? CAP + 1u : 0u;
+    }
+}
+
+void filter_pass(const uint row, const uint tile, const uint lin) {
+    if (lin == 0) {
+        sh_skip = atomicAdd(scratch[cnt_off() + row], 0u) > CAP ? 1u : 0u;
+    }
+    barrier();
+    if (sh_skip != 0u) {
+        return; // uniform
+    }
+    const uint  t    = row % p.n_tps;
+    const uint  s    = row / p.n_tps;
+    const ivec4 tk   = data_vt[s * p.n_tps + t];
+    const uint  tau  = scratch[tau_off() + row];
+    const uint  base = tile * (WG * CPT);
+    const uint  cand = cand_off() + row * CAP * 2u;
+    uint keys[CPT];
+    uint wts[CPT];
+    uint bys[CPT];
+    uint sbits[CPT];
+    uint bidx[CPT];
+    // all loads first (every class byte and score of the tile in flight together); a block past n_blocks gets class byte 0
+    // (EMPTY). vec4: 4 consecutive blocks per invocation and load (16-B score loads; the host sets it for sb_blk == 1,
+    // n_blocks % 4 == 0 and a 16-B aligned score binding) - the same blocks of the tile, another assignment to invocations
+    if (p.use_vec4 != 0u) {
+        const uint rbase = s * p.n_blocks * p.n_tps + t * p.sb_tps;
+        [[unroll]] for (uint g = 0; g < CPT / 4u; ++g) {
+            const uint  gb = base + (g * WG + lin) * 4u;
+            const bool  ok = gb < p.n_blocks;
+            const uvec4 sc = ok ? data_au4[(rbase + gb) / 4u] : uvec4(0u);
+            const uint  cw = ok ? scratch[cls_off() + s * nbw() + gb / 4u] : 0u;
+            [[unroll]] for (uint e = 0; e < 4u; ++e) {
+                bidx[4u * g + e]  = gb + e;
+                sbits[4u * g + e] = sc[e];
+                bys[4u * g + e]   = (cw >> (8u * e)) & 0xFFu;
+            }
+        }
+    } else {
+        [[unroll]] for (uint c = 0; c < CPT; ++c) {
+            const uint b = base + c * WG + lin;
+            const bool ok = b < p.n_blocks;
+            bidx[c]  = b;
+            bys[c]   = ok ? cls_byte(s, b) : 0u;
+            sbits[c] = ok ? data_au[s * p.n_blocks * p.n_tps + b * p.sb_blk + t * p.sb_tps] : 0u;
+        }
+    }
+    uint mine = 0u, wmine = 0u, nchk = 0u, nmix = 0u;
+    [[unroll]] for (uint c = 0; c < CPT; ++c) {
+        const uint b = bidx[c];
+        keys[c] = 0u;
+        wts[c]  = 0u;
+        if (bys[c] != 0u) {
+            const uint by   = bys[c];
+            const uint bits = sbits[c];
+            const uint w    = block_weight(s, tk, b, by);
+            if (((by >> 3u) & 3u) == CLS_CHECK) {
+                nchk++;
+                nmix += (w != 0u && w != (by & 7u)) ? 1u : 0u;
+            }
+            if (NK_CHECK != 0u && w != 0u) {
+                const uint e = (bits >> 23) & 0xFFu;
+                const uint m = bits & 0x7FFFFFu;
+                const uint f = (e == 0u && m != 0u ? 1u : 0u) | (e == 0xFFu && m != 0u ? 2u : 0u) | (bits == 0x7F800000u ? 4u : 0u);
+                if (f != 0u) {
+                    atomicOr(nk_flag[0], f);
+                }
+            }
+            const uint key = f2ui_u(bits);
+            if (w != 0u && key >= tau) {
+                keys[c] = key;
+                wts[c]  = w;
+                mine++;
+                wmine += w;
+            }
+        }
+    }
+    const uint incl = subgroupInclusiveAdd(mine);
+    const uint wsg  = subgroupAdd(wmine);
+    const uint csg  = subgroupAdd(nchk);
+    const uint msg  = subgroupAdd(nmix);
+    if (gl_SubgroupInvocationID == gl_SubgroupSize - 1) {
+        sh_scan[gl_SubgroupID] = incl;
+        sh_r0[gl_SubgroupID] = wsg;
+        sh_r1[gl_SubgroupID] = csg;
+        sh_r2[gl_SubgroupID] = msg;
+    }
+    barrier();
+    uint below = 0, total = 0, wtot = 0, ctot = 0, mtot = 0;
+    [[unroll]] for (uint w = 0; w < NWAVES; ++w) {
+        const uint v = sh_scan[w];
+        below += w < gl_SubgroupID ? v : 0u;
+        total += v;
+        wtot  += sh_r0[w];
+        ctot  += sh_r1[w];
+        mtot  += sh_r2[w];
+    }
+    if (lin == 0 && ctot != 0u) {
+        atomicAdd(stats[45], ctot);
+        atomicAdd(stats[46], mtot);
+    }
+    if (total == 0u) {
+        return; // uniform
+    }
+    if (lin == 0) {
+        sh_n = atomicAdd(scratch[cnt_off() + row], total);
+        atomicAdd(scratch[wsum_off() + row], wtot);
+    }
+    barrier();
+    uint pos = sh_n + below + incl - mine;
+    [[unroll]] for (uint c = 0; c < CPT; ++c) {
+        const uint b = bidx[c];
+        if (wts[c] != 0u) {
+            if (pos < CAP) {
+                scratch[cand + 2u * pos]      = keys[c];
+                scratch[cand + 2u * pos + 1u] = b | (wts[c] << 29u);
+            }
+            pos++;
+        }
+    }
+}
+
+// ascending bitonic sort of sk[0..P), P a power of two <= CAP (uniform)
+void lds_sort(const uint P, const uint lin) {
+    for (uint size = 2u; size <= P; size <<= 1u) {
+        for (uint stride = size >> 1u; stride > 0u; stride >>= 1u) {
+            for (uint t = lin; t < (P >> 1u); t += WG) {
+                const uint i = 2u * t - (t & (stride - 1u));
+                const uint j = i + stride;
+                const uint a = sk[i];
+                const uint b = sk[j];
+                if ((a > b) == ((i & size) == 0u)) {
+                    sk[i] = b;
+                    sk[j] = a;
+                }
+            }
+            barrier();
+        }
+    }
+}
+
+void fallback(const uint row, const uint lin, const uint why) {
+    if (lin == 0) {
+        const uint slot = atomicAdd(scratch[fb_off()], 1u);
+        scratch[fb_off() + 1u + slot] = row;
+        atomicAdd(stats[40], 1u);
+        atomicAdd(stats[why], 1u);
+    }
+}
+
+void select_pass(const uint row, const uint lin) {
+    const uint c    = scratch[cnt_off() + row];
+    const uint wsum = scratch[wsum_off() + row];
+    if (lin == 0) {
+        atomicMax(stats[47], c);
+    }
+    if (scratch[flag_off()] != 0u) {
+        fallback(row, lin, 43u);
+        return;
+    }
+    if (c > CAP) {
+        fallback(row, lin, 42u);
+        return;
+    }
+    if (wsum < p.k) {
+        fallback(row, lin, 41u);
+        return;
+    }
+    const uint  t     = row % p.n_tps;
+    const uint  s     = row / p.n_tps;
+    const ivec4 tk    = data_vt[s * p.n_tps + t];
+    const uint  cbase = s * 4u * p.ncols;
+    const uint  cand  = cand_off() + row * CAP * 2u;
+    uint ck[PER];
+    uint cw[PER];
+    uint cb[PER];
+    const uint qn = (c + WG - 1u) / WG;
+    [[unroll]] for (uint q = 0; q < PER; ++q) {
+        ck[q] = 0u;
+        cw[q] = 0u;
+        cb[q] = 0u;
+        if (q >= qn) {
+            continue; // uniform
+        }
+        const uint j = q * WG + lin;
+        const uint v = scratch[cand + 2u * j + 1u];
+        ck[q] = scratch[cand + 2u * j];
+        cw[q] = j < c ? v >> 29u : 0u;
+        cb[q] = v & 0x1FFFFFFFu;
+    }
+    const uvec2 st = reg_select_w(ck, cw, p.k, qn, lin);
+    const uint  T  = st.x;
+    uint mine = 0u;
+    [[unroll]] for (uint q = 0; q < PER; ++q) {
+        mine += (cw[q] != 0u && ck[q] >= T) ? cw[q] : 0u;
+    }
+    const uint n_sel = wg_sum(mine); // above + every tie: >= k
+    if (n_sel > CAP) {
+        fallback(row, lin, 42u);
+        return;
+    }
+    if (lin == 0) {
+        sh_n = 0u;
+    }
+    barrier();
+    [[unroll]] for (uint q = 0; q < PER; ++q) {
+        if (cw[q] != 0u && ck[q] >= T) {
+            const uint b   = cb[q];
+            const uint by  = cls_byte(s, b);
+            const uint n   = by & 7u;
+            const bool all = ((by >> 3u) & 3u) == CLS_FULL || V3_MUTANT == 3;
+            const uint lb  = list_off() + (s * p.n_blocks + b) * MAXC;
+            uint pos = atomicAdd(sh_n, cw[q]);
+            for (uint j = 0u; j < n; ++j) {
+                const uint id = scratch[lb + j];
+                if (all || cell_vis(cbase, tk, id)) {
+#ifdef ONEPASS_NEGCTL
+                    sk[pos] = ck[q] > T ? id : (0x80000000u | (0x7FFFFFFFu - id));
+#else
+                    sk[pos] = ck[q] > T ? id : (0x80000000u | id);
+#endif
+                    pos++;
+                }
+            }
+        }
+    }
+    barrier();
+    uint P = 1u;
+    while (P < n_sel) {
+        P <<= 1u;
+    }
+    for (uint j = n_sel + lin; j < P; j += WG) {
+        sk[j] = 0xFFFFFFFFu;
+    }
+    barrier();
+    lds_sort(P, lin);
+    const uint row_out = row * p.k;
+    for (uint j = lin; j < p.k; j += WG) {
+        const uint v = sk[j];
+#ifdef ONEPASS_NEGCTL
+        data_d[row_out + j] = int((v & 0x80000000u) != 0u ? 0x7FFFFFFFu - (v & 0x7FFFFFFFu) : v);
+#else
+        data_d[row_out + j] = int(v & 0x7FFFFFFFu);
+#endif
+    }
+    if (lin == 0) {
+        atomicAdd(stats[40], 1u);
+        atomicAdd(stats[44], c);
+    }
+}
+
+void main() {
+    const uint lin = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+    if (PASS == 5) {
+        rows_pass(gl_WorkGroupID.y, lin);
+        return;
+    }
+    if (PASS == 0) {
+        scatter_pass(gl_WorkGroupID.x, gl_WorkGroupID.y, lin);
+        return;
+    }
+    if (PASS == 1) {
+        classify_pass(gl_WorkGroupID.x * WG + lin, gl_WorkGroupID.y);
+        return;
+    }
+    const uint tile = gl_WorkGroupID.y;
+    for (uint row = gl_WorkGroupID.x; row < p.nrows; row += gl_NumWorkGroups.x) {
+        if (PASS == 2) {
+            sample_pass(row, lin);
+        } else if (PASS == 3) {
+            filter_pass(row, tile, lin);
+        } else {
+            select_pass(row, lin);
+        }
+        barrier();
+    }
+}

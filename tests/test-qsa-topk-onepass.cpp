@@ -40,9 +40,26 @@
 
 #include <unistd.h>
 
-enum { M_DISTINCT, M_FINE, M_CENSUS, M_MIXED, M_EQUAL, M_COARSE, M_SPARSE, M_COUNT };
+// [TAG_QSA_TOPK_V3] the block families (design 2026-10-31 section 2 B, identity proof): hot = the blocks around the rows'
+// positions boosted to the top (the causal boundary inside a block is selected on every row), xy = 4 cells per position
+// with x = 0..3 and the rows at those positions with x / y (p0 == pos decided by the x / y order), twoseq / twoseq1 = cells
+// of two sequences (regions, shared blocks, stray cells) with the rows alternating / all of sequence 0, holes = 15 % empty
+// cells (partial blocks everywhere); neginf = 99.5 % of the blocks score -inf (visible cells >= k, but fewer than k keys
+// above the -inf sentinel: v2 takes -inf ties by lowest id, visible or not - every row must fall back), tied2040 / tied2049
+// = that many random blocks per row tie at the top (8160 cells fit the cell CAP: the B path takes the big tie group;
+// 8196 do not, while 2049 blocks fit the block CAP: every row must fall back)
+enum { M_DISTINCT, M_FINE, M_CENSUS, M_MIXED, M_EQUAL, M_COARSE, M_SPARSE, M_HOT, M_XY, M_TWOSEQ, M_TWOSEQ1, M_HOLES,
+       M_NEGINF, M_TIED2040, M_TIED2049, M_COUNT };
 static const char * mode_name(int m) {
-    static const char * n[M_COUNT] = { "distinct", "fine", "census", "mixed", "equal", "coarse", "sparse" };
+    static const char * n[M_COUNT] = { "distinct", "fine", "census", "mixed", "equal", "coarse", "sparse", "hot", "xy", "twoseq",
+                                       "twoseq1", "holes", "neginf", "tied2040", "tied2049" };
+    return n[m];
+}
+// cell -> block maps: blk4 = i / 4, perm = random (blocks of any size: v3's summary sends the selection to v2), perm4 = a
+// random bijection onto 4-cell blocks, blk3 = i / 3 (every block partial for v3's 4-cell lists)
+enum { MAP_BLK4, MAP_PERM, MAP_PERM4, MAP_BLK3 };
+static const char * map_name(int m) {
+    static const char * n[4] = { "blk4", "perm", "perm4", "blk3" };
     return n[m];
 }
 
@@ -50,11 +67,11 @@ struct op_case {
     int64_t n_kv, n_tps, n_stream;
     int     width, mode;
     bool    plane;   // the plane form (ggml_qsa_top_k over an f16 mask) instead of the metadata form
-    bool    perm;    // random cell->block map instead of cell i -> block i/4
+    int     map;     // MAP_*: the cell->block map (false / true = blk4 / perm)
     std::string desc() const {
         char b[200];
         snprintf(b, sizeof(b), "n_kv=%" PRId64 " rows=%" PRId64 "x%" PRId64 " k=%d mode=%s form=%s map=%s", n_kv, n_tps, n_stream, width,
-                 mode_name(mode), plane ? "plane" : "vis", perm ? "perm" : "blk4");
+                 mode_name(mode), plane ? "plane" : "vis", map_name(map));
         return b;
     }
 };
@@ -105,6 +122,31 @@ static std::vector<op_case> make_cases() {
     }
     // a whole 2048-row ubatch in one dispatch (LLAMA_QSA_CHUNK off; ~0.6 GiB of planes)
     v.push_back({ 262144, 2048, 1, 2051, M_DISTINCT, false, false });
+    // [TAG_QSA_TOPK_V3] the block families (metadata form): causal boundary inside a block, partial tail block (n_kv not a
+    // multiple of 4: the pool's last used cell mid-block), empty cells, two sequences, permuted cell maps, p0 == pos with x / y
+    for (int64_t n : { 65536 + 4099, 262144 + 2, 1048576 + 1 }) {
+        v.push_back({ n, 128, 1, 2051, M_HOT, false, MAP_BLK4 });
+    }
+    v.push_back({ 262144 + 3, 6,   1, 2051, M_HOT,      false, MAP_BLK4 });
+    v.push_back({ 131072 + 1, 64,  2, 2051, M_HOT,      false, MAP_PERM4 });
+    v.push_back({ 262144,     128, 1, 2051, M_XY,       false, MAP_BLK4 });
+    v.push_back({ 65536 + 2,  6,   1, 2051, M_XY,       false, MAP_PERM4 });
+    v.push_back({ 1048576,    128, 1, 2051, M_XY,       false, MAP_BLK4 });
+    v.push_back({ 262144 + 1, 128, 1, 2051, M_TWOSEQ,   false, MAP_BLK4 });
+    v.push_back({ 262144 + 1, 128, 1, 2051, M_TWOSEQ1,  false, MAP_BLK4 });
+    v.push_back({ 131072,     6,   2, 2051, M_TWOSEQ1,  false, MAP_PERM4 });
+    v.push_back({ 262144,     128, 1, 2051, M_HOLES,    false, MAP_BLK4 });
+    v.push_back({ 1048576,    128, 1, 2051, M_HOLES,    false, MAP_PERM4 });
+    v.push_back({ 262144 + 2, 128, 1, 2051, M_DISTINCT, false, MAP_BLK3 });
+    v.push_back({ 262144,     128, 1, 2051, M_HOT,      false, MAP_BLK3 });
+    v.push_back({ 1048576,    128, 1, 2051, M_DISTINCT, false, MAP_PERM4 });
+    v.push_back({ 1048576,    128, 1, 2051, M_FINE,     false, MAP_PERM4 });
+    v.push_back({ 65536,      128, 2, 2051, M_CENSUS,   false, MAP_PERM4 });
+    // astra 2026-10-31 items 2 / 3: keys strictly above the sentinel, the cell-level CAP
+    v.push_back({ 262144,     128, 1, 2051, M_NEGINF,   false, MAP_BLK4 });
+    v.push_back({ 262144,     128, 1, 2051, M_TIED2040, false, MAP_BLK4 });
+    v.push_back({ 262144,     128, 1, 2051, M_TIED2049, false, MAP_BLK4 });
+    v.push_back({ 1048576,    6,   1, 2051, M_TIED2040, false, MAP_PERM4 });
     return v;
 }
 
@@ -133,35 +175,63 @@ struct op_inputs {
 static op_inputs make_inputs(const op_case & c) {
     op_inputs in;
     const int64_t n = c.n_kv, nr = c.n_tps*c.n_stream;
-    in.nb = (n + 3)/4;
-    std::mt19937 rng(0x0b1e55edu ^ (uint32_t) (n*131 + c.n_tps*7919 + c.n_stream*31 + c.width*17 + c.mode*1009 + c.plane*3 + c.perm*5));
+    in.nb = c.map == MAP_BLK3 ? (n + 2)/3 : (n + 3)/4;
+    std::mt19937 rng(0x0b1e55edu ^ (uint32_t) (n*131 + c.n_tps*7919 + c.n_stream*31 + c.width*17 + c.mode*1009 + c.plane*3 + c.map*5));
     std::uniform_real_distribution<float> u01(0.0f, 1.0f);
     const int64_t used = n - n/64;   // the padded tail of the pool: empty cells
     in.cb.resize(n*c.n_stream);
     in.cells.assign(n*4*c.n_stream, 0);
     in.toks.resize(4*nr);
     in.vis.assign(nr*n, 0);
+    std::vector<int32_t> perm4;
     for (int64_t s = 0; s < c.n_stream; s++) {
         int32_t * pos = in.cells.data() + s*4*n;
         int32_t * sm  = pos + n;
+        if (c.map == MAP_PERM4) {
+            perm4.resize(n);
+            for (int64_t j = 0; j < n; j++) { perm4[j] = (int32_t) j; }
+            std::shuffle(perm4.begin(), perm4.end(), rng);
+        }
         for (int64_t j = 0; j < n; j++) {
-            in.cb[s*n + j] = c.perm ? (int32_t) (rng() % (uint32_t) in.nb) : (int32_t) (j/4);
-            const bool empty = j >= used;
-            pos[j] = empty ? -1 : (int32_t) j;
+            in.cb[s*n + j] = c.map == MAP_PERM  ? (int32_t) (rng() % (uint32_t) in.nb)
+                           : c.map == MAP_PERM4 ? perm4[j]/4
+                           : c.map == MAP_BLK3  ? (int32_t) (j/3) : (int32_t) (j/4);
+            const bool empty = j >= used || (c.mode == M_HOLES && u01(rng) < 0.15f);
+            pos[j] = empty ? -1 : (int32_t) (c.mode == M_XY ? j/4 : j);
             // sparse: a cell belongs to the queries' sequence with probability ~ (k/2) / n, else to sequence 1
             sm[j]  = empty ? 0 : (c.mode == M_SPARSE && u01(rng) >= 0.5f*c.width/(float) n) ? 2 : 1;
-            pos[2*n + j] = INT32_MAX;
-            pos[3*n + j] = INT32_MAX;
+            if (!empty && (c.mode == M_TWOSEQ || c.mode == M_TWOSEQ1)) {
+                // sequence 0 in the first half (+1 cell: the boundary mid-block), sequence 1 after it; every 7th 4-cell group
+                // shared by both; 1 % stray cells of the other sequence
+                sm[j] = j < n/2 + 1 ? 1 : 2;
+                if ((j/4) % 7 == 0)       { sm[j] = 3; }
+                else if (u01(rng) < 0.01f) { sm[j] ^= 3; }
+            }
+            pos[2*n + j] = c.mode == M_XY ? (int32_t) (j % 4) : INT32_MAX;
+            pos[3*n + j] = c.mode == M_XY ? 0 : INT32_MAX;
         }
         for (int64_t t = 0; t < c.n_tps; t++) {
             int32_t * tk = in.toks.data() + 4*(s*c.n_tps + t);
             tk[0] = (int32_t) (used - c.n_tps + t);   // the chunk's last positions: causal
-            tk[1] = 1;
+            tk[1] = c.mode == M_TWOSEQ ? 1 << (t & 1) : 1;
             tk[2] = INT32_MAX;
             tk[3] = INT32_MAX;
+            if (c.mode == M_XY) {
+                // the rows sit at the last used positions, 4 rows per position, x = 3 - t % 4 (x0 > x hides that many cells
+                // of the row's own position: its block is partly visible), y = 0
+                tk[0] = (int32_t) ((used - 1)/4 - (c.n_tps - 1 - t)/4);
+                tk[2] = 3 - (int32_t) (t % 4);
+                tk[3] = 0;
+            }
             uint8_t * vr = in.vis.data() + (s*c.n_tps + t)*n;
             for (int64_t j = 0; j < n; j++) {
-                vr[j] = (sm[j] & tk[1]) != 0 && pos[j] <= tk[0];
+                // v2's predicate (kqv_visible): seq bit, p0 <= pos, at p0 == pos the x / y order
+                bool v = (sm[j] & tk[1]) != 0 && pos[j] <= tk[0];
+                if (v && pos[j] == tk[0]) {
+                    const int32_t x0 = pos[2*n + j], y0 = pos[3*n + j];
+                    v = !(y0 > tk[3] || (y0 == tk[3] && x0 > tk[2]));
+                }
+                vr[j] = v;
             }
         }
     }
@@ -176,13 +246,33 @@ static op_inputs make_inputs(const op_case & c) {
             if (c.mode == M_COARSE) { v = std::floor(16.0f*x)/4.0f; }
             if (c.mode == M_CENSUS) { v = u01(rng) < 0.05f ? -INFINITY : 4.0f*x; }
             if (eq_row)             { v = 0.5f; }
+            if (c.mode == M_NEGINF) { v = u01(rng) < 0.995f ? -INFINITY : 8.0f*x; }
             r[b] = v;
+        }
+        if (c.mode == M_TIED2040 || c.mode == M_TIED2049) {
+            // that many distinct random blocks of the row (all fully visible: below the chunk's first position) tie at 100
+            const int64_t g = c.mode == M_TIED2040 ? 2040 : 2049, lim = (used - c.n_tps)/4 - 1;
+            for (int64_t m = 0, b0 = (int64_t) (rng() % (uint32_t) (lim - g)); m < g; m++) {
+                r[b0 + m] = 100.0f;
+            }
         }
         if (c.mode == M_CENSUS) {
             // the census's +1e9 boost on the block of the row's own (last visible) cell
             const int64_t t = row % c.n_tps, s = row / c.n_tps;
             const int64_t own = in.toks[4*(s*c.n_tps + t)];
             r[in.cb[s*n + own]] = 1e9f;
+        }
+        if (c.mode == M_HOT || c.mode == M_XY || c.mode == M_TWOSEQ || c.mode == M_TWOSEQ1 || c.mode == M_HOLES) {
+            // the blocks holding the cells at the chunk's positions (+- 8, and the pool's tail) to the top, distinct values:
+            // every row selects the blocks its causal boundary cuts
+            const int64_t s = row / c.n_tps;
+            const int32_t lo = in.toks[4*(s*c.n_tps)] - 8, hi = in.toks[4*(s*c.n_tps + c.n_tps - 1)] + 8;
+            const int32_t * pos = in.cells.data() + s*4*n;
+            for (int64_t j = 0; j < n; j++) {
+                if ((pos[j] >= lo && pos[j] <= hi) || (j >= used - 8 && j < used)) {
+                    r[in.cb[s*n + j]] = 1000.0f + (float) (in.cb[s*n + j] % 4093);
+                }
+            }
         }
     }
     return in;
@@ -363,13 +453,16 @@ struct case_view {
     double      ms = 0.0;
     uint64_t    rows = 0, fb = 0, under = 0, over = 0;   // onepass counters, this case's delta
     double      cand = 0.0, cand_sum = 0.0;
+    // [TAG_QSA_TOPK_V3] the v3 counters, this case's delta (blocks / mixed: per row)
+    uint64_t    v3rows = 0, v3fb = 0;
+    double      v3blocks_sum = 0.0, v3mixed_sum = 0.0;
 };
 
 struct arm_view {
     std::vector<case_view> c;
-    bool rc0 = false, negctl = false, skip = false;
-    std::string proof;
-    size_t n_onepass = 0;
+    bool rc0 = false, negctl = false, skip = false, mutant = false;
+    std::string proof, proof_v3;
+    size_t n_onepass = 0, n_v3 = 0;
 };
 
 static arm_view run_arm(const char * self, const std::string & env, const std::string & dir, int reps, size_t n_cases) {
@@ -383,12 +476,16 @@ static arm_view run_arm(const char * self, const std::string & env, const std::s
     size_t cur = 0;
     uint64_t prev_rows = 0, prev_u = 0, prev_o = 0;
     double prev_cand_tot = 0.0;
+    uint64_t prev_v3rows = 0, prev_v3fb = 0;
+    double prev_v3b = 0.0, prev_v3m = 0.0;
     while (fgets(buf, sizeof(buf), p)) {
         const std::string l(buf);
         size_t idx;
         if (l.find("[op] SKIP") != std::string::npos) { a.skip = true; }
         if (l.find("qsa_topk: onepass ") != std::string::npos) { a.proof = l; }
         if (l.find("NEGATIVE-CONTROL BUILD: the onepass") != std::string::npos) { a.negctl = true; }
+        if (l.find("qsa_topk: v3 ") != std::string::npos) { a.proof_v3 = l; }
+        if (l.find("qsa_topk: v3 ") != std::string::npos && l.find("MUTANT BUILD") != std::string::npos) { a.mutant = true; }
         if (sscanf(l.c_str(), "[op] begin %zu", &idx) == 1 && idx < n_cases) {
             cur = idx;
         }
@@ -407,6 +504,7 @@ static arm_view run_arm(const char * self, const std::string & env, const std::s
                 if (ci < n_cases && a.c[ci].path.empty()) {
                     a.c[ci].path = l.substr(pp + 6, l.find(' ', pp + 6) - pp - 6);
                     a.n_onepass += a.c[ci].path.rfind("onepass", 0) == 0;
+                    a.n_v3      += a.c[ci].path == "v3";
                 }
             }
         }
@@ -427,6 +525,21 @@ static arm_view run_arm(const char * self, const std::string & env, const std::s
             const uint64_t done = v.rows - v.fb;
             v.cand      = done ? v.cand_sum/(double) done : 0.0;
             prev_rows = rows; prev_u = u; prev_o = o; prev_cand_tot = cand_tot;
+        }
+        // ggml_vulkan: qsa_topk v3: rows N, fallback F (x %: under U, over O, summary G), blocks/row B, mixed/row M (check/row C)
+        unsigned long long g;
+        double blk, mix;
+        const size_t p3 = l.find("qsa_topk v3: rows ");
+        if (p3 != std::string::npos &&
+            sscanf(l.c_str() + p3, "qsa_topk v3: rows %llu, fallback %llu (%lf %%: under %llu, over %llu, summary %llu), blocks/row %lf, "
+                   "mixed/row %lf", &rows, &fb, &pct, &u, &o, &g, &blk, &mix) == 8) {
+            const double btot = blk*(double) (rows - fb), mtot = mix*(double) rows;
+            case_view & v = a.c[cur];
+            v.v3rows       += rows - prev_v3rows;
+            v.v3fb         += fb - prev_v3fb;
+            v.v3blocks_sum += btot - prev_v3b;
+            v.v3mixed_sum  += mtot - prev_v3m;
+            prev_v3rows = rows; prev_v3fb = fb; prev_v3b = btot; prev_v3m = mtot;
         }
     }
     a.rc0 = pclose(p) == 0;
@@ -452,18 +565,28 @@ int main(int argc, char ** argv) {
     const char * tmpd = getenv("TMPDIR");
     const std::string base = std::string(tmpd && *tmpd ? tmpd : "/tmp") + "/test-qsa-topk-onepass-" + std::to_string((long long) getpid());
     const auto cases = make_cases();
-    const char * arms[3][2] = {
-        { "off",    "GGML_VK_QSA_TOPK_ONEPASS=0" },
-        { "on",     "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_ONEPASS_BACKOFF=0" },
-        { "on_all", "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_CELLS=1 GGML_VK_QSA_TOPK_ONEPASS_BACKOFF=0" },
+    // [TAG_QSA_TOPK_V3] arms 3 / 4: the block-weighted kernel at the default gates / forced on every admissible shape; the
+    // onepass arms set GGML_VK_QSA_TOPK_V3=0 explicitly (the knob's off = v66's onepass path)
+    const char * arms[5][2] = {
+        { "off",    "GGML_VK_QSA_TOPK_ONEPASS=0 GGML_VK_QSA_TOPK_V3=0" },
+        { "on",     "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_V3=0 GGML_VK_QSA_TOPK_ONEPASS_BACKOFF=0" },
+        { "on_all", "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_V3=0 GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_CELLS=1 GGML_VK_QSA_TOPK_ONEPASS_BACKOFF=0" },
+        { "v3",     "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_V3=1 GGML_VK_QSA_TOPK_ONEPASS_BACKOFF=0" },
+        { "v3_all", "GGML_VK_QSA_TOPK_ONEPASS=1 GGML_VK_QSA_TOPK_V3=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_KV=1 GGML_VK_QSA_TOPK_ONEPASS_MIN_CELLS=1 GGML_VK_QSA_TOPK_ONEPASS_BACKOFF=0" },
     };
+    const size_t n_arms = 5;
+    // GGML_TEST_ONEPASS_ARMS=<n>: run the first n arms only (timing probes)
+    const size_t n_run = getenv("GGML_TEST_ONEPASS_ARMS") ? std::min<size_t>(n_arms, std::max(1, atoi(getenv("GGML_TEST_ONEPASS_ARMS")))) : n_arms;
     std::vector<arm_view> v;
     for (const auto & arm : arms) {
         v.push_back(run_arm(argv[0], arm[1], base + "-" + arm[0], reps, cases.size()));
         if (v.back().skip) { printf("test-qsa-topk-onepass: SKIP (no GPU)\n"); return 0; }
-        printf("[op-arm] %s rc0=%d onepass_cases=%zu proof: %s", arm[0], (int) v.back().rc0, v.back().n_onepass,
-               v.back().proof.empty() ? "(none)\n" : v.back().proof.c_str());
+        printf("[op-arm] %s rc0=%d onepass_cases=%zu v3_cases=%zu proof: %s", arm[0], (int) v.back().rc0, v.back().n_onepass,
+               v.back().n_v3, v.back().proof.empty() ? "(none)\n" : v.back().proof.c_str());
+        printf("[op-arm] %s v3 proof: %s", arm[0], v.back().proof_v3.empty() ? "(none)\n" : v.back().proof_v3.c_str());
+        if (v.size() == n_run) { break; }
     }
+    while (v.size() < n_arms) { v.push_back(v[0]); }   // arms not run: copies of off (only with GGML_TEST_ONEPASS_ARMS)
 
     bool ok = true;
     size_t n_same = 0, n_diff = 0, n_missing = 0;
@@ -472,7 +595,7 @@ int main(int argc, char ** argv) {
         char name[32];
         snprintf(name, sizeof(name), "/case%03zu.ids", i);
         const auto d0 = slurp(base + "-off" + name);
-        for (int a = 1; a < 3; ++a) {
+        for (size_t a = 1; a < n_run; ++a) {
             const auto d = slurp(base + "-" + arms[a][0] + name);
             if (d0.empty() || d.empty()) { n_missing++; continue; }
             if (d == d0) { n_same++; } else { n_diff++; differs[i] = true; }
@@ -483,16 +606,33 @@ int main(int argc, char ** argv) {
         GGML_UNUSED(rc);
     }
 
-    printf("%-4s %-62s %-15s %9s %9s %9s %7s %8s %8s %9s\n", "case", "shape", "path(on_all)", "v2_ms", "on_ms", "on_all_ms", "x(all)",
-           "fb_on", "fb_all", "cand/row");
+    printf("%-4s %-62s %-15s %9s %9s %9s %9s %9s %7s %8s %8s %9s %8s %8s %8s\n", "case", "shape", "path(v3_all)", "v2_ms", "on_ms",
+           "on_all_ms", "v3_ms", "v3all_ms", "x(v3/op)", "fb_all", "fb_v3all", "cand/row", "blk/row", "mix/row", "v3exact");
+    size_t n_v3_bad = 0;
+    std::string v3_bad_list;
     for (size_t i = 0; i < cases.size(); ++i) {
-        const case_view & a = v[0].c[i], & b = v[1].c[i], & c = v[2].c[i];
-        printf("%-4zu %-62s %-15s %9.4f %9.4f %9.4f %7.2f %8.4f %8.4f %9.1f%s%s\n", i, cases[i].desc().c_str(),
-               c.path.empty() ? "-" : c.path.c_str(), a.ms, b.ms, c.ms, c.ms > 0 ? a.ms/c.ms : 0.0,
-               b.rows ? (double) b.fb/(double) b.rows : 0.0, c.rows ? (double) c.fb/(double) c.rows : 0.0, c.cand,
-               (a.exact && b.exact && c.exact) ? "" : "  NOT-EXACT", differs[i] ? "  DUMP-DIFFERS" : "");
+        const case_view & a = v[0].c[i], & b = v[1].c[i], & c = v[2].c[i], & d = v[3].c[i], & e = v[4].c[i];
+        const bool v3x = d.exact && e.exact;
+        if (!v3x) { n_v3_bad++; v3_bad_list += (v3_bad_list.empty() ? "" : ",") + std::to_string(i); }
+        const uint64_t edone = e.v3rows - e.v3fb;
+        printf("%-4zu %-62s %-15s %9.4f %9.4f %9.4f %9.4f %9.4f %7.2f %8.4f %8.4f %9.1f %8.1f %8.2f %8d%s%s\n", i, cases[i].desc().c_str(),
+               e.path.empty() ? "-" : e.path.c_str(), a.ms, b.ms, c.ms, d.ms, e.ms, e.ms > 0 ? c.ms/e.ms : 0.0,
+               c.rows ? (double) c.fb/(double) c.rows : 0.0, e.v3rows ? (double) e.v3fb/(double) e.v3rows : 0.0, c.cand,
+               edone ? e.v3blocks_sum/(double) edone : 0.0, e.v3rows ? e.v3mixed_sum/(double) e.v3rows : 0.0, (int) v3x,
+               (a.exact && b.exact && c.exact && d.exact && e.exact) ? "" : "  NOT-EXACT", differs[i] ? "  DUMP-DIFFERS" : "");
     }
     printf("[op-dump] %zu comparisons: %zu identical, %zu differ, %zu missing\n", n_same + n_diff + n_missing, n_same, n_diff, n_missing);
+
+    // [TAG_QSA_TOPK_V3] a mutant build: the battery must FAIL through the v3 arms (off / onepass arms exact)
+    if (v[3].mutant || v[4].mutant) {
+        bool op_ok = true;
+        for (size_t i = 0; i < cases.size(); ++i) {
+            for (size_t a = 0; a < 3; ++a) { op_ok = op_ok && (v[a].c[i].exact || v[a].c[i].unsupported); }
+        }
+        printf("test-qsa-topk-onepass: FAIL - MUTANT BUILD %s (v3 arms: %zu cases not exact [%s], %zu dumps differ; off / onepass arms "
+               "exact %d)\n", n_v3_bad > 0 && op_ok ? "CAUGHT" : "NOT CAUGHT", n_v3_bad, v3_bad_list.c_str(), n_diff, (int) op_ok);
+        return 1;
+    }
 
     const bool negctl = v[1].negctl || v[2].negctl;
     if (negctl) {
@@ -508,21 +648,31 @@ int main(int argc, char ** argv) {
             const bool all_fb = v[2].c[i].rows > 0 && v[2].c[i].fb == v[2].c[i].rows;
             if (op && !all_fb) { n_op++; n_op_fail += fail; } else { n_other_fail += fail; }
         }
-        const bool cok = off_ok && n_op > 0 && n_op_fail*10 >= n_op*9 && n_other_fail == 0;
-        printf("test-qsa-topk-onepass: NEGATIVE CONTROL %s (highest-id ties: %zu/%zu onepass cases FAIL, %zu other cases FAIL, "
-               "off arm exact %d)\n", cok ? "PASS" : "FAIL", n_op_fail, n_op, n_other_fail, (int) off_ok);
+        // [TAG_QSA_TOPK_V3] the same on the v3_all arm's v3 cases
+        size_t n_v3c = 0, n_v3c_fail = 0, n_v3_other_fail = 0;
+        for (size_t i = 0; i < cases.size(); ++i) {
+            const bool is3  = v[4].c[i].path == "v3";
+            const bool fail = !v[4].c[i].exact;
+            const bool all_fb = v[4].c[i].v3rows > 0 && v[4].c[i].v3fb == v[4].c[i].v3rows;
+            if (is3 && !all_fb) { n_v3c++; n_v3c_fail += fail; } else { n_v3_other_fail += fail; }
+        }
+        const bool cok = off_ok && n_op > 0 && n_op_fail*10 >= n_op*9 && n_other_fail == 0 &&
+                         n_v3c > 0 && n_v3c_fail*10 >= n_v3c*9 && n_v3_other_fail == 0;
+        printf("test-qsa-topk-onepass: NEGATIVE CONTROL %s (highest-id ties: %zu/%zu onepass cases FAIL, %zu other cases FAIL; v3: %zu/%zu "
+               "v3 cases FAIL, %zu other FAIL; off arm exact %d)\n", cok ? "PASS" : "FAIL", n_op_fail, n_op, n_other_fail, n_v3c_fail,
+               n_v3c, n_v3_other_fail, (int) off_ok);
         return cok ? 0 : 1;
     }
 
     // every arm exact on every case
-    for (size_t a = 0; a < 3; ++a) {
+    for (size_t a = 0; a < n_arms; ++a) {
         ok = ok && v[a].rc0;
         for (size_t i = 0; i < cases.size(); ++i) {
             const case_view & c = v[a].c[i];
             if (!c.seen || (!c.exact && !c.unsupported)) { ok = false; printf("  %s case %zu not exact / not seen\n", arms[a][0], i); }
         }
     }
-    ok = ok && n_diff == 0 && n_missing == 0 && n_same == 2*cases.size();
+    ok = ok && n_diff == 0 && n_missing == 0 && n_same == (n_run - 1)*cases.size();
     // the knob decides: off never onepass; on_all onepass wherever admissible (k <= 4096 <= n_kv, expected candidates fit);
     // on = on_all at n_kv >= the default gate. Forced cases fall back on every row (equal / coarse / sparse) or on the odd rows.
     size_t n_fb_forced = 0, n_fb_forced_ok = 0;
@@ -531,6 +681,44 @@ int main(int argc, char ** argv) {
         const bool op0 = v[0].c[i].path.rfind("onepass", 0) == 0;
         const bool op2 = v[2].c[i].path.rfind("onepass", 0) == 0;
         if (op0) { ok = false; printf("  off arm dispatched onepass on case %zu\n", i); }
+        // [TAG_QSA_TOPK_V3] the onepass arms never take v3; v3_all takes it wherever on_all took the nokeys onepass; v3 = v3_all
+        // at or above the default gate (v3's own sample plan may decline a shape: then both v3 arms run onepass)
+        for (size_t a = 0; a < 3; ++a) {
+            if (v[a].c[i].path == "v3") { ok = false; printf("  %s arm dispatched v3 on case %zu\n", arms[a][0], i); }
+        }
+        if (n_run == n_arms && v[2].c[i].path == "onepass_nokeys" && v[4].c[i].path != "v3") {
+            ok = false; printf("  v3_all arm did not dispatch v3 on case %zu (%s)\n", i, v[4].c[i].path.c_str());
+        }
+        if (n_run == n_arms && v[1].c[i].path == "onepass_nokeys" && v[3].c[i].path != "v3") {
+            ok = false; printf("  v3 arm did not dispatch v3 on case %zu (%s)\n", i, v[3].c[i].path.c_str());
+        }
+        const bool v3c = v[4].c[i].path == "v3";
+        if (v3c && (c.mode == M_EQUAL || c.mode == M_COARSE || c.mode == M_SPARSE)) {
+            n_fb_forced++;
+            n_fb_forced_ok += v[4].c[i].v3rows > 0 && v[4].c[i].v3fb == v[4].c[i].v3rows;
+        }
+        if (v3c && c.mode == M_MIXED) {
+            n_fb_forced++;
+            n_fb_forced_ok += v[4].c[i].v3rows > 0 && v[4].c[i].v3fb*2 >= v[4].c[i].v3rows && v[4].c[i].v3fb < v[4].c[i].v3rows;
+        }
+        // witnesses (astra 2026-10-31 item 6): every B family / map finishes rows on the B path (a pass through the v2 fallback
+        // alone would be vacuous); neginf and tied2049 send every row back (under / over)
+        const bool b_family = c.mode >= M_HOT || c.map == MAP_PERM4 || c.map == MAP_BLK3;
+        if (v3c && b_family) {
+            n_fb_forced++;
+            const uint64_t done3 = v[4].c[i].v3rows - v[4].c[i].v3fb;
+            const bool want_fb = c.mode == M_NEGINF || c.mode == M_TIED2049;
+            const bool w_ok = v[4].c[i].v3rows > 0 && (want_fb ? done3 == 0 : done3 > 0);
+            n_fb_forced_ok += w_ok;
+            if (!w_ok) { printf("  v3_all case %zu: witness failed (rows %" PRIu64 ", fallback %" PRIu64 ")\n", i, v[4].c[i].v3rows, v[4].c[i].v3fb); }
+        }
+        // the per-cell path runs: the families whose boundary blocks are selected show partly visible blocks
+        if (v3c && (c.mode == M_HOT || c.mode == M_XY)) {
+            n_fb_forced++;
+            const bool mixed_ok = v[4].c[i].v3mixed_sum > 0.0 && v[4].c[i].v3fb < v[4].c[i].v3rows;
+            n_fb_forced_ok += mixed_ok;
+            if (!mixed_ok) { printf("  v3_all case %zu: no partly visible block met or every row fell back\n", i); }
+        }
         if (!op2 && c.width <= c.n_kv) { ok = false; printf("  on_all arm did not dispatch onepass on case %zu (%s)\n", i, v[2].c[i].path.c_str()); }
         if (op2 && (c.mode == M_EQUAL || c.mode == M_COARSE || c.mode == M_SPARSE)) {
             n_fb_forced++;
@@ -543,8 +731,9 @@ int main(int argc, char ** argv) {
         }
     }
     ok = ok && n_fb_forced > 0 && n_fb_forced_ok == n_fb_forced && v[1].n_onepass > 0 && v[0].n_onepass == 0;
-    printf("test-qsa-topk-onepass: %s (%zu cases x 3 arms exact vs the contract reference; on / on_all dumps byte-identical to off "
-           "%zu/%zu; onepass cases on %zu, on_all %zu; forced-fallback cases behaving %zu/%zu)\n", ok ? "PASS" : "FAIL", cases.size(),
-           n_same, 2*cases.size(), v[1].n_onepass, v[2].n_onepass, n_fb_forced_ok, n_fb_forced);
+    printf("test-qsa-topk-onepass: %s (%zu cases x %zu arms exact vs the contract reference; on / on_all / v3 / v3_all dumps "
+           "byte-identical to off %zu/%zu; onepass cases on %zu, on_all %zu; v3 cases v3 %zu, v3_all %zu; forced-fallback / mixed-block "
+           "cases behaving %zu/%zu)\n", ok ? "PASS" : "FAIL", cases.size(), n_run, n_same, (n_run - 1)*cases.size(), v[1].n_onepass,
+           v[2].n_onepass, v[3].n_v3, v[4].n_v3, n_fb_forced_ok, n_fb_forced);
     return ok ? 0 : 1;
 }

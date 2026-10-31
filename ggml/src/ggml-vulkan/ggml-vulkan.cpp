@@ -981,9 +981,15 @@ struct vk_device_struct {
     // after its own synchronization, so every writer of what it reads has completed (astra v66 Important: device-global words
     // read at context B's sync could still be bumped by context A's pending selections, and the backoff consumed them)
     std::mutex qsa_topk_op_mutex; // the device-wide totals / backoff state below, shared by every context's reader
-    uint64_t qsa_topk_op_tot[40]  = {};
+    uint64_t qsa_topk_op_tot[48]  = {}; // [0..40) onepass, [40..48) v3 ([TAG_QSA_TOPK_V3])
     uint64_t qsa_topk_op_next_log = 1024;
     uint64_t qsa_topk_op_logged   = 0;
+    // [TAG_QSA_TOPK_V3] GGML_VK_QSA_TOPK_V3=1 (default off; needs onepass + nokeys): the onepass selection of the nokeys cell form
+    // over the blocks (topk_qsa_v3.comp: a block = one key weighted by its cells visible to the row), same gates, same
+    // fallback list and backoff as onepass; its own counters line (stats words 40..47)
+    bool     qsa_topk_v3 = false;
+    uint64_t qsa_topk_v3_next_log = 1024;
+    uint64_t qsa_topk_v3_logged   = 0;
     // backoff (GGML_VK_QSA_TOPK_ONEPASS_BACKOFF, default on): a window of >= 512 selected rows of which more than half fell
     // back sends the selections to v2 for qsa_topk_op_backoff synchronizations (16, doubling while it repeats, <= 1024)
     bool     qsa_topk_op_backoff_on = true;
@@ -1259,6 +1265,9 @@ struct vk_device_struct {
     // metadata, metadata without the key rows - and v2's cell form as its per-row fallback (QSA_TOPK_FB, push constant fb_off)
     vk_pipeline pipeline_topk_op_qsa[3], pipeline_topk_op_qsa_vis[3], pipeline_topk_op_qsa_vis_nk[3];
     vk_pipeline pipeline_topk_v2_qsa_fb[6], pipeline_topk_v2_qsa_vis_fb[6], pipeline_topk_v2_qsa_vis_nk_fb[6];
+    // [TAG_QSA_TOPK_V3] the block-weighted form of the nokeys onepass (passes 5 rows, 0 scatter, 1 classify, 2 sample,
+    // 3 filter, 4 select; onepass's 8 bindings); its fallback = pipeline_topk_v2_qsa_vis_nk_fb
+    vk_pipeline pipeline_topk_v3_qsa_vis_nk[6];
     vk_pipeline pipeline_qsa_bias;       // [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
@@ -2101,6 +2110,20 @@ struct vk_op_topk_onepass_push_constants {
 };
 // candidates per row (the shader's CAP); the sample / select passes hold up to CAP keys in LDS
 static constexpr uint32_t VK_QSA_TOPK_ONEPASS_CAP = 8192;
+
+// [TAG_QSA_TOPK_V3] topk_qsa_v3.comp: onepass's constants (n_tiles = the filter's tiles over the BLOCKS, n_sample / stride in
+// blocks, j_sample in cell weights) + the v3 region
+struct vk_op_topk_v3_push_constants {
+    vk_op_topk_onepass_push_constants op;
+    uint32_t v3_off;    // the v3 region of the scratch (uints)
+    uint32_t vec4;      // the filter's 16-B score loads (sb_blk == 1, n_blocks % 4 == 0, a 16-B aligned score binding)
+};
+static_assert(sizeof(vk_op_topk_v3_push_constants) == 15 * sizeof(uint32_t), "packed");
+// cells per block in the v3 block lists (the shader's MAXC): a block with more sends the whole selection to v2
+static constexpr uint32_t VK_QSA_TOPK_V3_MAXC = 4;
+// the v3 sample's run length in blocks (the shader's SRUN) and its size (<= CAP)
+static constexpr uint32_t VK_QSA_TOPK_V3_SRUN   = 8;
+static constexpr uint32_t VK_QSA_TOPK_V3_SAMPLE = 4096;
 // fallback passes: a grid of FBX rows x FBY tiles, both looped over (none listed = every workgroup exits at once). s1 sweep
 // (8x64 / 16x128 / 32x256 / 128x512): 16x128 = 2048 workgroups is the widest grid whose empty passes cost nothing measurable
 // (1M x 128 2.44 / 2.45 / 2.51 / 2.98 ms) while an all-fallback 262k x 128 selection runs at 1.05x v2 (8x64: 1.21x)
@@ -3557,7 +3580,7 @@ struct ggml_backend_vk_context {
     // topk_qsa_onepass.comp), created at its first onepass dispatch, written only by its own command buffers and read
     // (as deltas against qsa_topk_op_last) only after ggml_vk_synchronize / ggml_vk_cleanup of this context
     vk_buffer qsa_topk_op_stats;
-    uint32_t  qsa_topk_op_last[40] = {};
+    uint32_t  qsa_topk_op_last[48] = {}; // [40..48): [TAG_QSA_TOPK_V3]
     // [TAG_QSA_TOPK_NOKEYS] this context's CHECK word (host-visible, 16 B), created at its first NOKEYS dispatch, written only
     // by its own command buffers and read + cleared only at its own synchronization (a device-global word could be read and
     // cleared by context B while context A's selections were still in flight, and the warning attributed to the wrong context)
@@ -7822,6 +7845,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                              {pass, 256 / wave, device->qsa_topk_cpt, 0, 1, nk_check}, 1, true, true, wave);
                 }
             }
+            // [TAG_QSA_TOPK_V3] onepass's spec constants (LDS_N = CAP for the select only, which sorts in LDS)
+            if (device->qsa_topk_v3) {
+                for (uint32_t pass = 0; pass < 6; ++pass) {
+                    const uint32_t lds_n = pass == 4 ? VK_QSA_TOPK_ONEPASS_CAP : 1u;
+                    ggml_vk_create_pipeline2(device, device->pipeline_topk_v3_qsa_vis_nk[pass], "topk_qsa_v3_vis_nk_p" + std::to_string(pass),
+                                             topk_qsa_v3_vis_nk_f32_len, topk_qsa_v3_vis_nk_f32_data, "main", 8,
+                                             sizeof(vk_op_topk_v3_push_constants), {1, 1, 1},
+                                             {pass, 256 / wave, device->qsa_topk_cpt, lds_n, 1, nk_check}, 1, true, true, wave);
+                }
+            }
         }
     }
 
@@ -9353,6 +9386,28 @@ static vk_device ggml_vk_get_device(size_t idx) {
                           VK_QSA_TOPK_ONEPASS_CAP, device->qsa_topk_op_min_kv, (unsigned long long) device->qsa_topk_op_min_cells,
                           VK_QSA_TOPK_ONEPASS_CAP / 2, device->qsa_topk_op_fbx, device->qsa_topk_op_fby,
                           device->qsa_topk_op_backoff_on ? "on" : "off", op_negctl);
+
+            // [TAG_QSA_TOPK_V3] read before the pipelines are declared; needs onepass (gates, fallback, counters) and nokeys
+            // (the only form it implements)
+            const char * v3_env     = getenv("GGML_VK_QSA_TOPK_V3");
+            const bool   v3_env_set = v3_env != nullptr && *v3_env != '\0';
+            const bool   v3_req     = ggml_vk_env_bool("GGML_VK_QSA_TOPK_V3", false);
+            device->qsa_topk_v3     = v3_req && device->qsa_topk_onepass && device->qsa_topk_nokeys;
+#if defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 1
+            const char * v3_mut = " MUTANT BUILD M-B1: a block with p0 == min pos counted FULL";
+#elif defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 2
+            const char * v3_mut = " MUTANT BUILD M-B2: a FULL block weighs MAXC whatever its cell count";
+#elif defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 3
+            const char * v3_mut = " MUTANT BUILD M-B3: no per-cell test on partly visible blocks";
+#else
+            const char * v3_mut = "";
+#endif
+            GGML_LOG_WARN("ggml_vulkan: %s qsa_topk: v3 %s (%s%s; block-weighted onepass of the nokeys cell form, <= %u cells per "
+                          "block, onepass's gates / fallback / backoff)%s\n",
+                          device->name.c_str(), device->qsa_topk_v3 ? "on" : "off",
+                          v3_env_set ? (v3_req ? "GGML_VK_QSA_TOPK_V3=1" : "GGML_VK_QSA_TOPK_V3=0") : "default off; GGML_VK_QSA_TOPK_V3 unset",
+                          !v3_req ? "" : !device->qsa_topk_onepass ? "; needs onepass" : !device->qsa_topk_nokeys ? "; needs nokeys" : "",
+                          VK_QSA_TOPK_V3_MAXC, v3_mut);
         }
 
         // [TAG_QSA_SCORE_KREUSE] read before the pipelines are declared (=0: the kr twins are never created).
@@ -18031,16 +18086,54 @@ static bool ggml_vk_qsa_topk_onepass_plan(uint32_t n_kv, uint32_t width, uint32_
     return (double) j_sample * n_kv / n_sample <= 0.75 * VK_QSA_TOPK_ONEPASS_CAP;
 }
 
+// [TAG_QSA_TOPK_V3] whether an onepass selection (the caller has checked ggml_vk_qsa_topk_onepass) takes the block-weighted
+// kernel: the knob, the nokeys form, block ids that fit the candidate word (29 bits)
+static bool ggml_vk_qsa_topk_v3(const vk_device & device, bool nokeys, int64_t n_blocks, int64_t n_stream) {
+    return device->qsa_topk_v3 && nokeys && n_blocks > 0 && n_blocks * n_stream < ((int64_t) 1 << 29);
+}
+
+// [TAG_QSA_TOPK_V3] the v3 region after onepass's: wsum[rows] | flag[4] | ragg[n_stream][4] | bcnt[nb] | list[nb][MAXC] |
+// cls[n_stream][ceil(n_blocks / 4)], nb = n_blocks * n_stream (4.3 MiB at 262 144 blocks); the zeroed span = wsum .. bcnt
+static size_t ggml_vk_qsa_topk_v3_uints(size_t nrows, size_t n_blocks, size_t n_stream) {
+    const size_t nb = n_blocks * n_stream;
+    return nrows + 4 + 4 * n_stream + nb + VK_QSA_TOPK_V3_MAXC * nb + n_stream * ((n_blocks + 3) / 4);
+}
+
+// [TAG_QSA_TOPK_V3] the block sample: S = min(VK_QSA_TOPK_V3_SAMPLE, n_blocks) blocks (a multiple of SRUN), runs of SRUN consecutive blocks
+// SRUN * stride apart; tau = the j-th largest of their cell-weighted keys, j = ceil(m + 8 sqrt(4 m) + 16) with
+// m = k S / n_blocks the expected sampled cells above T (blocks correlate inside a run and weigh up to 4 cells: a wider
+// margin than onepass's - it only costs candidates, CAP is ~5x the expected count at 1M). Returns false (= onepass) when
+// the expected candidate blocks j n_blocks / (S r), r = n_kv / n_blocks, pass 3/4 of CAP.
+static bool ggml_vk_qsa_topk_v3_plan(uint32_t n_kv, uint32_t n_blocks, uint32_t width, uint32_t & n_sample, uint32_t & j_sample,
+                                     uint32_t & stride) {
+    n_sample = std::min<uint32_t>(VK_QSA_TOPK_V3_SAMPLE, n_blocks) & ~(VK_QSA_TOPK_V3_SRUN - 1);
+    if (n_sample == 0) {
+        return false;
+    }
+    stride = n_blocks / n_sample;
+    const double m = (double) width * n_sample / n_blocks;
+    j_sample = (uint32_t) std::ceil(m + 8.0 * std::sqrt(4.0 * m) + 16.0);
+    const double r = std::max(1.0, (double) n_kv / n_blocks);
+    return (double) j_sample * n_blocks / ((double) n_sample * r) <= 0.75 * VK_QSA_TOPK_ONEPASS_CAP;
+}
+
+// n_blocks: the selection's blocks ([TAG_QSA_TOPK_V3] region size; 0 = unknown -> n_kv, an upper bound)
 static size_t ggml_vk_qsa_scratch_bytes(const vk_device & device, int64_t n_kv, int64_t n_tps, int64_t n_stream,
-                                        bool blocks = false, bool vis = false) {
+                                        bool blocks = false, bool vis = false, int64_t n_blocks = 0) {
     const size_t nrows = (size_t) n_tps * (size_t) n_stream;
     // [TAG_QSA_TOPK_NOKEYS] no key rows: the histograms and the tile records only
-    size_t bytes = ggml_vk_qsa_topk_nokeys(device, blocks, vis, nrows) ? 0 : (size_t) n_kv * nrows * sizeof(float);
+    const bool nokeys = ggml_vk_qsa_topk_nokeys(device, blocks, vis, nrows);
+    size_t bytes = nokeys ? 0 : (size_t) n_kv * nrows * sizeof(float);
     if (device->qsa_topk_v2) {
         bytes += nrows * ggml_vk_qsa_topk_v2_row_extra(device, n_kv, blocks) * sizeof(uint32_t);
         // [TAG_QSA_TOPK_ONEPASS] + the onepass region (8.4 MiB at 128 rows)
         if (ggml_vk_qsa_topk_onepass(device, blocks, n_kv, nrows, 0)) {
             bytes += ggml_vk_qsa_topk_onepass_uints(nrows) * sizeof(uint32_t);
+            // [TAG_QSA_TOPK_V3] + the v3 region
+            const int64_t nb = n_blocks > 0 ? n_blocks : n_kv;
+            if (ggml_vk_qsa_topk_v3(device, nokeys, nb, n_stream)) {
+                bytes += ggml_vk_qsa_topk_v3_uints(nrows, (size_t) nb, (size_t) n_stream) * sizeof(uint32_t);
+            }
         }
     }
     return bytes;
@@ -18052,7 +18145,7 @@ static size_t ggml_vk_topk_qsa_scratch_size(const vk_device & device, const ggml
     const ggml_tensor * get_rows = cgraph->nodes[node_idx];
     const ggml_tensor * scores   = get_rows->src[0]; // [n_tps, n_blocks, n_stream]
     const ggml_tensor * cell_blk = get_rows->src[1]; // [n_kv, n_stream]
-    return ggml_vk_qsa_scratch_bytes(device, cell_blk->ne[0], scores->ne[0], scores->ne[2]);
+    return ggml_vk_qsa_scratch_bytes(device, cell_blk->ne[0], scores->ne[0], scores->ne[2], false, false, scores->ne[1]);
 }
 
 // ... and for a GGML_OP_QSA_TOP_K node, whose score is the unpermuted [n_blocks, n_tps, n_stream],
@@ -18060,7 +18153,8 @@ static size_t ggml_vk_topk_qsa_scratch_size(const vk_device & device, const ggml
 static size_t ggml_vk_qsa_top_k_scratch_size(const vk_device & device, const ggml_tensor * node) {
     return ggml_vk_qsa_scratch_bytes(device, node->src[1]->ne[0], node->src[0]->ne[1], node->src[0]->ne[2],
                                      /*blocks =*/ ggml_get_op_params_i32(node, 0) == 1,  // [TAG_QSA_WHOLE_BLOCKS]
-                                     /*vis    =*/ ggml_get_op_params_i32(node, 2) == 1); // [TAG_QSA_VIS] [TAG_QSA_TOPK_NOKEYS]
+                                     /*vis    =*/ ggml_get_op_params_i32(node, 2) == 1,  // [TAG_QSA_VIS] [TAG_QSA_TOPK_NOKEYS]
+                                     /*n_blocks =*/ node->src[0]->ne[0]);                // [TAG_QSA_TOPK_V3]
 }
 
 // [TAG_QSA_FUSED_SELECT] one dispatch of the QSA indexer selection: gather(score, cell_blk) + mask
@@ -18098,7 +18192,7 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
 
     // scratch holds the gathered+masked input (v2: its keys, then the histograms and tile records),
     // materialized once and reused across passes
-    const size_t scratch_size = ggml_vk_qsa_scratch_bytes(ctx->device, n_kv, n_tps, n_stream, n_sel > 0, vis);
+    const size_t scratch_size = ggml_vk_qsa_scratch_bytes(ctx->device, n_kv, n_tps, n_stream, n_sel > 0, vis, n_blocks);
     if (vk_qsa_scratch_presize) {
         // [TAG_QSA_SCRATCH] Raise the shared prealloc_x to the largest extent any optimized graph
         // asked for, not just to what this dispatch needs. The reserve graphs were optimized before
@@ -18193,7 +18287,12 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
         uint32_t op_sample = 0, op_j = 0, op_stride = 0;
         const bool     onepass   = ggml_vk_qsa_topk_onepass(ctx->device, n_sel > 0, n_kv, nrows, width) &&
                                    ggml_vk_qsa_topk_onepass_plan(n_kv, width, op_sample, op_j, op_stride);
-        const uint64_t op_end    = end_off + (onepass ? (uint64_t) ggml_vk_qsa_topk_onepass_uints(nrows) : 0);
+        // [TAG_QSA_TOPK_V3] the block-weighted kernel where its gate and its sample plan admit this onepass selection
+        uint32_t v3_sample = 0, v3_j = 0, v3_stride = 0;
+        const bool     v3        = onepass && ggml_vk_qsa_topk_v3(ctx->device, nokeys, n_blocks, n_stream) &&
+                                   ggml_vk_qsa_topk_v3_plan(n_kv, n_blocks, width, v3_sample, v3_j, v3_stride);
+        const uint64_t v3_off    = end_off + (onepass ? (uint64_t) ggml_vk_qsa_topk_onepass_uints(nrows) : 0);
+        const uint64_t op_end    = v3_off + (v3 ? (uint64_t) ggml_vk_qsa_topk_v3_uints(nrows, n_blocks, n_stream) : 0);
         GGML_ASSERT(n_sel == 0 || n_blocks <= n_kv);
         GGML_ASSERT(op_end <= UINT32_MAX);
         GGML_ASSERT(op_end * sizeof(uint32_t) <= ctx->prealloc_x->size);
@@ -18233,12 +18332,51 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
                                 : vis    ? ctx->device->pipeline_topk_op_qsa_vis : ctx->device->pipeline_topk_op_qsa;
             vk_pipeline * fb_pl = nokeys ? ctx->device->pipeline_topk_v2_qsa_vis_nk_fb
                                 : vis    ? ctx->device->pipeline_topk_v2_qsa_vis_fb : ctx->device->pipeline_topk_v2_qsa_fb;
-            if (ctx->device->dispatch_log) {
+            if (v3) {
+                // [TAG_QSA_TOPK_V3] zero wsum .. bcnt, then rows -> scatter -> classify -> sample -> filter -> select (topk_qsa_v3.comp)
+                const uint32_t tile_b    = 256 * ctx->device->qsa_topk_cpt;
+                const uint32_t n_tiles_b = (uint32_t) CEIL_DIV(n_blocks, tile_b);
+                const uint32_t nbw       = (n_blocks + 3) / 4;
+                const vk_subbuffer sc_buf = ggml_vk_tensor_subbuffer(ctx, scores);
+                const bool     vec4   = sb_blk == 1 && n_blocks % 4 == 0 && sc_buf.offset % 16 == 0 && tile_b % 1024 == 0;
+                const vk_op_topk_v3_push_constants pc3 {
+                    { n_kv, width, nrows, n_tps, n_blocks, n_stream, sb_blk, sb_tps, n_tiles_b, op_off, v3_sample, v3_j, v3_stride },
+                    (uint32_t) v3_off, vec4 ? 1u : 0u,
+                };
+                GGML_ASSERT(n_tiles_b <= ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+                GGML_ASSERT(n_stream <= ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+                const uint64_t z_uints = (uint64_t) nrows + 4 + 4 * (uint64_t) n_stream + (uint64_t) n_blocks * n_stream;
+                subctx->s->buffer->buf.fillBuffer(ctx->prealloc_x->buffer, v3_off * sizeof(uint32_t),
+                                                  (vk::DeviceSize) z_uints * sizeof(uint32_t), 0);
+                ggml_vk_sync_buffers(ctx, subctx);
+                if (ctx->device->dispatch_log) {
+                    fprintf(stderr, "[vk-dispatch] op=QSA_TOP_K path=v3 form=cells vis=%d n_kv=%u n_blocks=%u rows=%u k=%u tiles=%u "
+                            "sample=%u j=%u stride=%u scratch=%zu pipeline=%s node=%s\n", vis ? 1 : 0, n_kv, n_blocks, nrows, width,
+                            n_tiles_b, v3_sample, v3_j, v3_stride, scratch_size,
+                            ctx->device->pipeline_topk_v3_qsa_vis_nk[0]->name.c_str(), top_k->name);
+                }
+                // pass 5 (the rows' aggregates) first, then 0..4
+                for (uint32_t pass : { 5u, 0u, 1u, 2u, 3u, 4u }) {
+                    vk_pipeline & pl = ctx->device->pipeline_topk_v3_qsa_vis_nk[pass];
+                    const std::array<uint32_t, 3> el =
+                        pass == 5 ? std::array<uint32_t, 3> { 1, n_stream, 1 } :
+                        pass == 0 ? std::array<uint32_t, 3> { n_tiles_c, n_stream, 1 } :
+                        pass == 1 ? std::array<uint32_t, 3> { (uint32_t) CEIL_DIV(nbw, 256), n_stream, 1 } :
+                                    std::array<uint32_t, 3> { n_x, pass == 3 ? n_tiles_b : 1u, 1 };
+                    ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
+                    ggml_vk_dispatch_pipeline(ctx, subctx, pl,
+                        { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
+                          ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
+                          scratch_buf, toks_buf, nk_buf, st_buf }, pc3, el);
+                    ggml_vk_sync_buffers(ctx, subctx);
+                }
+            }
+            if (!v3 && ctx->device->dispatch_log) {
                 fprintf(stderr, "[vk-dispatch] op=QSA_TOP_K path=%s form=cells vis=%d n_kv=%u rows=%u k=%u tiles=%u sample=%u j=%u "
                         "stride=%u scratch=%zu pipeline=%s node=%s\n", nokeys ? "onepass_nokeys" : "onepass", vis ? 1 : 0, n_kv, nrows,
                         width, n_tiles_c, op_sample, op_j, op_stride, scratch_size, op_pl[0]->name.c_str(), top_k->name);
             }
-            for (uint32_t pass = 0; pass < 3; ++pass) {
+            for (uint32_t pass = 0; pass < (v3 ? 0u : 3u); ++pass) {
                 vk_pipeline & pl = op_pl[pass];
                 const std::array<uint32_t, 3> el { n_x, pass == 1 ? n_tiles_c : 1u, 1 };
                 ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
@@ -21151,10 +21289,16 @@ static void ggml_vk_qsa_topk_onepass_stats(ggml_backend_vk_context * ctx, bool f
     }
     std::lock_guard<std::mutex> lock(device->qsa_topk_op_mutex);
     volatile uint32_t * w = (volatile uint32_t *) ctx->qsa_topk_op_stats->ptr;
-    const uint64_t rows0 = device->qsa_topk_op_tot[0], fb0 = device->qsa_topk_op_tot[1] + device->qsa_topk_op_tot[2];
-    for (int i = 0; i < 40; ++i) {
+    // [TAG_QSA_TOPK_V3] the v3 selections (words 40..47) share the backoff window: rows 40, fallback 41 + 42 + 43
+    const auto op_rows = [&]() { return device->qsa_topk_op_tot[0] + device->qsa_topk_op_tot[40]; };
+    const auto op_fb   = [&]() {
+        return device->qsa_topk_op_tot[1] + device->qsa_topk_op_tot[2] + device->qsa_topk_op_tot[41] + device->qsa_topk_op_tot[42] +
+               device->qsa_topk_op_tot[43];
+    };
+    const uint64_t rows0 = op_rows(), fb0 = op_fb();
+    for (int i = 0; i < 48; ++i) {
         const uint32_t v = w[i];
-        if (i == 5) { // a running max, not a count
+        if (i == 5 || i == 47) { // a running max, not a count
             device->qsa_topk_op_tot[i] = std::max<uint64_t>(device->qsa_topk_op_tot[i], v);
         } else {
             device->qsa_topk_op_tot[i] += (uint32_t) (v - ctx->qsa_topk_op_last[i]);
@@ -21171,8 +21315,8 @@ static void ggml_vk_qsa_topk_onepass_stats(ggml_backend_vk_context * ctx, bool f
         if (b > 0) {
             device->qsa_topk_op_backoff.store(b - 1, std::memory_order_relaxed);
         }
-        device->qsa_topk_op_win_rows += rows - rows0;
-        device->qsa_topk_op_win_fb   += device->qsa_topk_op_tot[1] + device->qsa_topk_op_tot[2] - fb0;
+        device->qsa_topk_op_win_rows += op_rows() - rows0;
+        device->qsa_topk_op_win_fb   += op_fb() - fb0;
         if (device->qsa_topk_op_win_rows >= 512) {
             if (2 * device->qsa_topk_op_win_fb > device->qsa_topk_op_win_rows) {
                 device->qsa_topk_op_backoff.store(device->qsa_topk_op_backoff_len, std::memory_order_relaxed);
@@ -21190,6 +21334,27 @@ static void ggml_vk_qsa_topk_onepass_stats(ggml_backend_vk_context * ctx, bool f
                 device->qsa_topk_op_backoff_len = 16;
             }
             device->qsa_topk_op_win_rows = device->qsa_topk_op_win_fb = 0;
+        }
+    }
+    // [TAG_QSA_TOPK_V3] its own line, same cadence: rows, fallback (under W < k, over c > CAP, summary > MAXC cells in a
+    // block), candidate blocks per finished row, partly visible blocks per row (and the CHECK blocks met per row)
+    const uint64_t v3_rows = device->qsa_topk_op_tot[40];
+    if (v3_rows != 0 && v3_rows != device->qsa_topk_v3_logged && (final || v3_rows >= device->qsa_topk_v3_next_log)) {
+        const uint64_t u = device->qsa_topk_op_tot[41], o = device->qsa_topk_op_tot[42], g = device->qsa_topk_op_tot[43];
+        const uint64_t done = v3_rows - u - o - g;
+        char line[512];
+        const int n = snprintf(line, sizeof(line), "ggml_vulkan: qsa_topk v3: rows %llu, fallback %llu (%.4f %%: under %llu, over %llu, "
+                               "summary %llu), blocks/row %.1f, mixed/row %.2f (check/row %.2f), max c %llu, backoffs %llu%s\n",
+                               (unsigned long long) v3_rows, (unsigned long long) (u + o + g), 100.0 * (double) (u + o + g) / (double) v3_rows,
+                               (unsigned long long) u, (unsigned long long) o, (unsigned long long) g,
+                               done ? (double) device->qsa_topk_op_tot[44] / (double) done : 0.0,
+                               (double) device->qsa_topk_op_tot[46] / (double) v3_rows, (double) device->qsa_topk_op_tot[45] / (double) v3_rows,
+                               (unsigned long long) device->qsa_topk_op_tot[47], (unsigned long long) device->qsa_topk_op_backoffs,
+                               final ? " (final)" : "");
+        ggml_vk_qsa_topk_onepass_emit(line, n, sizeof(line));
+        device->qsa_topk_v3_logged = v3_rows;
+        while (device->qsa_topk_v3_next_log <= v3_rows) {
+            device->qsa_topk_v3_next_log *= 2;
         }
     }
     if (rows == 0 || rows == device->qsa_topk_op_logged || (!final && rows < device->qsa_topk_op_next_log)) {

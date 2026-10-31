@@ -228,6 +228,7 @@ option(GGML_VULKAN_SHADER_DEBUG_INFO        "ggml: enable Vulkan shader debug in
 option(GGML_VULKAN_QSA_KREUSE_NEGCTL        "ggml: Vulkan QSA_SCORE kr negative-control build (tests only)" OFF)
 option(GGML_VULKAN_QSA_TOPK_NOKEYS_NEGCTL   "ggml: Vulkan QSA select nokeys negative-control build (tests only)" OFF)
 option(GGML_VULKAN_QSA_TOPK_ONEPASS_NEGCTL  "ggml: Vulkan QSA select onepass negative-control build (tests only)" OFF)
+set(GGML_VULKAN_QSA_TOPK_V3_MUTANT "0" CACHE STRING "ggml: Vulkan QSA select v3 mutant build 1|2|3 (tests only)")
 option(GGML_VULKAN_MMID_SKIP_NEGCTL         "ggml: Vulkan mul_mat_id padding-skip negative-control build (tests only)" OFF)
 option(GGML_VULKAN_VALIDATE                 "ggml: enable Vulkan validation"                  OFF)
 option(GGML_VULKAN_RUN_TESTS                "ggml: run Vulkan tests"                          OFF)
