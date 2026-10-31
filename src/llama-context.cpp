@@ -4838,6 +4838,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 
     if (memory != nullptr) {
         LLAMA_LOG_DEBUG("%s: - writing memory module\n", __func__);
+        gdn_commit(-1);
         memory->state_write(io);
     }
 
@@ -4872,10 +4873,37 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (memory) {
+        gdn_commit(seq_id);
         memory->state_write(io, seq_id, flags);
     }
 
     return io.n_bytes();
+}
+
+void llama_context::gdn_commit(llama_seq_id seq_id) {
+    llama_memory_recurrent * recr = dynamic_cast<llama_memory_recurrent *>(memory.get());
+    if (recr == nullptr) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+            recr = hyb->get_mem_recr();
+        }
+    }
+    if (recr == nullptr || !recr->gdn_pending(seq_id)) {
+        return;
+    }
+
+    synchronize(); // the decode that deferred the state may still be running
+
+    const bool ok = recr->gdn_commit(seq_id, [&](ggml_backend_buffer_type_t buft) -> ggml_backend_t {
+        for (auto & backend : backends) {
+            if (ggml_backend_supports_buft(backend.get(), buft)) {
+                return backend.get();
+            }
+        }
+        return nullptr;
+    });
+    if (!ok) {
+        throw std::runtime_error("failed to commit the deferred gated delta net states");
+    }
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {

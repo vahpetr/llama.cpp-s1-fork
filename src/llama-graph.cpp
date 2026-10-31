@@ -365,8 +365,24 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_rs::set_input_gdn(const llama_memory_recurrent_context * mctx_cur) const {
+    if (s_copy_s) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_s->buffer));
+        int32_t * data = (int32_t *) s_copy_s->data;
+        for (uint32_t i = 0; i < mctx_cur->get_n_rs(); ++i) {
+            data[i] = mctx_cur->s_copy_s(i);
+        }
+    }
+    if (gdn_ctl) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(gdn_ctl->buffer));
+        mctx_cur->set_gdn_ctl((int32_t *) gdn_ctl->data);
+    }
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
+
+    set_input_gdn(mctx);
 
     const int64_t n_rs = mctx->get_n_rs();
 
@@ -1176,6 +1192,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
+    inp_rs->set_input_gdn(mctx->get_recr()); // [TAG_GDN_REPLAY]
+
     if (inp_rs->s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
@@ -1224,6 +1242,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+
+    inp_rs->set_input_gdn(mctx->get_recr()); // [TAG_GDN_REPLAY]
 
     if (inp_rs->s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
@@ -1298,6 +1318,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+
+    inp_rs->set_input_gdn(mctx->get_recr()); // [TAG_GDN_REPLAY]
 
     if (inp_rs->s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
@@ -3655,6 +3677,18 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
+
+    // [TAG_GDN_REPLAY]
+    if (mctx_cur->get_gdn_replay()) {
+        inp->s_copy_s = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_copy_s);
+        ggml_set_name(inp->s_copy_s, "rs_s_copy_s");
+        inp->s_copy_s_main  = ggml_view_1d(ctx0, inp->s_copy_s, n_seqs, 0);
+        inp->s_copy_s_extra = ggml_view_1d(ctx0, inp->s_copy_s, n_rs - n_seqs, n_seqs * inp->s_copy_s->nb[0]);
+        inp->gdn_ctl = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 4, n_seqs);
+        ggml_set_input(inp->gdn_ctl);
+        ggml_set_name(inp->gdn_ctl, "gdn_ctl");
+    }
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();

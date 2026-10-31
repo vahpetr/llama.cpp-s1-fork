@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-memory.h"
 
+#include <functional>
 #include <map>
 #include <set>
 #include <vector>
@@ -112,9 +113,29 @@ public:
 
     std::vector<mem_cell> cells;
 
+    // [TAG_GDN_REPLAY] commit by replay of the gated delta net states (LLAMA_GDN_REPLAY=1, default off; see
+    //   ggml_gated_delta_net_set_replay): S keeps one row per cell instead of 1 + n_rs_seq planes. A graph with a
+    //   rollback depth commits the state after its first n_seq_tokens - D tokens (D = min(depth, n_seq_tokens - 1),
+    //   the depth the planes would allow) and keeps the inputs of the last D tokens in the stash slot of the sequence
+    //   (st_l, slot = seq id, two halves of gdn_w rows); the next graph replays the replay_n kept ones first. seq_rm
+    //   drops tokens from the replay. Every state_write needs replay_n == 0: llama_context commits first (gdn_commit).
+    //   R and P keep their planes
+    bool gdn_replay = false;
+    uint32_t gdn_w = 0; // stash rows per half (n_rs_seq)
+    std::vector<uint32_t> replay_n;    // per seq
+    std::vector<uint32_t> replay_half; // per seq: the stash half holding its rows
+    std::vector<int32_t>  gdn_ctl_cur; // the current ubatch's control, I32 [4, n_seqs] (apply())
+
+    // any deferred state to commit for seq_id (-1: any sequence)
+    bool gdn_pending(llama_seq_id seq_id) const;
+    // replays the kept tokens of seq_id (-1: of every sequence) into S, then replay_n = 0; get_backend: the backend
+    //   that computes on a buffer type. Returns false on a failure (the state is then unchanged)
+    bool gdn_commit(llama_seq_id seq_id, const std::function<ggml_backend_t(ggml_backend_buffer_type_t)> & get_backend);
+
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    std::vector<ggml_tensor *> st_l; // the replay stash, F32 [row, gdn_w, 2*n_seq_max] (gdn_replay)
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
 
@@ -134,7 +155,8 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+            const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_s) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -180,6 +202,12 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
+
+    // [TAG_GDN_REPLAY] the commit by replay (llama_memory_recurrent::gdn_replay)
+    bool          get_gdn_replay() const;
+    ggml_tensor * get_st_l(int32_t il) const;
+    int32_t       s_copy_s(int i) const;           // the S row of a cell: no rollback planes
+    void          set_gdn_ctl(int32_t * ctl) const; // I32 [4, n_seqs] of the current ubatch
 
     int32_t s_copy(int i) const;
 

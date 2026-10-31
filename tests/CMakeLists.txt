@@ -149,6 +149,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-gdn-replay.cpp) # [TAG_GDN_REPLAY] "ops": replay vs planes per backend (memcmp); with -m: LLAMA_GDN_REPLAY 0 vs 1 at the llama level (not a ctest)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)

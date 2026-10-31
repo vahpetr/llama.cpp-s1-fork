@@ -543,7 +543,51 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     // [TAG_RECURRENT_ROLLBACK_SPLITS]
     // the snapshot path is selected by the context (n_rs_seq > 0), never by the active depth: a context must use
     //   the same GDN implementation for every decode - only the number of planes it writes varies with the depth
-    const bool keep = cparams.n_rs_seq > 0;
+    // [TAG_GDN_REPLAY] so is the commit by replay (the memory's gdn_replay): every graph of the context takes it
+    const bool replay = inp->gdn_ctl != nullptr;
+    const bool keep   = cparams.n_rs_seq > 0 && !replay;
+
+    if (replay) {
+        // one state per cell (no planes): the op replays the sequence's kept tokens, computes the window, writes the
+        //   state after its first n_seq_tokens - n_defer tokens and keeps the inputs of the rest (ggml.h)
+        const int64_t D        = S_v * S_v * H_v;
+        const size_t  row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+
+        ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, 1,
+            ssm_states_all->nb[1], (size_t) n_seqs * ssm_states_all->nb[1], (size_t) kv_head * row_size);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, dst);
+        ggml_gated_delta_net_set_replay(gdn_out, mctx_cur->get_st_l(il), inp->gdn_ctl);
+
+        static const bool no_direct = getenv("LLAMA_GDN_NO_DIRECT") != nullptr;
+        const bool direct = !no_direct && cache_device_supports(ssm_states_all, gdn_out);
+        if (!direct) {
+            // the state in the op's own output, then one copy into the cache row
+            gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, 1);
+            ggml_gated_delta_net_set_replay(gdn_out, mctx_cur->get_st_l(il), inp->gdn_ctl);
+        }
+
+        res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        if (direct) {
+            ggml_build_forward_expand(gf, gdn_out);
+        } else {
+            ggml_tensor * src = ggml_view_2d(ctx0, gdn_out, D, n_seqs, ggml_row_size(gdn_out->type, D),
+                ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens * n_seqs));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, ggml_view_2d(ctx0, ssm_states_all, D, n_seqs,
+                ssm_states_all->nb[1], (size_t) kv_head * row_size)));
+        }
+
+        return output;
+    }
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
