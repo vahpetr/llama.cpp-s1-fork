@@ -569,6 +569,37 @@ bool llama_memory_recurrent::gdn_commit(llama_seq_id seq_id, bool in_place, cons
     const int64_t H_v = hparams.ssm_dt_rank;
     const int64_t H_k = hparams.ssm_n_group;
 
+    // admission (v70.1 item 3): the snapshots of this commit (one S row per layer and committed sequence, 108 MiB per
+    //   sequence for Flash-Next) must fit the free device memory of each buffer type with a margin
+    //   (LLAMA_GDN_SNAPSHOT_MARGIN_MIB, default 512); otherwise the commit goes in place - no new memory, the same
+    //   bytes written, but the kept tokens can no longer be rolled back (seq_rm refuses -> the caller's checkpoint path)
+    if (!in_place) {
+        size_t n_seqs = 0;
+        for (llama_seq_id seq = 0; seq < (llama_seq_id) replay_n.size(); ++seq) {
+            n_seqs += replay_n[seq] > 0 && (seq_id < 0 || seq == seq_id);
+        }
+        std::map<ggml_backend_dev_t, size_t> need;
+        for (auto * sl : s_l) {
+            if (sl != nullptr) {
+                need[ggml_backend_buft_get_device(ggml_backend_buffer_get_type(sl->buffer))] += n_seqs * sl->nb[1];
+            }
+        }
+        const size_t margin = (size_t) (getenv("LLAMA_GDN_SNAPSHOT_MARGIN_MIB") ?
+            std::max(0LL, atoll(getenv("LLAMA_GDN_SNAPSHOT_MARGIN_MIB"))) : 512LL) << 20;
+        for (const auto & [dev, bytes] : need) {
+            size_t free = 0, total = 0;
+            if (dev != nullptr) {
+                ggml_backend_dev_memory(dev, &free, &total);
+            }
+            if (dev != nullptr && free > 0 && bytes + margin > free) {
+                LLAMA_LOG_WARN("%s: gdn replay: a %.1f MiB snapshot does not fit %s (free %.1f MiB, margin %.0f MiB): committing in "
+                        "place (the kept tokens can no longer be rolled back)\n", __func__, bytes / 1048576.0,
+                        ggml_backend_dev_name(dev), free / 1048576.0, margin / 1048576.0);
+                in_place = true;
+            }
+        }
+    }
+
     for (llama_seq_id seq = 0; seq < (llama_seq_id) replay_n.size(); ++seq) {
         if (replay_n[seq] == 0 || (seq_id >= 0 && seq != seq_id)) {
             continue;
