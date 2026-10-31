@@ -1096,6 +1096,7 @@ llama_context::llama_context(
         // [TAG_GDN_REPLAY] seq_cp commits its source in place through the context
         if (auto * recr = llama_gdn_recr(memory.get())) {
             recr->gdn_commit_hook = [this](llama_seq_id seq) { gdn_commit(seq, true); };
+            recr->gdn_sync_hook   = [this]() { synchronize(); };
         }
 
         // [TAG_KV_GRAPH_SPAN]
