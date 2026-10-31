@@ -2406,7 +2406,7 @@ def test_disk_incr_kshift_marks_every_row():
     planned = st["incr_verify_planned"]
     assert planned > 0 and st["incr_verify_mismatch"] == 0, st
     # slot 1 (its own stream, 16384 cells): a prompt close to the slot context, then generation past it -> context shift
-    n_ctx_slot = server.make_request("GET", "/slots").body[1]["n_ctx"]
+    n_ctx_slot = server.make_request("GET", "/props").body["default_generation_settings"]["n_ctx"]
     text = "Archive C. " + dc_text(44, 100)
     while len(server.make_request("POST", "/tokenize", data={"content": text}).body["tokens"]) < n_ctx_slot - 200:
         text += " " + dc_text(len(text), 400)
