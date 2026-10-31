@@ -3,6 +3,7 @@
 //   test-gdn-replay ops            - op level, on every backend: the replayed states and the window outputs against
 //                                    the snapshot planes path of the same backend, byte for byte (memcmp); CPU vs the
 //                                    other backends as NMSE
+//   test-gdn-replay perf           - us per verification-shaped op on the GPU backends: K = 1, planes, replay
 //   test-gdn-replay <common args>  - llama level with a real qwen4exp model (-m ...): two contexts, LLAMA_GDN_REPLAY=0
 //                                    and =1, decode windows with a rollback depth -> seq_rm r -> decode ...; logits and
 //                                    llama_state_seq_get_data bytes identical at every step, seq_cp, save -> load round
@@ -278,6 +279,74 @@ static int run_ops() {
     return (n_fail == 0 && worst_nmse <= 1e-6) ? 0 : 1;
 }
 
+// perf: one verification-shaped op per backend, us per op (median of 5 x 100): K = 1, the planes path K = n (direct
+//   store into n planes), and the replay (n_prefix p, the window, n_defer n - 1)
+static int run_perf() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+        if (!be) {
+            continue;
+        }
+        for (int64_t ns : { 1, 5 }) {
+            for (int64_t n : { 1, 5 }) {
+                const int64_t p = n == 1 ? 0 : 3;
+                op_graph og;
+                ggml_init_params ip = { 256 * ggml_tensor_overhead() + 4 * ggml_graph_overhead(), nullptr, true };
+                og.ctx = ggml_init(ip);
+                ggml_context * ctx = og.ctx;
+                ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, HK, n, ns);
+                ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, HK, n, ns);
+                ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, HV, n, ns);
+                ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, HV, n, ns);
+                ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, HV, n, ns);
+                ggml_tensor * st = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, HV, ns);
+                ggml_tensor * planes = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S * S * HV, ns, n);
+                ggml_tensor * S1 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S * S * HV, ns, 1);
+                ggml_tensor * stash = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ROW, W, 2 * ns);
+                ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, ns);
+                // 36 nodes per graph (the layers of a step): us per op = graph time / 36
+                constexpr int NL = 36;
+                ggml_cgraph * gfs[3];
+                for (int o = 0; o < 3; ++o) {
+                    gfs[o] = ggml_new_graph(ctx);
+                    for (int l = 0; l < NL; ++l) {
+                        ggml_tensor * op = ggml_gated_delta_net_ext(ctx, q, k, v, g, b, st, o == 1 ? planes : S1);
+                        if (o == 2) {
+                            ggml_gated_delta_net_set_replay(op, stash, c);
+                        }
+                        ggml_build_forward_expand(gfs[o], op);
+                    }
+                }
+                og.buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+                ggml_backend_buffer_clear(og.buf, 0);
+                std::vector<int32_t> cv(4 * ns);
+                for (int64_t s = 0; s < ns; ++s) { cv[4*s] = (int32_t) p; cv[4*s+1] = 0; cv[4*s+2] = (int32_t) (n - 1); cv[4*s+3] = (int32_t) s; }
+                ggml_backend_tensor_set(c, cv.data(), 0, cv.size() * sizeof(int32_t));
+                double us[3];
+                for (int o = 0; o < 3; ++o) {
+                    std::vector<double> t;
+                    ggml_backend_graph_compute(be, gfs[o]);
+                    for (int rep = 0; rep < 5; ++rep) {
+                        const int64_t t0 = ggml_time_us();
+                        for (int r = 0; r < 20; ++r) { ggml_backend_graph_compute(be, gfs[o]); }
+                        t.push_back((ggml_time_us() - t0) / (20.0 * NL));
+                    }
+                    std::sort(t.begin(), t.end());
+                    us[o] = t[2];
+                }
+                printf("perf %s ns=%lld n=%lld: K=1 %.1f us, planes K=%lld %.1f us, replay p=%lld d=%lld %.1f us (median us per op, 36 ops per graph)\n",
+                        ggml_backend_name(be), (long long) ns, (long long) n, us[0], (long long) n, us[1], (long long) p, (long long) (n - 1), us[2]);
+            }
+        }
+        ggml_backend_free(be);
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // llama level
 // ---------------------------------------------------------------------------------------------------------------------
@@ -478,6 +547,10 @@ static int run_model(const common_params & params, llama_model * model) {
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
+    if (argc >= 2 && strcmp(argv[1], "perf") == 0) {
+        ggml_backend_load_all();
+        return run_perf();
+    }
     if (argc >= 2 && strcmp(argv[1], "ops") == 0) {
         ggml_backend_load_all();
         const int rc = run_ops();
