@@ -138,6 +138,8 @@ public:
     void gdn_release();
     // set by llama_context: an in-place commit of one sequence (seq_cp commits its source first)
     std::function<void(llama_seq_id)> gdn_commit_hook;
+    // set by llama_context: waits for the running graphs (seq_cp reads the R / P planes of a pending rollback)
+    std::function<void()> gdn_sync_hook;
     // snapshot of a cell's committed S per layer (gdn_commit without in_place), and the buffers that hold them
     std::map<uint32_t, std::vector<ggml_tensor *>> gdn_snap;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> gdn_snap_bufs;

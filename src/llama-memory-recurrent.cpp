@@ -328,6 +328,32 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             gdn_commit_hook(seq_id_src);
             GGML_ASSERT(replay_n[seq_id_src] == 0);
         }
+        // [TAG_GDN_REPLAY] ... and its pending rollback of R / P is materialised: the plane rs_idx rows are copied to plane 0
+        //   and rs_idx reset, so the shared cell holds S, R and P of the same (rolled-back) position - the destination
+        //   (rs_idx 0) reads plane 0 like the source then
+        if (gdn_replay && rs_idx[seq_id_src] != 0 && cells[seq_id_src].tail >= 0) {
+            if (gdn_sync_hook) {
+                gdn_sync_hook(); // the decode that wrote the planes may still be running
+            }
+            const int32_t  t    = cells[seq_id_src].tail;
+            const uint32_t c    = cells[t].src >= 0 ? (uint32_t) cells[t].src : (uint32_t) t;
+            const uint32_t from = rs_idx[seq_id_src] * size + c;
+            std::vector<uint8_t> buf;
+            auto copy_row = [&](ggml_tensor * x) {
+                if (x == nullptr) {
+                    return;
+                }
+                buf.resize(x->nb[1]);
+                ggml_backend_tensor_get(x, buf.data(), (size_t) from * x->nb[1], x->nb[1]);
+                ggml_backend_tensor_set(x, buf.data(), (size_t) c * x->nb[1], x->nb[1]);
+            };
+            for (size_t il = 0; il < r_l.size(); ++il) {
+                copy_row(r_l[il]);
+                copy_row(p_l[il]);
+            }
+            set_rs_idx(seq_id_src, 0);
+            set_rs_valid_depth(seq_id_src, 0);
+        }
         if (gdn_replay) {
             replay_n[seq_id_dst] = 0;
         }
