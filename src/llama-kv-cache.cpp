@@ -994,6 +994,13 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
             res->set_inputs(nullptr);
 
+            // [TAG_DISK_INCR] (sc3fix 1) the graph ropes the K rows of EVERY cell of every stream, the unshifted ones too
+            //   (a zero shift is not the identity: YaRN magnitude, a quantized K round trip): all rows change now -
+            //   marked before the compute, so a failed / partial compute is covered too
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                v_cells[s].mod_mark_all();
+            }
+
             if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
                 return updated;
