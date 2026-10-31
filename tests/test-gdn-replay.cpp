@@ -690,6 +690,22 @@ static int run_model(const common_params & params, llama_model * model) {
         // seq_cp of a sequence with deferred tokens (astra's reproducer: defer A 4 rows -> cp A -> B -> roll A back 1 ->
         //   save B): ON commits A first, so B and A read the same committed row and A's rollback is refused (OFF
         //   accepts it and moves the shared cell's position - a planes-path quirk, not compared). Then seq_keep(A)
+        // snapshot admission (v70.1 item 3): an unfittable margin makes the save commit in place - same bytes, no new
+        //   memory, and the kept tokens are no longer rolled back on ON (OFF still can; positions re-synced below)
+        {
+            const llama_seq_id A = 0;
+            std::vector<llama_seq_id> one = { A };
+            std::vector<llama_pos> pa = pos;
+            expect(decode_window(off, one, pa, 4, 3, n_vocab, 180, lo) && decode_window(on, one, pa, 4, 3, n_vocab, 180, ln) && lo == ln,
+                   "admission: window", 180);
+            setenv("LLAMA_GDN_SNAPSHOT_MARGIN_MIB", "100000000", 1);
+            const auto a_off = seq_state(off, A), a_on = seq_state(on, A);
+            unsetenv("LLAMA_GDN_SNAPSHOT_MARGIN_MIB");
+            expect(!a_off.empty() && a_on == a_off, "admission: in-place commit bytes == OFF", 180);
+            expect(!llama_memory_seq_rm(llama_get_memory(on), A, pos[A] + 3, -1), "admission: ON refuses the rollback after an in-place commit", 180);
+            pos[A] += 4; // no rollback in either context
+        }
+
         // rollback -> seq_cp (v70.1 item 2): A defers 4 tokens and rolls 2 back (R / P rollback pending), then A -> B. ON
         //   materialises S, R and P of the rolled-back position before sharing: B == A on ON, A == A on OFF (the planes
         //   path gives B its plane 0 = the pre-rollback state - not compared). B is then dropped in both
