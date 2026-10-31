@@ -988,6 +988,9 @@ struct vk_device_struct {
     // over the blocks (topk_qsa_v3.comp: a block = one key weighted by its cells visible to the row), same gates, same
     // fallback list and backoff as onepass; its own counters line (stats words 40..47)
     bool     qsa_topk_v3 = false;
+    // GGML_VK_QSA_TOPK_V3_MIN_ROWS (default 16): v3 only for selections of >= this many rows, onepass below (decode 1 row,
+    // verify 2 rows: v3's per-selection summary costs more than it saves there). Path only: both give v2's ids and order.
+    uint32_t qsa_topk_v3_min_rows = 16;
     uint64_t qsa_topk_v3_next_log = 1024;
     uint64_t qsa_topk_v3_logged   = 0;
     // backoff (GGML_VK_QSA_TOPK_ONEPASS_BACKOFF, default on): a window of >= 512 selected rows of which more than half fell
@@ -9394,6 +9397,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
             // default ON on gfx1151 (like onepass, 0275), OFF elsewhere; an explicit 0/1 always wins
             const bool   v3_req     = ggml_vk_env_bool("GGML_VK_QSA_TOPK_V3", op_gfx1151);
             device->qsa_topk_v3     = v3_req && device->qsa_topk_onepass && device->qsa_topk_nokeys;
+            device->qsa_topk_v3_min_rows = env_u32("GGML_VK_QSA_TOPK_V3_MIN_ROWS", 16);
 #if defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 1
             const char * v3_mut = " MUTANT BUILD M-B1: a block with p0 == min pos counted FULL";
 #elif defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 2
@@ -9404,13 +9408,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
             const char * v3_mut = "";
 #endif
             GGML_LOG_WARN("ggml_vulkan: %s qsa_topk: v3 %s (%s%s; block-weighted onepass of the nokeys cell form, <= %u cells per "
-                          "block, onepass's gates / fallback / backoff)%s\n",
+                          "block, from %u rows (GGML_VK_QSA_TOPK_V3_MIN_ROWS; fewer: onepass), onepass's gates / fallback / backoff)%s\n",
                           device->name.c_str(), device->qsa_topk_v3 ? "on" : "off",
                           v3_env_set ? (v3_req ? "GGML_VK_QSA_TOPK_V3=1" : "GGML_VK_QSA_TOPK_V3=0")
                                      : (op_gfx1151 ? "default on gfx1151; GGML_VK_QSA_TOPK_V3 unset"
                                                    : "default off: not gfx1151; GGML_VK_QSA_TOPK_V3 unset"),
                           !v3_req ? "" : !device->qsa_topk_onepass ? "; needs onepass" : !device->qsa_topk_nokeys ? "; needs nokeys" : "",
-                          VK_QSA_TOPK_V3_MAXC, v3_mut);
+                          VK_QSA_TOPK_V3_MAXC, std::max<uint32_t>(device->qsa_topk_v3_min_rows, 1u), v3_mut);
         }
 
         // [TAG_QSA_SCORE_KREUSE] read before the pipelines are declared (=0: the kr twins are never created).
@@ -18091,8 +18095,9 @@ static bool ggml_vk_qsa_topk_onepass_plan(uint32_t n_kv, uint32_t width, uint32_
 
 // [TAG_QSA_TOPK_V3] whether an onepass selection (the caller has checked ggml_vk_qsa_topk_onepass) takes the block-weighted
 // kernel: the knob, the nokeys form, block ids that fit the candidate word (29 bits)
-static bool ggml_vk_qsa_topk_v3(const vk_device & device, bool nokeys, int64_t n_blocks, int64_t n_stream) {
-    return device->qsa_topk_v3 && nokeys && n_blocks > 0 && n_blocks * n_stream < ((int64_t) 1 << 29);
+static bool ggml_vk_qsa_topk_v3(const vk_device & device, bool nokeys, int64_t n_blocks, int64_t n_stream, size_t nrows) {
+    return device->qsa_topk_v3 && nokeys && n_blocks > 0 && n_blocks * n_stream < ((int64_t) 1 << 29) &&
+           nrows >= std::max<uint32_t>(device->qsa_topk_v3_min_rows, 1u);
 }
 
 // [TAG_QSA_TOPK_V3] the v3 region after onepass's: wsum[rows] | flag[4] | ragg[n_stream][4] | bcnt[nb] | list[nb][MAXC] |
@@ -18134,7 +18139,7 @@ static size_t ggml_vk_qsa_scratch_bytes(const vk_device & device, int64_t n_kv, 
             bytes += ggml_vk_qsa_topk_onepass_uints(nrows) * sizeof(uint32_t);
             // [TAG_QSA_TOPK_V3] + the v3 region
             const int64_t nb = n_blocks > 0 ? n_blocks : n_kv;
-            if (ggml_vk_qsa_topk_v3(device, nokeys, nb, n_stream)) {
+            if (ggml_vk_qsa_topk_v3(device, nokeys, nb, n_stream, nrows)) {
                 bytes += ggml_vk_qsa_topk_v3_uints(nrows, (size_t) nb, (size_t) n_stream) * sizeof(uint32_t);
             }
         }
@@ -18292,7 +18297,7 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
                                    ggml_vk_qsa_topk_onepass_plan(n_kv, width, op_sample, op_j, op_stride);
         // [TAG_QSA_TOPK_V3] the block-weighted kernel where its gate and its sample plan admit this onepass selection
         uint32_t v3_sample = 0, v3_j = 0, v3_stride = 0;
-        const bool     v3        = onepass && ggml_vk_qsa_topk_v3(ctx->device, nokeys, n_blocks, n_stream) &&
+        const bool     v3        = onepass && ggml_vk_qsa_topk_v3(ctx->device, nokeys, n_blocks, n_stream, nrows) &&
                                    ggml_vk_qsa_topk_v3_plan(n_kv, n_blocks, width, v3_sample, v3_j, v3_stride);
         const uint64_t v3_off    = end_off + (onepass ? (uint64_t) ggml_vk_qsa_topk_onepass_uints(nrows) : 0);
         const uint64_t op_end    = v3_off + (v3 ? (uint64_t) ggml_vk_qsa_topk_v3_uints(nrows, n_blocks, n_stream) : 0);
@@ -21347,13 +21352,13 @@ static void ggml_vk_qsa_topk_onepass_stats(ggml_backend_vk_context * ctx, bool f
         const uint64_t done = v3_rows - u - o - g;
         char line[512];
         const int n = snprintf(line, sizeof(line), "ggml_vulkan: qsa_topk v3: rows %llu, fallback %llu (%.4f %%: under %llu, over %llu, "
-                               "summary %llu), blocks/row %.1f, mixed/row %.2f (check/row %.2f), max c %llu, backoffs %llu%s\n",
+                               "summary %llu), blocks/row %.1f, mixed/row %.2f (check/row %.2f), max c %llu, backoffs %llu; onepass rows %llu%s\n",
                                (unsigned long long) v3_rows, (unsigned long long) (u + o + g), 100.0 * (double) (u + o + g) / (double) v3_rows,
                                (unsigned long long) u, (unsigned long long) o, (unsigned long long) g,
                                done ? (double) device->qsa_topk_op_tot[44] / (double) done : 0.0,
                                (double) device->qsa_topk_op_tot[46] / (double) v3_rows, (double) device->qsa_topk_op_tot[45] / (double) v3_rows,
                                (unsigned long long) device->qsa_topk_op_tot[47], (unsigned long long) device->qsa_topk_op_backoffs,
-                               final ? " (final)" : "");
+                               (unsigned long long) device->qsa_topk_op_tot[0], final ? " (final)" : "");
         ggml_vk_qsa_topk_onepass_emit(line, n, sizeof(line));
         device->qsa_topk_v3_logged = v3_rows;
         while (device->qsa_topk_v3_next_log <= v3_rows) {
