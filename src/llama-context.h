@@ -283,8 +283,9 @@ private:
 
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
-    // [TAG_GDN_REPLAY] commits the deferred gated delta net states of seq_id (-1: all) before a state is written
-    void gdn_commit(llama_seq_id seq_id);
+    // [TAG_GDN_REPLAY] commits the deferred gated delta net states of seq_id (-1: all): before a state is written into
+    //   snapshots (the live state stays deferred), in place for seq_cp and before a decode without a rollback depth
+    void gdn_commit(llama_seq_id seq_id, bool in_place = false);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
     //

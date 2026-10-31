@@ -128,9 +128,19 @@ public:
 
     // any deferred state to commit for seq_id (-1: any sequence)
     bool gdn_pending(llama_seq_id seq_id) const;
-    // replays the kept tokens of seq_id (-1: of every sequence) into S, then replay_n = 0; get_backend: the backend
-    //   that computes on a buffer type. Returns false on a failure (the state is then unchanged)
-    bool gdn_commit(llama_seq_id seq_id, const std::function<ggml_backend_t(ggml_backend_buffer_type_t)> & get_backend);
+    // replays the kept tokens of seq_id (-1: of every sequence). in_place: into the cell's S row, then replay_n = 0
+    //   (no rollback into those tokens afterwards). Otherwise into a snapshot row that state_write writes instead of
+    //   the cell's row (gdn_snap): the live state stays deferred and a later seq_rm can still drop kept tokens.
+    //   get_backend: the backend that computes on a buffer type. Returns false on a failure
+    bool gdn_commit(llama_seq_id seq_id, bool in_place, const std::function<ggml_backend_t(ggml_backend_buffer_type_t)> & get_backend);
+    // drops the snapshots (the next commit / decode; they live until then because an ON_DEVICE writer copies them
+    //   when it is destroyed, after state_write)
+    void gdn_release();
+    // set by llama_context: an in-place commit of one sequence (seq_cp commits its source first)
+    std::function<void(llama_seq_id)> gdn_commit_hook;
+    // snapshot of a cell's committed S per layer (gdn_commit without in_place), and the buffers that hold them
+    std::map<uint32_t, std::vector<ggml_tensor *>> gdn_snap;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> gdn_snap_bufs;
 
     // per layer
     std::vector<ggml_tensor *> r_l;

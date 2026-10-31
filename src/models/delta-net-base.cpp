@@ -543,7 +543,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     // [TAG_RECURRENT_ROLLBACK_SPLITS]
     // the snapshot path is selected by the context (n_rs_seq > 0), never by the active depth: a context must use
     //   the same GDN implementation for every decode - only the number of planes it writes varies with the depth
-    // [TAG_GDN_REPLAY] so is the commit by replay (the memory's gdn_replay): every graph of the context takes it
+    // [TAG_GDN_REPLAY] with the commit by replay (the memory's gdn_replay) the graphs with a rollback depth take the replay
+    //   op (gdn_ctl); the others the planes path with K = 1 into the cell row (llama_context commits before them)
     const bool replay = inp->gdn_ctl != nullptr;
     const bool keep   = cparams.n_rs_seq > 0 && !replay;
 

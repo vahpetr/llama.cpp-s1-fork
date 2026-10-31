@@ -3685,9 +3685,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         ggml_set_name(inp->s_copy_s, "rs_s_copy_s");
         inp->s_copy_s_main  = ggml_view_1d(ctx0, inp->s_copy_s, n_seqs, 0);
         inp->s_copy_s_extra = ggml_view_1d(ctx0, inp->s_copy_s, n_rs - n_seqs, n_seqs * inp->s_copy_s->nb[0]);
-        inp->gdn_ctl = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 4, n_seqs);
-        ggml_set_input(inp->gdn_ctl);
-        ggml_set_name(inp->gdn_ctl, "gdn_ctl");
+        // the replay op only in graphs with a rollback depth (verifications); the others run the planes path, K = 1
+        if (ubatch.rs_rollback_depth > 0) {
+            inp->gdn_ctl = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 4, n_seqs);
+            ggml_set_input(inp->gdn_ctl);
+            ggml_set_name(inp->gdn_ctl, "gdn_ctl");
+        }
     }
 
     inp->head = mctx_cur->get_head();

@@ -243,7 +243,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 //   hold snapshots of an older one), so refuse instead of restoring a stale state - the caller
                 //   then falls back to its checkpoint/replay path
                 // [TAG_GDN_REPLAY] the deferred S state can only drop the tokens it still keeps as inputs
-                const bool replay_ok = !gdn_replay || rollback <= (llama_pos) replay_n[seq_id];
+                const bool replay_ok = !gdn_replay || (rollback <= (llama_pos) replay_n[seq_id] && cell.seq_id.size() == 1);
                 if (!pending && replay_ok && rollback >= 1 && rollback <= (llama_pos) rs_valid_depth[seq_id]) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     if (gdn_replay) {
@@ -320,23 +320,16 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         set_rs_idx(seq_id_dst, 0);
         set_rs_valid_depth(seq_id_dst, 0);
 
-        // [TAG_GDN_REPLAY] the destination shares the source's cell, so it takes the source's deferred tokens too
-        //   (its own stash slot: a later decode of either sequence moves it to a cell of its own)
+        // [TAG_GDN_REPLAY] the destination shares the source's cell: the source is committed first (in place), so a
+        //   shared cell never holds deferred tokens (a later rollback of either sequence is refused, as a deferred
+        //   state of one sequence must not be replayed into a row another one reads)
+        if (gdn_replay && replay_n[seq_id_src] > 0) {
+            GGML_ASSERT(gdn_commit_hook && "gdn replay: seq_cp of a deferred state needs the context's commit");
+            gdn_commit_hook(seq_id_src);
+            GGML_ASSERT(replay_n[seq_id_src] == 0);
+        }
         if (gdn_replay) {
-            replay_n[seq_id_dst]    = replay_n[seq_id_src];
-            replay_half[seq_id_dst] = replay_half[seq_id_src];
-            if (replay_n[seq_id_src] > 0) {
-                std::vector<uint8_t> buf;
-                for (auto * st : st_l) {
-                    if (st == nullptr) {
-                        continue;
-                    }
-                    const size_t slot_bytes = st->nb[2] * 2;
-                    buf.resize(slot_bytes);
-                    ggml_backend_tensor_get(st, buf.data(), (size_t) seq_id_src * slot_bytes, slot_bytes);
-                    ggml_backend_tensor_set(st, buf.data(), (size_t) seq_id_dst * slot_bytes, slot_bytes);
-                }
-            }
+            replay_n[seq_id_dst] = 0;
         }
 
         auto & tail_src = cells[seq_id_src];
@@ -532,10 +525,16 @@ bool llama_memory_recurrent::gdn_pending(llama_seq_id seq_id) const {
     return false;
 }
 
+void llama_memory_recurrent::gdn_release() {
+    gdn_snap.clear();
+    gdn_snap_bufs.clear();
+}
+
 // [TAG_GDN_REPLAY] a graph of its own, on the backend of each layer's buffer: per layer one gated delta net op in commit
-//   mode (n_defer < 0) that replays the kept rows on the cell's S row in place - the same pipeline and arithmetic as
-//   the replay at the start of the next decode graph would have run
-bool llama_memory_recurrent::gdn_commit(llama_seq_id seq_id, const std::function<ggml_backend_t(ggml_backend_buffer_type_t)> & get_backend) {
+//   mode (n_defer < 0) that replays the kept rows on the cell's S row - the same pipeline and arithmetic as the replay
+//   at the start of the next decode graph would have run - into the row itself (in_place) or into a snapshot row
+bool llama_memory_recurrent::gdn_commit(llama_seq_id seq_id, bool in_place, const std::function<ggml_backend_t(ggml_backend_buffer_type_t)> & get_backend) {
+    gdn_release();
     if (!gdn_replay) {
         return true;
     }
@@ -553,6 +552,8 @@ bool llama_memory_recurrent::gdn_commit(llama_seq_id seq_id, const std::function
             replay_n[seq] = 0;
             continue;
         }
+        // seq_cp commits its source and a decode moves a sequence to a cell of its own: deferred = unshared
+        GGML_ASSERT(cells[tail].seq_id.size() == 1 && "gdn replay: deferred tokens in a shared cell");
         const uint32_t row = cells[tail].src >= 0 ? (uint32_t) cells[tail].src : (uint32_t) tail;
 
         // one graph per buffer type (the layers of one device)
@@ -562,10 +563,12 @@ bool llama_memory_recurrent::gdn_commit(llama_seq_id seq_id, const std::function
                 groups[ggml_backend_buffer_get_type(s_l[il]->buffer)].push_back(il);
             }
         }
+        std::vector<ggml_tensor *> snap(s_l.size(), nullptr);
         for (const auto & [buft, layers] : groups) {
             ggml_backend_t backend = get_backend(buft);
             if (backend == nullptr) {
                 LLAMA_LOG_ERROR("%s: no backend for %s\n", __func__, ggml_backend_buft_name(buft));
+                gdn_release();
                 return false;
             }
             const size_t n_tensors = 16 * layers.size() + 4;
@@ -587,7 +590,12 @@ bool llama_memory_recurrent::gdn_commit(llama_seq_id seq_id, const std::function
                 ggml_tensor * sl = s_l[il];
                 ggml_tensor * state = ggml_view_4d(ctx.get(), sl, S_v, S_v, H_v, 1,
                         S_v * ggml_element_size(sl), S_v * S_v * ggml_element_size(sl), sl->nb[1], (size_t) row * sl->nb[1]);
-                ggml_tensor * dst = ggml_view_3d(ctx.get(), sl, sl->ne[0], 1, 1, sl->nb[1], sl->nb[1], (size_t) row * sl->nb[1]);
+                ggml_tensor * dst = in_place ?
+                    ggml_view_3d(ctx.get(), sl, sl->ne[0], 1, 1, sl->nb[1], sl->nb[1], (size_t) row * sl->nb[1]) :
+                    ggml_new_tensor_3d(ctx.get(), sl->type, sl->ne[0], 1, 1);
+                if (!in_place) {
+                    snap[il] = dst;
+                }
                 ggml_tensor * gdn = ggml_gated_delta_net_ext(ctx.get(), q, k, v, g, b, state, dst);
                 ggml_gated_delta_net_set_replay(gdn, st_l[il], ctl);
                 ggml_build_forward_expand(gf, gdn);
@@ -595,6 +603,7 @@ bool llama_memory_recurrent::gdn_commit(llama_seq_id seq_id, const std::function
             ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
             if (!buf) {
                 LLAMA_LOG_ERROR("%s: failed to allocate the commit graph\n", __func__);
+                gdn_release();
                 return false;
             }
             ggml_backend_buffer_clear(buf.get(), 0);
@@ -602,17 +611,19 @@ bool llama_memory_recurrent::gdn_commit(llama_seq_id seq_id, const std::function
             ggml_backend_tensor_set(ctl, c, 0, sizeof(c));
             if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR("%s: failed to compute the commit graph\n", __func__);
+                gdn_release();
                 return false;
+            }
+            if (!in_place) {
+                gdn_snap_bufs.emplace_back(std::move(ctx), std::move(buf));
             }
         }
 
-        // every sequence of the cell had the same kept tokens (seq_cp copies them): all committed now
-        for (llama_seq_id other : cells[tail].seq_id) {
-            if ((uint32_t) other < replay_n.size()) {
-                replay_n[other] = 0;
-            }
+        if (in_place) {
+            replay_n[seq] = 0;
+        } else {
+            gdn_snap[row] = std::move(snap);
         }
-        replay_n[seq] = 0;
     }
 
     return true;
@@ -965,9 +976,15 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_s;    // [TAG_GDN_REPLAY] S rows: no rollback planes
     uint32_t cell_count = 0;
 
-    // [TAG_GDN_REPLAY] a deferred S state is not a state yet: llama_context commits it first (gdn_commit)
+    // [TAG_GDN_REPLAY] a deferred S state is not a state yet: llama_context commits it first (gdn_commit), into a
+    //   snapshot row that is written instead of the cell's
     for (size_t i = 0; i < replay_n.size(); ++i) {
-        GGML_ASSERT((replay_n[i] == 0 || (seq_id != -1 && (llama_seq_id) i != seq_id)) && "gdn replay: state_write before the commit");
+        if (replay_n[i] == 0 || (seq_id != -1 && (llama_seq_id) i != seq_id)) {
+            continue;
+        }
+        const int32_t tail = i < size ? cells[i].tail : -1;
+        const uint32_t row = tail < 0 ? 0 : (cells[tail].src >= 0 ? (uint32_t) cells[tail].src : (uint32_t) tail);
+        GGML_ASSERT(tail >= 0 && gdn_snap.count(row) && "gdn replay: state_write before the commit");
     }
 
     // Count the number of cells with the specified seq_id
@@ -1166,6 +1183,18 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             // Write each logical cell row range. With pending recurrent rollback,
             // the logical current state may live in a rollback snapshot plane ([TAG_GDN_REPLAY] S has none).
             for (const auto & range : cell_ranges_s) {
+                if (!gdn_snap.empty()) {
+                    // [TAG_GDN_REPLAY] a committed snapshot replaces its cell's row
+                    for (uint32_t r = range.first; r < range.second; ++r) {
+                        const auto it = gdn_snap.find(r);
+                        if (it != gdn_snap.end()) {
+                            io.write_tensor(it->second[il], 0, s_size_row);
+                        } else {
+                            io.write_tensor(s_l[il], r * s_size_row, s_size_row);
+                        }
+                    }
+                    continue;
+                }
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * s_size_row;
                 io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
@@ -1559,7 +1588,14 @@ bool llama_memory_recurrent_context::apply() {
     // [TAG_GDN_REPLAY] the graph's control per sequence {n_prefix, read_half, n_defer, slot}: it replays the kept tokens,
     //   then keeps the inputs of the last valid_depth tokens (the rollback the planes would allow) instead of their
     //   states. A token shared by several sequences defers nothing (its cell has no single stash slot)
-    if (mem->gdn_replay) {
+    if (mem->gdn_replay && ubatch.rs_rollback_depth == 0) {
+        // the graph runs the planes path with K = 1 (no replay): llama_context committed its sequences first
+        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+            for (int32_t j = 0; j < ubatch.n_seq_id[s * ubatch.n_seq_tokens]; ++j) {
+                GGML_ASSERT(mem->replay_n[ubatch.seq_id[s * ubatch.n_seq_tokens][j]] == 0 && "gdn replay: depth-0 graph over a deferred state");
+            }
+        }
+    } else if (mem->gdn_replay) {
         mem->gdn_ctl_cur.assign(4 * ubatch.n_seqs, 0);
         for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
             const uint32_t i = s * ubatch.n_seq_tokens;

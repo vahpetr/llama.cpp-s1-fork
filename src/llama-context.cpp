@@ -34,6 +34,17 @@
 #include <stdexcept>
 #include <string>
 
+// [TAG_GDN_REPLAY] the recurrent memory of a context when it commits gated delta net states by replay
+static llama_memory_recurrent * llama_gdn_recr(llama_memory_i * memory) {
+    llama_memory_recurrent * recr = dynamic_cast<llama_memory_recurrent *>(memory);
+    if (recr == nullptr) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory)) {
+            recr = hyb->get_mem_recr();
+        }
+    }
+    return recr != nullptr && recr->gdn_replay ? recr : nullptr;
+}
+
 //
 // llama_context
 //
@@ -1081,6 +1092,11 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // [TAG_GDN_REPLAY] seq_cp commits its source in place through the context
+        if (auto * recr = llama_gdn_recr(memory.get())) {
+            recr->gdn_commit_hook = [this](llama_seq_id seq) { gdn_commit(seq, true); };
+        }
 
         // [TAG_KV_GRAPH_SPAN]
         // shrink the n_kv that init_full() simulates for the worst-case compute-buffer reserve.
@@ -3234,6 +3250,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // [TAG_GDN_REPLAY] the snapshots of the last state write go; a graph without a rollback depth runs the planes path
+    //   (no replay), so its sequences' deferred tokens are committed in place first (a decode ends their rollback anyway)
+    if (auto * recr = llama_gdn_recr(memory.get())) {
+        recr->gdn_release();
+        if (rs_rollback_depth_cur == 0) {
+            std::set<llama_seq_id> seqs;
+            for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+                const int ns = batch_inp.n_seq_id ? batch_inp.n_seq_id[i] : 1;
+                for (int j = 0; j < ns; ++j) {
+                    seqs.insert(batch_inp.seq_id ? batch_inp.seq_id[i][j] : 0);
+                }
+            }
+            for (llama_seq_id seq : seqs) {
+                if (recr->gdn_pending(seq)) {
+                    gdn_commit(seq, true);
+                }
+            }
+        }
+    }
+
     balloc->set_rs_rollback_depth(rs_rollback_depth_cur);
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
@@ -4880,20 +4916,19 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
     return io.n_bytes();
 }
 
-void llama_context::gdn_commit(llama_seq_id seq_id) {
-    llama_memory_recurrent * recr = dynamic_cast<llama_memory_recurrent *>(memory.get());
+void llama_context::gdn_commit(llama_seq_id seq_id, bool in_place) {
+    llama_memory_recurrent * recr = llama_gdn_recr(memory.get());
     if (recr == nullptr) {
-        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
-            recr = hyb->get_mem_recr();
-        }
+        return;
     }
-    if (recr == nullptr || !recr->gdn_pending(seq_id)) {
+    if (!recr->gdn_pending(seq_id)) {
+        recr->gdn_release();
         return;
     }
 
     synchronize(); // the decode that deferred the state may still be running
 
-    const bool ok = recr->gdn_commit(seq_id, [&](ggml_backend_buffer_type_t buft) -> ggml_backend_t {
+    const bool ok = recr->gdn_commit(seq_id, in_place, [&](ggml_backend_buffer_type_t buft) -> ggml_backend_t {
         for (auto & backend : backends) {
             if (ggml_backend_supports_buft(backend.get(), buft)) {
                 return backend.get();
