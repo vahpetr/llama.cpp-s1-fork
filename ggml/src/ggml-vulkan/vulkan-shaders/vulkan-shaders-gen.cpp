@@ -1140,6 +1140,14 @@ void process_shaders() {
         string_to_spv("topk_qsa_onepass_f32", "topk_qsa_onepass.comp", {{"A_TYPE", "float"}, op_negctl});
         string_to_spv("topk_qsa_onepass_vis_f32", "topk_qsa_onepass.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}, op_negctl});
         string_to_spv("topk_qsa_onepass_vis_nk_f32", "topk_qsa_onepass.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}, {"QSA_TOPK_NOKEYS", "1"}, op_negctl});
+        // [TAG_QSA_TOPK_V3] the block-weighted onepass of the nokeys cell form; the same negative control, and the mutant builds
+        // (tests only: -DGGML_VULKAN_QSA_TOPK_V3_MUTANT=1|2|3)
+#if defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT > 0
+        const std::pair<std::string, std::string> v3_mutant = {"V3_MUTANT", std::to_string(GGML_VULKAN_QSA_TOPK_V3_MUTANT)};
+#else
+        const std::pair<std::string, std::string> v3_mutant = {"V3_MUTANT", "0"};
+#endif
+        string_to_spv("topk_qsa_v3_vis_nk_f32", "topk_qsa_v3.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}, {"QSA_TOPK_NOKEYS", "1"}, op_negctl, v3_mutant});
     }
     string_to_spv("topk_radix_select_v2_fb_f32", "topk_radix_select_v2.comp", {{"A_TYPE", "float"}, {"QSA_TOPK_FB", "1"}});
     string_to_spv("topk_radix_select_v2_vis_fb_f32", "topk_radix_select_v2.comp", {{"A_TYPE", "float"}, {"QSA_VIS", "1"}, {"QSA_TOPK_FB", "1"}});
