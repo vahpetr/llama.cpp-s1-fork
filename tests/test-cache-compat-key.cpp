@@ -171,6 +171,10 @@ int main() {
         CHECK(server_cache_env_digest({ "LLAMA_SPEC_OVERLAP=1" }) == d0);
         const std::string dk = server_cache_env_digest({ "LLAMA_KQ_VIS=1" });
         CHECK(server_cache_env_digest({ "LLAMA_KQ_VIS=1", "LLAMA_SPEC_OVERLAP=1" }) == dk);
+        // [TAG_GDN_REPLAY] the GDN commit by replay is EXACT as well
+        CHECK(server_cache_env_classify("LLAMA_GDN_REPLAY") == SERVER_CACHE_ENV_EXACT);
+        CHECK(server_cache_env_digest({ "LLAMA_GDN_REPLAY=1" }) == d0);
+        CHECK(server_cache_env_digest({ "LLAMA_KQ_VIS=1", "LLAMA_GDN_REPLAY=1" }) == dk);
         CHECK(server_cache_env_classify("GGML_VK_F32ACC") == SERVER_CACHE_ENV_SEMANTIC);
         CHECK(server_cache_env_classify("GGML_VK_F32ACC_SCOPE") == SERVER_CACHE_ENV_SEMANTIC);
         CHECK(server_cache_env_digest({ "GGML_VK_F32ACC=1" }) != d0);
