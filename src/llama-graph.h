@@ -288,6 +288,15 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // [TAG_GDN_REPLAY] the commit by replay of the gated delta net states (llama_memory_recurrent::gdn_replay): the S
+    //   rows (no rollback planes) and the replay control, null otherwise
+    ggml_tensor * s_copy_s       = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_s_main  = nullptr; // I32 [n_seqs]
+    ggml_tensor * s_copy_s_extra = nullptr; // I32 [n_rs - n_seqs]
+    ggml_tensor * gdn_ctl        = nullptr; // I32 [4, n_seqs], see ggml_gated_delta_net_set_replay
+
+    void set_input_gdn(const llama_memory_recurrent_context * mctx_cur) const;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
