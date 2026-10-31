@@ -1712,7 +1712,7 @@ std::string server_task_result_metrics::to_metrics() {
         }, {
             "disk_cache_save_wait_seconds_total", "Disk prompt cache: blocking time spent waiting for staging room (--cache-disk-async)", metrics.disk.save_wait_us / 1.e6
         }, {
-            "disk_cache_bytes_copied_total", "Disk prompt cache: state bytes copied off the device by saves", (double) metrics.disk.bytes_copied
+            "disk_cache_bytes_copied_total", "Disk prompt cache: state bytes the saves captured (with --cache-disk-incr including the blocks taken from the slot's last save; see bytes_device_read_total)", (double) metrics.disk.bytes_copied
         }, {
             "disk_cache_saves_async_total", "Disk prompt cache: saves committed through the asynchronous path", (double) metrics.disk.n_saves_async
         }, {
@@ -1725,6 +1725,8 @@ std::string server_task_result_metrics::to_metrics() {
             "disk_cache_incr_blocks_reused_total", "Disk prompt cache: 4 MiB KV blocks an incremental save took from the slot's last save instead of the device (--cache-disk-incr)", (double) metrics.disk.incr_blocks_reused
         }, {
             "disk_cache_incr_bytes_skipped_total", "Disk prompt cache: state bytes an incremental save did not copy off the device (--cache-disk-incr)", (double) metrics.disk.incr_bytes_skipped
+        }, {
+            "disk_cache_bytes_device_read_total", "Disk prompt cache: state bytes saves actually read off the device (bytes_copied_total minus incr_bytes_skipped_total)", (double) metrics.disk.bytes_device_read
         },
     };
 

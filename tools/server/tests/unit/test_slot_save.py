@@ -2317,6 +2317,11 @@ def test_disk_incr_save_identical_to_full():
     assert i[2]["incr_blocks_reused"] > 0, "nothing was reused"
     assert i[2]["incr_bytes_skipped"] == i[2]["incr_blocks_reused"] * 4 * 1024 * 1024
     assert abs(i[3]["disk_cache_incr_bytes_skipped_total"] - i[2]["incr_bytes_skipped"]) < 1e4  # /metrics prints %g
+    for arm in ("full", "incr", "verify"):  # (sc3fix 5) device read = captured - reused; every claim released
+        x = res[arm]
+        assert x[2]["bytes_device_read"] == x[2]["bytes_copied"] - x[2]["incr_bytes_skipped"], arm
+        assert x[2]["async_claims"] == 0, arm
+    assert i[2]["bytes_device_read"] < f[2]["bytes_device_read"] == f[2]["bytes_copied"] == i[2]["bytes_copied"]
     assert v[2]["incr_blocks_reused"] == 0  # verify copies everything
     assert v[2]["incr_verify_planned"] == i[2]["incr_blocks_reused"]  # the same blocks were reusable
     assert v[2]["incr_verify_checked"] == v[2]["incr_verify_planned"] and v[2]["incr_verify_mismatch"] == 0
@@ -2332,4 +2337,176 @@ def test_disk_incr_needs_async():
     dc_complete(server, DC_B)
     st = dc_settle(server)
     assert st["saves"] >= 1 and st["incr_blocks_reused"] == 0 and st["saves_async"] == 0
+    server.stop()
+
+
+# (sc3fix) regression tests for the SC3 items of the astra v69 DELTA review: each one fails on a09430242 (with only the
+#   test hooks / status fields of the sc3fix test commit) and passes with the fixes
+
+
+def dc_incr_server_np(tag, hooks, n_slots=1, kv_unified=None):
+    """dc_incr_server's incr arm (f32 K / V, no draft, --cache-disk-incr) with other hooks / slots"""
+    srv, cache_dir = dc_server(tag, 2048, n_ctx=16384, n_slots=n_slots, hooks=hooks)
+    srv.model_draft = None
+    srv.spec_type = None
+    srv.spec_draft_n_min = None
+    srv.spec_draft_n_max = None
+    if kv_unified is not None:
+        srv.kv_unified = kv_unified
+    srv.extra_args += ["-ctk", "f32", "-ctv", "f32", "--cache-disk-incr"]
+    return srv, cache_dir
+
+
+def dc_entry_blocks(cache_dir):
+    """every block key the registered entries' maps reference: n_tokens -> [keys] (.tgt then .dft)"""
+    import glob, json as js, struct
+    ns = glob.glob(os.path.join(cache_dir, "ns-*"))[0]
+    out = {}
+    for meta in glob.glob(os.path.join(ns, "*.meta")):
+        eid = os.path.basename(meta)[:-5]
+        keys = []
+        for ext in (".tgt", ".dft"):
+            mp = os.path.join(ns, eid + ext)
+            if not os.path.exists(mp):
+                continue
+            b = open(mp, "rb").read()
+            _magic, _ver, n_h = struct.unpack_from("<III", b, 0)
+            at = 12 + n_h + 8
+            while b[at] != 255:
+                kind = b[at]
+                at += 1
+                if kind == 0:
+                    (k,) = struct.unpack_from("<Q", b, at)
+                    at += 8 + k
+                    (ks,) = struct.unpack_from("<I", b, at)
+                    at += 4 + ks
+                else:
+                    (ks,) = struct.unpack_from("<I", b, at)
+                    keys.append(b[at + 4:at + 4 + ks].decode())
+                    at += 4 + ks
+        out[js.load(open(meta))["n_tokens"]] = keys
+    return ns, out
+
+
+def test_disk_incr_kshift_marks_every_row():
+    """(sc3fix 1) the K-shift graph ropes the K rows of every cell of every stream, the unshifted ones too (shift 0 is not
+    the identity with a YaRN magnitude != 1, or a quantized K round trip). Slot 0 holds A + P1 with a committed record
+    (its A blocks were reused once: non-vacuous); slot 1 context-shifts (--yarn-attn-factor 1.25: every K row of slot
+    0's stream is rescaled); slot 0's next save must not reuse a block recorded before the shift. incr_verify copies
+    the reusable blocks and compares their keys: a09430242 marked only the shifted cells -> stale "clean" blocks ->
+    incr_verify_mismatch > 0"""
+    global server
+    server, _ = dc_incr_server_np("incr-kshift", {"incr_verify": "1"}, n_slots=2, kv_unified=False)
+    server.extra_args += ["--context-shift", "--yarn-attn-factor", "1.25"]
+    server.start()
+    dc_complete(server, DC_INCR_A)
+    for k, seed in enumerate((41, 42, 43)):  # P1 saves A + P0 (the record), P2 saves A + P1 (A's blocks reusable)
+        dc_complete(server, DC_INCR_A + f" Part {k}. " + dc_text(seed, 300))
+    st = dc_settle(server)
+    planned = st["incr_verify_planned"]
+    assert planned > 0 and st["incr_verify_mismatch"] == 0, st
+    # slot 1 (its own stream, 8192 cells): a prompt close to the slot context, then generation past it -> context shift
+    n_ctx_slot = server.make_request("GET", "/slots").body[1]["n_ctx"]
+    text = "Archive C. " + dc_text(44, 100)
+    while len(server.make_request("POST", "/tokenize", data={"content": text}).body["tokens"]) < n_ctx_slot - 200:
+        text += " " + dc_text(len(text), 400)
+    res = server.make_request("POST", "/completion", data={
+        "prompt": text, "n_predict": 400, "id_slot": 1, "cache_prompt": True, "temperature": 0.0, "ignore_eos": True,
+        "n_keep": 16})
+    assert res.status_code == 200 and res.body["truncated"], "slot 1 did not context-shift"
+    dc_complete(server, DC_INCR_A + " Part 3. " + dc_text(45, 300))  # saves A + P2 (slot 0) after the shift
+    st = dc_settle(server)
+    print(f"verify planned {planned} -> {st['incr_verify_planned']}, mismatch {st['incr_verify_mismatch']}")
+    assert st["incr_verify_mismatch"] == 0, "a block recorded before the K-shift was reused after it"
+    assert st["incr_verify_planned"] == planned, "a block of the shifted stream was still planned for reuse"
+    assert st["async_claims"] == 0 and st["saves_async_failed"] == 0
+    server.stop()
+
+
+def test_disk_incr_reuse_alloc_failure_leaks_no_claim():
+    """(sc3fix 2) the first reused block's record allocation throws (hook fail_incr_alloc): the save fails, and no claim
+    stays behind (a09430242 claimed the key before the allocation: pending[key] leaked, blob_gc would keep the block
+    forever); the later save commits"""
+    global server
+    server, cache_dir = dc_incr_server_np("incr-allocfail", {"fail_incr_alloc": "1"})
+    server.start()
+    dc_incr_scenario(server)
+    st = dc_settle(server)
+    print(f"failed {st['saves_async_failed']} claims {st['async_claims']} reused {st['incr_blocks_reused']}")
+    assert st["saves_async_failed"] == 1, st
+    assert st["async_claims"] == 0, "the failed reuse left a claim behind"
+    ns, ents = dc_entry_blocks(cache_dir)
+    for n, keys in ents.items():
+        for k in keys:
+            assert os.path.exists(os.path.join(ns, "blk", k + ".blk")), (n, k)
+    server.stop()
+
+
+def test_disk_incr_record_failure_finishes_the_commit():
+    """(sc3fix 3) building the slot's incremental record throws at the first commit (hook fail_incr_rec), after the
+    entry was published: the commit still releases the job's claims and the server goes on (the record is dropped,
+    the next save copies everything); a09430242 let the exception out of commit_job"""
+    global server
+    server, cache_dir = dc_incr_server_np("incr-recfail", {"fail_incr_rec": "1"})
+    server.start()
+    dc_incr_scenario(server)
+    st = dc_settle(server)
+    print(f"saves {st['saves']} failed {st['saves_async_failed']} claims {st['async_claims']} "
+          f"reused {st['incr_blocks_reused']} entries {st['n_entries']}")
+    assert st["saves_async_failed"] == 0 and st["async_claims"] == 0, st
+    assert st["n_entries"] >= 3
+    ns, ents = dc_entry_blocks(cache_dir)
+    for n, keys in ents.items():
+        for k in keys:
+            assert os.path.exists(os.path.join(ns, "blk", k + ".blk")), (n, k)
+    server.stop()
+
+
+def test_disk_drop_of_a_claimed_block_fails_the_claimant():
+    """(sc3fix 4) a block a save in flight claimed (found present by its worker) turns out corrupt at another load and
+    is dropped (blob_drop_copy): the claimant must not commit an entry that references the dropped file. E1 = A + B1;
+    A + B3 is loaded from E1 and saved (job 4, its end held 15 s) - its first block = E1's first block, claimed; the
+    file is damaged, slot 1 loads E1 (longest prefix) -> corrupt -> dropped; job 4 commits after that. a09430242: job 4
+    is registered with a missing block (every later load of it fails)"""
+    global server
+    server, cache_dir = dc_server("dropclaim", 2048, n_ctx=32768, n_slots=2,
+                                  hooks={"finalize_delay_job4_ms": "15000"})
+    server.model_draft = None
+    server.spec_type = None
+    server.spec_draft_n_min = None
+    server.spec_draft_n_max = None
+    server.start()
+    ab1 = DC_INCR_A + " Part 1. " + dc_text(51, 200)
+    dc_complete(server, DC_INCR_A, slot=0)
+    dc_complete(server, ab1, slot=0)
+    dc_complete(server, "Archive Z1. " + dc_text(52, 50), slot=0)  # job 1 (+ job 2: A, the checkpoint branch) save A + B1
+    st = dc_settle(server)
+    ns, ents = dc_entry_blocks(cache_dir)
+    e1 = max(ents, key=lambda n: n if ents[n] else -1)
+    k0 = ents[e1][0]
+    r = dc_complete(server, DC_INCR_A + " Part 3. " + dc_text(53, 200), slot=0)  # job 3 saves Z1; A loaded
+    assert r["timings"]["cache_n"] >= 4000, r["timings"]
+    n_sub = st["saves"]
+    dc_complete(server, "Archive Z2. " + dc_text(54, 50), slot=0)  # the save of A + B3 (claims k0), its end held
+    time.sleep(3)  # its blocks are hashed / claimed by now (no per-block delay)
+    st = dc_status(server, through_loop=False)
+    assert st["saves_pending"] >= 1, "the A + B3 save is not in flight"
+    p = os.path.join(ns, "blk", k0 + ".blk")
+    with open(p, "r+b") as f:  # damage E1's first block (same size)
+        f.seek(100)
+        b = f.read(16)
+        f.seek(100)
+        f.write(bytes(x ^ 0xFF for x in b))
+    r = dc_complete(server, ab1 + " more", slot=1)  # E1 is the longest prefix: its load meets the damaged block
+    st = dc_status(server, through_loop=False)
+    print(f"slot 1 cache_n {r['timings']['cache_n']}, load failures {st['load_failures']}, saves {n_sub} -> {st['saves']}")
+    assert st["load_failures"] >= 1, "the damaged block was not met"
+    assert not os.path.exists(p), "the damaged block was not dropped"
+    st = dc_settle(server)
+    print(f"failed {st['saves_async_failed']} claims {st['async_claims']} entries {st['n_entries']}")
+    assert st["async_claims"] == 0
+    ns, ents = dc_entry_blocks(cache_dir)
+    for n, keys in ents.items():
+        for k in keys:
+            assert os.path.exists(os.path.join(ns, "blk", k + ".blk")), f"entry {n} references the dropped block {k}"
     server.stop()
