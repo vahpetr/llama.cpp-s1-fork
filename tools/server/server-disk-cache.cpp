@@ -733,6 +733,8 @@ static const char * const CACHE_ENV_EXACT[] = {
     "LLAMA_DISK_ASYNC_TEST", // [TAG_DISK_ASYNC_SAVE] test hooks, honoured only with --cache-disk-test
     "LLAMA_SPEC_OVERLAP", // [TAG_T2_SEQ_RM_COUNTED] host-phase diet of the speculative round: output-exact (class A), so
                           //   OVERLAP=1 keeps the namespace key (the v68 store is reused); GGML_VK_F32ACC* stay semantic
+    "LLAMA_GDN_REPLAY", // [TAG_GDN_REPLAY] GDN commit by replay: the state bytes and outputs are the planes path's (EXACT,
+                        //   docs/verification/2026-10-31-gdn-replay-kproof.md), so =1 keeps the namespace key
     // LLAMA_ARG_* aliases (common/arg.cpp): classified one by one by their parsed meaning - only the control plane
     "LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_API_KEY",
     // Vulkan speed / diagnostics only by contract
