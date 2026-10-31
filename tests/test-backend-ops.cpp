@@ -5382,6 +5382,103 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET with the commit by replay (ggml_gated_delta_net_set_replay, [TAG_GDN_REPLAY]): node 1 replays
+//   n_prefix stashed rows of each sequence (random stash), computes its window, writes the state after token
+//   n_tokens - 1 - n_defer and stashes the rest; node 2 replays those n_defer rows from the other half and runs a second
+//   window to its final state (both nodes compared against the CPU). Per sequence: its own prefix and stash slot
+struct test_gated_delta_net_replay : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int     v_repeat;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int     n_prefix;
+    const int     n_defer;
+    static constexpr int64_t W = 5; // stash rows per half
+
+    std::string vars() override {
+        return VARS_TO_STR7(head_count, head_size, v_repeat, n_seq_tokens, n_seqs, n_prefix, n_defer);
+    }
+
+    test_gated_delta_net_replay(int64_t head_count = 16, int64_t head_size = 128, int v_repeat = 3, int64_t n_seq_tokens = 3,
+            int64_t n_seqs = 1, int n_prefix = 2, int n_defer = 2)
+        : head_count(head_count), head_size(head_size), v_repeat(v_repeat), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          n_prefix(n_prefix), n_defer(n_defer) {}
+
+    // the prefix of sequence s, and its stash slot (sequences use the slots in a permuted order)
+    int prefix_of(int64_t s) const { return (int) ((n_prefix + s) % (W + 1)); }
+    int slot_of  (int64_t s) const { return (int) ((s * 3 + 1) % n_seqs); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H = head_count * v_repeat;
+        auto window = [&](const char * sfx, ggml_tensor ** q, ggml_tensor ** k, ggml_tensor ** v, ggml_tensor ** g, ggml_tensor ** b) {
+            *q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+            *k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+            *v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, H, n_seq_tokens, n_seqs);
+            *g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_seq_tokens, n_seqs);
+            *b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_seq_tokens, n_seqs);
+            ggml_set_name(*q, (std::string("q") + sfx).c_str());
+            ggml_set_name(*k, (std::string("k") + sfx).c_str());
+            ggml_set_name(*v, (std::string("v") + sfx).c_str());
+            ggml_set_name(*g, (std::string("g") + sfx).c_str());
+            ggml_set_name(*b, (std::string("beta") + sfx).c_str());
+            *q = ggml_l2_norm(ctx, *q, 1e-6f);
+            *k = ggml_l2_norm(ctx, *k, 1e-6f);
+        };
+        ggml_tensor * q1, * k1, * v1, * g1, * b1, * q2, * k2, * v2, * g2, * b2;
+        window("1", &q1, &k1, &v1, &g1, &b1);
+        window("2", &q2, &k2, &v2, &g2, &b2);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, H, n_seqs);
+        ggml_set_name(state, "state");
+        const int64_t row = head_size * head_count + head_size * H + H + H;
+        ggml_tensor * stash = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, row, W, 2 * n_seqs);
+        ggml_set_name(stash, "stash");
+        ggml_tensor * ctl1 = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, n_seqs);
+        ggml_tensor * ctl2 = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, n_seqs);
+        ggml_set_name(ctl1, "ctl1");
+        ggml_set_name(ctl2, "ctl2");
+
+        ggml_tensor * out1 = ggml_gated_delta_net(ctx, q1, k1, v1, g1, b1, state, 1);
+        ggml_gated_delta_net_set_replay(out1, stash, ctl1);
+        ggml_set_name(out1, "out1");
+        // node 2 starts from node 1's state
+        const int64_t attn = head_size * H * n_seq_tokens * n_seqs;
+        ggml_tensor * state2 = ggml_view_4d(ctx, out1, head_size, head_size, H, n_seqs,
+            head_size * sizeof(float), head_size * head_size * sizeof(float), head_size * head_size * H * sizeof(float),
+            attn * sizeof(float));
+        ggml_tensor * out = ggml_gated_delta_net(ctx, q2, k2, v2, g2, b2, ggml_cont(ctx, state2), 1);
+        ggml_gated_delta_net_set_replay(out, stash, ctl2);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            const std::string name = t->name;
+            if (name == "ctl1" || name == "ctl2") {
+                std::vector<int32_t> c(4 * n_seqs);
+                for (int64_t s = 0; s < n_seqs; ++s) {
+                    // node 1: half (s % 2) holds the random prefix rows; node 2 reads node 1's deferred rows
+                    const int32_t half = (int32_t) (s % 2);
+                    if (name == "ctl1") {
+                        c[4*s + 0] = prefix_of(s); c[4*s + 1] = half;     c[4*s + 2] = n_defer; c[4*s + 3] = slot_of(s);
+                    } else {
+                        c[4*s + 0] = n_defer;      c[4*s + 1] = 1 - half; c[4*s + 2] = 0;       c[4*s + 3] = slot_of(s);
+                    }
+                }
+                ggml_backend_tensor_set(t, c.data(), 0, c.size() * sizeof(int32_t));
+            } else if (name[0] == 'g' || name == "stash") {
+                init_tensor_uniform(t, -0.5f, -1e-4f); // g < 0, and the stash rows (k / v / beta in range too)
+            } else if (name.rfind("beta", 0) == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -14018,6 +14115,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+
+    // [TAG_GDN_REPLAY] commit by replay at the Flash-Next decode shape (H_k 16, H_v 48, S 128): windows n 1..6, every
+    //   replayed prefix p 0..5, the state after the whole window (n_defer 0) or after its first token (n_defer n-1),
+    //   one sequence and five (per-sequence prefix and stash slot)
+    for (int64_t n_seqs : { 1, 5 }) {
+        for (int64_t n = 1; n <= 6; ++n) {
+            for (int p = 0; p <= 5; ++p) {
+                for (int d : { 0, (int) std::min<int64_t>(n - 1, 5) }) {
+                    if (d == 0 && n > 1 && p % 2 == 1) {
+                        continue; // keeps the list short: odd prefixes with a deferred window only
+                    }
+                    test_cases.emplace_back(new test_gated_delta_net_replay(16, 128, 3, n, n_seqs, p, d));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_gated_delta_net_replay(4, 32, 1, 6, 5, 3, 5)); // another head size / pipeline
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

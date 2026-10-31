@@ -2865,6 +2865,22 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * dst_state);
 
+    // Commit by replay of a gated delta net with K == 1 (LLAMA_GDN_REPLAY, a speculative decoder's verification): the
+    // inputs of the trailing tokens of a window are kept instead of their states, and a later op replays those its caller
+    // kept with the same arithmetic. The op's state output (dst_state of ggml_gated_delta_net_ext, or the state region of
+    // the result) receives one state per sequence.
+    //   stash : F32 [row, W, 2*n_slot], contiguous: plane 2*c + h = half h of stash slot c, W token rows each;
+    //           row = k [S_k*H_k] (once per key head), v [S_v*H_v], g [H_v, or S_v*H_v with KDA], beta [H_v]
+    //   ctl   : I32 [4, n_seqs], read on the device, per sequence of the op: { n_prefix, read_half, n_defer, slot }
+    // The n_prefix rows of (slot, read_half) are replayed on the input state first (no output). With 0 <= n_defer <=
+    // min(n_tokens, W) the state written is the one after token n_tokens - 1 - n_defer (n_defer = 0: the final state)
+    // and the inputs of the last n_defer tokens go to (slot, 1 - read_half); n_defer < 0 commits only: the state after
+    // the prefix is written and the window is not computed (the attention output is left undefined).
+    GGML_API void ggml_gated_delta_net_set_replay(
+            struct ggml_tensor  * gdn,
+            struct ggml_tensor  * stash,
+            struct ggml_tensor  * ctl);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
