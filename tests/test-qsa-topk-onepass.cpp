@@ -654,6 +654,8 @@ int main(int argc, char ** argv) {
             const bool is3  = v[4].c[i].path == "v3";
             const bool fail = !v[4].c[i].exact;
             const bool all_fb = v[4].c[i].v3rows > 0 && v[4].c[i].v3fb == v[4].c[i].v3rows;
+            // the plane-form cases of the v3_all arm run onepass (the control's other target, counted above on on_all)
+            if (v[4].c[i].path.rfind("onepass", 0) == 0) { continue; }
             if (is3 && !all_fb) { n_v3c++; n_v3c_fail += fail; } else { n_v3_other_fail += fail; }
         }
         const bool cok = off_ok && n_op > 0 && n_op_fail*10 >= n_op*9 && n_other_fail == 0 &&
