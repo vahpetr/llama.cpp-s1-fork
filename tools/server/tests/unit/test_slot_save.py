@@ -2346,7 +2346,7 @@ def test_disk_incr_needs_async():
 
 def dc_incr_server_np(tag, hooks, n_slots=1, kv_unified=None):
     """dc_incr_server's incr arm (f32 K / V, no draft, --cache-disk-incr) with other hooks / slots"""
-    srv, cache_dir = dc_server(tag, 2048, n_ctx=16384, n_slots=n_slots, hooks=hooks)
+    srv, cache_dir = dc_server(tag, 2048, n_ctx=16384 * n_slots, n_slots=n_slots, hooks=hooks)
     srv.model_draft = None
     srv.spec_type = None
     srv.spec_draft_n_min = None
@@ -2401,11 +2401,11 @@ def test_disk_incr_kshift_marks_every_row():
     server.start()
     dc_complete(server, DC_INCR_A)
     for k, seed in enumerate((41, 42, 43)):  # P1 saves A + P0 (the record), P2 saves A + P1 (A's blocks reusable)
-        dc_complete(server, DC_INCR_A + f" Part {k}. " + dc_text(seed, 300))
+        dc_complete(server, DC_INCR_A + f" Part {k}. " + dc_text(seed, 4000))  # 2 * lcp < n: the divergence saves
     st = dc_settle(server)
     planned = st["incr_verify_planned"]
     assert planned > 0 and st["incr_verify_mismatch"] == 0, st
-    # slot 1 (its own stream, 8192 cells): a prompt close to the slot context, then generation past it -> context shift
+    # slot 1 (its own stream, 16384 cells): a prompt close to the slot context, then generation past it -> context shift
     n_ctx_slot = server.make_request("GET", "/slots").body[1]["n_ctx"]
     text = "Archive C. " + dc_text(44, 100)
     while len(server.make_request("POST", "/tokenize", data={"content": text}).body["tokens"]) < n_ctx_slot - 200:
@@ -2414,7 +2414,7 @@ def test_disk_incr_kshift_marks_every_row():
         "prompt": text, "n_predict": 400, "id_slot": 1, "cache_prompt": True, "temperature": 0.0, "ignore_eos": True,
         "n_keep": 16})
     assert res.status_code == 200 and res.body["truncated"], "slot 1 did not context-shift"
-    dc_complete(server, DC_INCR_A + " Part 3. " + dc_text(45, 300))  # saves A + P2 (slot 0) after the shift
+    dc_complete(server, DC_INCR_A + " Part 3. " + dc_text(45, 4000))  # saves A + P2 (slot 0) after the shift
     st = dc_settle(server)
     print(f"verify planned {planned} -> {st['incr_verify_planned']}, mismatch {st['incr_verify_mismatch']}")
     assert st["incr_verify_mismatch"] == 0, "a block recorded before the K-shift was reused after it"
@@ -2465,12 +2465,12 @@ def test_disk_incr_record_failure_finishes_the_commit():
 def test_disk_drop_of_a_claimed_block_fails_the_claimant():
     """(sc3fix 4) a block a save in flight claimed (found present by its worker) turns out corrupt at another load and
     is dropped (blob_drop_copy): the claimant must not commit an entry that references the dropped file. E1 = A + B1;
-    A + B3 is loaded from E1 and saved (job 4, its end held 15 s) - its first block = E1's first block, claimed; the
-    file is damaged, slot 1 loads E1 (longest prefix) -> corrupt -> dropped; job 4 commits after that. a09430242: job 4
+    A + B3 is loaded from E1 and saved (job 3, its end held 15 s) - its first block = E1's first block, claimed; the
+    file is damaged, slot 1 loads E1 (longest prefix) -> corrupt -> dropped; job 3 commits after that. a09430242: job 3
     is registered with a missing block (every later load of it fails)"""
     global server
     server, cache_dir = dc_server("dropclaim", 2048, n_ctx=32768, n_slots=2,
-                                  hooks={"finalize_delay_job4_ms": "15000"})
+                                  hooks={"finalize_delay_job3_ms": "15000"})
     server.model_draft = None
     server.spec_type = None
     server.spec_draft_n_min = None
@@ -2479,12 +2479,12 @@ def test_disk_drop_of_a_claimed_block_fails_the_claimant():
     ab1 = DC_INCR_A + " Part 1. " + dc_text(51, 200)
     dc_complete(server, DC_INCR_A, slot=0)
     dc_complete(server, ab1, slot=0)
-    dc_complete(server, "Archive Z1. " + dc_text(52, 50), slot=0)  # job 1 (+ job 2: A, the checkpoint branch) save A + B1
+    dc_complete(server, "Archive Z1. " + dc_text(52, 50), slot=0)  # job 1 saves A + B1 (E1)
     st = dc_settle(server)
     ns, ents = dc_entry_blocks(cache_dir)
     e1 = max(ents, key=lambda n: n if ents[n] else -1)
     k0 = ents[e1][0]
-    r = dc_complete(server, DC_INCR_A + " Part 3. " + dc_text(53, 200), slot=0)  # job 3 saves Z1; A loaded
+    r = dc_complete(server, DC_INCR_A + " Part 3. " + dc_text(53, 200), slot=0)  # job 2 saves Z1; A loaded from E1
     assert r["timings"]["cache_n"] >= 4000, r["timings"]
     n_sub = st["saves"]
     dc_complete(server, "Archive Z2. " + dc_text(54, 50), slot=0)  # the save of A + B3 (claims k0), its end held
