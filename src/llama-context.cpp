@@ -4467,8 +4467,17 @@ public:
                 }
             }
 
-            for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
+            // [TAG_GDN_REPLAY] the copy reads through the views of THIS capture: a reused storage keeps the views of an
+            //   earlier one, whose source may be gone (a gdn replay snapshot is freed after its save, and the next one can
+            //   land at the same address, so view_src compares equal above) - they only decide the reuse
+            if (!need_alloc) {
+                for (auto * v : mbuf.org) {
+                    ggml_backend_view_init(v);
+                }
+            }
+            const auto & src = need_alloc ? mbuf_cur.org : mbuf.org;
+            for (size_t i = 0; i < src.size(); ++i) {
+                ggml_backend_tensor_copy(src[i], mbuf_cur.cpy[i]);
             }
         }
     }
