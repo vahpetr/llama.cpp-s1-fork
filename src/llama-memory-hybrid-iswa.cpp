@@ -60,7 +60,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         n_rs_seq,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
-            : filter_recr
+            : filter_recr,
+        /* gdn_replay_ok */ false // [TAG_GDN_REPLAY] its graph inputs (llm_graph_input_mem_hybrid_iswa) were never proven with it
     )) {}
 
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {

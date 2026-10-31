@@ -690,6 +690,60 @@ static int run_model(const common_params & params, llama_model * model) {
         // seq_cp of a sequence with deferred tokens (astra's reproducer: defer A 4 rows -> cp A -> B -> roll A back 1 ->
         //   save B): ON commits A first, so B and A read the same committed row and A's rollback is refused (OFF
         //   accepts it and moves the shared cell's position - a planes-path quirk, not compared). Then seq_keep(A)
+        // repeated same-shape ON_DEVICE checkpoints (v70.1 item 4, the server's PARTIAL_ONLY | ON_DEVICE speculative
+        //   checkpoint): window -> device checkpoint (+ host oracle) -> a device buffer allocated in between (allocator
+        //   churn: the next snapshot lands elsewhere) -> window + rollback -> restore the device checkpoint -> host bytes
+        //   == the oracle; six rounds of the same shape (the writer reuses its storage), OFF and ON
+        {
+            const llama_state_seq_flags fl_host = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            const llama_state_seq_flags fl_dev  = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+            ggml_backend_buffer_type_t churn_buft = nullptr;
+            for (size_t i = 0; i < ggml_backend_dev_count() && !churn_buft; ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    churn_buft = ggml_backend_dev_buffer_type(dev);
+                }
+            }
+            std::vector<ggml_backend_buffer_t> churn;
+            const llama_seq_id A = 0;
+            auto get = [](llama_context * c, llama_seq_id s, llama_state_seq_flags f) {
+                std::vector<uint8_t> b(llama_state_seq_get_size_ext(c, s, f));
+                b.resize(llama_state_seq_get_data_ext(c, b.data(), b.size(), s, f));
+                return b;
+            };
+            std::vector<llama_seq_id> one = { A };
+            for (uint32_t k = 0; k < 6; ++k) {
+                std::vector<llama_pos> pa = pos;
+                expect(decode_window(off, one, pa, 4, 3, n_vocab, 300 + k, lo) && decode_window(on, one, pa, 4, 3, n_vocab, 300 + k, ln) && lo == ln,
+                       "ondev: window", 300 + k);
+                pos[A] += 4;
+                const llama_pos p_ck = pos[A];
+                std::vector<uint8_t> h_off = get(off, A, fl_host), h_on = get(on, A, fl_host);
+                std::vector<uint8_t> d_off = get(off, A, fl_dev),  d_on = get(on, A, fl_dev);
+                expect(!h_on.empty() && h_on == h_off && !d_on.empty(), "ondev: host oracle ON == OFF", 300 + k);
+                if (churn_buft) {
+                    ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(churn_buft, (size_t) (100 + 7 * k) << 20);
+                    if (b) { ggml_backend_buffer_clear(b, 0xA5); churn.push_back(b); }
+                    if (churn.size() > 2) { ggml_backend_buffer_free(churn.front()); churn.erase(churn.begin()); }
+                }
+                std::vector<llama_pos> pb = pos;
+                expect(decode_window(off, one, pb, 3, 2, n_vocab, 310 + k, lo) && decode_window(on, one, pb, 3, 2, n_vocab, 310 + k, ln) && lo == ln,
+                       "ondev: window after the checkpoint", 300 + k);
+                for (llama_context * c : { off, on }) {
+                    llama_memory_seq_rm(llama_get_memory(c), A, pos[A] + 2, -1);
+                }
+                for (auto pr : { std::make_pair(off, &d_off), std::make_pair(on, &d_on) }) {
+                    expect(llama_state_seq_set_data_ext(pr.first, pr.second->data(), pr.second->size(), A, fl_dev) == pr.second->size(),
+                           "ondev: device restore", 300 + k);
+                    llama_memory_seq_rm(llama_get_memory(pr.first), A, p_ck, -1);
+                }
+                expect(get(off, A, fl_host) == h_off, "ondev: OFF restored == oracle", 300 + k);
+                expect(get(on,  A, fl_host) == h_on,  "ondev: ON restored == oracle", 300 + k);
+                pos[A] = p_ck;
+            }
+            for (auto * b : churn) { ggml_backend_buffer_free(b); }
+        }
+
         // snapshot admission (v70.1 item 3): an unfittable margin makes the save commit in place - same bytes, no new
         //   memory, and the kept tokens are no longer rolled back on ON (OFF still can; positions re-synced below)
         {

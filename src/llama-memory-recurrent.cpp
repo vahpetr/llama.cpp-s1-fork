@@ -26,7 +26,8 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
+    const layer_filter_cb & filter,
+                     bool   gdn_replay_ok) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer();
 
     head = 0;
@@ -41,9 +42,12 @@ llama_memory_recurrent::llama_memory_recurrent(
     {
         const char * env = getenv("LLAMA_GDN_REPLAY");
         const bool want = env != nullptr && atoi(env) != 0;
-        gdn_replay = want && n_rs_seq > 0 && model.arch == LLM_ARCH_QWEN4EXP && type_s == GGML_TYPE_F32 &&
+        if (want && !gdn_replay_ok) {
+            LLAMA_LOG_WARN("%s: LLAMA_GDN_REPLAY=1 ignored: not supported under the hybrid iswa memory (SWA attention)\n", __func__);
+        }
+        gdn_replay = want && gdn_replay_ok && n_rs_seq > 0 && model.arch == LLM_ARCH_QWEN4EXP && type_s == GGML_TYPE_F32 &&
                      hparams.n_embd_s() == hparams.ssm_d_state * hparams.ssm_d_state * hparams.ssm_dt_rank;
-        if (want && !gdn_replay && n_rs_seq > 0) {
+        if (want && gdn_replay_ok && !gdn_replay && n_rs_seq > 0) {
             LLAMA_LOG_WARN("%s: LLAMA_GDN_REPLAY=1 ignored: not a qwen4exp gated delta net cache\n", __func__);
         }
         gdn_w = gdn_replay ? n_rs_seq : 0;

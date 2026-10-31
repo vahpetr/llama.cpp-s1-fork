@@ -25,7 +25,8 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
-        const layer_filter_cb & filter);
+        const layer_filter_cb & filter,
+                         bool   gdn_replay_ok = true); // [TAG_GDN_REPLAY] false: the owner does not support the replay
 
     ~llama_memory_recurrent() = default;
 
