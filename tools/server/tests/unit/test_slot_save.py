@@ -2408,10 +2408,11 @@ def test_disk_incr_kshift_marks_every_row():
     # slot 1 (its own stream, 16384 cells): a prompt close to the slot context, then generation past it -> context shift
     n_ctx_slot = server.make_request("GET", "/props").body["default_generation_settings"]["n_ctx"]
     text = "Archive C. " + dc_text(44, 100)
-    while len(server.make_request("POST", "/tokenize", data={"content": text}).body["tokens"]) < n_ctx_slot - 200:
+    while len(server.make_request("POST", "/tokenize", data={"content": text}).body["tokens"]) < n_ctx_slot:
         text += " " + dc_text(len(text), 400)
+    toks = server.make_request("POST", "/tokenize", data={"content": text}).body["tokens"][:n_ctx_slot - 200]
     res = server.make_request("POST", "/completion", data={
-        "prompt": text, "n_predict": 400, "id_slot": 1, "cache_prompt": True, "temperature": 0.0, "ignore_eos": True,
+        "prompt": toks, "n_predict": 400, "id_slot": 1, "cache_prompt": True, "temperature": 0.0, "ignore_eos": True,
         "n_keep": 16})
     assert res.status_code == 200 and res.body["truncated"], "slot 1 did not context-shift"
     dc_complete(server, DC_INCR_A + " Part 3. " + dc_text(45, 4000))  # saves A + P2 (slot 0) after the shift
