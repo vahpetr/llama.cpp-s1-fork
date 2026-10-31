@@ -135,6 +135,8 @@ struct server_disk_cache {
         int fail_finalize = 0; // (pkg9-fix 4) the N-th finalizer task enqueue throws
         bool check_pins = false;
         bool incr_verify = false; // [TAG_DISK_INCR]
+        int fail_incr_alloc = 0; // (sc3fix 2) the N-th block record of an incremental reuse: its allocation throws
+        int fail_incr_rec   = 0; // (sc3fix 3) the N-th slot record built at a commit: its allocation throws
         std::map<int, int> finalize_delay_job;
         std::map<int, int> hold_write_job; // hold_write_jobK_ms
     };
@@ -263,6 +265,7 @@ struct server_disk_cache {
     uint64_t incr_blocks_reused    = 0;
     uint64_t incr_bytes_skipped    = 0;
     uint64_t incr_blocks_verify_planned = 0; // incr_verify hook: blocks copied that the reuse would have skipped
+    uint64_t n_incr_alloc_hook = 0, n_incr_rec_hook = 0; // (sc3fix 2, 3) test hook counters (server thread)
     uint64_t last_load_us          = 0;
     uint64_t last_load_bytes       = 0;
 

@@ -1161,6 +1161,8 @@ server_disk_cache::server_disk_cache(std::string dir, uint64_t quota_bytes, int3
 //     quota_mib=N            the quota in MiB instead of --cache-disk-gib
 //     incr_verify=1          [TAG_DISK_INCR] with --cache-disk-incr: copy the blocks the incremental save would reuse and
 //                            compare their keys with the record (incr_verify_mismatch in GET /disk-cache, error log)
+//     fail_incr_alloc=N      (sc3fix 2) the N-th reused block's record allocation throws std::bad_alloc
+//     fail_incr_rec=N        (sc3fix 3) the N-th slot record built at a commit throws std::bad_alloc
 void server_disk_cache::set_test_hooks(bool enabled) {
     const char * v = getenv("LLAMA_DISK_ASYNC_TEST");
     if (!v || !*v) {
@@ -1205,6 +1207,10 @@ void server_disk_cache::set_test_hooks(bool enabled) {
             hooks.max_jobs = std::max(1, val);
         } else if (k == "incr_verify") { // [TAG_DISK_INCR] reuse nothing, compare the recorded keys with the device's
             hooks.incr_verify = val != 0;
+        } else if (k == "fail_incr_alloc") { // (sc3fix 2)
+            hooks.fail_incr_alloc = val;
+        } else if (k == "fail_incr_rec") { // (sc3fix 3)
+            hooks.fail_incr_rec = val;
         } else if (k == "quota_mib") {
             quota = (uint64_t) std::max(1, val) << 20;
         } else {
@@ -3109,6 +3115,9 @@ bool server_disk_cache::save_async_begin(llama_context * ctx_tgt, llama_context 
                         }
                         as->pending[key]++; // released at the commit with the job's other keys
                     }
+                    if (hooks.fail_incr_alloc > 0 && (int64_t) ++n_incr_alloc_hook == hooks.fail_incr_alloc) {
+                        throw std::bad_alloc(); // test hook fail_incr_alloc: the block record's allocation
+                    }
                     job.blocks.emplace_back();
                     auto & b = job.blocks.back();
                     b.key = key;
@@ -3261,6 +3270,9 @@ void server_disk_cache::commit_job(server_disk_save_job & job, std::vector<serve
     }
     if (incr) { // [TAG_DISK_INCR] the slot's record: this save's full blocks, if it committed (its keys stay claimed by its entry)
         if (ok && !superseded && job.incr_since != 0 && !job.incr_ranges.empty()) {
+            if (hooks.fail_incr_rec > 0 && (int64_t) ++n_incr_rec_hook == hooks.fail_incr_rec) {
+                throw std::bad_alloc(); // test hook fail_incr_rec: the record's allocation
+            }
             auto rec = std::make_shared<server_disk_incr_rec>();
             rec->since   = job.incr_since;
             rec->blk_dir = job.blk_dir;
@@ -4872,6 +4884,11 @@ std::vector<server_disk_lost> server_disk_cache::revalidate(const std::string & 
 }
 
 void server_disk_cache::refresh_status() {
+    size_t n_claims = 0; // (sc3fix) server thread, never under as->mtx here
+    if (as) {
+        std::lock_guard<std::mutex> lock(as->mtx);
+        n_claims = as->pending.size();
+    }
     json list = json::array();
     for (const auto & e : entries) {
         list.push_back({
@@ -4966,6 +4983,8 @@ void server_disk_cache::refresh_status() {
         { "incr_verify_planned", incr_blocks_verify_planned },
         { "incr_verify_checked", as ? as->incr_verified.load() : 0 },
         { "incr_verify_mismatch", as ? as->incr_mismatch.load() : 0 },
+        { "bytes_device_read", bytes_copied - incr_bytes_skipped }, // (sc3fix 5) bytes_copied minus the reused blocks
+        { "async_claims",   n_claims            }, // (sc3fix 2-4) block keys claimed by saves in flight (0 when settled)
         { "bytes_written_twice", n_bytes_written_twice }, // the synchronous fallback rewrote a block a worker was writing
         { "saves_async",    n_saves_async       },
         { "saves_async_failed", n_saves_async_failed },

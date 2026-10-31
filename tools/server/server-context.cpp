@@ -1778,6 +1778,7 @@ public:
             res.disk.n_saves_superseded    = disk_cache->n_saves_superseded;
             res.disk.incr_blocks_reused    = disk_cache->incr_blocks_reused; // [TAG_DISK_INCR]
             res.disk.incr_bytes_skipped    = disk_cache->incr_bytes_skipped;
+            res.disk.bytes_device_read     = disk_cache->bytes_copied - disk_cache->incr_bytes_skipped; // (sc3fix 5)
         }
 
         return res;
