@@ -2579,6 +2579,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
             score  = fused;
             biased = fold_bias;
         }
+        // [TAG_QSA_BIAS_FOLD] GGML_VK_QSA_BIAS_FOLD (default 1 = on; 0 = off), read here only for the lifetime below (the
+        // backend reads the same variable and decides): a backend that folds a QSA_BIAS bias computes it in the score's
+        // epilogue from that node's srcs (blk, qry, rows), which are not srcs of the score - ggml-alloc could hand their
+        // storage to a node scheduled between the QSA_BIAS node (their last graph consumer) and the score. Keep the
+        // gallocr-owned ones (the chunk rows; qry is a scheduler input copy and blk a view of the store, both never
+        // reused) for the whole graph: a few hundred bytes per chunk. Off = the graph and its allocation unchanged.
+        static const bool bias_fold = [] {
+            const char * e = getenv("GGML_VK_QSA_BIAS_FOLD");
+            // the backend's ggml_vk_env_bool reading: unset or empty = on
+            return e == nullptr || e[0] == '\0' || atoi(e) != 0;
+        }();
+        if (score == fused && biased && bias_fold && bias->op == GGML_OP_QSA_BIAS) {
+            for (int k = 0; k < 3; ++k) {
+                if (bias->src[k] != nullptr) {
+                    ggml_set_keep_alive(bias->src[k]);
+                }
+            }
+        }
     }
 
     if (score == nullptr) {
