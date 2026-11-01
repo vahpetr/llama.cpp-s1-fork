@@ -6,13 +6,16 @@
 #include "llama-ext.h"
 #include "llama-batch.h"
 #include "llama-model.h"
+#include "llama-gdn-admission.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <string>
 
 //
 // llama_memory_recurrent
@@ -67,8 +70,13 @@ llama_memory_recurrent::llama_memory_recurrent(
             LLAMA_LOG_WARN("%s: LLAMA_GDN_REPLAY=1 ignored: not a qwen4exp gated delta net cache\n", __func__);
         }
         if (n_rs_seq > 0 && model.arch == LLM_ARCH_QWEN4EXP) {
-            LLAMA_LOG_INFO("%s: gdn_replay: %s (%s)\n", __func__, gdn_replay ? "on" : "off",
-                    env_set ? "env" : (def_on ? "default on gfx1151" : "default off: not gfx1151"));
+            // the real reason (review m6): a wanted replay can still be off (hybrid iswa memory, not a gdn cache shape)
+            const char * base = env_set ? "env" : (def_on ? "default on gfx1151" : "default off: not gfx1151");
+            std::string why = base;
+            if (want && !gdn_replay) {
+                why += !gdn_replay_ok ? "; forced off: hybrid iswa memory" : "; forced off: not a qwen4exp gated delta net cache";
+            }
+            LLAMA_LOG_INFO("%s: gdn_replay: %s (%s)\n", __func__, gdn_replay ? "on" : "off", why.c_str());
         }
         gdn_w = gdn_replay ? n_rs_seq : 0;
         replay_n.assign(n_seq_max, 0);
@@ -611,15 +619,48 @@ bool llama_memory_recurrent::gdn_commit(llama_seq_id seq_id, bool in_place, cons
         const size_t margin = (size_t) (getenv("LLAMA_GDN_SNAPSHOT_MARGIN_MIB") ?
             std::max(0LL, atoll(getenv("LLAMA_GDN_SNAPSHOT_MARGIN_MIB"))) : 512LL) << 20;
         for (const auto & [dev, bytes] : need) {
-            size_t free = 0, total = 0;
-            if (dev != nullptr) {
-                ggml_backend_dev_memory(dev, &free, &total);
+            if (dev == nullptr) {
+                continue;
             }
-            if (dev != nullptr && free > 0 && bytes + margin > free) {
-                LLAMA_LOG_WARN("%s: gdn replay: a %.1f MiB snapshot does not fit %s (free %.1f MiB, margin %.0f MiB): committing in "
-                        "place (the kept tokens can no longer be rolled back)\n", __func__, bytes / 1048576.0,
-                        ggml_backend_dev_name(dev), free / 1048576.0, margin / 1048576.0);
+            // free memory: per heap max(0, budget - usage), UMA = the largest heap (one shared pool), discrete = the sum of the
+            //   device-local heaps (src/llama-gdn-admission.h); a device without per-heap budgets: ggml_backend_dev_memory, where
+            //   0 means "unknown" (no admission check, as before)
+            using heaps_fn = bool (*)(ggml_backend_dev_t, uint32_t, uint64_t *, uint64_t *, bool *, uint32_t *, bool *);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto * fn = reg != nullptr ? (heaps_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_memory_heaps") : nullptr;
+            uint64_t budget[16], usage[16]; bool dl[16]; uint32_t nh = 0; bool uma = false;
+            uint64_t free = 0;
+            const char * src = "dev_memory";
+            if (fn != nullptr && fn(dev, 16, budget, usage, dl, &nh, &uma) && nh > 0) {
+                llama_gdn_heap h[16];
+                for (uint32_t i = 0; i < nh; ++i) {
+                    h[i] = { budget[i], usage[i], dl[i] };
+                }
+                free = llama_gdn_heaps_free(h, nh, uma);
+                src  = uma ? "heaps, UMA max" : "heaps, device-local sum";
+            } else {
+                size_t f = 0, total = 0;
+                ggml_backend_dev_memory(dev, &f, &total);
+                if (f == 0) {
+                    continue;
+                }
+                free = f;
+            }
+            const bool fits = llama_gdn_admission_fits(free, bytes, margin);
+            if (!fits) {
+                LLAMA_LOG_WARN("%s: gdn replay: admission: a %.1f MiB snapshot does not fit %s (free %.1f MiB [%s], margin %.0f MiB): "
+                        "committing in place (the kept tokens can no longer be rolled back)\n", __func__, bytes / 1048576.0,
+                        ggml_backend_dev_name(dev), free / 1048576.0, src, margin / 1048576.0);
                 in_place = true;
+            } else {
+                static std::atomic<bool> logged { false }; // the first admission of the process at INFO (proof line), later at DEBUG
+                if (!logged.exchange(true)) {
+                    LLAMA_LOG_INFO("%s: gdn replay: admission: %.1f MiB snapshot fits %s (free %.1f MiB [%s], margin %.0f MiB)\n",
+                            __func__, bytes / 1048576.0, ggml_backend_dev_name(dev), free / 1048576.0, src, margin / 1048576.0);
+                } else {
+                    LLAMA_LOG_DEBUG("%s: gdn replay: admission: %.1f MiB snapshot fits %s (free %.1f MiB [%s], margin %.0f MiB)\n",
+                            __func__, bytes / 1048576.0, ggml_backend_dev_name(dev), free / 1048576.0, src, margin / 1048576.0);
+                }
             }
         }
     }
