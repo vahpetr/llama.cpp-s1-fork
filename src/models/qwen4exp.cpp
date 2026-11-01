@@ -1109,6 +1109,34 @@ static bool qwen4exp_qsa_relu_inplace() {
     return enabled;
 }
 
+// [TAG_QSA_IDX_F16_DECODE] (v71 program §4, class B) LLAMA_QSA_IDX_F16_DECODE=1 (default 0 = off): the indexer score of
+// the widths the backend does not take as QSA_SCORE (Vulkan: the mat-vec widths, 1..2 queries - decode and the MTP draft
+// step) reads the store's f16 mirror ([TAG_QSA_POOLED_F16_MIRROR], written by the same graph from the same values before
+// the score) instead of the f32 store: MUL_MAT_ROWS F16 x F32, half the bytes of the dominant decode GEMV at depth. NOT
+// exact: the mat-vec then multiplies f16-rounded keys (the f32 path multiplies the f32 keys), so scores move by the
+// f16 rounding of the keys and the selection can flip - a NEAR-band change (R154 class B). Widths >= 3 already read the
+// mirror through QSA_SCORE (exact there: coopmat1 converts A to f16 anyway) and are untouched, as is every prefill
+// graph and every graph without the mirror (the f32 path, node for node). Used only where the backend takes the F16
+// MUL_MAT_ROWS (supports_op of the first device), else the f32 path. Off = today's graph node for node.
+// LLAMA_QSA_IDX_F16_NEGCTL (compile-time, tests only): decode-width graphs read the mirror WITHOUT writing it (stale rows).
+static bool qwen4exp_qsa_idx_f16_decode() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_QSA_IDX_F16_DECODE");
+        const bool on = s != nullptr && atoi(s) != 0;
+        LLAMA_LOG_WARN("%s: qsa_idx_f16_decode: %s (LLAMA_QSA_IDX_F16_DECODE %s)%s\n", __func__, on ? "on" : "off",
+                       s ? s : "unset",
+#ifdef LLAMA_QSA_IDX_F16_NEGCTL
+                       " [NEGCTL MUTANT BUILD: decode-width graphs read a stale f16 mirror]"
+#else
+                       ""
+#endif
+                       );
+        return on;
+    }();
+
+    return enabled;
+}
+
 // [TAG_QSA_SCORE_EPILOGUE] (Program v8.1 A1, contrib 0235) GGML_VK_QSA_SCORE_EPILOGUE (default 1 = on; 0 = off): the
 // indexer score of build_qsa_select is ONE node, GGML_OP_QSA_SCORE - the score GEMM (MUL_MAT of the pooled keys or
 // MUL_MAT_ROWS of the store) with the ReLU, the ordered head sum ((s0 + s1) + s2) + s3 and the per-block bias computed in
@@ -2492,6 +2520,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             // [TAG_QSA_POOLED_F16_MIRROR] the same rows, from the same values, into the f16 mirror - expanded here, so it
             // is written whether or not this graph's score reads it (a mat-vec width reads the f32 store)
             ggml_tensor * st16 = nullptr;
+#ifdef LLAMA_QSA_IDX_F16_NEGCTL
+            // [TAG_QSA_IDX_F16_DECODE] negctl mutant (tests only): a decode-width graph does not write the mirror and hands
+            // the score the cache tensor itself - the rows this graph pools are stale there
+            if (store->f16_mirror && n_tokens <= 2) {
+                st16 = store->layers_f16.at(il);
+            } else
+#endif
             if (store->f16_mirror) {
                 st16 = ggml_set_rows(ctx0, store->layers_f16.at(il),
                         ggml_reshape_2d(ctx0, fresh, idx_dim, cap*n_stream), inp->dirty_dst);
@@ -2673,7 +2708,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
     if (score == nullptr) {
         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
         // [TAG_QSA_POOL_REMAP] the same product read straight from the store: [n_blocks, n_idx_h*n_tps, n_stream] either way
-        score = pooled ? ggml_mul_mat(ctx0, pooled, q) : ggml_mul_mat_rows(ctx0, pool_store, pool_remap, q);
+        // [TAG_QSA_IDX_F16_DECODE] knob on: from the store's f16 mirror where the backend takes it (class B, see the knob)
+        if (qwen4exp_qsa_idx_f16_decode() && !pooled && pool_store16 != nullptr && sched != nullptr) {
+            ggml_tensor * s16 = ggml_mul_mat_rows(ctx0, pool_store16, pool_remap, q);
+            const bool taken = ggml_backend_supports_op(ggml_backend_sched_get_backend(sched, 0), s16);
+            static std::atomic<int> logged{0};
+            if ((logged.fetch_or(taken ? 1 : 2) & (taken ? 1 : 2)) == 0) {
+                LLAMA_LOG_WARN("%s: qsa_idx_f16_decode: %s (first %d-query score of layer %d, %lld blocks)\n", __func__,
+                        taken ? "the score reads the f16 mirror (MUL_MAT_ROWS f16)" : "refused by the backend, f32 store",
+                        (int) n_tps, il, (long long) n_blocks);
+            }
+            if (taken) {
+                // the f32 store write (pool_store = the dirty rows' set_rows) has no other reader in this graph: keep it
+                ggml_build_forward_expand(gf, pool_store);
+                score = s16;
+            }
+        }
+        if (score == nullptr) {
+            score = pooled ? ggml_mul_mat(ctx0, pooled, q) : ggml_mul_mat_rows(ctx0, pool_store, pool_remap, q);
+        }
         score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
         score = qwen4exp_qsa_relu_inplace() ? ggml_relu_inplace(ctx0, score) : ggml_relu(ctx0, score); // [TAG_QSA_RELU_INPLACE]
 
