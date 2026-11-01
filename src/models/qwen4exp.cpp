@@ -3088,23 +3088,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
         o = ggml_reshape_3d(ctx0, o, o->ne[0], nc, n_stream);
 
         if (out == nullptr) {
-            // the first chunk's rows are 0 .. nc-1 of every stream (padded or not): its destination is a node - the chunk
-            // padded to n_tps rows - not a fresh leaf, so gallocr allocates it here instead of before every node
-            // (leaves are allocated first: a [hd, n_tps, n_stream] leaf per chunked layer would live across the graph)
-            GGML_ASSERT(t0 == 0);
-            out = ggml_pad(ctx0, o, 0, (int) (n_tps - nc), 0, 0);
-        } else {
-            // the destination rows: `rows` itself when the chunk is not padded (t0 .. t0+nc-1 per stream), else its first nc
-            ggml_tensor * dst_rows = rows;
-            if (np > nc) {
-                dst_rows = ggml_arange(ctx0, (float) t0, (float) (t0 + nc), 1.0f);
-                if (n_stream > 1) {
-                    dst_rows = ggml_repeat_4d(ctx0, dst_rows, nc, n_stream, 1, 1);
-                }
-                dst_rows = ggml_cast(ctx0, dst_rows, GGML_TYPE_I32); // [nc, n_stream]
-            }
-            out = ggml_set_rows(ctx0, out, o, dst_rows);
+            out = ggml_new_tensor_3d(ctx0, o->type, o->ne[0], n_tps, n_stream);
         }
+        // the destination rows: `rows` itself when the chunk is not padded (t0 .. t0+nc-1 per stream), else its first nc
+        ggml_tensor * dst_rows = rows;
+        if (np > nc) {
+            dst_rows = ggml_arange(ctx0, (float) t0, (float) (t0 + nc), 1.0f);
+            if (n_stream > 1) {
+                dst_rows = ggml_repeat_4d(ctx0, dst_rows, nc, n_stream, 1, 1);
+            }
+            dst_rows = ggml_cast(ctx0, dst_rows, GGML_TYPE_I32); // [nc, n_stream]
+        }
+        out = ggml_set_rows(ctx0, out, o, dst_rows);
         ggml_build_forward_expand(gf, out);
 
         t0 += nc;
