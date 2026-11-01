@@ -1471,7 +1471,8 @@ static void ggml_compute_forward_mul_mat_rows(
           struct ggml_tensor * b    = dst->src[1];
     const struct ggml_tensor * rows = dst->src[2];
 
-    GGML_ASSERT(a->type == GGML_TYPE_F32 && rows->type == GGML_TYPE_I32);
+    // [TAG_QSA_IDX_F16_DECODE] an F16 store gathers F16 rows: the product is then the F16 x F32 MUL_MAT
+    GGML_ASSERT((a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16) && rows->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(rows));
 
     const int64_t K      = a->ne[0];

@@ -3331,7 +3331,7 @@ struct ggml_tensor * ggml_mul_mat_rows(
         struct ggml_tensor  * a,
         struct ggml_tensor  * rows,
         struct ggml_tensor  * b) {
-    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && rows->type == GGML_TYPE_I32);
+    GGML_ASSERT((a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16) && b->type == GGML_TYPE_F32 && rows->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(rows));
     GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
     GGML_ASSERT(rows->ne[2] == 1 && rows->ne[3] == 1);

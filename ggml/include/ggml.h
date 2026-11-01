@@ -1463,10 +1463,12 @@ extern "C" {
     // (rows_flat = the M*n_b ids of `rows` in order): every backend computes it with the kernel, tiling and K
     // reduction order its MUL_MAT would pick for that [K, M, n_b] x [K, N, n_b] product, only the address of A's
     // row m of batch s is a[rows[m, s]].
-    //   a:      [K, n_rows]     F32, contiguous      (any row may be named any number of times)
+    //   a:      [K, n_rows]     F32 or F16, contiguous (any row may be named any number of times)
     //   rows:   [M, n_b]        I32, contiguous      (0 <= rows[m, s] < n_rows)
     //   b:      [K, N, n_b]     F32
     //   result: [M, N, n_b]     F32: result[m, n, s] = sum_k a[k, rows[m, s]] * b[k, n, s]
+    // [TAG_QSA_IDX_F16_DECODE] an F16 `a` (the qwen4exp store's f16 mirror) is the same contract with get_rows' F32 output
+    // copied back to F16 (exact) before the mul_mat: the F16 x F32 product. Vulkan takes it only at mat-vec widths.
     GGML_API struct ggml_tensor * ggml_mul_mat_rows(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
