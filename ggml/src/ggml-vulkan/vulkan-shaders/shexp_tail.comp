@@ -1,0 +1,57 @@
+#version 450
+
+#include "types.glsl"
+#include "utils.glsl"
+
+// [TAG_DECODE_FUSE] D3 "shexp_tail": the last two nodes of the qwen4exp FFN (build_layer_ffn)
+//   gated = shexp * gate          MUL   (gate = the shared expert's SIGMOID output, [1, T] or [ne0, T])
+//   out   = moe_out + gated       ADD   (ffn_out; moe_out = the expert-sum multi_add output)
+// in one dispatch. Exactness: the product is mul.comp's a * b rounded to f32 (f32 operands, as its store did), the sum
+// is add.comp's a + b on two f32 values. `precise` on the sum forbids contracting the product into it (an fma would
+// skip the product's rounding); nothing else in the expression can contract.
+// DECODE_FUSE_MUTANT (scratch trees only): 11 = the product contracted into the sum (fma).
+
+#ifndef DECODE_FUSE_MUTANT
+#define DECODE_FUSE_MUTANT 0
+#endif
+
+layout (binding = 0) readonly  buffer X {float data_x[];};   // the MUL operand of shape [ne0, T]
+layout (binding = 1) readonly  buffer G {float data_g[];};   // the MUL operand of shape [g_ne0, T], g_ne0 = 1 or ne0
+layout (binding = 2) readonly  buffer M {float data_m[];};   // moe_out [ne0, T]
+layout (binding = 3) writeonly buffer D {float data_d[];};   // out [ne0, T]
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint32_t ne0;      // n_embd
+    uint32_t ne;       // ne0 * T
+    uint32_t g_ne0;    // 1 (broadcast over the row) or ne0
+    uint32_t x_nb1;    // token strides, elements
+    uint32_t g_nb1;
+    uint32_t m_nb1;
+    uint32_t d_nb1;
+    uint32_t x_first;  // 1: the product is x * g (MUL src0 = x), 0: g * x
+} p;
+
+float product(float x, float g) {
+    return p.x_first != 0 ? x * g : g * x;
+}
+
+void main() {
+    const uint32_t idx = gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+    const uint32_t i0 = fastmod(idx, p.ne0);
+    const uint32_t t  = (idx - i0) / p.ne0;
+    const float x = data_x[t * p.x_nb1 + i0];
+    const float g = data_g[t * p.g_nb1 + (p.g_ne0 == 1 ? 0 : i0)];
+    const float m = data_m[t * p.m_nb1 + i0];
+#if DECODE_FUSE_MUTANT == 11
+    data_d[t * p.d_nb1 + i0] = fma(x, g, m);
+#else
+    const float gated = product(x, g);
+    precise float o = m + gated;
+    data_d[t * p.d_nb1 + i0] = o;
+#endif
+}

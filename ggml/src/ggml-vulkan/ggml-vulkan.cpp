@@ -1338,6 +1338,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     // [TAG_CONV_INPUT_SPLIT] CONCAT(state, x) + SSM_CONV (+ SILU / + ADD + SILU), by the number of fused ops after the conv
     vk_pipeline pipeline_ssm_conv_split_f32[3];
+    // [TAG_DECODE_FUSE] D3 decode fusions
+    vk_pipeline pipeline_shexp_tail_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -2419,6 +2421,12 @@ struct vk_op_ssm_conv_split_push_constants {
     uint32_t nbx0, nbx1, nbx2;   // the concat's second operand, element strides: token, channel, sequence
 };
 static_assert(offsetof(vk_op_ssm_conv_split_push_constants, sc) == sizeof(vk_op_ssm_conv_push_constants));
+// [TAG_DECODE_FUSE] shexp_tail.comp: MUL(shexp, gate) + ADD(moe_out, .) (strides in elements)
+struct vk_op_shexp_tail_push_constants {
+    uint32_t ne0, ne, g_ne0;
+    uint32_t x_nb1, g_nb1, m_nb1, d_nb1;
+    uint32_t x_first;
+};
 
 struct vk_op_conv2d_push_constants {
     uint32_t Cout;
@@ -2757,6 +2765,24 @@ static bool ggml_vk_env_bool(const char * name, bool def) {
         return def;
     }
     return atoi(s) != 0;
+}
+
+// [TAG_DECODE_FUSE] GGML_VK_DECODE_FUSE (default on; =0 restores the v70 dispatches): the D3 decode fusions of the v71
+// program. Each is its own recognition + shader and takes only nodes that are consecutive in the optimised graph order
+// (a buffer ggml-alloc freed after its last reader may hold a later node's data, so nothing is read past its slot), at
+// <= vk_decode_fuse_max_rows rows: shexp_tail, shexp_glu_sig, gdn_qk_gate. GGML_VK_DISABLE_FUSION_PATTERNS=<name>
+// disables one; GGML_VK_FUSION_COUNT reports each as <name>=<n> (the fusion witness).
+static bool ggml_vk_decode_fuse_enabled() {
+    static const bool on = ggml_vk_env_bool("GGML_VK_DECODE_FUSE", true);
+    return on;
+}
+// rows (tokens x sequences) up to which the decode fusions are tried; the class-A proof covers 1..9 and 16
+static constexpr int64_t vk_decode_fuse_max_rows = 32;
+// a range whose last node feeds the RMS_NORM right after it keeps today's dispatches: build_graph's add_rms (an
+// ADD-led node writing the sum-of-squares partials that RMS_NORM reads) must stay as it is
+static bool ggml_vk_decode_fuse_feeds_rms(const struct ggml_cgraph * cgraph, int last) {
+    return last + 1 < cgraph->n_nodes && cgraph->nodes[last + 1]->op == GGML_OP_RMS_NORM &&
+           cgraph->nodes[last + 1]->src[0] == cgraph->nodes[last];
 }
 
 // [TAG_MMID_TILE_B1] GGML_VK_MMID_TILE_BM128 (default on, =0 off): the coopmat1 mul_mat_id l tile = BM 128 x BN 64 on AMD
@@ -8193,6 +8219,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32[0], "ssm_conv_split_f32",           ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 5, sizeof(vk_op_ssm_conv_split_push_constants), {64, 32, 1}, {64, 4, 0, 0, 8}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32[1], "ssm_conv_split_silu_f32",      ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 5, sizeof(vk_op_ssm_conv_split_push_constants), {64, 32, 1}, {64, 4, 0, 1, 8}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32[2], "ssm_conv_split_bias_silu_f32", ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 5, sizeof(vk_op_ssm_conv_split_push_constants), {32, 16, 1}, {32, 16, 1, 1, 1}, 1);
+    // [TAG_DECODE_FUSE] D3 decode fusions
+    ggml_vk_create_pipeline(device, device->pipeline_shexp_tail_f32, "shexp_tail_f32", shexp_tail_f32_len, shexp_tail_f32_data, "main", 4, sizeof(vk_op_shexp_tail_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -17346,6 +17374,49 @@ static void ggml_vk_ssm_conv_split(ggml_backend_vk_context * ctx, vk_context& su
     ggml_vk_op_f32<vk_op_ssm_conv_split_push_constants>(ctx, subctx, state, w, src2, x, dst, GGML_OP_SSM_CONV, std::move(pc));
 }
 
+// [TAG_DECODE_FUSE] D3 "shexp_tail" dispatch (validated by ggml_vk_can_fuse_shexp_tail)
+static void ggml_vk_shexp_tail_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    ggml_tensor *       add = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * moe = add->src[0] == mul ? add->src[1] : add->src[0];
+    // the matcher took src0 as the [ne0, T] operand when it is one (the product stays src0 * src1 either way)
+    const bool x_first = mul->src[0]->ne[0] == add->ne[0];
+    const ggml_tensor * x = x_first ? mul->src[0] : mul->src[1];
+    const ggml_tensor * g = x_first ? mul->src[1] : mul->src[0];
+    vk_op_shexp_tail_push_constants pc{};
+    pc.ne0 = (uint32_t) add->ne[0];
+    pc.ne  = (uint32_t) ggml_nelements(add);
+    pc.g_ne0 = (uint32_t) g->ne[0];
+    pc.x_nb1 = (uint32_t) (x->nb[1] / sizeof(float));
+    pc.g_nb1 = (uint32_t) (g->nb[1] / sizeof(float));
+    pc.m_nb1 = (uint32_t) (moe->nb[1] / sizeof(float));
+    pc.d_nb1 = (uint32_t) (add->nb[1] / sizeof(float));
+    pc.x_first = x_first ? 1 : 0;
+    vk_pipeline pipeline = ctx->device->pipeline_shexp_tail_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const std::array<uint32_t, 3> elements = { pc.ne, 1, 1 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, x), ggml_vk_tensor_subbuffer(ctx, g), ggml_vk_tensor_subbuffer(ctx, moe),
+          ggml_vk_tensor_subbuffer(ctx, add) }, pc, elements);
+}
+
+// [TAG_DECODE_FUSE] the D3 fusions start at nodes whose op cases belong to other fusions (MUL / GLU / RMS_NORM), so
+// build_graph asks here before its op switch. The matchers are side-effect free: a fused range is ours exactly when
+// its matcher returns this node's num_additional_fused_ops (no other fusion starting at the same op produces that count
+// on the same nodes - see each matcher). Returns true when it dispatched.
+static int ggml_vk_can_fuse_shexp_tail(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
+static bool ggml_vk_decode_fuse_dispatch(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (ctx->num_additional_fused_ops < 1 || !ggml_vk_decode_fuse_enabled()) {
+        return false;
+    }
+    const ggml_tensor * node = cgraph->nodes[node_idx];
+    if (node->op == GGML_OP_MUL && ggml_vk_can_fuse_shexp_tail(ctx, cgraph, node_idx) == ctx->num_additional_fused_ops) {
+        ggml_vk_shexp_tail_dispatch_fused(ctx, subctx, cgraph, node_idx);
+        return true;
+    }
+    return false;
+}
+
 static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
     const ggml_tensor * x = dst->src[0];
     const ggml_tensor * g = dst->src[1];
@@ -21036,6 +21107,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             std::cerr << std::endl;
         }
     }
+    if (ggml_vk_decode_fuse_dispatch(ctx, compute_ctx, cgraph, node_idx)) {
+        goto decode_fuse_dispatched;   // [TAG_DECODE_FUSE]
+    }
 
     switch (node->op) {
     case GGML_OP_REPEAT:
@@ -21470,6 +21544,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     default:
         return false;
     }
+decode_fuse_dispatched:
 
     ctx->tensor_ctxs[node_idx] = compute_ctx;
 
@@ -22773,6 +22848,55 @@ static bool ggml_vk_can_fuse_concat_ssm_conv(const ggml_backend_vk_context * ctx
         return false;
     }
     return true;
+}
+
+// [TAG_DECODE_FUSE] D3 "shexp_tail": MUL(shexp, gate) -> ADD(moe_out, gated), the last two nodes of the qwen4exp FFN
+// (build_layer_ffn: ffn_shexp_gated, ffn_out), consecutive. 2-d f32, the gate [1, T] (broadcast) or [ne0, T]; the
+// product is elided (read only by the ADD); one output. Today's ADD must start no multi_add and feed no add_rms, and no
+// source may overlap the destination other than exactly (the graph_compute veto would undo the pair): a refused pair
+// keeps today's MUL + ADD. Returns the number of additional fused nodes (0 = no match).
+static uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
+static int ggml_vk_can_fuse_shexp_tail(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_decode_fuse_enabled() || node_idx + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+    if (mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD) {
+        return 0;
+    }
+    const ggml_tensor * moe = add->src[0] == mul ? add->src[1] : (add->src[1] == mul ? add->src[0] : nullptr);
+    if (!moe || moe == mul) {
+        return 0;
+    }
+    const int64_t ne0 = add->ne[0], T = add->ne[1];
+    auto const plain2d = [&](const ggml_tensor * t, int64_t e0) {
+        return t->type == GGML_TYPE_F32 && t->ne[0] == e0 && t->ne[1] == T && t->ne[2] == 1 && t->ne[3] == 1 &&
+               t->nb[0] == sizeof(float) && t->nb[1] % sizeof(float) == 0;
+    };
+    if (T > vk_decode_fuse_max_rows || !plain2d(add, ne0) || !plain2d(mul, ne0) || !plain2d(moe, ne0)) {
+        return 0;
+    }
+    const ggml_tensor * a = mul->src[0];
+    const ggml_tensor * b = mul->src[1];
+    const bool ab = plain2d(a, ne0) && (plain2d(b, 1) || plain2d(b, ne0));
+    const bool ba = !ab && plain2d(b, ne0) && plain2d(a, 1);
+    if (!ab && !ba) {
+        return 0;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL, GGML_OP_ADD }, { node_idx + 1 }) ||
+        ggml_vk_fuse_multi_add(ctx, cgraph, node_idx + 1) != 0 || ggml_vk_decode_fuse_feeds_rms(cgraph, node_idx + 1)) {
+        return 0;
+    }
+    for (const ggml_tensor * t : { a, b, moe }) {
+        if (get_misalign_bytes(ctx, t) || ggml_vk_tensors_overlap(t, add, true)) {
+            return 0;
+        }
+    }
+    if (get_misalign_bytes(ctx, add)) {
+        return 0;
+    }
+    return 1;
 }
 
 static bool ggml_vk_can_fuse_topk_moe(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
@@ -24397,6 +24521,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_LATE_SOFTMAX;
                 fusion_string = "TOPK_MOE_LATE_SOFTMAX";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (cgraph->nodes[i]->op == GGML_OP_MUL && ggml_vk_can_fuse_shexp_tail(ctx, cgraph, i) > 0 &&
+                       !vk_fusion_veto(ctx, "shexp_tail")) {
+                // [TAG_DECODE_FUSE] D3 shexp_tail: one output (the ADD); every source is read at the destination's
+                // (i0, t) only (the gate per row), so an exact alias is safe; the matcher refused any other overlap
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "SHEXP_TAIL";
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse_add_softplus_mul(ctx, cgraph, i) &&
                        !vk_fusion_veto(ctx, "add_softplus_mul")) {
                 ctx->num_additional_fused_ops = 2;
@@ -24455,15 +24587,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // Check whether fusion would overwrite src operands while they're still in use.
         // If so, disable fusion.
         if (ctx->num_additional_fused_ops) {
-            // There are up to two output nodes - topk_moe has two.
+            // There are up to two output nodes - topk_moe has two - and three for [TAG_DECODE_FUSE] gdn_qk_gate.
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
-            ggml_tensor *output_nodes[2] {};
+            ggml_tensor *output_nodes[3] {};
             output_nodes[0] = cgraph->nodes[i + ctx->num_additional_fused_ops];
-            if (bits) {
+            for (int j = 1; bits && j < 3; ++j) {
                 int output_idx = find_first_set(bits);
-                GGML_ASSERT(bits == (1u << output_idx));
-                output_nodes[1] = cgraph->nodes[i + output_idx];
+                output_nodes[j] = cgraph->nodes[i + output_idx];
+                bits &= ~(1u << output_idx);
             }
+            GGML_ASSERT(bits == 0);
 
             bool need_disable = false;
 
@@ -24474,7 +24607,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                                           ggml_nrows(cgraph->nodes[i]->src[0]) == 1;
 
             if (!is_topk_moe_single_row) {
-                for (int j = 0; j < 2; ++j) {
+                for (int j = 0; j < 3; ++j) {
                     ggml_tensor *dst = output_nodes[j];
                     if (!dst) {
                         continue;

@@ -1328,6 +1328,8 @@ void process_shaders() {
 
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
     string_to_spv("ssm_conv_split_f32", "ssm_conv.comp", {{"A_TYPE", "float"}, {"TWO_SRC", "1"}});
+    // [TAG_DECODE_FUSE] D3 decode fusions (ggml_vk_decode_fuse_dispatch)
+    string_to_spv("shexp_tail_f32", "shexp_tail.comp", {});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
