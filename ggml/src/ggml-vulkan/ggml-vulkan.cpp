@@ -23664,7 +23664,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         if (vk_fusion_list_enabled && cgraph->nodes[i]->op == GGML_OP_QSA_SCORE) {
             // [TAG_QSA_SCORE_EPILOGUE] one node, listed like a fusion so the fusion sets of two runs can be diffed
-            ggml_vk_fusion_list_report("qsa_score_epilogue", cgraph, i, 1, cgraph->nodes[i]->src[3] ? "+bias" : nullptr);
+            ggml_vk_fusion_list_report("qsa_score_epilogue", cgraph, i, 1,
+                                       (cgraph->nodes[i]->src[3] || cgraph->nodes[i]->src[5]) ? "+bias" : nullptr);
         }
         if (vk_fusion_list_enabled && ctx->num_additional_fused_ops > 0 && fusion_string) {
             std::string name = fusion_string;
@@ -23703,7 +23704,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // (+ bias ADD); qsa_score_epilogue_bias counts those that also folded the bias. Not a fusion pattern: one node.
             if (cgraph->nodes[i]->op == GGML_OP_QSA_SCORE) {
                 ggml_vk_fusion_count_add(fusion_counts, "", "qsa_score_epilogue");
-                if (cgraph->nodes[i]->src[3]) {
+                if (cgraph->nodes[i]->src[3] || cgraph->nodes[i]->src[5]) { // a bias node, or the [TAG_QSA_BIAS_FOLD] tables
                     ggml_vk_fusion_count_add(fusion_counts, "", "qsa_score_epilogue_bias");
                 }
                 // [TAG_QSA_BIAS_FOLD] qsa_bias_fold=<count>: those that compute the QSA_BIAS value in the epilogue

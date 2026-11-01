@@ -2357,6 +2357,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
     ggml_tensor * pooled = nullptr;
+    bool pooled_is_store = false; // pooled = the store CPY itself: it keeps its indexer_k_store-<il> name
 
     // [TAG_QSA_POOL_REMAP] LLAMA_QSA_POOL_REMAP=indexed (default): instead of `pooled`, the store and the remap the
     // score reads it through (a dirty-list graph only; the full pool has no remap and keeps `pooled`)
@@ -2416,7 +2417,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                 // [TAG_QSA_POOL_NO_CONT] indexed (the default): the run-time graphs have no such plane - the score
                 // reads the store through the remap ([TAG_QSA_POOL_REMAP]) - so the parity reason is gone and the
                 // score reads the store view itself (n_stream == 1: [idx_dim, n_blocks, 1], contiguous).
-                pooled = llama_qsa_pool_remap_indexed() ? st : ggml_cont(ctx0, st);
+                pooled_is_store = llama_qsa_pool_remap_indexed();
+                pooled = pooled_is_store ? st : ggml_cont(ctx0, st);
             } else {
                 // the store view skips the other streams' rows between batches: keep the contiguous rows for the
                 // GEMM and expand the copy on its own
@@ -2456,7 +2458,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         pooled = build_qsa_pool(k_all, inp->blk_cells, inp->blk_pos, n_blocks, n_stream, sections,
                 "indexer_k_pooled", il);
     }
-    if (pooled) {
+    if (pooled && !pooled_is_store) {
         cb(pooled, "indexer_k", il);
     }
 

@@ -17,7 +17,7 @@ extern "C" {
 // disagree about every op past UNARY. Nothing here builds with GGML_RPC=ON, so this is a marker for
 // whoever turns it on - if RPC ever ships from this fork the version policy needs a real decision
 // (a major bump), not a patch.
-#define RPC_PROTO_PATCH_VERSION    4 // [TAG_QSA_COMPACT_BIAS] 1 -> 2: GGML_OP_QSA_BIAS after QSA_TOP_K; [TAG_QSA_POOL_REMAP] 2 -> 3: GGML_OP_MUL_MAT_ROWS after QSA_BIAS (and GGML_OP_KQ_MASK, which did not bump it); [TAG_QSA_SCORE_EPILOGUE] 3 -> 4: GGML_OP_QSA_SCORE after MUL_MAT_ROWS
+#define RPC_PROTO_PATCH_VERSION    5 // [TAG_QSA_COMPACT_BIAS] 1 -> 2: GGML_OP_QSA_BIAS after QSA_TOP_K; [TAG_QSA_POOL_REMAP] 2 -> 3: GGML_OP_MUL_MAT_ROWS after QSA_BIAS (and GGML_OP_KQ_MASK, which did not bump it); [TAG_QSA_SCORE_EPILOGUE] 3 -> 4: GGML_OP_QSA_SCORE after MUL_MAT_ROWS; [TAG_QSA_BIAS_FOLD] 4 -> 5: QSA_SCORE bias tables as src[5..7]
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");

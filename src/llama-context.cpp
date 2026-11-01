@@ -591,6 +591,15 @@ struct llama_qsa_ids_dump {
             }
             return true;
         }
+        if (self->ids && llama_qsa_dump_name_is(t, "indexer_k_store-") && t->op == GGML_OP_CPY && t->ne[2] == 1 &&
+            llama_qsa_pool_remap_indexed()) {
+            // [TAG_QSA_POOL_NO_CONT] the full pool's score reads the store CPY itself (n_stream == 1, POOL_REMAP=indexed),
+            // which keeps its indexer_k_store-<il> name: the same bytes "indexer_k-<il>" named before
+            if (!ask) {
+                self->dump_pooled(t, "pooled", atoi(t->name + 16));
+            }
+            return true;
+        }
         if (self->ids && llama_qsa_dump_name_is(t, "indexer_k_dirty-")) {
             // [TAG_QSA_POOLED_CACHE] the dirty-list pooling the cache stores (prod: pooled cache + indexed remap)
             if (!ask) {
