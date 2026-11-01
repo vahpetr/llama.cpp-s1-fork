@@ -718,6 +718,15 @@ static constexpr std::initializer_list<std::array<int, 3>> hc_combine_edges {
     { 6, 1, 5 }, // add->src[1]     == mul
 };
 
+// [TAG_ADD_RMS_ROWS] the combine followed by the next sublayer's grouped RMSNorm (build_hc_mix: RMS_NORM(hc_combine) * w_norm
+// = hc_norm). One dispatch (rms_norm_hc_combine_f32) writes the combine's output AND hc_norm; see
+// ggml_vk_can_fuse_hc_combine_rms. The ADD (node 6) stays an output: the next combine reads it as its residual.
+static constexpr std::initializer_list<ggml_op> hc_combine_rms_pattern     { GGML_OP_REPEAT,  GGML_OP_SCALE,
+                                                                             GGML_OP_UNARY,   GGML_OP_SCALE,
+                                                                             GGML_OP_RESHAPE, GGML_OP_MUL,
+                                                                             GGML_OP_ADD,     GGML_OP_RMS_NORM,
+                                                                             GGML_OP_MUL };
+
 // qwen4 QSA indexer: gather per-block scores to cells + add f16 mask (cast+reshape) + top-k,
 // fused into one radix-select. The cast/reshape are elided; the raw f16 mask is read in-shader.
 static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_ROWS, GGML_OP_PERMUTE,
@@ -1191,6 +1200,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_sigmoid_mul_f32;
     vk_pipeline pipeline_rms_norm_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
+    vk_pipeline pipeline_rms_norm_hc_combine_f32;   // [TAG_ADD_RMS_ROWS]
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f16;
     vk_pipeline pipeline_rms_norm_back_f32;
@@ -1369,6 +1379,7 @@ struct vk_device_struct {
     std::atomic<uint64_t> buffer_destroy_count {};
     // per-fusion kill switches (all default on, GGML_VK_FUSE_<NAME>=0 turns one off)
     bool fuse_hc_combine;
+    bool fuse_hc_combine_rms;   // [TAG_ADD_RMS_ROWS] GGML_VK_ADD_RMS_ROWS (default on; =0 the v70 HC_COMBINE + RMS_NORM_MUL pair)
     bool fuse_sigmoid_mul;
     bool fuse_gdn_pre;
     // [TAG_HC_MIX_TAIL] GGML_VK_FUSE_MULTI_ADD_SCALE / GGML_VK_FUSE_SCALE_SILU
@@ -2275,6 +2286,15 @@ struct vk_op_hc_combine_push_constants {
     float    s2;
 };
 
+// [TAG_ADD_RMS_ROWS] rms_norm_hc_combine_f32: the RMS_NORM_MUL constants, then the combine's (generic_binary_head.glsl)
+struct vk_op_hc_combine_rms_push_constants {
+    vk_op_binary_push_constants bin;
+    float    s1;
+    float    s2;
+    uint32_t inj_nb1;
+};
+static_assert(sizeof(vk_op_hc_combine_rms_push_constants) == sizeof(vk_op_binary_push_constants) + 12);
+
 struct vk_op_add_softplus_mul_push_constants {
     uint32_t ne0;
     uint32_t ne;
@@ -3093,6 +3113,8 @@ static bool ggml_vk_g1_tile_valid(const vk_device & device, const vk_g1_tile & t
 //   ssm_conv_bias_silu               SSM_CONV+ADD+SILU
 //   ssm_conv_silu                    SSM_CONV+SILU
 //   rope_view_set_rows               ROPE+VIEW+SET_ROWS
+//   hc_combine_rms                   hc_combine + RMS_NORM+MUL               ([TAG_ADD_RMS_ROWS] the combine and the next hc_norm,
+//                                                                          any row count; GGML_VK_ADD_RMS_ROWS=0 turns it off)
 //   hc_combine                       REPEAT+SCALE+SIGMOID+SCALE+RESHAPE+MUL+ADD   (qwen4exp hyper-connection combine)
 //   snake                            MUL+SIN+SQR+MUL+ADD
 //   topk_qsa                         GET_ROWS+PERMUTE+CONT+CPY+RESHAPE+ADD+TOP_K   (qwen4 QSA indexer selection)
@@ -3163,7 +3185,7 @@ static const char * const vk_fusion_pattern_names[] = {
     "topk_moe_early_softmax", "topk_moe_late_softmax", "topk_moe_scale", "add_softplus_mul",
     "sigmoid_mul", "add_rms", "multi_add_scale", "scale_silu",
     "concat_ssm_conv_bias_silu", "concat_ssm_conv_silu", "concat_ssm_conv",
-    "rms_norm_scale", "rms_norm_mul_sigmoid_mul", "rms_norm_mul_mul", "hc_tail_mix",
+    "rms_norm_scale", "rms_norm_mul_sigmoid_mul", "rms_norm_mul_mul", "hc_tail_mix", "hc_combine_rms",
 };
 static bool vk_fusion_patterns_disabled_any = false;
 static std::vector<std::string> vk_fusion_patterns_disabled; // lower-case; trailing '*' = prefix match
@@ -3705,6 +3727,7 @@ struct ggml_backend_vk_context {
     // [TAG_RMS_NORM_EXT] RMS_NORM + SCALE (dst = the SCALE node), and the RMS_NORM + MUL tail
     // 0 = none, 1 = + MUL (RMS_NORM_MUL_MUL), 2 = + SIGMOID + MUL (RMS_NORM_MUL_SIGMOID_MUL)
     bool fused_rms_norm_scale {};
+    bool fused_hc_combine_rms {};   // [TAG_ADD_RMS_ROWS]
     int  fused_rms_norm_mul2 {};
     // ADD + UNARY(SOFTPLUS) + MUL: the GDN decay pre-chain, one dispatch off the ADD node
     bool fused_gdn_pre {};
@@ -7545,6 +7568,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_sigmoid_mul_f32, "rms_norm_mul_sigmoid_mul_f32", rms_norm_ext_f32_len, rms_norm_ext_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0, 1, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_partials_f32, "rms_norm_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_partials_f32, "rms_norm_mul_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+    // [TAG_ADD_RMS_ROWS] the rms_norm_mul_f32 specialisation (norepeat 0, do_multiply 1) of the HC_COMBINE_RMS variant
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_hc_combine_f32, "rms_norm_hc_combine_f32", rms_norm_hc_combine_f32_len, rms_norm_hc_combine_f32_data, "main", 6, sizeof(vk_op_hc_combine_rms_push_constants), {1, 1, 1}, {0, 1}, 1, true);
 
     if (sizeof(vk_op_rms_norm_mul_rope_push_constants) <= device->properties.limits.maxPushConstantsSize) {
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_rope_f32_f32, "rms_norm_mul_rope_f32_f32", rms_norm_mul_rope_f32_f32_len, rms_norm_mul_rope_f32_f32_data, "main", 7, sizeof(vk_op_rms_norm_mul_rope_push_constants), {1, 1, 1}, {0, 1}, 1, true);
@@ -9630,6 +9655,18 @@ static vk_device ggml_vk_get_device(size_t idx) {
             return v == nullptr || atoi(v) != 0;
         };
         device->fuse_hc_combine  = fuse_enabled("GGML_VK_FUSE_HC_COMBINE");
+        // [TAG_ADD_RMS_ROWS] HC_COMBINE + the next RMS_NORM_MUL (hc_norm) in one dispatch, any row count; bit-identical
+        // hc_combine and hc_norm (test-backend-ops HC_COMBINE_RMS_EXACT, e2e per-node hashes). =0: the v70 pair.
+        device->fuse_hc_combine_rms = device->fuse_hc_combine && fuse_enabled("GGML_VK_ADD_RMS_ROWS");
+        if (getenv("GGML_VK_ADD_RMS_ROWS") != nullptr) {
+            GGML_LOG_INFO("ggml_vulkan: add_rms_rows (hc_combine + rms_norm_mul): %s (GGML_VK_ADD_RMS_ROWS)\n",
+                          device->fuse_hc_combine_rms ? "on" : "off");
+        }
+#if defined(GGML_VULKAN_ADD_RMS_ROWS_MUTANT) && GGML_VULKAN_ADD_RMS_ROWS_MUTANT > 0
+        // [TAG_ADD_RMS_ROWS] the proof line of a mutant build (a shipped build has neither the line nor the string)
+        GGML_LOG_WARN("ggml_vulkan: add_rms_rows: MUTANT BUILD %d (1 = 256-wide reduction, 2 = reversed partial order, "
+                      "3 = negative control: residual bit flip): rms_norm_hc_combine_f32 is NOT exact\n", GGML_VULKAN_ADD_RMS_ROWS_MUTANT);
+#endif
         device->fuse_sigmoid_mul = fuse_enabled("GGML_VK_FUSE_SIGMOID_MUL");
         device->fuse_gdn_pre     = fuse_enabled("GGML_VK_FUSE_GDN_PRE");
         // [TAG_RMS_NORM_EXT] both bit-exact against the unfused ops (test-backend-ops *_EXACT arms, e2e dumps)
@@ -19404,6 +19441,53 @@ static void ggml_vk_hc_combine_dispatch_fused(ggml_backend_vk_context * ctx, vk_
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { res_buf, blk_buf, inj_buf, dst_buf }, pc, elements);
 }
 
+// [TAG_ADD_RMS_ROWS] Dispatch HC_COMBINE + RMS_NORM + MUL: one workgroup per (c, t) row of the combine, as RMS_NORM
+// dispatches. Bindings: residual, w_norm, hc_norm, block, inject, the combine's destination. The pattern is validated by
+// ggml_vk_can_fuse_hc_combine_rms before this call.
+static void ggml_vk_hc_combine_rms_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * repeat = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * scale1 = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * scale2 = cgraph->nodes[node_idx + 3];
+    ggml_tensor *       add    = cgraph->nodes[node_idx + 6];
+    ggml_tensor *       rms    = cgraph->nodes[node_idx + 7];
+    ggml_tensor *       mul    = cgraph->nodes[node_idx + 8];
+
+    const ggml_tensor * block    = repeat->src[0];
+    const ggml_tensor * inject   = scale1->src[0];
+    const ggml_tensor * residual = add->src[0];
+    const ggml_tensor * w        = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+
+    // the RMS_NORM_MUL constants exactly as ggml_vk_rms_norm builds them for this pair (src0 = the combine, src1 = w)
+    const ggml_tensor * src0 = add;
+    const ggml_tensor * src1 = w;
+    const ggml_tensor * dst  = mul;
+    const uint32_t s0 = ggml_type_size(src0->type), s1 = ggml_type_size(src1->type), sd = ggml_type_size(dst->type);
+    vk_op_hc_combine_rms_push_constants pc {};
+    pc.bin = {
+        (uint32_t)ggml_nelements(src0),
+        (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2], (uint32_t)src0->ne[3], (uint32_t)src0->nb[0] / s0, (uint32_t)src0->nb[1] / s0, (uint32_t)src0->nb[2] / s0, (uint32_t)src0->nb[3] / s0,
+        (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2], (uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / s1, (uint32_t)src1->nb[1] / s1, (uint32_t)src1->nb[2] / s1, (uint32_t)src1->nb[3] / s1,
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], (uint32_t) dst->ne[3], (uint32_t) dst->nb[0] / sd, (uint32_t) dst->nb[1] / sd, (uint32_t) dst->nb[2] / sd, (uint32_t) dst->nb[3] / sd,
+        0,   // misalign_offsets: the matcher requires every binding aligned
+        ((const float *) rms->op_params)[0], 0.0f, 0,
+    };
+    pc.s1      = ((const float *)scale1->op_params)[0];
+    pc.s2      = ((const float *)scale2->op_params)[0];
+    pc.inj_nb1 = ggml_is_contiguous(inject) ? (uint32_t) add->ne[1] : (uint32_t) (inject->nb[1] / sizeof(float));
+
+    vk_subbuffer res_buf = ggml_vk_tensor_subbuffer(ctx, residual);
+    vk_subbuffer w_buf   = ggml_vk_tensor_subbuffer(ctx, w);
+    vk_subbuffer d_buf   = ggml_vk_tensor_subbuffer(ctx, mul);
+    vk_subbuffer blk_buf = ggml_vk_tensor_subbuffer(ctx, block);
+    vk_subbuffer inj_buf = ggml_vk_tensor_subbuffer(ctx, inject);
+    vk_subbuffer out_buf = ggml_vk_tensor_subbuffer(ctx, add);
+
+    vk_pipeline pipeline = ctx->device->pipeline_rms_norm_hc_combine_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const std::array<uint32_t, 3> elements = { (uint32_t) src0->ne[1], (uint32_t) src0->ne[2], (uint32_t) src0->ne[3] };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { res_buf, w_buf, d_buf, blk_buf, inj_buf, out_buf }, pc, elements);
+}
+
 // Dispatch the fused snake activation: y = x + sin^2(a * x) * inv_b.
 // Match the naive mul -> sin -> sqr -> mul -> add chain and run the
 // dedicated kernel directly. The pattern is validated by
@@ -20722,7 +20806,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     switch (node->op) {
     case GGML_OP_REPEAT:
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->fused_hc_combine_rms) {
+            ggml_vk_hc_combine_rms_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->num_additional_fused_ops) {
             ggml_vk_hc_combine_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_repeat(ctx, compute_ctx, src0, node);
@@ -22996,6 +23082,54 @@ static bool ggml_vk_can_fuse_hc_combine(ggml_backend_vk_context * ctx, const str
     return true;
 }
 
+// [TAG_ADD_RMS_ROWS] Pattern check for HC_COMBINE + RMS_NORM + MUL (hc_combine_rms_pattern): the 7-op combine as
+// ggml_vk_can_fuse_hc_combine accepts it, its ADD as the RMS_NORM's input, and the RMS_NORM's single use a MUL by a
+// weight - the pair rms_norm_mul_f32 runs. The ADD may have other uses (it is the next combine's residual), nothing else
+// may. The fused dispatch reads every operand linearly with no offset: all contiguous, f32, no misalignment. An overlap
+// of hc_norm with block / inject / w_norm (ggml-alloc may hand hc_norm a block freed inside the chain) is refused here,
+// not by the generic veto, so the 7-op HC_COMBINE still fires there (*overlap tells GGML_VK_FUSION_COUNT).
+static bool ggml_vk_can_fuse_hc_combine_rms(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
+                                            bool * overlap) {
+    if (!ctx->device->fuse_hc_combine_rms) {
+        return false;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, hc_combine_rms_pattern, { node_idx + 6, node_idx + 8 })) {
+        return false;
+    }
+    if (!ggml_vk_can_fuse_hc_combine(ctx, cgraph, node_idx)) {
+        return false;
+    }
+    const ggml_tensor * scale1 = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add    = cgraph->nodes[node_idx + 6];
+    const ggml_tensor * rms    = cgraph->nodes[node_idx + 7];
+    const ggml_tensor * mul    = cgraph->nodes[node_idx + 8];
+    if (rms->src[0] != add || (mul->src[0] != rms && mul->src[1] != rms)) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    if (w == rms || rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // hc_norm = rms_norm(add) * w with w broadcast over rows ([ne0, hc] in qwen4exp), as rms_norm_mul_f32 indexes it
+    if (!ggml_are_same_shape(mul, add) || !ggml_are_same_shape(rms, add) || !ggml_can_repeat(w, mul) ||
+        w->ne[0] != add->ne[0] || !ggml_is_contiguous(w) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+    if (get_misalign_bytes(ctx, w) != 0 || get_misalign_bytes(ctx, mul) != 0) {
+        return false;
+    }
+    const ggml_tensor * block  = cgraph->nodes[node_idx + 0]->src[0];
+    const ggml_tensor * inject = scale1->src[0];
+    if (ggml_vk_tensors_overlap(block, mul, false) || ggml_vk_tensors_overlap(inject, mul, false) ||
+        ggml_vk_tensors_overlap(w, mul, false) || ggml_vk_tensors_overlap(add, mul, false)) {
+        if (overlap) {
+            *overlap = true;
+        }
+        return false;
+    }
+    return true;
+}
+
 // Pattern check for the 5-op Snake fusion: mul -> sin -> sqr -> mul -> add.
 // Verifies the chain shape, the closure x_in_add == x_in_mul0, and that
 // the broadcast operands a and inv_b share a [1, C] layout.
@@ -23735,12 +23869,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_concat_ssm_conv = false;
         ctx->fused_rms_norm_scale = false;
         ctx->fused_rms_norm_mul2 = 0;
+        ctx->fused_hc_combine_rms = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             // [TAG_HC_TAIL_FUSE] the whole hc_mix tail, tried before its constituent sigmoid_mul (+ multi_add_scale)
             int  hc_tail_n       = 0;
             bool hc_tail_overlap = false;
+            bool hcr_overlap = false;   // [TAG_ADD_RMS_ROWS] hc_combine_rms matched but hc_norm overlaps a source
             // RMS_NORM_MUL_SIGMOID_MUL (2) / RMS_NORM_MUL_MUL (1) / none (0): evaluated once per RMS_NORM node
             const int rms_norm_mul2 = cgraph->nodes[i]->op == GGML_OP_RMS_NORM ? ggml_vk_can_fuse_rms_norm_mul2(ctx, cgraph, i) : 0;
             if (num_adds && !vk_fusion_veto(ctx, "multi_add")) {
@@ -23889,8 +24025,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
                 op_srcs_fused_elementwise[2] = false;
+            } else if (ggml_vk_can_fuse_hc_combine_rms(ctx, cgraph, i, &hcr_overlap) &&
+                       !vk_fusion_veto(ctx, "hc_combine_rms")) {
+                // [TAG_ADD_RMS_ROWS] two outputs: the combine (node 6, read by the next combine) and hc_norm (node 8)
+                ctx->num_additional_fused_ops = 8;
+                ctx->fused_hc_combine_rms = true;
+                ctx->fused_ops_write_mask |= 1 << 6;
+                fusion_string = "HC_COMBINE_RMS";
+                // elementwise=true for the residual: a workgroup reads its own row of the residual (pass 1) before it
+                // writes the same row of either destination, and both destinations have the residual's layout, so an
+                // exact alias is safe. block / inject / w_norm differ in byte size from both destinations, so any
+                // overlap of theirs is still rejected (the matcher already refused one with hc_norm, see hcr_overlap).
+                std::fill_n(op_srcs_fused_elementwise, 9, true);
             } else if (ggml_vk_can_fuse_hc_combine(ctx, cgraph, i) &&
                        !vk_fusion_veto(ctx, "hc_combine")) {
+                if (hcr_overlap && fusion_count) {
+                    ggml_vk_fusion_count_add(fusion_counts, "overlap:", "hc_combine_rms");
+                }
                 ctx->num_additional_fused_ops = 6;
                 fusion_string = "HC_COMBINE";
                 // elementwise=true: every thread reads residual[idx] into a register before
@@ -24104,6 +24255,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_concat_ssm_conv = false;
                 ctx->fused_rms_norm_scale = false;
                 ctx->fused_rms_norm_mul2 = 0;
+                ctx->fused_hc_combine_rms = false;
             }
         }
 
