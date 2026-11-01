@@ -114,7 +114,7 @@ public:
 
     std::vector<mem_cell> cells;
 
-    // [TAG_GDN_REPLAY] commit by replay of the gated delta net states (LLAMA_GDN_REPLAY=1, default off; see
+    // [TAG_GDN_REPLAY] commit by replay of the gated delta net states (LLAMA_GDN_REPLAY; default on gfx1151, off elsewhere, R188; see
     //   ggml_gated_delta_net_set_replay): S keeps one row per cell instead of 1 + n_rs_seq planes. A graph with a
     //   rollback depth commits the state after its first n_seq_tokens - D tokens (D = min(depth, n_seq_tokens - 1),
     //   the depth the planes would allow) and keeps the inputs of the last D tokens in the stash slot of the sequence
