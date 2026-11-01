@@ -8330,6 +8330,8 @@ struct test_mul_mat_rows : public test_case {
     const int     mode;
     const bool    exact;
     const int     form;   // 0 = the op, 1 = the copy path's get_rows alone, 2 = its mul_mat alone (perf)
+    const ggml_type type_a; // [TAG_QSA_IDX_F16_DECODE] F32, or F16 (the f16 mirror; the exact form's copy path casts the
+                            // get_rows output back to F16 before the mul_mat: the same F16 x F32 product)
 
     static const char * mode_name(int m) {
         static const char * names[M_COUNT] = { "random", "perm", "ident", "spare", "quant", "prod" };
@@ -8347,12 +8349,15 @@ struct test_mul_mat_rows : public test_case {
 
     std::string vars() override {
         const std::string data = mode_name(mode);
-        return form == 0 ? VARS_TO_STR5(K, M, N, n_b, data) : VARS_TO_STR6(K, M, N, n_b, data, form);
+        const std::string v = form == 0 ? VARS_TO_STR5(K, M, N, n_b, data) : VARS_TO_STR6(K, M, N, n_b, data, form);
+        return type_a == GGML_TYPE_F32 ? v : v + ",type_a=" + ggml_type_name(type_a);
     }
 
-    test_mul_mat_rows(int64_t K, int64_t M, int64_t N, int64_t n_b, int mode, bool exact, int form = 0)
-        : K(K), M(M), N(N), n_b(n_b), mode(mode), exact(exact), form(form) {
+    test_mul_mat_rows(int64_t K, int64_t M, int64_t N, int64_t n_b, int mode, bool exact, int form = 0,
+                      ggml_type type_a = GGML_TYPE_F32)
+        : K(K), M(M), N(N), n_b(n_b), mode(mode), exact(exact), form(form), type_a(type_a) {
         GGML_ASSERT(mode >= 0 && mode < M_COUNT && form >= 0 && form <= 2 && !(exact && form != 0));
+        GGML_ASSERT(type_a == GGML_TYPE_F32 || (type_a == GGML_TYPE_F16 && form == 0));
     }
 
     double max_nmse_err() override { return 5e-4; }
@@ -8390,7 +8395,7 @@ struct test_mul_mat_rows : public test_case {
             return out;
         }
 
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_rows());
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, K, n_rows());
         ggml_set_name(a, "a");
         ggml_tensor * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, M, n_b);
         ggml_set_name(rows, "rows");
@@ -8411,6 +8416,10 @@ struct test_mul_mat_rows : public test_case {
         // the qwen4exp copy path, node for node: get_rows of the flat remap, reshaped to [K, M, n_b], then mul_mat
         ggml_tensor * pooled = ggml_get_rows(ctx, a, ggml_reshape_1d(ctx, rows, M*n_b));
         pooled = ggml_reshape_3d(ctx, pooled, K, M, n_b);
+        if (type_a != GGML_TYPE_F32) {
+            // get_rows widens to F32; the cast back is exact (every value came from an F16)
+            pooled = ggml_cpy(ctx, pooled, ggml_new_tensor_3d(ctx, type_a, K, M, n_b));
+        }
         ggml_tensor * copy = ggml_mul_mat(ctx, pooled, b);
         ggml_set_name(copy, "copy");
 
@@ -8451,6 +8460,12 @@ struct test_mul_mat_rows : public test_case {
                 for (auto & x : v) {
                     x = u11(rng);
                 }
+            }
+            if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> h(n);
+                ggml_fp32_to_fp16_row(v.data(), h.data(), n);
+                ggml_backend_tensor_set(t, h.data(), 0, n*sizeof(ggml_fp16_t));
+                return;
             }
             ggml_backend_tensor_set(t, v.data(), 0, n*sizeof(float));
         };
@@ -13736,6 +13751,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_rows(128, M, N, 1, test_mul_mat_rows::M_RANDOM, true));
         }
     }
+    // [TAG_QSA_IDX_F16_DECODE] an F16 store (the f16 mirror) at the mat-vec widths (N 1 / 4 / 8; Vulkan takes nothing
+    // wider), bit for bit against get_rows -> cast to F16 -> mul_mat on the backend itself, and against the CPU (NMSE)
+    for (int mode = 0; mode < test_mul_mat_rows::M_COUNT; mode++) {
+        for (int64_t N : { 1, 4, 8 }) {
+            test_cases.emplace_back(new test_mul_mat_rows(128, 4096, N, 1, mode, true, 0, GGML_TYPE_F16));
+        }
+        test_cases.emplace_back(new test_mul_mat_rows(72,  777,  4, 1, mode, true, 0, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_mul_mat_rows(128, 3000, 1, 2, mode, true, 0, GGML_TYPE_F16));
+    }
+    for (int64_t M : { 65536, 262016 }) {
+        test_cases.emplace_back(new test_mul_mat_rows(128, M, 4, 1, test_mul_mat_rows::M_PROD, true, 0, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_mul_mat_rows(128, M, 8, 1, test_mul_mat_rows::M_PROD, true, 0, GGML_TYPE_F16));
+    }
+    for (int64_t N : { 1, 4, 8 }) {
+        test_cases.emplace_back(new test_mul_mat_rows(128, 4096, N, 1, test_mul_mat_rows::M_PROD, false, 0, GGML_TYPE_F16));
+    }
+
     // ... and the op against the CPU (NMSE)
     for (int mode : { test_mul_mat_rows::M_RANDOM, test_mul_mat_rows::M_PROD }) {
         for (int64_t N : { 1, 4, 24, 96 }) {
