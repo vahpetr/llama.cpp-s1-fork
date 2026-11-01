@@ -2469,7 +2469,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     cb(q, "indexer_q", il);
 
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-    q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream);
+    // [TAG_QSA_Q_NO_CONT] the rope output is a fresh contiguous tensor: a reshape gives the same bytes without the copy
+    GGML_ASSERT(ggml_is_contiguous(q));
+    q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream);
 
     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) qwen4exp_qsa_top_k(hparams, il) + r - 1);
