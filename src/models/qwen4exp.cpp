@@ -18,6 +18,7 @@
 #include <string>
 #include <tuple>
 #include <map>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -280,7 +281,59 @@ static bool qwen4exp_on_vulkan(const ggml_tensor * w) {
 // the merged matmul for this ubatch: a converter-merged file has no separate halves, so it always takes it. A load-time
 // merge is skipped while a LoRA adapter is attached: build_lora_mm looks the adapter up by the weight tensor, and no
 // adapter references the container, so the merged matmul would drop the LoRA of both halves
-static bool qwen4exp_use_merged(const ggml_tensor * merged, const ggml_tensor * a, int64_t n_tokens, const llama_adapter_loras * loras) {
+// [TAG_MM_PLAN] P3a: above LLAMA_QWEN4EXP_MERGE_MAX_N the hc pair (b = hc_inject) still takes the merged matmul when the
+// Vulkan backend says the merged rows are bit-identical to the two matmuls at this n on this device
+// ("ggml_backend_dev_mul_mat_rows_merge_exact": the merged GEMM gets hc_down's own pipeline and split_k 1, the inject split_k
+// 1 on the same matmul family - the dispatch's plan function, no heuristics here). LLAMA_QWEN4EXP_MERGE_PLAN: unset = on
+// iff the weight's device is gfx1151 (STRIX_HALO; the R188 device test), 0 = off (the n <= MAX_N rule alone), 1 = on.
+// One WARN line per distinct n with the decision and its reason (the proof line; WARN like the merge_rows load line, so it
+// shows at the default verbosity).
+static int qwen4exp_merge_plan_mode(ggml_backend_dev_t dev) {
+    static const int mode = [dev] {
+        const char * s = getenv("LLAMA_QWEN4EXP_MERGE_PLAN");
+        const char * dsc = dev ? ggml_backend_dev_description(dev) : "";
+        const bool gfx1151 = dsc && (strstr(dsc, "STRIX_HALO") != nullptr || strstr(dsc, "GFX1151") != nullptr || strstr(dsc, "gfx1151") != nullptr);
+        const bool env_set = s != nullptr && *s != '\0';
+        const int m = env_set ? (atoi(s) != 0 ? 1 : 0) : (gfx1151 ? 1 : 0);
+        LLAMA_LOG_WARN("%s: qwen4exp merge plan: %s (%s)\n", __func__, m ? "on" : "off",
+                       env_set ? "env" : (gfx1151 ? "default on gfx1151" : "default off: not gfx1151"));
+        return m;
+    }();
+    return mode;
+}
+
+static bool qwen4exp_merge_plan_ok(const ggml_tensor * a, const ggml_tensor * b, int64_t n_tokens) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(a->buffer));
+    if (qwen4exp_merge_plan_mode(dev) == 0) {
+        return false;
+    }
+    if (a->type != b->type || a->ne[0] != b->ne[0]) {
+        return false;
+    }
+    using merge_exact_fn = int (*)(ggml_backend_dev_t, ggml_type, int64_t, int64_t, int64_t, int64_t, char *, size_t);
+    static const merge_exact_fn fn = [dev] {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        return reg ? (merge_exact_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_mul_mat_rows_merge_exact") : nullptr;
+    }();
+    if (fn == nullptr) {
+        return false;
+    }
+    char why[256] = "";
+    const bool ok = fn(dev, a->type, a->ne[1], b->ne[1], n_tokens, a->ne[0], why, sizeof(why)) == 1;
+    static std::mutex mtx;
+    static std::set<int64_t> seen;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (seen.insert(n_tokens * 2 + (ok ? 1 : 0)).second) {
+            LLAMA_LOG_WARN("qwen4exp merge plan: n=%lld %s m_a=%lld m_b=%lld %s: %s\n", (long long) n_tokens, ggml_type_name(a->type),
+                           (long long) a->ne[1], (long long) b->ne[1], ok ? "MERGE" : "separate", why);
+        }
+    }
+    return ok;
+}
+
+static bool qwen4exp_use_merged(const ggml_tensor * merged, const ggml_tensor * a, int64_t n_tokens, const llama_adapter_loras * loras,
+                                const ggml_tensor * b = nullptr) {
     if (merged == nullptr) {
         return false;
     }
@@ -295,7 +348,11 @@ static bool qwen4exp_use_merged(const ggml_tensor * merged, const ggml_tensor * 
     if (!qwen4exp_on_vulkan(merged)) {
         return false;
     }
-    return n_tokens <= qwen4exp_merge_max_n();
+    if (n_tokens <= qwen4exp_merge_max_n()) {
+        return true;
+    }
+    // [TAG_MM_PLAN] P3a (hc pair only: b given)
+    return b != nullptr && qwen4exp_merge_plan_ok(a, b, n_tokens);
 }
 
 void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
@@ -565,7 +622,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // the combine chain read the views as they read the two matmul outputs (row-strided at nt >= 2)
     ggml_tensor * lo  = nullptr;
     ggml_tensor * inj = nullptr;
-    if (inject && qwen4exp_use_merged(w_down_inject, w_down, nt, loras)) {
+    if (inject && qwen4exp_use_merged(w_down_inject, w_down, nt, loras, w_inject)) {
         const int64_t n_lo = w_down_inject->ne[1] - hc;
         ggml_tensor * li = build_lora_mm(w_down_inject, xn);
         cb(li, "hc_down_inject", il);
