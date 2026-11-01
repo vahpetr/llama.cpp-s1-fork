@@ -4,7 +4,10 @@
 // blk.<il>.hc_{attn,ffn}_{down,inject,norm}.weight (an extract of the brain GGUF is enough). Bitwise compare of every
 // output element, per sublayer, per n. Not a ctest (needs the weights and a GPU).
 // usage: test-qwen4exp-hc-merge-kproof <gguf>   env: KP_NS (default 9,64,1020,2044,2048), KP_REPS (timing, default 0),
-// KP_MUT_X=1 (sensitivity: the merged arm's input differs by one ulp in element 0 -> must FAIL), KP_LAYERS=a-b
+// KP_MUT_X=1 (sensitivity: the merged arm's input differs in f32 mantissa bit 16 of element 0 - above the f16 rounding of
+// B - -> must DIFF), KP_LAYERS=a-b. [TAG_MM_PLAN] P3a: per n the backend's "ggml_backend_dev_mul_mat_rows_merge_exact"
+// (the rule qwen4exp consults) decides MERGE / separate; verdict PASS iff every MERGE n is bit-equal in every sublayer.
+// With GGML_VK_MM_MERGE_FORCE=1 (negative control) the rule merges every n > 8 and the run must report NEGCTL CAUGHT.
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -46,7 +49,15 @@ int main(int argc, char ** argv) {
     ggml_backend_t be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     if (!be) be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
     if (!be) { fprintf(stderr, "no GPU backend\n"); return 2; }
-    printf("[kp] backend %s mut_x=%d reps=%d\n", ggml_backend_name(be), (int) mut_x, reps);
+    printf("[kp] backend %s (%s) mut_x=%d reps=%d\n", ggml_backend_name(be), ggml_backend_dev_description(ggml_backend_get_device(be)), (int) mut_x, reps);
+    ggml_backend_dev_t dev = ggml_backend_get_device(be);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using plan_fn  = int (*)(ggml_backend_dev_t, ggml_type, int64_t, int64_t, int64_t, const void **, const char **, uint32_t *);
+    using exact_fn = int (*)(ggml_backend_dev_t, ggml_type, int64_t, int64_t, int64_t, int64_t, char *, size_t);
+    plan_fn  q_plan  = (plan_fn)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_mul_mat_plan");
+    exact_fn q_exact = (exact_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_mul_mat_rows_merge_exact");
+    const bool forced = getenv("GGML_VK_MM_MERGE_FORCE") && atoi(getenv("GGML_VK_MM_MERGE_FORCE"));
+    printf("[kp] plan hooks: plan=%s exact=%s forced=%d\n", q_plan ? "yes" : "NO", q_exact ? "yes" : "NO", (int) forced);
 
     auto read_t = [&](const char * name, std::vector<uint8_t> & out) -> ggml_tensor * {
         int64_t id = gguf_find_tensor(g, name); if (id < 0) return nullptr;
@@ -94,9 +105,28 @@ int main(int argc, char ** argv) {
     ups.clear();
 
     long total_el = 0, total_bad = 0; int n_pairs_merged = 0;
+    long plan_merge_bad = 0, plan_merge_el = 0; int plan_merge_n = 0, plan_sep_n = 0;
     for (auto & p : pairs) n_pairs_merged += p.merged;
     for (int n : ns) {
         long n_bad_n = 0;
+        // the plan decision for this n (all mergeable pairs share type q4_K and shapes; asked per pair below anyway)
+        int dec = -1; char why[256] = "no hook";
+        for (auto & p : pairs) {
+            if (!p.merged) continue;
+            const int64_t K = p.down->ne[0], n_lo = p.down->ne[1], hc = p.inj->ne[1];
+            if (q_plan) {
+                const void * id; const char * nm; uint32_t sk;
+                const int64_t ms[3] = { n_lo, n_lo + hc, hc }; const char * lab[3] = { "down", "merged", "inject" };
+                for (int j = 0; j < 3; ++j) {
+                    const int r = q_plan(dev, p.down->type, ms[j], n, K, &id, &nm, &sk);
+                    printf("[kp-plan] n=%d %s m=%lld r=%d %s split_k=%u\n", n, lab[j], (long long) ms[j], r, r == 1 ? nm : "-", r == 1 ? sk : 0);
+                }
+            }
+            if (q_exact) dec = q_exact(dev, p.down->type, n_lo, hc, n, K, why, sizeof why);
+            break;
+        }
+        printf("[kp-plan] n=%d decision=%s reason=%s\n", n, dec == 1 ? "MERGE" : dec == 0 ? "separate" : "none", why);
+        if (dec == 1) plan_merge_n++; else plan_sep_n++;
         for (auto & p : pairs) {
             if (!p.merged) continue;
             const int64_t K = p.down->ne[0], n_lo = p.down->ne[1], hc = p.inj->ne[1], M = n_lo + hc;
@@ -122,7 +152,7 @@ int main(int argc, char ** argv) {
             ggml_cgraph * gb = ggml_new_graph(cctx); ggml_build_forward_expand(gb, om);
             ggml_backend_buffer_t cbuf = ggml_backend_alloc_ctx_tensors(cctx, be);
             ggml_backend_tensor_set(xa, x.data(), 0, x.size() * 4);
-            if (mut_x) { uint32_t u; memcpy(&u, &x[0], 4); u ^= 1; memcpy(&x[0], &u, 4); }
+            if (mut_x) { uint32_t u; memcpy(&u, &x[0], 4); u ^= 1u << 16; memcpy(&x[0], &u, 4); }
             ggml_backend_tensor_set(xb, x.data(), 0, x.size() * 4);
             ggml_backend_graph_compute(be, ga); ggml_backend_graph_compute(be, gb); ggml_backend_synchronize(be);
             std::vector<float> vd((size_t) n_lo * n), vi((size_t) hc * n), vm((size_t) M * n);
@@ -139,6 +169,7 @@ int main(int argc, char ** argv) {
                 }
             }
             total_el += (long) M * n; total_bad += bad_d + bad_i; n_bad_n += bad_d + bad_i;
+            if (dec == 1) { plan_merge_el += (long) M * n; plan_merge_bad += bad_d + bad_i; }
             double us_a = 0, us_b = 0;
             if (reps > 0) {
                 for (int w = 0; w < 2; ++w) { ggml_backend_graph_compute(be, ga); ggml_backend_graph_compute(be, gb); }
@@ -157,9 +188,12 @@ int main(int argc, char ** argv) {
                    n, p.il, p.kind, (long long) (M * n), bad_d, bad_i, maxd, fr, fc, fa, fb, us_a, us_b, (bad_d + bad_i) ? "DIFF" : "EQUAL");
             ggml_backend_buffer_free(cbuf); ggml_free(cctx);
         }
-        printf("[kp] n=%d pairs=%d bad=%ld %s\n", n, n_pairs_merged, n_bad_n, n_bad_n ? "DIFF" : "EQUAL");
+        printf("[kp] n=%d pairs=%d bad=%ld %s plan=%s\n", n, n_pairs_merged, n_bad_n, n_bad_n ? "DIFF" : "EQUAL", dec == 1 ? "MERGE" : "separate");
     }
     printf("[kp] DONE pairs_merged=%d pairs_total=%zu elements=%ld bad=%ld verdict=%s\n", n_pairs_merged, pairs.size(), total_el, total_bad, total_bad ? "DIFF" : "EQUAL");
+    printf("[kp] PLAN merge_n=%d separate_n=%d merge_elements=%ld merge_bad=%ld plan_verdict=%s%s\n", plan_merge_n, plan_sep_n, plan_merge_el, plan_merge_bad,
+           plan_merge_bad ? "FAIL" : "PASS", forced ? (plan_merge_bad ? " NEGCTL CAUGHT" : " NEGCTL NOT CAUGHT") : "");
     ggml_backend_buffer_free(wbuf); ggml_free(wctx); ggml_backend_free(be); gguf_free(g); fclose(f);
-    return total_bad ? 1 : 0;
+    if (forced) return plan_merge_bad ? 0 : 1;
+    return (plan_merge_bad || (!q_exact && total_bad)) ? 1 : 0;
 }
