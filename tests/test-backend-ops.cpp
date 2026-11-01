@@ -8373,7 +8373,14 @@ struct test_mul_mat_rows : public test_case {
 //                    0) - the CPU op must equal the CPU chain too. The chain is build_qsa_select's, node for node:
 //                    MUL_MAT (pooled) / MUL_MAT_ROWS (store + remap) -> reshape [M, H, N, n_b] -> RELU (in place) ->
 //                    CONT(head 0) + ADD(head 1) + ... -> ADD(bias). Bias modes: 0 none, 1 the QSA_BIAS constants
-//                    (+0, 1e9, -inf: the -inf rows stay -inf in both halves), 2 uniform. Shapes: ragged M (not a tile
+//                    (+0, 1e9, -inf: the -inf rows stay -inf in both halves), 2 uniform; [TAG_QSA_BIAS_FOLD] 3..5 a
+//                    GGML_OP_QSA_BIAS node over blk/qry tables (the compact bias, the values of test_qsa_bias): 3 the
+//                    chunk rows, the SAME node feeds the chain's ADD (the plane is computed; the Vulkan op still folds it),
+//                    4 the chunk rows, the op is the node's only consumer and the chain reads a twin node (Vulkan skips
+//                    the op's node: its plane keeps the uniform junk of initialize_tensors - a stale plane read = FAIL),
+//                    5 as 4 with identity rows (rows == NULL, n_tps == N). GGML_TEST_QSA_SCORE_HASH=1 prints the 64-bit
+//                    FNV-1a of the op's half (the biased score plane), the chain's half and the CPU op's half per case,
+//                    for cross-knob plane equality (GGML_VK_QSA_BIAS_FOLD=0 / 1). Shapes: ragged M (not a tile
 //                    multiple), every chunk width 1..128 (the widths the Vulkan op refuses - the mat-vec ones - report
 //                    "not supported"), unaligned K, two streams, other head counts, the deployed depths.
 //   QSA_SCORE        the op against the CPU backend (NMSE); in perf mode the op alone (the perf harness repeats only the
@@ -8385,7 +8392,7 @@ struct test_qsa_score : public test_case {
     const int64_t n_b;    // streams
     const int     n_head;
     const bool    rows;   // MUL_MAT_ROWS form (store + remap) vs MUL_MAT (pooled)
-    const int     bias;   // 0 none, 1 QSA_BIAS constants, 2 uniform
+    const int     bias;   // 0 none, 1 QSA_BIAS constants, 2 uniform, 3..5 a QSA_BIAS node (see above)
     const bool    exact;
     const bool    f16a;   // [TAG_QSA_POOLED_F16_MIRROR] the op reads an f16 mirror of the store (set_rows of every row)
     const float   scale;  // [TAG_QSA_POOLED_F16_MIRROR] the store's values x scale (1e-5: f16 denormals in the mirror)
@@ -8395,11 +8402,21 @@ struct test_qsa_score : public test_case {
         return exact ? "QSA_SCORE_EXACT" : "QSA_SCORE";
     }
 
+    int64_t n_tps() const { return bias == 5 ? N : (N >= 128 ? 2048 : N + 37); }   // the qry table's queries (bias >= 3)
+
     std::string vars() override {
         if (f16a || scale != 1.0f) {
             return VARS_TO_STR10(K, M, N, n_b, n_head, rows, bias, exact, f16a, scale);
         }
         return VARS_TO_STR8(K, M, N, n_b, n_head, rows, bias, exact);
+    }
+
+    static uint64_t fnv64(const float * x, size_t n, uint64_t h) {
+        const unsigned char * c = (const unsigned char *) x;
+        for (size_t i = 0; i < n*sizeof(float); i++) {
+            h = (h ^ c[i]) * 0x100000001b3ull;
+        }
+        return h;
     }
 
     test_qsa_score(int64_t K, int64_t M, int64_t N, int64_t n_b, int n_head, bool rows, int bias, bool exact,
@@ -8417,6 +8434,18 @@ struct test_qsa_score : public test_case {
             return nmse(a, b, n);
         }
         GGML_ASSERT(n == (size_t) (M*2*N*n_b));
+        static const bool hash = getenv("GGML_TEST_QSA_SCORE_HASH") != nullptr;
+        if (hash) {
+            // [TAG_QSA_BIAS_FOLD] per stream s: rows s*2N .. s*2N+N-1 are the op, the next N the chain
+            uint64_t ho = 0xcbf29ce484222325ull, hc = ho, hb = ho;
+            for (int64_t s = 0; s < n_b; s++) {
+                ho = fnv64(a + (size_t) (s*2*N*M),       (size_t) (N*M), ho);
+                hc = fnv64(a + (size_t) ((s*2*N + N)*M), (size_t) (N*M), hc);
+                hb = fnv64(b + (size_t) (s*2*N*M),       (size_t) (N*M), hb);
+            }
+            printf("[qsa-score-hash] %s(%s) op=%016llx chain=%016llx cpu_op=%016llx\n", op_desc(nullptr).c_str(), vars().c_str(),
+                   (unsigned long long) ho, (unsigned long long) hc, (unsigned long long) hb);
+        }
         size_t bad = 0;
         for (int64_t s = 0; s < n_b; s++) {
             for (int64_t t = 0; t < N; t++) {
@@ -8464,9 +8493,28 @@ struct test_qsa_score : public test_case {
             ggml_set_name(ids, "rows");
         }
         ggml_tensor * bi = nullptr;
-        if (bias) {
+        ggml_tensor * bi_chain = nullptr;   // the chain's bias (bias 4 / 5: a twin QSA_BIAS node over the same tables)
+        if (bias >= 1 && bias <= 2) {
             bi = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, M, N, n_b);
             ggml_set_name(bi, "bias");
+        } else if (bias >= 3) {
+            // [TAG_QSA_BIAS_FOLD] the compact bias as qwen4exp builds it: QSA_BIAS over the block / query tables (+ chunk rows)
+            ggml_tensor * blk = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 2, M, n_b);
+            ggml_set_name(blk, "qsa_blk");
+            ggml_tensor * qry = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 2, n_tps(), n_b);
+            ggml_set_name(qry, "qsa_qry");
+            ggml_tensor * brows = nullptr;
+            if (bias != 5) {
+                brows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, N, n_b);
+                ggml_set_name(brows, "qsa_rows");
+            }
+            bi = ggml_qsa_bias(ctx, blk, qry, brows);
+            ggml_set_name(bi, "bias_node");
+            bi_chain = bias == 3 ? bi : ggml_qsa_bias(ctx, blk, qry, brows);
+            ggml_set_name(bi_chain, bias == 3 ? "bias_node" : "bias_node_chain");
+        }
+        if (bi_chain == nullptr) {
+            bi_chain = bi;
         }
 
         ggml_tensor * op = ggml_qsa_score(ctx, a, ids, b, bi, n_head);
@@ -8483,7 +8531,7 @@ struct test_qsa_score : public test_case {
             return op;
         }
         ggml_set_name(op, "op");
-        ggml_tensor * ref = chain(ctx, a, ids, b, bi);
+        ggml_tensor * ref = chain(ctx, a, ids, b, bi_chain);
         ggml_set_name(ref, "chain");
 
         ggml_tensor * out = ggml_concat(ctx, op, ref, 1);
@@ -8536,6 +8584,38 @@ struct test_qsa_score : public test_case {
                     }
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, n*sizeof(float));
+            } else if (strcmp(name, "qsa_blk") == 0 || strcmp(name, "qsa_qry") == 0 || strcmp(name, "qsa_rows") == 0) {
+                // [TAG_QSA_BIAS_FOLD] test_qsa_bias's tables: keys / tails multiples of 4 near one base (both sides of
+                // key >= tail, and key == tail, occur), ~5 % spare ids, 5-bit vis masks incl. 0 and ~0, one query on bit 31;
+                // the chunk rows are the slice t0 .. t0+N-1 of the n_tps queries
+                std::mt19937 trng(0x9e3779b9u ^ (uint32_t) (M*131 + N*17 + n_b*7 + bias));
+                const int32_t base = (int32_t) (trng() % ((1u << 24) - (1u << 16))) & ~3;
+                auto near = [&]() { return base + (int32_t) (trng() % 4096)*4; };
+                std::vector<int32_t> data(ggml_nelements(t));
+                if (strcmp(name, "qsa_blk") == 0) {
+                    for (int64_t e = 0; e < M*n_b; ++e) {
+                        const uint32_t u = trng() % 100;
+                        const bool spare = u < 5;
+                        uint32_t vis = trng() & 31u;
+                        if (u >= 95) vis = 0xFFFFFFFFu;
+                        if (spare) vis = (u & 1) ? 0xFFFFFFFFu : 0u;
+                        data[2*e + 0] = spare ? INT32_MAX : near();
+                        data[2*e + 1] = (int32_t) vis;
+                    }
+                } else if (strcmp(name, "qsa_qry") == 0) {
+                    for (int64_t e = 0; e < n_tps()*n_b; ++e) {
+                        data[2*e + 0] = near();
+                        data[2*e + 1] = (int32_t) (e == 0 ? 0x80000000u : 1u << (trng() % 5));
+                    }
+                } else {
+                    const int64_t t0 = (n_tps() - N)/2;
+                    for (int64_t s = 0; s < n_b; ++s) {
+                        for (int64_t q = 0; q < N; ++q) {
+                            data[s*N + q] = (int32_t) (t0 + q);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
             } else if (strcmp(name, "bias") == 0) {
                 const int64_t n = ggml_nelements(t);
                 std::vector<float> v(n);
@@ -13562,6 +13642,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t M : { 65536, 262144 }) {
         for (int64_t N : { 3, 4, 5, 6, 9, 128 }) {
             test_cases.emplace_back(new test_qsa_score(128, M, N, 1, 4, true, 1, true, true));
+        }
+    }
+    // [TAG_QSA_BIAS_FOLD] the bias as a QSA_BIAS node, folded into the Vulkan epilogue: shared with the chain (3), the op's
+    // own node skipped over a stale plane (4), identity rows (5); both product forms, the f16 mirror, ragged M, widths,
+    // two streams, head counts, and the deployed 262k / 1M pools (65536 / 262144 blocks) at the deployed chunk (C 128 of
+    // an n_tps 2048 ubatch) and its tail
+    for (int bm : { 3, 4, 5 }) {
+        for (bool r : { false, true }) {
+            for (int64_t M : { 1, 17, 129, 1000 }) {
+                for (int64_t N : { 3, 4, 9, 37, 64, 127, 128 }) {
+                    test_cases.emplace_back(new test_qsa_score(128, M, N, 1, 4, r, bm, true));
+                }
+            }
+            for (int64_t N : { 3, 37, 128 }) {
+                test_cases.emplace_back(new test_qsa_score(128, 4133, N, 2, 4, r, bm, true));
+                test_cases.emplace_back(new test_qsa_score(72,  777,  N, 1, 4, r, bm, true));
+            }
+            for (int H : { 1, 2, 8, 16 }) {
+                test_cases.emplace_back(new test_qsa_score(128, 1000, 64, 1, H, r, bm, true));
+            }
+        }
+        for (int64_t N : { 3, 37, 128 }) {
+            test_cases.emplace_back(new test_qsa_score(128, 4133, N, 2, 4, true, bm, true, true));
+        }
+    }
+    for (int64_t M : { 65536, 262144 }) {
+        for (int bm : { 3, 4 }) {
+            for (int64_t N : { 128, 5 }) {
+                test_cases.emplace_back(new test_qsa_score(128, M, N, 1, 4, true, bm, true, true));
+                test_cases.emplace_back(new test_qsa_score(128, M, N, 1, 4, true, bm, true, false));
+            }
         }
     }
 
