@@ -1331,6 +1331,7 @@ void process_shaders() {
     // [TAG_DECODE_FUSE] D3 decode fusions (ggml_vk_decode_fuse_dispatch)
     string_to_spv("shexp_tail_f32", "shexp_tail.comp", {});
     string_to_spv("shexp_glu_sig_f32", "shexp_glu_sig.comp", {});
+    string_to_spv("gdn_qk_gate_f32", "gdn_qk_gate.comp", {});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 

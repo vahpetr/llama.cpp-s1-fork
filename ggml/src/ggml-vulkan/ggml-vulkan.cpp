@@ -1341,6 +1341,7 @@ struct vk_device_struct {
     // [TAG_DECODE_FUSE] D3 decode fusions
     vk_pipeline pipeline_shexp_tail_f32;
     vk_pipeline pipeline_shexp_glu_sig_f32;
+    vk_pipeline pipeline_gdn_qk_gate_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -2431,6 +2432,15 @@ struct vk_op_shexp_tail_push_constants {
 // [TAG_DECODE_FUSE] shexp_glu_sig.comp: GLU(SWIGLU split) + SIGMOID, both contiguous
 struct vk_op_shexp_glu_sig_push_constants {
     uint32_t n_glu, n_sig;
+};
+// [TAG_DECODE_FUSE] gdn_qk_gate.comp: two RMS_NORM + SCALE row sets and the ADD/SOFTPLUS/MUL gate (strides in elements)
+struct vk_op_gdn_qk_gate_push_constants {
+    uint32_t ncols;
+    uint32_t a_rows, a_ne01, a_ne02, a_nb01, a_nb02, a_nb03;
+    uint32_t b_rows, b_ne01, b_ne02, b_nb01, b_nb02, b_nb03;
+    float    a_eps, a_scale; uint32_t a_bias;
+    float    b_eps, b_scale; uint32_t b_bias;
+    uint32_t g_ne0, g_ne, g_a_nb1;
 };
 
 struct vk_op_conv2d_push_constants {
@@ -8227,6 +8237,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // [TAG_DECODE_FUSE] D3 decode fusions
     ggml_vk_create_pipeline(device, device->pipeline_shexp_tail_f32, "shexp_tail_f32", shexp_tail_f32_len, shexp_tail_f32_data, "main", 4, sizeof(vk_op_shexp_tail_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_shexp_glu_sig_f32, "shexp_glu_sig_f32", shexp_glu_sig_f32_len, shexp_glu_sig_f32_data, "main", 5, sizeof(vk_op_shexp_glu_sig_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gdn_qk_gate_f32, "gdn_qk_gate_f32", gdn_qk_gate_f32_len, gdn_qk_gate_f32_data, "main", 8, sizeof(vk_op_gdn_qk_gate_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -17419,6 +17430,44 @@ static void ggml_vk_shexp_glu_sig_dispatch_fused(ggml_backend_vk_context * ctx, 
           ggml_vk_tensor_subbuffer(ctx, sig->src[0]), ggml_vk_tensor_subbuffer(ctx, sig) }, pc, elements);
 }
 
+// [TAG_DECODE_FUSE] D3 "gdn_qk_gate" dispatch (validated by ggml_vk_can_fuse_gdn_qk_gate)
+static int ggml_vk_can_fuse_gdn_qk_gate(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int * gate_add);
+static void ggml_vk_gdn_qk_gate_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    int ai = -1;
+    const int n_extra = ggml_vk_can_fuse_gdn_qk_gate(ctx, cgraph, node_idx, &ai);
+    GGML_ASSERT(n_extra == ctx->num_additional_fused_ops && ai > node_idx);
+    const ggml_tensor * ra = cgraph->nodes[node_idx];
+    ggml_tensor *       sa = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * rb = cgraph->nodes[node_idx + 2];
+    ggml_tensor *       sb = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * add = cgraph->nodes[ai];
+    ggml_tensor *       mul = cgraph->nodes[ai + 2];
+    const ggml_tensor * xa = ra->src[0];
+    const ggml_tensor * xb = rb->src[0];
+    const uint32_t fs = sizeof(float);
+    vk_op_gdn_qk_gate_push_constants pc{};
+    pc.ncols  = 128;
+    pc.a_rows = (uint32_t) (ra->ne[1] * ra->ne[2] * ra->ne[3]); pc.a_ne01 = (uint32_t) ra->ne[1]; pc.a_ne02 = (uint32_t) ra->ne[2];
+    pc.a_nb01 = (uint32_t) (xa->nb[1] / fs); pc.a_nb02 = (uint32_t) (xa->nb[2] / fs); pc.a_nb03 = (uint32_t) (xa->nb[3] / fs);
+    pc.b_rows = (uint32_t) (rb->ne[1] * rb->ne[2] * rb->ne[3]); pc.b_ne01 = (uint32_t) rb->ne[1]; pc.b_ne02 = (uint32_t) rb->ne[2];
+    pc.b_nb01 = (uint32_t) (xb->nb[1] / fs); pc.b_nb02 = (uint32_t) (xb->nb[2] / fs); pc.b_nb03 = (uint32_t) (xb->nb[3] / fs);
+    // RMS_NORM op_params[0] = eps (rms_norm.comp p.param1); SCALE (s, b) as RMS_NORM_EXT do_post_scale takes them
+    pc.a_eps = ggml_get_op_params_f32(ra, 0); pc.a_scale = ggml_get_op_params_f32(sa, 0);
+    pc.b_eps = ggml_get_op_params_f32(rb, 0); pc.b_scale = ggml_get_op_params_f32(sb, 0);
+    const float ba = ggml_get_op_params_f32(sa, 1), bb = ggml_get_op_params_f32(sb, 1);
+    memcpy(&pc.a_bias, &ba, sizeof(float)); memcpy(&pc.b_bias, &bb, sizeof(float));
+    pc.g_ne0 = (uint32_t) mul->ne[0];
+    pc.g_ne  = (uint32_t) ggml_nelements(mul);
+    pc.g_a_nb1 = ggml_is_contiguous(add->src[0]) ? pc.g_ne0 : (uint32_t) (add->src[0]->nb[1] / fs);
+    vk_pipeline pipeline = ctx->device->pipeline_gdn_qk_gate_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const std::array<uint32_t, 3> elements = { pc.a_rows + pc.b_rows + CEIL_DIV(pc.g_ne, 128u), 1, 1 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, xa), ggml_vk_tensor_subbuffer(ctx, xb), ggml_vk_tensor_subbuffer(ctx, sa),
+          ggml_vk_tensor_subbuffer(ctx, sb), ggml_vk_tensor_subbuffer(ctx, add->src[0]), ggml_vk_tensor_subbuffer(ctx, add->src[1]),
+          ggml_vk_tensor_subbuffer(ctx, mul->src[1]), ggml_vk_tensor_subbuffer(ctx, mul) }, pc, elements);
+}
+
 // [TAG_DECODE_FUSE] the D3 fusions start at nodes whose op cases belong to other fusions (MUL / GLU / RMS_NORM), so
 // build_graph asks here before its op switch. The matchers are side-effect free: a fused range is ours exactly when
 // its matcher returns this node's num_additional_fused_ops (no other fusion starting at the same op produces that count
@@ -17436,6 +17485,11 @@ static bool ggml_vk_decode_fuse_dispatch(ggml_backend_vk_context * ctx, vk_conte
     }
     if (node->op == GGML_OP_GLU && ggml_vk_can_fuse_shexp_glu_sig(ctx, cgraph, node_idx) == ctx->num_additional_fused_ops) {
         ggml_vk_shexp_glu_sig_dispatch_fused(ctx, subctx, cgraph, node_idx);
+        return true;
+    }
+    if (node->op == GGML_OP_RMS_NORM && ctx->num_additional_fused_ops >= 6 &&
+        ggml_vk_can_fuse_gdn_qk_gate(ctx, cgraph, node_idx, nullptr) == ctx->num_additional_fused_ops) {
+        ggml_vk_gdn_qk_gate_dispatch_fused(ctx, subctx, cgraph, node_idx);
         return true;
     }
     return false;
@@ -22957,6 +23011,68 @@ static int ggml_vk_can_fuse_shexp_glu_sig(ggml_backend_vk_context * ctx, const s
     return 1;
 }
 
+// [TAG_DECODE_FUSE] D3 "gdn_qk_gate": RMS_NORM -> SCALE, RMS_NORM -> SCALE, then (after any no-op VIEW / RESHAPE /
+// PERMUTE / TRANSPOSE nodes) ADD -> SOFTPLUS -> MUL - the GDN q / k l2 norms and the decay pre-chain, consecutive in the
+// decode order. Each pair is exactly what rms_norm_scale accepts, with 128-wide rows (the shader's workgroup); the
+// triple is exactly what add_softplus_mul accepts. Outputs: both SCALEs and the MUL (last). Stateless guard for
+// build_graph's add_rms: the first RMS_NORM must not read the node right before it (add_rms needs exactly that).
+// Returns the number of additional fused nodes (0 = no match); *gate_add gets the ADD's index.
+static bool ggml_vk_can_fuse_rms_norm_scale(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
+static bool ggml_vk_can_fuse_add_softplus_mul(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
+static int ggml_vk_can_fuse_gdn_qk_gate(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
+                                        int * gate_add = nullptr) {
+    if (!ggml_vk_decode_fuse_enabled() || node_idx + 6 >= cgraph->n_nodes || node_idx < 1) {
+        return 0;
+    }
+    if (cgraph->nodes[node_idx]->op != GGML_OP_RMS_NORM || cgraph->nodes[node_idx + 2]->op != GGML_OP_RMS_NORM ||
+        cgraph->nodes[node_idx]->src[0] == cgraph->nodes[node_idx - 1]) {
+        return 0;
+    }
+    for (int k : { node_idx, node_idx + 2 }) {
+        const ggml_tensor * rms = cgraph->nodes[k];
+        const ggml_tensor * x   = rms->src[0];
+        if (!ggml_vk_can_fuse_rms_norm_scale(ctx, cgraph, k) || rms->ne[0] != 128 || x->nb[0] != sizeof(float) ||
+            x->nb[1] % sizeof(float) || x->nb[2] % sizeof(float) || x->nb[3] % sizeof(float) ||
+            rms->ne[2] * rms->ne[3] > vk_decode_fuse_max_rows ||
+            get_misalign_bytes(ctx, x) || get_misalign_bytes(ctx, cgraph->nodes[k + 1])) {
+            return 0;
+        }
+    }
+    auto const is_noop = [](const ggml_tensor * t) {
+        return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+    };
+    int j = node_idx + 4;
+    while (j < cgraph->n_nodes && is_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j + 2 >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_ADD || !ggml_vk_can_fuse_add_softplus_mul(ctx, cgraph, j)) {
+        return 0;
+    }
+    const ggml_tensor * add = cgraph->nodes[j];
+    const ggml_tensor * mul = cgraph->nodes[j + 2];
+    if (ggml_nrows(mul) > vk_decode_fuse_max_rows || mul->ne[0] > 4096) {
+        return 0;
+    }
+    const int idxs[7] = { node_idx, node_idx + 1, node_idx + 2, node_idx + 3, j, j + 1, j + 2 };
+    const ggml_op ops[7] = { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+    const int outs[3] = { node_idx + 1, node_idx + 3, j + 2 };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 7, ops, outs, 3) || ggml_vk_decode_fuse_feeds_rms(cgraph, j + 2)) {
+        return 0;
+    }
+    // the gate's alpha must be readable as row * a_nb1 + i0 (add_softplus_mul accepted it contiguous or row-strided)
+    if (add->src[0]->nb[1] % sizeof(float)) {
+        return 0;
+    }
+    const int64_t wgs = cgraph->nodes[node_idx]->ne[1] * cgraph->nodes[node_idx]->ne[2] * cgraph->nodes[node_idx]->ne[3] +
+                        cgraph->nodes[node_idx + 2]->ne[1] * cgraph->nodes[node_idx + 2]->ne[2] * cgraph->nodes[node_idx + 2]->ne[3] +
+                        CEIL_DIV(ggml_nelements(mul), 128);
+    if (wgs > (int64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+        return 0;
+    }
+    if (gate_add) { *gate_add = j; }
+    return j + 2 - node_idx;
+}
+
 static bool ggml_vk_can_fuse_topk_moe(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, topk_moe_mode mode) {
 
@@ -24412,6 +24528,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
+            } else if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM && ggml_vk_can_fuse_gdn_qk_gate(ctx, cgraph, i) > 0 &&
+                       !vk_fusion_veto(ctx, "gdn_qk_gate")) {
+                // [TAG_DECODE_FUSE] D3 gdn_qk_gate: three outputs (the two SCALEs, nodes 1 and 3, and the MUL, last). The
+                // norms read whole rows and the gate reads alpha at its own (head, row): nothing is elementwise.
+                int ai = -1;
+                ctx->num_additional_fused_ops = ggml_vk_can_fuse_gdn_qk_gate(ctx, cgraph, i, &ai);
+                ctx->fused_ops_write_mask |= (1 << 1) | (1 << 3);
+                fusion_string = "GDN_QK_GATE";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse_rms_norm_scale(ctx, cgraph, i) &&
                        !vk_fusion_veto(ctx, "rms_norm_scale")) {
                 // [TAG_RMS_NORM_EXT] one workgroup per row reads the whole row before it writes (as RMS_NORM_MUL)

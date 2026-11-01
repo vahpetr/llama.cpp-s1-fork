@@ -1,0 +1,123 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+#include "types.glsl"
+#include "utils.glsl"
+
+// [TAG_DECODE_FUSE] D3 "gdn_qk_gate": three node chains of the qwen4exp GDN layer that are consecutive in the decode
+// order (build_layer_attn_linear) in one dispatch, all three results written:
+//   A, B  RMS_NORM -> SCALE      the q and k l2 norms (build_gdn_l2_norm) over 128-wide rows of the conv output views
+//   G     ADD -> SOFTPLUS -> MUL  the decay pre-chain on the alpha view (what add_softplus_mul fuses today)
+// Workgroups [0, nA) normalise A's rows, [nA, nA + nB) B's rows, the rest compute 128 gate elements each.
+// Exactness:
+//   * A / B are rms_norm.comp (rms_norm_scale_f32, RMS_NORM_EXT do_post_scale) on one row: the per-thread partial
+//     sum += x * x from +0, the shared-memory tree that halves the stride, mean = sum / ncols, scale = inversesqrt(mean
+//     + eps), y = float(scale * x), out = y * param2 + bias. rms_norm.comp reduces over 512 threads; with ncols = 128 the
+//     threads >= 128 hold +0 and its steps s = 256 and s = 128 only add +0 to non-negative sums (x + (+0) = x for every
+//     x >= +0, inf and NaN), so the tree from s = 64 down pairs the same values in the same order.
+//   * G is add_softplus_mul.comp (the strided form reads alpha at row * a_nb1 + i0, the contiguous form at idx: the same
+//     element when a_nb1 == ne0), op_softplus character for character unary.comp's.
+// DECODE_FUSE_MUTANT (scratch trees only): 31 = the reduction tree reordered (neighbours first), 32 = the post-scale
+// reassociated ((scale * param2) * x + bias).
+
+#ifndef DECODE_FUSE_MUTANT
+#define DECODE_FUSE_MUTANT 0
+#endif
+
+#define NCOLS 128
+
+layout(local_size_x = NCOLS, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer XA {float data_xa[];};
+layout (binding = 1) readonly  buffer XB {float data_xb[];};
+layout (binding = 2) writeonly buffer DA {float data_da[];};
+layout (binding = 3) writeonly buffer DB {float data_db[];};
+layout (binding = 4) readonly  buffer AL {float data_al[];};
+layout (binding = 5) readonly  buffer DT {float data_dt[];};
+layout (binding = 6) readonly  buffer SA {float data_sa[];};
+layout (binding = 7) writeonly buffer GT {float data_gt[];};
+
+layout (push_constant) uniform parameter {
+    uint32_t ncols;                                   // 128, as rms_norm.comp's p.ne00
+    uint32_t a_rows, a_ne01, a_ne02, a_nb01, a_nb02, a_nb03;   // A: rows, row / channel dims, strides (elements)
+    uint32_t b_rows, b_ne01, b_ne02, b_nb01, b_nb02, b_nb03;
+    float    a_eps, a_scale; uint32_t a_bias;         // RMS_NORM param1, SCALE param1, SCALE param2 (bits)
+    float    b_eps, b_scale; uint32_t b_bias;
+    uint32_t g_ne0, g_ne, g_a_nb1;                    // gate: num_v_heads, elements, alpha row stride (elements)
+} p;
+
+shared float sumsh[NCOLS];
+
+// UNARY(SOFTPLUS) exactly as unary.comp defines it
+float op_softplus(float x) {
+    return (x > 20.0f) ? x : log(1.0f + exp(x));
+}
+
+void main() {
+    const uint wg  = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (wg >= p.a_rows + p.b_rows) {
+        // G: add_softplus_mul
+        const uint32_t idx = (wg - p.a_rows - p.b_rows) * NCOLS + tid;
+        if (idx >= p.g_ne) {
+            return;
+        }
+        const uint32_t i0 = fastmod(idx, p.g_ne0);
+        const float biased = data_al[((idx - i0) / p.g_ne0) * p.g_a_nb1 + i0] + data_dt[i0];   // ADD
+        const float sp     = op_softplus(biased);                                              // UNARY(SOFTPLUS)
+        data_gt[idx] = sp * data_sa[i0];                                                       // MUL
+        return;
+    }
+
+    // A or B (uniform per workgroup): one 128-wide row of an RMS_NORM -> SCALE pair
+    const bool is_b = wg >= p.a_rows;
+    const uint r    = is_b ? wg - p.a_rows : wg;
+    const uint ne01 = is_b ? p.b_ne01 : p.a_ne01;
+    const uint ne02 = is_b ? p.b_ne02 : p.a_ne02;
+    const uint i1 = r % ne01;
+    const uint i2 = (r / ne01) % ne02;
+    const uint i3 = (r / ne01) / ne02;
+    const uint a_offset = is_b ? i3 * p.b_nb03 + i2 * p.b_nb02 + i1 * p.b_nb01
+                               : i3 * p.a_nb03 + i2 * p.a_nb02 + i1 * p.a_nb01;
+    const float xi = is_b ? data_xb[a_offset + tid] : data_xa[a_offset + tid];
+
+    float sum = float(0.0f);
+    sum += xi * xi;
+    sumsh[tid] = sum;
+    barrier();
+#if DECODE_FUSE_MUTANT == 31
+    [[unroll]] for (uint s = 1; s < NCOLS; s <<= 1) {
+        if ((tid & (2 * s - 1)) == 0) {
+            sum += sumsh[tid + s];
+            sumsh[tid] = sum;
+        }
+        barrier();
+    }
+#else
+    [[unroll]] for (int s = NCOLS / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum += sumsh[tid + s];
+            sumsh[tid] = sum;
+        }
+        barrier();
+    }
+#endif
+    sum = sumsh[0];
+    const float mean  = sum / float(p.ncols);
+    const float scale = inversesqrt(mean + float(is_b ? p.b_eps : p.a_eps));
+    const float param2 = is_b ? p.b_scale : p.a_scale;
+    const float bias   = uintBitsToFloat(is_b ? p.b_bias : p.a_bias);
+#if DECODE_FUSE_MUTANT == 32
+    const float o = (scale * float(param2)) * float(xi) + float(bias);
+#else
+    const float y = float(scale * float(xi));
+    const float o = float(y) * float(param2) + float(bias);
+#endif
+    if (is_b) {
+        data_db[r * p.ncols + tid] = o;
+    } else {
+        data_da[r * p.ncols + tid] = o;
+    }
+}
