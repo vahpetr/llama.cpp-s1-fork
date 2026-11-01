@@ -14,6 +14,9 @@ layout (push_constant) uniform parameter
     uint ne20; uint ne21; uint ne22; uint ne23; uint nb20; uint nb21; uint nb22; uint nb23;
     uint misalign_offsets;
     float param1; float param2; int param3;
+#if HC_COMBINE_RMS
+    float hc_s1; float hc_s2; uint hc_inj_nb1;   // [TAG_ADD_RMS_ROWS] vk_op_hc_combine_rms_push_constants
+#endif
 #if RMS_NORM_ROPE_FUSION
     rope_params rope;
 #endif

@@ -175,6 +175,12 @@ if (Vulkan_FOUND)
         add_compile_definitions(GGML_VULKAN_HC_TAIL_NEGCTL)
         list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_HC_TAIL_NEGCTL=ON)
     endif()
+    # [TAG_ADD_RMS_ROWS] mutant builds of rms_norm_hc_combine_f32, tests only (1 = 256-wide reduction, 2 = reversed per-thread
+    # partial order, 3 = negative control: one residual bit flipped per row; 0 = none)
+    if (GGML_VULKAN_ADD_RMS_ROWS_MUTANT)
+        add_compile_definitions(GGML_VULKAN_ADD_RMS_ROWS_MUTANT=${GGML_VULKAN_ADD_RMS_ROWS_MUTANT})
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_ADD_RMS_ROWS_MUTANT=${GGML_VULKAN_ADD_RMS_ROWS_MUTANT})
+    endif()
 
     if (GGML_VULKAN_VALIDATE)
         add_compile_definitions(GGML_VULKAN_VALIDATE)

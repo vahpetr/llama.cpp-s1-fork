@@ -30,7 +30,12 @@ layout (binding = 6) readonly buffer R_I {uvec2 rope_data_i[];}; // indices for 
 #endif
 
 #extension GL_EXT_control_flow_attributes : enable
+#if HC_COMBINE_RMS && HC_RMS_MUTANT == 1
+// MUTANT BUILD ONLY (cmake -DGGML_VULKAN_ADD_RMS_ROWS_MUTANT=1): a 256-wide reduction tree instead of rms_norm's 512
+#define BLOCK_SIZE 256
+#else
 #define BLOCK_SIZE 512
+#endif
 
 layout (constant_id = 1) const bool do_multiply = false;
 
@@ -63,6 +68,48 @@ float load_c(uint idx) {
 }
 #endif
 
+#if HC_COMBINE_RMS
+// [TAG_ADD_RMS_ROWS] HC_COMBINE + RMS_NORM + MUL in one dispatch (rms_norm_hc_combine_f32, a separate SPIR-V: the other
+// rms_norm binaries are byte-unchanged - the two load sites below are macros that expand to the old text for them).
+// The qwen4exp hyper-connection combine (hc_combine.comp)
+//   x[i, c, t] = residual[i, c, t] + block[i, t] * (s2 * sigmoid(s1 * inject[c, t]))
+// is computed in place of the load of the RMS_NORM input, stored to binding 5 (the combine's own destination, read by
+// the next combine as its residual), and then reduced by the SAME source lines as rms_norm_mul_f32: one workgroup of
+// BLOCK_SIZE per row, the per-thread strided sum, the shared-memory tree. The normalised product re-reads the stored x
+// (the same invocation wrote it, at the same index). Rows are (c, t): row = c, channel = t, as RMS_NORM dispatches
+// [ne0, hc, T]. Every operand is contiguous with no misalignment (the matcher requires it); inject is read at
+// t * inj_nb1 + c, inj_nb1 = hc for a contiguous inject ([TAG_MERGE_ROWS]: a row view of the merged down|inject output).
+layout (binding = 3) readonly buffer HB {float data_hc_blk[];};
+layout (binding = 4) readonly buffer HI {float data_hc_inj[];};
+layout (binding = 5) buffer HR {float data_hc_res[];};
+
+// hc_combine.comp hc_weight(), character for character: SCALE -> SIGMOID -> SCALE, one f32 rounding per step, in a
+// function so a `precise` below cannot propagate into it
+float hc_weight(uint32_t i12) {
+    const float x   = data_hc_inj[i12] * p.hc_s1;
+    const float sig = 1.0f / (1.0f + exp(-x));
+    return sig * p.hc_s2;
+}
+
+// MUL(repeat(block), w) and ADD(residual, .) as two separately rounded steps (hc_combine.comp), stored as the combine's
+// output; NEGCTL (mutant 3) flips the last mantissa bit of the stored residual of column 0 only
+float hc_combine_x(uint a_idx, uint blk_idx, uint res_idx, float w, uint col) {
+    precise float bw  = data_hc_blk[blk_idx] * w;
+    precise float acc = data_a[a_idx] + bw;
+#if HC_RMS_MUTANT == 3
+    data_hc_res[res_idx] = col == 0 ? uintBitsToFloat(floatBitsToUint(acc) ^ 1u) : acc;
+#else
+    data_hc_res[res_idx] = acc;
+#endif
+    return acc;
+}
+#define RMS_LOAD_X(col)  hc_combine_x(a_offset + (col), blk_offset + (col), r_offset + (col), hc_w, (col))
+#define RMS_LOAD_X2(col) data_hc_res[r_offset + (col)]
+#else
+#define RMS_LOAD_X(col)  data_a[a_offset + (col)]
+#define RMS_LOAD_X2(col) data_a[a_offset + (col)]
+#endif
+
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
@@ -89,12 +136,23 @@ void rms_norm(uint num_iters) {
 #else
     uint32_t d_offset = ((samp*nchannels + channel)*nrows + row)*ncols + get_doffset();
 #endif
+#if HC_COMBINE_RMS
+    const uint32_t r_offset   = ((samp*nchannels + channel)*nrows + row)*ncols;   // the combine's destination row
+    const uint32_t blk_offset = channel*ncols;                                    // block[., t]
+    const float    hc_w       = hc_weight(channel*p.hc_inj_nb1 + row);           // inject[c, t]
+#endif
     FLOAT_TYPE sum = FLOAT_TYPE(0.0f); // partial sum for thread in warp
 
+#if HC_COMBINE_RMS && HC_RMS_MUTANT == 2
+    // MUTANT BUILD ONLY (cmake -DGGML_VULKAN_ADD_RMS_ROWS_MUTANT=2): each thread adds its partials in reverse column order
+    [[unroll]] for (uint idx = 0; idx < num_iters; ++idx) {
+        const uint col = tid + (num_iters - 1 - idx) * BLOCK_SIZE;
+#else
     [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+#endif
         FLOAT_TYPE xi = FLOAT_TYPE(0);
         if (col < ncols) {
-            xi = FLOAT_TYPE(data_a[a_offset + col]);
+            xi = FLOAT_TYPE(RMS_LOAD_X(col));
         }
         sum += xi * xi;
     }
@@ -146,14 +204,14 @@ void rms_norm(uint num_iters) {
                 if (col >= ncols) {
                     continue;
                 }
-                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
+                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(RMS_LOAD_X2(col)) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
             }
         } else {
             [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                 if (col >= ncols) {
                     continue;
                 }
-                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
+                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(RMS_LOAD_X2(col)) * FLOAT_TYPE(data_b[b_offset + col]));
             }
         }
     } else {

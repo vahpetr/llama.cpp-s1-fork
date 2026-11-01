@@ -891,6 +891,12 @@ void process_shaders() {
     string_to_spv("rms_norm_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     // [TAG_RMS_NORM_EXT] RMS_NORM + SCALE and RMS_NORM + MUL + (SIGMOID +) MUL (spec constants 2..4 select the tail)
     string_to_spv("rms_norm_ext_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_EXT", "1"}}));
+    // [TAG_ADD_RMS_ROWS] HC_COMBINE + RMS_NORM + MUL (mutant builds: -DGGML_VULKAN_ADD_RMS_ROWS_MUTANT=1|2|3, tests only)
+#if defined(GGML_VULKAN_ADD_RMS_ROWS_MUTANT) && GGML_VULKAN_ADD_RMS_ROWS_MUTANT > 0
+    string_to_spv("rms_norm_hc_combine_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"HC_COMBINE_RMS", "1"}, {"HC_RMS_MUTANT", std::to_string(GGML_VULKAN_ADD_RMS_ROWS_MUTANT)}}));
+#else
+    string_to_spv("rms_norm_hc_combine_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"HC_COMBINE_RMS", "1"}, {"HC_RMS_MUTANT", "0"}}));
+#endif
     string_to_spv("rms_norm_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_mul_rope_f32_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
     string_to_spv("rms_norm_mul_rope_f32_f16", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
