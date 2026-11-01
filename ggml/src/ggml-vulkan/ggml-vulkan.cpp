@@ -22934,6 +22934,7 @@ static bool ggml_vk_can_fuse_concat_ssm_conv(const ggml_backend_vk_context * ctx
 // source may overlap the destination other than exactly (the graph_compute veto would undo the pair): a refused pair
 // keeps today's MUL + ADD. Returns the number of additional fused nodes (0 = no match).
 static uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
+static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise);
 static int ggml_vk_can_fuse_shexp_tail(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (!ggml_vk_decode_fuse_enabled() || node_idx + 1 >= cgraph->n_nodes) {
         return 0;
