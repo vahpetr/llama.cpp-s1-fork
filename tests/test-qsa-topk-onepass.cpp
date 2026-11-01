@@ -366,6 +366,148 @@ static bool compute(ggml_backend_t be, const std::vector<ggml_tensor *> & nodes)
     return ok;
 }
 
+// [TAG_QSA_TOPK_V3] stage 2 (v71 P6): the v3 block summary is built once per metadata snapshot and reused; these checks change
+// the snapshot under it. Each prints "[op] stale <i> <name> exact=<0|1> bad=<n>"; the dispatch lines of its ops (node
+// stale<i>_<j>) carry summary=built|reused, which the parent checks on the v3 arms:
+//   0 gen    one graph of 2 ops computed twice, every input rewritten in place in between (same tensors, same addresses):
+//            built 2, reused 2
+//   1 nkv    two graphs over views of the SAME storage at offset 0 with another n_kv / n_blocks (the mirror pattern): built 2
+//   2 write  one graph: op, a CPY that rewrites the cell planes in place, op over the CPY's result (same address): built 2
+//   3 alt    one graph alternating two metadata snapshots A, B, A: built 3
+// A -DGGML_VULKAN_QSA_TOPK_V3_MUTANT=4 build (the summary reused whenever the metadata addresses match) must fail 0..2.
+static size_t check_rows(ggml_tensor * op, const op_inputs & in, const op_case & c) {
+    const int64_t nr = c.n_tps*c.n_stream;
+    std::vector<int32_t> o((size_t) (c.width*nr)), ref;
+    std::vector<uint32_t> keys, tmp;
+    ggml_backend_tensor_get(op, o.data(), 0, o.size()*sizeof(int32_t));
+    size_t bad = 0;
+    for (int64_t row = 0; row < nr; row++) {
+        reference_row(in, c, row, keys, tmp, ref);
+        bad += memcmp(ref.data(), o.data() + row*c.width, c.width*sizeof(int32_t)) != 0;
+    }
+    return bad;
+}
+
+struct vis_set {
+    ggml_tensor * score = nullptr, * cb = nullptr, * cells = nullptr, * toks = nullptr;
+};
+
+static vis_set new_set(ggml_context * ctx, const op_case & c, int64_t nb) {
+    vis_set v;
+    v.score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nb, c.n_tps, c.n_stream);
+    v.cb    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, c.n_kv, c.n_stream);
+    v.cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, c.n_kv, 4, c.n_stream);
+    v.toks  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, c.n_tps, c.n_stream);
+    return v;
+}
+
+static void set_inputs(const vis_set & v, const op_inputs & in) {
+    ggml_backend_tensor_set(v.score, in.score.data(), 0, ggml_nbytes(v.score));
+    ggml_backend_tensor_set(v.cb,    in.cb.data(),    0, ggml_nbytes(v.cb));
+    ggml_backend_tensor_set(v.cells, in.cells.data(), 0, ggml_nbytes(v.cells));
+    ggml_backend_tensor_set(v.toks,  in.toks.data(),  0, ggml_nbytes(v.toks));
+}
+
+static ggml_tensor * stale_op(ggml_context * ctx, const vis_set & v, ggml_tensor * cells, int width, int i, int j) {
+    ggml_tensor * op = ggml_qsa_top_k_vis(ctx, v.score, v.cb, cells ? cells : v.cells, v.toks, width, 0, true);
+    ggml_format_name(op, "stale%d_%d", i, j);
+    return op;
+}
+
+static void stale_checks() {
+    const op_case cA { 262144,     128, 1, 2051, M_DISTINCT, false, MAP_BLK4  };
+    const op_case cB { 262144,     128, 1, 2051, M_HOLES,    false, MAP_PERM4 };
+    const op_case cC { 196608 + 2, 128, 1, 2051, M_HOT,      false, MAP_PERM4 };
+    const op_case cW { 262144,     128, 1, 2051, M_HOLES,    false, MAP_BLK4  };
+    const op_inputs inA = make_inputs(cA), inB = make_inputs(cB), inC = make_inputs(cC);
+    op_inputs inW = make_inputs(cW);
+    // the write check's second op: A's scores, cell map and rows over W's planes (holes: 15 % of the cells emptied)
+    GGML_ASSERT(inW.cb == inA.cb && inW.toks == inA.toks && inW.nb == inA.nb);
+    const std::vector<int32_t> cellsW = inW.cells;
+    inW.score = inA.score;
+    const char * names[4] = { "gen", "nkv", "write", "alt" };
+    printf("[op] stale-begin\n");
+    for (int i = 0; i < 4; i++) {
+        ggml_backend_t be = gpu_backend();
+        GGML_ASSERT(be);
+        ggml_init_params ip = { 32*ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        size_t bad = 0;
+        bool   ok  = true;
+        std::vector<ggml_tensor *> g1, g2;
+        vis_set a, b;
+        ggml_tensor * extra = nullptr;
+        if (i == 0) {
+            a = new_set(ctx, cA, inA.nb);
+            g1 = { stale_op(ctx, a, nullptr, cA.width, i, 0), stale_op(ctx, a, nullptr, cA.width, i, 1) };
+        } else if (i == 1) {
+            // one storage, two views at offset 0: n_kv 262144 (65536 blocks), then 196610 (49153 blocks)
+            ggml_tensor * sc_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, inA.nb*cA.n_tps);
+            ggml_tensor * cb_b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, cA.n_kv);
+            ggml_tensor * ce_b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4*cA.n_kv);
+            ggml_tensor * tk   = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, cA.n_tps, 1);
+            const auto views = [&](const op_case & c, int64_t nb) {
+                vis_set v;
+                v.score = ggml_view_3d(ctx, sc_b, nb, c.n_tps, 1, nb*sizeof(float), nb*c.n_tps*sizeof(float), 0);
+                v.cb    = ggml_view_2d(ctx, cb_b, c.n_kv, 1, c.n_kv*sizeof(int32_t), 0);
+                v.cells = ggml_view_3d(ctx, ce_b, c.n_kv, 4, 1, c.n_kv*sizeof(int32_t), 4*c.n_kv*sizeof(int32_t), 0);
+                v.toks  = tk;
+                return v;
+            };
+            a = views(cA, inA.nb);
+            b = views(cC, inC.nb);
+            g1 = { stale_op(ctx, a, nullptr, cA.width, i, 0) };
+            g2 = { stale_op(ctx, b, nullptr, cC.width, i, 1) };
+        } else if (i == 2) {
+            a = new_set(ctx, cA, inA.nb);
+            extra = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, cA.n_kv, 4, 1);
+            ggml_tensor * cp = ggml_cpy(ctx, extra, a.cells);
+            g1 = { stale_op(ctx, a, nullptr, cA.width, i, 0), stale_op(ctx, a, cp, cA.width, i, 1) };
+        } else {
+            a = new_set(ctx, cA, inA.nb);
+            b = new_set(ctx, cB, inB.nb);
+            g1 = { stale_op(ctx, a, nullptr, cA.width, i, 0), stale_op(ctx, b, nullptr, cB.width, i, 1), stale_op(ctx, a, nullptr, cA.width, i, 2) };
+        }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+        GGML_ASSERT(buf);
+        if (!ggml_backend_supports_op(be, g1[0])) {
+            printf("[op] stale %d %s unsupported\n", i, names[i]);
+        } else {
+            if (i == 0) {
+                set_inputs(a, inA);
+                GGML_ASSERT(compute(be, g1));
+                bad += check_rows(g1[0], inA, cA) + check_rows(g1[1], inA, cA);
+                set_inputs(a, inB);   // every input rewritten in place: same tensors, same addresses, the B map / holes
+                GGML_ASSERT(compute(be, g1));
+                bad += check_rows(g1[0], inB, cB) + check_rows(g1[1], inB, cB);
+            } else if (i == 1) {
+                set_inputs(a, inA);
+                GGML_ASSERT(compute(be, g1));
+                bad += check_rows(g1[0], inA, cA);
+                set_inputs(b, inC);   // the same storage laid out for the smaller n_kv
+                GGML_ASSERT(compute(be, g2));
+                bad += check_rows(g2[0], inC, cC);
+            } else if (i == 2) {
+                set_inputs(a, inA);
+                ggml_backend_tensor_set(extra, cellsW.data(), 0, ggml_nbytes(extra));
+                GGML_ASSERT(compute(be, g1));
+                bad += check_rows(g1[0], inA, cA) + check_rows(g1[1], inW, cW);
+            } else {
+                set_inputs(a, inA);
+                set_inputs(b, inB);
+                GGML_ASSERT(compute(be, g1));
+                bad += check_rows(g1[0], inA, cA) + check_rows(g1[1], inB, cB) + check_rows(g1[2], inA, cA);
+            }
+            ok = bad == 0;
+            printf("[op] stale %d %s exact=%d bad=%zu\n", i, names[i], (int) ok, bad);
+        }
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        ggml_backend_free(be);
+    }
+    printf("[op] stale-end\n");
+}
+
 static int child(const std::string & dir, int reps) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
@@ -449,6 +591,11 @@ static int child(const std::string & dir, int reps) {
         ggml_backend_free(be);
         printf("[op] end %zu\n", i);
     }
+    // GGML_TEST_ONEPASS_STALE=1: the stale checks also with a case filter (smoke runs); =0: never
+    const char * st = getenv("GGML_TEST_ONEPASS_STALE");
+    if (st ? atoi(st) != 0 : (!getenv("GGML_TEST_ONEPASS_CASES") && !getenv("GGML_TEST_ONEPASS_NTPS"))) {
+        stale_checks();
+    }
     return 0;
 }
 
@@ -463,8 +610,15 @@ struct case_view {
     double      v3blocks_sum = 0.0, v3mixed_sum = 0.0;
 };
 
+// [TAG_QSA_TOPK_V3] stage 2: the stale-summary checks of an arm
+struct stale_view {
+    bool seen = false, exact = false, unsupported = false;
+    int  v3 = 0, built = 0, reused = 0;
+};
+
 struct arm_view {
     std::vector<case_view> c;
+    stale_view st[4];
     bool rc0 = false, negctl = false, skip = false, mutant = false;
     std::string proof, proof_v3;
     size_t n_onepass = 0, n_v3 = 0;
@@ -472,7 +626,7 @@ struct arm_view {
 
 static arm_view run_arm(const char * self, const std::string & env, const std::string & dir, int reps, size_t n_cases) {
     arm_view a;
-    a.c.resize(n_cases);
+    a.c.resize(n_cases + 1);   // [n_cases]: the stale checks' counter lines land here
     const std::string cmd = "rm -rf '" + dir + "' && mkdir -p '" + dir + "' && " + env + " GGML_VK_DISPATCH_LOG=1 '" + self +
                             "' --child '" + dir + "' " + std::to_string(reps) + " 2>&1";
     FILE * p = popen(cmd.c_str(), "r");
@@ -493,6 +647,23 @@ static arm_view run_arm(const char * self, const std::string & env, const std::s
         if (l.find("qsa_topk: v3 ") != std::string::npos && l.find("MUTANT BUILD") != std::string::npos) { a.mutant = true; }
         if (sscanf(l.c_str(), "[op] begin %zu", &idx) == 1 && idx < n_cases) {
             cur = idx;
+        }
+        if (l.find("[op] stale-begin") != std::string::npos) {
+            cur = n_cases;
+        }
+        int si = -1;
+        if (sscanf(l.c_str(), "[op] stale %d", &si) == 1 && si >= 0 && si < 4) {
+            a.st[si].seen = true;
+            a.st[si].unsupported = l.find(" unsupported") != std::string::npos;
+            a.st[si].exact = l.find(" exact=1 ") != std::string::npos;
+        }
+        if (l.rfind("[vk-dispatch] op=QSA_TOP_K ", 0) == 0 && l.find(" node=stale") != std::string::npos) {
+            const int i = atoi(l.c_str() + l.find(" node=stale") + 11);
+            if (i >= 0 && i < 4) {
+                a.st[i].v3     += l.find(" path=v3 ") != std::string::npos;
+                a.st[i].built  += l.find(" summary=built ") != std::string::npos;
+                a.st[i].reused += l.find(" summary=reused ") != std::string::npos;
+            }
         }
         if (sscanf(l.c_str(), "[op] case %zu", &idx) == 1 && idx < n_cases) {
             case_view & v = a.c[idx];
@@ -629,13 +800,28 @@ int main(int argc, char ** argv) {
     printf("[op-dump] %zu comparisons: %zu identical, %zu differ, %zu missing\n", n_same + n_diff + n_missing, n_same, n_diff, n_missing);
 
     // [TAG_QSA_TOPK_V3] a mutant build: the battery must FAIL through the v3 arms (off / onepass arms exact)
+    // stage 2: the stale-summary checks (every arm exact; the v3 arms build / reuse the summary as the snapshot demands)
+    size_t n_stale_v3_bad = 0;
+    bool   stale_op_ok = true;
+    for (int i = 0; i < 4; ++i) {
+        for (size_t a = 0; a < n_run; ++a) {
+            const stale_view & t = v[a].st[i];
+            if (a < 3) { stale_op_ok = stale_op_ok && t.seen && (t.exact || t.unsupported); }
+            else       { n_stale_v3_bad += !(t.seen && t.exact); }
+        }
+        printf("[op-stale] %d %s: exact off/on/on_all/v3/v3_all %d/%d/%d/%d/%d; v3 arm: v3 dispatches %d, built %d, reused %d; v3_all: %d / %d / %d\n",
+               i, i == 0 ? "gen" : i == 1 ? "nkv" : i == 2 ? "write" : "alt", (int) v[0].st[i].exact, (int) v[1].st[i].exact,
+               (int) v[2].st[i].exact, (int) v[3].st[i].exact, (int) v[4].st[i].exact, v[3].st[i].v3, v[3].st[i].built,
+               v[3].st[i].reused, v[4].st[i].v3, v[4].st[i].built, v[4].st[i].reused);
+    }
     if (v[3].mutant || v[4].mutant) {
-        bool op_ok = true;
+        bool op_ok = stale_op_ok;
         for (size_t i = 0; i < cases.size(); ++i) {
             for (size_t a = 0; a < 3; ++a) { op_ok = op_ok && (v[a].c[i].exact || v[a].c[i].unsupported); }
         }
-        printf("test-qsa-topk-onepass: FAIL - MUTANT BUILD %s (v3 arms: %zu cases not exact [%s], %zu dumps differ; off / onepass arms "
-               "exact %d)\n", n_v3_bad > 0 && op_ok ? "CAUGHT" : "NOT CAUGHT", n_v3_bad, v3_bad_list.c_str(), n_diff, (int) op_ok);
+        printf("test-qsa-topk-onepass: FAIL - MUTANT BUILD %s (v3 arms: %zu cases not exact [%s], %zu dumps differ, %zu stale checks not "
+               "exact; off / onepass arms exact %d)\n", (n_v3_bad > 0 || n_stale_v3_bad > 0) && op_ok ? "CAUGHT" : "NOT CAUGHT", n_v3_bad,
+               v3_bad_list.c_str(), n_diff, n_stale_v3_bad, (int) op_ok);
         return 1;
     }
 
@@ -749,10 +935,28 @@ int main(int argc, char ** argv) {
             n_fb_forced_ok += v[2].c[i].rows > 0 && v[2].c[i].fb*2 >= v[2].c[i].rows && v[2].c[i].fb < v[2].c[i].rows;
         }
     }
+    // stage 2: stale checks exact everywhere; the v3 arms dispatch v3 for every stale op and build exactly per snapshot
+    size_t n_stale_ok = 0, n_stale = 0;
+    if (n_run == n_arms) {
+        const int want_built[4] = { 2, 2, 2, 3 }, want_reused[4] = { 2, 0, 0, 0 }, n_ops[4] = { 4, 2, 2, 3 };
+        for (int i = 0; i < 4; ++i) {
+            for (size_t a = 0; a < n_arms; ++a) {
+                const stale_view & t = v[a].st[i];
+                const bool w = a < 3 ? t.v3 == 0 : (t.v3 == n_ops[i] && t.built == want_built[i] && t.reused == want_reused[i]);
+                n_stale++;
+                n_stale_ok += t.seen && t.exact && w;
+                if (!(t.seen && t.exact && w)) {
+                    printf("  %s stale check %d: seen %d exact %d v3 %d built %d reused %d\n", arms[a][0], i, (int) t.seen, (int) t.exact,
+                           t.v3, t.built, t.reused);
+                }
+            }
+        }
+        ok = ok && n_stale_ok == n_stale;
+    }
     ok = ok && n_fb_forced > 0 && n_fb_forced_ok == n_fb_forced && v[1].n_onepass > 0 && v[0].n_onepass == 0;
     printf("test-qsa-topk-onepass: %s (%zu cases x %zu arms exact vs the contract reference; on / on_all / v3 / v3_all dumps "
            "byte-identical to off %zu/%zu; onepass cases on %zu, on_all %zu; v3 cases v3 %zu, v3_all %zu; forced-fallback / mixed-block "
-           "cases behaving %zu/%zu)\n", ok ? "PASS" : "FAIL", cases.size(), n_run, n_same, (n_run - 1)*cases.size(), v[1].n_onepass,
-           v[2].n_onepass, v[3].n_v3, v[4].n_v3, n_fb_forced_ok, n_fb_forced);
+           "cases behaving %zu/%zu; stale-summary checks %zu/%zu)\n", ok ? "PASS" : "FAIL", cases.size(), n_run, n_same, (n_run - 1)*cases.size(), v[1].n_onepass,
+           v[2].n_onepass, v[3].n_v3, v[4].n_v3, n_fb_forced_ok, n_fb_forced, n_stale_ok, n_stale);
     return ok ? 0 : 1;
 }

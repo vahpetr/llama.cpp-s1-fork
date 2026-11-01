@@ -993,6 +993,11 @@ struct vk_device_struct {
     uint32_t qsa_topk_v3_min_rows = 16;
     uint64_t qsa_topk_v3_next_log = 1024;
     uint64_t qsa_topk_v3_logged   = 0;
+    // [TAG_QSA_TOPK_V3] stage 2 (v71 P6): the write generation of this device's buffers - bumped by every host-side write
+    // (set / memset / copy / clear, sync and async) - one component of the v3 summary's snapshot identity
+    // (ggml_backend_vk_context::qsa_topk_v3_sum_id); summaries built / reused (the counters line)
+    std::atomic<uint64_t> qsa_meta_gen {0};
+    std::atomic<uint64_t> qsa_topk_v3_sum_built {0}, qsa_topk_v3_sum_reused {0}, qsa_topk_v3_sum_inval {0};
     // backoff (GGML_VK_QSA_TOPK_ONEPASS_BACKOFF, default on): a window of >= 512 selected rows of which more than half fell
     // back sends the selections to v2 for qsa_topk_op_backoff synchronizations (16, doubling while it repeats, <= 1024)
     bool     qsa_topk_op_backoff_on = true;
@@ -1268,8 +1273,9 @@ struct vk_device_struct {
     // metadata, metadata without the key rows - and v2's cell form as its per-row fallback (QSA_TOPK_FB, push constant fb_off)
     vk_pipeline pipeline_topk_op_qsa[3], pipeline_topk_op_qsa_vis[3], pipeline_topk_op_qsa_vis_nk[3];
     vk_pipeline pipeline_topk_v2_qsa_fb[6], pipeline_topk_v2_qsa_vis_fb[6], pipeline_topk_v2_qsa_vis_nk_fb[6];
-    // [TAG_QSA_TOPK_V3] the block-weighted form of the nokeys onepass (passes 5 rows, 0 scatter, 1 classify, 2 sample,
-    // 3 filter, 4 select; onepass's 8 bindings); its fallback = pipeline_topk_v2_qsa_vis_nk_fb
+    // [TAG_QSA_TOPK_V3] the block-weighted form of the nokeys onepass (passes 0 scatter, 5 summarize - once per metadata
+    // snapshot -, 1 classify, 2 sample, 3 filter, 4 select; onepass's 8 bindings + the summary); its fallback =
+    // pipeline_topk_v2_qsa_vis_nk_fb
     vk_pipeline pipeline_topk_v3_qsa_vis_nk[6];
     vk_pipeline pipeline_qsa_bias;       // [TAG_QSA_COMPACT_BIAS] GGML_OP_QSA_BIAS
     vk_pipeline pipeline_sum_rows_f32;
@@ -3594,6 +3600,23 @@ struct ggml_backend_vk_context {
     // cleared by context B while context A's selections were still in flight, and the warning attributed to the wrong context)
     vk_buffer qsa_topk_nk_flag;
     bool      qsa_topk_nk_warned = false;
+    // [TAG_QSA_TOPK_V3] stage 2 (v71 P6): the v3 block summary (topk_qsa_v3.comp binding 8: block lists, counts, min / max
+    // p0, AND / OR seq mask) in a device buffer of its own - never prealloc_x, which flash attention and other ops overwrite
+    // between two selections - built once per metadata snapshot and reused by every selection of the graph over it. Snapshot
+    // identity: this context's graph serial (bumped at every graph_compute: the inputs are rewritten between graphs), the
+    // device's write generation (qsa_meta_gen: any host write into a vk buffer), the metadata's vk buffers / offsets / sizes
+    // (cell_blk and the cell planes), n_kv, n_blocks, n_stream. A node of the graph that writes into either metadata range
+    // drops it (ggml_vk_qsa_topk_v3_note_writes); so does a reallocation of this buffer.
+    struct qsa_topk_v3_sum_id_t {
+        bool             valid = false;
+        uint64_t         serial = 0, gen = 0;
+        const vk_buffer_struct * cb_buf = nullptr, * vc_buf = nullptr;
+        size_t           cb_off = 0, cb_size = 0, vc_off = 0, vc_size = 0;
+        uint32_t         n_kv = 0, n_blocks = 0, n_stream = 0;
+    };
+    vk_buffer            qsa_topk_v3_sum;
+    qsa_topk_v3_sum_id_t qsa_topk_v3_sum_id;
+    uint64_t             qsa_graph_serial = 0;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -7859,7 +7882,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 for (uint32_t pass = 0; pass < 6; ++pass) {
                     const uint32_t lds_n = pass == 4 ? VK_QSA_TOPK_ONEPASS_CAP : 1u;
                     ggml_vk_create_pipeline2(device, device->pipeline_topk_v3_qsa_vis_nk[pass], "topk_qsa_v3_vis_nk_p" + std::to_string(pass),
-                                             topk_qsa_v3_vis_nk_f32_len, topk_qsa_v3_vis_nk_f32_data, "main", 8,
+                                             topk_qsa_v3_vis_nk_f32_len, topk_qsa_v3_vis_nk_f32_data, "main", 9,
                                              sizeof(vk_op_topk_v3_push_constants), {1, 1, 1},
                                              {pass, 256 / wave, device->qsa_topk_cpt, lds_n, 1, nk_check}, 1, true, true, wave);
                 }
@@ -9402,7 +9425,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
             const bool   v3_env_set = v3_env != nullptr && *v3_env != '\0';
             // default ON on gfx1151 (like onepass, 0275), OFF elsewhere; an explicit 0/1 always wins
             const bool   v3_req     = ggml_vk_env_bool("GGML_VK_QSA_TOPK_V3", op_gfx1151);
-            device->qsa_topk_v3     = v3_req && device->qsa_topk_onepass && device->qsa_topk_nokeys;
+            // stage 2 (v71 P6): the select's sort pairs lanes with subgroupShuffleXor
+            device->qsa_topk_v3     = v3_req && device->qsa_topk_onepass && device->qsa_topk_nokeys && device->subgroup_shuffle;
             device->qsa_topk_v3_min_rows = env_u32("GGML_VK_QSA_TOPK_V3_MIN_ROWS", 16);
 #if defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 1
             const char * v3_mut = " MUTANT BUILD M-B1: a block with p0 == min pos counted FULL";
@@ -9410,16 +9434,20 @@ static vk_device ggml_vk_get_device(size_t idx) {
             const char * v3_mut = " MUTANT BUILD M-B2: a FULL block weighs MAXC whatever its cell count";
 #elif defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 3
             const char * v3_mut = " MUTANT BUILD M-B3: no per-cell test on partly visible blocks";
+#elif defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 4
+            const char * v3_mut = " MUTANT BUILD reuse-stale: the block summary reused whenever the metadata addresses match";
 #else
             const char * v3_mut = "";
 #endif
             GGML_LOG_WARN("ggml_vulkan: %s qsa_topk: v3 %s (%s%s; block-weighted onepass of the nokeys cell form, <= %u cells per "
-                          "block, from %u rows (GGML_VK_QSA_TOPK_V3_MIN_ROWS; fewer: onepass), onepass's gates / fallback / backoff)%s\n",
+                          "block, from %u rows (GGML_VK_QSA_TOPK_V3_MIN_ROWS; fewer: onepass), onepass's gates / fallback / backoff; "
+                          "block summary once per metadata snapshot)%s\n",
                           device->name.c_str(), device->qsa_topk_v3 ? "on" : "off",
                           v3_env_set ? (v3_req ? "GGML_VK_QSA_TOPK_V3=1" : "GGML_VK_QSA_TOPK_V3=0")
                                      : (op_gfx1151 ? "default on gfx1151; GGML_VK_QSA_TOPK_V3 unset"
                                                    : "default off: not gfx1151; GGML_VK_QSA_TOPK_V3 unset"),
-                          !v3_req ? "" : !device->qsa_topk_onepass ? "; needs onepass" : !device->qsa_topk_nokeys ? "; needs nokeys" : "",
+                          !v3_req ? "" : !device->qsa_topk_onepass ? "; needs onepass" : !device->qsa_topk_nokeys ? "; needs nokeys" :
+                          !device->subgroup_shuffle ? "; needs subgroup shuffle" : "",
                           VK_QSA_TOPK_V3_MAXC, std::max<uint32_t>(device->qsa_topk_v3_min_rows, 1u), v3_mut);
         }
 
@@ -18213,11 +18241,20 @@ static bool ggml_vk_qsa_topk_v3(const vk_device & device, bool nokeys, int64_t n
            nrows >= std::max<uint32_t>(device->qsa_topk_v3_min_rows, 1u);
 }
 
-// [TAG_QSA_TOPK_V3] the v3 region after onepass's: wsum[rows] | flag[4] | ragg[n_stream][4] | bcnt[nb] | list[nb][MAXC] |
-// cls[n_stream][ceil(n_blocks / 4)], nb = n_blocks * n_stream (4.3 MiB at 262 144 blocks); the zeroed span = wsum .. bcnt
+// [TAG_QSA_TOPK_V3] the per-selection v3 region after onepass's: wsum[rows] | cls[n_stream][ceil(n_blocks / 4)] (256 KiB at
+// 262 144 blocks; the sample pass zeroes wsum, the classify pass writes every cls word)
 static size_t ggml_vk_qsa_topk_v3_uints(size_t nrows, size_t n_blocks, size_t n_stream) {
+    return nrows + n_stream * ((n_blocks + 3) / 4);
+}
+
+// [TAG_QSA_TOPK_V3] stage 2: the block summary (its own buffer, ggml_backend_vk_context::qsa_topk_v3_sum): flag[4] |
+// bcnt[nb4] | bsum[nb] (4 words) | list[nb][MAXC], nb = n_blocks * n_stream, nb4 = nb rounded up to 4 (9 MiB at 262 144
+// blocks); the zeroed span = flag .. bcnt
+static bool ggml_vk_qsa_topk_v3_range(const ggml_backend_vk_context * ctx, const ggml_tensor * t, const vk_buffer_struct *& buf,
+                                      size_t & off, size_t & size); // [TAG_QSA_TOPK_V3] defined before graph_compute
+static size_t ggml_vk_qsa_topk_v3_sum_uints(size_t n_blocks, size_t n_stream) {
     const size_t nb = n_blocks * n_stream;
-    return nrows + 4 + 4 * n_stream + nb + VK_QSA_TOPK_V3_MAXC * nb + n_stream * ((n_blocks + 3) / 4);
+    return 4 + ((nb + 3) & ~(size_t) 3) + 4 * nb + VK_QSA_TOPK_V3_MAXC * nb;
 }
 
 // [TAG_QSA_TOPK_V3] the block sample: S = min(VK_QSA_TOPK_V3_SAMPLE, n_blocks) blocks (a multiple of SRUN), runs of SRUN consecutive blocks
@@ -18454,7 +18491,8 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
             vk_pipeline * fb_pl = nokeys ? ctx->device->pipeline_topk_v2_qsa_vis_nk_fb
                                 : vis    ? ctx->device->pipeline_topk_v2_qsa_vis_fb : ctx->device->pipeline_topk_v2_qsa_fb;
             if (v3) {
-                // [TAG_QSA_TOPK_V3] zero wsum .. bcnt, then rows -> scatter -> classify -> sample -> filter -> select (topk_qsa_v3.comp)
+                // [TAG_QSA_TOPK_V3] the block summary (scatter -> summarize) when this selection's metadata snapshot differs from
+                // the one the summary holds, then classify -> sample -> filter -> select (topk_qsa_v3.comp)
                 const uint32_t tile_b    = 256 * ctx->device->qsa_topk_cpt;
                 const uint32_t n_tiles_b = (uint32_t) CEIL_DIV(n_blocks, tile_b);
                 const uint32_t nbw       = (n_blocks + 3) / 4;
@@ -18466,31 +18504,87 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
                 };
                 GGML_ASSERT(n_tiles_b <= ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
                 GGML_ASSERT(n_stream <= ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
-                const uint64_t z_uints = (uint64_t) nrows + 4 + 4 * (uint64_t) n_stream + (uint64_t) n_blocks * n_stream;
-                subctx->s->buffer->buf.fillBuffer(ctx->prealloc_x->buffer, v3_off * sizeof(uint32_t),
-                                                  (vk::DeviceSize) z_uints * sizeof(uint32_t), 0);
-                ggml_vk_sync_buffers(ctx, subctx);
-                if (ctx->device->dispatch_log) {
-                    fprintf(stderr, "[vk-dispatch] op=QSA_TOP_K path=v3 form=cells vis=%d n_kv=%u n_blocks=%u rows=%u k=%u tiles=%u "
-                            "sample=%u j=%u stride=%u scratch=%zu pipeline=%s node=%s\n", vis ? 1 : 0, n_kv, n_blocks, nrows, width,
-                            n_tiles_b, v3_sample, v3_j, v3_stride, scratch_size,
-                            ctx->device->pipeline_topk_v3_qsa_vis_nk[0]->name.c_str(), top_k->name);
+
+                // stage 2: the summary buffer, grown geometrically (>= 1 MiB). Recorded work may still read the old one:
+                // submit and wait first, as ggml_vk_preallocate_buffers does for prealloc_x
+                const size_t sum_bytes = ggml_vk_qsa_topk_v3_sum_uints(n_blocks, n_stream) * sizeof(uint32_t);
+                const size_t range_cap = (size_t) ctx->device->properties.limits.maxStorageBufferRange;
+                GGML_ASSERT(sum_bytes <= range_cap);
+                if (!ctx->qsa_topk_v3_sum || ctx->qsa_topk_v3_sum->size < sum_bytes) {
+                    const size_t old  = ctx->qsa_topk_v3_sum ? ctx->qsa_topk_v3_sum->size : 0;
+                    const size_t want = std::min(range_cap, std::max({ sum_bytes, old + old / 4, (size_t) 1 << 20 }));
+                    if (ctx->qsa_topk_v3_sum) {
+                        ggml_vk_ctx_end(subctx);
+                        ggml_vk_submit(subctx, {});
+                        ctx->submit_pending = true;
+                        ggml_vk_synchronize(ctx);
+                        GGML_ASSERT(ctx->compute_ctx.expired());
+                        ggml_vk_ctx_begin(ctx->device, subctx);
+                        ctx->compute_ctx = subctx;
+                        ggml_vk_destroy_buffer(ctx->qsa_topk_v3_sum);
+                    }
+                    ctx->qsa_topk_v3_sum = ggml_vk_create_buffer_device(ctx->device, want);
+                    ctx->qsa_topk_v3_sum_id.valid = false;
+                    GGML_LOG_INFO("ggml_vulkan: qsa_topk v3: block summary buffer %s -> %s (n_blocks=%u n_stream=%u needs %s)\n",
+                                  format_size(old).c_str(), format_size(want).c_str(), n_blocks, n_stream, format_size(sum_bytes).c_str());
                 }
-                // pass 5 (the rows' aggregates) first, then 0..4
-                for (uint32_t pass : { 5u, 0u, 1u, 2u, 3u, 4u }) {
+                const vk_subbuffer sum_buf { ctx->qsa_topk_v3_sum, 0, ctx->qsa_topk_v3_sum->size };
+
+                // the snapshot identity of this selection's metadata
+                ggml_backend_vk_context::qsa_topk_v3_sum_id_t want_id;
+                want_id.valid    = true;
+                want_id.serial   = ctx->qsa_graph_serial;
+                want_id.gen      = ctx->device->qsa_meta_gen.load(std::memory_order_relaxed);
+                want_id.n_kv     = n_kv;
+                want_id.n_blocks = n_blocks;
+                want_id.n_stream = n_stream;
+                const bool have_cb = ggml_vk_qsa_topk_v3_range(ctx, cell_blk, want_id.cb_buf, want_id.cb_off, want_id.cb_size);
+                const bool have_vc = ggml_vk_qsa_topk_v3_range(ctx, mask,     want_id.vc_buf, want_id.vc_off, want_id.vc_size);
+                GGML_ASSERT(have_cb && have_vc);
+                const auto & id = ctx->qsa_topk_v3_sum_id;
+#if defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 4
+                // MUTANT reuse-stale (tests only): the addresses alone decide
+                const bool reuse = id.valid && id.cb_buf == want_id.cb_buf && id.cb_off == want_id.cb_off &&
+                                   id.vc_buf == want_id.vc_buf && id.vc_off == want_id.vc_off;
+#else
+                const bool reuse = id.valid && id.serial == want_id.serial && id.gen == want_id.gen &&
+                                   id.cb_buf == want_id.cb_buf && id.cb_off == want_id.cb_off && id.cb_size == want_id.cb_size &&
+                                   id.vc_buf == want_id.vc_buf && id.vc_off == want_id.vc_off && id.vc_size == want_id.vc_size &&
+                                   id.n_kv == want_id.n_kv && id.n_blocks == want_id.n_blocks && id.n_stream == want_id.n_stream;
+#endif
+                const auto dispatch3 = [&](uint32_t pass, const std::array<uint32_t, 3> & el) {
                     vk_pipeline & pl = ctx->device->pipeline_topk_v3_qsa_vis_nk[pass];
-                    const std::array<uint32_t, 3> el =
-                        pass == 5 ? std::array<uint32_t, 3> { 1, n_stream, 1 } :
-                        pass == 0 ? std::array<uint32_t, 3> { n_tiles_c, n_stream, 1 } :
-                        pass == 1 ? std::array<uint32_t, 3> { (uint32_t) CEIL_DIV(nbw, 256), n_stream, 1 } :
-                                    std::array<uint32_t, 3> { n_x, pass == 3 ? n_tiles_b : 1u, 1 };
                     ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
                     ggml_vk_dispatch_pipeline(ctx, subctx, pl,
-                        { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
+                        { sc_buf, ggml_vk_tensor_subbuffer(ctx, top_k),
                           ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
-                          scratch_buf, toks_buf, nk_buf, st_buf }, pc3, el);
+                          scratch_buf, toks_buf, nk_buf, st_buf, sum_buf }, pc3, el);
                     ggml_vk_sync_buffers(ctx, subctx);
+                };
+                if (!reuse) {
+                    // every earlier reader of the summary (a previous snapshot's selections) is ordered before the rebuild
+                    ggml_vk_sync_buffers(ctx, subctx);
+                    const uint64_t nb = (uint64_t) n_blocks * n_stream;
+                    subctx->s->buffer->buf.fillBuffer(ctx->qsa_topk_v3_sum->buffer, 0,
+                                                      (vk::DeviceSize) (4 + ((nb + 3) & ~(uint64_t) 3)) * sizeof(uint32_t), 0);
+                    ggml_vk_sync_buffers(ctx, subctx);
+                    dispatch3(0, { n_tiles_c, n_stream, 1 });                                   // scatter
+                    dispatch3(5, { (uint32_t) CEIL_DIV(n_blocks, 256), n_stream, 1 });          // summarize
+                    ctx->qsa_topk_v3_sum_id = want_id;
+                    ctx->device->qsa_topk_v3_sum_built.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    ctx->device->qsa_topk_v3_sum_reused.fetch_add(1, std::memory_order_relaxed);
                 }
+                if (ctx->device->dispatch_log) {
+                    fprintf(stderr, "[vk-dispatch] op=QSA_TOP_K path=v3 form=cells vis=%d n_kv=%u n_blocks=%u rows=%u k=%u tiles=%u "
+                            "sample=%u j=%u stride=%u scratch=%zu summary=%s pipeline=%s node=%s\n", vis ? 1 : 0, n_kv, n_blocks, nrows, width,
+                            n_tiles_b, v3_sample, v3_j, v3_stride, scratch_size, reuse ? "reused" : "built",
+                            ctx->device->pipeline_topk_v3_qsa_vis_nk[0]->name.c_str(), top_k->name);
+                }
+                dispatch3(1, { (uint32_t) CEIL_DIV(nbw, 256), n_stream, 1 });                   // classify
+                dispatch3(2, { n_x, 1, 1 });                                                     // sample
+                dispatch3(3, { n_x, n_tiles_b, 1 });                                             // filter
+                dispatch3(4, { n_x, 1, 1 });                                                     // select
             }
             if (!v3 && ctx->device->dispatch_log) {
                 fprintf(stderr, "[vk-dispatch] op=QSA_TOP_K path=%s form=cells vis=%d n_kv=%u rows=%u k=%u tiles=%u sample=%u j=%u "
@@ -21175,6 +21269,7 @@ static void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, g
     }
 
     uint32_t val32 = (uint32_t)value * 0x01010101;
+    buf->device->qsa_meta_gen.fetch_add(1, std::memory_order_relaxed); // [TAG_QSA_TOPK_V3]
     ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
 }
 
@@ -21187,6 +21282,7 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
         return;
     }
 
+    buf->device->qsa_meta_gen.fetch_add(1, std::memory_order_relaxed); // [TAG_QSA_TOPK_V3]
     ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
@@ -21201,6 +21297,7 @@ static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, g
         return;
     }
 
+    buf->device->qsa_meta_gen.fetch_add(1, std::memory_order_relaxed); // [TAG_QSA_TOPK_V3]
     ggml_vk_buffer_write_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_data, stride_tensor, size, n_copies);
 }
 
@@ -21244,6 +21341,7 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
         vk_buffer src_buf = src_buf_ctx->dev_buffer;
         vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
 
+        dst_buf->device->qsa_meta_gen.fetch_add(1, std::memory_order_relaxed); // [TAG_QSA_TOPK_V3]
         ggml_vk_buffer_copy(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src_buf, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
 
         return true;
@@ -21256,6 +21354,7 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
 static void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
+    ctx->dev_buffer->device->qsa_meta_gen.fetch_add(1, std::memory_order_relaxed); // [TAG_QSA_TOPK_V3]
     ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, buffer->size);
 }
 
@@ -21484,12 +21583,15 @@ static void ggml_vk_qsa_topk_onepass_stats(ggml_backend_vk_context * ctx, bool f
         const uint64_t done = v3_rows - u - o - g;
         char line[512];
         const int n = snprintf(line, sizeof(line), "ggml_vulkan: qsa_topk v3: rows %llu, fallback %llu (%.4f %%: under %llu, over %llu, "
-                               "summary %llu), blocks/row %.1f, mixed/row %.2f (check/row %.2f), max c %llu, backoffs %llu; onepass rows %llu%s\n",
+                               "summary %llu), blocks/row %.1f, mixed/row %.2f (check/row %.2f), max c %llu, backoffs %llu; summaries built %llu "
+                               "reused %llu dropped %llu; onepass rows %llu%s\n",
                                (unsigned long long) v3_rows, (unsigned long long) (u + o + g), 100.0 * (double) (u + o + g) / (double) v3_rows,
                                (unsigned long long) u, (unsigned long long) o, (unsigned long long) g,
                                done ? (double) device->qsa_topk_op_tot[44] / (double) done : 0.0,
                                (double) device->qsa_topk_op_tot[46] / (double) v3_rows, (double) device->qsa_topk_op_tot[45] / (double) v3_rows,
                                (unsigned long long) device->qsa_topk_op_tot[47], (unsigned long long) device->qsa_topk_op_backoffs,
+                               (unsigned long long) device->qsa_topk_v3_sum_built.load(), (unsigned long long) device->qsa_topk_v3_sum_reused.load(),
+                               (unsigned long long) device->qsa_topk_v3_sum_inval.load(),
                                (unsigned long long) device->qsa_topk_op_tot[0], final ? " (final)" : "");
         ggml_vk_qsa_topk_onepass_emit(line, n, sizeof(line));
         device->qsa_topk_v3_logged = v3_rows;
@@ -21538,6 +21640,8 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
     ggml_vk_qsa_topk_onepass_stats(ctx, true);
     ggml_vk_destroy_buffer(ctx->qsa_topk_op_stats); // [TAG_QSA_TOPK_ONEPASS] this context's counters, read above
     ggml_vk_destroy_buffer(ctx->qsa_topk_nk_flag);  // [TAG_QSA_TOPK_NOKEYS] this context's CHECK word
+    ggml_vk_destroy_buffer(ctx->qsa_topk_v3_sum);   // [TAG_QSA_TOPK_V3] this context's block summary
+    ctx->qsa_topk_v3_sum_id.valid = false;
 
     delete ctx;
     delete backend;
@@ -21604,6 +21708,7 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
     }
 
     vk_buffer buf = buf_ctx->dev_buffer;
+    buf->device->qsa_meta_gen.fetch_add(1, std::memory_order_relaxed); // [TAG_QSA_TOPK_V3]
 
     auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
 
@@ -21725,6 +21830,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
     vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
+    dst_buf->device->qsa_meta_gen.fetch_add(1, std::memory_order_relaxed); // [TAG_QSA_TOPK_V3]
 
     if (ggml_backend_buffer_is_vk(src->buffer)) {
         ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
@@ -23061,9 +23167,66 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+// [TAG_QSA_TOPK_V3] stage 2: the vk buffer and byte range a tensor's data occupies (false: not in a vk buffer of this device)
+static bool ggml_vk_qsa_topk_v3_range(const ggml_backend_vk_context * ctx, const ggml_tensor * t, const vk_buffer_struct *& buf,
+                                      size_t & off, size_t & size) {
+    if (t == nullptr || t->buffer == nullptr) {
+        return false;
+    }
+    vk_buffer b = nullptr;
+    size_t    o = 0;
+    if (ctx->device->uma) {
+        ggml_vk_host_get(ctx->device, t->data, b, o);
+    }
+    if (!b) {
+        if (!ggml_backend_buffer_is_vk(t->buffer)) {
+            return false;
+        }
+        b = ((ggml_backend_vk_buffer_context *) t->buffer->context)->dev_buffer;
+        o = vk_tensor_offset(t) + t->view_offs;
+    }
+    buf  = b.get();
+    off  = o;
+    size = ggml_nbytes(t);
+    return true;
+}
+
+// [TAG_QSA_TOPK_V3] stage 2: a node about to be recorded that writes into the metadata the v3 summary was built from (its own
+// tensor, or a source it mutates) drops the summary - the next v3 selection rebuilds it. Views write nothing.
+static void ggml_vk_qsa_topk_v3_note_writes(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i, int n_fused) {
+#if defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 4
+    GGML_UNUSED(ctx); GGML_UNUSED(cgraph); GGML_UNUSED(i); GGML_UNUSED(n_fused); // MUTANT reuse-stale: writes ignored
+#else
+    auto & id = ctx->qsa_topk_v3_sum_id;
+    for (int k = 0; id.valid && k <= n_fused && i + k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * node = cgraph->nodes[i + k];
+        const ggml_tensor * w[3] = {
+            (ggml_is_empty(node) || ggml_op_is_empty(node->op)) ? nullptr : node, ggml_vk_mutated_src(node, 0), ggml_vk_mutated_src(node, 1),
+        };
+        for (const ggml_tensor * t : w) {
+            const vk_buffer_struct * b = nullptr;
+            size_t off = 0, size = 0;
+            if (!ggml_vk_qsa_topk_v3_range(ctx, t, b, off, size)) {
+                continue;
+            }
+            const bool hit_cb = b == id.cb_buf && off < id.cb_off + id.cb_size && id.cb_off < off + size;
+            const bool hit_vc = b == id.vc_buf && off < id.vc_off + id.vc_size && id.vc_off < off + size;
+            if (hit_cb || hit_vc) {
+                id.valid = false;
+                ctx->device->qsa_topk_v3_sum_inval.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+        }
+    }
+#endif
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    // [TAG_QSA_TOPK_V3] a new graph: its inputs may have been rewritten since the last one (the v3 summary's identity)
+    ctx->qsa_graph_serial++;
 
     if (ctx->device->f32acc_trunk) { // [TAG_F32ACC] proof line, once: the first graph that holds excluded matmuls
         static std::atomic<bool> f32acc_proof {false};
@@ -23768,6 +23931,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
+        if (ctx->qsa_topk_v3_sum_id.valid) { // [TAG_QSA_TOPK_V3] a write into the summary's metadata drops it
+            ggml_vk_qsa_topk_v3_note_writes(ctx, cgraph, i, ctx->num_additional_fused_ops);
+        }
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
         if (vk_perf_logger_enabled && enqueued) {

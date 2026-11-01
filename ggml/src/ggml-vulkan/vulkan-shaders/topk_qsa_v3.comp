@@ -6,52 +6,63 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 
 // [TAG_QSA_TOPK_V3] (plan 2.9.2 #1, design docs/research/2026-10-31-topk-v3-design.md section 2 "B"; GGML_VK_QSA_TOPK_V3=1,
-// default off) the onepass selection (topk_qsa_onepass.comp) of the metadata cell form without the key rows, done over the
-// BLOCKS: the cells of a block share one score, so a block is one key with a weight = the number of its cells visible to the
-// row. Only the blocks whose cells the row sees in part pay a per-cell visibility test.
+// default on gfx1151) the onepass selection (topk_qsa_onepass.comp) of the metadata cell form without the key rows, done over
+// the BLOCKS: the cells of a block share one score, so a block is one key with a weight = the number of its cells visible to
+// the row. Only the blocks whose cells the row sees in part pay a per-cell visibility test.
 //
 // Output contract - v2's, byte for byte, ids AND order (topk_radix_select_v2.comp, the nokeys cell form):
 //   cell key = visible ? f2ui_u(score bits of the cell's block) : 0x007FFFFF; T = the k-th largest cell key of the row;
 //   ids = every cell with key > T ascending, then the lowest-id cells with key == T ascending, until k.
 //
-// Five passes (PASS), one dispatch each, a full barrier between them, then v2's six passes (QSA_TOPK_FB, the onepass
-// fallback list) over the rows this file could not finish:
-//   5 rows     (first; one workgroup per stream): the stream's token records -> min / max pos, AND / OR of the seq bits.
-//   0 scatter  (cell tiles, streams): every cell with a nonzero seq mask and a block id < n_blocks takes a slot of its
-//              block's list with one atomic on the block's word, which also counts the cells not visible to every row of
-//              the selection's stream and the cells visible to some row (from pass 5's aggregates); > MAXC cells in one block raise the summary flag (every
-//              row of the selection goes to v2). A cell with a zero seq mask is invisible to every row ((sm & tk.y) == 0),
-//              so it never has a key above 0x007FFFFF.
-//   1 classify (block words, streams): per block one byte = cell count (3 bits) | class (2 bits) for the selection's rows:
-//              FULL  every cell visible to every row of the stream: (sm & AND tk.y) != 0 and p0 < min pos (strict: at
-//                    p0 == pos the x / y order decides);
-//              EMPTY no cell visible to any row: (sm & OR tk.y) == 0 or p0 > max pos, for every cell;
-//              CHECK the rest - the row tests each cell (v2's predicate, cell_vis).
-//   2 sample   one workgroup per row: n_sample blocks (runs of SRUN at stride), weight-ranked (FULL / CHECK: the cell
-//              count, EMPTY or key <= 0x007FFFFF: 0): tau = the j_sample-th largest sampled cell key, floored to 0x00800000.
-//              Zeroes the row's candidate count (or CAP + 1: the sample promises > 2 CAP candidate blocks).
-//   3 filter   (rows, block tiles): per block the row's weight w (FULL: count, CHECK: the visible cells, EMPTY: 0) and its
-//              key; w > 0 and key >= tau appends (key, block | w << 29) to the row's list and adds w to the row's weight sum.
-//   4 select   one workgroup per row: c blocks with weight sum W. Fallback to v2 on the summary flag, c > CAP, W < k, or
-//              more than CAP cells at keys >= T. Else T = the k-th largest of the candidates' cell keys (v2's radix rule with
-//              the histogram counting weights), every candidate block with key >= T is expanded into its visible cells as
-//              composites (key > T: id, key == T: 1 << 31 | id), sorted ascending in LDS, the first k written.
+// Stage 2 (v71 P6): the block summary depends on the cell metadata only (cell_blk, the pos / seq planes, n_kv, n_blocks,
+// n_stream), which every QSA layer and chunk of a graph shares, so it is built ONCE per metadata snapshot into a buffer of its
+// own (binding 8, ggml-vulkan.cpp qsa_topk_v3_sum: never prealloc_x, which flash attention and other ops overwrite between
+// selections); the host decides reuse from the snapshot identity (graph serial, write generation, the metadata's buffers /
+// offsets / sizes, n_kv, n_blocks, n_stream). Per selection only the row-dependent part runs.
+//
+// Passes (PASS), one dispatch each, a full barrier between them:
+//   per snapshot:
+//   0 scatter   (cell tiles, streams): every cell with a nonzero seq mask and a block id < n_blocks takes a slot of its
+//               block's list with one atomic on the block's count; a block of > MAXC cells raises the summary flag (every
+//               row of every selection over this snapshot goes to v2). A cell with a zero seq mask is invisible to every
+//               row ((sm & tk.y) == 0), so it never has a key above 0x007FFFFF.
+//   5 summarize (blocks, streams): per block {min p0, max p0, AND seq mask, OR seq mask} over its listed cells.
+//   per selection:
+//   1 classify  (block words, streams): the stream's rows -> min / max pos, AND / OR of the seq bits (in LDS, per
+//               workgroup), then per block one byte = cell count (3 bits) | class (2 bits):
+//               FULL  every cell visible to every row: (AND sm & AND tk.y) != 0 and max p0 < min pos (strict: at p0 == pos
+//                     the x / y order decides);
+//               EMPTY no cell visible to any row: no cell, (OR sm & OR tk.y) == 0, or min p0 > max pos;
+//               CHECK the rest - the row tests each cell (v2's predicate, cell_vis). Sufficient conditions only: a block
+//               that is not proven FULL / EMPTY is CHECK, which is exact (only slower).
+//   2 sample    one workgroup per row: n_sample blocks (runs of SRUN at stride), weight-ranked (FULL / CHECK: the visible
+//               cells, EMPTY or key <= 0x007FFFFF: 0): tau = the j_sample-th largest sampled cell key, floored to 0x00800000.
+//               Zeroes the row's candidate count (or CAP + 1: the sample promises > 2 CAP candidate blocks) and weight sum.
+//   3 filter    (rows, block tiles): per block the row's weight w (FULL: count, CHECK: the visible cells, EMPTY: 0) and its
+//               key; w > 0 and key >= tau appends (key, block | w << 29) to the row's list and adds w to the row's weight sum.
+//   4 select    one workgroup per row: c blocks with weight sum W. Fallback to v2 on the summary flag, c > CAP, W < k, or
+//               more than CAP cells at keys >= T. Else T = the k-th largest of the candidates' cell keys (v2's radix rule
+//               with the histogram counting weights), every candidate block with key >= T is expanded into its visible
+//               cells as composites (key > T: id, key == T: 1 << 31 | id), sorted ascending in LDS, the first k written.
+// Then v2's six passes (QSA_TOPK_FB, the onepass fallback list) over the rows this file could not finish.
 // Why the result is v2's: every candidate key is > 0x007FFFFF and W counts exactly the cells with key >= tau (a block's
 // visible cells, all with the block's key), so W >= k means T >= tau > 0x007FFFFF and every cell with key >= T sits in a
 // candidate block. The weighted histogram over the candidates is v2's histogram over those cells (a block adds w where v2
 // adds 1 per cell), so T is v2's; the expansion emits exactly the visible cells (FULL: all, CHECK: per-cell test), and the
-// sorted composites are v2's emit truncated to k. tau, the sample and the order of the atomics never reach an id.
+// sorted composites are v2's emit truncated to k. tau, the sample and the order of the atomics (list slots, candidates) never
+// reach an id.
 //
-// Scratch (uint offsets): op_off: tau[nrows] | cnt[nrows] | fb[1 + nrows] | cand[nrows][CAP][2] (onepass's layout, so the
-// fallback list sits where the QSA_TOPK_FB passes read it); v3_off: wsum[nrows] | flag[4] | ragg[n_stream][4] |
-// bcnt[n_stream * n_blocks] (count | not-all-visible << 8 | some-visible << 20) | list[n_stream * n_blocks][MAXC] | cls[n_stream][nbw] (nbw = ceil(n_blocks / 4) words of 4
-// class bytes). The host zeroes wsum .. bcnt before pass 0.
+// Scratch (binding 4, uint offsets): op_off: tau[nrows] | cnt[nrows] | fb[1 + nrows] | cand[nrows][CAP][2] (onepass's
+// layout, so the fallback list sits where the QSA_TOPK_FB passes read it); v3_off: wsum[nrows] | cls[n_stream][nbw]
+// (nbw = ceil(n_blocks / 4) words of 4 class bytes).
+// Summary (binding 8, nb = n_stream * n_blocks, nb4 = nb rounded up to 4): flag[4] | bcnt[nb4] | bsum[nb] (uvec4: min p0,
+// max p0, AND sm, OR sm) | list[nb][MAXC]. The host zeroes flag .. bcnt before pass 0.
 // stats (binding 7, after onepass's 40 words): [40] rows selected here or sent back, [41] fallback W < k, [42] fallback
 // c > CAP or > CAP cells at T, [43] fallback summary flag, [44] candidate blocks summed over the finished rows, [45] CHECK
 // blocks met by the filter, [46] of them partly visible (0 < w < count), [47] max c.
 // ONEPASS_NEGCTL takes the highest-id ties (as topk_qsa_onepass.comp). V3_MUTANT (tests only, cmake
-// -DGGML_VULKAN_QSA_TOPK_V3_MUTANT=n): 1 = M-B1 (FULL at p0 <= min pos), 2 = M-B2 (a FULL block weighs MAXC whatever its
-// count), 3 = M-B3 (a CHECK block counted and expanded as FULL: no per-cell test).
+// -DGGML_VULKAN_QSA_TOPK_V3_MUTANT=n): 1 = M-B1 (FULL at max p0 <= min pos), 2 = M-B2 (a FULL block weighs MAXC whatever its
+// count), 3 = M-B3 (a CHECK block counted and expanded as FULL: no per-cell test); 4 = reuse-stale is host-only.
 
 #ifndef V3_MUTANT
 #define V3_MUTANT 0
@@ -67,7 +78,7 @@
 #define CLS_FULL  1u
 #define CLS_CHECK 2u
 
-layout(constant_id = 0) const uint PASS       = 0;  // 5 rows, 0 scatter, 1 classify, 2 sample, 3 filter, 4 select
+layout(constant_id = 0) const uint PASS       = 0;  // 0 scatter, 5 summarize (per snapshot); 1 classify, 2 sample, 3 filter, 4 select
 layout(constant_id = 1) const uint NWAVES     = 4;
 layout(constant_id = 2) const uint CPT        = 8;  // cells (scatter) / blocks (filter) per invocation per tile
 layout(constant_id = 3) const uint LDS_N      = 1;  // CAP for the select, 1 else
@@ -85,6 +96,8 @@ layout (binding = 4) buffer S {uint scratch[];};
 layout (binding = 5) readonly  buffer VT {ivec4 data_vt[];};   // token records {pos, seq bit, x, y}
 layout (binding = 6) buffer NKF {uint nk_flag[];};
 layout (binding = 7) buffer ST {uint stats[];};
+layout (binding = 8) buffer SM {uint summ[];};          // the block summary (one per metadata snapshot)
+layout (binding = 8) buffer SM4 {uvec4 summ4[];};       // the same, bsum as 16-B elements
 
 layout (push_constant) uniform parameter {
     uint ncols;
@@ -136,11 +149,12 @@ uint fb_off()   { return p.op_off + 2u * p.nrows; }
 uint cand_off() { return p.op_off + 3u * p.nrows + 1u; }
 uint nbw()      { return (p.n_blocks + 3u) / 4u; }
 uint wsum_off() { return p.v3_off; }
-uint flag_off() { return p.v3_off + p.nrows; }
-uint ragg_off() { return p.v3_off + p.nrows + 4u; }
-uint bcnt_off() { return ragg_off() + 4u * p.n_stream; }
-uint list_off() { return bcnt_off() + p.n_stream * p.n_blocks; }
-uint cls_off()  { return list_off() + MAXC * p.n_stream * p.n_blocks; }
+uint cls_off()  { return p.v3_off + p.nrows; }
+// summary (binding 8): flag[4] | bcnt[nb4] | bsum[nb] uvec4 | list[nb][MAXC]
+uint nbs()      { return p.n_stream * p.n_blocks; }
+uint bcnt_off() { return 4u; }
+uint bsum_off() { return 4u + ((nbs() + 3u) & ~3u); }    // a multiple of 4: 16-B aligned
+uint list_off() { return bsum_off() + 4u * nbs(); }
 
 // v2's visibility of cell i to token tk (kqv_visible: seq bit, then p0 > pos, then at p0 == pos the x / y order)
 bool cell_vis(const uint cbase, const ivec4 tk, const uint i) {
@@ -183,86 +197,85 @@ uint block_weight(const uint s, const ivec4 tk, const uint b, const uint byte) {
     const uint lb    = list_off() + (s * p.n_blocks + b) * MAXC;
     uint w = 0u;
     for (uint j = 0u; j < n; ++j) {
-        w += cell_vis(cbase, tk, scratch[lb + j]) ? 1u : 0u;
+        w += cell_vis(cbase, tk, summ[lb + j]) ? 1u : 0u;
     }
     return w;
 #endif
 }
 
-// PASS 5 (dispatched first, one workgroup per stream): the stream's token records -> min / max pos, AND / OR of the seq bits
-void rows_pass(const uint s, const uint lin) {
-    int  mn = 0x7FFFFFFF, mx = -0x7FFFFFFF - 1;
-    uint ya = 0xFFFFFFFFu, yo = 0u;
-    for (uint t = lin; t < p.n_tps; t += WG) {
-        const ivec4 tk = data_vt[s * p.n_tps + t];
-        mn = min(mn, tk.x);
-        mx = max(mx, tk.x);
-        ya &= uint(tk.y);
-        yo |= uint(tk.y);
-    }
-    mn = subgroupMin(mn);
-    mx = subgroupMax(mx);
-    ya = subgroupAnd(ya);
-    yo = subgroupOr(yo);
-    if (gl_SubgroupInvocationID == 0u) {
-        sh_r0[gl_SubgroupID] = uint(mn);
-        sh_r1[gl_SubgroupID] = uint(mx);
-        sh_r2[gl_SubgroupID] = ya;
-        sh_r3[gl_SubgroupID] = yo;
-    }
-    barrier();
-    if (lin == 0u) {
-        [[unroll]] for (uint w = 0u; w < NWAVES; ++w) {
-            mn = min(mn, int(sh_r0[w]));
-            mx = max(mx, int(sh_r1[w]));
-            ya &= sh_r2[w];
-            yo |= sh_r3[w];
-        }
-        scratch[ragg_off() + 4u * s + 0u] = uint(mn);
-        scratch[ragg_off() + 4u * s + 1u] = uint(mx);
-        scratch[ragg_off() + 4u * s + 2u] = ya;
-        scratch[ragg_off() + 4u * s + 3u] = yo;
-    }
-}
-
+// PASS 0 (per snapshot): per cell one atomic on its block's count; the slot it returns places the cell in the block's list.
+// A count can pass MAXC only in a block of > MAXC cells, which raises the summary flag (every row to v2).
 void scatter_pass(const uint tile, const uint s, const uint lin) {
-    const int  mn = int(scratch[ragg_off() + 4u * s + 0u]);
-    const int  mx = int(scratch[ragg_off() + 4u * s + 1u]);
-    const uint ya = scratch[ragg_off() + 4u * s + 2u];
-    const uint yo = scratch[ragg_off() + 4u * s + 3u];
-    // per cell one atomic on its block's word: + 1 (count, bits 0..7), + 1 << 8 when the cell is NOT visible to every row
-    // of the stream (bits 8..19: (sm & AND tk.y) != 0 and p0 < min pos - strict: at p0 == pos the x / y order decides),
-    // + 1 << 20 when it may be visible to some row (bits 20..31: (sm & OR tk.y) != 0 and p0 <= max pos). A field can only
-    // carry past its width in a block of > MAXC cells, which raises the summary flag (every row to v2).
-    const uint cbase = s * 4u * p.ncols;
-    const uint base  = tile * (WG * CPT);
+    const uint base = tile * (WG * CPT);
     [[unroll]] for (uint c = 0u; c < CPT; ++c) {
         const uint i = base + c * WG + lin;
         if (i < p.ncols) {
-            const uint sm = uint(data_vc[cbase + p.ncols + i]);
-            const int  p0 = data_vc[cbase + i];
+            const uint sm = uint(data_vc[s * 4u * p.ncols + p.ncols + i]);
             const uint b  = uint(cell_blk[s * p.ncols + i]);
             if (sm != 0u && b < p.n_blocks) {
-#if V3_MUTANT == 1
-                const bool causal_full = p0 <= mn; // MUTANT M-B1: p0 == min pos counted visible (the x / y order ignored)
-#else
-                const bool causal_full = p0 < mn;
-#endif
-                const bool fv  = (sm & ya) != 0u && (VIS_CAUSAL == 0u || causal_full);
-                const bool ev  = (sm & yo) == 0u || (VIS_CAUSAL != 0u && p0 > mx);
-                const uint add = 1u + (fv ? 0u : (1u << 8u)) + (ev ? 0u : (1u << 20u));
-                const uint slot = atomicAdd(scratch[bcnt_off() + s * p.n_blocks + b], add) & 0xFFu;
+                const uint slot = atomicAdd(summ[bcnt_off() + s * p.n_blocks + b], 1u);
                 if (slot < MAXC) {
-                    scratch[list_off() + (s * p.n_blocks + b) * MAXC + slot] = i;
+                    summ[list_off() + (s * p.n_blocks + b) * MAXC + slot] = i;
                 } else {
-                    atomicOr(scratch[flag_off()], 1u);
+                    atomicOr(summ[0], 1u);
                 }
             }
         }
     }
 }
 
-void classify_pass(const uint wi, const uint s) {
+// PASS 5 (per snapshot): per block {min p0, max p0, AND sm, OR sm} over its listed cells (none: an empty block)
+void summarize_pass(const uint b, const uint s) {
+    if (b >= p.n_blocks) {
+        return;
+    }
+    const uint g     = s * p.n_blocks + b;
+    const uint n     = min(summ[bcnt_off() + g], MAXC); // > MAXC: the flag sends every row to v2
+    const uint cbase = s * 4u * p.ncols;
+    int  mn = 0x7FFFFFFF, mx = -0x7FFFFFFF - 1;
+    uint ya = 0xFFFFFFFFu, yo = 0u;
+    for (uint j = 0u; j < n; ++j) {
+        const uint i  = summ[list_off() + g * MAXC + j];
+        const int  p0 = data_vc[cbase + i];
+        const uint sm = uint(data_vc[cbase + p.ncols + i]);
+        mn = min(mn, p0);
+        mx = max(mx, p0);
+        ya &= sm;
+        yo |= sm;
+    }
+    summ4[bsum_off() / 4u + g] = uvec4(uint(mn), uint(mx), ya, yo);
+}
+
+// PASS 1 (per selection): the stream's token records -> min / max pos, AND / OR of the seq bits (each workgroup on its own:
+// n_tps records, L2-resident), then per block the class byte for this selection's rows
+void classify_pass(const uint wg, const uint s, const uint lin) {
+    int  rmn = 0x7FFFFFFF, rmx = -0x7FFFFFFF - 1;
+    uint rya = 0xFFFFFFFFu, ryo = 0u;
+    for (uint t = lin; t < p.n_tps; t += WG) {
+        const ivec4 tk = data_vt[s * p.n_tps + t];
+        rmn = min(rmn, tk.x);
+        rmx = max(rmx, tk.x);
+        rya &= uint(tk.y);
+        ryo |= uint(tk.y);
+    }
+    rmn = subgroupMin(rmn);
+    rmx = subgroupMax(rmx);
+    rya = subgroupAnd(rya);
+    ryo = subgroupOr(ryo);
+    if (gl_SubgroupInvocationID == 0u) {
+        sh_r0[gl_SubgroupID] = uint(rmn);
+        sh_r1[gl_SubgroupID] = uint(rmx);
+        sh_r2[gl_SubgroupID] = rya;
+        sh_r3[gl_SubgroupID] = ryo;
+    }
+    barrier();
+    [[unroll]] for (uint w = 0u; w < NWAVES; ++w) {
+        rmn = min(rmn, int(sh_r0[w]));
+        rmx = max(rmx, int(sh_r1[w]));
+        rya &= sh_r2[w];
+        ryo |= sh_r3[w];
+    }
+    const uint wi = wg * WG + lin;
     if (wi >= nbw()) {
         return;
     }
@@ -272,11 +285,18 @@ void classify_pass(const uint wi, const uint s) {
         if (b >= p.n_blocks) {
             break;
         }
-        const uint v   = scratch[bcnt_off() + s * p.n_blocks + b];
-        const uint n   = min(v & 0xFFu, MAXC); // > MAXC: the flag sends every row to v2
-        const uint nf  = (v >> 8u) & 0xFFFu;   // cells not visible to every row
-        const uint ne  = v >> 20u;             // cells visible to some row
-        const uint cls = (n == 0u || ne == 0u) ? CLS_EMPTY : nf == 0u ? CLS_FULL : CLS_CHECK;
+        const uint  g  = s * p.n_blocks + b;
+        const uint  n  = min(summ[bcnt_off() + g], MAXC);
+        const uvec4 bs = summ4[bsum_off() / 4u + g];
+        const int   bmn = int(bs.x), bmx = int(bs.y);
+#if V3_MUTANT == 1
+        const bool causal_full = bmx <= rmn; // MUTANT M-B1: p0 == min pos counted visible (the x / y order ignored)
+#else
+        const bool causal_full = bmx < rmn;
+#endif
+        const bool empty = n == 0u || (bs.w & ryo) == 0u || (VIS_CAUSAL != 0u && bmn > rmx);
+        const bool full  = (bs.z & rya) != 0u && (VIS_CAUSAL == 0u || causal_full);
+        const uint cls   = empty ? CLS_EMPTY : full ? CLS_FULL : CLS_CHECK;
         word |= (n | (cls << 3u)) << (8u * q);
     }
     scratch[cls_off() + s * nbw() + wi] = word;
@@ -395,6 +415,7 @@ void sample_pass(const uint row, const uint lin) {
     if (lin == 0) {
         scratch[tau_off() + row] = tau;
         scratch[cnt_off() + row] = over ? CAP + 1u : 0u;
+        scratch[wsum_off() + row] = 0u;
     }
 }
 
@@ -551,7 +572,7 @@ void select_pass(const uint row, const uint lin) {
     if (lin == 0) {
         atomicMax(stats[47], c);
     }
-    if (scratch[flag_off()] != 0u) {
+    if (summ[0] != 0u) {
         fallback(row, lin, 43u);
         return;
     }
@@ -609,7 +630,7 @@ void select_pass(const uint row, const uint lin) {
             const uint lb  = list_off() + (s * p.n_blocks + b) * MAXC;
             uint pos = atomicAdd(sh_n, cw[q]);
             for (uint j = 0u; j < n; ++j) {
-                const uint id = scratch[lb + j];
+                const uint id = summ[lb + j];
                 if (all || cell_vis(cbase, tk, id)) {
 #ifdef ONEPASS_NEGCTL
                     sk[pos] = ck[q] > T ? id : (0x80000000u | (0x7FFFFFFFu - id));
@@ -649,7 +670,7 @@ void select_pass(const uint row, const uint lin) {
 void main() {
     const uint lin = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
     if (PASS == 5) {
-        rows_pass(gl_WorkGroupID.y, lin);
+        summarize_pass(gl_WorkGroupID.x * WG + lin, gl_WorkGroupID.y);
         return;
     }
     if (PASS == 0) {
@@ -657,7 +678,7 @@ void main() {
         return;
     }
     if (PASS == 1) {
-        classify_pass(gl_WorkGroupID.x * WG + lin, gl_WorkGroupID.y);
+        classify_pass(gl_WorkGroupID.x, gl_WorkGroupID.y, lin);
         return;
     }
     const uint tile = gl_WorkGroupID.y;
