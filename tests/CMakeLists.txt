@@ -267,6 +267,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # [TAG_MMID_SKIP] the mul_mat_id padding skip (#25483) over the partial-tile MUL_MAT_ID cases (runs test-backend-ops); not a
     # ctest - needs a Vulkan device, SKIP otherwise. A -DGGML_VULKAN_MMID_SKIP_NEGCTL=ON build is its negative control.
     llama_build(test-mmid-skip.cpp)
+    # [TAG_HC_TAIL_FUSE] the hc_mix tail (SIGMOID_MUL + MULTI_ADD_SCALE vs the fused hc_tail_mix) on a Vulkan device: dumps hc_mixed
+    # over n x sublayer fixtures for a byte comparison of two runs (GGML_VK_HC_TAIL_FUSE=0 vs on, or a
+    # -DGGML_VULKAN_HC_TAIL_NEGCTL=ON build with GGML_VK_HC_TAIL_MUTANT=<m>); not a ctest - SKIP without a Vulkan device
+    llama_build(test-vk-hc-tail.cpp)
     # [TAG_MMID_SCALE_EPI] MUL_MAT_ID + MUL on the GEMM path, fused (tile-store epilogue) vs the host f32 product of the lone
     # MUL_MAT_ID, bit for bit; not a ctest - needs a Vulkan device, SKIP otherwise
     llama_build(test-mmid-scale-epi.cpp)
