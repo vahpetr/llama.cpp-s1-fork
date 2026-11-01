@@ -2642,6 +2642,8 @@ struct ggml_vk_garbage_collector {
 
 static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx);
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested = nullptr);
+struct ggml_backend_vk_context;
+static void ggml_vk_prewarm_note_lazy(ggml_backend_vk_context * ctx, const vk_pipeline & pipeline, int64_t us); // [TAG_VK_PREWARM_SHAPES]
 static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx);
 static bool ggml_vk_intel_windows_driver_in_range(uint32_t driver_version, uint32_t lower_major, uint32_t lower_minor, uint32_t upper_major, uint32_t upper_minor);
 
@@ -3767,6 +3769,12 @@ struct ggml_backend_vk_context {
 
     // for GGML_SCHED_PROFILE: host time spent inside ggml_vk_submit() during the current graph_compute
     int64_t sched_prof_submit_us {};
+
+    // [TAG_VK_PREWARM_SHAPES] graph_compute calls so far (ggml-sched calls it once per backend split, so the load-time
+    //   warm-up is several calls): the pre-warm scans the first GGML_VK_PREWARM_GRAPHS of them; matmul node signatures
+    //   (op, src0 type, src1 type, m, k, prec) already scanned are skipped
+    uint64_t prewarm_n_graphs {};
+    std::set<std::tuple<int, int, int, int64_t, int64_t, int>> prewarm_seen;
 };
 
 // The gate at every fusion match site, evaluated *after* the pattern's own match test so that a
@@ -4485,7 +4493,9 @@ static void ggml_pipeline_request_descriptor_sets(ggml_backend_vk_context *ctx, 
     VK_LOG_DEBUG("ggml_pipeline_request_descriptor_sets(" << pipeline->name << ", " << n << ")");
     ctx->pipeline_descriptor_set_requirements += n;
     if (!pipeline->compiled) {
+        const int64_t t_lazy0 = ggml_time_us(); // [TAG_VK_PREWARM_SHAPES] a first-use (lazy) compile inside a graph
         ggml_vk_load_shaders(ctx->device, pipeline);
+        ggml_vk_prewarm_note_lazy(ctx, pipeline, ggml_time_us() - t_lazy0);
     }
     ggml_pipeline_allocate_descriptor_sets(ctx);
 }
@@ -14383,6 +14393,199 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     }
 }
 
+// [TAG_VK_PREWARM_SHAPES] GGML_VK_PREWARM_SHAPES (default on, =0 off): pipelines are compiled lazily, the first time a graph
+//   asks for one (ggml_pipeline_request_descriptor_sets). Each new decode width (MTP verify / draft nt = 1..9) and each new
+//   prefill shape class then pays a compile inside its first graph (M5, docs/verification/2026-11-01-v71-measurements-m1-m7.md:
+//   q5_0 mat-vec n=3 8 ms once, then 16 us). In the first GGML_VK_PREWARM_GRAPHS (default 64) graph_compute calls of a
+//   context (ggml-sched calls once per backend split: the load-time warm-up is several calls; node signatures already
+//   scanned are skipped), this compiles the matmul pipelines the same weights select at the other widths: for every MUL_MAT / MUL_MAT_ID node, the mat-vec
+//   pipelines at n = 1..8 and every tile variant of the mul_mm pipelines its (src0 type, src1 path, precision) selects
+//   (s / m / l, aligned, and the dense twins t16 / b2 / g1 where the device has them) - the same selectors the dispatch
+//   uses, nothing changed in them. The pipeline objects are the ones a lazy compile would create (same SPIR-V, same
+//   specialization constants), so outputs are identical by construction; only the compile moves to load time.
+//   GGML_VK_PREWARM_THREADS (default min(8, cores)): parallel compiles. GGML_VK_PREWARM_LOG=1: one line per lazy
+//   compile after load (pipeline, ms, context, graph number) - the measurement of what is left.
+static int ggml_vk_prewarm_mode() {
+    static const int v = [] {
+        const char * s = getenv("GGML_VK_PREWARM_SHAPES");
+        return (s == nullptr || *s == '\0') ? 1 : atoi(s);
+    }();
+    return v;
+}
+static uint64_t ggml_vk_prewarm_graphs() {
+    static const uint64_t v = [] {
+        const char * s = getenv("GGML_VK_PREWARM_GRAPHS");
+        const long long n = (s == nullptr || *s == '\0') ? 64 : atoll(s);
+        return (uint64_t) std::max(1LL, n);
+    }();
+    return v;
+}
+static bool ggml_vk_prewarm_log() {
+    static const bool v = ggml_vk_env_bool("GGML_VK_PREWARM_LOG", false);
+    return v;
+}
+
+static void ggml_vk_prewarm_note_lazy(ggml_backend_vk_context * ctx, const vk_pipeline & pipeline, int64_t us) {
+    if (!ggml_vk_prewarm_log()) {
+        return; // (the pre-warm's own compiles do not pass through here)
+    }
+    GGML_LOG_WARN("ggml_vulkan: prewarm_shapes: lazy compile %s %.2f ms (ctx %p graph %" PRIu64 ")\n",
+                  pipeline->name.c_str(), us / 1e3, (void *) ctx, ctx->prewarm_n_graphs);
+}
+
+static void ggml_vk_prewarm_add(std::vector<vk_pipeline> & out, const vk_pipeline & p) {
+    if (p && p->initialized && !p->compiled && std::find(out.begin(), out.end(), p) == out.end()) {
+        out.push_back(p);
+    }
+}
+static void ggml_vk_prewarm_add_mm(std::vector<vk_pipeline> & out, const vk_matmul_pipeline & mmp, bool l = true, bool m = true, bool s = true) {
+    if (!mmp) {
+        return;
+    }
+    if (l) { ggml_vk_prewarm_add(out, mmp->l); ggml_vk_prewarm_add(out, mmp->a_l); }
+    if (m) { ggml_vk_prewarm_add(out, mmp->m); ggml_vk_prewarm_add(out, mmp->a_m); }
+    if (s) { ggml_vk_prewarm_add(out, mmp->s); ggml_vk_prewarm_add(out, mmp->a_s); }
+}
+// the twin of the base container's choice (f16acc / f32acc), as the dispatch maps it
+static vk_matmul_pipeline ggml_vk_prewarm_twin(const vk_matmul_pipeline & mmp, const vk_matmul_pipeline2 & base, const vk_matmul_pipeline2 & twin) {
+    return mmp == base.f16acc ? twin.f16acc : mmp == base.f32acc ? twin.f32acc : nullptr;
+}
+
+static void ggml_vk_prewarm_shapes(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    const int mode = ggml_vk_prewarm_mode();
+    if (mode == 0) {
+        if (ctx->prewarm_n_graphs == 1) {
+            GGML_LOG_WARN("ggml_vulkan: prewarm_shapes: off (GGML_VK_PREWARM_SHAPES=0; pipelines compile at first use)\n");
+        }
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    const vk_device & dev = ctx->device;
+    const uint64_t max_range = dev->properties.limits.maxStorageBufferRange;
+    const bool q8_1_mm = dev->integer_dot_product || dev->mmq_cm1;
+    std::vector<vk_pipeline> todo;
+    int n_mm = 0, n_mmid = 0;
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        if (src0 == nullptr || src1 == nullptr || (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16)) {
+            continue;
+        }
+        const ggml_type t = src0->type;
+        const uint32_t m = (uint32_t) src0->ne[1];
+        const uint32_t k = (uint32_t) src0->ne[0];
+        if (!ctx->prewarm_seen.insert({ (int) node->op, (int) t, (int) src1->type, src0->ne[1], src0->ne[0], node->op_params[0] }).second) {
+            continue;
+        }
+        const bool big = ggml_nbytes(src0) > max_range;
+        const ggml_prec prec = (ggml_prec) node->op_params[0];
+        const auto add64 = [&](const vk_pipeline & p) {
+            ggml_vk_prewarm_add(todo, p);
+            if (big && p) {
+                vk_pipeline pp = p;
+                ggml_vk_prewarm_add(todo, ggml_vk_get_64b_indexing_pipeline(ctx, pp));
+            }
+        };
+
+        if (node->op == GGML_OP_MUL_MAT) {
+            n_mm++;
+            // mat-vec: the decode / MTP verify widths
+            for (uint32_t n = 1; n <= mul_mat_vec_max_cols; ++n) {
+                for (const bool hoist : { false, true }) {
+                    add64(ggml_vk_get_dequantize_mul_mat_vec(ctx, t, src1->type, n, m, k, hoist));
+                    if (dev->integer_dot_product && src1->type == GGML_TYPE_F32) {
+                        add64(ggml_vk_get_dequantize_mul_mat_vec(ctx, t, GGML_TYPE_Q8_1, n, m, k, hoist));
+                    }
+                }
+            }
+            // mul_mm: n > 8 (wide verify) and the prefill ubatches
+            vk_matmul_pipeline mmp_q;
+            if (q8_1_mm && src1->type == GGML_TYPE_F32 && t < GGML_TYPE_COUNT && !dev->pipeline_dequant_mul_mat_mat_q8_1[t].f32acc->is_empty()) {
+                mmp_q = ggml_vk_get_mul_mat_mat_pipeline(ctx, t, GGML_TYPE_Q8_1, prec);
+                ggml_vk_prewarm_add_mm(todo, mmp_q);
+                ggml_vk_prewarm_add(todo, ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1));
+            }
+            vk_matmul_pipeline mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, t, src1->type, prec);
+            if (mmp == nullptr || mmp->is_empty()) {
+                // the f16 dequant fallback
+                ggml_vk_prewarm_add(todo, ggml_vk_get_to_fp16(ctx, t));
+                mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, t == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16, src1->type, prec);
+            }
+            if (mmp && !mmp->is_empty()) {
+                ggml_vk_prewarm_add_mm(todo, mmp);
+                if (t < GGML_TYPE_COUNT) {
+                    const vk_matmul_pipeline2 & base = dev->pipeline_dequant_mul_mat_mat[t];
+                    ggml_vk_prewarm_add_mm(todo, ggml_vk_prewarm_twin(mmp, base, dev->pipeline_dequant_mul_mat_mat_t16[t]),
+                                           false, false, dev->mul_mat_t16_s[t]);
+                    ggml_vk_prewarm_add_mm(todo, ggml_vk_prewarm_twin(mmp, base, dev->pipeline_dequant_mul_mat_mat_b2[t]),
+                                           dev->mul_mat_b2_l[t], dev->mul_mat_b2_m[t], false);
+                    ggml_vk_prewarm_add_mm(todo, ggml_vk_prewarm_twin(mmp, base, dev->pipeline_dequant_mul_mat_mat_g1[t]),
+                                           dev->mul_mat_g1_l[t], dev->mul_mat_g1_m[t], dev->mul_mat_g1_s[t]);
+                }
+            }
+            ggml_vk_prewarm_add(todo, dev->pipeline_matmul_split_k_reduce);
+        } else {
+            n_mmid++;
+            if (src1->type != GGML_TYPE_F32) {
+                continue;
+            }
+            add64(ggml_vk_get_dequantize_mul_mat_vec_id(ctx, t, GGML_TYPE_F32, m, k));
+            if (dev->integer_dot_product) {
+                add64(ggml_vk_get_dequantize_mul_mat_vec_id(ctx, t, GGML_TYPE_Q8_1, m, k));
+                ggml_vk_prewarm_add(todo, ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1));
+            }
+            if (q8_1_mm && t < GGML_TYPE_COUNT && !dev->pipeline_dequant_mul_mat_mat_id_q8_1[t].f32acc->is_empty()) {
+                ggml_vk_prewarm_add_mm(todo, ggml_vk_get_mul_mat_mat_id_pipeline(ctx, t, GGML_TYPE_Q8_1, prec));
+            }
+            // the selector asserts on a quantized type without any mul_mat_id container: those have no mul_mm path
+            const bool has_id = t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 ||
+                                (t < GGML_TYPE_COUNT && (!dev->pipeline_dequant_mul_mat_mat_id[t].f16acc->is_empty() ||
+                                                         !dev->pipeline_dequant_mul_mat_mat_id[t].f32acc->is_empty()));
+            if (has_id) {
+                const vk_matmul_pipeline mmp = ggml_vk_get_mul_mat_mat_id_pipeline(ctx, t, GGML_TYPE_F32, prec);
+                if (mmp && !mmp->is_empty()) {
+                    ggml_vk_prewarm_add_mm(todo, mmp);
+                }
+                ggml_vk_prewarm_add_mm(todo, ggml_vk_get_mul_mat_mat_id_f16b_pipeline(ctx, t, prec));
+            }
+        }
+    }
+
+    const int64_t t1 = ggml_time_us();
+    const size_t n_todo = todo.size();
+    if (n_todo > 0) {
+        int n_thr = (int) std::min<unsigned>(8u, std::max(1u, std::thread::hardware_concurrency()));
+        if (const char * e = getenv("GGML_VK_PREWARM_THREADS")) {
+            n_thr = std::max(1, atoi(e));
+        }
+        n_thr = (int) std::min<size_t>((size_t) n_thr, n_todo);
+        std::atomic<size_t> next {0};
+        vk_device d = ctx->device;
+        const auto work = [&]() {
+            for (size_t j; (j = next.fetch_add(1)) < n_todo; ) {
+                ggml_vk_load_shaders(d, todo[j]);
+            }
+        };
+        std::vector<std::thread> thr;
+        for (int j = 1; j < n_thr; ++j) {
+            thr.emplace_back(work);
+        }
+        work();
+        for (auto & th : thr) {
+            th.join();
+        }
+        GGML_LOG_WARN("ggml_vulkan: prewarm_shapes: on (GGML_VK_PREWARM_SHAPES=%d): %zu pipelines compiled in %.1f ms "
+                      "(%d threads, scan %.1f ms; %d new MUL_MAT + %d new MUL_MAT_ID signatures, mat-vec n 1..%u + mul_mm tiles) "
+                      "ctx %p graph %" PRIu64 "\n", mode, n_todo, (ggml_time_us() - t1) / 1e3, n_thr, (t1 - t0) / 1e3, n_mm, n_mmid,
+                      mul_mat_vec_max_cols, (void *) ctx, ctx->prewarm_n_graphs);
+    }
+}
+
 static bool ggml_vk_use_mul_mat_vec_id(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src2 = dst->src[2];
@@ -23646,6 +23849,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             GGML_LOG_WARN("ggml_vulkan: f32acc: on (scope trunk, %d MUL_MAT nodes match src0 *.indexer.* in this graph; "
                           "per-type HIT/INERT at dispatch)\n", n_ex);
         }
+    }
+
+    ctx->prewarm_n_graphs++; // [TAG_VK_PREWARM_SHAPES] the context's first graph calls (the load-time warm-up splits) pre-warm
+    if (ctx->prewarm_n_graphs <= ggml_vk_prewarm_graphs()) {
+        ggml_vk_prewarm_shapes(ctx, cgraph);
     }
 
     const bool prof = ggml_vk_sched_prof_enabled();
