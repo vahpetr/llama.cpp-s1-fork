@@ -9322,7 +9322,15 @@ static void ggml_compute_forward_qsa_bias_f32(
         const int64_t s = row / np;
 
         const int64_t q = rows ? (int64_t) ((const int32_t *) rows->data)[s*np + t] : t;
-        GGML_ASSERT(q >= 0 && q < n_tps);
+        if (q < 0 || q >= n_tps) {
+            // [TAG_QSA_BIAS_FOLD] out-of-range query row: -inf for every block, as qsa_bias.comp and the Vulkan score
+            // epilogue write it (one contract across the backends; the graph never builds such a row)
+            float * d = (float *) ((char *) dst->data + s*dst->nb[2] + t*dst->nb[1]);
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                d[b] = -INFINITY;
+            }
+            continue;
+        }
 
         const int32_t * qe   = (const int32_t *) qry->data + 2*(s*n_tps + q);
         const int32_t   tail = qe[0];

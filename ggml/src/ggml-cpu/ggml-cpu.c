@@ -1648,11 +1648,14 @@ static void ggml_compute_forward_qsa_score(
         if (tblk) {
             const int64_t n_tps = tqry->ne[1];
             const int64_t q     = trow ? (int64_t) ((const int32_t *) trow->data)[s*N + t] : t;
-            GGML_ASSERT(q >= 0 && q < n_tps);
-            const int32_t * qe = (const int32_t *) tqry->data + 2*(s*n_tps + q);
-            ttail = qe[0];
-            tbit  = (uint32_t) qe[1];
-            tbe   = (const int32_t *) tblk->data + 2*s*M;
+            tbe = (const int32_t *) tblk->data + 2*s*M;
+            if (q >= 0 && q < n_tps) {
+                const int32_t * qe = (const int32_t *) tqry->data + 2*(s*n_tps + q);
+                ttail = qe[0];
+                tbit  = (uint32_t) qe[1];
+            }
+            // [TAG_QSA_BIAS_FOLD] an out-of-range query row (q < 0 or q >= n_tps) reads no table entry: bit 0, so every
+            // block is -inf - the one contract of qsa_bias.comp, the Vulkan epilogue and ggml_compute_forward_qsa_bias
         }
         for (int64_t m = 0; m < M; ++m) {
             float sum = (p0[m] > 0.f) ? p0[m] : 0.f;

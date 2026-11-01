@@ -8375,12 +8375,13 @@ struct test_mul_mat_rows : public test_case {
 //                    CONT(head 0) + ADD(head 1) + ... -> ADD(bias). Bias modes: 0 none, 1 the QSA_BIAS constants
 //                    (+0, 1e9, -inf: the -inf rows stay -inf in both halves), 2 uniform; [TAG_QSA_BIAS_FOLD] 3..5 a
 //                    GGML_OP_QSA_BIAS node over blk/qry tables (the compact bias, the values of test_qsa_bias): 3 the
-//                    chunk rows, the SAME node feeds the chain's ADD (the plane is computed; the Vulkan op still folds it),
-//                    4 the chunk rows, the op is the node's only consumer and the chain reads a twin node (Vulkan skips
-//                    the op's node: its plane keeps the uniform junk of initialize_tensors - a stale plane read = FAIL),
-//                    5 as 4 with identity rows (rows == NULL, n_tps == N); 6 / 7 the graph-side form: no bias operand,
-//                    the tables on the op (ggml_qsa_score_set_bias_tables), chunk rows / identity rows, against the chain
-//                    over a QSA_BIAS node of the same tables. GGML_TEST_QSA_SCORE_HASH=1 prints the 64-bit
+//                    chunk rows, the SAME node feeds the chain's ADD, 4 the op is the node's only consumer and the chain
+//                    reads a twin node, 5 as 4 with identity rows (rows == NULL, n_tps == N) - the node form is never
+//                    folded (astra PACKAGE v71a Important 1): the node runs, the op reads its plane, still bit for bit;
+//                    6 / 7 the graph-side form: no bias operand, the tables on the op (ggml_qsa_score_set_bias_tables),
+//                    chunk rows / identity rows, against the chain over a QSA_BIAS node of the same tables; 8 as 6 with
+//                    out-of-range query rows (-1 first, n_tps last, per stream: -inf rows on every backend).
+//                    GGML_TEST_QSA_SCORE_HASH=1 prints the 64-bit
 //                    FNV-1a of the op's half (the biased score plane), the chain's half and the CPU op's half per case,
 //                    for cross-knob plane equality (GGML_VK_QSA_BIAS_FOLD=0 / 1). Shapes: ragged M (not a tile
 //                    multiple), every chunk width 1..128 (the widths the Vulkan op refuses - the mat-vec ones - report
@@ -8623,6 +8624,11 @@ struct test_qsa_score : public test_case {
                         for (int64_t q = 0; q < N; ++q) {
                             data[s*N + q] = (int32_t) (t0 + q);
                         }
+                        if (bias == 8) {
+                            // [TAG_QSA_BIAS_FOLD] out-of-range rows: the contract is -inf for the whole row
+                            data[s*N + 0] = -1;
+                            data[s*N + N - 1] = (int32_t) n_tps();
+                        }
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
@@ -8651,7 +8657,8 @@ struct test_qsa_score : public test_case {
 // and nothing else, so the backends must agree BITWISE: err() counts the elements whose bit patterns
 // differ (-inf == -inf, +0.0 != -0.0), and the bar is 0.
 //   rows_mode 0 = NULL, 1 = the arange slice t0..t0+np (a [TAG_QSA_CHUNK] chunk), 2 = the PAD chunk (arange
-//   clamped to n_tps - 1), 3 = random rows with repeats
+//   clamped to n_tps - 1), 3 = random rows with repeats, 4 = random rows with out-of-range entries (-1, n_tps, n_tps + 5:
+//   [TAG_QSA_BIAS_FOLD] -inf rows on every backend - one contract with the Vulkan shader)
 struct test_qsa_bias : public test_case {
     const int64_t n_blocks;
     const int64_t n_tps;
@@ -8730,6 +8737,7 @@ struct test_qsa_bias : public test_case {
                         switch (rows_mode) {
                             case 1: q = t0 + t; break;
                             case 2: q = std::min<int64_t>(t0 + t, n_tps - 1); break;
+                            case 4: q = (t % 5 == 0) ? -1 : (t % 5 == 1) ? n_tps : (t % 5 == 2) ? n_tps + 5 : (int64_t) (rng() % (uint32_t) n_tps); break;
                             default: q = (int64_t) (rng() % (uint32_t) n_tps); break;
                         }
                         data[s*np + t] = (int32_t) q;
@@ -13654,11 +13662,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_qsa_score(128, M, N, 1, 4, true, 1, true, true));
         }
     }
-    // [TAG_QSA_BIAS_FOLD] the bias as a QSA_BIAS node, folded into the Vulkan epilogue: shared with the chain (3), the op's
-    // own node skipped over a stale plane (4), identity rows (5); both product forms, the f16 mirror, ragged M, widths,
+    // [TAG_QSA_BIAS_FOLD] the bias as a QSA_BIAS node (3 shared with the chain, 4 own node, 5 identity rows: run unfused,
+    // the plane read) and as the op's tables (6 chunk rows, 7 identity rows, 8 out-of-range rows: folded); both product
+    // forms, the f16 mirror, ragged M, widths,
     // two streams, head counts, and the deployed 262k / 1M pools (65536 / 262144 blocks) at the deployed chunk (C 128 of
     // an n_tps 2048 ubatch) and its tail
-    for (int bm : { 3, 4, 5, 6, 7 }) {
+    for (int bm : { 3, 4, 5, 6, 7, 8 }) {
         for (bool r : { false, true }) {
             for (int64_t M : { 1, 17, 129, 1000 }) {
                 for (int64_t N : { 3, 4, 9, 37, 64, 127, 128 }) {
@@ -13719,6 +13728,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_bias(512,    7,    7,   1, 0));
     test_cases.emplace_back(new test_qsa_bias(4096,   265,  256, 1, 2));
     test_cases.emplace_back(new test_qsa_bias(2048,   64,   64,  2, 3));
+    test_cases.emplace_back(new test_qsa_bias(2048,   64,   64,  2, 4));   // [TAG_QSA_BIAS_FOLD] out-of-range rows
+    test_cases.emplace_back(new test_qsa_bias(4096,   265,  128, 1, 4));
     test_cases.emplace_back(new test_qsa_bias(1000,   5,    5,   5, 0));
     test_cases.emplace_back(new test_qsa_bias(1000,   40,   64,  5, 2));
 
