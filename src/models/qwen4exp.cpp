@@ -2911,6 +2911,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
         zeros = ggml_fill(ctx0, zeros, 0.0f);
     }
 
+    // [TAG_QSA_CHUNK_OUT] one [hd, n_tps, n_stream] output per layer: each chunk SET_ROWS its nc rows into it (rows
+    // t0 .. t0+nc-1 of every stream; f32 -> f32, a bit copy), instead of the growing ggml_concat that copied every
+    // earlier chunk again (O(chunks^2) rows). Each SET_ROWS returns a full-size view of the one before, so the chain
+    // orders the writes and the final reshape depends on every chunk; the chunks tile 0 .. n_tps-1 exactly (the
+    // assert after the loop), so every row is written once before anything reads it.
     ggml_tensor * out = nullptr;
 
     int64_t t0 = 0;
@@ -3026,7 +3031,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_chunked(
         }
         o = ggml_reshape_3d(ctx0, o, o->ne[0], nc, n_stream);
 
-        out = out ? ggml_concat(ctx0, out, o, 1) : o;
+        if (out == nullptr) {
+            out = ggml_new_tensor_3d(ctx0, o->type, o->ne[0], n_tps, n_stream);
+        }
+        // the destination rows: `rows` itself when the chunk is not padded (t0 .. t0+nc-1 per stream), else its first nc
+        ggml_tensor * dst_rows = rows;
+        if (np > nc) {
+            dst_rows = ggml_arange(ctx0, (float) t0, (float) (t0 + nc), 1.0f);
+            if (n_stream > 1) {
+                dst_rows = ggml_repeat_4d(ctx0, dst_rows, nc, n_stream, 1, 1);
+            }
+            dst_rows = ggml_cast(ctx0, dst_rows, GGML_TYPE_I32); // [nc, n_stream]
+        }
+        out = ggml_set_rows(ctx0, out, o, dst_rows);
         ggml_build_forward_expand(gf, out);
 
         t0 += nc;
