@@ -816,6 +816,12 @@ void process_shaders() {
             string_to_spv("mul_mat_vec_rows_f32_f32_f32_subgroup", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"A_ROW_IDS", "1"}}));
             string_to_spv("mul_mat_vec_rows_f32_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}, {"A_ROW_IDS", "1"}}));
         }
+        // [TAG_QSA_IDX_F16_DECODE] the same twin of mul_mat_vec_f16_f32_f32 (an F16 store: the qwen4exp f16 mirror)
+        if (tname == "f16") {
+            string_to_spv("mul_mat_vec_rows_f16_f32_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"A_ROW_IDS", "1"}}));
+            string_to_spv("mul_mat_vec_rows_f16_f32_f32_subgroup", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"A_ROW_IDS", "1"}}));
+            string_to_spv("mul_mat_vec_rows_f16_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}, {"A_ROW_IDS", "1"}}));
+        }
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (tname == "mxfp4" || tname == "nvfp4") {
@@ -1473,6 +1479,13 @@ void write_output_files() {
     if (basename(input_filepath) == "mul_mat_vec.comp") {
         src << "const void * arr_dmmv_rows_f32_f32_f32_data[3] = {mul_mat_vec_rows_f32_f32_f32_data, mul_mat_vec_rows_f32_f32_f32_subgroup_data, mul_mat_vec_rows_f32_f32_f32_subgroup_no_shmem_data};\n";
         src << "const uint64_t arr_dmmv_rows_f32_f32_f32_len[3] =  {mul_mat_vec_rows_f32_f32_f32_len,  mul_mat_vec_rows_f32_f32_f32_subgroup_len, mul_mat_vec_rows_f32_f32_f32_subgroup_no_shmem_len};\n";
+    }
+    // [TAG_QSA_IDX_F16_DECODE] its F16-store twin
+    hdr << "extern const void * arr_dmmv_rows_f16_f32_f32_data[3];\n";
+    hdr << "extern const uint64_t arr_dmmv_rows_f16_f32_f32_len[3];\n";
+    if (basename(input_filepath) == "mul_mat_vec.comp") {
+        src << "const void * arr_dmmv_rows_f16_f32_f32_data[3] = {mul_mat_vec_rows_f16_f32_f32_data, mul_mat_vec_rows_f16_f32_f32_subgroup_data, mul_mat_vec_rows_f16_f32_f32_subgroup_no_shmem_data};\n";
+        src << "const uint64_t arr_dmmv_rows_f16_f32_f32_len[3] =  {mul_mat_vec_rows_f16_f32_f32_len,  mul_mat_vec_rows_f16_f32_f32_subgroup_len, mul_mat_vec_rows_f16_f32_f32_subgroup_no_shmem_len};\n";
     }
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
