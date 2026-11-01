@@ -2141,12 +2141,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_pool(
     members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_rows, n_stream);
 
     // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
+    // [TAG_QSA_POOL_NO_CONT] the slices are strided views, no ggml_cont (as [TAG_HC_MIX_NO_CONT]): ggml_add allocates a
+    // contiguous destination, the Vulkan add and ggml_vk_fuse_multi_add take strided sources, and with no CONT node
+    // between them the ADD chain + SCALE fuse to multi_add_scale. The sum still runs as (((m0+m1)+m2)+m3) over the same
+    // f32 values (a f32 -> f32 cont is a bit copy). r == 1 keeps the cont: the SCALE then needs a contiguous source.
     ggml_tensor * pooled = nullptr;
     for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_rows, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
+        ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_rows, n_stream,
+                members->nb[2], members->nb[3], i*members->nb[1]);
         pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+    }
+    if (r == 1) {
+        pooled = ggml_cont(ctx0, pooled);
     }
     pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
     cb(pooled, name_pooled, il);
@@ -2402,12 +2408,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             if (n_stream == 1) {
                 // the selection reads the rows it just stored (f32 copies: the same bits), so the chain is pulled
                 // into the graph where the recompute's is - at its first consumer - and `fresh` dies at the copy.
-                // The read is a real tensor (ggml_cont of the store view), not the view itself: it is the full-pool
-                // twin of the remap get_rows output of every run-time graph with cap < n_blocks - same shape, same
-                // lifetime across the [TAG_QSA_CHUNK] chunks - so the reserve (always the full pool) holds every
-                // tensor a run-time graph holds, with pooling planes at least as large (M3 fix round 1: with the
-                // bare view the reserve lacked this plane and the buffer regrew inside the graph span).
-                pooled = ggml_cont(ctx0, st);
+                // LLAMA_QSA_POOL_REMAP=copy: the read is a real tensor (ggml_cont of the store view), not the view
+                // itself: it is the full-pool twin of the remap get_rows output of every run-time graph with cap <
+                // n_blocks - same shape, same lifetime across the [TAG_QSA_CHUNK] chunks - so the reserve (always the
+                // full pool) holds every tensor a run-time graph holds, with pooling planes at least as large (M3 fix
+                // round 1: with the bare view the reserve lacked this plane and the buffer regrew inside the graph span).
+                // [TAG_QSA_POOL_NO_CONT] indexed (the default): the run-time graphs have no such plane - the score
+                // reads the store through the remap ([TAG_QSA_POOL_REMAP]) - so the parity reason is gone and the
+                // score reads the store view itself (n_stream == 1: [idx_dim, n_blocks, 1], contiguous).
+                pooled = llama_qsa_pool_remap_indexed() ? st : ggml_cont(ctx0, st);
             } else {
                 // the store view skips the other streams' rows between batches: keep the contiguous rows for the
                 // GEMM and expand the copy on its own
