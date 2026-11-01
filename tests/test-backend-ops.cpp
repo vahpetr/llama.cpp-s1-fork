@@ -4192,6 +4192,130 @@ struct test_hc_combine_fuse : public test_case {
     }
 };
 
+// [TAG_ADD_RMS_ROWS] HC_COMBINE_RMS_EXACT: the combine (build_hc_combine) and the next sublayer's grouped RMSNorm
+// (build_hc_mix: hc_norm = RMS_NORM(combine) * w_norm), built twice from the same inputs ON THE SAME BACKEND: arm A as
+// the model emits it (the 9 ops consecutive: Vulkan fuses them into hc_combine_rms), arm B with a same-shape RESHAPE
+// between the ADD and the RMS_NORM, so it runs exactly the v70 pair (hc_combine, then rms_norm_mul). The graph returns
+// concat(combA - combB, combB - combA, normA - normB, normB - normA): +0 everywhere iff both outputs are the same floats
+// (a sign-of-zero difference leaves a -0); compared BITWISE against the CPU's +0 (err = differing bit patterns, max 0).
+// strided = inject is a row view of a wider [n_lo + hc, T] tensor ([TAG_MERGE_ROWS], the prefill layout).
+struct test_hc_combine_rms_exact : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+    const bool    strided;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_COMBINE_RMS_EXACT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, hc, n_tokens, strided);
+    }
+
+    double max_nmse_err() override { return 0.0; }
+    double max_err() override { return 0.0; }
+    double max_err(ggml_backend_t backend) override { GGML_UNUSED(backend); return 0.0; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        size_t bad = 0;
+        for (size_t i = 0; i < n; i++) {
+            bad += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        }
+        return (double) bad;
+    }
+
+    test_hc_combine_rms_exact(int64_t n_embd = 2560, int64_t hc = 4, int64_t n_tokens = 5, bool strided = false)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens), strided(strided) {}
+
+    ggml_tensor * flat_diff(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
+        ggml_tensor * d0 = ggml_sub(ctx, a, b);
+        ggml_tensor * d1 = ggml_sub(ctx, b, a);
+        return ggml_concat(ctx, ggml_reshape_1d(ctx, d0, ggml_nelements(d0)),
+                                ggml_reshape_1d(ctx, d1, ggml_nelements(d1)), 0);
+    }
+
+    // build_hc_combine + the head of build_hc_mix; split = the RESHAPE that keeps the 9 ops apart
+    void arm(ggml_context * ctx, ggml_tensor * residual, ggml_tensor * block, ggml_tensor * inject, ggml_tensor * w_norm,
+             bool split, ggml_tensor ** comb, ggml_tensor ** norm) {
+        ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx, w, 2.0f);
+        w = ggml_reshape_3d(ctx, w, 1, hc, n_tokens);
+        ggml_tensor * b = ggml_reshape_3d(ctx, block, n_embd, 1, n_tokens);
+        b = ggml_repeat_4d(ctx, b, n_embd, hc, n_tokens, 1);
+        *comb = ggml_add(ctx, residual, ggml_mul(ctx, b, w));
+        ggml_tensor * x = split ? ggml_reshape_3d(ctx, *comb, n_embd, hc, n_tokens) : *comb;
+        *norm = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w_norm);
+        // the model's node order (build_hc_combine expands the inject first; the norm follows the combine), which
+        // ggml_backend_compare_graph_backend keeps: it computes the graph as built
+        if (gf && mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, *norm);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * block = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(block, "block");
+        ggml_tensor * w_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(w_norm, "w_norm");
+        ggml_tensor * inject;
+        if (strided) {
+            const int64_t n_lo = 320;
+            ggml_tensor * li = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_lo + hc, n_tokens);
+            ggml_set_name(li, "inject");
+            inject = ggml_view_2d(ctx, li, hc, n_tokens, li->nb[1], ggml_row_size(li->type, n_lo));
+        } else {
+            inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+            ggml_set_name(inject, "inject");
+        }
+        if (gf && mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, inject);
+        }
+        ggml_tensor * comb_a, * norm_a, * comb_b, * norm_b;
+        arm(ctx, residual, block, inject, w_norm, false, &comb_a, &norm_a);
+        arm(ctx, residual, block, inject, w_norm, true,  &comb_b, &norm_b);
+        ggml_tensor * out = ggml_concat(ctx, flat_diff(ctx, comb_a, comb_b), flat_diff(ctx, norm_a, norm_b), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0x2545f491u ^ (uint32_t) (n_embd*31 + hc*131 + n_tokens*17 + strided));
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->type != GGML_TYPE_F32) {
+                continue;
+            }
+            const std::string name = ggml_get_name(t);
+            float lo = -4.0f, hi = 4.0f;
+            if (name == "inject") {
+                lo = -8.0f; hi = 8.0f;      // both sigmoid tails
+            } else if (name == "w_norm") {
+                lo = 0.5f; hi = 1.5f;       // the converter folds gamma to (1 + w)
+            }
+            std::uniform_real_distribution<float> u(lo, hi);
+            std::vector<float> v(ggml_nelements(t));
+            for (size_t i = 0; i < v.size(); ++i) {
+                float e = u(rng);
+                // per-row magnitude spread (rows of the residual 1e-3 .. 1e3) and exact zeros of both signs (1 in 32)
+                if (name == "residual") {
+                    const size_t row = i / (size_t) n_embd;
+                    e *= powf(10.0f, (float) ((row * 2654435761u) % 7) - 3.0f);
+                }
+                if (name != "w_norm" && (rng() & 31) == 0) {
+                    e = (rng() & 1) ? -0.0f : 0.0f;
+                }
+                v[i] = e;
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
+        }
+    }
+};
+
 // [TAG_HC_MIX_TAIL] qwen4exp hyper-connection mix tail (build_hc_mix), two forms:
 //
 //   HC_MIX_TAIL_FUSE   build_hc_mix node for node: RMS_NORM+MUL(w_norm) -> reshape -> MUL_MAT(w_down)
@@ -11665,6 +11789,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_combine_fuse(1, 4, 5));       // degenerate row
     test_cases.emplace_back(new test_hc_combine_fuse(2560, 1, 5));    // hc == 1
     test_cases.emplace_back(new test_hc_combine_fuse(257, 3, 7));     // all primes
+
+    // [TAG_ADD_RMS_ROWS] hc_combine_rms against the v70 pair, bit for bit: the production geometry over decode / verify /
+    // ubatch-tail / full-ubatch rows, contiguous and row-strided inject, then off-geometry rows (num_blocks 1 / 10 / > 32)
+    for (int64_t nt : { 1, 9, 64, 1020, 2044, 2048 }) {
+        for (bool strided : { false, true }) {
+            test_cases.emplace_back(new test_hc_combine_rms_exact(2560, 4, nt, strided));
+        }
+    }
+    test_cases.emplace_back(new test_hc_combine_rms_exact(31, 4, 17, false));
+    test_cases.emplace_back(new test_hc_combine_rms_exact(257, 3, 7, true));
+    test_cases.emplace_back(new test_hc_combine_rms_exact(2560, 1, 5, false));
+    test_cases.emplace_back(new test_hc_combine_rms_exact(5000, 4, 3, true));
+    test_cases.emplace_back(new test_hc_combine_rms_exact(20000, 2, 3, false));
 
     // [TAG_HC_MIX_TAIL] qwen4exp hc_mix tail: the build_hc_mix chain against the CPU, and the two new fusions
     // (multi_add_scale, scale_silu) bit for bit against the unfused chain on the same backend - production
