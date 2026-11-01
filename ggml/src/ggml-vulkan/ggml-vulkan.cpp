@@ -1340,6 +1340,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_split_f32[3];
     // [TAG_DECODE_FUSE] D3 decode fusions
     vk_pipeline pipeline_shexp_tail_f32;
+    vk_pipeline pipeline_shexp_glu_sig_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -2426,6 +2427,10 @@ struct vk_op_shexp_tail_push_constants {
     uint32_t ne0, ne, g_ne0;
     uint32_t x_nb1, g_nb1, m_nb1, d_nb1;
     uint32_t x_first;
+};
+// [TAG_DECODE_FUSE] shexp_glu_sig.comp: GLU(SWIGLU split) + SIGMOID, both contiguous
+struct vk_op_shexp_glu_sig_push_constants {
+    uint32_t n_glu, n_sig;
 };
 
 struct vk_op_conv2d_push_constants {
@@ -8221,6 +8226,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32[2], "ssm_conv_split_bias_silu_f32", ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 5, sizeof(vk_op_ssm_conv_split_push_constants), {32, 16, 1}, {32, 16, 1, 1, 1}, 1);
     // [TAG_DECODE_FUSE] D3 decode fusions
     ggml_vk_create_pipeline(device, device->pipeline_shexp_tail_f32, "shexp_tail_f32", shexp_tail_f32_len, shexp_tail_f32_data, "main", 4, sizeof(vk_op_shexp_tail_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_shexp_glu_sig_f32, "shexp_glu_sig_f32", shexp_glu_sig_f32_len, shexp_glu_sig_f32_data, "main", 5, sizeof(vk_op_shexp_glu_sig_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -17400,11 +17406,25 @@ static void ggml_vk_shexp_tail_dispatch_fused(ggml_backend_vk_context * ctx, vk_
           ggml_vk_tensor_subbuffer(ctx, add) }, pc, elements);
 }
 
+// [TAG_DECODE_FUSE] D3 "shexp_glu_sig" dispatch (validated by ggml_vk_can_fuse_shexp_glu_sig)
+static void ggml_vk_shexp_glu_sig_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * glu = cgraph->nodes[node_idx];
+    ggml_tensor * sig = cgraph->nodes[node_idx + 1];
+    const vk_op_shexp_glu_sig_push_constants pc = { (uint32_t) ggml_nelements(glu), (uint32_t) ggml_nelements(sig) };
+    vk_pipeline pipeline = ctx->device->pipeline_shexp_glu_sig_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const std::array<uint32_t, 3> elements = { pc.n_glu + pc.n_sig, 1, 1 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, glu->src[0]), ggml_vk_tensor_subbuffer(ctx, glu->src[1]), ggml_vk_tensor_subbuffer(ctx, glu),
+          ggml_vk_tensor_subbuffer(ctx, sig->src[0]), ggml_vk_tensor_subbuffer(ctx, sig) }, pc, elements);
+}
+
 // [TAG_DECODE_FUSE] the D3 fusions start at nodes whose op cases belong to other fusions (MUL / GLU / RMS_NORM), so
 // build_graph asks here before its op switch. The matchers are side-effect free: a fused range is ours exactly when
 // its matcher returns this node's num_additional_fused_ops (no other fusion starting at the same op produces that count
 // on the same nodes - see each matcher). Returns true when it dispatched.
 static int ggml_vk_can_fuse_shexp_tail(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
+static int ggml_vk_can_fuse_shexp_glu_sig(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
 static bool ggml_vk_decode_fuse_dispatch(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (ctx->num_additional_fused_ops < 1 || !ggml_vk_decode_fuse_enabled()) {
         return false;
@@ -17412,6 +17432,10 @@ static bool ggml_vk_decode_fuse_dispatch(ggml_backend_vk_context * ctx, vk_conte
     const ggml_tensor * node = cgraph->nodes[node_idx];
     if (node->op == GGML_OP_MUL && ggml_vk_can_fuse_shexp_tail(ctx, cgraph, node_idx) == ctx->num_additional_fused_ops) {
         ggml_vk_shexp_tail_dispatch_fused(ctx, subctx, cgraph, node_idx);
+        return true;
+    }
+    if (node->op == GGML_OP_GLU && ggml_vk_can_fuse_shexp_glu_sig(ctx, cgraph, node_idx) == ctx->num_additional_fused_ops) {
+        ggml_vk_shexp_glu_sig_dispatch_fused(ctx, subctx, cgraph, node_idx);
         return true;
     }
     return false;
@@ -22899,6 +22923,40 @@ static int ggml_vk_can_fuse_shexp_tail(ggml_backend_vk_context * ctx, const stru
     return 1;
 }
 
+// [TAG_DECODE_FUSE] D3 "shexp_glu_sig": GLU(SWIGLU, split) immediately followed by an independent UNARY(SIGMOID) (the
+// shared expert's swiglu and its gate's sigmoid, consecutive in the decode order). Both outputs stay (each is read
+// later); all f32 contiguous, <= max rows, the SIGMOID reading neither the GLU's result nor a view of it. Returns 1 or 0.
+static int ggml_vk_can_fuse_shexp_glu_sig(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_decode_fuse_enabled() || node_idx + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * glu = cgraph->nodes[node_idx];
+    const ggml_tensor * sig = cgraph->nodes[node_idx + 1];
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || !glu->src[1] ||
+        sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID) {
+        return 0;
+    }
+    const ggml_tensor * a = glu->src[0];
+    const ggml_tensor * b = glu->src[1];
+    const ggml_tensor * s = sig->src[0];
+    if (s == glu || s->view_src == glu || a == sig || b == sig) {
+        return 0;
+    }
+    for (const ggml_tensor * t : { a, b, glu, s, sig }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || get_misalign_bytes(ctx, t)) {
+            return 0;
+        }
+    }
+    if (!ggml_are_same_shape(a, glu) || !ggml_are_same_shape(b, glu) || !ggml_are_same_shape(s, sig) ||
+        ggml_nrows(glu) > vk_decode_fuse_max_rows || ggml_nrows(sig) > vk_decode_fuse_max_rows ||
+        ggml_nelements(glu) + ggml_nelements(sig) > (int64_t) 256 * ctx->device->properties.limits.maxComputeWorkGroupCount[0] ||
+        !ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_GLU, GGML_OP_UNARY }, { node_idx, node_idx + 1 }) ||
+        ggml_vk_decode_fuse_feeds_rms(cgraph, node_idx + 1)) {
+        return 0;
+    }
+    return 1;
+}
+
 static bool ggml_vk_can_fuse_topk_moe(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, topk_moe_mode mode) {
 
@@ -24527,6 +24585,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // (i0, t) only (the gate per row), so an exact alias is safe; the matcher refused any other overlap
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "SHEXP_TAIL";
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
+            } else if (cgraph->nodes[i]->op == GGML_OP_GLU && ggml_vk_can_fuse_shexp_glu_sig(ctx, cgraph, i) > 0 &&
+                       !vk_fusion_veto(ctx, "shexp_glu_sig")) {
+                // [TAG_DECODE_FUSE] D3 shexp_glu_sig: two outputs (the GLU, node 0, and the SIGMOID); each thread reads
+                // its own element of one node's sources before writing that node's element, so an exact alias within a
+                // node is safe; any overlap across the two nodes has different sizes and is vetoed
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_ops_write_mask |= 1 << 0;
+                fusion_string = "SHEXP_GLU_SIG";
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse_add_softplus_mul(ctx, cgraph, i) &&

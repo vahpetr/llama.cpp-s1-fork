@@ -1,0 +1,50 @@
+#version 450
+
+#include "types.glsl"
+
+// [TAG_DECODE_FUSE] D3 "shexp_glu_sig": two independent element-wise nodes that are consecutive in the qwen4exp decode
+// order (build_layer_ffn: the shared expert's GLU(SWIGLU, split) = ffn_swiglu, then the SIGMOID of its per-token gate
+// = shared_expert_gate_sigmoid) in one dispatch, both outputs written. Thread idx < n_glu computes the GLU element,
+// the rest the SIGMOID element idx - n_glu. op_swiglu is swiglu.comp's op() and op_sigmoid unary.comp's, character for
+// character, each in a function of its own; f32 in and out, so every value rounds where the separate dispatch stored it.
+// DECODE_FUSE_MUTANT (scratch trees only): 21 = swiglu as a * b / (1 + exp(-a)) (same function, other rounding).
+
+#ifndef DECODE_FUSE_MUTANT
+#define DECODE_FUSE_MUTANT 0
+#endif
+
+layout (binding = 0) readonly  buffer A  {float data_a[];};    // GLU src0 (gate), contiguous
+layout (binding = 1) readonly  buffer B  {float data_b[];};    // GLU src1 (up), contiguous
+layout (binding = 2) writeonly buffer D0 {float data_d0[];};   // GLU dst, contiguous
+layout (binding = 3) readonly  buffer S  {float data_s[];};    // SIGMOID src, contiguous
+layout (binding = 4) writeonly buffer D1 {float data_d1[];};   // SIGMOID dst, contiguous
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint32_t n_glu;
+    uint32_t n_sig;
+} p;
+
+// GLU(SWIGLU) exactly as swiglu.comp defines op()
+float op_swiglu(float a, float b) {
+#if DECODE_FUSE_MUTANT == 21
+    return a * b / (1.0f + exp(-a));
+#else
+    return a / (1.0f + exp(-a)) * b;
+#endif
+}
+
+// UNARY(SIGMOID) exactly as unary.comp defines it
+float op_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+void main() {
+    const uint32_t idx = gl_GlobalInvocationID.x;
+    if (idx < p.n_glu) {
+        data_d0[idx] = op_swiglu(data_a[idx], data_b[idx]);
+    } else if (idx - p.n_glu < p.n_sig) {
+        data_d1[idx - p.n_glu] = op_sigmoid(data_s[idx - p.n_glu]);
+    }
+}
