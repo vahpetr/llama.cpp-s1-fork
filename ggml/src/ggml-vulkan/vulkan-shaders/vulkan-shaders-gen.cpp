@@ -446,6 +446,14 @@ void string_to_spv(std::string name, const std::string& source, const std::map<s
     }
 }
 
+// [TAG_QSA_BIAS_FOLD] negative-control build for the bias-fold K-proof only (the QSA_SCORE epilogue honours
+// GGML_VK_QSA_BIAS_FOLD_MUTANT); a shipped build defines the inert QSA_FOLD_NEGCTL_OFF instead
+#ifdef GGML_VULKAN_QSA_BIAS_FOLD_NEGCTL
+static const std::pair<std::string, std::string> qsa_fold_negctl = {"QSA_FOLD_NEGCTL", "1"};
+#else
+static const std::pair<std::string, std::string> qsa_fold_negctl = {"QSA_FOLD_NEGCTL_OFF", "1"};
+#endif
+
 void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool coopmat2, bool f16acc, bool dot2 = false) {
     std::string load_vec = coopmat2 ? "1" : fp16 ? "8" : "4";
     std::string aligned_b_type_f32 = coopmat2 ? "float" : fp16 ? "mat2x4" : "vec4";
@@ -632,14 +640,14 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         // score epilogue (ReLU, ordered head sum, bias) in the coopmat1 store. Same defines + QSA_SCORE_EPILOGUE, so the
         // product is the same code; coopmat1 only (the epilogue reads the fragment's coopmat_stage).
         if (tname == "f32" && coopmat && !coopmat2 && !f16acc && !dot2 && matmul_id_type == MatMulIdType::NONE) {
-            string_to_spv(shader_name + "_f32_f32_qsa", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"QSA_SCORE_EPILOGUE", "1"}}), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
-            string_to_spv(shader_name + "_f32_f32_rows_qsa", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"A_ROW_IDS", "1"}, {"QSA_SCORE_EPILOGUE", "1"}}), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
+            string_to_spv(shader_name + "_f32_f32_qsa", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"QSA_SCORE_EPILOGUE", "1"}, qsa_fold_negctl}), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
+            string_to_spv(shader_name + "_f32_f32_rows_qsa", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"A_ROW_IDS", "1"}, {"QSA_SCORE_EPILOGUE", "1"}, qsa_fold_negctl}), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
         }
         // [TAG_QSA_POOLED_F16_MIRROR] the row-id QSA twin with an f16 A (the store's f16 mirror): the f32-A shader's
         // FLOAT_TYPE is already f16 on coopmat1, so the shared tiles, fragments, K loop, accumulator and epilogue are the
         // same; only the A load reads f16 instead of converting f32 -> f16
         if (tname == "f16" && coopmat && !coopmat2 && !f16acc && !dot2 && matmul_id_type == MatMulIdType::NONE) {
-            string_to_spv(shader_name + "_f16_f32_rows_qsa", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"A_ROW_IDS", "1"}, {"QSA_SCORE_EPILOGUE", "1"}}), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
+            string_to_spv(shader_name + "_f16_f32_rows_qsa", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"A_ROW_IDS", "1"}, {"QSA_SCORE_EPILOGUE", "1"}, qsa_fold_negctl}), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
         }
         // [TAG_QSA_SCORE_KREUSE] the three QSA twins above with the pooled keys reused across query tiles (QSA_SCORE_KREUSE:
         // workgroups numbered key tile major, x = ir * blocks_n + ic); same defines otherwise, so the product and the
@@ -652,10 +660,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             const std::map<std::string, std::string> kr = {{"QSA_SCORE_KREUSE", "1"}};
 #endif
             if (tname == "f32") {
-                string_to_spv(shader_name + "_f32_f32_qsa_kr", source_name, merge_maps(merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"QSA_SCORE_EPILOGUE", "1"}}), kr), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
-                string_to_spv(shader_name + "_f32_f32_rows_qsa_kr", source_name, merge_maps(merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"A_ROW_IDS", "1"}, {"QSA_SCORE_EPILOGUE", "1"}}), kr), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
+                string_to_spv(shader_name + "_f32_f32_qsa_kr", source_name, merge_maps(merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"QSA_SCORE_EPILOGUE", "1"}, qsa_fold_negctl}), kr), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
+                string_to_spv(shader_name + "_f32_f32_rows_qsa_kr", source_name, merge_maps(merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"A_ROW_IDS", "1"}, {"QSA_SCORE_EPILOGUE", "1"}, qsa_fold_negctl}), kr), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
             } else {
-                string_to_spv(shader_name + "_f16_f32_rows_qsa_kr", source_name, merge_maps(merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"A_ROW_IDS", "1"}, {"QSA_SCORE_EPILOGUE", "1"}}), kr), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
+                string_to_spv(shader_name + "_f16_f32_rows_qsa_kr", source_name, merge_maps(merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"A_ROW_IDS", "1"}, {"QSA_SCORE_EPILOGUE", "1"}, qsa_fold_negctl}), kr), fp16, coopmat, coopmat2, f16acc, cm1_sfx);
             }
         }
 
