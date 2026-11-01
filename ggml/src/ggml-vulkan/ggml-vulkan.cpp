@@ -22996,6 +22996,15 @@ static int ggml_vk_can_fuse_shexp_glu_sig(ggml_backend_vk_context * ctx, const s
     if (s == glu || s->view_src == glu || a == sig || b == sig) {
         return 0;
     }
+    // the gate's per-token sigmoid ([1, T]), not e.g. a router sigmoid that topk_moe fuses
+    if (sig->ne[0] != 1) {
+        return 0;
+    }
+    // the graph_compute veto checks each node's sources with that node's elementwise flag, which would let an exact
+    // alias ACROSS the two nodes through (GLU threads read while SIGMOID threads write): refuse any cross overlap
+    if (ggml_vk_tensors_overlap(a, sig, false) || ggml_vk_tensors_overlap(b, sig, false) || ggml_vk_tensors_overlap(s, glu, false)) {
+        return 0;
+    }
     for (const ggml_tensor * t : { a, b, glu, s, sig }) {
         if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || get_misalign_bytes(ctx, t)) {
             return 0;
@@ -23042,8 +23051,12 @@ static int ggml_vk_can_fuse_gdn_qk_gate(ggml_backend_vk_context * ctx, const str
         return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
     };
     int j = node_idx + 4;
-    while (j < cgraph->n_nodes && is_noop(cgraph->nodes[j])) {
+    while (j < cgraph->n_nodes && is_noop(cgraph->nodes[j]) && j + 2 - node_idx <= 12) {
         j++;
+    }
+    // op_srcs_fused_elementwise in graph_compute holds 13 nodes
+    if (j + 2 - node_idx > 12) {
+        return 0;
     }
     if (j + 2 >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_ADD || !ggml_vk_can_fuse_add_softplus_mul(ctx, cgraph, j)) {
         return 0;
