@@ -23122,6 +23122,13 @@ static bool ggml_vk_can_fuse_hc_combine_rms(ggml_backend_vk_context * ctx, const
     const ggml_tensor * inject = scale1->src[0];
     if (ggml_vk_tensors_overlap(block, mul, false) || ggml_vk_tensors_overlap(inject, mul, false) ||
         ggml_vk_tensors_overlap(w, mul, false) || ggml_vk_tensors_overlap(add, mul, false)) {
+        if (vk_fusion_diag) {
+            const char * who = ggml_vk_tensors_overlap(block, mul, false) ? "block" : ggml_vk_tensors_overlap(inject, mul, false) ? "inject" :
+                               ggml_vk_tensors_overlap(w, mul, false) ? "w_norm" : "combine";
+            GGML_LOG_INFO("ggml_vulkan: fusion HC_COMBINE_RMS refused at node %d: hc_norm %s overlaps the %s %s (%s)\n",
+                          node_idx, mul->name, who, who[0] == 'b' ? block->name : who[0] == 'i' ? inject->name : who[0] == 'w' ? w->name : add->name,
+                          ggml_op_name((who[0] == 'b' ? block : who[0] == 'i' ? inject : who[0] == 'w' ? w : add)->op));
+        }
         if (overlap) {
             *overlap = true;
         }
