@@ -233,6 +233,7 @@ set(GGML_VULKAN_QSA_TOPK_V3_MUTANT "0" CACHE STRING "ggml: Vulkan QSA select v3 
 option(GGML_VULKAN_MMID_SKIP_NEGCTL         "ggml: Vulkan mul_mat_id padding-skip negative-control build (tests only)" OFF)
 option(GGML_VULKAN_VALIDATE                 "ggml: enable Vulkan validation"                  OFF)
 option(GGML_VULKAN_RUN_TESTS                "ggml: run Vulkan tests"                          OFF)
+option(GGML_VULKAN_HC_TAIL_NEGCTL          "ggml: Vulkan hc tail fusion mutant shaders (tests only)" OFF)
 option(GGML_WEBGPU                          "ggml: use WebGPU"                                OFF)
 option(GGML_WEBGPU_DEBUG                    "ggml: enable WebGPU debug output"                OFF)
 option(GGML_WEBGPU_CPU_PROFILE              "ggml: enable WebGPU profiling (CPU)"             OFF)

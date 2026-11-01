@@ -1302,6 +1302,14 @@ void process_shaders() {
     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "0"}});
     string_to_spv("multi_add_rms_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "1"}});
     string_to_spv("multi_add_scale_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "0"}, {"MULTI_ADD_SCALE", "1"}});
+    // [TAG_HC_TAIL_FUSE] SIGMOID_MUL + MULTI_ADD_SCALE of the qwen4exp hc_mix tail in one dispatch; the negative-control
+    // build adds the mutants 1..6 of hc_tail_mix.comp (tests only, selected at run time by GGML_VK_HC_TAIL_MUTANT)
+    string_to_spv("hc_tail_mix_f32", "hc_tail_mix.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+#ifdef GGML_VULKAN_HC_TAIL_NEGCTL
+    for (int m = 1; m <= 6; ++m) {
+        string_to_spv("hc_tail_mix_m" + std::to_string(m) + "_f32", "hc_tail_mix.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"HC_TAIL_MUTANT", std::to_string(m)}});
+    }
+#endif
 
     string_to_spv("ssm_scan_f32",          "ssm_scan.comp", {{"A_TYPE", "float"}});
     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});

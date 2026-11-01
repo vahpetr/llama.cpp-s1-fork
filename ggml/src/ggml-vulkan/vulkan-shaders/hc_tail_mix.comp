@@ -1,0 +1,129 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef HC_TAIL_MUTANT
+#define HC_TAIL_MUTANT 0
+#endif
+#if HC_TAIL_MUTANT == 3
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+// [TAG_HC_TAIL_FUSE] the qwen4exp build_hc_mix tail in one dispatch:
+//   gated[s] = xn[s] * sigmoid(gate_in[s])            (SIGMOID_MUL, mul.comp under MUL_SIGMOID_B)
+//   mixed    = ((((0 + gated[0]) + gated[1]) + ...) + gated[S-1]) * param1 + param2
+//                                                     (MULTI_ADD_SCALE, multi_add.comp under MULTI_ADD_SCALE)
+// Only `mixed` is written; the gated plane is never stored.
+//
+// Bit-identity with the two dispatches (class A):
+//  * the sigmoid is op_sigmoid of unary.comp / load_b of mul.comp character for character:
+//    float x, 1.0f / (1.0f + exp(-x)), then FLOAT_TYPE(a) * sigmoid with xn as the left operand;
+//  * the product is `precise`: in mul.comp it was rounded to f32 and stored, so the following add
+//    must not contract it into an fma (sum + xn*sig -> fma would skip that rounding);
+//  * the sum starts at FLOAT_TYPE(0) and adds the streams in the multi_add source order, exactly
+//    as multi_add.comp (the +0 is kept: it is what multi_add.comp evaluates for signed zeros);
+//  * the scale is multi_add.comp's `sum * FLOAT_TYPE(p1) + FLOAT_TYPE(p2)` on the unmarked sum,
+//    so its contraction decision is the one multi_add.comp / scale.comp already make.
+// HC_TAIL_MUTANT (negative-control builds only, GGML_VULKAN_HC_TAIL_NEGCTL): 1 fma-contracted
+// sum + xn*sig, 2 balanced (s0+s1)+(s2+s3), 3 f16 tail arithmetic, 4 wrong token stride,
+// 5 missing scale, 6 omitted last stream.
+
+#include "types.glsl"
+#include "utils.glsl"
+
+layout (push_constant) uniform parameter
+{
+    // dst shape and strides (elements)
+    uint ne20; uint ne21; uint ne22; uint ne23;
+    uint nbd[4];
+    // per stream: element offset and strides into the gate-input / xn planes
+    // (the stream views of the elided MUL; the planes share its contiguous layout)
+    uint off[4];
+    uint nbs[4][4];
+    float scale_param1; float scale_param2;
+} p;
+
+// No readonly/writeonly decorations. Workaround for MoltenVK Bug, see https://github.com/ggml-org/llama.cpp/issues/15498
+layout (binding = 0) buffer B {A_TYPE data_b[];};   // the SIGMOID's source (hc_up GEMM output)
+layout (binding = 1) buffer X {A_TYPE data_x[];};   // xn (the MUL's src0)
+layout (binding = 2) buffer D {D_TYPE data_d[];};   // hc_mixed (the SCALE)
+
+layout(constant_id = 0) const uint num_srcs = 4;
+
+const uint num_threads = 256;
+
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+uint get_idx() {
+    return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+}
+
+FLOAT_TYPE load_sigmoid(uint i) {
+    const float x = float(data_b[i]);
+    return FLOAT_TYPE(1.0f / (1.0f + exp(-x)));
+}
+
+uint stream_idx(uint s, uint i00, uint i01, uint i02, uint i03) {
+#if HC_TAIL_MUTANT == 4
+    // wrong token stride: rows read as if the streams were not interleaved
+    return p.off[s] + i03*p.nbs[s][3] + i02*p.nbs[s][2] + i01*p.ne20 + i00*p.nbs[s][0];
+#else
+    return p.off[s] + i03*p.nbs[s][3] + i02*p.nbs[s][2] + i01*p.nbs[s][1] + i00*p.nbs[s][0];
+#endif
+}
+
+void main() {
+    uint idx = get_idx();
+
+    const uint ne = p.ne20 * p.ne21 * p.ne22 * p.ne23;
+
+    // num_threads * num_iter must equal 512, to match the wg_denoms and get_idx calculation
+    const uint num_iter = 2;
+
+    [[unroll]] for (uint it = 0; it < num_iter; ++it) {
+        if (idx >= ne) {
+            continue;
+        }
+        uint i00, i01, i02, i03;
+        get_indices(idx, i00, i01, i02, i03, p.ne20, p.ne21, p.ne22, p.ne23);
+
+#if HC_TAIL_MUTANT == 2
+        FLOAT_TYPE pair[2];
+        [[unroll]] for (uint h = 0; h < 2; ++h) {
+            const uint i0 = stream_idx(2*h + 0, i00, i01, i02, i03);
+            const uint i1 = stream_idx(2*h + 1, i00, i01, i02, i03);
+            precise FLOAT_TYPE g0 = FLOAT_TYPE(data_x[i0]) * load_sigmoid(i0);
+            precise FLOAT_TYPE g1 = FLOAT_TYPE(data_x[i1]) * load_sigmoid(i1);
+            pair[h] = g0 + g1;
+        }
+        FLOAT_TYPE sum = pair[0] + pair[1];
+#else
+        FLOAT_TYPE sum = FLOAT_TYPE(0);
+#if HC_TAIL_MUTANT == 6
+        [[unroll]] for (uint s = 0; s + 1 < num_srcs; ++s) {
+#else
+        [[unroll]] for (uint s = 0; s < num_srcs; ++s) {
+#endif
+            const uint i = stream_idx(s, i00, i01, i02, i03);
+#if HC_TAIL_MUTANT == 1
+            sum = fma(FLOAT_TYPE(data_x[i]), load_sigmoid(i), sum);
+#elif HC_TAIL_MUTANT == 3
+            const float16_t g = float16_t(data_x[i]) * float16_t(load_sigmoid(i));
+            sum = FLOAT_TYPE(float16_t(sum) + g);
+#else
+            precise FLOAT_TYPE g = FLOAT_TYPE(data_x[i]) * load_sigmoid(i);
+            sum += g;
+#endif
+        }
+#endif
+
+        const uint d = i03*p.nbd[3] + i02*p.nbd[2] + i01*p.nbd[1] + i00*p.nbd[0];
+#if HC_TAIL_MUTANT == 5
+        data_d[d] = D_TYPE(sum);
+#else
+        data_d[d] = D_TYPE(sum * FLOAT_TYPE(p.scale_param1) + FLOAT_TYPE(p.scale_param2));
+#endif
+
+        idx += num_threads;
+    }
+}

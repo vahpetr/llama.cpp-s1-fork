@@ -169,6 +169,12 @@ if (Vulkan_FOUND)
         add_compile_definitions(GGML_VULKAN_MMID_SKIP_NEGCTL)
         list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_MMID_SKIP_NEGCTL=ON)
     endif()
+    # [TAG_HC_TAIL_FUSE] negative-control build for the hc tail fusion proof only: compiles the hc_tail_mix.comp mutants
+    # 1..6, selected at run time by GGML_VK_HC_TAIL_MUTANT=<m> (unset = the real shader)
+    if (GGML_VULKAN_HC_TAIL_NEGCTL)
+        add_compile_definitions(GGML_VULKAN_HC_TAIL_NEGCTL)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_HC_TAIL_NEGCTL=ON)
+    endif()
 
     if (GGML_VULKAN_VALIDATE)
         add_compile_definitions(GGML_VULKAN_VALIDATE)
