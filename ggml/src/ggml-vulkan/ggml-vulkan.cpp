@@ -225,6 +225,8 @@ struct ggml_backend_vk_context;
 #define MAX_PARAMETER_COUNT 12
 // Max number of adds that can be fused without exceeding MAX_PARAMETER_COUNT.
 #define MAX_FUSED_ADDS (MAX_PARAMETER_COUNT - 3)
+// [TAG_HC_TAIL_FUSE] streams the hc tail fusion handles (qwen4exp hc_mult = 4); hc_tail_mix.comp sizes its push constants by it
+#define VK_HC_TAIL_MAX_STREAMS 4
 
 typedef std::shared_ptr<struct vk_pipeline_struct> vk_pipeline;
 
@@ -1148,6 +1150,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_multi_add_rms[MAX_FUSED_ADDS];
     // [TAG_HC_MIX_TAIL] ADD+ADD(+ADD...)+SCALE, indexed like pipeline_multi_add (number of adds - 1)
     vk_pipeline pipeline_multi_add_scale[MAX_FUSED_ADDS];
+    // [TAG_HC_TAIL_FUSE] SIGMOID+MUL+ADD..ADD+SCALE of the hc_mix tail, indexed by number of streams - 2
+    vk_pipeline pipeline_hc_tail_mix[VK_HC_TAIL_MAX_STREAMS - 1];
 
     vk_pipeline pipeline_add_id_f32;
 
@@ -1370,6 +1374,8 @@ struct vk_device_struct {
     // [TAG_HC_MIX_TAIL] GGML_VK_FUSE_MULTI_ADD_SCALE / GGML_VK_FUSE_SCALE_SILU
     bool fuse_multi_add_scale;
     bool fuse_scale_silu;
+    // [TAG_HC_TAIL_FUSE] GGML_VK_HC_TAIL_FUSE (default on; 0 = SIGMOID_MUL + MULTI_ADD_SCALE as before)
+    bool fuse_hc_tail;
     // [TAG_CONV_INPUT_SPLIT] GGML_VK_FUSE_CONCAT_SSM_CONV
     bool fuse_concat_ssm_conv;
     // [TAG_RMS_NORM_EXT] GGML_VK_FUSE_RMS_NORM_SCALE / GGML_VK_FUSE_RMS_NORM_MUL_MUL
@@ -1956,6 +1962,20 @@ struct vk_op_multi_add_scale_push_constants {
 static_assert(std::is_standard_layout_v<vk_op_multi_add_scale_push_constants>);
 static_assert(offsetof(vk_op_multi_add_scale_push_constants, scale_param1) == sizeof(vk_op_multi_add_push_constants));
 static_assert(sizeof(vk_op_multi_add_scale_push_constants) <= 256);
+
+// [TAG_HC_TAIL_FUSE] hc_tail_mix.comp: dst shape + strides, per stream the element offset and strides into the
+// gate-input / xn planes (both laid out like the elided MUL), and the SCALE's two params
+struct vk_op_hc_tail_mix_push_constants {
+    uint32_t ne20; uint32_t ne21; uint32_t ne22; uint32_t ne23;
+    uint32_t nbd[4];
+    uint32_t off[VK_HC_TAIL_MAX_STREAMS];
+    uint32_t nbs[VK_HC_TAIL_MAX_STREAMS][4];
+    float scale_param1;
+    float scale_param2;
+};
+static_assert(VK_HC_TAIL_MAX_STREAMS == 4); // update hc_tail_mix.comp if this changes
+static_assert(std::is_standard_layout_v<vk_op_hc_tail_mix_push_constants>);
+static_assert(sizeof(vk_op_hc_tail_mix_push_constants) <= 128);
 
 struct vk_op_topk_moe_push_constants {
     uint32_t n_rows;
@@ -3084,6 +3104,9 @@ static bool ggml_vk_g1_tile_valid(const vk_device & device, const vk_g1_tile & t
 //   topk_moe_scale                   the optional trailing DIV+RESHAPE+SCALE / GET_ROWS+SCALE appended to any topk_moe_*
 //   add_softplus_mul                 ADD+SOFTPLUS+MUL                     (qwen4exp GDN decay pre-chain)
 //   scale_silu                       SCALE+SILU                           (qwen4exp hc_mix down projection)
+//   hc_tail_mix                      SIGMOID+MUL+RESHAPE/VIEW..+ADD..ADD+SCALE   (qwen4exp hc_mix tail, [TAG_HC_TAIL_FUSE];
+//                                                                          GGML_VK_HC_TAIL_FUSE=0 turns it off; disabled, the
+//                                                                          sigmoid_mul + multi_add_scale pair fires as before)
 //   sigmoid_mul                      SIGMOID+MUL
 //   add_rms                          ADD that also writes the sum-of-squares partials consumed by the RMS_NORM
 //                                    right after it (ggml_vk_build_graph; decode only, rows == 1)
@@ -3140,7 +3163,7 @@ static const char * const vk_fusion_pattern_names[] = {
     "topk_moe_early_softmax", "topk_moe_late_softmax", "topk_moe_scale", "add_softplus_mul",
     "sigmoid_mul", "add_rms", "multi_add_scale", "scale_silu",
     "concat_ssm_conv_bias_silu", "concat_ssm_conv_silu", "concat_ssm_conv",
-    "rms_norm_scale", "rms_norm_mul_sigmoid_mul", "rms_norm_mul_mul",
+    "rms_norm_scale", "rms_norm_mul_sigmoid_mul", "rms_norm_mul_mul", "hc_tail_mix",
 };
 static bool vk_fusion_patterns_disabled_any = false;
 static std::vector<std::string> vk_fusion_patterns_disabled; // lower-case; trailing '*' = prefix match
@@ -3689,6 +3712,8 @@ struct ggml_backend_vk_context {
     // then counts the adds AND the scale), and SCALE + SILU dispatched off the SCALE node
     bool fused_multi_add_scale {};
     bool fused_scale_silu {};
+    // [TAG_HC_TAIL_FUSE] SIGMOID + MUL + views + ADD..ADD + SCALE dispatched off the SIGMOID node (dst = the SCALE)
+    bool fused_hc_tail {};
     // [TAG_CONV_INPUT_SPLIT] CONCAT + SSM_CONV (+ ...) dispatched off the CONCAT node
     bool fused_concat_ssm_conv {};
     // GGML_VK_FUSION_COUNT: add_rms fusions of the current graph (decided inside ggml_vk_build_graph)
@@ -7627,6 +7652,34 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
+    // [TAG_HC_TAIL_FUSE] one pipeline per stream count (spec constant num_srcs); the negative-control build swaps in the
+    // mutant GGML_VK_HC_TAIL_MUTANT=<1..6> of hc_tail_mix.comp (tests only)
+    {
+        const void * hc_tail_data = hc_tail_mix_f32_data;
+        uint64_t     hc_tail_len  = hc_tail_mix_f32_len;
+        std::string  hc_tail_name = "hc_tail_mix_f32";
+#ifdef GGML_VULKAN_HC_TAIL_NEGCTL
+        if (const char * m = getenv("GGML_VK_HC_TAIL_MUTANT")) {
+            switch (atoi(m)) {
+                case 1: hc_tail_data = hc_tail_mix_m1_f32_data; hc_tail_len = hc_tail_mix_m1_f32_len; break;
+                case 2: hc_tail_data = hc_tail_mix_m2_f32_data; hc_tail_len = hc_tail_mix_m2_f32_len; break;
+                case 3: hc_tail_data = hc_tail_mix_m3_f32_data; hc_tail_len = hc_tail_mix_m3_f32_len; break;
+                case 4: hc_tail_data = hc_tail_mix_m4_f32_data; hc_tail_len = hc_tail_mix_m4_f32_len; break;
+                case 5: hc_tail_data = hc_tail_mix_m5_f32_data; hc_tail_len = hc_tail_mix_m5_f32_len; break;
+                case 6: hc_tail_data = hc_tail_mix_m6_f32_data; hc_tail_len = hc_tail_mix_m6_f32_len; break;
+                default: break;
+            }
+            if (hc_tail_data != (const void *) hc_tail_mix_f32_data) {
+                hc_tail_name = std::string("hc_tail_mix_m") + m + "_f32";
+                GGML_LOG_WARN("ggml_vulkan: NEGATIVE-CONTROL hc tail shader %s\n", hc_tail_name.c_str());
+            }
+        }
+#endif
+        for (uint32_t i = 0; i < VK_HC_TAIL_MAX_STREAMS - 1; ++i) {
+            ggml_vk_create_pipeline2(device, device->pipeline_hc_tail_mix[i], hc_tail_name + "_" + std::to_string(i+2), hc_tail_len, hc_tail_data, "main", 3, sizeof(vk_op_hc_tail_mix_push_constants), {512, 1, 1}, {i+2}, 1);
+        }
+    }
+
     ggml_vk_create_pipeline(device, device->pipeline_add_id_f32, "add_id_f32", add_id_f32_len, add_id_f32_data, "main", 4, sizeof(vk_op_add_id_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_acc_f32, "acc_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
@@ -9587,6 +9640,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->fuse_multi_add_scale = fuse_enabled("GGML_VK_FUSE_MULTI_ADD_SCALE") && device->multi_add &&
                                        device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_scale_push_constants);
         device->fuse_scale_silu      = fuse_enabled("GGML_VK_FUSE_SCALE_SILU");
+        // [TAG_HC_TAIL_FUSE] the whole hc_mix tail (SIGMOID_MUL + MULTI_ADD_SCALE) in one dispatch, bit-identical hc_mixed
+        device->fuse_hc_tail         = fuse_enabled("GGML_VK_HC_TAIL_FUSE") &&
+                                       device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_hc_tail_mix_push_constants);
         // [TAG_CONV_INPUT_SPLIT] the GDN conv input: ssm_conv reads concat(state, x^T) from its two sources
         device->fuse_concat_ssm_conv = fuse_enabled("GGML_VK_FUSE_CONCAT_SSM_CONV");
         // [TAG_VK_DISPATCH_LOG] read once here; off = one bool test per matmul dispatch, nothing else
@@ -19212,6 +19268,60 @@ static void ggml_vk_sigmoid_mul_dispatch_fused(ggml_backend_vk_context * ctx, vk
     ggml_vk_mul(ctx, subctx, mul->src[0], unary->src[0], mul);
 }
 
+static int ggml_vk_hc_tail_streams(const struct ggml_cgraph * cgraph, int node_idx, int * first_add_out, int * num_adds_out,
+                                   const ggml_tensor ** streams);
+
+// [TAG_HC_TAIL_FUSE] dispatch of the fused hc_mix tail validated by ggml_vk_can_fuse_hc_tail: hc_tail_mix.comp reads
+// the SIGMOID's source and xn through each stream view's offset / strides and writes only the SCALE's destination
+static void ggml_vk_hc_tail_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * unary = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
+    ggml_tensor *       dst   = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+
+    int first_add = 0;
+    int num_adds  = 0;
+    const ggml_tensor * streams[VK_HC_TAIL_MAX_STREAMS] = {};
+    const int n_extra = ggml_vk_hc_tail_streams(cgraph, node_idx, &first_add, &num_adds, streams);
+    GGML_ASSERT(n_extra == ctx->num_additional_fused_ops && dst->op == GGML_OP_SCALE);
+    const int num_streams = num_adds + 1;
+
+    vk_op_hc_tail_mix_push_constants pc {};
+    pc.ne20 = (uint32_t) dst->ne[0];
+    pc.ne21 = (uint32_t) dst->ne[1];
+    pc.ne22 = (uint32_t) dst->ne[2];
+    pc.ne23 = (uint32_t) dst->ne[3];
+    for (int d = 0; d < 4; ++d) {
+        pc.nbd[d] = (uint32_t) (dst->nb[d] / sizeof(float));
+    }
+    for (int s = 0; s < num_streams; ++s) {
+        pc.off[s] = (uint32_t) (streams[s]->view_offs / sizeof(float));
+        for (int d = 0; d < 4; ++d) {
+            pc.nbs[s][d] = (uint32_t) (streams[s]->nb[d] / sizeof(float));
+        }
+    }
+    // the SCALE's (s, b) exactly as ggml_vk_scale / the multi_add_scale dispatch pass them
+    pc.scale_param1 = ggml_get_op_params_f32(dst, 0);
+    pc.scale_param2 = ggml_get_op_params_f32(dst, 1);
+
+    vk_pipeline pipeline = ctx->device->pipeline_hc_tail_mix[num_streams - 2];
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer g_buf  = ggml_vk_tensor_subbuffer(ctx, unary->src[0]);
+    vk_subbuffer xn_buf = ggml_vk_tensor_subbuffer(ctx, mul->src[0]);
+    vk_subbuffer d_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    std::array<uint32_t, 3> elements;
+    const uint32_t ne = ggml_nelements(dst);
+    if (ne > 262144) {
+        elements = { 512, 512, CEIL_DIV(ne, 262144) };
+    } else if (ne > 512) {
+        elements = { 512, CEIL_DIV(ne, 512), 1 };
+    } else {
+        elements = { ne, 1, 1 };
+    }
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { g_buf, xn_buf, d_buf }, pc, elements);
+}
+
 // Dispatch the fused Gated-DeltaNet decay pre-chain (qwen4exp build_layer_attn_linear):
 //   out[i0, r] = softplus(alpha[i0, r] + dt[i0]) * a[i0]
 // replacing ADD -> UNARY(SOFTPLUS) -> MUL. The pattern is validated by
@@ -20785,6 +20895,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_UNARY:
         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
+        if (ctx->fused_hc_tail) {
+            ggml_vk_hc_tail_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
             break;
         }
         if (ctx->fused_mul_sigmoid) {
@@ -23128,6 +23242,152 @@ static bool ggml_vk_can_fuse_multi_add_scale(ggml_backend_vk_context * ctx, cons
     return true;
 }
 
+// [TAG_HC_TAIL_FUSE] the qwen4exp build_hc_mix tail as one dispatch (hc_tail_mix.comp):
+//   UNARY(SIGMOID, g) -> MUL(xn, .) -> RESHAPE/VIEW (the S stream views) -> ADD x (S-1) -> SCALE(1/S)
+// at node_idx (the SIGMOID). This is SIGMOID_MUL followed by MULTI_ADD_SCALE with the gated plane never stored: one
+// invocation per mixed element loads the S gate inputs and S xn values, evaluates mul.comp's sigmoid and product,
+// then multi_add.comp's ordered sum (from +0, streams in the multi_add source order) and scale expression.
+// Traffic 100 -> 68 B per mixed element (S = 4), one dispatch fewer.
+//
+// Eligibility (astra P4 design review Q3), anything else leaves the SIGMOID_MUL + MULTI_ADD_SCALE pair:
+//  * the exact chain: sigmoid only as the MUL's src1, every node between the MUL and the first ADD an empty view whose
+//    view_src is the MUL, 2..VK_HC_TAIL_MAX_STREAMS-1 consecutive ADDs (the multi_add the old path forms; a single ADD
+//    is not a multi_add and is refused), each stream a view of the MUL, then the SCALE of the last ADD with param2 == 0;
+//  * no external consumer of any eliminated intermediate (sigmoid, product, views, partial sums) and none of them an
+//    output: ggml_can_fuse_subgraph with the SCALE as the only output;
+//  * the sigmoid's source is the plain matmul (op MUL_MAT): a LoRA-expanded w_up (build_lora_mm's ADD of the adapter
+//    product) is refused;
+//  * f32 everywhere, gate input / xn / product contiguous and of one shape (so a stream view's offsets and strides
+//    index all three planes alike), no misaligned operand;
+//  * no overlap of hc_mixed with the gate input or xn (xn stays live for hc_inject; the read is not elementwise in
+//    the output index); *overlap reports that refusal (GGML_VK_FUSION_COUNT: overlap:hc_tail_mix).
+// Returns the number of additional fused nodes (SCALE index - node_idx), 0 when it does not apply.
+static int ggml_vk_hc_tail_streams(const struct ggml_cgraph * cgraph, int node_idx, int * first_add_out, int * num_adds_out,
+                                   const ggml_tensor ** streams) {
+    const int n = cgraph->n_nodes;
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    int j = node_idx + 2;
+    while (j < n && j - node_idx <= 12 && ggml_vk_is_empty(cgraph->nodes[j])) {
+        const ggml_tensor * v = cgraph->nodes[j];
+        if ((v->op != GGML_OP_RESHAPE && v->op != GGML_OP_VIEW) || v->view_src != mul) {
+            return 0;
+        }
+        j++;
+    }
+    const int first_add = j;
+    int num_adds = 0;
+    while (j < n && cgraph->nodes[j]->op == GGML_OP_ADD && num_adds < VK_HC_TAIL_MAX_STREAMS) {
+        num_adds++;
+        j++;
+    }
+    if (num_adds < 2 || num_adds > VK_HC_TAIL_MAX_STREAMS - 1 || j >= n || cgraph->nodes[j]->op != GGML_OP_SCALE) {
+        return 0;
+    }
+    // the stream order of ggml_vk_multi_add: the first ADD's src0, src1, then each next ADD's other operand
+    streams[0] = cgraph->nodes[first_add]->src[0];
+    streams[1] = cgraph->nodes[first_add]->src[1];
+    for (int k = 1; k < num_adds; ++k) {
+        const ggml_tensor * add  = cgraph->nodes[first_add + k];
+        const ggml_tensor * prev = cgraph->nodes[first_add + k - 1];
+        if (add->src[0] == prev) {
+            streams[k + 1] = add->src[1];
+        } else if (add->src[1] == prev) {
+            streams[k + 1] = add->src[0];
+        } else {
+            return 0;
+        }
+    }
+    *first_add_out = first_add;
+    *num_adds_out  = num_adds;
+    return j - node_idx;
+}
+
+static int ggml_vk_can_fuse_hc_tail(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
+                                    bool * overlap = nullptr) {
+    if (!ctx->device->fuse_hc_tail || node_idx + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * unary = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
+    if (unary->op != GGML_OP_UNARY || ggml_get_unary_op(unary) != GGML_UNARY_OP_SIGMOID ||
+        mul->op != GGML_OP_MUL || mul->src[1] != unary || mul->src[0] == unary) {
+        return 0;
+    }
+    const ggml_tensor * g  = unary->src[0];
+    const ggml_tensor * xn = mul->src[0];
+    if (g->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    if (unary->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || xn->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    if (!ggml_are_same_shape(g, mul) || !ggml_are_same_shape(xn, mul) ||
+        !ggml_is_contiguous(g) || !ggml_is_contiguous(xn) || !ggml_is_contiguous(mul)) {
+        return 0;
+    }
+
+    int first_add = 0;
+    int num_adds  = 0;
+    const ggml_tensor * streams[VK_HC_TAIL_MAX_STREAMS] = {};
+    const int n_extra = ggml_vk_hc_tail_streams(cgraph, node_idx, &first_add, &num_adds, streams);
+    // graph_compute's op_srcs_fused_elementwise holds 13 entries
+    if (n_extra <= 0 || n_extra > 12) {
+        return 0;
+    }
+    const int scale_idx = node_idx + n_extra;
+    const ggml_tensor * scale = cgraph->nodes[scale_idx];
+    if (scale->src[0] != cgraph->nodes[scale_idx - 1] || scale->type != GGML_TYPE_F32 ||
+        ggml_get_op_params_f32(scale, 1) != 0.0f) {
+        return 0;
+    }
+
+    // no external consumer of an elided node, none an output, the views' sources inside the pattern
+    ggml_op ops[13];
+    for (int k = 0; k <= n_extra; ++k) {
+        ops[k] = cgraph->nodes[node_idx + k]->op;
+    }
+    const int outputs[1] = { scale_idx };
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, n_extra + 1, ops, outputs, 1)) {
+        return 0;
+    }
+
+    for (int k = 0; k < num_adds; ++k) {
+        const ggml_tensor * add = cgraph->nodes[first_add + k];
+        if (add->type != GGML_TYPE_F32 || !ggml_are_same_shape(add, scale)) {
+            return 0;
+        }
+    }
+    for (int s = 0; s <= num_adds; ++s) {
+        const ggml_tensor * v = streams[s];
+        bool member = false;
+        for (int k = node_idx + 2; k < first_add; ++k) {
+            member = member || cgraph->nodes[k] == v;
+        }
+        if (!member || v->op != GGML_OP_VIEW || v->view_src != mul || v->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(v, scale) || v->nb[0] != sizeof(float) || (v->view_offs % sizeof(float)) != 0 ||
+            (v->nb[1] % sizeof(float)) != 0 || (v->nb[2] % sizeof(float)) != 0 || (v->nb[3] % sizeof(float)) != 0) {
+            return 0;
+        }
+    }
+
+    if (get_misalign_bytes(ctx, g) || get_misalign_bytes(ctx, xn) || get_misalign_bytes(ctx, scale)) {
+        return 0;
+    }
+    const bool ovl_g  = ggml_vk_tensors_overlap(g, scale, false);
+    const bool ovl_xn = ggml_vk_tensors_overlap(xn, scale, false);
+    if (ovl_g || ovl_xn) {
+        if (overlap) {
+            *overlap = true;
+        }
+        if (vk_fusion_diag) {
+            GGML_LOG_INFO("ggml_vulkan: hc_tail_mix refused at node %d (%s): dst overlaps%s%s, n=%lld\n", node_idx, scale->name,
+                          ovl_g ? " gate-input" : "", ovl_xn ? " xn" : "", (long long) scale->ne[1]);
+        }
+        return 0;
+    }
+    return n_extra;
+}
+
 // [TAG_HC_MIX_TAIL] SCALE + UNARY(SILU), the qwen4exp build_hc_mix silu(scale(w_down x, 1/hc)).
 // scale_silu.comp evaluates scale.comp's expression and unary.comp's op_silu on the register
 // value; the elided store rounded to f32 anyway. Matched only for f32, param2 == 0 and
@@ -23471,12 +23731,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_multi_add_scale = false;
         ctx->fused_scale_silu = false;
+        ctx->fused_hc_tail = false;
         ctx->fused_concat_ssm_conv = false;
         ctx->fused_rms_norm_scale = false;
         ctx->fused_rms_norm_mul2 = 0;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+            // [TAG_HC_TAIL_FUSE] the whole hc_mix tail, tried before its constituent sigmoid_mul (+ multi_add_scale)
+            int  hc_tail_n       = 0;
+            bool hc_tail_overlap = false;
             // RMS_NORM_MUL_SIGMOID_MUL (2) / RMS_NORM_MUL_MUL (1) / none (0): evaluated once per RMS_NORM node
             const int rms_norm_mul2 = cgraph->nodes[i]->op == GGML_OP_RMS_NORM ? ggml_vk_can_fuse_rms_norm_mul2(ctx, cgraph, i) : 0;
             if (num_adds && !vk_fusion_veto(ctx, "multi_add")) {
@@ -23720,6 +23984,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // writes the same element of the destination, so an exact alias is safe
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            } else if ((hc_tail_n = ggml_vk_can_fuse_hc_tail(ctx, cgraph, i, &hc_tail_overlap)) > 0 &&
+                       !vk_fusion_veto(ctx, "hc_tail_mix")) {
+                ctx->num_additional_fused_ops = hc_tail_n;
+                ctx->fused_hc_tail = true;
+                fusion_string = "HC_TAIL_MIX";
+                // xn and the gate input are read per stream, not in the output's element order: any overlap with the
+                // destination vetoes (ggml_vk_can_fuse_hc_tail already refused one, so this never fires)
+                std::fill_n(op_srcs_fused_elementwise, hc_tail_n + 1, false);
             } else if (ggml_vk_can_fuse_sigmoid_mul(ctx, cgraph, i) &&
                        !vk_fusion_veto(ctx, "sigmoid_mul")) {
                 ctx->num_additional_fused_ops = 1;
@@ -23729,6 +24001,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // element of the destination, so an exact alias is safe
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            }
+            if (hc_tail_overlap && fusion_count) {
+                ggml_vk_fusion_count_add(fusion_counts, "overlap:", "hc_tail_mix");
             }
             if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
                 // Look for an additional scale op to fuse - occurs in deepseek2 and nemotron3 nano.
@@ -23825,6 +24100,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_multi_add_scale = false;
                 ctx->fused_scale_silu = false;
+                ctx->fused_hc_tail = false;
                 ctx->fused_concat_ssm_conv = false;
                 ctx->fused_rms_norm_scale = false;
                 ctx->fused_rms_norm_mul2 = 0;
