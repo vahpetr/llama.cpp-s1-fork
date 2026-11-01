@@ -4,6 +4,7 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
 
 // [TAG_QSA_TOPK_V3] (plan 2.9.2 #1, design docs/research/2026-10-31-topk-v3-design.md section 2 "B"; GGML_VK_QSA_TOPK_V3=1,
 // default on gfx1151) the onepass selection (topk_qsa_onepass.comp) of the metadata cell form without the key rows, done over
@@ -43,14 +44,17 @@
 //   4 select    one workgroup per row: c blocks with weight sum W. Fallback to v2 on the summary flag, c > CAP, W < k, or
 //               more than CAP cells at keys >= T. Else T = the k-th largest of the candidates' cell keys (v2's radix rule
 //               with the histogram counting weights), every candidate block with key >= T is expanded into its visible
-//               cells as composites (key > T: id, key == T: 1 << 31 | id), sorted ascending in LDS, the first k written.
+//               cells as composites (key > T: id, key == T: 1 << 31 | id), sorted ascending (a bitonic network over the
+//               next power of two >= max(n, WG): strides < the subgroup size in registers (subgroupShuffleXor), the rest in
+//               LDS, pairs whose upper element is padding skipped), the first k written.
 // Then v2's six passes (QSA_TOPK_FB, the onepass fallback list) over the rows this file could not finish.
 // Why the result is v2's: every candidate key is > 0x007FFFFF and W counts exactly the cells with key >= tau (a block's
 // visible cells, all with the block's key), so W >= k means T >= tau > 0x007FFFFF and every cell with key >= T sits in a
 // candidate block. The weighted histogram over the candidates is v2's histogram over those cells (a block adds w where v2
 // adds 1 per cell), so T is v2's; the expansion emits exactly the visible cells (FULL: all, CHECK: per-cell test), and the
-// sorted composites are v2's emit truncated to k. tau, the sample and the order of the atomics (list slots, candidates) never
-// reach an id.
+// sorted composites are v2's emit truncated to k. tau, the sample, the order of the atomics (list slots, candidates) and the
+// sort network never reach an id. The skipped sort pairs are exactly those that would not swap: padding (0xFFFFFFFF, above
+// every composite) starts at n and every merge keeps it there, so a pair whose upper index is >= n compares x <= padding.
 //
 // Scratch (binding 4, uint offsets): op_off: tau[nrows] | cnt[nrows] | fb[1 + nrows] | cand[nrows][CAP][2] (onepass's
 // layout, so the fallback list sits where the QSA_TOPK_FB passes read it); v3_off: wsum[nrows] | cls[n_stream][nbw]
@@ -538,21 +542,83 @@ void filter_pass(const uint row, const uint tile, const uint lin) {
     }
 }
 
-// ascending bitonic sort of sk[0..P), P a power of two <= CAP (uniform)
-void lds_sort(const uint P, const uint lin) {
-    for (uint size = 2u; size <= P; size <<= 1u) {
-        for (uint stride = size >> 1u; stride > 0u; stride >>= 1u) {
-            for (uint t = lin; t < (P >> 1u); t += WG) {
-                const uint i = 2u * t - (t & (stride - 1u));
-                const uint j = i + stride;
-                const uint a = sk[i];
-                const uint b = sk[j];
-                if ((a > b) == ((i & size) == 0u)) {
-                    sk[i] = b;
-                    sk[j] = a;
-                }
+// The select's sort: an ascending bitonic network (every merge ascending: first the mirror stage, mask size - 1, then the
+// half-cleaners, mask = stride) over P = a power of two >= max(n, WG) elements; element e = q * WG + lin lives in register
+// v[q] of invocation lin, so a stage whose mask is below the subgroup size pairs two lanes of one subgroup (shuffle, no
+// barrier); the stages with a larger mask go through LDS (sk) with a barrier each. Of a pair (e, e ^ mask), e < e ^ mask,
+// the lower index keeps the min.
+
+// one register stage: mask < gl_SubgroupSize, hb = its top bit (uniform)
+void reg_stage(inout uint v[PER], const uint nr, const uint mask, const uint hb) {
+    const bool lo = (gl_SubgroupInvocationID & hb) == 0u;
+    [[unroll]] for (uint q = 0; q < PER; ++q) {
+        if (q >= nr) {
+            break; // uniform
+        }
+        const uint o = subgroupShuffleXor(v[q], mask);
+        v[q] = lo ? min(v[q], o) : max(v[q], o);
+    }
+}
+
+// one LDS stage over sk[0..P): pairs (e, j = e ^ mask) with e's bit hb clear; a pair with j >= n is skipped (sk[j] is padding,
+// so it would not swap). e(t) >= 2 t - (hb - 1), so no t >= (n + hb) / 2 has e < n (uniform bounds)
+void lds_stage(const uint P, const uint n, const uint mask, const uint hb, const uint lin) {
+    const uint tb = min(P >> 1u, (n + hb + 1u) >> 1u);
+    for (uint t = lin; t < tb; t += WG) {
+        const uint e = ((t & ~(hb - 1u)) << 1u) | (t & (hb - 1u));
+        const uint j = e ^ mask;
+        if (j < n) {
+            const uint a = sk[e];
+            const uint b = sk[j];
+            if (a > b) {
+                sk[e] = b;
+                sk[j] = a;
             }
+        }
+    }
+}
+
+// sorts the n composites in sk[0..n) (written, followed by a barrier) into v (element q * WG + lin in v[q]); P = nr * WG
+void sort_composites(inout uint v[PER], const uint n, const uint P, const uint nr, const uint lin) {
+    const uint SG = gl_SubgroupSize;
+    [[unroll]] for (uint q = 0; q < PER; ++q) {
+        v[q] = 0xFFFFFFFFu;
+        if (q >= nr) {
+            continue; // uniform
+        }
+        const uint e = q * WG + lin;
+        v[q] = e < n ? sk[e] : 0xFFFFFFFFu;
+    }
+    // merges of size <= SG: registers only (P >= WG >= SG)
+    for (uint size = 2u; size <= SG; size <<= 1u) {
+        reg_stage(v, nr, size - 1u, size >> 1u);
+        for (uint m = size >> 2u; m > 0u; m >>= 1u) {
+            reg_stage(v, nr, m, m);
+        }
+    }
+    for (uint size = SG << 1u; size <= P; size <<= 1u) {
+        barrier(); // every invocation has read sk for the previous step (only its own elements since)
+        [[unroll]] for (uint q = 0; q < PER; ++q) {
+            if (q >= nr) {
+                break;
+            }
+            sk[q * WG + lin] = v[q];
+        }
+        barrier();
+        lds_stage(P, n, size - 1u, size >> 1u, lin);
+        barrier();
+        for (uint m = size >> 2u; m >= SG; m >>= 1u) {
+            lds_stage(P, n, m, m, lin);
             barrier();
+        }
+        [[unroll]] for (uint q = 0; q < PER; ++q) {
+            if (q >= nr) {
+                break;
+            }
+            v[q] = sk[q * WG + lin];
+        }
+        for (uint m = SG >> 1u; m > 0u; m >>= 1u) {
+            reg_stage(v, nr, m, m);
         }
     }
 }
@@ -643,23 +709,27 @@ void select_pass(const uint row, const uint lin) {
         }
     }
     barrier();
-    uint P = 1u;
+    uint P = WG;
     while (P < n_sel) {
         P <<= 1u;
     }
-    for (uint j = n_sel + lin; j < P; j += WG) {
-        sk[j] = 0xFFFFFFFFu;
-    }
-    barrier();
-    lds_sort(P, lin);
+    const uint nr = P / WG;
+    uint sv[PER];
+    sort_composites(sv, n_sel, P, nr, lin);
     const uint row_out = row * p.k;
-    for (uint j = lin; j < p.k; j += WG) {
-        const uint v = sk[j];
+    [[unroll]] for (uint q = 0; q < PER; ++q) {
+        if (q >= nr) {
+            break;
+        }
+        const uint j = q * WG + lin;
+        if (j < p.k) {
+            const uint v = sv[q];
 #ifdef ONEPASS_NEGCTL
-        data_d[row_out + j] = int((v & 0x80000000u) != 0u ? 0x7FFFFFFFu - (v & 0x7FFFFFFFu) : v);
+            data_d[row_out + j] = int((v & 0x80000000u) != 0u ? 0x7FFFFFFFu - (v & 0x7FFFFFFFu) : v);
 #else
-        data_d[row_out + j] = int(v & 0x7FFFFFFFu);
+            data_d[row_out + j] = int(v & 0x7FFFFFFFu);
 #endif
+        }
     }
     if (lin == 0) {
         atomicAdd(stats[40], 1u);
