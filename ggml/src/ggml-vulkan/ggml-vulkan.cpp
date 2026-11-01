@@ -12042,50 +12042,36 @@ static void ggml_vk_f32acc_excluded_note(const ggml_tensor * src0, const vk_matm
     }
 }
 
-static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k,
-                                  const ggml_tensor * row_ids = nullptr, uint64_t row_ids_a_bytes = 0) {
-    VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
-    std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
-    std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
-    std::cerr << "))");
-    GGML_ASSERT(ggml_vk_dim01_contiguous(src0) || src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);  // NOLINT
-    GGML_ASSERT(ggml_vk_dim01_contiguous(src1) || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);  // NOLINT
+// [TAG_MM_PLAN] the mat-mat plan of ggml_vk_mul_mat_q_f16: conversion passes, the matmul pipeline family (mmp), the
+// tile / alignment choice, split_k and the exact-twin swaps (t16, B2, G1). It reads ctx->device only (no buffers, no
+// command recording), so ggml_backend_vk_dev_mul_mat_plan can ask it for a descriptor-only matmul: this function is
+// the single source of truth for both the dispatch and the graph-side query (qwen4exp LLAMA_QWEN4EXP_MERGE_PLAN).
+struct vk_mm_plan {
+    bool x_non_contig;
+    bool y_non_contig;
+    ggml_type f16_type;
+    bool y_f32_kernel;
+    bool quantize_y;
+    bool f32acc_excl;
+    ggml_prec prec;
+    vk_matmul_pipeline mmp;
+    ggml_type mm_a;
+    ggml_type mm_b;
+    bool qx_needs_dequant;
+    bool qy_needs_dequant;
+    ggml_type effective_src1_type;
+    uint32_t kpad;
+    bool aligned;
+    vk_pipeline base_pipeline;
+    vk_pipeline pipeline;
+    uint32_t split_k;
+};
 
-    const uint64_t ne00 = src0->ne[0];
+static vk_mm_plan ggml_vk_mul_mat_q_f16_plan(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+                                             bool disable_split_k, const ggml_tensor * row_ids) {
     const uint64_t ne01 = src0->ne[1];
-    const uint64_t ne02 = src0->ne[2];
-    const uint64_t ne03 = src0->ne[3];
-
     const uint64_t ne10 = src1->ne[0];
     const uint64_t ne11 = src1->ne[1];
-    const uint64_t ne12 = src1->ne[2];
-    const uint64_t ne13 = src1->ne[3];
-
-    const uint64_t ne21 = dst->ne[1];
-    const uint32_t stride_d = dst->nb[1] / ggml_type_size(dst->type);
-    const uint32_t stride_batch_d = stride_d*ne21;
-
-    const uint64_t r2 = ne12 / ne02;
-    const uint64_t r3 = ne13 / ne03;
-
-    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
-    ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
-    ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
-
-    vk_buffer d_Qx = nullptr;
-    size_t qx_buf_offset = 0;
-    vk_buffer d_Qy = nullptr;
-    size_t qy_buf_offset = 0;
-
-    bool src0_uma = false;
-    bool src1_uma = false;
-
-    if (ctx->device->uma) {
-        ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
-        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
-        src0_uma = d_Qx != nullptr;
-        src1_uma = d_Qy != nullptr;
-    }
 
     // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
     const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
@@ -12130,9 +12116,6 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         mm_a = f16_type; mm_b = y_f32_kernel ? GGML_TYPE_F32 : f16_type;
         mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, mm_a, mm_b, prec);
     }
-    if (f32acc_excl) {
-        ggml_vk_f32acc_excluded_note(src0, mmp, ggml_vk_get_mul_mat_mat_pipeline(ctx, mm_a, mm_b, GGML_PREC_F32));
-    }
 
     // Not implemented
     GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
@@ -12156,12 +12139,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
 
-    // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
-    uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) : ne11;
-    const uint64_t x_ne = ggml_nelements(src0);
-    // 128 elements per Q8_1 x4 block
-    const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
-    const uint64_t d_ne = ggml_nelements(dst);
+    const vk_pipeline base_pipeline = pipeline;   // padded_n is sized by the base (pre-twin) pipeline
 
     const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
 
@@ -12227,6 +12205,106 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             }
         }
     }
+
+
+    vk_mm_plan plan;
+    plan.x_non_contig = x_non_contig;
+    plan.y_non_contig = y_non_contig;
+    plan.f16_type = f16_type;
+    plan.y_f32_kernel = y_f32_kernel;
+    plan.quantize_y = quantize_y;
+    plan.f32acc_excl = f32acc_excl;
+    plan.prec = prec;
+    plan.mmp = mmp;
+    plan.mm_a = mm_a;
+    plan.mm_b = mm_b;
+    plan.qx_needs_dequant = qx_needs_dequant;
+    plan.qy_needs_dequant = qy_needs_dequant;
+    plan.effective_src1_type = effective_src1_type;
+    plan.kpad = kpad;
+    plan.aligned = aligned;
+    plan.base_pipeline = base_pipeline;
+    plan.pipeline = pipeline;
+    plan.split_k = split_k;
+    return plan;
+}
+
+static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k,
+                                  const ggml_tensor * row_ids = nullptr, uint64_t row_ids_a_bytes = 0) {
+    VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
+    std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
+    std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
+    std::cerr << "))");
+    GGML_ASSERT(ggml_vk_dim01_contiguous(src0) || src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);  // NOLINT
+    GGML_ASSERT(ggml_vk_dim01_contiguous(src1) || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);  // NOLINT
+
+    const uint64_t ne00 = src0->ne[0];
+    const uint64_t ne01 = src0->ne[1];
+    const uint64_t ne02 = src0->ne[2];
+    const uint64_t ne03 = src0->ne[3];
+
+    const uint64_t ne10 = src1->ne[0];
+    const uint64_t ne11 = src1->ne[1];
+    const uint64_t ne12 = src1->ne[2];
+    const uint64_t ne13 = src1->ne[3];
+
+    const uint64_t ne21 = dst->ne[1];
+    const uint32_t stride_d = dst->nb[1] / ggml_type_size(dst->type);
+    const uint32_t stride_batch_d = stride_d*ne21;
+
+    const uint64_t r2 = ne12 / ne02;
+    const uint64_t r3 = ne13 / ne03;
+
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
+    ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
+
+    vk_buffer d_Qx = nullptr;
+    size_t qx_buf_offset = 0;
+    vk_buffer d_Qy = nullptr;
+    size_t qy_buf_offset = 0;
+
+    bool src0_uma = false;
+    bool src1_uma = false;
+
+    if (ctx->device->uma) {
+        ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
+        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
+        src0_uma = d_Qx != nullptr;
+        src1_uma = d_Qy != nullptr;
+    }
+
+    // [TAG_MM_PLAN] the plan (ggml_vk_mul_mat_q_f16_plan), unchanged locals below
+    const vk_mm_plan mm_plan = ggml_vk_mul_mat_q_f16_plan(ctx, src0, src1, dst, disable_split_k, row_ids);
+    const bool x_non_contig = mm_plan.x_non_contig;
+    const bool y_non_contig = mm_plan.y_non_contig;
+    const ggml_type f16_type = mm_plan.f16_type;
+    const bool y_f32_kernel = mm_plan.y_f32_kernel;
+    const bool quantize_y = mm_plan.quantize_y;
+    const bool f32acc_excl = mm_plan.f32acc_excl;
+    const ggml_prec prec = mm_plan.prec;
+    vk_matmul_pipeline mmp = mm_plan.mmp;
+    ggml_type mm_a = mm_plan.mm_a;
+    ggml_type mm_b = mm_plan.mm_b;
+    const bool qx_needs_dequant = mm_plan.qx_needs_dequant;
+    const bool qy_needs_dequant = mm_plan.qy_needs_dequant;
+    const ggml_type effective_src1_type = mm_plan.effective_src1_type;
+    const uint32_t kpad = mm_plan.kpad;
+    const bool aligned = mm_plan.aligned;
+    const vk_pipeline base_pipeline = mm_plan.base_pipeline;
+    vk_pipeline pipeline = mm_plan.pipeline;
+    const uint32_t split_k = mm_plan.split_k;
+    GGML_UNUSED(f16_type); GGML_UNUSED(y_f32_kernel); GGML_UNUSED(prec); GGML_UNUSED(effective_src1_type); GGML_UNUSED(kpad); GGML_UNUSED(aligned);
+    if (f32acc_excl) {
+        ggml_vk_f32acc_excluded_note(src0, mmp, ggml_vk_get_mul_mat_mat_pipeline(ctx, mm_a, mm_b, GGML_PREC_F32));
+    }
+
+    // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
+    uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, base_pipeline->wg_denoms[1]) : ne11;
+    const uint64_t x_ne = ggml_nelements(src0);
+    // 128 elements per Q8_1 x4 block
+    const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
+    const uint64_t d_ne = ggml_nelements(dst);
 
     // [TAG_QSA_POOL_REMAP] with row ids A is bound whole: the store, not M rows of it
     const uint64_t qx_sz = row_ids ? row_ids_a_bytes : ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
@@ -25957,6 +26035,105 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static bool ggml_backend_vk_dev_mat_vec_m_invariant(ggml_backend_dev_t dev);   // [TAG_MM_PLAN] defined below (TAG_MERGE_ROWS)
+
+// [TAG_MM_PLAN] the plan ggml_vk_mul_mat would make on `dev` for mul_mat(A [k, m] of `type`, contiguous, in a device buffer;
+// B f32 [k, n] contiguous, one batch; default precision): 0 = the mat-vec route (n <= mul_mat_vec_max_cols: one per-row
+// reduction whatever m is), 1 = the mat-mat route, *out = ggml_vk_mul_mat_q_f16_plan's answer (the dispatch's own function,
+// no second copy of the heuristics), -1 = not answered (not a Vulkan device, an A over maxStorageBufferRange = the M-split
+// route, bad arguments).
+static int ggml_vk_mm_plan_query(ggml_backend_dev_t dev, ggml_type type, int64_t m, int64_t n, int64_t k, vk_mm_plan * out) {
+    if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_vk_reg() || m <= 0 || n <= 0 || k <= 0 ||
+        type < 0 || type >= GGML_TYPE_COUNT || k % ggml_blck_size(type) != 0) {
+        return -1;
+    }
+    if (n <= (int64_t) mul_mat_vec_max_cols) {
+        return 0;   // ggml_vk_mul_mat: dst->ne[1] <= mul_mat_vec_max_cols on one batch -> ggml_vk_mul_mat_vec_q_f16
+    }
+    const ggml_backend_vk_device_context * dctx = (const ggml_backend_vk_device_context *) dev->context;
+    ggml_tensor a = {}, b = {}, d = {};
+    a.type = type; a.ne[0] = k; a.ne[1] = m; a.ne[2] = a.ne[3] = 1;
+    a.nb[0] = ggml_type_size(type); a.nb[1] = ggml_row_size(type, k); a.nb[2] = a.nb[3] = a.nb[1] * m;
+    b.type = GGML_TYPE_F32; b.ne[0] = k; b.ne[1] = n; b.ne[2] = b.ne[3] = 1;
+    b.nb[0] = sizeof(float); b.nb[1] = sizeof(float) * k; b.nb[2] = b.nb[3] = b.nb[1] * n;
+    d.type = GGML_TYPE_F32; d.op = GGML_OP_MUL_MAT; d.ne[0] = m; d.ne[1] = n; d.ne[2] = d.ne[3] = 1;
+    d.nb[0] = sizeof(float); d.nb[1] = sizeof(float) * m; d.nb[2] = d.nb[3] = d.nb[1] * n;
+    d.src[0] = &a; d.src[1] = &b;
+    ggml_backend_vk_context dry;   // the plan reads ctx->device only
+    dry.device = ggml_vk_get_device(dctx->device);
+    if (ggml_nbytes(&a) > dry.device->properties.limits.maxStorageBufferRange) {
+        return -1;
+    }
+    *out = ggml_vk_mul_mat_q_f16_plan(&dry, &a, &b, &d, false, nullptr);
+    return 1;
+}
+
+// [TAG_MM_PLAN] "ggml_backend_dev_mul_mat_plan": ggml_vk_mm_plan_query for other libraries. 1 fills *pipeline_id (the
+// pipeline object: equal ids = the same shader, tile and load variant), *name (for logs) and *split_k; 0 / -1 as above.
+static int ggml_backend_vk_dev_mul_mat_plan(ggml_backend_dev_t dev, ggml_type type, int64_t m, int64_t n, int64_t k,
+                                            const void ** pipeline_id, const char ** name, uint32_t * split_k) {
+    vk_mm_plan plan;
+    const int r = ggml_vk_mm_plan_query(dev, type, m, n, k, &plan);
+    if (r == 1) {
+        if (pipeline_id) { *pipeline_id = plan.pipeline.get(); }
+        if (name)        { *name = plan.pipeline ? plan.pipeline->name.c_str() : "?"; }
+        if (split_k)     { *split_k = plan.split_k; }
+    }
+    return r;
+}
+
+// [TAG_MM_PLAN] "ggml_backend_dev_mul_mat_rows_merge_exact": may mul_mat([a | b], x) replace mul_mat(a, x) and mul_mat(b, x)
+// bit for bit on `dev`? a = [k, m_a], b = [k, m_b], both of `type`, x f32 [k, n] (the qwen4exp load-time row merge,
+// TAG_MERGE_ROWS). 1 = yes, 0 = no; *why names the deciding fact. From the dispatch's own plan (ggml_vk_mm_plan_query):
+//   n <= mul_mat_vec_max_cols: the mat-vec route, exact where the per-row reduction is M-invariant (AMD + RADV, R146);
+//   else: the merged plan must be a's plan (same pipeline object = shader, tile, load variant; same split_k), split_k 1,
+//   and b's plan split_k 1 from the same matmul family (shader + accumulator, no conversion pass). Any split_k > 1
+//   refuses: b (m_b below the tile's BM) never splits, so a split merged GEMM sums b's rows in another K order (hand M71,
+//   n = 64 on the 780M). That the split_k 1 tile / load variants of one family keep the per-element K order (BK,
+//   fragments) is proven per device by test-qwen4exp-hc-merge-kproof, not assumed elsewhere.
+// GGML_VK_MM_MERGE_FORCE=1 (negative control only): 1 for every n > 8 - the K-proof must then catch a split_k shape.
+static int ggml_backend_vk_dev_mul_mat_rows_merge_exact(ggml_backend_dev_t dev, ggml_type type, int64_t m_a, int64_t m_b,
+                                                        int64_t n, int64_t k, char * why, size_t why_size) {
+    auto say = [&](int r, const char * fmt, auto... args) {
+        if (why && why_size) { snprintf(why, why_size, fmt, args...); }
+        return r;
+    };
+    static const bool force = [] { const char * e = getenv("GGML_VK_MM_MERGE_FORCE"); return e && atoi(e) != 0; }();
+    vk_mm_plan pa, pm, pb;
+    const int ra = ggml_vk_mm_plan_query(dev, type, m_a,       n, k, &pa);
+    const int rm = ggml_vk_mm_plan_query(dev, type, m_a + m_b, n, k, &pm);
+    const int rb = ggml_vk_mm_plan_query(dev, type, m_b,       n, k, &pb);
+    if (ra < 0 || rm < 0 || rb < 0) {
+        return say(0, "%s", "no plan");
+    }
+    if (ra == 0) {
+        return ggml_backend_vk_dev_mat_vec_m_invariant(dev) ? say(1, "mat-vec (n <= %u, M-invariant)", mul_mat_vec_max_cols)
+                                                            : say(0, "%s", "mat-vec, M-invariance not verified on this device");
+    }
+    const char * na = pa.pipeline ? pa.pipeline->name.c_str() : "?";
+    const char * nm = pm.pipeline ? pm.pipeline->name.c_str() : "?";
+    const char * nb = pb.pipeline ? pb.pipeline->name.c_str() : "?";
+    if (force) {
+        return say(1, "FORCED (GGML_VK_MM_MERGE_FORCE) merged %s split_k %u / a %s split_k %u / b %s split_k %u", nm, pm.split_k, na, pa.split_k, nb, pb.split_k);
+    }
+    if (pm.pipeline != pa.pipeline) {
+        return say(0, "tile: merged %s vs a %s", nm, na);
+    }
+    if (pm.split_k != pa.split_k) {
+        return say(0, "split_k: merged %u vs a %u", pm.split_k, pa.split_k);
+    }
+    if (pm.split_k != 1) {
+        return say(0, "split_k %u on %s (b %s split_k %u)", pm.split_k, nm, nb, pb.split_k);
+    }
+    if (pb.split_k != 1) {
+        return say(0, "b split_k %u on %s", pb.split_k, nb);
+    }
+    if (pm.mmp != pb.mmp || pm.quantize_y || pb.quantize_y || pm.qx_needs_dequant || pb.qx_needs_dequant || pm.qy_needs_dequant || pb.qy_needs_dequant) {
+        return say(0, "family: merged %s vs b %s", nm, nb);
+    }
+    return say(1, "same plan %s split_k 1, b %s split_k 1", nm, nb);
+}
+
 // [TAG_MERGE_ROWS] capability for the model code (qwen4exp load-time projection merges, contrib 0290): true where the
 // mat-vec dispatch (n <= mul_mat_vec_max_cols) of an M-row matrix is verified to compute each output row with the same
 // pipeline and the same per-row reduction whatever M is, so a [a | b] container gives bit-identical rows to a and b alone.
@@ -26005,6 +26182,12 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_fa_kv_ids") == 0) { // [TAG_QSA_INDEXED_FA] FLASH_ATTN_EXT reads src[5]
         return (void *) ggml_backend_vk_reg_get_proc_address;
+    }
+    if (strcmp(name, "ggml_backend_dev_mul_mat_plan") == 0) { // [TAG_MM_PLAN] int (*)(dev, type, m, n, k, const void **, const char **, uint32_t *)
+        return (void *) ggml_backend_vk_dev_mul_mat_plan;
+    }
+    if (strcmp(name, "ggml_backend_dev_mul_mat_rows_merge_exact") == 0) { // [TAG_MM_PLAN] int (*)(dev, type, m_a, m_b, n, k, char *, size_t)
+        return (void *) ggml_backend_vk_dev_mul_mat_rows_merge_exact;
     }
     if (strcmp(name, "ggml_backend_dev_mat_vec_m_invariant") == 0) { // [TAG_MERGE_ROWS] bool (*)(ggml_backend_dev_t)
         return (void *) ggml_backend_vk_dev_mat_vec_m_invariant;
