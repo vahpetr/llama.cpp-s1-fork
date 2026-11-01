@@ -3405,6 +3405,27 @@ void ggml_qsa_score_set_a_f16(
     score->src[4] = a16;
 }
 
+// [TAG_QSA_BIAS_FOLD] see ggml.h
+void ggml_qsa_score_set_bias_tables(
+        struct ggml_tensor * score,
+        struct ggml_tensor * blk,
+        struct ggml_tensor * qry,
+        struct ggml_tensor * rows) {
+    GGML_ASSERT(score->op == GGML_OP_QSA_SCORE && score->src[3] == NULL);
+    GGML_ASSERT(blk->type == GGML_TYPE_I32 && qry->type == GGML_TYPE_I32 && ggml_is_contiguous(blk) && ggml_is_contiguous(qry));
+    GGML_ASSERT(blk->ne[0] == 2 && blk->ne[1] == score->ne[0] && blk->ne[2] == score->ne[2] && blk->ne[3] == 1);
+    GGML_ASSERT(qry->ne[0] == 2 && qry->ne[2] == score->ne[2] && qry->ne[3] == 1);
+    if (rows != NULL) {
+        GGML_ASSERT(rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows));
+        GGML_ASSERT(rows->ne[0] == score->ne[1] && rows->ne[1] == score->ne[2] && rows->ne[2] == 1 && rows->ne[3] == 1);
+    } else {
+        GGML_ASSERT(qry->ne[1] == score->ne[1]);
+    }
+    score->src[5] = blk;
+    score->src[6] = qry;
+    score->src[7] = rows;
+}
+
 // ggml_mul_mat_id
 
 /*

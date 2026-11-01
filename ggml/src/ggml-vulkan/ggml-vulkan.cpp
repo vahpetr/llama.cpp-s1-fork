@@ -13248,13 +13248,29 @@ static bool ggml_vk_qsa_bias_folded_away(const ggml_backend_vk_context * ctx, co
     return found == uses;
 }
 
+// [TAG_QSA_BIAS_FOLD] the bias tables the epilogue reads (has_bias 2): the op's own src[5..7] (ggml_qsa_score_set_bias_tables,
+// the graph-side form: no plane exists, always folded) or the srcs of the QSA_BIAS node in src[3] (the backend-side form,
+// ggml_vk_qsa_score_bias_fold). false = no folded bias.
+static bool ggml_vk_qsa_score_tables(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, const ggml_tensor * t[3]) {
+    if (dst->src[5] != nullptr) {
+        t[0] = dst->src[5]; t[1] = dst->src[6]; t[2] = dst->src[7];
+        return true;
+    }
+    if (const ggml_tensor * bn = ggml_vk_qsa_score_bias_fold(ctx, dst)) {
+        t[0] = bn->src[0]; t[1] = bn->src[1]; t[2] = bn->src[2];
+        return true;
+    }
+    return false;
+}
+
 static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * a    = dst->src[0];
     const ggml_tensor * b    = dst->src[1];
     const ggml_tensor * rows = dst->src[2];
     const ggml_tensor * bias = dst->src[3];
-    // [TAG_QSA_BIAS_FOLD] the QSA_BIAS node whose value the epilogue computes (its plane is not read), or nullptr
-    const ggml_tensor * fold = ggml_vk_qsa_score_bias_fold(ctx, dst);
+    // [TAG_QSA_BIAS_FOLD] the tables whose bias the epilogue computes (no plane is read), when fold
+    const ggml_tensor * ft[3] = { nullptr, nullptr, nullptr };
+    const bool fold = ggml_vk_qsa_score_tables(ctx, dst, ft);
     // [TAG_QSA_POOLED_F16_MIRROR] the store's f16 mirror: the product reads it instead of converting `a` (same f16 values)
     const ggml_tensor * a16  = rows ? dst->src[4] : nullptr;
 
@@ -13288,9 +13304,9 @@ static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx,
     vk_subbuffer d_D  = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer d_ID = rows ? ggml_vk_tensor_subbuffer(ctx, rows) : d_D;
     vk_subbuffer d_B  = bias && !fold ? ggml_vk_tensor_subbuffer(ctx, bias) : d_D;
-    vk_subbuffer d_BK = fold ? ggml_vk_tensor_subbuffer(ctx, fold->src[0]) : d_D;
-    vk_subbuffer d_BQ = fold ? ggml_vk_tensor_subbuffer(ctx, fold->src[1]) : d_D;
-    vk_subbuffer d_BR = fold && fold->src[2] ? ggml_vk_tensor_subbuffer(ctx, fold->src[2]) : d_D;
+    vk_subbuffer d_BK = fold ? ggml_vk_tensor_subbuffer(ctx, ft[0]) : d_D;
+    vk_subbuffer d_BQ = fold ? ggml_vk_tensor_subbuffer(ctx, ft[1]) : d_D;
+    vk_subbuffer d_BR = fold && ft[2] ? ggml_vk_tensor_subbuffer(ctx, ft[2]) : d_D;
     // has_bias: 0 none, 1 the plane, 2 folded (+ the negative-control build's mutant in bits 8..)
     const uint32_t has_bias = fold ? (2u | (ctx->device->qsa_bias_fold_mutant << 8)) : (bias ? 1u : 0u);
 
@@ -13306,7 +13322,7 @@ static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx,
               n_b, n_b, 1, 1, N },
             n_head, has_bias,
             (uint32_t) (dst->nb[1]/sizeof(float)), (uint32_t) (dst->nb[2]/sizeof(float)),
-            fold ? (uint32_t) fold->src[1]->ne[1] : 0u, fold && fold->src[2] ? 1u : 0u,
+            fold ? (uint32_t) ft[1]->ne[1] : 0u, fold && ft[2] ? 1u : 0u,
         };
         if (kr) {
             // [TAG_QSA_SCORE_KREUSE] blocks_m * blocks_n workgroups in one row, key tile major (the shader derives ir, ic)
@@ -23691,8 +23707,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     ggml_vk_fusion_count_add(fusion_counts, "", "qsa_score_epilogue_bias");
                 }
                 // [TAG_QSA_BIAS_FOLD] qsa_bias_fold=<count>: those that compute the QSA_BIAS value in the epilogue
-                if (ggml_vk_qsa_score_bias_fold(ctx, cgraph->nodes[i])) {
+                const ggml_tensor * ft[3];
+                if (ggml_vk_qsa_score_tables(ctx, cgraph->nodes[i], ft)) {
                     ggml_vk_fusion_count_add(fusion_counts, "", "qsa_bias_fold");
+                    // qsa_bias_tables=<count>: of those, the graph-side form (no QSA_BIAS node, no plane allocated)
+                    if (cgraph->nodes[i]->src[5] != nullptr) {
+                        ggml_vk_fusion_count_add(fusion_counts, "", "qsa_bias_tables");
+                    }
                 }
                 // [TAG_QSA_SCORE_KREUSE] qsa_score_kreuse=<count>: those dispatched on the kr twin (key tile major, the pooled
                 // keys reused across the plane's N tiles); the dispatch's own plan, so the count is what ran. Not a fusion
@@ -25338,6 +25359,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (bias && (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias))) {
                     return false;
                 }
+                // [TAG_QSA_BIAS_FOLD] the bias tables (ggml_qsa_score_set_bias_tables): i32, contiguous, no plane besides
+                if (const ggml_tensor * tb = op->src[5]) {
+                    const ggml_tensor * tq = op->src[6];
+                    const ggml_tensor * tr = op->src[7];
+                    if (bias || !tq || tb->type != GGML_TYPE_I32 || tq->type != GGML_TYPE_I32 || !ggml_is_contiguous(tb) ||
+                        !ggml_is_contiguous(tq) || tb->ne[1] != op->ne[0] || tb->ne[2] != op->ne[2] || tq->ne[2] != op->ne[2] ||
+                        (tr && (tr->type != GGML_TYPE_I32 || !ggml_is_contiguous(tr) || tr->ne[0] != op->ne[1] || tr->ne[1] != op->ne[2]))) {
+                        return false;
+                    }
+                }
                 // [TAG_QSA_POOLED_F16_MIRROR] the f16 mirror hint: an f16 copy of the store, read by the f16-A twin
                 const ggml_tensor * a16 = op->src[4];
                 if (a16 && (!rows || a16->type != GGML_TYPE_F16 || !ggml_is_contiguous(a16) ||
@@ -26248,6 +26279,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                                           ggml_get_op_params_i32(tensor, 0));
             if (src_clone[4]) {
                 ggml_qsa_score_set_a_f16(tensor_clone, src_clone[4]);
+            }
+            if (src_clone[5]) { // [TAG_QSA_BIAS_FOLD] the graph-side table form
+                ggml_qsa_score_set_bias_tables(tensor_clone, src_clone[5], src_clone[6], src_clone[7]);
             }
         } else if (tensor->op == GGML_OP_SUB) {
             tensor_clone = ggml_sub(ggml_ctx, src_clone[0], src_clone[1]);

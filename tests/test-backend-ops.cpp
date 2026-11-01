@@ -8378,7 +8378,9 @@ struct test_mul_mat_rows : public test_case {
 //                    chunk rows, the SAME node feeds the chain's ADD (the plane is computed; the Vulkan op still folds it),
 //                    4 the chunk rows, the op is the node's only consumer and the chain reads a twin node (Vulkan skips
 //                    the op's node: its plane keeps the uniform junk of initialize_tensors - a stale plane read = FAIL),
-//                    5 as 4 with identity rows (rows == NULL, n_tps == N). GGML_TEST_QSA_SCORE_HASH=1 prints the 64-bit
+//                    5 as 4 with identity rows (rows == NULL, n_tps == N); 6 / 7 the graph-side form: no bias operand,
+//                    the tables on the op (ggml_qsa_score_set_bias_tables), chunk rows / identity rows, against the chain
+//                    over a QSA_BIAS node of the same tables. GGML_TEST_QSA_SCORE_HASH=1 prints the 64-bit
 //                    FNV-1a of the op's half (the biased score plane), the chain's half and the CPU op's half per case,
 //                    for cross-knob plane equality (GGML_VK_QSA_BIAS_FOLD=0 / 1). Shapes: ragged M (not a tile
 //                    multiple), every chunk width 1..128 (the widths the Vulkan op refuses - the mat-vec ones - report
@@ -8402,7 +8404,7 @@ struct test_qsa_score : public test_case {
         return exact ? "QSA_SCORE_EXACT" : "QSA_SCORE";
     }
 
-    int64_t n_tps() const { return bias == 5 ? N : (N >= 128 ? 2048 : N + 37); }   // the qry table's queries (bias >= 3)
+    int64_t n_tps() const { return (bias == 5 || bias == 7) ? N : (N >= 128 ? 2048 : N + 37); }   // the qry table's queries (bias >= 3)
 
     std::string vars() override {
         if (f16a || scale != 1.0f) {
@@ -8469,6 +8471,8 @@ struct test_qsa_score : public test_case {
 
     int64_t n_rows() const { return n_b*(M + M/8 + 1); }
 
+    ggml_tensor * tables[3] = { nullptr, nullptr, nullptr };
+
     ggml_tensor * chain(ggml_context * ctx, ggml_tensor * a, ggml_tensor * ids, ggml_tensor * b, ggml_tensor * bi) {
         ggml_tensor * score = ids ? ggml_mul_mat_rows(ctx, a, ids, b) : ggml_mul_mat(ctx, a, b);
         score = ggml_reshape_4d(ctx, score, M, n_head, N, n_b);
@@ -8504,20 +8508,26 @@ struct test_qsa_score : public test_case {
             ggml_tensor * qry = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 2, n_tps(), n_b);
             ggml_set_name(qry, "qsa_qry");
             ggml_tensor * brows = nullptr;
-            if (bias != 5) {
+            if (bias != 5 && bias != 7) {
                 brows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, N, n_b);
                 ggml_set_name(brows, "qsa_rows");
             }
-            bi = ggml_qsa_bias(ctx, blk, qry, brows);
-            ggml_set_name(bi, "bias_node");
+            if (bias <= 5) {
+                bi = ggml_qsa_bias(ctx, blk, qry, brows);
+                ggml_set_name(bi, "bias_node");
+            }
             bi_chain = bias == 3 ? bi : ggml_qsa_bias(ctx, blk, qry, brows);
             ggml_set_name(bi_chain, bias == 3 ? "bias_node" : "bias_node_chain");
+            tables[0] = blk; tables[1] = qry; tables[2] = brows;
         }
         if (bi_chain == nullptr) {
             bi_chain = bi;
         }
 
         ggml_tensor * op = ggml_qsa_score(ctx, a, ids, b, bi, n_head);
+        if (bias >= 6) {
+            ggml_qsa_score_set_bias_tables(op, tables[0], tables[1], tables[2]);
+        }
         if (f16a) {
             // the store's f16 mirror as qwen4exp writes it: set_rows of the f32 rows into an F16 store
             ggml_tensor * a16 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, K, n_rows());
@@ -13648,7 +13658,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // own node skipped over a stale plane (4), identity rows (5); both product forms, the f16 mirror, ragged M, widths,
     // two streams, head counts, and the deployed 262k / 1M pools (65536 / 262144 blocks) at the deployed chunk (C 128 of
     // an n_tps 2048 ubatch) and its tail
-    for (int bm : { 3, 4, 5 }) {
+    for (int bm : { 3, 4, 5, 6, 7 }) {
         for (bool r : { false, true }) {
             for (int64_t M : { 1, 17, 129, 1000 }) {
                 for (int64_t N : { 3, 4, 9, 37, 64, 127, 128 }) {
@@ -13668,7 +13678,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     for (int64_t M : { 65536, 262144 }) {
-        for (int bm : { 3, 4 }) {
+        for (int bm : { 3, 4, 6 }) {
             for (int64_t N : { 128, 5 }) {
                 test_cases.emplace_back(new test_qsa_score(128, M, N, 1, 4, true, bm, true, true));
                 test_cases.emplace_back(new test_qsa_score(128, M, N, 1, 4, true, bm, true, false));

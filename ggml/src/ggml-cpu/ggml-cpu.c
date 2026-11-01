@@ -1556,6 +1556,10 @@ static void ggml_compute_forward_qsa_score(
           struct ggml_tensor * b    = dst->src[1];
     const struct ggml_tensor * rows = dst->src[2];
     const struct ggml_tensor * bias = dst->src[3];
+    // [TAG_QSA_BIAS_FOLD] the bias as its tables (ggml_qsa_score_set_bias_tables): ggml_compute_forward_qsa_bias's value
+    const struct ggml_tensor * tblk = dst->src[5];
+    const struct ggml_tensor * tqry = dst->src[6];
+    const struct ggml_tensor * trow = dst->src[7];
 
     const int     n_head = ggml_get_op_params_i32(dst, 0);
     const int64_t K      = a->ne[0];
@@ -1638,6 +1642,18 @@ static void ggml_compute_forward_qsa_score(
         const float * p0 = plane + (size_t) M*(size_t) (s*N*n_head + t*n_head);
         float       * d  = (float *) ((char *) dst->data + t*dst->nb[1] + s*dst->nb[2]);
         const float * bi = bias ? (const float *) ((const char *) bias->data + t*bias->nb[1] + s*bias->nb[2]) : NULL;
+        int32_t         ttail = 0;
+        uint32_t        tbit  = 0;
+        const int32_t * tbe   = NULL;
+        if (tblk) {
+            const int64_t n_tps = tqry->ne[1];
+            const int64_t q     = trow ? (int64_t) ((const int32_t *) trow->data)[s*N + t] : t;
+            GGML_ASSERT(q >= 0 && q < n_tps);
+            const int32_t * qe = (const int32_t *) tqry->data + 2*(s*n_tps + q);
+            ttail = qe[0];
+            tbit  = (uint32_t) qe[1];
+            tbe   = (const int32_t *) tblk->data + 2*s*M;
+        }
         for (int64_t m = 0; m < M; ++m) {
             float sum = (p0[m] > 0.f) ? p0[m] : 0.f;
             for (int h = 1; h < n_head; ++h) {
@@ -1646,6 +1662,10 @@ static void ggml_compute_forward_qsa_score(
             }
             if (bi) {
                 sum = sum + *(const float *) ((const char *) bi + m*bias->nb[0]);
+            } else if (tbe) {
+                const int32_t  key = tbe[2*m + 0];
+                const uint32_t vis = (uint32_t) tbe[2*m + 1];
+                sum = sum + ((vis & tbit) == 0 ? -INFINITY : (key >= ttail ? 1e9f : 0.0f));
             }
             *(float *) ((char *) d + m*dst->nb[0]) = sum;
         }

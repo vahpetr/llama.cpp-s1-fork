@@ -1508,6 +1508,17 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * a16);
 
+    // [TAG_QSA_BIAS_FOLD] the compact per-block bias as the op's own operands (bias == NULL): src[5] blk [2, M, n_b] I32
+    // (key, vis), src[6] qry [2, n_tps, n_b] I32 (tail, bit), src[7] rows [N, n_b] I32 or NULL (identity, N == n_tps) -
+    // the srcs of a ggml_qsa_bias(blk, qry, rows). The result equals ggml_qsa_score(..., ggml_qsa_bias(blk, qry, rows), ...)
+    // bit for bit: the bias value is (vis & bit) == 0 ? -inf : (key >= tail ? 1e9f : +0.0f), q = rows[t, s] or t, added
+    // last as before. No [M, N, n_b] plane exists (qwen4exp, GGML_VK_QSA_BIAS_FOLD).
+    GGML_API void ggml_qsa_score_set_bias_tables(
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blk,
+            struct ggml_tensor  * qry,
+            struct ggml_tensor  * rows);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

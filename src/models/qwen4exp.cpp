@@ -2493,13 +2493,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         return nullptr;
     }
 
+    // [TAG_QSA_COMPACT_BIAS] (QSA_BIAS node) [TAG_QSA_BIAS_FOLD] build_qsa_select places it in the graph (before the score
+    // chain, as this caller did) unless the score takes its tables and the node is not needed at all
     ggml_tensor * bias = inp->bias_rows(ctx0, nullptr);
-    if (inp->compact) {
-        // [TAG_QSA_COMPACT_BIAS] place the QSA_BIAS node before the score chain, where the plane (a leaf) used to be
-        // available: expanded later, as src[1] of the bias ADD, it would sit between the head-sum ADDs and that ADD
-        // and split the chain the Vulkan multi_add fusion folds (the chunked path keeps its old get_rows position)
-        ggml_build_forward_expand(gf, bias);
-    }
 
     return build_qsa_select(inp, pooled, q, bias, kq_mask, width, blk_bias, il, pool_store, pool_remap, vis_cells, vis_toks,
             pool_store16);
@@ -2564,9 +2560,43 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
     ggml_tensor * score  = nullptr;
     bool          biased = false;
 
+    // [TAG_QSA_BIAS_FOLD] GGML_VK_QSA_BIAS_FOLD (default 1 = on; 0 = off; the backend's ggml_vk_env_bool reading: unset
+    // or empty = on): a QSA_BIAS bias goes into the score as its tables (ggml_qsa_score_set_bias_tables) - the QSA_BIAS
+    // node is then referenced by nothing, never enters the graph and gets no [n_blocks, np, n_stream] allocation. Where
+    // the backend refuses that form, the node stays and a folding backend computes it from the node's srcs (below).
+    static const bool bias_fold = [] {
+        const char * e = getenv("GGML_VK_QSA_BIAS_FOLD");
+        return e == nullptr || e[0] == '\0' || atoi(e) != 0;
+    }();
+    bool bias_tables = false;
+
     // [TAG_QSA_SCORE_EPILOGUE] the whole chain below as one node, where the backend takes it (bias folded unless the score
     // capture needs the pre-bias plane)
     if (qwen4exp_qsa_score_epilogue()) {
+        const bool fold_bias = blk_bias && !qwen4exp_qsa_dump_score();
+        if (fold_bias && bias_fold && bias != nullptr && bias->op == GGML_OP_QSA_BIAS && sched != nullptr) {
+            ggml_tensor * ft = ggml_qsa_score(ctx0, pooled ? pooled : pool_store, pooled ? nullptr : pool_remap, q,
+                    nullptr, (int) n_idx_h);
+            if (pool_store16 != nullptr && !pooled) {
+                ggml_qsa_score_set_a_f16(ft, pool_store16);
+            }
+            ggml_qsa_score_set_bias_tables(ft, bias->src[0], bias->src[1], bias->src[2]);
+            if (ggml_backend_supports_op(ggml_backend_sched_get_backend(sched, 0), ft)) {
+                score       = ft;
+                biased      = true;
+                bias_tables = true;
+            }
+        }
+    }
+    if (!bias_tables && bias != nullptr && bias->op == GGML_OP_QSA_BIAS && bias->src[2] == nullptr) {
+        // [TAG_QSA_COMPACT_BIAS] the whole-ubatch QSA_BIAS (build_qsa_top_k's): placed before the score chain, where the
+        // plane (a leaf) used to be available - expanded later, as src[1] of the bias ADD, it would sit between the
+        // head-sum ADDs and that ADD and split the chain the Vulkan multi_add fusion folds (the chunked path's rows form
+        // keeps its old position). Was done by the caller for every compact bias; here so the table form can leave it out.
+        ggml_build_forward_expand(gf, bias);
+    }
+
+    if (score == nullptr && qwen4exp_qsa_score_epilogue()) {
         const bool fold_bias = blk_bias && !qwen4exp_qsa_dump_score();
         ggml_tensor * fused = ggml_qsa_score(ctx0, pooled ? pooled : pool_store, pooled ? nullptr : pool_remap, q,
                 fold_bias ? bias : nullptr, (int) n_idx_h);
@@ -2585,11 +2615,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
         // storage to a node scheduled between the QSA_BIAS node (their last graph consumer) and the score. Keep the
         // gallocr-owned ones (the chunk rows; qry is a scheduler input copy and blk a view of the store, both never
         // reused) for the whole graph: a few hundred bytes per chunk. Off = the graph and its allocation unchanged.
-        static const bool bias_fold = [] {
-            const char * e = getenv("GGML_VK_QSA_BIAS_FOLD");
-            // the backend's ggml_vk_env_bool reading: unset or empty = on
-            return e == nullptr || e[0] == '\0' || atoi(e) != 0;
-        }();
         if (score == fused && biased && bias_fold && bias->op == GGML_OP_QSA_BIAS) {
             for (int k = 0; k < 3; ++k) {
                 if (bias->src[k] != nullptr) {
