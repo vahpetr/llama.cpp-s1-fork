@@ -1374,6 +1374,10 @@ struct vk_device_struct {
     // count limit (maxComputeWorkGroupCount[0], or the smaller GGML_VK_QSA_SCORE_KREUSE_MAX_WG test hook)
     bool     qsa_score_kreuse;
     uint32_t qsa_score_kreuse_max_wg;
+    // [TAG_QSA_BIAS_FOLD] GGML_VK_QSA_BIAS_FOLD (default on; 0 = the QSA_BIAS node runs and QSA_SCORE reads its plane);
+    // the negative-control build's mutant (GGML_VK_QSA_BIAS_FOLD_MUTANT, 0 elsewhere)
+    bool     qsa_bias_fold;
+    uint32_t qsa_bias_fold_mutant;
     // [TAG_MMID_PRECAST_B] GGML_VK_MMID_PRECAST_B (default on)
     bool mmid_precast_b;
     // [TAG_MMID_TILE_G2A] / [TAG_MM_WARPTILE_EXT] once-per-device flags, set with exchange() (ggml_vk_load_shaders runs per lazily requested pipeline)
@@ -1576,6 +1580,7 @@ struct vk_mat_mat_qsa_push_constants {
     vk_mat_mat_push_constants mm;
     uint32_t n_head; uint32_t has_bias;
     uint32_t stride_o; uint32_t batch_stride_o;
+    uint32_t bias_n_tps; uint32_t bias_has_rows;   // [TAG_QSA_BIAS_FOLD] has_bias == 2 only
 };
 static_assert(std::is_standard_layout_v<vk_mat_mat_qsa_push_constants>);
 static_assert(offsetof(vk_mat_mat_qsa_push_constants, n_head) == sizeof(vk_mat_mat_push_constants));
@@ -6539,12 +6544,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_rows, matmul_f32_f32_rows, , wg_denoms, warptile, vk_mat_mat_push_constants, 4, ); // [TAG_QSA_POOL_REMAP]
-        // [TAG_QSA_SCORE_EPILOGUE] same slots / tiles / spec constants as the two above; bindings A, B, D, row ids, bias
-        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_qsa, matmul_f32_f32_qsa, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
-        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_rows_qsa, matmul_f32_f32_rows_qsa, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
+        // [TAG_QSA_SCORE_EPILOGUE] same slots / tiles / spec constants as the two above; bindings A, B, D, row ids, bias,
+        // [TAG_QSA_BIAS_FOLD] blk, qry, bias rows
+        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_qsa, matmul_f32_f32_qsa, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 8, );
+        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_rows_qsa, matmul_f32_f32_rows_qsa, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 8, );
         // [TAG_QSA_POOLED_F16_MIRROR] created under the F32 availability flags (mul_mat_{s,m,l}[F32]): it is selected for
         // the slot the F32 plan picks, never by an f16 plan
-        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f16_f32_rows_qsa, matmul_f16_f32_rows_qsa, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
+        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f16_f32_rows_qsa, matmul_f16_f32_rows_qsa, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 8, );
         // [TAG_QSA_SCORE_KREUSE] the same three twins, workgroups numbered M tile major (same flags, slots, tiles, spec and
         // push constants); not created with the knob off. The shader decodes (ir, ic) from x with its spec-constant BM / BN,
         // the host builds x from wg_denoms: a tile table whose two sides disagree leaves the twins uncreated (fail closed)
@@ -6555,9 +6561,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             GGML_LOG_WARN("ggml_vulkan: qsa_score_kreuse: the f32 tile table's BM/BN differ from its wg_denoms - kr twins not created\n");
         }
         if (device->qsa_score_kreuse && kr_tiles_agree) {
-            CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_qsa_kr, matmul_f32_f32_qsa_kr, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
-            CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_rows_qsa_kr, matmul_f32_f32_rows_qsa_kr, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
-            CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f16_f32_rows_qsa_kr, matmul_f16_f32_rows_qsa_kr, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 5, );
+            CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_qsa_kr, matmul_f32_f32_qsa_kr, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 8, );
+            CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_rows_qsa_kr, matmul_f32_f32_rows_qsa_kr, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 8, );
+            CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f16_f32_rows_qsa_kr, matmul_f16_f32_rows_qsa_kr, , wg_denoms, warptile, vk_mat_mat_qsa_push_constants, 8, );
         }
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_f16, matmul_f32_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
@@ -9429,6 +9435,16 @@ static vk_device ggml_vk_get_device(size_t idx) {
             }
         }
 
+        // [TAG_QSA_BIAS_FOLD] a QSA_SCORE whose bias is a QSA_BIAS node computes that bias in its epilogue from the node's
+        // tables, and the QSA_BIAS node is not run when every one of its consumers is such a score
+        device->qsa_bias_fold = ggml_vk_env_bool("GGML_VK_QSA_BIAS_FOLD", true);
+        device->qsa_bias_fold_mutant = 0;
+#ifdef GGML_VULKAN_QSA_BIAS_FOLD_NEGCTL
+        if (const char * m = getenv("GGML_VK_QSA_BIAS_FOLD_MUTANT")) {
+            device->qsa_bias_fold_mutant = (uint32_t) std::min(std::max(atoi(m), 0), 3);
+        }
+#endif
+
         ggml_vk_load_shaders(device);
 
         // [TAG_VK_BUFFER_ALIGN] the proof line (WARN: the server drops ggml INFO lines)
@@ -9467,6 +9483,15 @@ static vk_device ggml_vk_get_device(size_t idx) {
             GGML_LOG_WARN("ggml_vulkan: qsa_score_kreuse: %s (GGML_VK_QSA_SCORE_KREUSE; QSA_SCORE planes of >= 2 N tiles dispatched "
                           "key tile major; max %u workgroups)%s\n", device->qsa_score_kreuse ? "on" : "off",
                           device->qsa_score_kreuse_max_wg, negctl);
+            // [TAG_QSA_BIAS_FOLD] the proof line
+#ifdef GGML_VULKAN_QSA_BIAS_FOLD_NEGCTL
+            const char * fold_negctl = " NEGATIVE-CONTROL BUILD";
+#else
+            const char * fold_negctl = "";
+#endif
+            GGML_LOG_WARN("ggml_vulkan: qsa_bias_fold: %s (GGML_VK_QSA_BIAS_FOLD; the QSA_BIAS bias of a QSA_SCORE computed in the "
+                          "score epilogue, the QSA_BIAS node skipped)%s mutant %u\n", device->qsa_bias_fold ? "on" : "off",
+                          fold_negctl, device->qsa_bias_fold_mutant);
         }
 
 #ifdef GGML_VULKAN_MMID_SKIP_NEGCTL
@@ -13159,11 +13184,77 @@ static vk_qsa_score_plan ggml_vk_qsa_score_plan(ggml_backend_vk_context * ctx, c
     return plan;
 }
 
+static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer);
+
+// [TAG_QSA_BIAS_FOLD] the QSA_BIAS node a QSA_SCORE folds into its epilogue (has_bias 2), or nullptr (has_bias 0 / 1: no
+// bias, or the bias plane is read). Folded when the knob is on, the bias is a GGML_OP_QSA_BIAS node of exactly the score's
+// [M, N, n_b] shape over a block table of M blocks and n_b streams, and every table it reads lives in a Vulkan buffer.
+// The ONE predicate behind the dispatch, the barrier tracking of the tables and the skip of the QSA_BIAS node
+// (ggml_vk_qsa_bias_folded_away), so the three cannot disagree.
+static const ggml_tensor * ggml_vk_qsa_score_bias_fold(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+    const ggml_tensor * bias = dst->src[3];
+    if (!ctx->device->qsa_bias_fold || dst->op != GGML_OP_QSA_SCORE || bias == nullptr || bias->op != GGML_OP_QSA_BIAS) {
+        return nullptr;
+    }
+    const ggml_tensor * blk  = bias->src[0];
+    const ggml_tensor * qry  = bias->src[1];
+    const ggml_tensor * brow = bias->src[2];
+    if (bias->ne[0] != dst->ne[0] || bias->ne[1] != dst->ne[1] || bias->ne[2] != dst->ne[2] ||
+        blk->ne[1] != dst->ne[0] || blk->ne[2] != dst->ne[2] || qry->ne[2] != dst->ne[2] ||
+        (brow != nullptr && (brow->ne[0] != dst->ne[1] || brow->ne[1] != dst->ne[2]))) {
+        return nullptr;
+    }
+    for (const ggml_tensor * t : { blk, qry, brow }) {
+        if (t != nullptr && (t->buffer == nullptr || !ggml_backend_buffer_is_vk(t->buffer))) {
+            return nullptr;
+        }
+    }
+    return bias;
+}
+
+// [TAG_QSA_BIAS_FOLD] the k-th table (0 blk, 1 qry, 2 rows) a folding QSA_SCORE reads besides its srcs, or nullptr: the
+// barrier tracking of ggml_vk_build_graph checks and records these as reads of the node
+static const ggml_tensor * ggml_vk_qsa_fold_src(const ggml_backend_vk_context * ctx, const ggml_tensor * node, int k) {
+    const ggml_tensor * bias = node->op == GGML_OP_QSA_SCORE ? ggml_vk_qsa_score_bias_fold(ctx, node) : nullptr;
+    return bias ? bias->src[k] : nullptr;
+}
+
+// [TAG_QSA_BIAS_FOLD] true when the QSA_BIAS node at node_idx need not run: the knob on, not a graph output, and every one
+// of its uses (ggml_node_get_use_count) found among the later nodes of THIS graph as src[3] of a QSA_SCORE that folds it.
+// A use anywhere else (an ADD, a view, a node of another split or backend, the eval callback's subgraph cut) fails closed:
+// the node runs and writes its plane as before.
+static bool ggml_vk_qsa_bias_folded_away(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * node = cgraph->nodes[node_idx];
+    if (!ctx->device->qsa_bias_fold || node->op != GGML_OP_QSA_BIAS || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const int32_t uses = ggml_node_get_use_count(cgraph, node_idx);
+    if (uses <= 0) {
+        return false;
+    }
+    int32_t found = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && found < uses; j++) {
+        const ggml_tensor * c = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            if (c->src[k] != node) {
+                continue;
+            }
+            if (k != 3 || ggml_vk_qsa_score_bias_fold(ctx, c) != node) {
+                return false;
+            }
+            found++;
+        }
+    }
+    return found == uses;
+}
+
 static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * a    = dst->src[0];
     const ggml_tensor * b    = dst->src[1];
     const ggml_tensor * rows = dst->src[2];
     const ggml_tensor * bias = dst->src[3];
+    // [TAG_QSA_BIAS_FOLD] the QSA_BIAS node whose value the epilogue computes (its plane is not read), or nullptr
+    const ggml_tensor * fold = ggml_vk_qsa_score_bias_fold(ctx, dst);
     // [TAG_QSA_POOLED_F16_MIRROR] the store's f16 mirror: the product reads it instead of converting `a` (same f16 values)
     const ggml_tensor * a16  = rows ? dst->src[4] : nullptr;
 
@@ -13196,7 +13287,12 @@ static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx,
     vk_subbuffer d_Y  = ggml_vk_tensor_subbuffer(ctx, b);
     vk_subbuffer d_D  = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer d_ID = rows ? ggml_vk_tensor_subbuffer(ctx, rows) : d_D;
-    vk_subbuffer d_B  = bias ? ggml_vk_tensor_subbuffer(ctx, bias) : d_D;
+    vk_subbuffer d_B  = bias && !fold ? ggml_vk_tensor_subbuffer(ctx, bias) : d_D;
+    vk_subbuffer d_BK = fold ? ggml_vk_tensor_subbuffer(ctx, fold->src[0]) : d_D;
+    vk_subbuffer d_BQ = fold ? ggml_vk_tensor_subbuffer(ctx, fold->src[1]) : d_D;
+    vk_subbuffer d_BR = fold && fold->src[2] ? ggml_vk_tensor_subbuffer(ctx, fold->src[2]) : d_D;
+    // has_bias: 0 none, 1 the plane, 2 folded (+ the negative-control build's mutant in bits 8..)
+    const uint32_t has_bias = fold ? (2u | (ctx->device->qsa_bias_fold_mutant << 8)) : (bias ? 1u : 0u);
 
     const uint32_t max_z = ctx->device->properties.limits.maxComputeWorkGroupCount[2];
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(n_b, max_z));
@@ -13208,15 +13304,16 @@ static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx,
         const vk_mat_mat_qsa_push_constants pc = {
             { M, N, K, K, K, stride_d, stride_batch_x, stride_batch_y, stride_batch_d, base_work_group_z, n_b, K,
               n_b, n_b, 1, 1, N },
-            n_head, bias ? 1u : 0u,
+            n_head, has_bias,
             (uint32_t) (dst->nb[1]/sizeof(float)), (uint32_t) (dst->nb[2]/sizeof(float)),
+            fold ? (uint32_t) fold->src[1]->ne[1] : 0u, fold && fold->src[2] ? 1u : 0u,
         };
         if (kr) {
             // [TAG_QSA_SCORE_KREUSE] blocks_m * blocks_n workgroups in one row, key tile major (the shader derives ir, ic)
-            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_X, d_Y, d_D, d_ID, d_B }, pc,
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_X, d_Y, d_D, d_ID, d_B, d_BK, d_BQ, d_BR }, pc,
                                       { plan.blocks_m*plan.blocks_n*pipeline->wg_denoms[0], pipeline->wg_denoms[1], groups_z });
         } else {
-            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_X, d_Y, d_D, d_ID, d_B }, pc, { M, N, groups_z });
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_X, d_Y, d_D, d_ID, d_B, d_BK, d_BQ, d_BR }, pc, { M, N, groups_z });
         }
         base_work_group_z += groups_z;
     }
@@ -20222,6 +20319,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
         return false;
     }
+    // [TAG_QSA_BIAS_FOLD] every consumer computes this bias itself: the plane is never written (nor read)
+    if (node->op == GGML_OP_QSA_BIAS && ggml_vk_qsa_bias_folded_away(ctx, cgraph, node_idx)) {
+        return false;
+    }
 
     VK_LOG_DEBUG("ggml_vk_build_graph(" << node << ", " << ggml_op_name(node->op) << ")");
     ctx->semaphore_idx = 0;
@@ -20315,6 +20416,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                     break;
                 }
             }
+            // [TAG_QSA_BIAS_FOLD] the tables a folding QSA_SCORE reads besides its srcs
+            for (int k = 0; k < 3 && !need_sync; ++k) {
+                const ggml_tensor * fs = ggml_vk_qsa_fold_src(ctx, cur_node, k);
+                if (fs && overlaps_unsynced(fs, ctx->unsynced_nodes_written)) {
+                    need_sync = true;
+                }
+            }
+            if (need_sync) {
+                break;
+            }
             // A source the node writes through (ggml_gated_delta_net_ext) also conflicts with earlier reads.
             const ggml_tensor * mut = ggml_vk_mutated_src(cur_node);
             if (mut && overlaps_unsynced(mut, ctx->unsynced_nodes_read)) {
@@ -20354,6 +20465,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                     continue;
                 }
                 ctx->unsynced_nodes_read.push_back(cur_node->src[j]);
+            }
+            for (int k = 0; k < 3; ++k) {
+                if (const ggml_tensor * fs = ggml_vk_qsa_fold_src(ctx, cur_node, k)) {
+                    ctx->unsynced_nodes_read.push_back(fs);
+                }
             }
             if (const ggml_tensor * mut = ggml_vk_mutated_src(cur_node)) {
                 ctx->unsynced_nodes_written.push_back(mut);
@@ -23574,12 +23690,20 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 if (cgraph->nodes[i]->src[3]) {
                     ggml_vk_fusion_count_add(fusion_counts, "", "qsa_score_epilogue_bias");
                 }
+                // [TAG_QSA_BIAS_FOLD] qsa_bias_fold=<count>: those that compute the QSA_BIAS value in the epilogue
+                if (ggml_vk_qsa_score_bias_fold(ctx, cgraph->nodes[i])) {
+                    ggml_vk_fusion_count_add(fusion_counts, "", "qsa_bias_fold");
+                }
                 // [TAG_QSA_SCORE_KREUSE] qsa_score_kreuse=<count>: those dispatched on the kr twin (key tile major, the pooled
                 // keys reused across the plane's N tiles); the dispatch's own plan, so the count is what ran. Not a fusion
                 // pattern: one node.
                 if (ggml_vk_qsa_score_plan(ctx, cgraph->nodes[i]).kr) {
                     ggml_vk_fusion_count_add(fusion_counts, "", "qsa_score_kreuse");
                 }
+            }
+            // [TAG_QSA_BIAS_FOLD] qsa_bias_skip=<count>: QSA_BIAS nodes not run (every consumer folds them)
+            if (cgraph->nodes[i]->op == GGML_OP_QSA_BIAS && ggml_vk_qsa_bias_folded_away(ctx, cgraph, i)) {
+                ggml_vk_fusion_count_add(fusion_counts, "", "qsa_bias_skip");
             }
 
             // mmid_mul_nofuse:<reason>=count - why the expert-weight multiply stayed unfused at this

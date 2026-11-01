@@ -94,6 +94,16 @@ layout (binding = 3) readonly buffer ROW_IDS {int data_row_ids[];};
 // inside one TN-wide fragment (TN % n_head == 0, fragment columns start at multiples of TN), so it is subgroup-local.
 // Binding 4 is the bias (aliased to D and never read when qsa_has_bias == 0).
 layout (binding = 4) readonly buffer QSA_BIAS {float data_qsa_bias[];};
+// [TAG_QSA_BIAS_FOLD] qsa_has_bias == 2: the bias operand is a GGML_OP_QSA_BIAS node that was never run; its value is
+// computed here from that node's own srcs, exactly as qsa_bias.comp would have written it - blk [2, M, n_b] (key, vis)
+// at binding 5, qry [2, qsa_bias_n_tps, n_b] (tail, bit) at binding 6, rows [N/n_head, n_b] at binding 7 when
+// qsa_bias_has_rows (identity otherwise):
+//   bias[m, t, s] = (vis & bit) == 0 ? -inf : (key >= tail ? 1e9 : +0.0),   q = rows[t, s] or t,   q >= n_tps: -inf
+// The three values are the same bit patterns qsa_bias.comp stores, added by the same single f32 add below, so the
+// result is bit-identical to qsa_has_bias == 1 over the materialised plane. Bindings 5..7 alias D otherwise.
+layout (binding = 5) readonly buffer QSA_BLK  {int data_qsa_blk[];};
+layout (binding = 6) readonly buffer QSA_QRY  {int data_qsa_qry[];};
+layout (binding = 7) readonly buffer QSA_BROW {int data_qsa_brow[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -133,6 +143,8 @@ layout (push_constant) uniform parameter
     uint qsa_has_bias;
     uint qsa_stride_o;        // the result's row stride (elements): t
     uint qsa_batch_stride_o;  // the result's batch stride (elements): b
+    uint qsa_bias_n_tps;      // [TAG_QSA_BIAS_FOLD] qry->ne[1] (qsa_has_bias == 2)
+    uint qsa_bias_has_rows;   // [TAG_QSA_BIAS_FOLD] binding 7 holds the query rows (qsa_has_bias == 2)
 #endif
 #endif
 } p;
@@ -700,8 +712,38 @@ void main() {
                                 sum += max(float(coopmat_stage[st + h * TM]), 0.0f);
                             }
                             const uint o = batch_idx * p.qsa_batch_stride_o + (c0 / qsa_h) * p.qsa_stride_o + row;
-                            if (p.qsa_has_bias != 0) {
+#ifdef QSA_FOLD_NEGCTL
+                            const uint qsa_bmode = p.qsa_has_bias & 0xFFu;
+                            const uint qsa_mut   = p.qsa_has_bias >> 8;
+#else
+                            const uint qsa_bmode = p.qsa_has_bias;
+#endif
+                            if (qsa_bmode == 1) {
                                 sum += data_qsa_bias[o];
+                            } else if (qsa_bmode == 2) {
+                                // [TAG_QSA_BIAS_FOLD] qsa_bias.comp's value for (b = row, t = c0 / n_head, s = batch_idx)
+                                const uint np_q = p.N / qsa_h;
+                                const uint t    = c0 / qsa_h;
+                                const uint q    = p.qsa_bias_has_rows != 0 ? uint(data_qsa_brow[batch_idx * np_q + t]) : t;
+                                uint bv = 0xFF800000u;                                  // -inf
+                                if (q < p.qsa_bias_n_tps) {
+                                    const uint qi   = 2u * (batch_idx * p.qsa_bias_n_tps + q);
+                                    int        tail = data_qsa_qry[qi];
+                                    const uint bit  = uint(data_qsa_qry[qi + 1u]);
+                                    const uint bi   = 2u * (batch_idx * p.M + row);
+                                    const int  key  = data_qsa_blk[bi];
+                                    uint       vis  = uint(data_qsa_blk[bi + 1u]);
+                                    uint       big  = 0x4E6E6B28u;                      // 1e9f, exact
+#ifdef QSA_FOLD_NEGCTL
+                                    // negative-control build only (GGML_VK_QSA_BIAS_FOLD_MUTANT): 1 = 1e9 -> +inf,
+                                    // 2 = vis bit 0 inverted, 3 = tail off by one (key > tail)
+                                    if (qsa_mut == 1u) big = 0x7F800000u;
+                                    if (qsa_mut == 2u) vis ^= 1u;
+                                    if (qsa_mut == 3u) tail += 1;
+#endif
+                                    bv = (vis & bit) == 0u ? 0xFF800000u : (key >= tail ? big : 0x00000000u);
+                                }
+                                sum += uintBitsToFloat(bv);
                             }
                             data_d[o] = D_TYPE(sum);
                         }
