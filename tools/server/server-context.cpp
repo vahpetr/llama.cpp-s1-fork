@@ -266,12 +266,21 @@ static int server_env_int(const char * name, int lo, int hi, bool print_on = tru
 
 // [TAG_T2_HOST_SPLIT] LLAMA_SPEC_OVERLAP (T2, default 0): 1 = step 1, the host-phase diet - counted top-down seq_rm in
 //   libllama ([TAG_T2_SEQ_RM_COUNTED]) and no per-round prompt copy for an MTP-only drafter. Output bytes unchanged
-//   (class A). The env being set at all (0 or 1) also prints the per-phase host split next to the round time line.
+//   (class A). The env being set at all (0, 1 or 2) also prints the per-phase host split next to the round time line.
+// [TAG_T2_O1] 2 = step 1 + step 2 (O1, submit/sync verify): the streamed partial responses of a speculative round are
+//   built in process_token as before (same bytes, same order) but queued per slot; they are sent inside the next verify
+//   decode's window between llama_decode (submit) and llama_synchronize, so the critical host path of the round no longer
+//   pays the result-queue sends. Every other send of the slot (a final response, an error, a non-deferred partial)
+//   flushes the slot's queue first, so the per-task order is unchanged. Streamed chunks leave one round later.
 static int server_spec_overlap() {
     static const int v = [] {
-        const int o = server_env_int("LLAMA_SPEC_OVERLAP", 0, 1, /*print_on =*/ false);
+        const int o = server_env_int("LLAMA_SPEC_OVERLAP", 0, 2, /*print_on =*/ false);
         if (o >= 1) {
             SRV_WRN("LLAMA_SPEC_OVERLAP=%d: T2 step 1 on (counted seq_rm, no per-round prompt copy for an MTP-only drafter)\n", o);
+        }
+        if (o >= 2) {
+            SRV_WRN("LLAMA_SPEC_OVERLAP=%d: T2 step 2 on (O1: streamed partial responses of a speculative round are sent inside "
+                    "the next verify submit..sync window)\n", o);
         }
         return o;
     }();
@@ -631,6 +640,10 @@ struct server_slot {
 
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
+    // [TAG_T2_O1] LLAMA_SPEC_OVERLAP=2: partial responses built in this round's process_token, sent inside the next verify
+    //   window (or before any other send of this slot); spec_defer_send is set only around a speculative round's tokens
+    mutable std::vector<server_task_result_ptr> spec_deferred;
+    bool spec_defer_send = false;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -1377,6 +1390,13 @@ struct server_slot {
                         h[SERVER_SPEC_HS_PRE_DRAFT]/1e3/nr, h[SERVER_SPEC_HS_POST_DRAFT]/1e3/nr, h[SERVER_SPEC_HS_BATCH]/1e3/nr,
                         h[SERVER_SPEC_HS_SAMPLE]/1e3/nr, h[SERVER_SPEC_HS_SEQ_RM]/1e3/nr, h[SERVER_SPEC_HS_TOKENS]/1e3/nr,
                         (stats.t_spec_host_us - sum)/1e3/nr);
+                // [TAG_T2_O1] host gap = the host part of the round (critical path, the GPU waits on it unless the async
+                //   catch-up still runs); send = partial-response sends inside tokens; window = deferred sends done inside
+                //   the verify submit..sync window (hidden behind the verify GPU work)
+                SLT_INF(*this, "host gap (LLAMA_SPEC_OVERLAP=%d): per round %.3f ms (send on the critical path %.3f ms), "
+                        "verify window %.3f ms (%" PRIu64 " deferred sends)\n", server_spec_overlap(),
+                        stats.t_spec_host_us/1e3/nr, stats.t_spec_send_us/1e3/nr, stats.t_spec_window_us/1e3/nr,
+                        stats.n_spec_window_sends);
             }
         }
 
@@ -3640,7 +3660,29 @@ private:
     }
 
     void send_error(const server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
+        spec_flush_deferred(slot); // [TAG_T2_O1] the slot's queued partials first
         send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
+    }
+
+    // [TAG_T2_O1] send the slot's queued partial responses (in order); returns the number sent
+    size_t spec_flush_deferred(const server_slot & slot) {
+        const size_t n = slot.spec_deferred.size();
+        for (auto & r : slot.spec_deferred) {
+            queue_results.send(std::move(r));
+        }
+        slot.spec_deferred.clear();
+        return n;
+    }
+
+    // [TAG_T2_O1] all slots' queued partial responses (the verify window, and passes with nothing else to flush them)
+    size_t spec_flush_deferred_all() {
+        size_t n = 0;
+        for (const auto & s : slots) {
+            if (!s.spec_deferred.empty()) {
+                n += spec_flush_deferred(s);
+            }
+        }
+        return n;
     }
 
     void send_error(const int id_task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0) {
@@ -3700,10 +3742,23 @@ private:
             res->stats = slot.stats;
         }
 
+        // [TAG_T2_O1] the result is complete here (same fields, same snapshot); only the send may be deferred
+        if (slot.spec_defer_send) {
+            slot.spec_deferred.push_back(std::move(res));
+            return;
+        }
+        const int64_t t_send0 = ggml_time_us();
+        spec_flush_deferred(slot);
         queue_results.send(std::move(res));
+        if (!is_progress && !is_begin) {
+            spec_rt.send_us += ggml_time_us() - t_send0;
+        }
     }
 
     void send_final_response(server_slot & slot) {
+        spec_flush_deferred(slot); // [TAG_T2_O1] the slot's queued partials precede its final response
+        slot.spec_defer_send = false;
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -5331,6 +5386,10 @@ private:
         // [TAG_T2_HOST_SPLIT] the host phases of this pass (timers only) and the end of the post-draft block
         int64_t hs_us[SERVER_SPEC_HS_COUNT] = {};
         int64_t t_post_draft_end_us = 0;
+        // [TAG_T2_O1] partial-response sends of this pass on the critical path / deferred ones sent in the verify window
+        int64_t  send_us      = 0;
+        int64_t  window_us    = 0;
+        uint64_t window_sends = 0;
     } spec_rt;
 
     // [TAG_SPEC_DRAFT_POLICY] one single-slot pure round -> the cost fits
@@ -5488,6 +5547,9 @@ private:
             for (int k = 0; k < SERVER_SPEC_HS_COUNT; ++k) { // [TAG_T2_HOST_SPLIT]
                 st.t_spec_hs_us[k] += spec_rt.hs_us[k];
             }
+            st.t_spec_send_us      += spec_rt.send_us; // [TAG_T2_O1]
+            st.t_spec_window_us    += spec_rt.window_us;
+            st.n_spec_window_sends += spec_rt.window_sends;
         }
         metrics.n_spec_timed_rounds += 1;
         metrics.t_spec_draft_us     += spec_rt.draft_us;
@@ -5723,6 +5785,13 @@ private:
     void update_slots() {
         slots_invalidated.clear();
 
+        // [TAG_T2_O1] a slot that stopped without a final response (cancel / release) keeps no queued partials
+        for (const auto & s : slots) {
+            if (!s.spec_deferred.empty() && !s.is_processing()) {
+                spec_flush_deferred(s);
+            }
+        }
+
         if (disk_cache) {
             report_disk_lost(disk_cache->poll(), "on the server loop"); // [TAG_DISK_ASYNC_SAVE] finished saves committed
         }
@@ -5788,6 +5857,9 @@ private:
             spec_rt.ckpt_us           = 0;
             std::fill(std::begin(spec_rt.hs_us), std::end(spec_rt.hs_us), 0); // [TAG_T2_HOST_SPLIT]
             spec_rt.t_post_draft_end_us = 0;
+            spec_rt.send_us      = 0; // [TAG_T2_O1]
+            spec_rt.window_us    = 0;
+            spec_rt.window_sends = 0;
         }
 
         try {
@@ -7254,6 +7326,17 @@ private:
         queue_tasks.yield_to_queue([&]() {
             llama_set_rs_rollback_depth(ctx_tgt, rs_depth);
             ret = llama_decode(ctx_tgt, batch_view);
+            // [TAG_T2_O1] LLAMA_SPEC_OVERLAP=2: the verify graph is submitted and runs on the GPU; the previous round's
+            //   queued partial responses are sent now, before the sync (only the slots' result queues are touched; also on a
+            //   decode error: those tokens were accepted by the previous round and precede the error, as with OVERLAP=1)
+            if (server_spec_overlap() >= 2) {
+                const int64_t t_win0 = ggml_time_us();
+                const size_t  n_win  = spec_flush_deferred_all();
+                if (n_win > 0) {
+                    spec_rt.window_us    += ggml_time_us() - t_win0;
+                    spec_rt.window_sends += n_win;
+                }
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -7757,6 +7840,9 @@ private:
             struct hs_scope { int64_t & acc; int64_t t0; ~hs_scope() { acc += ggml_time_us() - t0; } }
                 hs_tokens { spec_rt.hs_us[SERVER_SPEC_HS_TOKENS], t_tokens0 }; // [TAG_T2_HOST_SPLIT] incl. a final response
 
+            // [TAG_T2_O1] LLAMA_SPEC_OVERLAP=2: this round's partial responses are queued (sent in the next verify window);
+            //   send_final_response flushes them first and clears the flag
+            slot.spec_defer_send = server_spec_overlap() >= 2;
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
@@ -7776,6 +7862,7 @@ private:
                     return;
                 }
             }
+            slot.spec_defer_send = false;
 
             slot.print_timings_tg();
 

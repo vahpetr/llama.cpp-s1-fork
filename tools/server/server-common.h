@@ -397,6 +397,11 @@ struct server_slot_stats {
     // post-draft (draft stats + draft KV seq_rm + per-round checkpoints), batch (batch build + render), sample (target
     // sample-and-accept), seq_rm (the accepted-tail removal / restore), tokens (process_token + streaming)
     int64_t  t_spec_hs_us[6]     = {};
+    // [TAG_T2_O1] (T2 step 2) the streamed partial-response sends of the speculative rounds: sent on the critical path
+    // (inside tokens above), and the deferred ones sent inside the next verify decode's submit..sync window
+    int64_t  t_spec_send_us      = 0;
+    int64_t  t_spec_window_us    = 0;
+    uint64_t n_spec_window_sends = 0;
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
