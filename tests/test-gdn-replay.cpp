@@ -464,10 +464,14 @@ static int run_perf() {
 // ---------------------------------------------------------------------------------------------------------------------
 
 static bool g_saw_replay = false;
+static std::string g_default_line; // R188: the "gdn_replay: on|off (default ... | env)" proof line of the last context
 
 static void log_cb(ggml_log_level level, const char * text, void * ud) {
     if (strstr(text, "gdn replay:") != nullptr) {
         g_saw_replay = true;
+    }
+    if (const char * p = strstr(text, "gdn_replay: "); p != nullptr) {
+        g_default_line = p + strlen("gdn_replay: "); // "on|off (reason)"
     }
     if (level >= GGML_LOG_LEVEL_WARN || ud != nullptr) {
         fputs(text, stderr);
@@ -491,6 +495,48 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
         return nullptr;
     }
     return ctx;
+}
+
+// R188: with LLAMA_GDN_REPLAY unset the replay is ON iff the device is gfx1151 (STRIX_HALO), OFF elsewhere (780M ...);
+//   the proof line names the reason. Then LLAMA_GDN_REPLAY=0 must switch it off and say "env".
+static int check_default(const common_params & params, llama_model * model) {
+    bool gfx1151 = false;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const char * d = ggml_backend_dev_description(dev);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && d != nullptr &&
+            (strstr(d, "STRIX_HALO") != nullptr || strstr(d, "GFX1151") != nullptr || strstr(d, "gfx1151") != nullptr)) {
+            gfx1151 = true;
+        }
+    }
+    int fail = 0;
+    for (int mode = 0; mode < 2; mode++) { // 0 = unset (the default), 1 = LLAMA_GDN_REPLAY=0
+        if (mode == 0) {
+            unsetenv("LLAMA_GDN_REPLAY");
+        } else {
+            setenv("LLAMA_GDN_REPLAY", "0", 1);
+        }
+        g_saw_replay = false;
+        g_default_line.clear();
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = 1;
+        cparams.n_rs_seq   = 5;
+        cparams.kv_unified = true;
+        cparams.n_ctx      = std::max<uint32_t>(cparams.n_ctx, 2048);
+        llama_context * ctx = llama_init_from_model(model, cparams);
+        const bool want = mode == 0 && gfx1151;
+        const char * why = mode == 1 ? "(env)" : (gfx1151 ? "(default on gfx1151)" : "(default off: not gfx1151)");
+        const bool ok = ctx != nullptr && g_saw_replay == want && g_default_line.find(want ? "on " : "off ") == 0 &&
+                        g_default_line.find(why) != std::string::npos;
+        printf("model: default check %s: device %s, replay %s, proof line '%s' -> %s\n", mode == 0 ? "unset" : "LLAMA_GDN_REPLAY=0",
+               gfx1151 ? "gfx1151" : "not gfx1151", g_saw_replay ? "used" : "not used",
+               g_default_line.substr(0, g_default_line.find('\n')).c_str(), ok ? "PASS" : "FAIL");
+        fail += ok ? 0 : 1;
+        if (ctx) {
+            llama_free(ctx);
+        }
+    }
+    return fail;
 }
 
 static std::vector<uint8_t> seq_state(llama_context * ctx, llama_seq_id s) {
@@ -895,7 +941,8 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to load the model\n");
         return 1;
     }
-    const int rc = run_model(params, model);
+    const int rc_def = check_default(params, model); // R188
+    const int rc = run_model(params, model) + rc_def;
     llama_model_free(model);
     printf("test-gdn-replay model: %s\n", rc == 0 ? "PASS" : "FAIL");
     return rc;

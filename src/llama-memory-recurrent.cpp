@@ -40,15 +40,35 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     // [TAG_GDN_REPLAY] the gated delta net layers of qwen4exp (S = S_v x S_v per value head, scalar gate)
     {
+        // R188 (2026-11-01): default ON when every recurrent layer lives on a gfx1151 Vulkan device (the device class the
+        //   K-proof / D-gate / S0.2 verified: decode -2.0/-2.5/-4.5 % at 32k/262k/1M, GTT -676 MiB), OFF elsewhere (780M and
+        //   other devices: the planes path unless LLAMA_GDN_REPLAY=1). An explicit LLAMA_GDN_REPLAY=0/1 always wins.
+        //   Same device test as GGML_VK_QSA_TOPK_ONEPASS / _V3 (0275 / 0361): the Vulkan device name has STRIX_HALO / gfx1151.
+        bool def_on = offload;
+        for (int i = 0; i < n_layer && def_on; i++) {
+            if (filter && !filter(i)) {
+                continue;
+            }
+            ggml_backend_dev_t dev = model.dev_layer(i);
+            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            const char *       dsc = dev != nullptr ? ggml_backend_dev_description(dev) : nullptr;
+            def_on = reg != nullptr && strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0 && dsc != nullptr &&
+                     (strstr(dsc, "STRIX_HALO") != nullptr || strstr(dsc, "GFX1151") != nullptr || strstr(dsc, "gfx1151") != nullptr);
+        }
         const char * env = getenv("LLAMA_GDN_REPLAY");
-        const bool want = env != nullptr && atoi(env) != 0;
-        if (want && !gdn_replay_ok) {
+        const bool env_set = env != nullptr && *env != '\0';
+        const bool want = env_set ? atoi(env) != 0 : def_on;
+        if (want && env_set && !gdn_replay_ok) {
             LLAMA_LOG_WARN("%s: LLAMA_GDN_REPLAY=1 ignored: not supported under the hybrid iswa memory (SWA attention)\n", __func__);
         }
         gdn_replay = want && gdn_replay_ok && n_rs_seq > 0 && model.arch == LLM_ARCH_QWEN4EXP && type_s == GGML_TYPE_F32 &&
                      hparams.n_embd_s() == hparams.ssm_d_state * hparams.ssm_d_state * hparams.ssm_dt_rank;
-        if (want && gdn_replay_ok && !gdn_replay && n_rs_seq > 0) {
+        if (want && env_set && gdn_replay_ok && !gdn_replay && n_rs_seq > 0) {
             LLAMA_LOG_WARN("%s: LLAMA_GDN_REPLAY=1 ignored: not a qwen4exp gated delta net cache\n", __func__);
+        }
+        if (n_rs_seq > 0 && model.arch == LLM_ARCH_QWEN4EXP) {
+            LLAMA_LOG_INFO("%s: gdn_replay: %s (%s)\n", __func__, gdn_replay ? "on" : "off",
+                    env_set ? "env" : (def_on ? "default on gfx1151" : "default off: not gfx1151"));
         }
         gdn_w = gdn_replay ? n_rs_seq : 0;
         replay_n.assign(n_seq_max, 0);
