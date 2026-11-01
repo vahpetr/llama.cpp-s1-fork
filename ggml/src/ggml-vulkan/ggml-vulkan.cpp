@@ -24748,7 +24748,8 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
             *total += heap.size;
 
             if (membudget_supported && i < budgetprops.heapUsage.size()) {
-                *free += budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
+                // a heap whose usage is over its budget has 0 free (unsigned: the difference wrapped to ~2^64)
+                *free += budgetprops.heapBudget[i] > budgetprops.heapUsage[i] ? budgetprops.heapBudget[i] - budgetprops.heapUsage[i] : 0;
             } else {
                 *free += heap.size;
             }
@@ -25971,6 +25972,35 @@ static bool ggml_backend_vk_dev_mat_vec_m_invariant(ggml_backend_dev_t dev) {
     return device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eMesaRadv;
 }
 
+// [TAG_GDN_REPLAY] per-heap memory budget of a Vulkan device for the gdn replay snapshot admission (src/llama-gdn-admission.h):
+//   n_max entries of budget / usage / device-local flag, *n heaps written, *uma = integrated GPU (every heap is the one shared pool).
+//   false when the device has no VK_EXT_memory_budget (the caller falls back to ggml_backend_dev_memory).
+static bool ggml_backend_vk_dev_memory_heaps(ggml_backend_dev_t dev, uint32_t n_max, uint64_t * budget, uint64_t * usage, bool * device_local,
+                                             uint32_t * n, bool * uma) {
+    *n = 0;
+    *uma = false;
+    if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_vk_reg()) {
+        return false;
+    }
+    const int device = ((const ggml_backend_vk_device_context *) dev->context)->device;
+    if (device >= (int) vk_instance.device_supports_membudget.size() || !vk_instance.device_supports_membudget[device]) {
+        return false;
+    }
+    vk::PhysicalDevice vkdev = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device]];
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budgetprops;
+    vk::PhysicalDeviceMemoryProperties2 memprops = {};
+    memprops.pNext = &budgetprops;
+    vkdev.getMemoryProperties2(&memprops);
+    *uma = vkdev.getProperties().deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+    for (uint32_t i = 0; i < memprops.memoryProperties.memoryHeapCount && *n < n_max; ++i) {
+        budget[*n]       = budgetprops.heapBudget[i];
+        usage[*n]        = budgetprops.heapUsage[i];
+        device_local[*n] = (bool) (memprops.memoryProperties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal);
+        ++*n;
+    }
+    return true;
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_fa_kv_ids") == 0) { // [TAG_QSA_INDEXED_FA] FLASH_ATTN_EXT reads src[5]
@@ -25978,6 +26008,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_dev_mat_vec_m_invariant") == 0) { // [TAG_MERGE_ROWS] bool (*)(ggml_backend_dev_t)
         return (void *) ggml_backend_vk_dev_mat_vec_m_invariant;
+    }
+    if (strcmp(name, "ggml_backend_dev_memory_heaps") == 0) { // [TAG_GDN_REPLAY] see ggml_backend_vk_dev_memory_heaps
+        return (void *) ggml_backend_vk_dev_memory_heaps;
     }
     return NULL;
 }

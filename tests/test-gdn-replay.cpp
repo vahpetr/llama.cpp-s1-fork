@@ -4,6 +4,7 @@
 //                                    the snapshot planes path of the same backend, byte for byte (memcmp); CPU vs the
 //                                    other backends as NMSE
 //   test-gdn-replay perf           - us per verification-shaped op on the GPU backends: K = 1, planes, replay
+//   test-gdn-replay admission      - the snapshot admission free-memory rules with fake heaps (RV71 Major)
 //   test-gdn-replay <common args>  - llama level with a real qwen4exp model (-m ...): two contexts, LLAMA_GDN_REPLAY=0
 //                                    and =1, decode windows with a rollback depth -> seq_rm r -> decode ...; logits and
 //                                    llama_state_seq_get_data bytes identical at every step, seq_cp, save -> load round
@@ -18,6 +19,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "../src/llama-gdn-admission.h"
 
 #include <algorithm>
 #include <clocale>
@@ -916,6 +918,30 @@ static int run_model(const common_params & params, llama_model * model) {
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
+    if (argc >= 2 && strcmp(argv[1], "admission") == 0) {
+        // review RV71 Major: the snapshot admission's free memory with fake heaps (no device): usage over budget must give
+        //   0 free (not a wrapped ~2^64) and refuse; a UMA device's heaps share one pool (max, not the sum); a discrete
+        //   device sums its device-local heaps only; the margin is kept and free < margin refuses (no unsigned wrap)
+        const uint64_t MiB = 1ull << 20, GiB = 1ull << 30;
+        int fail = 0;
+        auto chk = [&](bool ok, const char * what) { printf("admission: %-72s %s\n", what, ok ? "ok" : "FAIL"); fail += !ok; };
+        const llama_gdn_heap over[]  = { { 100 * GiB, 101 * GiB, true } };                       // usage > budget
+        const llama_gdn_heap umab[]  = { { 60 * GiB, 20 * GiB, true }, { 60 * GiB, 20 * GiB, false } }; // two heaps, one pool
+        const llama_gdn_heap umaov[] = { { 1 * GiB, 0, true }, { 100 * GiB, 101 * GiB, false } };   // small carve-out + overcommitted GTT
+        const llama_gdn_heap dgpu[]  = { { 16 * GiB, 4 * GiB, true }, { 8 * GiB, 1 * GiB, true }, { 64 * GiB, 0, false } };
+        chk(llama_gdn_heaps_free(over, 1, true) == 0, "usage > budget (UMA): free 0, not wrapped");
+        chk(llama_gdn_heaps_free(over, 1, false) == 0, "usage > budget (discrete): free 0, not wrapped");
+        chk(!llama_gdn_admission_fits(llama_gdn_heaps_free(over, 1, true), 108 * MiB, 512 * MiB), "usage > budget: 108 MiB snapshot refused");
+        chk(llama_gdn_heaps_free(umab, 2, true) == 40 * GiB, "UMA two heaps sharing the pool: 40 GiB (max), not 80 (sum)");
+        chk(llama_gdn_heaps_free(umaov, 2, true) == 1 * GiB, "UMA, GTT overcommitted: free = the 1 GiB heap, no wrap");
+        chk(llama_gdn_heaps_free(dgpu, 3, false) == 19 * GiB, "discrete: sum of the device-local heaps (12 + 7), host heap ignored");
+        chk(llama_gdn_admission_fits(40 * GiB, 108 * MiB, 512 * MiB), "40 GiB free: 108 MiB + 512 MiB margin fits");
+        chk(!llama_gdn_admission_fits(600 * MiB, 108 * MiB, 512 * MiB), "600 MiB free: 108 MiB + 512 MiB margin refused");
+        chk(llama_gdn_admission_fits(620 * MiB, 108 * MiB, 512 * MiB), "620 MiB free: 108 + 512 = 620 fits (boundary)");
+        chk(!llama_gdn_admission_fits(100 * MiB, 0, 512 * MiB), "free < margin: refused, no wrap of free - margin");
+        printf("test-gdn-replay admission: %s\n", fail == 0 ? "PASS" : "FAIL");
+        return fail;
+    }
     if (argc >= 2 && strcmp(argv[1], "perf") == 0) {
         ggml_backend_load_all();
         return run_perf();
