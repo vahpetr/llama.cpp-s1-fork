@@ -1381,8 +1381,9 @@ struct vk_device_struct {
     // count limit (maxComputeWorkGroupCount[0], or the smaller GGML_VK_QSA_SCORE_KREUSE_MAX_WG test hook)
     bool     qsa_score_kreuse;
     uint32_t qsa_score_kreuse_max_wg;
-    // [TAG_QSA_BIAS_FOLD] GGML_VK_QSA_BIAS_FOLD (default on; 0 = the QSA_BIAS node runs and QSA_SCORE reads its plane);
-    // the negative-control build's mutant (GGML_VK_QSA_BIAS_FOLD_MUTANT, 0 elsewhere)
+    // [TAG_QSA_BIAS_FOLD] GGML_VK_QSA_BIAS_FOLD (default on), for the proof line only: the graph (qwen4exp build_qsa_select)
+    // reads it and builds the table form; the backend folds exactly the nodes that carry tables. The negative-control
+    // build's mutant (GGML_VK_QSA_BIAS_FOLD_MUTANT, 0 elsewhere)
     bool     qsa_bias_fold;
     uint32_t qsa_bias_fold_mutant;
     // [TAG_MMID_PRECAST_B] GGML_VK_MMID_PRECAST_B (default on)
@@ -9464,8 +9465,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
             }
         }
 
-        // [TAG_QSA_BIAS_FOLD] a QSA_SCORE whose bias is a QSA_BIAS node computes that bias in its epilogue from the node's
-        // tables, and the QSA_BIAS node is not run when every one of its consumers is such a score
+        // [TAG_QSA_BIAS_FOLD] a QSA_SCORE that carries the bias tables (src[5..7]) computes the bias in its epilogue
         device->qsa_bias_fold = ggml_vk_env_bool("GGML_VK_QSA_BIAS_FOLD", true);
         device->qsa_bias_fold_mutant = 0;
 #ifdef GGML_VULKAN_QSA_BIAS_FOLD_NEGCTL
@@ -9518,8 +9518,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
 #else
             const char * fold_negctl = "";
 #endif
-            GGML_LOG_WARN("ggml_vulkan: qsa_bias_fold: %s (GGML_VK_QSA_BIAS_FOLD; the QSA_BIAS bias of a QSA_SCORE computed in the "
-                          "score epilogue, the QSA_BIAS node skipped)%s mutant %u\n", device->qsa_bias_fold ? "on" : "off",
+            GGML_LOG_WARN("ggml_vulkan: qsa_bias_fold: %s (GGML_VK_QSA_BIAS_FOLD, read by the graph: QSA_SCORE nodes that carry the "
+                          "bias tables compute the bias in the epilogue, no QSA_BIAS plane; a QSA_BIAS node always runs)%s mutant %u\n",
+                          device->qsa_bias_fold ? "on" : "off",
                           fold_negctl, device->qsa_bias_fold_mutant);
         }
 
@@ -13213,80 +13214,14 @@ static vk_qsa_score_plan ggml_vk_qsa_score_plan(ggml_backend_vk_context * ctx, c
     return plan;
 }
 
-static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer);
-
-// [TAG_QSA_BIAS_FOLD] the QSA_BIAS node a QSA_SCORE folds into its epilogue (has_bias 2), or nullptr (has_bias 0 / 1: no
-// bias, or the bias plane is read). Folded when the knob is on, the bias is a GGML_OP_QSA_BIAS node of exactly the score's
-// [M, N, n_b] shape over a block table of M blocks and n_b streams, and every table it reads lives in a Vulkan buffer.
-// The ONE predicate behind the dispatch, the barrier tracking of the tables and the skip of the QSA_BIAS node
-// (ggml_vk_qsa_bias_folded_away), so the three cannot disagree.
-static const ggml_tensor * ggml_vk_qsa_score_bias_fold(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
-    const ggml_tensor * bias = dst->src[3];
-    if (!ctx->device->qsa_bias_fold || dst->op != GGML_OP_QSA_SCORE || bias == nullptr || bias->op != GGML_OP_QSA_BIAS) {
-        return nullptr;
-    }
-    const ggml_tensor * blk  = bias->src[0];
-    const ggml_tensor * qry  = bias->src[1];
-    const ggml_tensor * brow = bias->src[2];
-    if (bias->ne[0] != dst->ne[0] || bias->ne[1] != dst->ne[1] || bias->ne[2] != dst->ne[2] ||
-        blk->ne[1] != dst->ne[0] || blk->ne[2] != dst->ne[2] || qry->ne[2] != dst->ne[2] ||
-        (brow != nullptr && (brow->ne[0] != dst->ne[1] || brow->ne[1] != dst->ne[2]))) {
-        return nullptr;
-    }
-    for (const ggml_tensor * t : { blk, qry, brow }) {
-        if (t != nullptr && (t->buffer == nullptr || !ggml_backend_buffer_is_vk(t->buffer))) {
-            return nullptr;
-        }
-    }
-    return bias;
-}
-
-// [TAG_QSA_BIAS_FOLD] the k-th table (0 blk, 1 qry, 2 rows) a folding QSA_SCORE reads besides its srcs, or nullptr: the
-// barrier tracking of ggml_vk_build_graph checks and records these as reads of the node
-static const ggml_tensor * ggml_vk_qsa_fold_src(const ggml_backend_vk_context * ctx, const ggml_tensor * node, int k) {
-    const ggml_tensor * bias = node->op == GGML_OP_QSA_SCORE ? ggml_vk_qsa_score_bias_fold(ctx, node) : nullptr;
-    return bias ? bias->src[k] : nullptr;
-}
-
-// [TAG_QSA_BIAS_FOLD] true when the QSA_BIAS node at node_idx need not run: the knob on, not a graph output, and every one
-// of its uses (ggml_node_get_use_count) found among the later nodes of THIS graph as src[3] of a QSA_SCORE that folds it.
-// A use anywhere else (an ADD, a view, a node of another split or backend, the eval callback's subgraph cut) fails closed:
-// the node runs and writes its plane as before.
-static bool ggml_vk_qsa_bias_folded_away(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
-    const ggml_tensor * node = cgraph->nodes[node_idx];
-    if (!ctx->device->qsa_bias_fold || node->op != GGML_OP_QSA_BIAS || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-        return false;
-    }
-    const int32_t uses = ggml_node_get_use_count(cgraph, node_idx);
-    if (uses <= 0) {
-        return false;
-    }
-    int32_t found = 0;
-    for (int j = node_idx + 1; j < cgraph->n_nodes && found < uses; j++) {
-        const ggml_tensor * c = cgraph->nodes[j];
-        for (int k = 0; k < GGML_MAX_SRC; k++) {
-            if (c->src[k] != node) {
-                continue;
-            }
-            if (k != 3 || ggml_vk_qsa_score_bias_fold(ctx, c) != node) {
-                return false;
-            }
-            found++;
-        }
-    }
-    return found == uses;
-}
-
-// [TAG_QSA_BIAS_FOLD] the bias tables the epilogue reads (has_bias 2): the op's own src[5..7] (ggml_qsa_score_set_bias_tables,
-// the graph-side form: no plane exists, always folded) or the srcs of the QSA_BIAS node in src[3] (the backend-side form,
-// ggml_vk_qsa_score_bias_fold). false = no folded bias.
+// [TAG_QSA_BIAS_FOLD] the bias tables the epilogue reads (has_bias 2): only the op's own src[5..7]
+// (ggml_qsa_score_set_bias_tables, the graph-side form - the tables are operands of the node, so the allocator, the
+// scheduler and the barrier tracking see them like any src). A QSA_BIAS node in src[3] is never folded (astra PACKAGE
+// v71a Important 1): it runs and the epilogue reads its plane (has_bias 1). false = no folded bias.
 static bool ggml_vk_qsa_score_tables(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, const ggml_tensor * t[3]) {
+    GGML_UNUSED(ctx);
     if (dst->src[5] != nullptr) {
         t[0] = dst->src[5]; t[1] = dst->src[6]; t[2] = dst->src[7];
-        return true;
-    }
-    if (const ggml_tensor * bn = ggml_vk_qsa_score_bias_fold(ctx, dst)) {
-        t[0] = bn->src[0]; t[1] = bn->src[1]; t[2] = bn->src[2];
         return true;
     }
     return false;
@@ -20430,11 +20365,6 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
         return false;
     }
-    // [TAG_QSA_BIAS_FOLD] every consumer computes this bias itself: the plane is never written (nor read)
-    if (node->op == GGML_OP_QSA_BIAS && ggml_vk_qsa_bias_folded_away(ctx, cgraph, node_idx)) {
-        return false;
-    }
-
     VK_LOG_DEBUG("ggml_vk_build_graph(" << node << ", " << ggml_op_name(node->op) << ")");
     ctx->semaphore_idx = 0;
 
@@ -20527,16 +20457,6 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                     break;
                 }
             }
-            // [TAG_QSA_BIAS_FOLD] the tables a folding QSA_SCORE reads besides its srcs
-            for (int k = 0; k < 3 && !need_sync; ++k) {
-                const ggml_tensor * fs = ggml_vk_qsa_fold_src(ctx, cur_node, k);
-                if (fs && overlaps_unsynced(fs, ctx->unsynced_nodes_written)) {
-                    need_sync = true;
-                }
-            }
-            if (need_sync) {
-                break;
-            }
             // A source the node writes through (ggml_gated_delta_net_ext) also conflicts with earlier reads.
             const ggml_tensor * mut = ggml_vk_mutated_src(cur_node);
             if (mut && overlaps_unsynced(mut, ctx->unsynced_nodes_read)) {
@@ -20576,11 +20496,6 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                     continue;
                 }
                 ctx->unsynced_nodes_read.push_back(cur_node->src[j]);
-            }
-            for (int k = 0; k < 3; ++k) {
-                if (const ggml_tensor * fs = ggml_vk_qsa_fold_src(ctx, cur_node, k)) {
-                    ctx->unsynced_nodes_read.push_back(fs);
-                }
             }
             if (const ggml_tensor * mut = ggml_vk_mutated_src(cur_node)) {
                 ctx->unsynced_nodes_written.push_back(mut);
@@ -23886,10 +23801,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 if (ggml_vk_qsa_score_plan(ctx, cgraph->nodes[i]).kr) {
                     ggml_vk_fusion_count_add(fusion_counts, "", "qsa_score_kreuse");
                 }
-            }
-            // [TAG_QSA_BIAS_FOLD] qsa_bias_skip=<count>: QSA_BIAS nodes not run (every consumer folds them)
-            if (cgraph->nodes[i]->op == GGML_OP_QSA_BIAS && ggml_vk_qsa_bias_folded_away(ctx, cgraph, i)) {
-                ggml_vk_fusion_count_add(fusion_counts, "", "qsa_bias_skip");
             }
 
             // mmid_mul_nofuse:<reason>=count - why the expert-weight multiply stayed unfused at this
