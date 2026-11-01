@@ -183,7 +183,18 @@ int main() {
               server_cache_env_digest({ "GGML_VK_F32ACC=1" }));
         CHECK(server_cache_env_digest({ "GGML_VK_F32ACC=1", "GGML_VK_F32ACC_SCOPE=trunk" }) !=
               server_cache_env_digest({ "GGML_VK_F32ACC=1" }));
-        printf("env registry: LLAMA_SPEC_OVERLAP unset/0/1 = one digest (exact), GGML_VK_F32ACC(_SCOPE) semantic\n");
+        // [TAG_QSA_BIAS_FOLD] [TAG_QSA_TOPK_V3] class-A Vulkan knobs: unset / default / override give one env digest
+        for (const char * n : { "GGML_VK_QSA_BIAS_FOLD", "GGML_VK_QSA_BIAS_FOLD_MUTANT", "GGML_VK_QSA_TOPK_V3_MIN_ROWS" }) {
+            CHECK(server_cache_env_classify(n) == SERVER_CACHE_ENV_EXACT);
+        }
+        CHECK(server_cache_env_digest({ "GGML_VK_QSA_BIAS_FOLD=1" }) == d0);
+        CHECK(server_cache_env_digest({ "GGML_VK_QSA_BIAS_FOLD=0" }) == d0);
+        CHECK(server_cache_env_digest({ "GGML_VK_QSA_TOPK_V3_MIN_ROWS=16" }) == d0);
+        CHECK(server_cache_env_digest({ "GGML_VK_QSA_TOPK_V3_MIN_ROWS=2" }) == d0);
+        CHECK(server_cache_env_digest({ "GGML_VK_QSA_BIAS_FOLD_MUTANT=0" }) == d0);
+        CHECK(server_cache_env_digest({ "LLAMA_KQ_VIS=1", "GGML_VK_QSA_BIAS_FOLD=0", "GGML_VK_QSA_TOPK_V3_MIN_ROWS=1" }) == dk);
+        printf("env registry: LLAMA_SPEC_OVERLAP unset/0/1 = one digest (exact), GGML_VK_F32ACC(_SCOPE) semantic, "
+               "GGML_VK_QSA_BIAS_FOLD / _MUTANT / GGML_VK_QSA_TOPK_V3_MIN_ROWS unset/default/override = one digest\n");
     }
 
     // sampled model identity and the memo
