@@ -988,9 +988,10 @@ struct vk_device_struct {
     // over the blocks (topk_qsa_v3.comp: a block = one key weighted by its cells visible to the row), same gates, same
     // fallback list and backoff as onepass; its own counters line (stats words 40..47)
     bool     qsa_topk_v3 = false;
-    // GGML_VK_QSA_TOPK_V3_MIN_ROWS (default 16): v3 only for selections of >= this many rows, onepass below (decode 1 row,
-    // verify 2 rows: v3's per-selection summary costs more than it saves there). Path only: both give v2's ids and order.
-    uint32_t qsa_topk_v3_min_rows = 16;
+    // GGML_VK_QSA_TOPK_V3_MIN_ROWS (default 2, v71 P6; was 16 in v70): v3 only for selections of >= this many rows, onepass
+    // below. With the summary once per snapshot (stage 2) v3 beats onepass from 2 rows (780M 1M verify 266 vs 343 us); a decode
+    // row (1) stays on onepass. Path only: both give v2's ids and order. Candidate default, R184: back to 16 if S0.2 1M decode is not faster.
+    uint32_t qsa_topk_v3_min_rows = 2;
     uint64_t qsa_topk_v3_next_log = 1024;
     uint64_t qsa_topk_v3_logged   = 0;
     // [TAG_QSA_TOPK_V3] stage 2 (v71 P6): the write generation of this device's buffers - bumped by every host-side write
@@ -9427,7 +9428,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
             const bool   v3_req     = ggml_vk_env_bool("GGML_VK_QSA_TOPK_V3", op_gfx1151);
             // stage 2 (v71 P6): the select's sort pairs lanes with subgroupShuffleXor
             device->qsa_topk_v3     = v3_req && device->qsa_topk_onepass && device->qsa_topk_nokeys && device->subgroup_shuffle;
-            device->qsa_topk_v3_min_rows = env_u32("GGML_VK_QSA_TOPK_V3_MIN_ROWS", 16);
+            device->qsa_topk_v3_min_rows = env_u32("GGML_VK_QSA_TOPK_V3_MIN_ROWS", 2);
 #if defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 1
             const char * v3_mut = " MUTANT BUILD M-B1: a block with p0 == min pos counted FULL";
 #elif defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 2

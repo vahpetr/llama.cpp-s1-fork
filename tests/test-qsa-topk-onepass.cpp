@@ -882,17 +882,18 @@ int main(int argc, char ** argv) {
         if (n_run == n_arms && v[2].c[i].path == "onepass_nokeys" && v[4].c[i].path != "v3") {
             ok = false; printf("  v3_all arm did not dispatch v3 on case %zu (%s)\n", i, v[4].c[i].path.c_str());
         }
-        // the v3 arm keeps the default GGML_VK_QSA_TOPK_V3_MIN_ROWS (16): fewer rows stay on onepass; v3_all sets it to 1
+        // the v3 arm keeps the default GGML_VK_QSA_TOPK_V3_MIN_ROWS (2, v71 P6): a 1-row selection stays on onepass; v3_all sets it to 1
         const int64_t c_rows = c.n_tps*c.n_stream;
-        const char *  want3  = c_rows >= 16 ? "v3" : "onepass_nokeys";
+        const char *  want3  = c_rows >= 2 ? "v3" : "onepass_nokeys";
         if (n_run == n_arms && v[1].c[i].path == "onepass_nokeys" && v[3].c[i].path != want3) {
             ok = false; printf("  v3 arm dispatched %s on case %zu, want %s\n", v[3].c[i].path.c_str(), i, want3);
         }
         if (n_run == n_arms && c_rows <= 2 && !c.plane && v[2].c[i].path == "onepass_nokeys") {
-            // MIN_ROWS witness: a decode / verify selection takes onepass by default (v3 arm, where its gate admits onepass)
-            // and v3 with MIN_ROWS=1 (v3_all)
+            // MIN_ROWS witness: by default a decode selection (1 row) takes onepass and a verify selection (2 rows) v3 (v3 arm,
+            // where its gate admits onepass); v3_all (MIN_ROWS=1) takes v3 for both
             n_fb_forced++;
-            const bool w_ok = v[4].c[i].path == "v3" && (v[1].c[i].path != "onepass_nokeys" || v[3].c[i].path == "onepass_nokeys");
+            const char * want_d = c_rows >= 2 ? "v3" : "onepass_nokeys";
+            const bool w_ok = v[4].c[i].path == "v3" && (v[1].c[i].path != "onepass_nokeys" || v[3].c[i].path == want_d);
             n_fb_forced_ok += w_ok;
             if (!w_ok) { printf("  MIN_ROWS witness failed on case %zu (v3 %s, v3_all %s)\n", i, v[3].c[i].path.c_str(), v[4].c[i].path.c_str()); }
         }
