@@ -9438,6 +9438,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
             const char * v3_mut = " MUTANT BUILD M-B3: no per-cell test on partly visible blocks";
 #elif defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 4
             const char * v3_mut = " MUTANT BUILD reuse-stale: the block summary reused whenever the metadata addresses match";
+#elif defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 5
+            const char * v3_mut = " MUTANT BUILD no-wait: the block summary buffer reallocated without the submit / wait";
 #else
             const char * v3_mut = "";
 #endif
@@ -18446,10 +18448,20 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
                 const size_t sum_bytes = ggml_vk_qsa_topk_v3_sum_uints(n_blocks, n_stream) * sizeof(uint32_t);
                 const size_t range_cap = (size_t) ctx->device->properties.limits.maxStorageBufferRange;
                 GGML_ASSERT(sum_bytes <= range_cap);
+                const char * sum_buf_state = "same"; // the dispatch log's summary_buf= (new / grown / same)
                 if (!ctx->qsa_topk_v3_sum || ctx->qsa_topk_v3_sum->size < sum_bytes) {
                     const size_t old  = ctx->qsa_topk_v3_sum ? ctx->qsa_topk_v3_sum->size : 0;
                     const size_t want = std::min(range_cap, std::max({ sum_bytes, old + old / 4, (size_t) 1 << 20 }));
+                    sum_buf_state = ctx->qsa_topk_v3_sum ? "grown" : "new";
+#if defined(GGML_VULKAN_QSA_TOPK_V3_MUTANT) && GGML_VULKAN_QSA_TOPK_V3_MUTANT == 5
                     if (ctx->qsa_topk_v3_sum) {
+                        // MUTANT no-wait (tests only): the old summary is freed while recorded selections still read it
+                        ggml_vk_destroy_buffer(ctx->qsa_topk_v3_sum);
+                    }
+                    if (false) {
+#else
+                    if (ctx->qsa_topk_v3_sum) {
+#endif
                         ggml_vk_ctx_end(subctx);
                         ggml_vk_submit(subctx, {});
                         ctx->submit_pending = true;
@@ -18513,8 +18525,8 @@ static void ggml_vk_topk_qsa_dispatch(ggml_backend_vk_context * ctx, vk_context 
                 }
                 if (ctx->device->dispatch_log) {
                     fprintf(stderr, "[vk-dispatch] op=QSA_TOP_K path=v3 form=cells vis=%d n_kv=%u n_blocks=%u rows=%u k=%u tiles=%u "
-                            "sample=%u j=%u stride=%u scratch=%zu summary=%s pipeline=%s node=%s\n", vis ? 1 : 0, n_kv, n_blocks, nrows, width,
-                            n_tiles_b, v3_sample, v3_j, v3_stride, scratch_size, reuse ? "reused" : "built",
+                            "sample=%u j=%u stride=%u scratch=%zu summary=%s summary_buf=%s pipeline=%s node=%s\n", vis ? 1 : 0, n_kv, n_blocks, nrows, width,
+                            n_tiles_b, v3_sample, v3_j, v3_stride, scratch_size, reuse ? "reused" : "built", sum_buf_state,
                             ctx->device->pipeline_topk_v3_qsa_vis_nk[0]->name.c_str(), top_k->name);
                 }
                 dispatch3(1, { (uint32_t) CEIL_DIV(nbw, 256), n_stream, 1 });                   // classify

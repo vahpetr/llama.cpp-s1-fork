@@ -374,7 +374,12 @@ static bool compute(ggml_backend_t be, const std::vector<ggml_tensor *> & nodes)
 //   1 nkv    two graphs over views of the SAME storage at offset 0 with another n_kv / n_blocks (the mirror pattern): built 2
 //   2 write  one graph: op, a CPY that rewrites the cell planes in place, op over the CPY's result (same address): built 2
 //   3 alt    one graph alternating two metadata snapshots A, B, A: built 3
-// A -DGGML_VULKAN_QSA_TOPK_V3_MUTANT=4 build (the summary reused whenever the metadata addresses match) must fail 0..2.
+//   4 grow   one graph (one context, fresh summary buffer): small (65 536 cells, 1 MiB buffer) -> a prealloc_x user (the
+//            plane form, keyed scratch: prealloc_x grows mid-graph) -> large (262 144 cells: the summary buffer must be
+//            reallocated while the small selection's commands are recorded = the submit / wait branch) -> the plane op again ->
+//            small again: built 3, summary_buf new 1 / grown 1 (astra v71a Important 3)
+// A -DGGML_VULKAN_QSA_TOPK_V3_MUTANT=4 build (the summary reused whenever the metadata addresses match) must fail 0..2;
+// =5 (the buffer reallocated without the submit / wait: the recorded small selection reads a freed buffer) must fail 4.
 static size_t check_rows(ggml_tensor * op, const op_inputs & in, const op_case & c) {
     const int64_t nr = c.n_tps*c.n_stream;
     std::vector<int32_t> o((size_t) (c.width*nr)), ref;
@@ -425,9 +430,12 @@ static void stale_checks() {
     GGML_ASSERT(inW.cb == inA.cb && inW.toks == inA.toks && inW.nb == inA.nb);
     const std::vector<int32_t> cellsW = inW.cells;
     inW.score = inA.score;
-    const char * names[4] = { "gen", "nkv", "write", "alt" };
+    const op_case cS { 65536,      128, 1, 2051, M_DISTINCT, false, MAP_BLK4  };
+    const op_case cP { 262144,     128, 1, 2051, M_DISTINCT, true,  MAP_BLK4  };
+    const op_inputs inS = make_inputs(cS), inP = make_inputs(cP);
+    const char * names[5] = { "gen", "nkv", "write", "alt", "grow" };
     printf("[op] stale-begin\n");
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         ggml_backend_t be = gpu_backend();
         GGML_ASSERT(be);
         ggml_init_params ip = { 32*ggml_tensor_overhead(), nullptr, true };
@@ -435,8 +443,8 @@ static void stale_checks() {
         size_t bad = 0;
         bool   ok  = true;
         std::vector<ggml_tensor *> g1, g2;
-        vis_set a, b;
-        ggml_tensor * extra = nullptr;
+        vis_set a, b, sm;
+        ggml_tensor * extra = nullptr, * pmask = nullptr;
         if (i == 0) {
             a = new_set(ctx, cA, inA.nb);
             g1 = { stale_op(ctx, a, nullptr, cA.width, i, 0), stale_op(ctx, a, nullptr, cA.width, i, 1) };
@@ -463,10 +471,23 @@ static void stale_checks() {
             extra = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, cA.n_kv, 4, 1);
             ggml_tensor * cp = ggml_cpy(ctx, extra, a.cells);
             g1 = { stale_op(ctx, a, nullptr, cA.width, i, 0), stale_op(ctx, a, cp, cA.width, i, 1) };
-        } else {
+        } else if (i == 3) {
             a = new_set(ctx, cA, inA.nb);
             b = new_set(ctx, cB, inB.nb);
             g1 = { stale_op(ctx, a, nullptr, cA.width, i, 0), stale_op(ctx, b, nullptr, cB.width, i, 1), stale_op(ctx, a, nullptr, cA.width, i, 2) };
+        } else {
+            sm = new_set(ctx, cS, inS.nb);
+            a  = new_set(ctx, cA, inA.nb);
+            b  = new_set(ctx, cP, inP.nb);   // the plane op's score / cell map (its cells / toks unused)
+            pmask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, cP.n_kv, cP.n_tps, 1, cP.n_stream);
+            const auto plane = [&](int j) {
+                ggml_tensor * op = ggml_qsa_top_k(ctx, b.score, b.cb, pmask, cP.width);
+                ggml_format_name(op, "stale%d_p%d", i, j);
+                return op;
+            };
+            // plain ggml_backend_graph_compute: no graph_optimize, the nodes run in this order
+            g1 = { stale_op(ctx, sm, nullptr, cS.width, i, 0), plane(1), stale_op(ctx, a, nullptr, cA.width, i, 2), plane(3),
+                   stale_op(ctx, sm, nullptr, cS.width, i, 4) };
         }
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
         GGML_ASSERT(buf);
@@ -492,11 +513,27 @@ static void stale_checks() {
                 ggml_backend_tensor_set(extra, cellsW.data(), 0, ggml_nbytes(extra));
                 GGML_ASSERT(compute(be, g1));
                 bad += check_rows(g1[0], inA, cA) + check_rows(g1[1], inW, cW);
-            } else {
+            } else if (i == 3) {
                 set_inputs(a, inA);
                 set_inputs(b, inB);
                 GGML_ASSERT(compute(be, g1));
                 bad += check_rows(g1[0], inA, cA) + check_rows(g1[1], inB, cB) + check_rows(g1[2], inA, cA);
+            } else {
+                set_inputs(sm, inS);
+                set_inputs(a, inA);
+                ggml_backend_tensor_set(b.score, inP.score.data(), 0, ggml_nbytes(b.score));
+                ggml_backend_tensor_set(b.cb, inP.cb.data(), 0, ggml_nbytes(b.cb));
+                const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ni = ggml_fp32_to_fp16(-INFINITY);
+                std::vector<ggml_fp16_t> m(inP.vis.size());
+                for (size_t q = 0; q < m.size(); q++) { m[q] = inP.vis[q] ? z : ni; }
+                ggml_backend_tensor_set(pmask, m.data(), 0, ggml_nbytes(pmask));
+                for (ggml_tensor * op : g1) {   // junk, so a skipped row cannot pass
+                    std::vector<int32_t> j(ggml_nelements(op), -7);
+                    ggml_backend_tensor_set(op, j.data(), 0, ggml_nbytes(op));
+                }
+                GGML_ASSERT(compute(be, g1));
+                bad += check_rows(g1[0], inS, cS) + check_rows(g1[1], inP, cP) + check_rows(g1[2], inA, cA) +
+                       check_rows(g1[3], inP, cP) + check_rows(g1[4], inS, cS);
             }
             ok = bad == 0;
             printf("[op] stale %d %s exact=%d bad=%zu\n", i, names[i], (int) ok, bad);
@@ -613,12 +650,12 @@ struct case_view {
 // [TAG_QSA_TOPK_V3] stage 2: the stale-summary checks of an arm
 struct stale_view {
     bool seen = false, exact = false, unsupported = false;
-    int  v3 = 0, built = 0, reused = 0;
+    int  v3 = 0, built = 0, reused = 0, buf_new = 0, buf_grown = 0;
 };
 
 struct arm_view {
     std::vector<case_view> c;
-    stale_view st[4];
+    stale_view st[5];
     bool rc0 = false, negctl = false, skip = false, mutant = false;
     std::string proof, proof_v3;
     size_t n_onepass = 0, n_v3 = 0;
@@ -652,17 +689,19 @@ static arm_view run_arm(const char * self, const std::string & env, const std::s
             cur = n_cases;
         }
         int si = -1;
-        if (sscanf(l.c_str(), "[op] stale %d", &si) == 1 && si >= 0 && si < 4) {
+        if (sscanf(l.c_str(), "[op] stale %d", &si) == 1 && si >= 0 && si < 5) {
             a.st[si].seen = true;
             a.st[si].unsupported = l.find(" unsupported") != std::string::npos;
             a.st[si].exact = l.find(" exact=1 ") != std::string::npos;
         }
         if (l.rfind("[vk-dispatch] op=QSA_TOP_K ", 0) == 0 && l.find(" node=stale") != std::string::npos) {
             const int i = atoi(l.c_str() + l.find(" node=stale") + 11);
-            if (i >= 0 && i < 4) {
-                a.st[i].v3     += l.find(" path=v3 ") != std::string::npos;
-                a.st[i].built  += l.find(" summary=built ") != std::string::npos;
-                a.st[i].reused += l.find(" summary=reused ") != std::string::npos;
+            if (i >= 0 && i < 5) {
+                a.st[i].v3        += l.find(" path=v3 ") != std::string::npos;
+                a.st[i].built     += l.find(" summary=built ") != std::string::npos;
+                a.st[i].reused    += l.find(" summary=reused ") != std::string::npos;
+                a.st[i].buf_new   += l.find(" summary_buf=new ") != std::string::npos;
+                a.st[i].buf_grown += l.find(" summary_buf=grown ") != std::string::npos;
             }
         }
         if (sscanf(l.c_str(), "[op] case %zu", &idx) == 1 && idx < n_cases) {
@@ -803,16 +842,18 @@ int main(int argc, char ** argv) {
     // stage 2: the stale-summary checks (every arm exact; the v3 arms build / reuse the summary as the snapshot demands)
     size_t n_stale_v3_bad = 0;
     bool   stale_op_ok = true;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         for (size_t a = 0; a < n_run; ++a) {
             const stale_view & t = v[a].st[i];
             if (a < 3) { stale_op_ok = stale_op_ok && t.seen && (t.exact || t.unsupported); }
             else       { n_stale_v3_bad += !(t.seen && t.exact); }
         }
-        printf("[op-stale] %d %s: exact off/on/on_all/v3/v3_all %d/%d/%d/%d/%d; v3 arm: v3 dispatches %d, built %d, reused %d; v3_all: %d / %d / %d\n",
-               i, i == 0 ? "gen" : i == 1 ? "nkv" : i == 2 ? "write" : "alt", (int) v[0].st[i].exact, (int) v[1].st[i].exact,
+        printf("[op-stale] %d %s: exact off/on/on_all/v3/v3_all %d/%d/%d/%d/%d; v3 arm: v3 dispatches %d, built %d, reused %d, buf new %d grown %d; "
+               "v3_all: %d / %d / %d / %d / %d\n",
+               i, i == 0 ? "gen" : i == 1 ? "nkv" : i == 2 ? "write" : i == 3 ? "alt" : "grow", (int) v[0].st[i].exact, (int) v[1].st[i].exact,
                (int) v[2].st[i].exact, (int) v[3].st[i].exact, (int) v[4].st[i].exact, v[3].st[i].v3, v[3].st[i].built,
-               v[3].st[i].reused, v[4].st[i].v3, v[4].st[i].built, v[4].st[i].reused);
+               v[3].st[i].reused, v[3].st[i].buf_new, v[3].st[i].buf_grown, v[4].st[i].v3, v[4].st[i].built, v[4].st[i].reused,
+               v[4].st[i].buf_new, v[4].st[i].buf_grown);
     }
     if (v[3].mutant || v[4].mutant) {
         bool op_ok = stale_op_ok;
@@ -939,11 +980,13 @@ int main(int argc, char ** argv) {
     // stage 2: stale checks exact everywhere; the v3 arms dispatch v3 for every stale op and build exactly per snapshot
     size_t n_stale_ok = 0, n_stale = 0;
     if (n_run == n_arms) {
-        const int want_built[4] = { 2, 2, 2, 3 }, want_reused[4] = { 2, 0, 0, 0 }, n_ops[4] = { 4, 2, 2, 3 };
-        for (int i = 0; i < 4; ++i) {
+        const int want_built[5] = { 2, 2, 2, 3, 3 }, want_reused[5] = { 2, 0, 0, 0, 0 }, n_ops[5] = { 4, 2, 2, 3, 3 };
+        for (int i = 0; i < 5; ++i) {
             for (size_t a = 0; a < n_arms; ++a) {
                 const stale_view & t = v[a].st[i];
-                const bool w = a < 3 ? t.v3 == 0 : (t.v3 == n_ops[i] && t.built == want_built[i] && t.reused == want_reused[i]);
+                // grow: the first selection allocates (new), the large one reallocates (grown) - the submit / wait branch
+                const bool wb = i != 4 || (t.buf_new == 1 && t.buf_grown == 1);
+                const bool w = a < 3 ? t.v3 == 0 : (t.v3 == n_ops[i] && t.built == want_built[i] && t.reused == want_reused[i] && wb);
                 n_stale++;
                 n_stale_ok += t.seen && t.exact && w;
                 if (!(t.seen && t.exact && w)) {
