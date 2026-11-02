@@ -1,3 +1,5 @@
+find_package(Threads REQUIRED)
+
 llama_add_compile_flags()
 
 function(llama_build source)
@@ -443,6 +445,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+target_link_libraries(test-backend-ops PRIVATE Threads::Threads) # upstream #31414: explicit thread linkage
 llama_build_and_test(test-qsa-frozen.cpp) # [TAG_QSA_FROZEN] llama-qsa-frozen core (capture / replay) + the LLAMA_QSA_INDEXED_SORT chain, CPU
 llama_build_and_test(test-qsa-relu-inplace.cpp) # [TAG_QSA_RELU_INPLACE] the indexer score ReLU in place vs out of place: bitwise + allocator bytes, CPU
 
