@@ -4083,7 +4083,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 kv_head * row_size);
 
-        emit_tail(ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        emit_tail(ggml_cpy(ctx0, tail, dst));
     } else {
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
         // slot 0 is the final state, slot s the state s tokens back, as llm_build_delta_net_base::build_conv_state
