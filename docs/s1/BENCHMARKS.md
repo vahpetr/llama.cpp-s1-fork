@@ -1,654 +1,87 @@
 # Benchmarks
 
-All numbers are measured on my two boxes, single runs unless a range is given. "vNN" is my image version (one image per fork
-build; v53 = fork `prod-v11-stage6` @ f0fa8ddf1, v54 = v53 + webui and logging changes, v55 = v54 + webui
-changes only, v56 = v55 + webui changes only, v57 = v56 + webui changes only, v58 = v57 + webui
-changes only, v59 = v58 + a server backend-sampling guard and webui changes; same numerics, gated: G6 same-key,
-bit-identical to v58; v60 = v59 + patches 0227-0240, EXACT against v59, see section 0; v61 = v60 +
-patches 0241-0243, EXACT against v60 and the v59 reference, see section 0a; v62 = v61 + patches 0244-0251, numbers = v61,
-section 0b; v63 = v62 + patches 0252-0259, EXACT against the v59 reference, see section 0c; v64 = this tree's HEAD = v63 +
-patches 0262 / 0263 / 0265 and the probabilistic draft sampling of 0252 on in the composes, EXACT on the short gate tier, see
-section 0d). Run-to-run noise on the speed track is about ±1.5 %.
-
-Latest build: **v64 (2026-10-21)**, section 0d (its kernels off vs on in one llama-server A/B: section 2c; the S0.2 server rows
-of v64 are not measured yet). v63 against v62 is section 0c (its llama-server rows against v61: section 2b). v61's numbers against v60 are in section 0a (with the version lineage table at its end),
-the v60-vs-v59 package is section 0, and both have a v61 column below. Sections 1 and 2 are the v52/v53 suite baselines (older,
-slower at depth) with a v61 column where v61 was measured; "not re-measured" marks the rows that need a new server run. The
-llama-server rows on the S0.2 corpus (v59, v61, v63; the same driver and token positions) are sections 2a and 2b; the v64
-kernels A/B on the same corpus is section 2c.
-
-Brain model everywhere below: Qwen3.8-Flash-Next-Uncensored i1-Q4_K_M + MTP draft head (vocab-pruned, see deploy/README.md),
-KV q8_0, one slot, YaRN x4, QSA above 64k, s1 (Ryzen AI Max+ 395, GTT 110 GiB, Vulkan/RADV). Sections 7 and 8 are the
-780M box.
-
-## 0. v60 vs v59 (2026-10-15/16, 1M profile, oracle probe)
-
-Method: my oracle probe, a small libllama program that drives the 1M brain configuration (same model files, flags and env as
-the compose, without the vision projector) through a fixed token corpus and logs the wall time of every operation. Fill rows:
-one continuous cold fill in steps of 65 536 tokens with the MTP draft on; t/s = new tokens / wall of the step. Cold prompt rows:
-cold (not cached) prompts in one fresh process; the 8k prompt is its first operation, 32k and 64k come later. v59 = rev `a1b6c324e` (plus the dump-only patch 0229, so both arms log the same records),
-v60 = rev `845c6fbcd`; same corpus, same argv and env; single runs, the two passes ran about a day apart. Before trusting the
-probe I checked it against llama-server on v59: the fill steps agree within 1.2 % and the whole fill within 0.2 % (section 2a).
-The probe's GTT has no vision projector, so it is not the server's GTT.
-
-| metric | v59 | v60 | v61 (section 0a) | v60 vs v59 | v60 with the f16 mirror off (0240) |
-|---|---|---|---|---|---|
-| fill step 196 608 -> 262 144 | 368.0 t/s | **474.3 t/s** | 491.4 t/s | +28.9 % | 460.7 |
-| fill step 262 144 -> 327 680 | 340.2 t/s | 453.9 t/s | 470.8 t/s | +33.4 % | 443.0 |
-| fill step 458 752 -> 524 288 | 284.1 t/s | **413.2 t/s** | 433.9 t/s | +45.4 % | 399.9 |
-| fill step 983 040 -> 1 048 576 | 194.9 t/s | **328.9 t/s** | 357.1 t/s | +68.7 % | 311.0 |
-| cold fill 0 -> 262k / 0 -> 524k (sum of prefill walls) | 687.3 s / 1 534.6 s | 584.3 s / 1 190.2 s | 572.0 s / 1 153.0 s | -15.0 % / -22.4 % time | 591.2 s / 1 215.7 s |
-| cold fill 0 -> 1 048 576 (sum of 18 prefill walls) | 64.30 min | **43.99 min** | 41.80 min | -31.6 % time (x1.46) | 45.65 min |
-| cold prompt 8k | 503.4 t/s | 548.8 t/s | 550.0 t/s | +9.0 % | 535.3 |
-| cold prompt 32k | 423.0 t/s | **458.6 t/s** | 457.5 t/s | +8.4 % | 445.5 |
-| cold prompt 64k | 335.4 t/s | 357.8 t/s | 357.9 t/s | +6.7 % | 350.6 |
-| step on a restored prefix, 196 608 / 458 752 / 983 040 + 65 536 | 368.2 / 283.6 / 195.0 t/s | 472.8 / 413.1 / 326.0 t/s | 488.4 / 432.3 / 355.6 t/s | +28.4 / +45.7 / +67.2 % | 452.6 / 391.6 / 305.4 |
-| GTT peak, fill pass (probe, no projector) | 104 078 MiB | 104 900 MiB | 104 544 MiB | +822 MiB | 104 121 MiB |
-
-The gain grows with depth: the dense part below 64k gains 5-9.5 %, every QSA step above it more, up to +68.7 % at 1M. The
-f16 mirror alone is worth +2.9 % (->262k) to +5.8 % (->1M) in the back-to-back fill pair and costs 779 MiB.
-
-Server rows, llama-server with the full compose (vision projector loaded):
-
-| metric | v59 | v60 | v61 | v63 (sections 0c, 2b) | v64 (sections 0d, 2c) | source |
-|---|---|---|---|---|---|---|
-| GTT after load | 104 591 MiB | 105 414 MiB (+823) | 105 495 MiB (+81) | 105 495 MiB (= v61; v62 live 105 414 + 81) | 105 495 MiB (= v63 after load; the v63 live level just before the switch was 105 414) | the v60 deploy on 2026-10-16: v59 live just before the switch, v60 after load; later deploys likewise |
-| GTT after the deploy smoke requests | - | 106 032 MiB | 105 519 MiB | 105 519 MiB | 105 519 MiB | each version's deploy smoke; the admission bar is 109 216 |
-| GTT peak over a 1M fill | 105 196 MiB (section 2a) | not measured (at least 106 032 MiB, the after-smoke value) | 105 825 MiB at load, 105 627 over the fill | 105 519 MiB at load, 105 627 over the fill (= v61) | not measured (no S0.2 run on v64 yet) | S0.2 runs, llama-server, corpus tokens-s02: v59 2026-10-15, v61 2026-10-18 (section 2a), v63 2026-10-21 (section 2b) |
-| GTT peak, oracle probe score-capture pass (no projector) | 105 538 MiB | 106 357 MiB (+819) | 106 095 MiB (-262) | 106 095 MiB (= v61) | 106 096 MiB (short gate, score pass) | the gate's maximum; capture buffers, not a serving state |
-| decode at depth (worst of 3 windows, draft on) | 26.07 / 22.10 / 24.38 ms/tok at 32k / 262k / 1M (section 2a) | not measured | 25.83 / 21.04 / 19.92 ms/tok (-0.9 / -4.8 / -18.3 %) | 25.80 / 21.05 / 19.93 ms/tok (= v61, same accepted drafts) | not measured on this basis; live 32k probe 21.3 vs 22.1 ms/tok on v63 (section 0d) | S0.2 runs, llama-server, corpus tokens-s02: v59 2026-10-15, v61 2026-10-18 (section 2a), v63 2026-10-21 (section 2b) |
-| TTFT, 256 new tokens on a 1M history | 2 452 ms median of 3 (2 054 ms warm, section 2a) | not measured | 1 886 ms median of 3 (1 592 ms warm), -23 % | 1 728 ms median of 3 (1 449 ms warm), -8.3 % vs v61 | not measured | S0.2 runs, llama-server, corpus tokens-s02: v59 2026-10-15, v61 2026-10-18 (section 2a), v63 2026-10-21 (section 2b) |
-| cold prompt 128k | 377.9 t/s (section 2a) | not measured | 427.4 t/s (+13.1 %) | 439.8 t/s (+2.9 % vs v61) | not measured; cold 32k / 72k 500.9 / 417.3 t/s vs 467.5 / 385.6 with the v63 kernels (+7.2 / +8.2 %, section 2c) | S0.2 runs, llama-server, corpus tokens-s02: v59 2026-10-15, v61 2026-10-18 (section 2a), v63 2026-10-21 (section 2b) |
-
-Class: EXACT. On my S0.1 oracle (fixed prompts, greedy; every compared position's logits, the saved states and the QSA
-selected ids in order, at verify widths 1-6 in full and the last 6 positions of widths 7-9, depths 8k -> 1M, and restore /
-replay histories) v60 matched v59 bit for bit at all 1 502 compared logit positions and 224 state points. The gate ran on
-gfx1151 with the production configuration minus the vision projector (one slot, a text corpus); it covers the package as a
-whole, not each patch alone, and the B2 tile (0233, off by default) was not in it;
-multi-slot stream offsets were not covered. On the live server after the switch, three fixed requests (a 32k prompt, a chat,
-a needle at 26.7k) gave the same tokens and the same number of accepted drafts as on v59; on the 32k prompt the top-5
-logprobs differed by exactly 0.
-
-Observed and not explained yet: in the probe, state saves were about 1.8x slower on v60 than on v59 (21.4 s vs 11.6 s for the
-15.6 GB state at 1M) while loads and the state size were the same. On llama-server (section 2a, v61 vs v59, same bytes) the save took 0.5 -> 1.4 s at 262k and 3.2 -> 3.9 s at 1M; cause not established.
-
-## 0a. v61 vs v60 (2026-10-17, 1M profile, oracle probe = the gate's fill/full passes)
-
-Method as in section 0, with one difference: these rows come from the EXACT gate's own probe passes (the fill pass and the
-full pass of each gate), not from separate timing runs. v60 = gate of 2026-10-15/16 (rev `845c6fbcd`, fill pass 2026-10-16),
-v61 = gate of 2026-10-17 (rev `7a438f3ba`, fill pass 2026-10-17); same corpus, argv and env; single runs. The v59 and v60
-columns of section 0 were recomputed from the same kind of records with the same extraction and reproduce exactly.
-
-| metric | v60 | v61 | change |
-|---|---|---|---|
-| fill step 65 536 -> 131 072 | 512.2 t/s | 524.4 t/s | +2.4 % |
-| fill step 196 608 -> 262 144 | 474.3 t/s | **491.4 t/s** | +3.6 % |
-| fill step 262 144 -> 327 680 | 453.9 t/s | 470.8 t/s | +3.7 % |
-| fill step 458 752 -> 524 288 | 413.2 t/s | **433.9 t/s** | +5.0 % |
-| fill step 983 040 -> 1 048 576 | 328.9 t/s | **357.1 t/s** | +8.6 % |
-| cold fill 0 -> 262k / 0 -> 524k (sum of prefill walls) | 584.3 s / 1 190.2 s | 572.0 s / 1 153.0 s | -2.1 % / -3.1 % time |
-| cold fill 0 -> 1 048 576 (sum of 18 prefill walls) | 43.99 min | **41.80 min** | -5.0 % time (x1.05; x1.54 vs v59) |
-| cold prompt 8k | 548.8 t/s | 550.0 t/s | +0.2 % |
-| cold prompt 32k | 458.6 t/s | 457.5 t/s | -0.2 % |
-| cold prompt 64k | 357.8 t/s | 357.9 t/s | +0.0 % |
-| step on a restored prefix, 196 608 / 458 752 / 983 040 + 65 536 | 472.8 / 413.1 / 326.0 t/s | 488.4 / 432.3 / 355.6 t/s | +3.3 / +4.6 / +9.1 % |
-| GTT peak, fill pass (probe, no projector) | 104 900 MiB | 104 544 MiB | -356 MiB |
-| GTT peak, score-capture pass (the gate's maximum) | 106 357 MiB | 106 095 MiB | -262 MiB |
-
-The dense range (below 64k) is unchanged within 0.4 %; every QSA step gains, more with depth (+2.4 % at 131k to +8.6 % at
-1M), because both levers work on the indexer, whose cost grows with the pool. All 18 fill steps, v60 -> v61 wall (s):
-14.938 -> 14.881, 57.345 -> 57.475, 112.284 -> 112.250, 127.954 -> 124.964, 133.551 -> 129.088, 138.180 -> 133.356,
-144.386 -> 139.187, 149.070 -> 143.344, 153.853 -> 147.416, 158.620 -> 151.047, 164.056 -> 155.915, 168.396 -> 159.050,
-172.816 -> 162.442, 178.724 -> 166.930, 183.262 -> 171.082, 189.147 -> 176.088, 193.810 -> 179.741, 199.249 -> 183.503.
-
-Kernel level (s1, rev `7a438f3ba`, knob off vs on in one build):
-
-| measurement | off | on | change |
-|---|---|---|---|
-| A2b: QSA_SCORE ms per call at the deployed chunk shape, 16 shapes (pool 16 384-262 144 blocks; f32 rows and f16-mirror forms), the gate's run | | | median ratio 0.877 (min 0.673, max 1.097) |
-| A2b: pool 262 144 blocks, f16-mirror form (the production form at 3+ rows) / f32 rows, the gate's run | 2.929 / 3.870 ms | 2.568 / 2.696 ms | -12.3 / -30.3 % |
-| A2b: pools 98 304-262 144 blocks, gate's run / a second run the same day (medians 0.877 / 0.830) | | | f32 rows -30.3 to -32.2 / -30.2 to -32.5 %; f16 mirror -12.3 to -22.6 / -15.9 to -21.2 % |
-| A2b: pools 16 384-65 536 blocks, gate's run | | | -32.7 to +9.7 % (small calls, mixed) |
-| A3: QSA_TOP_K GPU time, one QSA layer, 64k step -> 262k / -> 524k / -> 1M | 1.834 / 3.757 / 7.616 s | 1.219 / 2.993 / 6.097 s | -33.6 / -20.3 / -20.0 % |
-| A3: selection scratch preallocated (524k test fill) | 258.00 MiB | 32.25 MiB | -225.75 MiB (the cell-form scratch 257 -> 1 MiB) |
-| A3: whole-pass wall inside the gate, prefill 8k / decode-like tails at 262k | | | ratio 0.980 / 0.993 |
-
-Gate section walls (v60 gate vs v61 gate; coarse: they include state hashing and capture I/O, not only compute):
-
-| section | v60 | v61 |
-|---|---|---|
-| arm (logits + states pass) | 116:36 | 115:03 |
-| ids capture | 125:59 | 124:00 |
-| score capture | 200:08 | 196:08 |
-| dispatch log pass | 35:53 | 35:27 |
-| fill pass | 45:48 | 43:35 |
-
-Server rows, llama-server with the full compose (vision projector loaded):
-
-| metric | v60 | v61 | v63 (sections 0c, 2b) | v64 (sections 0d, 2c) | source |
-|---|---|---|---|---|---|
-| GTT after load | 105 414 MiB | 105 495 MiB (+81) | 105 495 MiB (= v61) | 105 495 MiB (= v63) | the v61 deploy on 2026-10-17: v60 live just before the switch, v61 after load; the v63 deploy on 2026-10-21 likewise |
-| GTT after the deploy smoke requests | 106 032 MiB | 105 519 MiB | 105 519 MiB | 105 519 MiB | each version's deploy smoke; the admission bar is 109 216 |
-| GTT peak over a 1M fill | not measured | 105 825 MiB at load, 105 627 over the fill (v59: 105 196 / 105 193) | 105 519 at load, 105 627 over the fill | not measured | S0.2 runs, llama-server, corpus tokens-s02: v59 2026-10-15, v61 2026-10-18 (section 2a), v63 2026-10-21 (section 2b) |
-| decode at depth (worst of 3 windows, draft on) | not measured | 25.83 / 21.04 / 19.92 ms/tok at 32k / 262k / 1M (v59: 26.07 / 22.10 / 24.38) | 25.80 / 21.05 / 19.93 ms/tok (= v61) | not measured on this basis (section 0d: live 32k probe -3.6 %) | S0.2 runs, llama-server, corpus tokens-s02: v59 2026-10-15, v61 2026-10-18 (section 2a), v63 2026-10-21 (section 2b) |
-| TTFT, 256 new tokens on a 1M history | not measured | 1 886 ms median of 3, 1 592 ms warm (v59: 2 452 / 2 054) | 1 728 ms median of 3, 1 449 ms warm (-8.3 / -9.0 %) | not measured | S0.2 runs, llama-server, corpus tokens-s02: v59 2026-10-15, v61 2026-10-18 (section 2a), v63 2026-10-21 (section 2b) |
-| cold prompt 128k | not measured | 427.4 t/s (v59: 377.9) | 439.8 t/s (+2.9 %) | not measured (section 2c: cold 32k +7.2 %, 72k +8.2 % vs the v63 kernels) | S0.2 runs, llama-server, corpus tokens-s02: v59 2026-10-15, v61 2026-10-18 (section 2a), v63 2026-10-21 (section 2b) |
-
-Class: EXACT, the same gate as v60's (section 0) against the same v59 reference: 1 502 logit positions and 224 state points
-identical, ordered selected ids identical; plus an off arm per lever (A2b off, A2b forced onto its fallback with a 4-workgroup
-limit, A3 off) equal to the reference on the short case set. 91 PASS, 4 INFO, 0 FAIL. On the live server after the switch, the
-three fixed requests (a 32k prompt, a chat, a needle) gave the same tokens and accepted drafts as a fresh v60 reference; on the
-32k prompt the top-5 logprobs differed by exactly 0.
-
-### Version lineage on the brain
-
-| version | date | what changed | class vs the previous | disk-cache key |
-|---|---|---|---|---|
-| v52 | 2026-10-09 | graph + allocation-plan cache (decode 524k 23.6 -> 22.2 ms/tok) | EXACT | - |
-| v53 | 2026-10-09 | multi-slot fixes (one-slot behaviour = v52) | one slot = v52 | - |
-| v54 | 2026-10-10 | webui compaction, logs and counters | same numerics | same as v53 |
-| v55-v58 | 2026-10-10/11 | webui only | same numerics | same |
-| v59 | 2026-10-11 | server backend-sampling guard + webui | bit-identical to v58 | same |
-| v60 | 2026-10-16 | patches 0227-0240: prefill kernels (B1, B3, B4, B4c), QSA score epilogue (A1) and f16 pooled-key mirror (A2a), mat-vec hoist (C1), KQ visibility mirror (C2), indexer cell-ext restore (0239) | EXACT (oracle above) | new: adopts the v59 namespace read-only (docs/s1/DEPLOY.md) |
-| v61 | 2026-10-17 | patches 0241-0243: QSA score GEMM key-tile-major dispatch (A2b), QSA select without key rows (A3), test / comment polish | EXACT (section 0a) | same as v60 (the v59 adopt stays) |
-| v62 | 2026-10-19 | contrib 0244-0251 at rev e4af0a6ca: correctness and diagnostics, `--spec-draft-n-ubatch` ships unset | numbers = v61 (section 0b) | same as v61 |
-| v63 | 2026-10-21 | contrib 0252-0259 at rev 8c1a468aa: MUL_MAT_ID skip + prepass tile list (U3), semantic disk checkpoints + `cache_pin` (SC1), checkpoints and MTP draft state in `/slots` files (U5), `--spec-draft-sampling` (U7, ships greedy) | EXACT (section 0c; llama-server rows vs v61 in section 2b) | same as v62 |
-| v64 | 2026-10-21 | contrib 0262 / 0263 / 0265 at rev c5b3462ed: `mul_mat_id` 8-warp tile (G2a), flash-attention shared-memory layouts (FA1), dense GEMM tile table (G1); the composes turn 0252's probabilistic draft sampling on | EXACT on the short gate tier by ruling (section 0d; the deep tripwire the night after re-runs the control arms); kernels A/B in section 2c | same as v63 (slot files too) |
-
-## 0b. v62 (2026-10-19): correctness release, numbers = v61
-
-
-v62 = v61 + patches 0244-0251 (correctness and diagnostics; `--spec-draft-n-ubatch` ships unset). Prefill, decode and fill
-are unchanged by design, so every v61 number below stands for v62. Slot save identity (u1-server-ab, llama-server): the saved
-bytes are identical v61 <-> v62 at 262k and 1M; save 527 -> 549 ms at 262k and 2 269 -> 2 316 ms at 1M (noise band).
-Source: docs/releases/v62-regressions.md in the piagent repo.
-
-## 0c. v63 (2026-10-21): MoE matmul, semantic checkpoints, warm draft after a slot restore
-
-v63 = v62 + patches 0252-0259 (rev `8c1a468aa`): the MUL_MAT_ID padding skip and the tile list from the expert-count prepass
-(0253 / 0254, upstream #25483 / #29998), checkpoints at message boundaries kept on disk plus the `cache_pin` request field
-(0255 / 0256), context checkpoints and the MTP draft state in the `/slots` save file (0257 / 0258, upstream #26004 / #30574),
-slot-file checkpoints kept out of the deep store (0259), and `--spec-draft-sampling` (0252, upstream #27694; ships at its
-default, greedy). Knobs: KNOBS.md, "v63 package".
-
-Class: EXACT. The full S0.1 oracle gate (2026-10-20 11:56 -> 2026-10-21 04:36, 16.7 h, the 1M production configuration minus the
-vision projector, one slot, text corpus) against the v59 reference: 1 502 logit positions and 224 state points identical,
-ordered selected ids identical, with the A2b / A3 off arms as for v61 and a MUL_MAT_ID section (the shipped library has no
-negative-control marker; 22 of 22 skip unit cases pass). 96 PASS, 4 INFO, 0 FAIL. GTT peak of the gate (score-capture pass)
-106 095 MiB, as on v61 (106 095; v60 106 357). Inside the gate the A3 on/off wall ratio on the decode-like tails at 262k is 1.061 (v62: 0.999), but the absolute A3-on tails are unchanged vs v62 (v63/v62 = 1.006; prompt 8k 0.966): the A3-off path got 5.3 % faster with the MUL_MAT_ID skip (0253 / 0254; off arm v63/v62 = 0.947), so the shipped A3-on configuration did not regress, and the release accepted the ratio on that basis.
-
-Images: `vahpetr/llama-cpp-s1-fork:v63` = `:v63k` = `:latest`, `sha256:d16b1cdc9139573f07c380f6a5fc6913866348bb6a121593c2e52c76f538a5d4`; in production since
-2026-10-21 06:32 on the s1 brain and 06:38 on the balkon hands (local build `flash-next:vulkan-v63k`, image id `f82fdd2a4091`).
-
-Measured with llama-server and the full compose on s1 (1M brain profile), one measurement unit on 2026-10-21, single runs; the
-"v62" values come from the v62 image in the same unit. These rows are not comparable to section 2a (other driver and corpus).
-
-| metric | v63 | v62 / reference | note |
-|---|---|---|---|
-| cold fill 0 -> 1 046 528 in 65 536-token steps | 41.6 min | (v61 probe fill 41.8 min, section 0a) | GTT peak 105 659 MiB over the fill |
-| decode band at 1M after restoring a v61-format slot file (greedy, 128 tokens) | 18.62 ms/tok median (worst 19.13), acceptance 0.968 | 18.58 ms/tok (worst 19.20), acceptance 0.968 | same file, same tokens on both: unchanged |
-| decode band at 1M straight after the fill (continuous, greedy) | 24.65 ms/tok median, acceptance 0.723 | not run on v62 | one sample, a different text position from the row above |
-| `/slots` file at 1M | 18.35 GB (+2.6 GiB: checkpoints + draft state) | 15.55 GB (v61 / v62 format) | save 3.7 s; restore 4.1 s (same process and after a restart); the v61-format file restores in 3.8 s (v63) / 4.4 s (v62) |
-| `/slots` restore at 32k | 95 ms (same process), 190-197 ms (new process) | 116 ms (v62 reading the v63 file) | file 910 MB vs 601 MB in the v62 format |
-| decode after a 32k slot restore, 128 tokens | 18.3 ms/tok, acceptance 0.94 (warm draft from the file) | 24.4-33.5 ms/tok, acceptance 0.50-0.62 (cold draft: a v62-format file on v63, or v62 on a v63 file) | the 0257 / 0258 effect; the 0.62 run is on another text |
-| fresh 32k prompt | 69.79 s greedy / 68.98 s pi sampling | 72.85 / 72.07 s | -4.2 / -4.3 %, one sample each |
-| branch turn that diverges after a message boundary, `--cache-disk-ckpt-semantic` 16 vs 0 (one session, 5 turns + 3 branches) | TTFT 1.84 s (643 prompt tokens processed) | 4.86 s at 0 (2 054 processed) | the other two branches: no gain (4.13 vs 4.20 s, 6.15 vs 5.99 s; their RAM checkpoint was within the min step); full turns equal; 8 saves wrote 4 406 vs 4 645 MiB |
-| conversation saved on exit, adopted after a restart (49 070 tokens) | save 785 ms (640 MiB), load 672 ms (1 357 MiB) | - | |
-| MUL_MAT_ID kernel test, q4_K, 2 048 / 512 rows | -8.0 / -20.6 % | v62 | no shape slower; the end-to-end 1M timings of the same probe run (a3-run6) unchanged |
-
-Server rows on the S0.2 corpus (llama-server, the full compose minus the disk cache, corpus tokens-s02, the same driver and
-token positions as the v61 run of 2026-10-18; run of 2026-10-21 08:27-09:29, single runs; the full table is section 2b):
-
-| metric | v61 (2026-10-18) | v63 (2026-10-21) | change |
-|---|---|---|---|
-| cold prompt 128k (first request) / warm repeat | 427.4 / 429.5 t/s | 439.8 / 440.5 t/s | +2.9 / +2.6 % |
-| prefill 72k, two repeats | 377.2 / 377.9 t/s | 384.1 / 385.8 t/s | +1.8 / +2.1 % |
-| fill step ->262k / ->524k / ->1M (65 536 new tokens) | 483.2 / 425.0 / 351.5 t/s | 495.0 / 434.1 / 358.2 t/s | +2.4 / +2.1 / +1.9 % |
-| whole fill 0 -> 1 046 528 (17 steps, bands inside) | 0.70 h | 0.69 h (41.4 min) | -1.4 % time |
-| decode at depth, draft on, worst of 3 windows, 32k / 262k / 1M | 25.83 / 21.04 / 19.92 ms/tok | 25.80 / 21.05 / 19.93 ms/tok | unchanged (same accepted / drafted counts) |
-| serial decode without the draft, 32k / 262k / 1M (restored slots) | 32.69 / 33.33 / 40.65 ms/tok | 32.65 / 33.30 / 40.59 ms/tok | unchanged |
-| TTFT at 1M + 256 new tokens: warm / median of 3 (two after a slot restore) | 1 592 / 1 886 ms | 1 449 / 1 728 ms | -9.0 / -8.3 % |
-| `/slots` save at 32k / 262k / 1M | 0.57 / 3.72 / 14.48 GiB in 0.1 / 1.4 / 3.9 s | 0.96 / 4.71 / 17.09 GiB in 0.1 / 1.7 / 4.0 s | +68 / +27 / +18 % bytes (draft state + checkpoints in the file, 0257 / 0258); +0.3 / +0.1 s |
-| GTT (server, projector loaded): at load / over the fill | 105 825 / 105 627 MiB | 105 519 / 105 627 MiB | -306 / 0 MiB |
-| run wall (= the box's downtime) | 63.5 min | 62.1 min | -2.2 % |
-
-The prefill rows are the MUL_MAT_ID skip (0253 / 0254): +2-3 % wherever a prompt is processed, the same order as the gate arm's
-8k / 32k (+3.5 % vs v62). Decode is unchanged by design (no v63 patch changes the default decode path; `--spec-draft-sampling` ships
-greedy, byte-identical). The TTFT gain is on the prompt side on both the warm and the restored requests (prompt processing 1 439 -> 1 327 ms
-warm, 1 734 -> 1 614 ms restored; the restored-minus-warm penalty stays ~280-290 ms), so it reads as the matmul skip at 256
-rows, not as the warm draft of 0257 / 0258, which pays after the first token (the 32k row above). The slot files grow by the
-draft state and the checkpoints they now carry; the save walls move with the bytes.
-
-`--spec-draft-sampling probabilistic`: functional checks only (at T = 0 the same ids as greedy, T > 0 -> T = 0 -> T > 0,
-cancel, grammar, end of generation); its decode band was not measured, so v63 ships greedy.
-
-Compatibility: same disk-cache key as v62 (both read each other's entries). A v62 server restoring a v63 `/slots` file reads
-the target state and skips the appendices: the restore is correct, but the draft starts cold (32k: 33.5 ms/tok, acceptance 0.50,
-until the draft context warms up again), so a rollback to v62 is safe and only slower for the first rounds after a restore.
-
-## 0d. v64 (2026-10-21): kernel package G2a / FA1 / G1, probabilistic draft sampling on in the composes
-
-v64 = v63 + patches 0262 / 0263 / 0265 (rev `c5b3462ed`, `prod-v11-stage9-pkg3`; ggml-vulkan and tests only, no server
-change): the `mul_mat_id` coopmat1 l tile with 8 warps of 64 x 16 and a 72-byte LDS stride (0262, G2a, RADV only by design),
-the coopmat1 flash-attention shared-memory layouts for dense prefill (0263, FA1: P.V staging aliased onto the softmax staging,
-dead-column V staged per 16-row chunk; 31 -> 21 KiB at head size 256), and a 3-rule dense GEMM tile table for the large
-prefill matmuls (0265, G1: q4_K / q6_K m >= 2048 k >= 2560 -> BM 64 x BN 128, q5_0 m >= 2048 k <= 640 -> BM 128 x BN 64,
-2 warps, LDS pad 4, subgroup 64 pinned). All three on by default; knobs in KNOBS.md, "v64 package". The composes add
-`--spec-draft-sampling probabilistic` (0252, in the code since v63): at T > 0 the MTP draft is sampled and verified by
-rejection sampling, T = 0 is unchanged.
-
-Class: EXACT on the short tier of the S0.1 oracle gate, by my ruling for this release (R133 / R137): the candidate passes of
-the gate (run 2026-10-21 15:26 -> 21:01, the 1M production configuration minus the vision projector, one slot, text corpus)
-are complete and match the v59 reference - 558 logit positions and 81 state points identical, ordered selected ids
-identical, with the score and dispatch captures compared as extra evidence (pooled and score planes identical on the shared
-tags; 3 of 3 required kernels dispatched); the per-lever control arms (A2b off / limited, A3 off: production-eligibility rows,
-not the candidate's check) were cut and belong to the deep tripwire the night after the release (pkg11 full profile, automatic
-rollback to v63 on any difference; not in this text). GTT peak of the gate 106 096 MiB (score pass; v61 / v63 106 095).
-Targeted regressions on top: the byte classifiers of each kernel against the v63 build (G1 48/48 identical on the 780M, 36 of
-them on `_g1`, knob 0 48/48, int8 negative control 0/48; G2a 42/42 + 27/27 + 90/90 duplicate-id / hot-route cases on
-`*_aligned_l_g2a`, pad 4 27/27; FA1 44/44 FNV hashes equal to the pristine build with the knobs on and off), `test-backend-ops`
-MUL_MAT 1139/1139, MUL_MAT_ID 1058/1058, FLASH_ATTN_EXT 5253/5253, the three negative controls (A2b, A3, MUL_MAT_ID skip)
-3/3, and the identity check of the A/B unit (section 2c). On the live server after the switch, three fixed greedy requests
-(a 32k prompt, a chat, a needle at 26.7k) gave the same tokens and accepted drafts as v63; on the 32k prompt the top-5
-logprobs differed by exactly 0. The full oracle (16.7 h) and the pair gate for probabilistic draft sampling return at v67.
-Not covered: multi-slot stream offsets, the probabilistic draft (the gate runs greedy), FA1 under the QSA masks beyond 64k and
-the 72-byte stride on gfx1151 beyond the short case set (the deep tripwire's job).
-
-Images: `vahpetr/llama-cpp-s1-fork:v64` = `:v64k` = `:latest`, `sha256:b3c12a3a7f680d9d1683edbc1b5728b285766618bfacb9aa2159d9eed891ff28`;
-in production since 2026-10-21 22:12 on the s1 brain (local build `flash-next:vulkan-v64`, image id `bb175dd1070a`) and 22:16 on
-the balkon hands (`flash-next:vulkan-v64k`, image id `7e8d8fe2bbe9`). Same disk-cache key as v60-v63 (13 of 13 same-key
-checks, v63 reads v64's entries) and the same slot-file format as v63.
-
-Measured on s1 (1M brain profile, llama-server with the full compose): the A/B unit of section 2c ran one image with the three
-kernel knobs off (= the v63 kernels) and on, before the release; the live probes ran on the production server before and after
-the switch.
-
-| metric | v63 kernels | v64 | change | note |
-|---|---|---|---|---|
-| prefill, fresh 32k prompt (cold, 2 reps per arm) | 467.5 t/s | 500.9 t/s | +7.15 % | section 2c |
-| prefill, fresh 72k prompt (cold, 2 reps per arm) | 385.6 t/s | 417.3 t/s | +8.22 % | above 64k the QSA layers run the indexed path, which FA1 leaves alone |
-| warm-up prompt 66k incl. the pipeline compiles | 367 / 367 t/s | 403 / 399 t/s | +9 % | one per arm visit |
-| node time of one cold 32k request under the perf logger: FLASH_ATTN_EXT / MUL_MAT_ID / G1-eligible MUL_MAT / all | 19.39 / 16.14 / 17.62 / 68.45 s | 16.20 / 15.48 / 16.89 / 63.83 s | -16.5 / -4.1 / -4.1 / -6.8 % | per-node barriers: attribution only |
-| identity across the arms | 32 greedy tokens + top-8 logprobs at 32k, the first token at 72k | identical | PASS | |
-| decode at 32k on the live server, 256 tokens x 3 reps, T = 0 / pi's thinking card / pi's instruct card, both runs with `--spec-draft-sampling probabilistic` | 22.07 / 22.51 / 22.91 ms/tok, acceptance 0.743 / 0.729 / 0.694 | 21.27 / 21.68 / 22.28 ms/tok, the same acceptance | -3.6 / -3.7 / -2.7 % | probe-u7 (fresh 32k history, draft n_max 5, p_min 0.7); the same accepted / drafted counts rep for rep |
-| GTT, llama-server with the vision projector, after load / after the smoke requests | 105 414 MiB live level before the switch (v63 after load: 105 495) | 105 495 / 105 519 MiB | = v63's after-load value | bar 109 216 |
-| the gate's own probe, capture on (not a timing run): cold prompt 8k / 32k | 592.8 / 507.1 t/s (v63 gate) | 596.8 / 509.8 t/s | +0.7 / +0.5 % | with the id / logit captures the observed tensors split the schedule, so the kernel gain hardly shows here; the A/B unit is the timing evidence |
-| 524k profile; S0.2 server rows (128k, the 65k fill steps, decode bands at depth, TTFT at 1M, slot saves) | v63 numbers (sections 0c, 2b) | not measured yet | | the next measurement window |
-
-Probabilistic draft sampling: `--spec-draft-sampling probabilistic` is the compose default since v64 (rulings R134 / R135);
-greedy outputs are unaffected (T = 0 bit-identical; the EXACT gate ran greedy). The live probe above is not an off -> on
-comparison of the flag: the v63 server had been restarted on the already-committed compose, so both runs drafted
-probabilistically and the row shows the kernel package at sampled requests. The off -> on decode comparison at T > 0 and the
-distribution check (the pair gate) are scheduled (v67 / the next measurement window). On the hands the 40-task agent coding
-bench with the flag scored 39/40 (python 20/20, javascript 19/20; the three earlier references 38/40; one run at T 0.7, so
-within noise of the bar, not evidence of a gain), with no early-stopped reply in 40 tasks.
-
-Kernel level on the 780M (balkon, prod env `GGML_VK_DISABLE_MMQ_CM1=1`, `test-backend-ops perf`, 3 rotated rounds, ms per
-node unless stated; the s1 numbers are the node attribution above):
-
-| lever | shapes | base (v63) | v64 | change |
-|---|---|---|---|---|
-| G2a MUL_MAT_ID, uniform router, n 2048 | q4_K 640 x 2560 / q5_0 2560 x 640 / q8_0 2560 x 640 | 23.3 / 25.3 / 24.8 ms | 19.3 / 21.6 / 21.8 ms | -17 / -15 / -12 % (2.9 -> 3.5 TFLOPS on q4_K) |
-| G2a, n 512 | q4_K / q5_0 / q8_0 | | | -20 / -16 / -9 % |
-| G2a, the hands' types, n 2048 | iq3_s / q6_K | | | -17 / -14 % |
-| G2a, skewed routers n 128 ... 2048 | 3 types | | | -10 ... -26 %, no shape slower; pad 4 (the conformant layout) instead of pad 2: -3 ... +2 %, so pad 2 is the lever |
-| FA1 FLASH_ATTN_EXT, q8_0 K/V, visibility mask, nb 2048, interleaved A/B | n_kv 8k / 32k / 64k | | | -12.8 / -18.0 / -16.5 %; nb 1 / 6 unchanged |
-| G1 dense MUL_MAT, kernel us, n 2048 | q4_K 6144 x 2560 / 10240 x 2560 / 12288 x 2560 / 2560 x 6144 | 17 475 / 28 994 / 35 033 / 16 433 | 11 251 / 18 676 / 22 620 / 11 248 | -36 / -36 / -35 / -32 % |
-| G1, n 2048 | q6_K 10240 x 2560; q5_0 10240 x 320 | 29 584; 4 073 | 22 498; 3 568 | -24 %; -12 % |
-| G1, the hc shapes (base tile kept) | q4_K / q6_K 320 x 10240 | | | -2 ... +1 % |
-
-The 780M G1 gains did not transfer shape for shape to gfx1151: under the s1 perf logger the q5_0 10240 x 320 node is -19 %
-and q4_K 2560 x 6144 -8 %, but q4_K 12288 x 2560 is +8 %, 6144 x 2560 +5 % and q6_K 10240 x 2560 +3 % (section 2c); the net
-of the G1-eligible nodes is -4.1 %, and a per-rule re-cut of the table on gfx1151 is an open item.
-
-Hands (780M, `:v64k`, section 7): the deploy smoke right after the restart gave 24.6 t/s on the short chat reply (draft 183/189);
-the v63k reference on a free GPU is 27.8 t/s; a re-measure on a free GPU is pending, and the disk-cache restore check passed
-(a stored 6 214-token entry restored with prompt_n 41).
-
-## 1. 524k profile baseline - suite runs 2026-10-09 21:50 and 2026-10-10 02:30 (image v53; v54-v61 keep these numerics,
-v60/v61 gated EXACT on the 1M oracle; their speed gains at depth are in sections 0 and 0a)
-
-| metric | v53 suite (524k profile) | v61 (1M profile live server, deploy smoke 2026-10-17, and the oracle probe of section 0a) |
-|---|---|---|
-| decode, cold (empty context), mean of code / C# / essay | 61.0 t/s (61.5 / 70.9 / 50.7) | 75.3 t/s on one 116-token chat reply (draft 95/100); not the suite's 3-prompt mean |
-| decode at 27k depth | 57.1-58.2 t/s (draft acceptance 0.95) | 57.2 t/s worst decode window at 26.7k (acceptance 0.954) |
-| decode at 107k depth | 51.6 t/s (acceptance 0.94) | not re-measured |
-| decode at 213k depth | 59.9 t/s (acceptance 0.93) | not re-measured |
-| decode at 524k depth | 22.2 ms/tok = 45 t/s (v52 gate, 2026-10-09) | not re-measured at 524k; S0.2 corpus, worst window: 21.04 ms/tok at 262k, 19.92 at 1M (section 2a) |
-| prefill 8k (synthetic / real text: wiki en, wiki ru, C#, HTML) | 550 / 524-528 t/s | 550.0 t/s (probe, text) |
-| prefill 32k | 450 t/s | 457.5 t/s (probe); 501.3 t/s on the 26.7k smoke prompt |
-| prefill of a 2k chunk at 107k / 213k depth | 407 / 421 t/s | not re-measured (65k steps at 131k / 262k: 524.4 / 491.4 t/s, probe) |
-| cold fill 0 -> 524k | 25.6 min | 19.2 min (1 153.0 s, probe, 1M profile) |
-| 5 parallel short streams, total | 220 t/s | not re-measured (one slot in the 1M profile) |
-| GTT peak | 94 493 MiB = 92.3 GiB | 1M profile: 105 495 MiB after load, 105 519 after the smoke (524k profile not run) |
-| needle in a haystack 32k / 107k / 213k | 2/2, 2/2, 2/2 | 2/2 at 26.7k (smoke); 107k / 213k not re-measured |
-
-Decode at 213k reads faster than at 107k in these runs; the prompts differ in how predictable they are (acceptance), so compare
-depths within one row of section 3 rather than across this table.
-
-## 2. 1M profile - 2026-10-09 (image v52, same numerics as v53), cold fill in 16 steps of 65 536 tokens; v60/v61 fill and step numbers: sections 0 and 0a
-
-| depth | prefill of the step, t/s | decode ms/tok | decode t/s | draft acceptance | GTT MiB | v61 prefill of the step, t/s (oracle probe 2026-10-17, section 0a) |
-|---|---|---|---|---|---|---|
-| 65 536 | 333 | 21.4 | 46.8 | 0.77 | 105 188 | 550.5 / 427.6 / 291.9 (the probe fills 0 -> 8k -> 32k -> 64k) |
-| 131 072 | 435 | 19.5 | 51.2 | 0.81 | 105 193 | 524.4 |
-| 262 144 | 361 | 21.2 | 47.1 | 0.82 | 105 193 | 491.4 |
-| 524 288 | 278 | 22.4 | 44.7 | 0.82 | 105 193 | 433.9 |
-| 786 432 | 227 | 22.1 | 45.3 | 0.85 | 105 193 | 392.6 |
-| 917 504 | 208 | 25.1 | 39.8 | 0.82 | 105 193 | 372.2 |
-| 1 048 320 | 192 | 28.2 | 35.5 | 0.78 | 105 193 | 357.1 (step 983 040 -> 1 048 576) |
-
-Whole fill 0 -> 1M: 1.09 h (v61: 0.70 h both in the probe, section 0a, and on llama-server, section 2a; v63: 0.69 h on llama-server, section 2b; v61 decode on the S0.2
-corpus, worst window, draft on: 21.04 ms/tok at 262k and 19.92 at 1M; server GTT over the v61 fill 105 627 MiB, section 2a). GTT is flat from the first step (102.7 GiB)
-because every compute buffer is reserved at load. No admission waits. Host RSS 3.3-7.5 GiB. The same 1M arm on v47 (2026-10-06): 17.8 t/s at 1M, fill 1.76 h, GTT 106 043 MiB.
-
-## 2a. S0.2 H0 rows: v59 (2026-10-15) and v61 (2026-10-18), llama-server, corpus tokens-s02
-
-Images v59 and v61, 1M brain profile without the disk cache (one slot, vision projector loaded), corpus tokens-s02 (sha256
-e77e4bea67adebe8..., 1 098 504 tokens); the same driver, argv, env and token positions in both runs; single runs (noise
-+-1.5 %). Decode rows are worst-of-3 windows of 128 tokens on a continuous history; they are a baseline on this corpus and not
-comparable 1:1 with the rows of sections 1 and 2 (other text, other acceptance). v60 was not measured this way (it was live
-for one day); v59 -> v61 covers the v60 and v61 packages together.
-
-| row | v59 | v61 | change |
-|---|---|---|---|
-| cold prompt 128k (first request of the process) | 377.9 t/s (warm repeat 378.4) | 427.4 t/s (warm repeat 429.5) | +13.1 % |
-| prefill 72k, two repeats | 346.4 / 348.3 t/s | 377.2 / 377.9 t/s | +8.9 / +8.5 % |
-| fill step ->262k / ->524k / ->1M | 370.1 / 280.7 / 195.1 t/s | 483.2 / 425.0 / 351.5 t/s | +30.6 / +51.4 / +80.2 % |
-| whole fill 0 -> 1 046 528 (17 steps, bands inside) | 1.07 h | 0.70 h | -34.6 % time |
-| TTFT follow-up at 1M, 256 new tokens | 2 054 ms warm; 2 511 / 2 452 ms after a slot restore (median 2 452) | 1 592 ms warm; 1 886 / 1 901 ms after a slot restore (median 1 886) | -22.5 % warm, -23.1 % median |
-| slot save at 32k / 262k / 1M | 0.57 / 3.72 / 14.48 GiB in 0.1 / 0.5 / 3.2 s | 0.57 / 3.72 / 14.48 GiB in 0.1 / 1.4 / 3.9 s | same bytes; +0.9 s at 262k, +0.7 s at 1M |
-| GTT peak (server, projector loaded): at load / over the fill | 105 196 / 105 193 MiB | 105 825 / 105 627 MiB | +629 / +434 MiB |
-| run wall (= prod downtime) | 87.5 min | 63.5 min | -27 % |
-
-Serial decode without the draft versus draft on (ms/tok, worst window). The accepted / drafted counts and the per-round widths
-are identical in the two runs: the same tokens came out, as the EXACT class says.
-
-| depth | no draft v59 | no draft v61 | draft on v59 | draft on v61 | draft acceptance (both) | gain v59 | gain v61 |
-|---|---|---|---|---|---|---|---|
-| 32 768 | 33.07 | 32.69 | 26.07 | 25.83 | 0.817 (223/273) | -21 % | -21 % |
-| 262 144 | 33.76 | 33.33 | 22.10 | 21.04 | 0.800 (264/330) | -35 % | -37 % |
-| 1 046 528 | 42.45 | 40.65 | 24.38 | 19.92 | 0.877 (306/349) | -43 % | -51 % |
-
-v61 vs v59: with the draft -0.9 / -4.8 / -18.3 % at 32k / 262k / 1M, without it -1.1 / -1.3 / -4.2 %. The draft-on path gains
-more at 1M because it runs the QSA indexer more often per emitted token (the sparse MTP draft has its own indexer pass and the
-verify round scores a plane of 5-6 rows); the levers were not isolated one by one here.
-
-Per-round verify width with the draft on (width = sampled token + drafts; identical in both runs):
-
-| depth | share of rounds with width >= 3 | mean width |
-|---|---|---|
-| 32 768 | 41.0 % | 2.73 |
-| 262 144 | 65.8 % | 3.77 |
-| 1 046 528 | 97.4 % | 5.51 |
-
-The slot save is slower on v61 at the same size (262k 0.5 -> 1.4 s, 1M 3.2 -> 3.9 s): the server-side form of the probe's
-state-save slowdown (section 0, last paragraph). Loads were not timed here.
-
-## 2b. S0.2 H0 rows: v61 (2026-10-18) and v63 (2026-10-21), llama-server, corpus tokens-s02
-
-Images v61 and v63, 1M brain profile without the disk cache (one slot, vision projector loaded), corpus tokens-s02 (sha256
-e77e4bea67adebe8..., 1 098 504 tokens); the same driver, argv, env and token positions as the two runs of section 2a; single
-runs (noise +-1.5 %). Decode rows are worst-of-3 windows of 128 tokens on a continuous history. v62 was not measured this way
-(its numbers are v61's by design); v61 -> v63 covers the v62 and v63 packages together. Run of 2026-10-21 08:27:22 -> 09:29:35
-(23 checks, 0 FAIL; the box's production server was down for 62 min 11 s and came back on the same image and key).
-
-| row | v61 | v63 | change |
-|---|---|---|---|
-| cold prompt 128k (first request of the process) | 427.4 t/s (warm repeat 429.5) | 439.8 t/s (warm repeat 440.5) | +2.9 % |
-| prefill 72k, two repeats | 377.2 / 377.9 t/s | 384.1 / 385.8 t/s | +1.8 / +2.1 % |
-| fill step ->262k / ->524k / ->1M | 483.2 / 425.0 / 351.5 t/s | 495.0 / 434.1 / 358.2 t/s | +2.4 / +2.1 / +1.9 % |
-| whole fill 0 -> 1 046 528 (17 steps, bands inside) | 0.70 h | 0.69 h | -1.4 % time |
-| TTFT follow-up at 1M, 256 new tokens | 1 592 ms warm; 1 886 / 1 901 ms after a slot restore (median 1 886) | 1 449 ms warm; 1 728 / 1 746 ms after a slot restore (median 1 728) | -9.0 % warm, -8.3 % median |
-| slot save at 32k / 262k / 1M | 0.57 / 3.72 / 14.48 GiB in 0.1 / 1.4 / 3.9 s | 0.96 / 4.71 / 17.09 GiB in 0.1 / 1.7 / 4.0 s | +0.39 / +0.99 / +2.61 GiB (draft state + checkpoints in the file); +0.3 s at 262k, +0.1 s at 1M |
-| GTT peak (server, projector loaded): at load / over the fill | 105 825 / 105 627 MiB | 105 519 / 105 627 MiB | -306 / 0 MiB |
-| run wall (= prod downtime) | 63.5 min | 62.1 min | -2.2 % |
-
-Serial decode without the draft versus draft on (ms/tok, worst window). The accepted / drafted counts and the per-round widths
-are identical in the two runs (and in the v59 run): the same tokens came out, as the EXACT class says.
-
-| depth | no draft v61 | no draft v63 | draft on v61 | draft on v63 | draft acceptance (both) | gain v61 | gain v63 |
-|---|---|---|---|---|---|---|---|
-| 32 768 | 32.69 | 32.65 | 25.83 | 25.80 | 0.817 (223/273) | -21 % | -21 % |
-| 262 144 | 33.33 | 33.30 | 21.04 | 21.05 | 0.800 (264/330) | -37 % | -37 % |
-| 1 046 528 | 40.65 | 40.59 | 19.92 | 19.93 | 0.877 (306/349) | -51 % | -51 % |
-
-v63 vs v61: decode within +-0.15 % on every row, with and without the draft - unchanged by design (no v63 patch changes the
-default decode path; `--spec-draft-sampling` ships greedy, byte-identical). Per-round verify widths: 41.0 % / 65.8 % / 97.4 % of rounds with width >= 3
-and mean widths 2.73 / 3.77 / 5.51 at 32k / 262k / 1M, identical to section 2a.
-
-Prefill: +2-3 % everywhere a prompt is processed (cold 128k, 72k, every 65k fill step), the MUL_MAT_ID padding skip and the
-prepass tile list of 0253 / 0254 (section 0c); the same order as the gate arm's 8k / 32k (+3.5 % vs v62). The whole 1M fill
-takes 41.4 min on llama-server (41.6 min in the pre-release measurement unit, 40.7 min in the gate probe).
-
-TTFT at 1M + 256 new tokens: -9.0 % warm and -8.3 % after a slot restore. The restored-minus-warm penalty is unchanged (v61
-+293 ms, v63 +280 ms) and the gain sits in the prompt processing on both paths (1 439 -> 1 327 ms warm, 1 734 -> 1 614 ms
-restored), so this row is the matmul skip at 256 rows (the small-m shape where it gains most), not the warm draft that the slot
-file now carries (0257 / 0258): that one pays after the first token (section 0c: 18.3 vs 24-34 ms/tok after a 32k restore).
-
-Slot files: +0.39 / +0.99 / +2.61 GiB at 32k / 262k / 1M (+68 / +27 / +18 %) are the MTP draft state and the context checkpoints
-that the file carries since v63 (0257 / 0258); 17.09 GiB at 1M = the 18.35 GB file of section 0c. The save walls move with the
-bytes (262k 1.4 -> 1.7 s, 1M 3.9 -> 4.0 s); the v59 -> v61 save slowdown of section 2a is still there underneath (loads not
-timed in this run; 4.1 s for the 1M file in section 0c).
-
-## 2c. AB64: the v64 kernels off vs on, one image, llama-server, corpus tokens-s02 (2026-10-21)
-
-One image (`flash-next:vulkan-pkg3-a722925`, rev `a72292533`: the v64 kernels before the G1 r8 fix, which only changed the G1
-proof line's log level and pinned its subgroup size on the host side - the shaders and tiles are those of v64's `c5b3462ed`),
-1M brain profile without the disk cache (one slot, vision projector loaded), corpus tokens-s02 (sha256 e77e4bea67adebe8...,
-1 098 504 tokens). Arm A0 = the four knobs 0 (`GGML_VK_MMID_TILE_G2A=0 GGML_VK_FA_SFPV_ALIAS=0 GGML_VK_FA_V_CHUNK=0
-GGML_VK_DENSE_TILE_G1=0`: the v63 kernels), A3 = all on (the v64 default). Visits A0, A3, A0, A3 for the timings, then A3 and
-A0 under `GGML_VK_PERF_LOGGER=1`; each visit is a fresh server. Cold prompts (`cache_prompt false`, `n_predict 1` plus the
-identity chain): P32 = 32 768 tokens at corpus offset 400 000, P72 = 73 728 tokens at 100 000, after a warm-up prompt of
-66 560 tokens at 900 000 that includes the pipeline compiles. Run 13:59 -> 14:35 (36 min of production downtime), 50 checks,
-0 FAIL. The run's formal verdict was NO-GO because the G1 startup line was missing from the server log (it was an INFO line
-that llama-server drops; the node attribution below shows G1 engaged, and r8 made it a WARN line) - the numbers stand.
-
-| row | A0 (v63 kernels) | A3 (v64) | change |
-|---|---|---|---|
-| prefill 32k, cold, 2 reps | 467.5 t/s (468.5 / 466.5) | 500.9 t/s (504.5 / 497.4) | +7.15 % |
-| prefill 72k, cold, 2 reps | 385.6 t/s (385.8 / 385.5) | 417.3 t/s (422.4 / 412.2) | +8.22 % |
-| warm-up 66k incl. the pipeline compiles, one per visit | 368.5 / 366.6 t/s | 402.9 / 398.7 t/s | +9 % |
-| identity: 32 greedy tokens (the first + 31 chain steps) with top-8 logprobs at 32k; the first token at 72k | reference (within-A0 equal) | identical to A0 | PASS |
-
-Per-node attribution, one cold 32k request per arm under the perf logger (a barrier after every node, so the sums are not a
-timing run; 51 ubatch blocks):
-
-| node class | A0 ms | A3 ms | change | lever |
-|---|---|---|---|---|
-| MUL_MAT_ID (expert GEMMs) | 16 136.8 | 15 480.2 | -4.07 % | G2a |
-| FLASH_ATTN_EXT (dense) | 19 394.5 | 16 201.9 | -16.46 % | FA1 |
-| dense MUL_MAT eligible for the G1 table | 17 620.7 | 16 894.3 | -4.12 % | G1 |
-| other nodes | 15 302.8 | 15 249.5 | -0.3 % | |
-| all nodes | 68 454.9 | 63 825.9 | -6.76 % | |
-
-The three levers touch disjoint ops, so the node deltas attribute the gain; FA1 carries about two thirds of it at 32k. Within
-the G1-eligible set the picture on gfx1151 is mixed (A0 -> A3 ms, count per request): q5_0 10240 x 320 at n 2048 (x1455)
-2 879.8 -> 2 324.0 (-19 %), q4_K 2560 x 6144 (x720) 2 779.4 -> 2 552.3 (-8 %), q4_K 10240 x 2560 (x285) 1 496.8 -> 1 462.5
-(-2 %), but q4_K 12288 x 2560 (x180) 1 181.7 -> 1 278.9 (+8 %), q4_K 6144 x 2560 (x540) 1 571.3 -> 1 656.5 (+5 %) and q6_K
-10240 x 2560 (x270) 1 762.5 -> 1 813.1 (+3 %); the hc shapes (q4_K / q6_K 320 x 10240, base tile by design) -2 %. The 780M
-had every large q4_K shape at -31 ... -38 % (section 0d); a per-rule re-cut of the table for gfx1151 is an open item, the
-package stays because its net is a gain and the bits are identical. Above 64k the QSA layers run the indexed flash-attention
-path, which FA1 leaves alone, so the 72k row carries FA1 on its dense part only; G2a and G1 act on the whole prompt.
-
-## 3. How we got here (same box, same weights)
-
-| build | date | decode cold | prefill 8k | decode 107k | prefill 107k | decode 213k | prefill 213k | notes |
-|---|---|---|---|---|---|---|---|---|
-| stock llama.cpp PR #27742 image | 2026-08-27 | ~24 t/s | 365 t/s (6.5k) | - | - | - | - | IQ4_XS; 17.5 t/s decode at 26k; no MTP head in any GGUF |
-| stock b10689 | 2026-08-30 | 27 t/s | - | - | - | - | - | MTP not supported by the stock converter/loader |
-| v9 (first fork build with MTP) | 2026-09-06 | 49.6 | 386 | - | - | - | - | 5 slots, dense attention |
-| v31-det (dense attention) | 2026-09-09 | - | - | 41.8 | 271 | 29.4 | 167 | depth track, 5 slots |
-| v53 (QSA + sparse draft + graph cache) | 2026-10-09 | 61.0 | 550 | 51.6 | 407 | 59.9 | 421 | 1 slot |
-| v60 (v59 + prefill kernels, QSA score epilogue, f16 pooled-key mirror) | 2026-10-16 | - | 549 (probe) | - | - | - | - | 1 slot; decode at depth not re-measured; 65k fill steps at ->262k / ->524k / ->1M 474 / 413 / 329 t/s, cold fill 0 -> 1M 44.0 min (section 0) |
-| v61 (v60 + QSA score GEMM dispatch A2b, select without key rows A3) | 2026-10-17 | 75.3 (one chat, deploy smoke; not the 3-prompt mean) | 550 (probe) | - | - | - | - | 1 slot; S0.2 corpus (section 2a): decode 47.5 / 50.2 t/s at 262k / 1M (draft on, worst window), 65k fill steps 483 / 425 / 352 t/s on llama-server (491 / 434 / 357 in the probe), cold fill 0 -> 1M 0.70 h |
-| v63 (v62 + MUL_MAT_ID skip U3, semantic checkpoints SC1, draft state and checkpoints in slot files U5) | 2026-10-21 | - | 570 (gate arm) | - | - | - | - | 1 slot; S0.2 corpus (section 2b): decode 47.5 / 50.2 t/s at 262k / 1M (= v61), 65k fill steps 495 / 434 / 358 t/s on llama-server, cold prompt 128k 439.8 t/s, cold fill 0 -> 1M 0.69 h, TTFT at 1M + 256 new tokens 1 449 ms warm / 1 728 ms after a restore |
-
-The stock rows used a different quant (IQ4_XS / UD-Q4_K_XL of the base model), so they are a rough reference, not a paired A/B.
-The paired A/B on the same GGUF (stock b10689 vs v60, n_ctx 262 144 dense) is section 9.
-At depth the gain comes from QSA (sparse attention over 2 051 selected cells per query instead of the whole context); at 1M it is
-the difference between possible and not.
-
-## 4. What single levers were worth (paired gates on s1)
-
-| lever | class | effect | when |
-|---|---|---|---|
-| QSA select without key rows (A3, patch 0243, v61) | exact (gate section 0a) | QSA_TOP_K GPU time per layer -33.6 / -20.3 / -20.0 % at the 64k step -> 262k / -> 524k / -> 1M; selection scratch 258 -> 32 MiB; GTT fill peak -356 MiB | 2026-10-17 |
-| QSA score GEMM key-tile-major dispatch (A2b, patch 0241, v61) | exact (gate section 0a) | QSA_SCORE kernel ms median x0.877 over 16 shapes (f32 rows -30 %, f16 mirror -12 to -23 % at pools 98k-262k); A2b + A3 together: fill step -> 1M +8.6 %, -> 524k +5.0 %, cold fill 0 -> 1M -5.0 % | 2026-10-17 |
-| f16 pooled-key mirror (A2a, patch 0240, v60) | exact | fill step +2.9 % (-> 262k) to +5.8 % (-> 1M), +779 MiB GTT (section 0, last column) | 2026-10-16 |
-| v60 package 0227-0240 as a whole (B1, B3, B4, B4c, A1, A2a, C1, C2) | exact (gate section 0) | fill step -> 262k / -> 524k / -> 1M +28.9 / +45.4 / +68.7 %, cold fill 0 -> 1M 64.3 -> 44.0 min, cold prompt 8k / 32k / 64k +9.0 / +8.4 / +6.7 % | 2026-10-16 |
-| MTP speculative decoding (draft n-max 5, p-min 0.7) vs no draft | output-preserving | 23.4 vs 35.1 ms/tok at 81k, 27.4 vs 39.9 at 524k (profiler on) | 2026-10-09 |
-| sparse MTP draft (`LLAMA_MTP_QSA=1`) | target exact | decode at 524k -18.1 % ms/tok | 2026-10-08 |
-| attention-free draft catch-up (`LLAMA_MTP_CATCHUP_ATTN=0`) | exact | 524k fill -29.6 % | 2026-10-08 |
-| graph + plan cache (`LLAMA_GRAPH_CACHE=8`) | exact | decode at 524k 23.6 -> 22.2 ms/tok (-5.8 %) | 2026-10-09 |
-| incremental QSA census (`LLAMA_QSA_CENSUS_INC=1`) | exact | 524k ms/tok -7.6 %; plan step 5.6 ms -> 38 us | 2026-10-04 |
-| QSA top-k v2 selection | exact | decode +22.8 % at 524k | 2026-10-03 |
-| pooled-key remap without the copy | exact | -8.3 % ms/tok | 2026-10-03 |
-| indexed prefill (`LLAMA_QSA_PREFILL=indexed`) | composition | fill x1.88, GTT -2.9 GiB; accuracy non-inferior, 1 of 339 needles lost in its gate | 2026-10-03 |
-| `amd_iommu=off` (host) | - | +13 % decode, +25 % prefill | 2026-08-27 |
-| GPU DPM pinned high (host) | - | +3 % prefill | 2026-09-07 |
-
-Measured and NOT adopted: int8 coopmat1 MMQ (lowered draft acceptance at 32k/107k), q8_0 draft KV, a throughput-driven draft
-length policy, draft width 3 instead of 5 (+1 %, within noise), `-ub 4096`.
-
-## 5. Two slots give no total throughput
-
-Gate 2026-10-09, two concurrent streams at 393k each (`-np 2`, per-stream KV): each round costs 2.4x a solo round, so the total
-is ~39 t/s vs 46 t/s for one stream (-15 %). Speculative decoding already batches the rows of one context with high expert
-overlap; a second context shares fewer expert reads and adds its own depth work. A second slot is a concurrency feature (two
-agents served at ~0.45x speed each), not a speed-up.
-
-## 6. Disk prompt cache (2026-10-04, image v43)
-
-132k-token chat, 12 turns. Branch after turn 6 (72.5k tokens): rewind to a stored checkpoint and replay 28 tokens in 0.6 s, vs a
-fresh prefill of the same prompt in 209 s; the answer was identical to the fresh reference. New chat with the same system prompt:
-0.7 s. The first conversation copied after another one took the slot: 0.9 s. Entry size ~15 KB/token + 0.3-0.5 GiB fixed;
-loads at 6.8 GB/s cold, 8.8-10 GB/s from page cache. For comparison, re-prefill costs 58 s at 27k, 288 s at 108k, 468 s at 139k.
-
-## 7. Hands box (balkon, Radeon 780M, 96 GB) - Qwen3.8-Flash-Next GSQ-RCO abliterated
-
-| weights | date | decode | prefill | other |
-|---|---|---|---|---|
-| IQ3_XXS-hc8 | 2026-10-07 | 18 t/s | 129 t/s | 40-task agent coding bench 38/40 (Qwen3.6-35B-A3B on the same box: 35/40, decode 31, prefill 343); wall per task 510 vs 632 s |
-| IQ3_XXS-hc8, 400k context | 2026-10-07 | 13.3 t/s | 72.6 t/s | needles at 399k found |
-| IQ3_S-hc8-o8 (the compose) | 2026-10-10 | ~15-16 t/s | ~140 t/s at 1.7k | early end-of-reply P(EOS) 0.001 vs 0.090 on IQ3_XXS-hc8 |
-| IQ3_S-hc8-o8, image v61k (the compose 2026-10-17 to 2026-10-21) | 2026-10-17 | 24.3 t/s on one short chat reply (deploy smoke, draft 183/189) | not re-measured | disk-cache restore of a stored 6 584-token entry: PASS (prompt_n 4, cache_n 6 580); v61's levers act on the QSA indexer above 64k only |
-| IQ3_S-hc8-o8, image v63k `f82fdd2a4091` (the compose 2026-10-21 06:38 to 22:16) | 2026-10-21 | 27.8 / 28.0 / 27.7 t/s on one short chat reply (the smoke request: max_tokens 256, temperature 0, thinking off; 3 runs, free GPU, 06:57; draft 184/186, prompt 189-224 ms); v62k smoke 2026-10-19: 25.8 t/s. The deploy smoke's 20.9 t/s ran next to a GPU test container on the same 780M and is not used | not re-measured | disk-cache restore of the stored 6 584-token entry: PASS (prompt_n 4, cache_n 6 580) |
-| IQ3_S-hc8-o8, image v64k `7e8d8fe2bbe9` + `--spec-draft-sampling probabilistic` (the compose since 2026-10-21 22:16) | 2026-10-21 | 24.6 t/s on the same smoke request right after the restart (draft 183/189); the v63k free-GPU value is 27.8, a free-GPU re-measure is pending. GTT 75 479 MiB after the switch | not re-measured | disk-cache restore of a stored 6 214-token entry: PASS (prompt_n 41, cache_n 6 173); 40-task agent coding bench with the probabilistic draft (T 0.7, thinking off): 39/40 (python 20/20, javascript 19/20; references 38/40), 91 min, no early-stopped reply |
-
-QSA on the 780M at 128k: +48 % prefill, +68 % decode vs dense. `-ub 4096`, forced MMVQ and int8 MMQ: no gain.
-
-## 8. Another model family: Qwen3.6-35B-A3B on the 780M, upstream vs this fork (2026-10-17; fork arm = pkg7, the v60 code; not re-run on v61)
-
-Question: do the generic levers help a model the fork was not built for? Model Qwen3.6-35B-A3B UD-Q4_K_XL (unsloth's file, MTP head included), balkon
-(Radeon 780M, Vulkan/RADV, Mesa 25.2.8, kernel 7.0.0-38), the hands server stopped. All arms: `-c 262144 --parallel 1 -ngl 999 -b 2048 -ub 2048
--t 8 -tb 8 --no-mmap --fit off --cache-ram 0`, no `--cache-disk`, KV f16 and flash attention at upstream's defaults, one slot. Upstream = the official
-image `ghcr.io/ggml-org/llama.cpp:server-vulkan-b10689`, no env. Fork = this tree at the v60 revision (image `flash-next:vulkan-pkg7-845c6fb`).
-Arms and their env, verbatim:
-
-- **fork** (fk; fkc = the same env on the same night as fk0a/fk0b): `GGML_VK_DISABLE_MMQ_CM1=1 GGML_VK_FREE_WAIT_IDLE=1 GGML_ALLOC_GROW_SLACK=10 LLAMA_RESERVE_RUNTIME_SHAPE=1 LLAMA_GRAPH_CACHE=8`
-- **fk0a** (the listed levers off, graph cache off): `GGML_VK_DISABLE_MMQ_CM1=1 GGML_VK_FREE_WAIT_IDLE=1 GGML_ALLOC_GROW_SLACK=10 LLAMA_RESERVE_RUNTIME_SHAPE=1 GGML_VK_MMID_PRECAST_B=0 GGML_VK_MMID_TILE_BM128=0 GGML_VK_FUSE_MULTI_ADD_SCALE=0 GGML_VK_FUSE_SCALE_SILU=0 GGML_VK_FUSE_CONCAT_SSM_CONV=0 GGML_VK_DENSE_TILE_M16=0 GGML_VK_MMVQ_HOIST=0`
-- **fk0b** (every fork-only knob off): `GGML_VK_DISABLE_MMQ_CM1=1 GGML_VK_FREE_WAIT_IDLE=1 GGML_ALLOC_GROW_SLACK=10 LLAMA_RESERVE_RUNTIME_SHAPE=1 GGML_VK_MMID_PRECAST_B=0 GGML_VK_MMID_TILE_BM128=0 GGML_VK_FUSE_MULTI_ADD_SCALE=0 GGML_VK_FUSE_SCALE_SILU=0 GGML_VK_FUSE_CONCAT_SSM_CONV=0 GGML_VK_DENSE_TILE_M16=0 GGML_VK_MMVQ_HOIST=0 GGML_VK_FUSE_GDN_PRE=0 GGML_VK_FUSE_SIGMOID_MUL=0 GGML_VK_FUSE_HC_COMBINE=0 GGML_VK_CONCAT_TRANSPOSE=0 GGML_VK_MMID_COMPACT=0 GGML_VK_DISABLE_HOIST_ROW_IDS=1 GGML_VK_FA_GQA_TOKENS=0 GGML_VK_FA_NO_ZERO_DEAD_V=1 LLAMA_GDN_NO_DIRECT=1 LLAMA_SAMPLER_FASTPATH=0`
-
-`GGML_VK_DISABLE_MMQ_CM1=1` keeps the fork on the same matmul path as upstream (b10689 predates upstream's int8 coopmat1 MMQ).
-MTP-on arms add `draft-mtp` (n-max 3, p-min 0.7); the -bs arms add backend sampling.
-
-Mixed reference: the fork's base is b10664 plus drluoto's branch and a GDN fix, not b10689, so "fork vs upstream" mixes the
-fork's levers with about 25 upstream commits, the drluoto changes and fork-only default kernels. Per-lever attribution comes
-only from fk vs fk0a. fk0b vs upstream bounds what is not a fork knob; some fk0b knobs may also switch off paths upstream has,
-so it is a lower bound, not an upstream equivalent. Gain columns: positive = the first-named build is better (higher t/s,
-lower ms/token).
-
-Cold prefill, t/s, median (MTP off):
-
-| prompt | upstream | fork | fork vs up | fkc | fk0a | fk vs fk0a | fk0b | fk0b vs up | n up/fk/fkc/fk0a/fk0b |
-|---|---|---|---|---|---|---|---|---|---|
-| 8k | 304.1 | 310.7 | +2.2 % | 330.7 | 318.9 | **+3.7 %** | 280.1 | -7.9 % | 3/3/1/1/1 |
-| 32k | 212.9 | 225.1 | +5.7 % | 227.8 | 224.5 | **+1.5 %** | 199.4 | -6.3 % | 3/3/1/1/1 |
-| 72k | 130.7 | 152.6 | +16.8 % | 153.3 | 151.6 | **+1.1 %** | 122.8 | -6.0 % | 3/3/1/1/1 |
-
-The fk vs fk0a column uses fkc (same night as fk0a/fk0b).
-
-Decode right after each cold prefill, ms/token (128 tokens, median over the repeats):
-
-| prompt | upstream | fork | fork vs up | fk0a | fk vs fk0a |
-|---|---|---|---|---|---|
-| 8k | 46.48 | 46.91 | -0.9 % | 46.78 | +0.0 % |
-| 32k | 53.50 | 54.42 | -1.7 % | 54.30 | -0.2 % |
-| 72k | 65.17 | 66.84 | -2.6 % | 66.86 | -0.1 % |
-
-Decode at depth, MTP off, ms/token (median of 3 windows of 128 tokens of one request per depth: n = 1, no noise band):
-
-| depth | upstream | fork | fork vs up | fkc | fk0a | fk vs fk0a | fk0b |
-|---|---|---|---|---|---|---|---|
-| 4k | 49.77 | 46.22 | +7.1 % | 46.39 | 46.13 | -0.6 % | 50.30 |
-| 32k | 56.03 | 54.62 | +2.5 % | 54.48 | 54.54 | +0.1 % | 58.70 |
-| 128k | 85.28 | 84.38 | +1.1 % | - | - | - | - |
-
-Decode at depth, MTP on (draft-mtp n-max 3, p-min 0.7, the multi-row verify path), ms/token, n = 1:
-
-| depth | upstream | fork | fork vs up | draft acceptance up / fork |
-|---|---|---|---|---|
-| 4k | 35.54 | 32.39 | +8.9 % | 0.934 / 0.932 |
-| 32k | 39.48 | 38.17 | +3.3 % | 0.958 / 0.965 |
-| 128k | 69.70 | 75.16 | -7.8 % | 0.924 / 0.890 |
-
-At 128k the fork is 7.8 % slower with a lower draft acceptance, at n = 1. Acceptance is content-dependent and each arm continues
-the conversation with its own generated tokens (the 32k/128k contexts differ by at most 2 x 448 tokens between arms), so this
-row does not separate kernel speed from acceptance; no fk0a MTP arm exists to isolate it.
-
-Backend sampling (`-bs`), MTP off, depth 4k only: upstream 45.51, fork 45.57 ms/token (-0.1 %).
-
-Which fork levers fire on this model (probe: 2k cold prompt + 32 tokens, MTP on, `GGML_VK_FUSION_LIST=1 GGML_VK_DISPATCH_LOG=1`,
-fk vs fk0a):
-
-- B4 `concat_ssm_conv`, B3 `multi_add_scale` and B3 `scale_silu` do not fire on qwen35moe (11 distinct fusions in both arms, none
-  only in one of them).
-- B1 mmid precast fires: 83 staging cpys in fk, 0 in fk0a; the expert GEMMs run `matmul_id_subgroup_q4_k/q6_k_f16_f16acc_aligned_l`
-  in fk vs `matmul_id_subgroup_q4_k/q6_k_f32_f16acc_aligned_m` in fk0a.
-- C1 MMVQ hoist fires: the `mul_mat_vec_*_hoist` pipelines appear in fk only.
-- A1/A2a (QSA; no QSA metadata in the GGUF), C2 (needs `LLAMA_KQ_VIS=1`, set in no arm) and hc_combine (qwen4exp only) do not
-  apply by construction. The graph cache K = 8 is set by env in fk; its proof line does not reach the server log.
-
-Reading per lever class (attribution = fk vs fk0a only, n = 1 per point):
-
-- **B1 (expert GEMM pre-cast + BM128 tile):** fires; the fk vs fk0a prefill gain of +3.7 / +1.5 / +1.1 % at 8k / 32k / 72k is
-  attributed mainly to B1 (fk0a also turns off C1, B4c and the graph cache).
-- **C1 + graph cache (decode, MTP off):** fk vs fk0a at depth -0.6 / +0.1 % (4k / 32k) and +0.0 / -0.2 / -0.1 % right after the
-  prefills: below 1 % (n = 1, no noise band), so neither is measurable on this model. fk0a drops both together, so they are not separated.
-- **B3 / B4:** contribute nothing here because they do not fire.
-- **B4c (m <= 16 tile):** not isolated (there is no fk0a MTP process).
-- The large "fork vs up" prefill gain at 72k (+16.8 %) is mostly not the listed levers (fk vs fk0a +1.1 %); it is the mixed
-  reference. fk0b is -7.9 / -6.3 / -6.0 % vs upstream in prefill; that is a lower bound for the non-knob part, not an
-  upstream-equivalent arm.
-
-Identity (greedy 64 tokens, ignore_eos, top-5 logprobs, ~1k prompt): the generated tokens were IDENTICAL (64/64) in every pair
-(upstream vs fork MTP off and MTP on, fk vs fk0a, fk0a vs fk0b, MTP off vs on in each build). fk vs fk0a: top-5 lists equal at
-64/64 positions, max |delta logprob| 0 (fkc vs fk0a), so the levers do not change the numerics on this 64-token probe. Upstream vs fork (MTP off): top-5
-lists equal at 45/64 positions, max |delta logprob| 1.899 on matching ids; this is a difference between two builds with different
-numerics, reported, not a defect. The fork claims EXACT only for Qwen3.8-Flash-Next against its own previous version; for this
-model it makes no EXACT claim.
-
-GTT peak per process, MiB:
-
-| arm | MTP off | MTP on | -bs |
-|---|---|---|---|
-| upstream | 27 984 | 31 453 | 28 256 |
-| fork | 28 289 | 31 477 | 28 292 |
-
-The fork arms run the A3B-profile allocator env (`GGML_VK_FREE_WAIT_IDLE=1 GGML_ALLOC_GROW_SLACK=10 LLAMA_RESERVE_RUNTIME_SHAPE=1`),
-so this is "A3B profile vs stock", not a like-for-like allocation comparison.
-
-Why these decode numbers are higher than the A3B row in section 7 (decode 31 t/s) and my earlier 31-33 ms/token band for
-this model on this box: those were measured with the MTP draft on (my A3B hands compose: draft-mtp, KV q8_0); in this A/B only the
-MTP-off tables run without the draft, and all arms use KV f16 and contexts up to 128k. The MTP-on rows here are closer (fork at
-4k: 32.39 ms/token, inside the old 31-33 band). It is a different configuration, not a regression.
-
-Evidence: run 20261016T222558Z on balkon; upstream image `ghcr.io/ggml-org/llama.cpp:server-vulkan-b10689` sha256:584ed154…,
-fork image `flash-next:vulkan-pkg7-845c6fb` sha256:d21f904a…, model sha256 55983c5a…; kernel 7.0.0-38, Mesa 25.2.8; 24 driver
-checks and all runbook checks (pinned sums, images, model, argv/env as frozen per arm, hands restore) 0 FAIL.
-
-## 9. Stock llama.cpp b10689 vs this fork (v60), same GGUF, gfx1151, n_ctx 262 144 dense (2026-10-16; holds for v61: its two levers are QSA indexer kernels, which this dense arm never runs)
+Numbers for release v71 (image `flash-next:vulkan-v71`, fork revision `8bcde80da`, `prod-v11-stage9-pkg11`) on s1, plus one
+dated comparison with stock llama.cpp (section 6). Single runs unless reps are given; the speed noise band is about ±1.5 %.
+
+## 1. Setup and method
+
+Host s1: Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB LPDDR5x, GTT 108 GiB (`ttm.pages_limit=28311552`), GPU DPM level
+`high` while busy, kernel 7.0.0-38-generic; Mesa 26.0.8 RADV (`mesa-vulkan-drivers 26.0.8-1ubuntu0.3`) and `libvulkan1`
+1.4.341 inside the image.
+
+Model: `Qwen3.8-Flash-Next-Uncensored.i1-Q4_K_M.gguf` (mradermacher imatrix, 119 150 723 360 B = 110.97 GiB) + mmproj f16
+(0.84 GiB). Draft: MTP head `mtp-Qwen3.8-Flash-Next.Q4_K_M.v65536-v5.gguf`, vocabulary pruned to 65 536 (not published; the
+public setup uses the full-vocabulary head, so decode rows are an upper bound for it); `--spec-type draft-mtp
+--spec-draft-n-max 5 --spec-draft-p-min 0.7 --spec-draft-sampling probabilistic`.
+
+Server flags: the 1M compose (`deploy/s1/docker-compose.brain-1m.yml`): `-c 1048576 --parallel 1 --kv-unified`, `-ctk q8_0
+-ctv q8_0`, `-b 2048 -ub 2048`, `-fa on`, `--rope-scaling yarn --rope-scale 4 --yarn-orig-ctx 262144`, `--qsa-ratio 4` with
+`LLAMA_QSA_MIN_KV=65536` (dense below 65 536 tokens), `-ot per_layer_token_embd=CPU`, `--load-mode mmap --tensor-read-lazy
+auto`, `--ctx-checkpoints 4`, `--cache-disk-async 1024 --cache-disk-incr`; temp 0.7, top-p 0.8, top-k 20, min-p 0, presence
+penalty 1.5, `--reasoning off`; `GGML_VK_DISABLE_MMQ_CM1=1` (int8 MMQ off). Top-k v3, the QSA bias fold and GDN replay run at
+their v71 code defaults on gfx1151 (startup proof lines). The S0.2 runs strip `--cache-disk*` from the compose.
+
+Method:
+
+- **Cold prompt**: one prompt with `cache_prompt` false; t/s of the prompt.
+- **Step → N**: the 65 536-token append that reaches depth N, in one continuous history; t/s of that step.
+- **Fill**: sum of the raw step walls from 0 to the last depth.
+- **Decode**: ms per token with MTP on, worst of 3 windows of 128 tokens at that depth, continuous history, fixed corpus
+  (`tokens-s02`). No-draft decode is the restore path with the draft off.
+- **TTFT**: 256 new tokens after a slot restore of a 1M conversation.
+- **GTT**: `mem_info_gtt_used` of the GPU.
+
+No stock llama.cpp or other-engine numbers were measured on v71.
+
+## 2. S0.2 run 2026-11-04 (llama-server, corpus `tokens-s02`, 1M profile)
+
+| measurement | v71 |
+|---|---:|
+| cold prompt 128k, t/s (first request; warm repeat 584.4) | 580.5 |
+| 72k prompt, probe M2 (range of its reps), t/s | 511.2–512.2 |
+| step 197 070 → 262 606, t/s | 676.9 |
+| step 459 676 → 525 212, t/s | 648.2 |
+| step 983 964 → 1 046 528 (62 564 new tokens), t/s | 585.3 |
+| fill 0 → 1 046 528 (17 steps), min | 27.76 |
+| decode with MTP at 32k / 262k / 1M, ms/token | 24.01 / 19.33 / 17.69 |
+| the same in t/s | 41.6 / 51.7 / 56.5 |
+| draft acceptance at 32k / 262k / 1M | 0.817 / 0.800 / 0.877 |
+| decode without draft (restore path) at 32k / 262k / 1M, ms/token | 31.80 / 32.37 / 39.39 |
+| TTFT, 256 new tokens at 1 046 989 after a restore, median of 3, ms (1 302.9 warm, 1 266.9 / 1 303.6 after restore) | 1 303 |
+| GTT peak over the 1M fill, MiB (admission bar 109 216) | 105 407 |
+| 1M slot file: size / save time | 17.09 GiB / 3.0 s |
+
+Decode at depth depends on how predictable the text is (draft acceptance); on this corpus 1M decodes faster than 32k.
+
+## 3. AB64 run 2026-11-01 (llama-server, cold prompts, 2 reps, arm A3 = the v71 image)
+
+| measurement | v71 |
+|---|---:|
+| cold prompt 32k, t/s (reps 623.41 / 623.58) | 623.5 |
+| cold prompt 72k, t/s | 510.0 |
+| GTT peak over the cold prompts, MiB | 104 739 |
+| greedy identity against the reference arm | PASS |
+
+## 4. Deploy smoke 2026-11-01 (the 1M compose, with the disk cache)
+
+| measurement | v71 |
+|---|---:|
+| GTT after load, MiB | 104 580 |
+| cold prompt 8k (8 192 tokens, n = 1), t/s | 789.1 |
+| short chat (32-token prompt, 116 tokens), t/s | 84.3 |
+| draft accepted / drafted on that reply | 95 / 100 |
+
+## 5. Two slots and the hands box
+
+Two concurrent streams (`-np 2`, per-stream KV) cost 2.4x a solo round each, so the total was 15 % below one stream: speculative
+decoding already batches the rows of one context with high expert overlap, and a second context shares fewer expert reads. A
+second slot is a concurrency feature, not a speed-up.
+
+Hands (Radeon 780M): the v71 hands build (`:v71k`) is not published and has no measurements; the hands run `:v70k`.
+
+## 6. Stock llama.cpp b10689 vs this fork (v60), same GGUF, gfx1151, n_ctx 262 144 dense (2026-10-16)
+
+This is the last stock baseline; it was not re-run on v71.
 
 Run `20261016-203641` on s1. Stock = the official image `ghcr.io/ggml-org/llama.cpp:server-vulkan-b10689` (build 10689 /
 57291f264); fork = the v60 image (845c6fbcd). Same files in every arm: Qwen3.8-Flash-Next-Uncensored i1-Q4_K_M + mmproj f16;
@@ -681,7 +114,7 @@ restore band at 261 120 (the fork reserves the full KV at load). TTFT: median of
 Not comparable:
 
 - 524k and 1M exist only in the fork (QSA + YaRN x4 over the native 262 144 window); stock stops at 262 144. QSA itself is
-  fork-only and off here; the 1M-profile step numbers (474.3 t/s at 196 608 -> 262 144 etc.) are QSA numbers, not these.
+  fork-only and off here; the 1M-profile step numbers above are QSA numbers, not these.
 - MTP needs the fork's sidecar draft GGUF (blk.48 nextn, vocabulary pruned to 65 536); upstream b10689 has no MTP graph.
 - Fork base is b10664 + PR #27742 + drluoto + the GDN fix, not b10689: "fork vs b10689" also contains ~25 upstream commits.
 - YaRN x4 (`--rope-scaling yarn --rope-scale 4 --yarn-orig-ctx 262144`) runs in both arms, as in the committed compose; a stock

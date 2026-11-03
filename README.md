@@ -1,401 +1,137 @@
 # llama.cpp for Strix Halo: Qwen3.8-Flash-Next at 1M context on Vulkan
 
-This is my fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). I tuned it for one machine: an AMD Ryzen AI Max+ 395
-("Strix Halo", Radeon 8060S iGPU, gfx1151) with 128 GB of unified memory, running on **Vulkan (RADV), not ROCm**. A second, smaller
-box with a Ryzen 9 7940HS and a Radeon 780M (RDNA3, 96 GB) serves as the "hands" for parallel coding agents.
+This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) for one machine: an AMD Ryzen AI Max+ 395 ("Strix Halo",
+Radeon 8060S iGPU, gfx1151, 128 GB unified memory) on Vulkan (RADV), not ROCm. The model is Qwen3.8-Flash-Next (`qwen4exp`), a
+177B-parameter MoE with about 6B active parameters per token, an MTP head and vision. Stock llama.cpp runs this model with a
+dense window of at most 262 144 tokens and no working speculative decoding. This fork runs it with a 1 048 576-token context in
+one slot, with sparse attention, MTP drafting and a disk prompt cache. This README describes release v71 (fork revision
+`8bcde80da`, `prod-v11-stage9-pkg11`).
 
-The model is **Qwen3.8-Flash-Next** (`qwen4exp`): a 177B-parameter MoE (125B weights + a 51B n-gram embedding table, ~6B active
-per token, MTP head, vision). Stock llama.cpp runs it at ~24-27 t/s with a dense 262k window and no working speculative
-decoding. This fork runs it with a **1 048 576-token context in one slot at 35-60 t/s decode**, in about 103 GiB of GPU memory.
+## Measured on v71, by context depth
 
-Everything here was measured on my two boxes. Numbers, dates and image versions: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md).
-Deploying it, upgrading and rolling back: [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md). Flags and knobs: [docs/s1/KNOBS.md](docs/s1/KNOBS.md).
+| depth | prefill or step, t/s | decode with MTP, t/s (ms/token) | draft acceptance | TTFT after slot restore |
+|---|---:|---:|---:|---:|
+| 8k | 789.1 (cold prompt) | — | — | — |
+| 32k | 623.5 (cold prompt) | 41.6 (24.01) | 0.817 | — |
+| 128k | 580.5 (cold prompt) | — | — | — |
+| 262k | 676.9 (step) | 51.7 (19.33) | 0.800 | — |
+| 524k | 648.2 (step) | — | — | — |
+| 1M | 585.3 (step) | 56.5 (17.69) | 0.877 | 1 303 ms |
 
-## What v64 adds (2026-10-21)
+GTT after load: 104 580 MiB (admission bar 109 216 MiB). Cold fill 0 → 1 046 528 tokens: 27.76 min (sum of 17 step walls).
+"—" = not measured on v71. Per-run tables and the method: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md).
 
-v64 is v63 plus three kernel patches (0262, 0263, 0265; revision `c5b3462ed`, `prod-v11-stage9-pkg3`) and one compose change:
-v63's `--spec-draft-sampling probabilistic` is now on in every compose that has a draft model. The three kernels are on by their
-defaults (no new environment). All three are host-side tile and shared-memory layout choices for AMD coopmat1 on RADV; the
-per-output math of the shaders is unchanged:
+Measurement setup:
 
-- **0263, FA1: flash-attention shared-memory layouts.** The coopmat1 flash-attention kernel at head size 256 was bound by its
-  LDS footprint on RDNA3 (31 KiB per workgroup = 4 workgroups per WGP while the registers allow more). Two layout changes,
-  both on dense multi-row dispatches only (prefill; decode, verify and the indexed QSA path keep their pipelines): the P.V
-  staging shares the storage of the softmax staging (disjoint lifetimes), and the dead-column V is staged per 16-row chunk;
-  31 -> 21 KiB, 4 -> 6 workgroups per WGP. Knobs `GGML_VK_FA_SFPV_ALIAS`, `GGML_VK_FA_V_CHUNK`.
-- **0262, G2a: the expert-GEMM tile with 8 warps.** v60's B1 `mul_mat_id` tile (BM 128 x BN 64; q4_K / q5_0 / q8_0 / q6_K /
-  iq3_s experts) runs 8 warps of 64 x 16 instead of 4 warps of 64 x 32, with an LDS row pad of 2 instead of 4 (a 72-byte
-  stride: conflict-free but not 16-byte aligned, so RADV only; `GGML_VK_MMID_TILE_G2A_PAD=4` is the conformant layout). Same
-  fragments, same K loop, same bits. Knob `GGML_VK_MMID_TILE_G2A`; startup line `mmid_tile_g2a: on (...)`.
-- **0265, G1: a tile table for the large dense GEMMs.** Three rules pick a 2-warp tile for the dense coopmat1 matmuls of a
-  prefill ubatch (q4_K / q6_K with m >= 2048 and k >= 2560 -> BM 64 x BN 128; q5_0 with m >= 2048 and k <= 640 -> BM 128 x BN
-  64; LDS pad 4, subgroup 64 pinned); the hyper-connection shapes (m = 320) stay on the base tile. Knob
-  `GGML_VK_DENSE_TILE_G1`; startup line `dense_tile_g1: table on (3 rules) (...)`.
-- **0252 on by default: probabilistic draft sampling.** At T > 0 the MTP draft is sampled at the request's temperature and
-  verified by rejection sampling; a T = 0 request is unchanged (greedy, bit-identical). The composes carry
-  `--spec-draft-sampling probabilistic`; the code is v63's.
+- Host s1: Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB LPDDR5x, GTT 108 GiB (`ttm.pages_limit=28311552`), GPU DPM level
+  `high` while busy, kernel 7.0.0-38-generic, Mesa 26.0.8 RADV and Vulkan loader 1.4.341 inside the image.
+- Image `flash-next:vulkan-v71` (rev `8bcde80da`), llama-server, the 1M compose of `deploy/s1/` without `--cache-disk*`.
+- Weights: Qwen3.8-Flash-Next-Uncensored i1-Q4_K_M (mradermacher, 110.97 GiB) + mmproj f16. Draft: the MTP head pruned to a
+  65 536-token vocabulary (not published); the public setup uses the full-vocabulary head, so the decode column is an upper
+  bound for it.
+- `-c 1048576 --parallel 1`, KV q8_0, `-b 2048 -ub 2048`, flash attention on, YaRN x4 over 262 144, QSA ratio 4 from 65 536
+  tokens (dense below), MTP `n-max 5`, `p-min 0.7`, probabilistic draft sampling; temp 0.7, top-p 0.8, top-k 20, reasoning off.
+- Cold prompt = one prompt with `cache_prompt` false (8k: one deploy smoke prompt; 32k: 2 reps; 128k: the first request).
+- Step = the 65 536-token append that reaches the depth; t/s of that step. Fill = sum of the step walls.
+- Decode = ms per token, worst of 3 windows of 128 tokens, continuous history, draft on, fixed text corpus. Decode speed depends
+  on draft acceptance, which depends on the text.
+- TTFT = 256 new tokens after restoring a saved 1M conversation, median of 3.
+- Single runs; noise band about ±1.5 %.
+- No stock llama.cpp or other-engine numbers were measured on v71; the only cross-engine number is the dated v60 stock comparison.
 
-Gate: the short tier of my S0.1 oracle (1M production configuration minus the vision projector, one slot, text corpus) by
-ruling, not the full 16.7 h run of v63: the candidate passes are complete and EXACT against the v59 reference (558 logit
-positions and 81 state points identical, ordered selected ids identical; the score and dispatch captures compared as extra
-evidence), the per-lever control arms were cut and re-run by the deep tripwire the night after the release (with an automatic
-rollback to v63 on any difference; its result is not in this text). On top of it: each kernel's byte classifier against the
-v63 build (G1 48/48, G2a 42/42 + 27/27 + 90/90 duplicate-id / hot-route cases, FA1 44/44 hashes), `test-backend-ops` (MUL_MAT
-1139/1139, MUL_MAT_ID 1058/1058, FLASH_ATTN_EXT 5253/5253), three negative controls, and the identity check of the A/B unit
-below (32 greedy tokens with top-8 logprobs at 32k, the first token at 72k, kernels off vs on). The full oracle and the
-pair gate for probabilistic draft sampling return at v67. Same disk-cache key as v60-v63: an install on v63 switches by
-changing the image and the compose. Release notes: [docs/s1/RELEASE-NOTES.md](docs/s1/RELEASE-NOTES.md).
+## Against upstream and other Strix Halo engines
 
-1M brain profile, llama-server with the full compose on s1, one A/B unit on 2026-10-21 on one image (the v64 kernels switched
-off = the v63 kernels, and on = the v64 default; BENCHMARKS.md section 2c), plus the live probes around the switch:
+Their numbers are their published ones (date, quant, context as they state); nothing below was re-measured on v71.
 
-| metric | v63 kernels | v64 kernels | change | method |
-|---|---|---|---|---|
-| prefill, fresh 32k prompt | 467.5 t/s | **500.9 t/s** | +7.15 % | 2 reps per arm, cold (`cache_prompt false`) |
-| prefill, fresh 72k prompt | 385.6 t/s | **417.3 t/s** | +8.22 % | 2 reps per arm; above 64k the QSA layers run the indexed path, which FA1 leaves alone |
-| warm-up prompt 66k (incl. the pipeline compiles) | 367 t/s | 401 t/s | +9 % | one per arm visit |
-| node time, one cold 32k request under the perf logger: FLASH_ATTN_EXT / MUL_MAT_ID / G1-eligible MUL_MAT / all nodes | 19.39 / 16.14 / 17.62 / 68.45 s | 16.20 / 15.48 / 16.89 / 63.83 s | -16.5 / -4.1 / -4.1 / -6.8 % | per-node barriers: attribution, not a timing run; the three levers touch disjoint ops |
-| identity, kernels off vs on | 32 greedy tokens + top-8 logprobs at 32k, the first token at 72k | identical | PASS | within-arm and cross-arm |
-| decode at 32k, 256 tokens, live server, a neutral (T = 0) sampler / pi's thinking card / pi's instruct card, both runs with `--spec-draft-sampling probabilistic` | 22.07 / 22.51 / 22.91 ms/tok | 21.27 / 21.68 / 22.28 ms/tok | -3.6 / -3.7 / -2.7 % | probe-u7, 3 reps each, before (v63 image) and after the switch; the same accepted / drafted counts rep for rep |
-| GTT, llama-server with the vision projector, after load | 105 414 MiB (v63 live level just before the switch) | 105 495 MiB (105 519 after the smoke requests) | +81 MiB; = v63's own after-load value | deploy smoke; bar 109 216 |
-| hands (780M, `:v64k`), one short chat reply | 27.8 t/s (v63k, free GPU) | 24.6 t/s (the deploy smoke right after the restart) | re-measure pending | 40-task coding bench with the probabilistic draft: 39/40 (reference 38/40) |
+| engine | backend | max context on a 128 GB box | prefill vs ours | decode vs ours | source / date |
+|---|---|---|---|---|---|
+| stock llama.cpp b10689, same GGUF | Vulkan | 262 144 (dense); no working MTP for this model | ours (v60) +46 % on a cold 32k prompt | ours (v60) +49 % at 261k, MTP off on both | measured by us, 2026-10-16 (last stock baseline) |
+| Strata (Niko1221/Strata, open) | HIP / CUDA, Strix Halo port, int8 KV | ≤ 131k | ×1.8–2 ours at 8k–128k (≈ 1 160–1 320 t/s flat, 4-bit) | parity (IQ4_XS 53–54 t/s at 8k, 51 at 128k) | their Linux Strix Halo numbers, 2026-10 |
+| halogen-flash-server (closed) | HIP | below 1M (exact limit not checked) | ≈ ×3 ours | parity | their numbers, as of 2026-10-11 |
+| Nathan/halo-box | Vulkan fork | not checked | ≈ ×1.7–1.9 ours at ≤ 32k | not checked | read 2026-10-28, before its GEMM loaders were ported here in v68 (+12 % here); not re-compared |
 
-On the probabilistic draft: `--spec-draft-sampling probabilistic` is the compose default since v64 (my rulings R134 / R135);
-greedy outputs are unaffected (T = 0 is bit-identical; the EXACT gate ran greedy). The decode-at-32k row above is not an
-off -> on comparison of the flag: both probes ran with the flag on (the v63 server had been restarted on the already-committed
-compose before the switch), so it shows the kernel package at sampled requests only. The off -> on decode comparison at T > 0
-and the distribution check (the pair gate) are scheduled (v67 / the next measurement window); the hands' 40-task coding bench
-holds 39/40 with the flag. The S0.2 server rows (section 2b's basis: 128k, the 65k fill steps, decode bands at depth, TTFT at
-1M) are not measured on v64 yet.
+## What this fork is for
 
-## What v63 adds (2026-10-21)
+- 1M-token context in one slot on a 128 GB Strix Halo; the engines above stop at 128k–262k.
+- QSA sparse attention with a bit-exact top-k: the model's own indexer, verified against the dense path by an oracle gate.
+- Decode that does not slow down with depth: 1M decodes at least as fast as 32k (table above).
+- A disk prompt cache that resumes a 1M conversation in the TTFT above instead of a full re-prefill (fill time above).
+- MTP speculative decoding on Vulkan.
+- Vulkan/RADV only: stock Mesa, no ROCm.
 
-v63 is v62 plus eight patches (0252-0259), revision `8c1a468aa`. Every new flag runs at its default, so the composes do not
-change:
+Short-context prefill is below Strata and halogen (×0.5–0.7 of theirs); the fork optimises depth, not the 8k–32k range.
 
-- **0253 / 0254: MUL_MAT_ID work skip and the prepass tile list** (upstream #25483 / #29998). In an expert matmul tile, the
-  invocations and coopmat warps whose B columns are not rows of the expert skip their loads and multiply-adds, and the matmul_id
-  shaders read their (expert, tile) list from the expert-count prepass instead of a binary search. EXACT; the MUL_MAT_ID kernel
-  test on q4_K is -8.0 / -20.6 % at 2 048 / 512 rows, no shape slower.
-- **0255 / 0256: semantic deep checkpoints and `cache_pin`.** The disk cache keeps recurrent checkpoints at message boundaries
-  (user turn starts, the end of the system prompt, of a tool result, of a turn's input) on top of the depth schedule
-  (`--cache-disk-ckpt-semantic`, default 16), so a branch after such a boundary restores close to it; a request can pin one
-  checkpoint per conversation with `cache_pin: {"tokens": N}`.
-- **0257 / 0258: context checkpoints and the MTP draft state in `/slots` save files** (upstream #26004 / #30574). A restored
-  slot drafts warm instead of starting with an empty draft context. A 1M slot file restores in 4.1 s (18.35 GB, +2.6 GiB for
-  the checkpoints and the draft state); after a 32k restore, decode runs at 18.3 ms/tok with the warm draft against 24-34 ms/tok
-  with a cold one.
-- 0259: checkpoints restored from a slot file never enter the disk cache's deep store or become a pin.
-- **0252: `--spec-draft-sampling greedy|probabilistic`** (upstream #27694): at T > 0 the draft can be sampled and verified by
-  rejection sampling. It ships at its default, greedy (byte-identical to v62); its decode band is not measured yet.
+## What is in it
 
-The package is EXACT under the full S0.1 oracle gate (16.7 h, finished 2026-10-21 04:36; the 1M production configuration minus
-the vision projector, one slot, text corpus): bit-identical to the v59 reference at 1 502 logit positions and 224 state points,
-ordered selected ids identical, the A2b / A3 off arms and a MUL_MAT_ID section as well; 96 PASS, 4 INFO, 0 FAIL. The disk-cache
-key is v62's (and v60's / v61's): an install on v62 switches by changing the image. A v62 server restores a v63 slot file
-correctly but with a cold draft, so a rollback to v62 is safe and only slower for the first rounds after a restore.
-Release notes: [docs/s1/RELEASE-NOTES.md](docs/s1/RELEASE-NOTES.md).
+- QSA sparse attention: the indexer picks 2 051 cells per query in the 12 full-attention layers; fused top-k select (v3 on
+  gfx1151), indexed flash attention, persistent pooled-key cache, incremental census; dense below 65 536 tokens.
+- GDN commit-by-replay: after a speculative verify the Gated-DeltaNet state is committed by replaying the accepted tokens
+  instead of keeping one state plane per draft position; default on gfx1151, off elsewhere.
+- MTP speculative decoding: the MTP head drafts on Vulkan, sparse at depth; probabilistic draft sampling; trimmed host phase
+  per round (`LLAMA_SPEC_OVERLAP=1`).
+- Graph and allocation-plan cache between decode steps.
+- Flat memory: compute buffers reserved at load, KQ mask from cell metadata, GTT admission that delays a prefill chunk instead
+  of overrunning GTT.
+- Disk prompt cache with recurrent checkpoints, asynchronous and incremental saves, restore instead of re-prefill.
+- Vulkan kernels for RDNA3/RDNA3.5 coopmat1: MoE `mul_mat_id` tiles and loaders, dense GEMM tile table, flash-attention
+  layouts, QSA score epilogue, hyper-connection and GDN fusions.
+- Hands profile for the Radeon 780M (gfx1103): five slots, IQ3_S experts with Q8_0 hyper-connection and head weights.
+- webui for long agent sessions: auto-compaction, continuation from the stop point, per-chat reasoning levels, timing per reply.
 
-1M brain profile, llama-server with the full compose on s1, one measurement unit on 2026-10-21, single runs; the v62 values come
-from the v62 image in the same unit (BENCHMARKS.md section 0c; not comparable to the S0.2 rows of section 2a):
-
-| metric | v62 | v63 | change |
-|---|---|---|---|
-| decode after a 32k `/slots` restore, 128 tokens | 24.4-33.5 ms/tok, acceptance 0.50-0.62 (cold draft) | **18.3 ms/tok, acceptance 0.94** | warm draft from the file |
-| decode band at 1M after restoring the same v61-format slot file | 18.58 ms/tok, acceptance 0.968 | 18.62 ms/tok, acceptance 0.968 | unchanged |
-| `/slots` file at 1M | 15.55 GB | 18.35 GB | save 3.7 s, restore 4.1 s |
-| cold fill 0 -> 1M, 65 536-token steps | (v61 probe: 41.8 min) | 41.6 min | GTT peak 105 659 MiB over the fill |
-| fresh 32k prompt, greedy / pi sampling | 72.85 / 72.07 s | 69.79 / 68.98 s | -4.2 / -4.3 %, one sample each |
-| branch turn after a message boundary, TTFT, `--cache-disk-ckpt-semantic` 0 vs 16 | 4.86 s | **1.84 s** | one branch of three; the other two unchanged |
-| GTT, llama-server with the vision projector, after load | 105 414 MiB | 105 495 MiB | +81 MiB; bar 109 216 |
-
-Server rows on the S0.2 corpus (llama-server, the same driver and token positions as the v61 run; 2026-10-21, single runs; BENCHMARKS.md section 2b), v61 -> v63: cold prompt 128k 427.4 -> 439.8 t/s (+2.9 %), 65k fill steps ->262k / ->524k / ->1M 483 / 425 / 352 -> 495 / 434 / 358 t/s (+2 %), cold fill 0 -> 1M 0.70 -> 0.69 h; decode at depth 25.80 / 21.05 / 19.93 ms/tok at 32k / 262k / 1M (= v61, same accepted drafts); TTFT at 1M + 256 new tokens 1 592 -> 1 449 ms warm and 1 886 -> 1 728 ms median after a slot restore (-8 %, on the prompt side); slot file at 1M 14.48 -> 17.09 GiB (+18 %: draft state + checkpoints), save 3.9 -> 4.0 s; server GTT over the fill 105 627 MiB (= v61).
-
-## What v62 adds (2026-10-19)
-
-v62 is v61 plus patches 0244-0251, a correctness and diagnostics release: a flash-attention Q8_0-K out-of-bounds read
-(upstream #29988), TOP_K (#30107), an in-place mul_mat stride (#28956), state-restore hardening, server slot fixes, the
-`GGML_VK_BUF_LOG` knob and `--spec-draft-n-ubatch` (shipped unset). It passed the short oracle gate and the full oracle tripwire
-the night after, both EXACT; the 1M brain is bit-identical to v61 and every v61 number stands for v62 (BENCHMARKS.md section 0b).
-Same disk-cache key as v61.
-
-## What v61 adds (2026-10-17)
-
-v61 is v60 plus three patches. Two are speed levers for the QSA indexer at depth, both on by default (no compose change):
-
-- **0241, A2b: pooled-key reuse in the indexer score GEMM.** A 128-query prefill chunk is four query tiles. v60 streamed the
-  whole pooled-key store once per query tile; v61 numbers the score GEMM's workgroups key-tile-major, so the four workgroups
-  that read the same tile of keys are dispatched back to back and the later ones usually find it in cache (an observed
-  effect; the bits do not depend on it). Each workgroup runs the same per-tile program as before, so every output bit is
-  unchanged. Knob `GGML_VK_QSA_SCORE_KREUSE` (coopmat1 devices).
-- **0243, A3: top-k select without key rows.** The select pass over the score plane no longer writes and re-reads a key row
-  per (row, cell); it computes the key from the score bits and the cell visibility with integer instructions. This also removes
-  the key region from the selection scratch (258 -> 32.25 MiB preallocated in a 524k test). Knob `GGML_VK_QSA_TOPK_NOKEYS`.
-- 0242: a test fix (a private temp dir per run) and comment wording; no code change.
-
-The package is EXACT, gated the same way as v60: on gfx1151 with the 1M production configuration minus the vision projector,
-one slot, my S0.1 oracle corpus (text), v61 matched the v59 reference bit for bit (logits at 1 502 positions, 224 state
-points, ordered selected ids, restore / replay histories); with A2b off, A2b forced onto its fallback (a 4-workgroup limit)
-and A3 off, the short case set matched the same reference. 91 checks PASS, 4 INFO, 0 FAIL (13 h 35 min wall, 13 h 21 min of sections). The state format
-and the disk-cache key are v60's: an install on v60 switches by changing the image (the v59 adopt line, if you have it, stays
-as it is).
-Release notes: [docs/s1/RELEASE-NOTES.md](docs/s1/RELEASE-NOTES.md).
-
-1M brain profile, i1-Q4_K_M + MTP draft, KV q8_0, one slot, v60 -> v61:
-
-| metric | v60 | v61 | change | method |
-|---|---|---|---|---|
-| prefill of the 65 536-token step ending at 262k / 524k / 1M | 474.3 / 413.2 / 328.9 t/s | **491.4 / 433.9 / 357.1 t/s** | +3.6 / +5.0 / +8.6 % | oracle probe, continuous cold fill, draft on |
-| cold fill 0 -> 1M | 44.0 min | **41.8 min** | -5.0 % time | oracle probe, sum of 18 prefill steps |
-| cold prompt 8k / 32k / 64k | 548.8 / 458.6 / 357.8 t/s | 550.0 / 457.5 / 357.9 t/s | +0.2 / -0.2 / +0.0 % | oracle probe; dense range, not touched by the levers |
-| step on a restored prefix, -> 262k / -> 524k / -> 1M | 472.8 / 413.1 / 326.0 t/s | 488.4 / 432.3 / 355.6 t/s | +3.3 / +4.6 / +9.1 % | oracle probe |
-| GTT peak, oracle probe (no projector) | 106 357 MiB | 106 095 MiB | -262 MiB | the gate's score-capture pass; admission bar 109 216 |
-| GTT peak, oracle probe fill pass | 104 900 MiB | 104 544 MiB | -356 MiB | the gate's fill pass |
-| GTT, llama-server with the vision projector, after load | 105 414 MiB | 105 495 MiB (105 519 peak after the smoke requests) | +81 MiB | deploy smokes, 2026-10-16 / 2026-10-17 |
-| decode at depth (draft on, worst window) / TTFT at 1M + 256 new tokens / server GTT over a 1M fill | not measured on v60; v59: 26.07 / 22.10 / 24.38 ms/tok, 2 452 ms, 105 196 MiB | 25.83 / 21.04 / 19.92 ms/tok at 32k / 262k / 1M; 1 886 ms median (1 592 warm); 105 825 MiB at load, 105 627 over the fill | vs v59: -0.9 / -4.8 / -18.3 %; -23 %; +434 MiB | llama-server S0.2 rows, corpus tokens-s02, 2026-10-15 (v59) and 2026-10-18 (v61), BENCHMARKS section 2a |
-
-Kernel level, s1: the A2b score GEMM per call at the deployed chunk shape, 16 shapes (pool 16 384-262 144 blocks, key forms
-f32 rows and f16 mirror), median time ratio on/off 0.877 (0.673-1.097) in the gate's run; at pools of 98 304 blocks and more
--30 to -32 % on f32 rows and -12 to -23 % on the f16 mirror (the production form). The
-A3 select of one QSA layer for the 64k step ending at 262k / 524k / 1M: 1.834 -> 1.219 / 3.757 -> 2.993 / 7.616 -> 6.097 s.
-The probe rows are single runs, the v60 and v61 passes a day apart; the dense rows (8k-64k) moved within 0.4 %.
-Server-side rows (llama-server, the S0.2 corpus, the same driver and positions) exist for v59 and v61, not for v60: cold prompt
-128k 377.9 -> 427.4 t/s, fill 0 -> 1M 1.07 -> 0.70 h, decode with the draft 26.07 / 22.10 / 24.38 -> 25.83 / 21.04 / 19.92 ms/tok
-at 32k / 262k / 1M with the same accepted-draft counts, TTFT at 1M 2 452 -> 1 886 ms; docs/s1/BENCHMARKS.md section 2a.
-
-## What v60 adds (2026-10-16)
-
-v60 is v59 plus fourteen patches (0227-0240) aimed at prefill on this GPU, mostly at depth: fused hyper-connection tails and a
-GDN conv input without the concat pass, MoE expert GEMMs with a one-time f16 cast of the activations and a larger tile, a
-16 x 16 tile for the m = 4 hyper-connection inject, the QSA indexer score as one op with an f16 mirror of its pooled keys, a
-mat-vec that unpacks the weights once per row for the speculative verify widths, and a device-resident KQ visibility mirror.
-The package is EXACT against v59, as a whole: gated on gfx1151 with the 1M production configuration minus the vision
-projector, one slot, on my S0.1 oracle corpus (text), it gave bit-identical logits, saved states and ordered selected ids,
-including restore / replay histories, at verify widths 1-6 in full and the last 6 positions of widths 7-9; this is no claim
-for other model families, and not a claim of equality with upstream. The B2 tile (0233) is built but off by default and was
-not part of the gated configuration. One defect is
-fixed (0239: a restored conversation with images lost the image tokens' positions in the indexer cache); because of it the
-saved-state format changed, so v60 has a new disk-cache key and adopts the v59 cache read-only (DEPLOY.md, section 4).
-Release notes: [docs/s1/RELEASE-NOTES.md](docs/s1/RELEASE-NOTES.md).
-
-1M brain profile, i1-Q4_K_M + MTP draft, KV q8_0, one slot, v59 -> v60:
-
-| metric | v59 | v60 | change | method |
-|---|---|---|---|---|
-| prefill of the 65 536-token step ending at 262k / 524k / 1M | 368.0 / 284.1 / 194.9 t/s | **474.3 / 413.2 / 328.9 t/s** | +28.9 / +45.4 / +68.7 % | oracle probe, continuous cold fill, draft on |
-| cold fill 0 -> 1M | 64.3 min | **44.0 min** | -31.6 % time | oracle probe, sum of 18 prefill steps |
-| cold prompt 8k / 32k / 64k | 503.4 / 423.0 / 335.4 t/s | 548.8 / 458.6 / 357.8 t/s | +9.0 / +8.4 / +6.7 % | oracle probe, cold prompts in one process (8k = its first prompt) |
-| GTT, llama-server with the vision projector | 104 591 MiB (v59 live, just before the switch) | 105 414 MiB after load, 106 032 after the first requests | | deploy smoke, 2026-10-16 |
-| GTT peak, oracle probe (no projector) | 105 538 MiB | 106 357 MiB | +819 MiB | the gate's score-capture pass; admission bar 109 216 |
-| decode at depth | 26.1 / 22.1 / 24.4 ms/tok at 32k / 262k / 1M | not measured on v60 | v61: 25.83 / 21.04 / 19.92 ms/tok (BENCHMARKS section 2a) | llama-server, my corpus, draft on, worst of 3 windows of 128 tokens |
-| TTFT, 256 new tokens on a 1M history | 2.45 s (median of 3; 2.05 s warm) | not measured on v60 | v61: 1.89 s median (1.59 s warm) | llama-server |
-
-The probe is a libllama program that runs the compose's configuration (without the projector) through a fixed corpus; on v59
-it matched llama-server within 1.2 % per step. Single runs, the v59 and v60 passes about a day apart.
-
-## What it gives
-
-Same box, one conversation, one slot for the fork's current column (the fork columns use the i1-Q4_K_M weights). The last
-column is the v53 suite of 2026-10-09/10 (v54-v59 have the same numerics); v60's and v61's prefill gains are in the tables above:
-
-| | stock llama.cpp (Aug 2026) | this fork, dense (Sep 9) | this fork, v53-v59 |
-|---|---|---|---|
-| decode, empty context | 24-27 t/s | 49.6 t/s (Sep 6) | **61 t/s** |
-| decode at 107k / 213k | - | 41.8 / 29.4 t/s | **51.6 / 59.9 t/s** |
-| decode at 524k / 1M | not possible | not possible | **45 / 35.5 t/s** |
-| prefill 8k / 32k | 365 t/s at 6.5k | 386 / 329 t/s | **550 / 450 t/s** |
-| prefill at 213k depth | - | 167 t/s | **421 t/s** |
-| cold fill 0 -> 524k / 0 -> 1M | - | - | **25.6 min / 1.09 h** |
-| GPU memory (GTT) | - | - | **92.3 GiB at 524k, 102.7 GiB at 1M**, flat at every depth |
-
-The stock row used IQ4_XS / UD-Q4_K_XL of the base model, so it is a rough reference. Decode at depth depends on how predictable
-the text is (draft acceptance), which is why 213k can read faster than 107k.
-
-### Stock llama.cpp b10689 vs this fork (v60), same GGUF, gfx1151, n_ctx 262 144 dense
-
-Measured 2026-10-16 on s1: the official `server-vulkan-b10689` image against v60, same i1-Q4_K_M GGUF, one slot, KV q8_0,
-YaRN x4, dense attention on both sides. This is the 262k window stock can run, not the fork's 1M profile.
-
-| measurement | stock b10689 | v60 | v60 vs stock |
-|---|---:|---:|---:|
-| cold prompt 8k / 32k / 72k / 128k, t/s (128k: n = 1; both MTP off) | 353.8 / 312.6 / 247.8 / 192.0 | 544.3 / 455.8 / 338.2 / 245.9 | +53.9 / +45.8 / +36.5 / +28.1 % |
-| prefill steps 65 536 -> 261 120, aggregate, t/s | 107.3 | 124.1 | +15.7 % |
-| last step 207 110 -> 261 120, t/s | 81.4 | 91.4 | +12.2 % |
-| decode at 26k / 131k / 261k, MTP off, ms/token (restore path both) | 37.82 / 56.04 / 77.81 | 31.76 / 41.05 / 52.18 | +19.1 / +36.5 / +49.1 % t/s |
-| decode at 26k / 131k / 261k, fork MTP on (continuous), ms/token | no stock MTP | 20.00 / 24.69 / 40.88 (acceptance 0.782 / 0.949 / 0.852) | +89.1 / +127.0 / +90.3 % vs stock MTP off |
-| GTT at 262k, MTP off | 88 137 MiB | 85 420 MiB | -3.1 % |
-| TTFT, continuation at 261.6k + 256 new tokens, median of 3 | 5 359 ms | 3 659 ms (MTP on) | x1.46 |
-
-GTT point: stock at the end of its continuous fill, the fork in the MTP-off restore band at 261 120 (the fork reserves the
-full KV at load).
-
-- **No stock MTP number.** b10689 failed to load the sidecar draft GGUF (`failed to load draft model`); upstream `qwen4exp` has no MTP graph.
-- **Greedy-64 identity, stock vs fork, both MTP off: 62/64 tokens equal (against stock rep 0), first divergence at token 48.** Reported, not graded:
-  stock lacks the GDN normalization fix (upstream PR #28068) and the fork's exactness patches.
-- **The stock server was not run-to-run deterministic in this run:** greedy-64 rep 0 != rep 1 on the same 2 000-token prompt
-  within one process; the fork arms were deterministic (fk0 with the strict top-5 check, fkm tokens only). Observed once (2 reps); reported, not diagnosed.
-
-Caveats (524k/1M and QSA are fork-only, MTP needs the sidecar draft, the fork's base is b10664 + PR #27742 + the GDN fix rather
-than b10689, YaRN x4 in both arms, decode bands by the restore path) and the method: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md),
-section 9.
-
-What does that:
-
-- **QSA sparse attention for 524k-1M.** The model's 12 full-attention layers ship an indexer that the GGUFs leave switched off.
-  The fork runs it: each query attends to 2 051 selected cells instead of the whole context, with a persistent pooled-key
-  cache, an incremental block census, a fused top-k selection kernel and indexed flash attention for prefill. Dense below 64k,
-  so short prompts are unchanged.
-- **MTP speculative decoding that pays off on Vulkan.** On the early MTP builds the draft was a 5x loss on this GPU. Here it is
-  roughly x1.5 decode (23.4 vs 35.1 ms/token at 81k), and the draft itself runs sparse at depth (-18 % ms/token at 524k).
-- **Graph + allocation-plan cache.** Decode reuses built graphs and their memory plans on an exact match (-5.8 % ms/token).
-- **Flat memory.** The KQ mask is computed from cell metadata instead of a [context x batch] plane (at 1M that plane alone would
-  be 4 GiB), and every compute buffer is reserved at load. GTT does not grow during a 1M fill; an admission check makes a
-  prefill chunk wait rather than run the box out of memory.
-- **Disk prompt cache with recurrent checkpoints.** A conversation evicted from the slot is written to NVMe (~15 KB/token) and
-  loaded back instead of re-prefilled; checkpoints are kept along the conversation, so a branch or a copy rewinds to the nearest
-  one. Measured: 72.5k-token branch resumed in 0.6 s (re-prefill: 209 s), identical answer.
-- **webui for long agent sessions.** Context-reserve auto-compaction (summarise and continue before the window is full, continue a
-  reply that hit the cap from its exact stop point, a guard against unfinished replies), per-chat context settings, a frozen tool
-  list per conversation (tool changes do not invalidate the cache). The one context element is upstream's ring by the send
-  button: amber and a "compact?" link from 80 % full (setting), red below the pre-turn minimum, pulsing while it compacts.
-  Hover opens its card, click or Enter pins it: upstream's usage details plus last-request prefill / decode t/s, MTP % with
-  accepted / drafted, cache share, the chat's compute time, the reserve with its breakdown, the compaction state with Cancel,
-  links to the previous / next compacted chat, "Compact now" and the settings; `/compact` in the composer. Timing chips
-  collapse to one muted line per reply (details on hover; "Show timing chips" hides them). A continuation drops the prefill
-  the server echoes back (whitespace-normalised match; a diverging echo is joined verbatim and the message marked
-  `echoMismatch`). Reasoning per chat: "+" menu -> Reasoning -> Default / Off / Low / Medium / High / Max. When the template
-  supports it (Qwen3.8-Flash-Next), Low / Medium / High / Max also send the native `reasoning_effort` low / medium / xhigh /
-  xhigh. An explicit level gets the model card's thinking sampling, Off the instruct sampling, but only for parameters you
-  have not set yourself; Default sends neither and follows the server. Both servers here run `--reasoning off`, so Default
-  means no thinking. Settings -> Sampling & Penalties -> "Presets by reasoning state" makes both presets editable (Thinking
-  and Instruct, model-card defaults, "Reset to model card") with optional per-level overrides for Low / Medium / High / Max;
-  precedence: your own Sampling values > level override > preset. The presets follow Save / Cancel and are included in
-  settings export / import.
-- **Backend sampling.** `--backend-sampling` (or the webui checkbox) works with draft-mtp on this fork, but it bypasses the
-  graph cache and the CPU fast path (slower decode) and is not bit-exact at temperature > 0: keep it off for speed. Clients can
-  read `/props` -> `backend_sampling_supported` and `speculative {type, n_max}`; where it cannot work, a request asking for it
-  gets a clear 400 before any slot is touched.
-- **Telemetry.** The stop type of every reply at INFO (`stop=eos|limit|word|cancel`), per-round speculative timings, `kqvis-prof`
-  lines, expert-occupancy stats, `disk_cache_*` in `/metrics`, `GET /disk-cache`.
-
-The full list (240 numbered changes, including upstream back-ports): [docs/s1/PATCHES.md](docs/s1/PATCHES.md).
-
-## What is hardware-specific and what is not
-
-- **Vulkan / RDNA3 and RDNA3.5:** the new kernels (QSA top-k radix select, indexed and metadata flash attention, KQ mask, GDN and
-  hyper-connection fusions), the MoE `mul_mat_id` changes (row-id hoisting up to 512 experts, compact grid, tile choice, the
-  v64 8-warp tile), the v64 dense GEMM tile table and flash-attention shared-memory layouts, flash attention coopmat1 tiles
-  with RDNA3 signed-zero handling, UMA readback. They should help any RADV GPU with cooperative
-  matrices on a large MoE; I measured them on gfx1151 and gfx1103 only.
-- **Generic (libllama / server / webui, any backend):** the QSA model logic and memory, graph and plan cache, disk prompt cache,
-  GTT admission (reads an AMD sysfs file; the path is a knob), the webui, the speculative-decoding fixes, the logs.
-- **Model-specific:** QSA and the MTP work apply to `qwen4exp` only. Other models run upstream's model code with the fork's
-  generic kernels.
-- **Not tested:** ROCm/HIP and NVIDIA. The new ops have CPU and Vulkan implementations only.
-
-### Other models
-
-Which v60-v64 levers can help another model:
-
-| lever | patches / knob | scope |
-|---|---|---|
-| B1: MoE expert GEMMs, f16 pre-cast of B + BM 128 x BN 64 tile | 0231, 0232 | generic: any `mul_mat_id` on AMD coopmat1 with q4_K / q5_0 / q8_0 / q6_K / iq3_s experts |
-| G2a: the B1 tile with 8 warps and a 72-byte LDS stride (v64) | 0262, `GGML_VK_MMID_TILE_G2A` | generic: the same `mul_mat_id` cases as B1; RADV only by design (`GGML_VK_MMID_TILE_G2A_PAD=4` = the conformant layout, measured as no gain) |
-| FA1: flash-attention shared-memory layouts (v64) | 0263, `GGML_VK_FA_SFPV_ALIAS` / `GGML_VK_FA_V_CHUNK` | generic: dense multi-row flash attention on AMD coopmat1; the LDS saving was measured at head size 256 only |
-| G1: dense GEMM tile table (v64) | 0265, `GGML_VK_DENSE_TILE_G1` | generic by shape: dense q4_K / q6_K matmuls with m >= 2048, k >= 2560 and q5_0 with m >= 2048, k <= 640 at n >= 512 on AMD coopmat1 with subgroup 64; the 780M gains did not transfer shape for shape to gfx1151 (BENCHMARKS.md section 2c) |
-| B4: GDN conv input without the concat pass | 0228 | generic fusion (CONCAT + SSM_CONV); fires where a model's graph has that shape. On Qwen3.6-35B-A3B it does not fire (probe, 2026-10-17) |
-| B4c: 16 x 16 tile for m <= 16 matmuls | 0234 | generic: dense matmul with m <= 16, q4_K / q8_0 weights, AMD coopmat1 |
-| C1: mat-vec unpack hoist | 0236 | generic: mat-vec at 2-8 columns (speculative verify widths), MMVQ q4_0 / q5_0 / q8_0 / q4_K and f32 x f32 |
-| graph + allocation-plan cache | 0192-0196, `LLAMA_GRAPH_CACHE` | generic (libllama) |
-| disk prompt cache | `--cache-disk` | generic (server) |
-| B3: hc_mix tail fusion | 0227 | a generic graph-pattern fusion (multi_add + SCALE, SCALE + SILU); the sites I know are Qwen3.8-Flash-Next's hyper-connections and QSA pooling. On Qwen3.6-35B-A3B it does not fire (probe, 2026-10-17) |
-| QSA line: A1 score epilogue, A2a f16 mirror, A2b score key reuse, A3 select without key rows, the indexer cache and 0239 | 0118-0161, 0235, 0239, 0240, 0241, 0243 | Qwen3.8-Flash-Next only |
-
-One A/B so far on another family: Qwen3.6-35B-A3B UD-Q4_K_XL on the 780M (KV f16, 262k context, one slot), upstream
-b10689 vs this fork at the v60 revision with `GGML_VK_DISABLE_MMQ_CM1=1 GGML_VK_FREE_WAIT_IDLE=1 GGML_ALLOC_GROW_SLACK=10
-LLAMA_RESERVE_RUNTIME_SHAPE=1 LLAMA_GRAPH_CACHE=8` (the int8 MMQ switch keeps both arms on the same matmul path), run 2026-10-17.
-MTP off: cold prefill 8k / 32k / 72k 304.1 / 212.9 / 130.7 -> 310.7 / 225.1 / 152.6 t/s (+2.2 / +5.7 / +16.8 %); decode at depth
-4k / 32k / 128k 49.77 / 56.03 / 85.28 -> 46.22 / 54.62 / 84.38 ms/token (one request per depth, no noise band). The fork's base
-is b10664 plus drluoto's branch, so "fork vs upstream" also contains about 25 upstream commits. Per-lever split done (the same
-fork with the levers off): +3.7 / +1.5 / +1.1 % prefill at 8k / 32k / 72k, attributed mainly to B1; decode below 1 % (n = 1,
-not measurable); B3/B4 do not fire; MTP on +8.9 / +3.3 % at 4k / 32k and -7.8 % at 128k with lower draft acceptance (0.890 vs
-0.924) (n = 1); greedy tokens identical 64/64 in every pair. No EXACT claim for this
-family (other numerics). Details: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md), section 8.
-
-## Hardware and host setup
-
-s1: Ryzen AI Max+ 395, 128 GB LPDDR5x, VRAM carve-out at the minimum, kernel 7.0, Ubuntu. Kernel parameters
-`ttm.pages_limit=28835840 ttm.page_pool_size=28835840` (110 GiB GTT), `amd_iommu=off` (+13 % decode, +25 % prefill),
-`amdgpu.lockup_timeout=600000`, dirty-page caps at 2 GiB, 64 GiB swap, a hardware watchdog, GPU clock pinned high.
-balkon: Ryzen 9 7940HS + 780M, 96 GB DDR5, 78 GiB GTT, same idea scaled down. Details and the exact lines:
-[docs/s1/HOST-TUNING.md](docs/s1/HOST-TUNING.md). A 1M cold fill keeps the GPU busy for an hour; check your cooling.
+Numbered changes, including upstream back-ports: [docs/s1/PATCHES.md](docs/s1/PATCHES.md). Flags and environment knobs:
+[docs/s1/KNOBS.md](docs/s1/KNOBS.md). QSA, GDN replay and the MTP work are `qwen4exp`-only; the graph cache, disk cache, GTT
+admission and webui are backend-generic; the Vulkan kernels were measured on gfx1151 and gfx1103 only. ROCm/HIP and NVIDIA are
+not tested.
 
 ## Running it
 
-Two commands per box (details, disk needs and the manual route: [deploy/README.md](deploy/README.md)):
-
 ```sh
-deploy/s1/setup-brain.sh           # Strix Halo: 1M brain   (BRAIN_CTX=524k for the 524k profile)
-deploy/balkon/setup-hands.sh       # 780M: 5-slot hands
+git clone https://github.com/vahpetr/llama.cpp-s1-fork && cd llama.cpp-s1-fork    # branch s1-public
+deploy/s1/setup-brain.sh --dry-run && deploy/s1/setup-brain.sh           # Strix Halo: 1M brain (BRAIN_CTX=524k for 524k)
+deploy/balkon/setup-hands.sh --dry-run && deploy/balkon/setup-hands.sh   # Radeon 780M: 5-slot hands
 ```
 
-Each script checks docker, the Hugging Face CLI, disk space, the GTT limit and the Vulkan device; downloads the weights and
-checks their sha256; (hands only) re-encodes the BF16 hyper-connection weights and the LM head to Q8_0 with
-`tools/s1/gguf_hc_q8.py`; pulls the image (or builds it with `BUILD=1`); starts the compose file and smoke-tests it.
-`--dry-run` shows every step first. Which weights and why: [docs/s1/WEIGHTS.md](docs/s1/WEIGHTS.md). I redistribute no weights;
-they come from their authors' Hugging Face repos.
-The published image `vahpetr/llama-cpp-s1-fork:v64` = `:v64k` = `:latest` (one digest,
-`sha256:b3c12a3a7f680d9d1683edbc1b5728b285766618bfacb9aa2159d9eed891ff28`) is built from my `prod-v11-stage9-pkg3` revision
-(v64 = `c5b3462ed`; `:v63` / `:v63k` stay as the rollback, v63 = `8c1a468aa`, digest
-`sha256:d16b1cdc9139573f07c380f6a5fc6913866348bb6a121593c2e52c76f538a5d4`; `:v62` = `e4af0a6ca`, `:v61` = `7a438f3ba` and
-`:v60` = `845c6fbcd` are older rollbacks with the same key); this `s1-public` branch adds docs, deploy files, `tools/s1` and
-comment scrubs on top.
-Upgrading from v60-v63: same disk-cache key, change the image and take the v64 compose (one added flag; the old compose works
-too and keeps greedy drafting). Upgrading an install with stored conversations from v59: the
-disk-cache key changes, see [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md), section 4 (one `--cache-disk-adopt` line).
-My production draft head is a vocabulary-pruned variant built from my own traffic, so the public setup uses dzannotti's
-full-vocabulary head, and the decode numbers above are an upper bound for it.
-
-First start on s1: GTT after load 105 495 MiB (1M, v64 = v63; 105 519 after the smoke requests, bar 109 216) or
-~94 500 MiB (524k, v59; not re-measured on v60-v64); the first long prompt fills at ~550 t/s on 8k (v61 probe), 501 t/s on a
-fresh 32k prompt (v64 A/B), falling to ~358 t/s near 1M (v63 S0.2 rows; the v64 fill steps are not measured yet; a cold 1M
-fill takes 41.4 min on v63).
-
-## Known limitations
-
-- **No context shift.** The model has recurrent (Gated-DeltaNet) layers. The client must compact before the window is full;
-  the bundled webui does. Replies near the end of the window are capped by the client to the room that is left.
-- **Accuracy at 1M is not gated.** One long-context probe scored 76.8 % at 1M (vs ~77 % at 524k). Use the 1M window for recall
-  over long inputs and check answers that depend on it.
-- **Two slots give no extra throughput** on these boxes (-15 % total, measured). A second slot is for concurrency only.
-- **After a checkpoint rewind** (disk cache, branch, copy) the continuation can differ from a fresh prefill at near-tie tokens:
-  the same math in a different batch composition. The state itself is verified, the text is not guaranteed byte-identical.
-- **Pre-v60 disk-cache entries with images are not loaded by v60-v64** (they may carry the defect 0239 fixes); text entries
-  are. A rollback to v59 does not see conversations saved by v60-v64 (v60 to v64 share one key).
-- **Probabilistic draft sampling (v64 composes) is not gated** beyond its unit tests, the 40-task hands bench and the live
-  probe above; its decode effect on the brain is unmeasured. `--spec-draft-sampling greedy` restores v63's drafting.
-- One model load per GPU at a time; a build or a second load next to a loaded 1M model has run my box out of memory.
-- Single-user setups. No multi-tenant hardening beyond upstream's.
+Images on Docker Hub, `vahpetr/llama-cpp-s1-fork`: `:v71` is the brain image of this release; the hands run `:v70k` (see Known
+limitations); `:v70` is the brain rollback. Host settings: [docs/s1/HOST-TUNING.md](docs/s1/HOST-TUNING.md). Upgrade, rollback
+and disk-cache keys: [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md). Compose files and flags: [deploy/README.md](deploy/README.md).
 
 ## For AI agents
 
-If you are an agent working on or with this code, start with [AGENTS.md](AGENTS.md) (repo map, tags, test contract, exactness
-classes, how to measure) and [docs/s1/KNOBS.md](docs/s1/KNOBS.md) (every flag and env knob with default, effect, class and the
-value I run). The webui's compaction and timing features exist so that agents can run long sessions on this box without
-re-prefilling and without guessing where the time went.
+1. Entry points: `deploy/s1/setup-brain.sh` (brain), `deploy/balkon/setup-hands.sh` (hands), `deploy/setup-common.sh` (shared
+   checks), `deploy/README.md` (what the scripts do, by-hand route).
+2. Compose files: `deploy/s1/docker-compose.brain-1m.yml` (1M), `deploy/s1/docker-compose.brain-524k.yml` (524k),
+   `deploy/balkon/docker-compose.hands.yml` (hands).
+3. Run every script with `--dry-run` first: it prints each check, file and size and changes nothing.
+4. The scripts check docker and the compose plugin, the Hugging Face CLI, free disk, the GTT limit and the Vulkan device; they
+   download the weights, check sha256, (hands) re-encode with `tools/s1/gguf_hc_q8.py`, pull the image, start the compose and
+   smoke-test it.
+5. Hardware for the 1M brain: Strix Halo with 128 GB and GTT 108 GiB (`ttm.pages_limit=28311552`). For the hands: a Radeon
+   780M-class box with 96 GB and GTT 78 GiB.
+6. Weights and sha256: [docs/s1/WEIGHTS.md](docs/s1/WEIGHTS.md). About 160 GB free disk for the brain, 150 GB for the hands.
+7. Docker Hub tags: `:v71` brain, `:v70k` hands, `:v70` brain rollback. `BUILD=1` builds the image from this tree instead.
+8. Verify: `curl -sf http://127.0.0.1:8000/health`, `/props` shows `n_ctx` 1048576, then one chat request
+   ([docs/s1/DEPLOY.md](docs/s1/DEPLOY.md), "Smoke checks").
+9. Flags and environment knobs with defaults and classes: [docs/s1/KNOBS.md](docs/s1/KNOBS.md).
+10. Code map, tags, test contract, exactness classes: [AGENTS.md](AGENTS.md).
 
-## How I work
+## Known limitations
 
-I run this box with my own agent harness: a controller model plans and reviews, worker agents ("hands") edit code and run tests,
-and every change goes through a gate on the real model before it ships. That harness is private; this repository is the runtime
-it runs on.
+- hands build :v71k is not published — the v71 code crashes once at warmup on the Radeon 780M (gfx1103, vk::DeviceLostError); hands run :v70k until the fix
+- No context shift: the recurrent layers forbid it; the client must compact before the window is full (the bundled webui does).
+- Accuracy at 1M is not gated. Check answers that depend on deep recall.
+- Two slots give no extra total throughput on these boxes; a second slot is for concurrency only.
+- After a checkpoint rewind the continuation can differ from a fresh prefill at near-tie tokens (same math, different batch
+  shape). The restored state is verified; the text is not guaranteed byte-identical.
+- Disk-cache entries are tied to a cache key. v71 shares its key with v60–v70; [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md) has the details.
+- One model load per GPU at a time: a build or a second load next to a loaded 1M model has run the 128 GB box out of memory.
+- Single-user setups; no multi-tenant hardening beyond upstream's.
+- The 524k profile and the hands profile have no v71 measurements.
 
 ## Upstream and license
 
 Based on [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) via drluoto's `strix-halo-flash-next` branch (b10664) and
-upstream PR #27742 (Qwen3.8-Flash-Next support). Upstream's documentation is in `docs/`; its README is at
-<https://github.com/ggml-org/llama.cpp#readme>. One change is open upstream as PR #28118; several others are PR candidates, not submitted yet.
+upstream PR #27742 (Qwen3.8-Flash-Next), plus selected upstream back-ports. Upstream's documentation is in `docs/`. One change is
+open upstream as PR #28118.
 
-MIT License, Copyright (c) 2023-2026 The ggml authors, see [LICENSE](LICENSE). The fork's changes are released under the same
-license. Third-party components keep their licenses (`licenses/`, and the acknowledgements in upstream's README: cpp-httplib,
-stb, nlohmann/json, miniaudio, subprocess.h).
+MIT License, Copyright (c) 2023-2026 The ggml authors, see [LICENSE](LICENSE); the fork's changes use the same license.
+Third-party components keep their licenses (`licenses/` and upstream's acknowledgements).
