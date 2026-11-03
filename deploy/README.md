@@ -1,14 +1,18 @@
 # Running it: two commands per box
 
-| file | box | context | GTT after load | needs GTT |
-|---|---|---|---|---|
-| `s1/docker-compose.brain-1m.yml` | Ryzen AI Max+ 395, 128 GB | 1 048 576, 1 slot | 102.7 GiB, flat | 110 GiB |
-| `s1/docker-compose.brain-524k.yml` | Ryzen AI Max+ 395, 128 GB | 525 312, 1 slot | 92.3 GiB, flat | ~96 GiB (I ran it at 104) |
-| `balkon/docker-compose.hands.yml` | Ryzen 9 7940HS + 780M, 96 GB | 917 504 pool, 5 slots | ~73.7 GiB (75 479 MiB measured on v64k) | 78 GiB |
+Release v71. Hands run `:v70k`: hands build :v71k is not published — the v71 code crashes once at warmup on the Radeon 780M
+(gfx1103, vk::DeviceLostError); hands run :v70k until the fix.
+
+| file | box | context | image | GTT after load | needs GTT |
+|---|---|---|---|---|---|
+| `s1/docker-compose.brain-1m.yml` | Ryzen AI Max+ 395, 128 GB | 1 048 576, 1 slot | `:v71` | 104 580 MiB (v71 deploy smoke) | 108 GiB |
+| `s1/docker-compose.brain-524k.yml` | Ryzen AI Max+ 395, 128 GB | 525 312, 1 slot | `:v71` | not measured on v71 | less than the 1M profile |
+| `balkon/docker-compose.hands.yml` | Ryzen 9 7940HS + 780M, 96 GB | 917 504 pool, 5 slots | `:v70k` | not measured on v71 | 78 GiB |
 
 First set the host up ([docs/s1/HOST-TUNING.md](../docs/s1/HOST-TUNING.md)): without the GTT change none of these load.
-Step by step, including the upgrade from v60-v63 (same key) or v59 (new disk-cache key) and the rollback: [docs/s1/DEPLOY.md](../docs/s1/DEPLOY.md).
-Why these weights: [docs/s1/WEIGHTS.md](../docs/s1/WEIGHTS.md). Every flag and knob: [docs/s1/KNOBS.md](../docs/s1/KNOBS.md).
+Step by step, the upgrade (v60–v70 share v71's disk-cache key; v59 needs an adopt step) and the rollback to `:v70`:
+[docs/s1/DEPLOY.md](../docs/s1/DEPLOY.md). Why these weights: [docs/s1/WEIGHTS.md](../docs/s1/WEIGHTS.md). Every flag and knob:
+[docs/s1/KNOBS.md](../docs/s1/KNOBS.md).
 
 ## The scripts
 
@@ -38,38 +42,26 @@ Both are idempotent and resumable (re-run after an interrupted download; finishe
 3. **Re-encode (hands only, CPU, a few minutes):** `tools/s1/gguf_hc_q8.py` turns the 290 BF16 `hc_*` tensors into Q8_0 and
    copies `output.weight` + `token_embd.weight` from the Q8_0 head, in one pass. The script checks that exactly those 292
    tensors changed type, compares the result with my file's sha256, and hardlinks the untouched PLE shard (no 29 GB copy).
-4. **Image:** `docker pull vahpetr/llama-cpp-s1-fork:v64` (s1) or `:v64k` (balkon). `BUILD=1` builds it from this tree instead.
+4. **Image:** `docker pull vahpetr/llama-cpp-s1-fork:v71` (s1) or `:v70k` (balkon). `BUILD=1` builds it from this tree instead.
 5. **Start** the compose file, wait for `/health` (up to 15-20 min; the brain's first start pre-reads the 33 GiB PLE range),
-   print the expected GTT and fill times, and smoke-test: `/props` n_ctx, one short completion, `/disk-cache` own key and entries.
+   print the expected GTT and fill time, and smoke-test: `/props` n_ctx, one short completion, `/disk-cache` own key and entries.
 
 Defaults: models in `deploy/<box>/models`, slots and the disk prompt cache in `deploy/<box>/slots`; override with `MODELS_DIR`,
 `SLOTS_DIR`, `LLAMA_S1_IMAGE`. The scripts refuse to start a second llama-s1 container on the same GPU.
 
 ## The image
 
-The prebuilt images are this tree built with upstream's `.devops/vulkan.Dockerfile`, target `server`, exactly as my
-production images:
+The prebuilt images are this tree built with upstream's `.devops/vulkan.Dockerfile`, target `server`:
 
 ```sh
 git archive <rev> | docker build -f .devops/vulkan.Dockerfile --build-arg APP_REVISION=<rev> --label llama.rev=<rev> \
-  --target server -t vahpetr/llama-cpp-s1-fork:v64 -
+  --target server -t vahpetr/llama-cpp-s1-fork:v71 -
 ```
 
-v64 = rev `c5b3462ed` (the `prod-v11-stage9-pkg3` head; this branch adds docs, deploy files, `tools/s1` and comment scrubs on top). `:v64`, `:v64k`
-and `:latest` are one image (digest `sha256:b3c12a3a7f680d9d1683edbc1b5728b285766618bfacb9aa2159d9eed891ff28`), built on the
-780M box; my s1 production image is the same revision built on s1, and the gate ran on that one. Rollback: `:v63` /
-`:v63k` (rev `8c1a468aa`, one image, `sha256:d16b1cdc9139573f07c380f6a5fc6913866348bb6a121593c2e52c76f538a5d4`; same
-disk-cache key and slot-file format as v64), and the older `:v62` / `:v62k` (rev `e4af0a6ca`,
-`sha256:4281527a03092d87200d14d18222f060aecea6b47468379a6ec24a7ac9d52a96`), `:v61` / `:v61k` (rev `7a438f3ba`,
-`sha256:46fc98c6f86902b220309e172691758e9806eaf2fc411a640d4ac2f5595b7c63`),
-`:v60` / `:v60k` (rev `845c6fbcd`, `sha256:794113766af1129c65e9541bcc4b9b3bac4d378fa38b38cd4d7c5f00fbf7a0d1`; same key) and
-`:v59` / `:v59k` (rev `a1b6c324e`, one image,
-`sha256:5da04b0d8bc24f022c28d0cce0d993c4ed2c5837527113625dbeade5699d5f92`) stay published; set
-`LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v63` (or `:v63k`, `:v62`, `:v61`, `:v60`, `:v59`, ...). v60-v64 use a new disk-cache key against
-v59, so read "Upgrading from v59" in docs/s1/DEPLOY.md before switching a v59 install that has stored conversations; from v60-v63
-it is an image change plus one compose flag (`--spec-draft-sampling probabilistic`, new in the v64 composes; every image since
-v63 accepts it, older images do not know it - drop the two lines when rolling back to v62 or older). Build with no model loaded on the GPU: on the
-128 GB box a build next to a loaded model has run it out of memory. `docker compose -f <file> build` does the same from a checkout.
+`:v71` = rev `8bcde80da` (`prod-v11-stage9-pkg11`; this branch adds docs, deploy files and `tools/s1` on top). The hands run
+`:v70k` and `:v70` is the brain rollback (rev `03599f20a`, same disk-cache key): `LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v70`.
+Build with no model loaded on the GPU: on the 128 GB box a build next to a loaded model has run it out of memory.
+`docker compose -f <file> build` does the same from a checkout.
 
 ## By hand
 
@@ -78,25 +70,17 @@ in docs/s1/WEIGHTS.md), then `docker compose -f <file> up -d`.
 
 ## First start: what to expect
 
-- **GTT after load** (`cat /sys/class/drm/card*/device/mem_info_gtt_used`): brain-1m 104 672-105 193 MiB on v59, 105 414 MiB
-  on v60 (the f16 pooled-key mirror, +0.8 GiB) and 106 032 MiB after the first requests, 105 495 MiB on v61, v63 and v64 (v62: 105 414) and 105 519 MiB
-  after the smoke requests (the admission bar is 109 216),
-  brain-524k ~94 500 MiB (v59), hands ~73.7 GiB (75 479 MiB after the v64k switch; 76 260 MiB on v60k after a restart). On v59 the
-  1M fill stayed at 105 188-105 196 MiB (per-step readings on v52, peaks on v59) because `--kv-graph-span 0` reserves the compute buffers for the full span at load;
-  on v63 the server peak over a full 1M fill was 105 659 MiB. An allocation error at load means the GTT limit is too small.
+- **GTT after load** (`cat /sys/bus/pci/devices/<bdf>/mem_info_gtt_used`): brain-1m 104 580 MiB on v71, up to 105 407 MiB over a
+  full 1M fill (admission bar 109 216 MiB on my host). `--kv-graph-span 0` reserves the compute buffers for the full span at
+  load, so an allocation error at load means the GTT limit is too small. The 524k and hands profiles have no v71 measurement.
 - **Log proofs** (`-lv 4`): `n_ctx = 1048576` (or 525312), `freq_scale = 0.25` for target and draft, the QSA ratio line,
-  `graph cache: K = 8`, `kq_vis: on`; from v60 also `qsa_score_epilogue: on`, `mmvq_hoist: on from 2 columns`,
-  `kq_vis_mirror = on`, `qsa_pooled_f16_mirror: on`, and the disk-cache line `legacy unmarked states: ...`; from v61 also
-  `qsa_score_kreuse: on` and `qsa_topk: v2 ...; nokeys on`; from v64 also `mmid_tile_g2a: on (...)` and `dense_tile_g1: table on
-  (3 rules) (...)` (WARN lines, once per device; an `off (<reason>; ...)` line names what is missing on your device).
-- **Cold fill** on s1 (one long prompt, empty cache), 1M profile: 0 -> 524k in 19.2 min, 0 -> 1M in 41.8 min on v61 (19.8 / 44
-  min on v60, 25.6 / 64 min on v59), oracle probe; 0 -> 1M in 41.4 min on v63 (llama-server, 65 536-token steps; v64 not
-  measured over a fill yet). Prefill ~550 t/s on short prompts, 501 t/s on a fresh 32k prompt and 417 t/s on a fresh 72k prompt on v64
-  (v63: 467 / 386), ~358 t/s near 1M (v63; v60: ~330, v59: ~195 t/s).
+  `graph cache: K = 8`, `kq_vis: on`, and on gfx1151 `qsa_topk: onepass on`, `qsa_topk: v3 on (... from 2 rows ...)`,
+  `qsa_bias_fold: on`, `gdn_replay: on (default on gfx1151)`. An `off (<reason>)` line names what is missing on your device.
+- **Speed** on s1 (v71): [docs/s1/BENCHMARKS.md](../docs/s1/BENCHMARKS.md).
 - **Host RAM:** the PLE table lives in the page cache, so `MemAvailable` sits at a few GiB on s1 with the brain loaded. That is
   normal. Do not start a second model or a big build on the same box.
-- **Disk prompt cache** (`slots/prompt-cache/<profile>`): ~15 KB per cached token (a 1M conversation is ~17 GiB). One directory
-  per profile. Each build key has its own `ns-<key>` subdirectory; a new key starts empty unless you adopt the old one
+- **Disk prompt cache** (`slots/prompt-cache/<profile>`): ~15 KB per cached token (the v71 1M slot file is 17.09 GiB). One
+  directory per profile. Each build key has its own `ns-<key>` subdirectory; a new key starts empty unless you adopt the old one
   (`--cache-disk-adopt`, docs/s1/DEPLOY.md). Namespaces of other keys are left alone until they sit idle past the TTL or
   together pass half the quota; an adopted one is never removed.
 - **Endpoints:** `/health`, `/metrics` (Prometheus; `disk_cache_*`), `/slots`, `GET /disk-cache`, the webui at `/`.

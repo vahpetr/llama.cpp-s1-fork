@@ -7,7 +7,8 @@ read once at start (or at context/memory creation). Upstream flags I rely on but
 Class: **EXACT** = outputs and state bytes identical with the knob on and off (proven by a gate); **COMPOSITION** = same math per
 op but a different batching / selection route, so near-ties can flip a token (classified by replay, see AGENTS.md); **LOSSY**
 = changes numerics; **SCHED** = scheduling or memory only, never outputs; **DIAG** = logging / checks / test-only.
-"prod" = the value in my s1 brain composes (`deploy/s1/`); "-" = unset (the default). Rows marked (?) I have not re-checked
+This page describes v71 (fork revision `8bcde80da`, `prod-v11-stage9-pkg11`). "prod" = the value in my s1 brain composes
+(`deploy/s1/`, v71); "-" = unset (the default). Rows marked (?) I have not re-checked
 against the code for this table.
 
 ## Server flags
@@ -125,11 +126,29 @@ against the code for this table.
 | `GGML_VK_BUF_LOG=1` | 0 | 0244 (v62 62.1, `[TAG_VK_BUF_LOG]`): one INFO line per Vulkan buffer allocation, `[vk-buf] <device> kind=device\|host\|other size=<B> (<MiB>) type=<memory type index> heap=<heap> flags=<VkMemoryPropertyFlags> wc=<0\|1> import=<0\|1>`; kind device = `ggml_vk_create_buffer_device` (weights, KV / recurrent / pool buffers, preallocs), host = pinned host memory, other = staging / aux; wc=1 = host-visible without HOST_CACHED (write-combined for CPU reads). Prints only (the #30049 read-path change is parked, R129) | DIAG | - |
 | `GGML_SCHED_PROFILE=1`, `GGML_GET_ROWS_STATS=1\|2` | 0 | host-side scheduler timers, get_rows census | DIAG | - |
 
+## Added after patch 0265 (in v71)
+
+Defaults below are read from the v71 code. The package sections that follow name the patches that added each older knob;
+their defaults are the same in v71. Patch rows for these knobs are not in docs/s1/PATCHES.md yet; the tag in the code comment
+is the provenance.
+
+| knob | default | effect | class | prod |
+|---|---|---|---|---|
+| `--cache-disk-async N` (env `LLAMA_ARG_CACHE_DISK_ASYNC`) | 0 | `[TAG_DISK_ASYNC_SAVE]`: asynchronous disk-cache save with N MiB of host staging; the server loop only copies the slot state off the device, worker threads hash the 4 MiB blocks and write the new ones; a save waits only when N MiB are not written yet; 0 = synchronous. Not in the disk-cache key | SCHED | 1024 |
+| `--cache-disk-incr` (env `LLAMA_ARG_CACHE_DISK_INCR`) | off | incremental asynchronous save (needs `--cache-disk-async`): KV blocks whose cells were not modified since the slot's last committed save are taken from that save instead of the device; the files are byte-identical to a full copy. Not in the disk-cache key | EXACT (same file bytes) | on |
+| `LLAMA_SPEC_OVERLAP=0\|1` | 0 | `[TAG_T2_HOST_SPLIT]` / `[TAG_T2_SEQ_RM_COUNTED]`: 1 = trimmed host phase of each speculative round (counted top-down `seq_rm`, no per-round prompt copy for an MTP-only drafter); setting the variable at all also prints the per-phase host split next to the round time line. Not in the disk-cache key | EXACT (output bytes unchanged) | 1 |
+| `GGML_VK_QSA_TOPK_ONEPASS=0\|1` | on on gfx1151, off elsewhere | `[TAG_QSA_TOPK_ONEPASS]` (0275): the QSA top-k cell form as sample -> one filter pass -> exact select of the candidates, v2 per row where the candidates do not fit; gated per dispatch by `GGML_VK_QSA_TOPK_ONEPASS_MIN_KV` / `_MIN_CELLS`. Startup line `qsa_topk: onepass on\|off (...)` | EXACT (v2's ids and order) | - |
+| `GGML_VK_QSA_TOPK_V3=0\|1` | on on gfx1151, off elsewhere | `[TAG_QSA_TOPK_V3]` (0361): the single-pass selection over blocks (a block = one key weighted by its cells visible to the row); needs onepass, the nokeys form and subgroup shuffle. Startup line `qsa_topk: v3 on\|off (...)` | EXACT (v2's ids and order) | - |
+| `GGML_VK_QSA_TOPK_V3_MIN_ROWS=N` | 2 | v3 only for selections of >= N rows; fewer rows (a decode row) use onepass. Path only | EXACT | - |
+| `GGML_VK_QSA_BIAS_FOLD=0\|1` | 1 | `[TAG_QSA_BIAS_FOLD]`: the QSA block bias is computed in the epilogue of the QSA score instead of a separate `[n_blocks, np, n_stream]` node. Startup line `qsa_bias_fold: on\|off (...)` | EXACT (v71 package gate) | - |
+| `LLAMA_GDN_REPLAY=0\|1` | on when every recurrent layer is on a gfx1151 Vulkan device, off elsewhere | `[TAG_GDN_REPLAY]`: the Gated-DeltaNet state after a speculative verify is committed by replaying the accepted tokens instead of keeping a state plane per draft position. Startup line `gdn_replay: on\|off (<reason>)`. Not in the disk-cache key | EXACT (state bytes and outputs equal to the planes path) | - |
+| `LLAMA_GDN_SNAPSHOT_MARGIN_MIB=N` | 512 | `[TAG_GDN_REPLAY]`: margin of the GDN snapshot admission (per-heap free value clamped at 0; on UMA the largest heap). Not in the disk-cache key | SCHED | - |
+
 ## v64 package - patches 0262, 0263, 0265
 
 All three are in v64 and none is set in my composes: the "default" column is what v64 runs. On by default, EXACT as part of the
 gated package (the short tier of the oracle by ruling, bit-identical logits, states and ordered selected ids against the v59
-reference on the candidate passes; each kernel's byte classifier identical to the v63 build; docs/s1/BENCHMARKS.md section 0d).
+reference on the candidate passes; each kernel's byte classifier identical to the v63 build; its release gate record, not in this tree).
 The `=0` switches exist for A/B runs and to bisect. The two tile levers print one WARN line per device (shown in the effect
 column); the flash-attention layouts print nothing. All three are host-side choices for AMD coopmat1 (not coopmat2); other
 devices keep their pipelines and stay silent.
@@ -140,12 +159,12 @@ devices keep their pipelines and stay silent.
 | `GGML_VK_MMID_TILE_G2A_PAD=N` | 2 on RADV, else 4 | 0262: the G2A LDS row pad, 0 / 2 / 4 / 6 / 8 (parsed with strtol; other values ignored with a warning). Pad 2 = a 72-byte stride is the measured lever (780M n 2048: -10 ... -19 %; pad 4 = 80 B: -3 ... +2 % vs the 0232 tile) but violates VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986 (16-byte stride alignment): RADV-only by design (conflict-free and bit-identical there); a non-conformant value off RADV turns G2A off. A `GGML_VULKAN_VALIDATE` build defaults to 4, so validation builds run the conformant layout while RADV production runs pad 2 (the production evidence is the gate on the real image); with a loader-enabled validation layer on a normal build (`VK_INSTANCE_LAYERS`, vkconfig) set `GGML_VK_MMID_TILE_G2A_PAD=4`. The startup line shows the pad, the stride in bytes and whether it is 16-B aligned | EXACT (the bits do not depend on the pad; pad 4 27/27 classifier-identical) | - |
 | `GGML_VK_FA_SFPV_ALIAS=0` | on | 0263 (FA1): in the coopmat1 flash-attention kernel the P.V staging buffer lives in the storage of the softmax staging; their lifetimes are disjoint, so nothing is shared at the same time; -4 KiB of LDS per workgroup. Dense multi-row dispatches only (no selected-ids / indexed QSA path, no GQA-token fold): the decode, verify and indexed pipelines are byte-identical with or without it; the shared-memory estimate keeps the old sizes, so no pipeline verdict changes. No startup line: the knob's absence from the environment (or `=1`) is the proof | EXACT | - |
 | `GGML_VK_FA_V_CHUNK=0` | on | 0263 (FA1): the dead-column V tile is staged per 16-row chunk instead of whole (the V staging 8 -> 2 KiB on aligned f16); aligned dispatches only, the same dense multi-row rule as above. Together the two layouts take the head-size-256 kernel from 31 to 21 KiB of LDS and from 4 to 6 workgroups per WGP on RDNA3. Test `tests/test-fa-prefill-exact` (hashes equal to the pristine build on 44 cases: n_kv 8k / 32k / 64k, q8_0 / f16, visibility / plane masks, unaligned, odd row counts, decode folds). 780M interleaved A/B, q8_0 K/V, nb 2048: 8k / 32k / 64k -12.8 / -18.0 / -16.5 %; s1 FLASH_ATTN_EXT node -16.5 % at 32k | EXACT | - |
-| `GGML_VK_DENSE_TILE_G1=0` | on (the table) | 0265 (G1): where the base plan picks the AMD coopmat1 l tile with split_k 1 for a dense q4_K / q5_0 / q6_K x f32 matmul with n >= 512, three rules choose a 2-warp tile: q4_K / q6_K m >= 2048 k >= 2560 -> BM 64 x BN 128 (2 warps of 64 x 64), q5_0 m >= 2048 k <= 640 -> BM 128 x BN 64; LDS pad 4 (a 16-B aligned stride, conformant), requiredSubgroupSize 64 pinned, 128 threads; other shapes (the hc 320 x 10240 matmuls, m <= 16, split_k > 1, n < 512) keep their tiles; pipelines `*_g1`. `=0` = the base tiles. `=BLOCK:BM:BN:WM:WN:PAD` = one sweep tile for every eligible shape (A/B only; a pad that is not a multiple of 4 is RADV-only; an invalid tile is refused with a warning and the base tile kept). Startup line once per device, always: `dense_tile_g1: table on (3 rules) (q4_K / q6_K m >= 2048 k >= 2560 -> BM 64 x BN 128, q5_0 ... -> BM 128 x BN 64, 128 threads, LDS pad 4 / 4, subgroup 64 pinned, pipelines *_g1; GGML_VK_DENSE_TILE_G1)`, `dense_tile_g1: sweep tile ...` or `dense_tile_g1: off (<reason>; the base dense tiles stay)` (knob 0 / not AMD coopmat1 / proprietary driver / no subgroup-64 pin / base tile without 16 x 16 fragments). 780M kernel test: the large q4_K shapes -31 ... -38 %, q6_K 10240 x 2560 -24 %, q5_0 10240 x 320 -12 %; on s1 the G1-eligible nodes net -4.1 % at 32k with a mixed per-shape picture (BENCHMARKS.md section 2c), so the table may be re-cut for gfx1151 | EXACT | - |
+| `GGML_VK_DENSE_TILE_G1=0` | on (the table) | 0265 (G1): where the base plan picks the AMD coopmat1 l tile with split_k 1 for a dense q4_K / q5_0 / q6_K x f32 matmul with n >= 512, three rules choose a 2-warp tile: q4_K / q6_K m >= 2048 k >= 2560 -> BM 64 x BN 128 (2 warps of 64 x 64), q5_0 m >= 2048 k <= 640 -> BM 128 x BN 64; LDS pad 4 (a 16-B aligned stride, conformant), requiredSubgroupSize 64 pinned, 128 threads; other shapes (the hc 320 x 10240 matmuls, m <= 16, split_k > 1, n < 512) keep their tiles; pipelines `*_g1`. `=0` = the base tiles. `=BLOCK:BM:BN:WM:WN:PAD` = one sweep tile for every eligible shape (A/B only; a pad that is not a multiple of 4 is RADV-only; an invalid tile is refused with a warning and the base tile kept). Startup line once per device, always: `dense_tile_g1: table on (3 rules) (q4_K / q6_K m >= 2048 k >= 2560 -> BM 64 x BN 128, q5_0 ... -> BM 128 x BN 64, 128 threads, LDS pad 4 / 4, subgroup 64 pinned, pipelines *_g1; GGML_VK_DENSE_TILE_G1)`, `dense_tile_g1: sweep tile ...` or `dense_tile_g1: off (<reason>; the base dense tiles stay)` (knob 0 / not AMD coopmat1 / proprietary driver / no subgroup-64 pin / base tile without 16 x 16 fragments). 780M kernel test: the large q4_K shapes -31 ... -38 %, q6_K 10240 x 2560 -24 %, q5_0 10240 x 320 -12 %; on s1 the G1-eligible nodes net -4.1 % at 32k with a mixed per-shape picture (its release gate record, not in this tree), so the table may be re-cut for gfx1151 | EXACT | - |
 
 ## v63 package - patches 0252-0259
 
 In v63, nothing new is set in my composes: the "default" column is what v63 runs. The package gate (full S0.1 oracle,
-docs/s1/BENCHMARKS.md section 0c) is EXACT against the v59 reference. 0253 / 0254 (MUL_MAT_ID: skip the B columns of a tile
+its release gate record, not in this tree) is EXACT against the v59 reference. 0253 / 0254 (MUL_MAT_ID: skip the B columns of a tile
 that are not rows of the expert, and read the tile list written by the expert-count prepass) have no runtime knob; the
 existing `GGML_VK_MMID_COMPACT=0` and `GGML_VK_DISABLE_HOIST_ROW_IDS=1` keep their meaning, and the build option below is
 test-only. 0257 / 0258 (context checkpoints and the MTP draft state in the `/slots` save file) and 0259 (a checkpoint restored
@@ -160,7 +179,7 @@ request field are in the first table: `--spec-draft-sampling` (0252), `--cache-d
 
 Both are in v61 and neither is set in my composes: the "default" column is what v61 runs. On by default, EXACT as part of the
 gated package (bit-identical logits, states and ordered selected ids against the v59 reference on my oracle, and each lever's
-off arm equal to the same reference; docs/s1/BENCHMARKS.md section 0a). The `=0` switches exist for A/B runs and to bisect.
+off arm equal to the same reference; its release gate record, not in this tree). The `=0` switches exist for A/B runs and to bisect.
 Each prints one startup line (shown in the effect column). 0242 has no knob.
 
 | knob | default | effect | class | prod |
@@ -174,7 +193,7 @@ Each prints one startup line (shown in the effect column). 0242 has no knob.
 
 All of these are in v60 and none is set in my composes: the "default" column is what v60 runs. Every compute change below
 that is on by default is EXACT as part of the gated package (bit-identical logits, states and ordered selected ids against v59
-on my oracle, see docs/s1/BENCHMARKS.md section 0); the `=0` switches exist for A/B runs and to bisect. The B2 tile (0233) is off
+on my oracle, see its release gate record, not in this tree); the `=0` switches exist for A/B runs and to bisect. The B2 tile (0233) is off
 and was not in the gated configuration. Patch numbers: docs/s1/PATCHES.md.
 
 **On by default in v60:** `GGML_VK_FUSE_MULTI_ADD_SCALE`, `GGML_VK_FUSE_SCALE_SILU` (0227), `GGML_VK_FUSE_CONCAT_SSM_CONV` (0228),

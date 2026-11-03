@@ -3,7 +3,7 @@
 # verifies the weights, pulls the image, starts the compose file and smoke-tests it. Idempotent: re-run it any time, finished
 # steps are skipped (a downloaded file is re-hashed only if its size or mtime changed).
 #
-#   deploy/s1/setup-brain.sh                    # 1M context (default; needs GTT 110 GiB)
+#   deploy/s1/setup-brain.sh                    # 1M context (default; needs GTT 108 GiB)
 #   BRAIN_CTX=524k deploy/s1/setup-brain.sh     # 524k context (fits GTT 104 GiB)
 #   deploy/s1/setup-brain.sh --dry-run          # print every step and size, change nothing
 #   deploy/s1/setup-brain.sh --only download    # or --only up
@@ -22,15 +22,15 @@ parse_args "$@"
 
 BRAIN_CTX="${BRAIN_CTX:-1m}"
 case "$BRAIN_CTX" in
-    1m)   COMPOSE="$HERE/docker-compose.brain-1m.yml";   CONTAINER=llama-s1-brain-1m;   NEED_GTT_MIB=112640
-          EXPECT="GTT ~105 500 MiB after load (105 495 on v63 and v64), up to ~106 000 MiB after the first requests (bar 109 216); cold fill 0 -> 1M ~41 min (41.4 on v63; v64 fill not measured yet, its fresh 32k prompt is +7 %), 0 -> 524k ~19 min" ;;
+    1m)   COMPOSE="$HERE/docker-compose.brain-1m.yml";   CONTAINER=llama-s1-brain-1m;   NEED_GTT_MIB=110592
+          EXPECT="GTT 104 580 MiB after load on v71, peak 105 407 MiB over a full 1M fill; cold fill 0 -> 1M 27.76 min on v71; prefill 623.5 t/s on a cold 32k prompt" ;;
     524k) COMPOSE="$HERE/docker-compose.brain-524k.yml"; CONTAINER=llama-s1-brain-524k; NEED_GTT_MIB=98000
-          EXPECT="GTT after load ~94 500 MiB (92.3 GiB) on v59, more on v60-v64 (not measured); cold fill 0 -> 524k ~26 min on v59 (faster on v60-v64)" ;;
+          EXPECT="the 524k profile has no v71 measurements" ;;
     *) die "BRAIN_CTX must be 1m or 524k" ;;
 esac
 export MODELS_DIR="${MODELS_DIR:-$HERE/models}"
 export SLOTS_DIR="${SLOTS_DIR:-$HERE/slots}"
-export LLAMA_S1_IMAGE="${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v64}"
+export LLAMA_S1_IMAGE="${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v71}"
 PORT=8000
 
 # ---- weights, sha256 as published on Hugging Face (LFS oid) and checked against my local files, as of 2026-10-10 ----------

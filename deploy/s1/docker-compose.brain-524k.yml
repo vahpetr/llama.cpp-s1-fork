@@ -1,8 +1,6 @@
-# Brain, 524k context, one slot - AMD Ryzen AI Max+ 395 (Strix Halo, Radeon 8060S / gfx1151), 128 GB, Vulkan.
+# Brain, 524k context, one slot - AMD Ryzen AI Max+ 395 (Strix Halo, Radeon 8060S / gfx1151), 128 GB, Vulkan. Release v71.
 # Same as docker-compose.brain-1m.yml except the context size (and the names / cache dir). Use this one if your GTT limit is
-# below 110 GiB or you want ~10 GiB more headroom: measured GTT 92.3 GiB (94 493 MiB, v53, 2026-10-09), decode 45 t/s at 524k depth,
-# cold fill 0 -> 524k in 25.6 min (v53; v60-v64 not re-measured on this profile, their prefill is faster on the 1M profile and the
-# f16 pooled-key mirror adds GTT in proportion to the context: 779 MiB measured at 1M). Same YaRN and QSA as the 1M profile (a 32k greedy check gave identical tokens, 64/64).
+# below 108 GiB or you want more headroom. Not measured on v71. Same YaRN and QSA as the 1M profile.
 #
 #   BRAIN_CTX=524k deploy/s1/setup-brain.sh        # downloads + checks the weights, pulls the image, starts this file, smoke-tests it
 #   or by hand: docker compose -f docker-compose.brain-524k.yml up -d   (MODELS_DIR / SLOTS_DIR / LLAMA_S1_IMAGE override the defaults)
@@ -15,7 +13,7 @@ services:
       context: ../..
       dockerfile: .devops/vulkan.Dockerfile
       target: server
-    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v64}   # prebuilt; `docker compose build` builds the same thing from this tree
+    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v71}   # prebuilt; `docker compose build` builds the same thing from this tree
     container_name: llama-s1-brain-524k
     restart: unless-stopped
     stop_grace_period: 90s            # on SIGTERM the server writes its slot to the disk prompt cache (a few seconds)
@@ -61,22 +59,23 @@ services:
       - LLAMA_QSA_COMPACT_BIAS=1        # selection bias as compact per-block tables instead of a [n_blocks x n_tokens] plane
       - LLAMA_QSA_GATHER_Q8=1           # gather selected K/V rows in q8_0 (same bytes as the cache, no conversion)
       - LLAMA_QSA_GATHER_MAX_WINDOWS=64 # cap on contiguous windows per gather
-      - LLAMA_QSA_CHUNK=128             # split the QSA half of a layer into chunks of <= 128 queries (exact; -0.5 GiB GTT, fill -2.8 %)
+      - LLAMA_QSA_CHUNK=128             # split the QSA half of a layer into chunks of <= 128 queries (exact; less GTT)
       - LLAMA_QSA_PREFILL=indexed       # prefill: flash attention over the selected ids instead of a masked scan
       - LLAMA_QSA_VIS=1                 # QSA selection / indexed FA read the metadata too (no mask plane; at 1M it would be 4 GiB)
       - LLAMA_QSA_CENSUS_INC=1          # incremental block census: re-plan only cells past the last plan (exact)
       - LLAMA_QSA_INPUTS_INC=1          # incremental QSA graph inputs, device-resident mirrors (exact)
-      - LLAMA_QSA_RELU_INPLACE=1        # in-place ReLU on the score path (exact; -0.25 GiB)
+      - LLAMA_QSA_RELU_INPLACE=1        # in-place ReLU on the score path (exact; less GTT)
       - GGML_VK_QSA_SCRATCH_PRESIZE=1   # presize the QSA selection scratch at load
       - GGML_VK_QSA_SCRATCH_PRESIZE_FA=1 # ... and the indexed-FA staging, so no buffer grows mid-fill
       - GGML_VK_QSA_FUSED_SELECT=1      # score + block map + mask -> top-k ids in one fused op
       # --- MTP draft ---
-      - LLAMA_MTP_CATCHUP_ATTN=0        # attention-free draft catch-up on prefill (exact; fill -29.6 % at 524k)
-      - LLAMA_MTP_QSA=1                 # sparse MTP draft: the draft block uses its own indexer (target exact; decode at 524k -18 %)
+      - LLAMA_MTP_CATCHUP_ATTN=0        # attention-free draft catch-up on prefill (exact; faster fill)
+      - LLAMA_MTP_QSA=1                 # sparse MTP draft: the draft block uses its own indexer (target exact)
+      - LLAMA_SPEC_OVERLAP=1            # trimmed host phase of each speculative round (output-exact; not in the disk-cache key)
       # --- graph + allocation-plan cache ---
-      - LLAMA_GRAPH_CACHE=8             # keep up to 8 built graphs and their allocation plans, reuse on an exact shape match (decode -5.8 %)
+      - LLAMA_GRAPH_CACHE=8             # keep up to 8 built graphs and their allocation plans, reuse on an exact shape match
       # --- GTT admission: a prefill chunk waits instead of pushing GTT over the bar (scheduling only, never changes outputs) ---
-      - LLAMA_GTT_ADMISSION_MIB=${LLAMA_GTT_ADMISSION_MIB:-109216}  # bar = GTT size - 3 424 MiB (112 640 - 3 424 here); setup-brain.sh computes it
+      - LLAMA_GTT_ADMISSION_MIB=${LLAMA_GTT_ADMISSION_MIB:-109216}  # my host's bar (GTT 110 592 MiB); setup-brain.sh sets GTT size - 3 424 MiB for yours
       - LLAMA_GTT_SLOPE_B_PER_CELL=256  # expected GTT growth per new KV cell (planeless layout)
       - LLAMA_GTT_STAGING_B_PER_CELL=0  # no geometric staging step (the presize covers every graph)
       - LLAMA_GTT_ONCE_MIB=1200         # one-time first-use growth allowed before the slope applies
@@ -154,14 +153,13 @@ services:
       - "0.125"                         # deep checkpoints: dense near the end of a conversation, logarithmic in depth
       - --cache-disk-ckpt-max
       - "32"                            # per conversation (113 MiB each for this model)
-      # --- upgrading from v59 or older: keep the stored conversations (docs/s1/DEPLOY.md, "Upgrading from v59") ---
-      # v60 changed the saved-state format (v61-v64 keep v60's), so its disk-cache key (the ns-<key> directory under the --cache-disk dir) is new and
-      # it starts with an empty namespace. To keep reading the old one, uncomment the next two lines and put the OLD key there:
-      # the ns-<key> directory name of the old version, or "key" in GET /disk-cache of the old server (16 hex digits). It is
-      # opened read-only: text conversations load, ones with images are refused (re-prefilled once), new saves go to the new
-      # namespace, and a rollback to the old image finds its namespace untouched. Required when upgrading: a namespace that is
-      # NOT adopted is deleted by the cache cleanup once idle past --cache-disk-ttl-days or once foreign namespaces exceed half of
-      # --cache-disk-gib (a 1M namespace can on its own). A fresh install has nothing to adopt.
+      - --cache-disk-async
+      - "1024"                          # asynchronous save: 1 024 MiB of host staging, worker threads write the blocks
+      - --cache-disk-incr               # incremental re-save: unchanged KV blocks come from the last save (byte-identical files)
+      # --- upgrading from v59 or older only (v60-v71 share one key): keep the stored conversations (docs/s1/DEPLOY.md, section 4) ---
+      # Uncomment the next two lines and put the OLD key there (the ns-<key> directory name, or "key" in GET /disk-cache of the
+      # old server). The old namespace is opened read-only; without adoption the cache cleanup deletes it once idle past
+      # --cache-disk-ttl-days or once foreign namespaces exceed half of --cache-disk-gib. A fresh install has nothing to adopt.
       # - --cache-disk-adopt
       # - "<old key>"
       - --slot-prompt-similarity
@@ -176,7 +174,7 @@ services:
       - --spec-draft-p-min
       - "0.7"                           # stop drafting when the head is unsure
       - --spec-draft-sampling
-      - probabilistic                   # v64 default: at T > 0 the draft is sampled and verified by rejection sampling; T = 0 unchanged (greedy = v63). `greedy` restores v63's drafting; images before v63 do not know the flag
+      - probabilistic                   # at T > 0 the draft is sampled and verified by rejection sampling; T = 0 stays greedy; `greedy` turns it off
       - --reasoning-format
       - deepseek
       - --reasoning

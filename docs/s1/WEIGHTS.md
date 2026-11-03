@@ -19,8 +19,8 @@ native context 262 144.
 
 **Why this quant.** i1-Q4_K_M is 5.39 bits per weight over the whole file. The PLE table (32.8 GiB, Q5_0: its rows are 160 wide,
 so K-quants fall back to Q5_0) stays in host RAM through mmap; the rest (78.2 GiB) goes to the GPU. With a 1M-token q8_0 KV,
-the QSA indexer cache and the draft, GTT sits at 102.7 GiB, which leaves the OS ~14 GiB of the 124 GiB it sees, most of it
-page cache for the PLE table. By my arithmetic an i1-Q5_K_M trunk (89 GiB) would not fit next to the 1M KV; i1-IQ4_XS (64 GiB
+the QSA indexer cache and the draft, GTT is 104 580 MiB after load on v71 (GTT limit 108 GiB), which leaves the OS the rest of
+the 124 GiB it sees, most of it page cache for the PLE table. By my arithmetic an i1-Q5_K_M trunk (89 GiB) would not fit next to the 1M KV; i1-IQ4_XS (64 GiB
 trunk) fits easily, but Q4_K_M fit and I never needed to step down.
 
 **Head and embedding stay as shipped** (`output.weight` Q6_K, `token_embd.weight` Q4_K). I tried the hands' Q8_0 head trick on
@@ -34,11 +34,11 @@ p 0.008), and +3.4 points (not significant) on 8k/32k controls. The two files co
 "not worse at depth", not a clean abliteration effect. I kept the uncensored one.
 
 **Draft head.** The MTP head is exported from the official checkpoint (the abliteration changed four MTP tensors; the official
-head drafts the uncensored target fine: acceptance 0.77-0.95 depending on depth and text). My servers run a vocabulary-pruned
+head drafts the uncensored target: acceptance 0.800-0.877 at 32k-1M on v71 with the pruned copy below). My servers run a vocabulary-pruned
 copy of the same head (65 536 of 248 320 output rows, fork patch 0007, `mtp-...Q4_K_M.v65536-v5.gguf`, sha `afeabdf62af8227b`).
 The ranking behind the pruning is built partly from my own traffic, so I do not publish it. The full-vocabulary dzannotti file
-loads the same way; I have not measured the speed difference on the current build, so treat the README decode numbers as an
-upper bound for it.
+loads the same way; I have not measured the speed difference on v71, so treat the README decode numbers as an upper bound
+for it.
 
 ## 2. Hands (balkon, Ryzen 9 7940HS + Radeon 780M, 96 GB)
 
@@ -97,13 +97,13 @@ changed to Q8_0; nothing else changed type; sha256 of shard 1 = `4b1be1167cf5303
 
 | weights | image | what | kind |
 |---|---|---|---|
-| brain i1-Q4_K_M + pruned MTP | v53 | speed suite, needles 32k-213k, exactness census (docs/s1/BENCHMARKS.md section 1) | suite run, single rep |
+| brain i1-Q4_K_M + pruned MTP | v53 | speed suite, needles 32k-213k, exactness census | suite run, single rep |
 | brain i1-Q4_K_M + pruned MTP | v52 | 1M fill + decode per 64k step | single run |
 | brain, every fork change | v9-v53 | paired gates: token / state-hash identity, census, speed with noise band | gates |
 | brain uncensored vs official | v35 | long-context accuracy 262k / 524k, 244 items | paired, informational |
 | brain Q8 head (o8) | v53 | EOS probe | single probe |
 | hands GSQ tiers vs A3B | v40k-v48k | speed 1k-32k, 40-task coding bench | 1 rep per arm |
-| hands IQ3_S-hc8-o8 | v53k | EOS probe, speed, GTT per pool size | probe; the 40-task gate on o8 was pending when I wrote this |
+| hands IQ3_S-hc8-o8 | v53k | EOS probe, speed, GTT per pool size | probe |
 
 Accuracy at the 1M tier is not gated: one long-context probe scored 76.8 % at 1M. Use the 1M window for recall over very long
 inputs, and check answers that depend on it.
