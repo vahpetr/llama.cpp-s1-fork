@@ -47,7 +47,7 @@ No stock llama.cpp or other-engine numbers were measured on v71.
 | the same in t/s | 41.6 / 51.7 / 56.5 |
 | draft acceptance at 32k / 262k / 1M | 0.817 / 0.800 / 0.877 |
 | decode without draft (restore path) at 32k / 262k / 1M, ms/token | 31.80 / 32.37 / 39.39 |
-| TTFT, 256 new tokens at 1 046 989 after a restore, median of 3, ms (1 302.9 warm, 1 266.9 / 1 303.6 after restore) | 1 303 |
+| TTFT, 256 new tokens at 1 046 989 after a slot restore, mean of the 2 restored reps, ms (1 266.9 / 1 303.6; warm rep without restore 1 302.9) | 1 285 |
 | GTT peak over the 1M fill, MiB (admission bar 109 216) | 105 407 |
 | 1M slot file: size / save time | 17.09 GiB / 3.0 s |
 

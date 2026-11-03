@@ -16,7 +16,7 @@ one slot, with sparse attention, MTP drafting and a disk prompt cache. This READ
 | 128k | 580.5 (cold prompt) | — | — | — |
 | 262k | 676.9 (step) | 51.7 (19.33) | 0.800 | — |
 | 524k | 648.2 (step) | — | — | — |
-| 1M | 585.3 (step) | 56.5 (17.69) | 0.877 | 1 303 ms |
+| 1M | 585.3 (step) | 56.5 (17.69) | 0.877 | 1 285 ms |
 
 GTT after load: 104 580 MiB (admission bar 109 216 MiB). Cold fill 0 → 1 046 528 tokens: 27.76 min (sum of 17 step walls).
 "—" = not measured on v71. Per-run tables and the method: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md).
@@ -35,7 +35,7 @@ Measurement setup:
 - Step = the 65 536-token append that reaches the depth; t/s of that step. Fill = sum of the step walls.
 - Decode = ms per token, worst of 3 windows of 128 tokens, continuous history, draft on, fixed text corpus. Decode speed depends
   on draft acceptance, which depends on the text.
-- TTFT = 256 new tokens after restoring a saved 1M conversation, median of 3.
+- TTFT = 256 new tokens after restoring a saved 1M conversation, mean of 2 restored reps.
 - Single runs; noise band about ±1.5 %.
 - No stock llama.cpp or other-engine numbers were measured on v71; the only cross-engine number is the dated v60 stock comparison.
 
