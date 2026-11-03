@@ -5,9 +5,10 @@ contributor rules for llama.cpp itself are in
 [upstream AGENTS.md](https://github.com/ggml-org/llama.cpp/blob/master/AGENTS.md); they apply to anything sent upstream from here.
 Read README.md first, then docs/s1/KNOBS.md (every flag and env knob) and docs/s1/PATCHES.md (every change, numbered).
 
-This tree is **v61** (2026-10-17): fork revision `7a438f3ba` (`prod-v11-stage8-pkg8`) plus the docs and deploy files of this
-`s1-public` branch. Image `vahpetr/llama-cpp-s1-fork:v61` (= `:v61k` = `:latest`); deploy steps in docs/s1/DEPLOY.md, what
-changed in docs/s1/RELEASE-NOTES.md.
+This tree is **v71**: fork revision `8bcde80da` (`prod-v11-stage9-pkg11`) plus the docs and deploy files of this `s1-public`
+branch. Brain image `vahpetr/llama-cpp-s1-fork:v71`; the hands run `:v70k` (the v71 hands build is not published, see README.md
+Known limitations); brain rollback `:v70`. Deploy steps in docs/s1/DEPLOY.md, what the release contains in
+docs/s1/RELEASE-NOTES.md.
 
 ## Where the fork's code lives
 
@@ -19,12 +20,13 @@ changed in docs/s1/RELEASE-NOTES.md.
 | KQ mask from metadata (`LLAMA_KQ_VIS`), its device mirror with per-consumer dirty ranges, cells | `src/llama-graph.cpp`, `src/llama-kv-cache.cpp`, `src/llama-kv-cells.h` |
 | graph + allocation-plan cache, reserve shape, MTP catch-up | `src/llama-context.cpp`, `ggml/src/ggml-backend.cpp`, `ggml/src/ggml-alloc.c` |
 | speculative decoding (MTP draft, replay, adaptive / tput policy) | `common/speculative.cpp`, `common/sampling.cpp` |
-| server: slots, checkpoints, GTT admission, multi-slot routing, stop-type log | `tools/server/server-context.cpp`, `server-task.cpp` |
-| disk prompt cache (tiers, deep checkpoints, namespaces, adopt, fingerprint, legacy-state policy `LLAMA_LEGACY_UNMARKED`) | `tools/server/server-disk-cache.cpp/.h` |
-| Vulkan kernels: QSA top-k, indexed / metadata FA, KQ mask, fusions, MMQ int8, expert telemetry; v60: QSA score epilogue and the matmul tile plans (`mul_mm`), mat-vec hoist, hc_mix tail and conv-input fusions | `ggml/src/ggml-vulkan/ggml-vulkan.cpp`, `vulkan-shaders/{topk_radix_select*,flash_attn_*,kq_mask,qsa_bias,hc_combine,add_softplus_mul,mul_mmq_cm1*,mul_mm,mul_mat_vec*,multi_add,scale_silu,ssm_conv}` |
+| GDN commit-by-replay (`LLAMA_GDN_REPLAY`, snapshot admission) | `src/llama-memory-recurrent.cpp` |
+| server: slots, checkpoints, GTT admission, multi-slot routing, stop-type log, speculative host phase (`LLAMA_SPEC_OVERLAP`) | `tools/server/server-context.cpp`, `server-task.cpp` |
+| disk prompt cache (tiers, deep checkpoints, namespaces, adopt, fingerprint, async and incremental saves, legacy-state policy `LLAMA_LEGACY_UNMARKED`) | `tools/server/server-disk-cache.cpp/.h` |
+| Vulkan kernels: QSA top-k (v2 radix, single-pass, v3 block form), QSA score epilogue with the bias fold, indexed / metadata FA, KQ mask, matmul tile plans (`mul_mm`, `mul_mat_id`), mat-vec hoist, fusions, MMQ int8, expert telemetry | `ggml/src/ggml-vulkan/ggml-vulkan.cpp`, `vulkan-shaders/{topk_radix_select*,topk_qsa_onepass,topk_qsa_v3,flash_attn_*,kq_mask,qsa_bias,hc_combine,add_softplus_mul,mul_mmq_cm1*,mul_mm,mul_mat_vec*,multi_add,scale_silu,ssm_conv}` |
 | new ops (`GGML_OP_QSA_TOP_K`, `QSA_BIAS`, `QSA_SCORE`, `KQ_MASK`, FA with ids / metadata, `get_rows_type`) | `ggml/include/ggml.h`, `ggml/src/ggml.c`, `ggml/src/ggml-cpu/ops.cpp`, `ggml/src/ggml-cpu/ggml-cpu.c` |
 | webui (compaction, per-chat settings, timing chips, frozen tools) | `tools/ui/` (Svelte; tests under `tools/ui/tests/`) |
-| tools | `tools/mtp-replay/`, `tools/qsa-frozen/`, `tools/s1/gguf_hc_q8.py` |
+| tools | `tools/mtp-replay/`, `tools/qsa-frozen/`; `tools/s1/gguf_hc_q8.py` (hands profile, CPU: re-encodes the BF16 `hc_*` weights and swaps in a Q8_0 head; `setup-hands.sh` runs it and checks the result's sha256) |
 | deploy + docs | `deploy/`, `docs/s1/` |
 
 ## Tags: how to find a feature
@@ -35,11 +37,14 @@ Fork code and commits carry `[TAG_<NAME>]` markers. `git grep -n TAG_GRAPH_CACHE
 `_MIN_KV`, `_SCRATCH`, `_WHOLE_BLOCKS`), `TAG_KQ_VIS`, `TAG_MTP_QSA`, `TAG_MTP_CATCHUP_NOATTN`, `TAG_GRAPH_CACHE`,
 `TAG_MULTISLOT`, `TAG_GTT_ADMISSION`, `TAG_KV_GRAPH_SPAN`, `TAG_DISK_PROMPT_CACHE`, `TAG_DEEP_CKPT`, `TAG_DISK_ADOPT`,
 `TAG_CACHE_COMPAT2`, `TAG_STATE_DESCRIPTOR`, `TAG_SPEC_DRAFT_POLICY`, `TAG_SPEC_ROUND_TIMING`, `TAG_WEBUI`, `TAG_VK_EXPERT_OCC`,
-`TAG_UP<pr>` (an upstream back-port). v60 added `TAG_HC_MIX_TAIL` (0227), `TAG_CONV_INPUT_SPLIT` (0228), `TAG_QSA_DUMP_IDS` /
+`TAG_UP<pr>` (an upstream back-port). Patches 0227-0243 added `TAG_HC_MIX_TAIL` (0227), `TAG_CONV_INPUT_SPLIT` (0228), `TAG_QSA_DUMP_IDS` /
 `TAG_QSA_DUMP_SCORE` (0229), `TAG_VK_DISPATCH_LOG` (0230), `TAG_MMID_PRECAST_B` / `TAG_MMID_TILE_B1` (0231 / 0232),
 `TAG_DENSE_TILE_B2` (0233), `TAG_INJECT_TILE_M16` (0234), `TAG_QSA_SCORE_EPILOGUE` (0235), `TAG_MMVQ_HOIST` (0236),
 `TAG_KQ_VIS_MIRROR` (0237), `TAG_SPEC_TRACE_IDS` (0238), `TAG_CELL_EXT_RESTORE` / `TAG_CELL_EXT_PROVENANCE` (0239),
-`TAG_QSA_POOLED_F16_MIRROR` (0240); v61 added `TAG_QSA_SCORE_KREUSE` (0241) and `TAG_QSA_TOPK_NOKEYS` (0243). New work gets a new tag in both the code comment and the commit subject.
+`TAG_QSA_POOLED_F16_MIRROR` (0240), `TAG_QSA_SCORE_KREUSE` (0241) and `TAG_QSA_TOPK_NOKEYS` (0243). Tags in v71 code
+not listed in docs/s1/PATCHES.md yet include `TAG_QSA_TOPK_ONEPASS`, `TAG_QSA_TOPK_V3`, `TAG_QSA_BIAS_FOLD`, `TAG_GDN_REPLAY`,
+`TAG_T2_HOST_SPLIT` / `TAG_T2_SEQ_RM_COUNTED` (`LLAMA_SPEC_OVERLAP`) and `TAG_DISK_ASYNC_SAVE`. New work gets a new tag in both
+the code comment and the commit subject.
 
 ## Build and test contract
 
@@ -50,7 +55,8 @@ Fork code and commits carry `[TAG_<NAME>]` markers. `git grep -n TAG_GRAPH_CACHE
    off == on == CHECK), `test-mtp-catchup` / `test-mtp-qsa-restore` / `test-mtp-qsa-phase` / `test-mtp-carrier`,
    `test-state-portable` (np1 <-> np2 state), `test-cache-compat-key` (incl. the unmarked-checkpoint rules),
    `test-spec-draft-policy`, `test-draft-accept-eog`, `test-cell-ext-restore` / `-qsa` (state restore with and without PLE,
-   text and image entries, marked and unmarked).
+   text and image entries, marked and unmarked), `test-gdn-replay`, `test-qsa-topk-onepass`, `test-qsa-topk-nokeys`,
+   `test-qsa-score-kreuse`.
    Built but not ctests (need a Vulkan coopmat1 GPU): `test-qsa-f16-mirror` (mirror off vs on + CHECK through the model graph),
    `test-vk-graph-order` (fusion / dispatch order through the scheduler, `tests/test-vk-graph-order.sh`).
 2. Vulkan op tests on a box with the GPU: build with `-DGGML_VULKAN=ON`, then
@@ -65,13 +71,11 @@ Fork code and commits carry `[TAG_<NAME>]` markers. `git grep -n TAG_GRAPH_CACHE
 - **EXACT**: same tokens, same probabilities, same state bytes. Proof = per-step slot state hashes identical (save the slot,
   sha256), `[qsa-ids]` selection dumps identical (`LLAMA_QSA_DUMP_IDS=1`), the census oracle identical (fixed prompts, greedy,
   512 tokens, every position compared with probabilities), and CHECK modes where they exist (`LLAMA_GRAPH_CACHE_CHECK`,
-  `LLAMA_QSA_CENSUS_CHECK`, `LLAMA_KQ_VIS_MIRROR_CHECK`, `LLAMA_QSA_POOLED_F16_MIRROR_CHECK`). Since v60 the gate is my S0.1
-  oracle: one probe program (private) drives the production configuration through fixed prompts and compares the new build
-  with the previous one bit for bit - logits at every captured position, the saved states, the QSA ids per chunk (`[qsa-ids]`
-  sha256 records, patch 0229) - at verify widths 1-6 in full and the last 6 positions of widths 7-9, depths 8k -> 1M, and
-  restore / replay histories. v60 vs v59: 1 502 logit positions and 224 state points identical, on gfx1151, the package as a
-  whole, production configuration minus the vision projector, one slot, text corpus; v61 the same against the same v59
-  reference, plus an off arm per lever (docs/s1/BENCHMARKS.md section 0a).
+  `LLAMA_QSA_CENSUS_CHECK`, `LLAMA_KQ_VIS_MIRROR_CHECK`, `LLAMA_QSA_POOLED_F16_MIRROR_CHECK`). Release gates use my oracle
+  (private): a probe program drives the production configuration through fixed prompts and compares the new build with the
+  previous one bit for bit - logits at captured positions, the saved states, the QSA ids per chunk (`[qsa-ids]` sha256
+  records, patch 0229) - across verify widths, depths up to 1M and restore / replay histories, on gfx1151, the package as a
+  whole. v71 passed it against v70 (docs/s1/RELEASE-NOTES.md).
 - **COMPOSITION**: same per-op math, different batching / routing / selection order, so near-ties can flip a token. Proof =
   teacher-forced replay after the first divergence: every divergence must be a near-tie or a selection flip that the reference
   also accepts (my "R81" classifier), plus needles and speed. A change that cannot be classified this way is treated as LOSSY.

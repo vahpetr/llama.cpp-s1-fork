@@ -1,7 +1,7 @@
 # Host tuning (my setup, adapt)
 
-Both boxes run Ubuntu with kernel 7.0 (`7.0.0-34-generic`), Mesa RADV for Vulkan, Docker with `/dev/dri` passed in. These are
-the lines actually in use on 2026-10-10, read from `/proc/cmdline` and `/etc/sysctl.d`. Items marked *(my setup)* are there for
+Both boxes run Ubuntu with kernel 7.0 (s1: `7.0.0-38-generic`), Mesa RADV for Vulkan (inside the image), Docker with `/dev/dri`
+passed in. The s1 kernel line below was read from `/proc/cmdline` on 2026-11-04; the rest is from `/etc/sysctl.d` as of 2026-10-10. Items marked *(my setup)* are there for
 reasons that are not specific to LLM serving or that I have not isolated - check them against your own needs.
 
 ## s1: Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 128 GB LPDDR5x
@@ -12,15 +12,17 @@ the GPU), which is what the kernel parameters below size. The OS sees ~124 GiB.
 Kernel command line (`GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`, then `sudo update-grub` and reboot):
 
 ```
-ttm.pages_limit=28835840 ttm.page_pool_size=28835840   # 28 835 840 x 4 KiB pages = 110 GiB (112 640 MiB) of GTT
+ttm.pages_limit=28311552 ttm.page_pool_size=28311552   # 28 311 552 x 4 KiB pages = 108 GiB (110 592 MiB) of GTT
 amd_iommu=off                                           # measured +13 % decode, +25 % prefill, +56 % 4-stream vs iommu=pt
 amdgpu.lockup_timeout=600000                            # long prompts: with the default 10 s Vulkan died at ~155k prompt tokens
 ```
 
 - GTT size: I set it with `ttm.pages_limit` / `ttm.page_pool_size`, not `amdgpu.gttsize`. Check after reboot:
-  `cat /sys/class/drm/card*/device/mem_info_gtt_total` (should read 118 111 600 640 bytes = 110 GiB).
-- 110 GiB is needed only for the 1M profile (102.7 GiB GTT). The 524k profile (92.3 GiB) ran for weeks with 104 GiB
-  (`ttm.pages_limit=27262976`). Leaving ~14 GiB to the OS is enough only because nothing else big runs on the box.
+  `cat /sys/bus/pci/devices/<bdf>/mem_info_gtt_total` (should read 115 964 116 992 bytes = 108 GiB). I ran 110 GiB until
+  2026-10-30 and lowered it to 108 GiB after a host out-of-memory hang, to leave the OS more RAM.
+- 108 GiB is needed only for the 1M profile (104 580 MiB GTT after load on v71, 105 407 MiB peak over a 1M fill). The 524k
+  profile ran for weeks with 104 GiB (`ttm.pages_limit=27262976`). Leaving ~16 GiB to the OS is enough only because nothing
+  else big runs on the box.
 - *(my setup)* also on the command line: `nvme_core.default_ps_max_latency_us=0 pcie_aspm=off pcie_port_pm=off
   processor.max_cstate=1 mitigations=off transparent_hugepage=always` and a ramoops reservation. These came from chasing NVMe
   power-state issues and crash logging on this unit, not from LLM tuning; I have not measured their effect on inference.
@@ -53,7 +55,8 @@ Resilience *(my setup, worth copying)*:
 - One heavy GPU or RAM job at a time. Two model loads at once, or a GGUF conversion next to a model reload, hung or OOM'd the box
   more than once. I serialise them with one `flock`.
 
-Cooling: a 1M cold fill keeps the GPU at full load for over an hour, and a busy agent day is hours of decode. My unit runs
+Cooling: a 1M cold fill keeps the GPU at full load for about half an hour (27.76 min on v71), and a busy agent day is hours of
+decode. My unit runs
 in its default power profile; I have not measured throttling. Check temperatures under a long fill before you trust numbers.
 
 ## balkon: Ryzen 9 7940HS / Radeon 780M (gfx1103, RDNA3), 96 GB DDR5
