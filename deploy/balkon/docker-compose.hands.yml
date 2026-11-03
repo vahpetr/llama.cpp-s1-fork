@@ -2,13 +2,13 @@
 #
 # Model: Qwen3.8-Flash-Next GSQ-RCO abliterated (SC117) IQ3_S, with two local re-encodes made by tools/s1/gguf_hc_q8.py
 # (deploy/README.md has the exact steps):
-#   - the hyper-connection weights hc_* BF16 -> Q8_0 ("hc8"): the 780M has no bf16 math, Q8_0 is smaller and decodes 1-5 % faster;
+#   - the hyper-connection weights hc_* BF16 -> Q8_0 ("hc8"): the 780M has no bf16 math, Q8_0 is smaller;
 #   - output.weight + token_embd.weight replaced by the base model's Q8_0 bytes ("o8"): the low-bit head ended replies early
 #     (P(EOS) at a mid-code stop 0.021 on IQ3_S-hc8, 0.001 on IQ3_S-hc8-o8).
 # Context: one pool of 917 504 cells shared by 5 slots (--kv-unified), any single slot can grow to the whole pool;
-# YaRN x4 over 262 144 + QSA above 64k. GTT ~73 GiB of a 78 GiB limit (interpolated from measured 786k and 1M pools),
-# decode ~15-16 t/s, prefill ~140 t/s at 1.7k (measured 2026-10-10); on v63k 27.8 t/s on a short chat reply (free GPU), GTT 75 479 MiB
-# after the v64k switch.
+# YaRN x4 over 262 144 + QSA above 64k. Needs a 78 GiB GTT limit.
+# Image: :v70k. Known limitation: hands build :v71k is not published - the v71 code crashes once at warmup on the Radeon 780M
+# (gfx1103, vk::DeviceLostError); hands run :v70k until the fix. No v71 hands measurements.
 #
 #   deploy/balkon/setup-hands.sh        # downloads + checks the weights, pulls the image, starts this file, smoke-tests it
 #   or by hand: docker compose -f docker-compose.hands.yml up -d   (MODELS_DIR / SLOTS_DIR / LLAMA_S1_IMAGE override the defaults)
@@ -21,7 +21,7 @@ services:
       context: ../..
       dockerfile: .devops/vulkan.Dockerfile
       target: server
-    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v64k}   # prebuilt; `docker compose build` builds the same thing from this tree
+    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v70k}   # prebuilt; `docker compose build` builds the same thing from this tree
     container_name: llama-s1-hands
     restart: unless-stopped
     stop_grace_period: 90s            # on SIGTERM the server writes its slots to the disk prompt cache
@@ -52,12 +52,13 @@ services:
       - GGML_VK_QSA_FUSED_SELECT=1
       - LLAMA_QSA_CHUNK=128
       - LLAMA_QSA_POOLED_CACHE=1
-      - LLAMA_QSA_MIN_KV=65536          # dense below 64k; on the 780M QSA at 128k measured +48 % prefill / +68 % decode vs dense
+      - LLAMA_QSA_MIN_KV=65536          # dense below 64k
       - LLAMA_QSA_GATHER_MAX_WINDOWS=64
       - LLAMA_QSA_PREFILL=indexed
       - LLAMA_QSA_VIS=1
       - LLAMA_QSA_CENSUS_INC=1
       - LLAMA_QSA_INPUTS_INC=1
+      - LLAMA_SPEC_OVERLAP=1            # trimmed host phase of each speculative round (output-exact; not in the disk-cache key)
       - LLAMA_QSA_RELU_INPLACE=1
       - LLAMA_MTP_CATCHUP_ATTN=0
     volumes:
@@ -131,11 +132,13 @@ services:
       - "0.125"
       - "--cache-disk-ckpt-max"
       - "32"
-      # Upgrading from v59k or older: v60 changed the saved-state format, so the disk-cache key is new (v61k-v64k keep v60k's key). To keep the stored
-      # conversations, uncomment the next two lines with the OLD key (the ns-<key> directory name in /slots/prompt-cache/hands,
-      # or "key" in GET /disk-cache of the old server): read-only, text entries load, image entries are refused, new saves go
-      # to the new namespace (docs/s1/DEPLOY.md). Required when upgrading: a namespace that is NOT adopted is deleted by the
-      # cache cleanup once idle past the TTL or once foreign namespaces exceed half the quota. A fresh install has nothing to adopt.
+      - "--cache-disk-async"
+      - "1024"                          # asynchronous save with 1 024 MiB of host staging
+      - "--cache-disk-incr"             # incremental re-save: unchanged KV blocks come from the last save (byte-identical files)
+      # Upgrading from v59k or older only (v60k-v70k share one key): to keep the stored conversations, uncomment the next two
+      # lines with the OLD key (the ns-<key> directory name in /slots/prompt-cache/hands, or "key" in GET /disk-cache of the old
+      # server). Read-only; without adoption the cache cleanup deletes the old namespace once idle past the TTL or once foreign
+      # namespaces exceed half the quota (docs/s1/DEPLOY.md, section 4). A fresh install has nothing to adopt.
       # - "--cache-disk-adopt"
       # - "<old key>"
       - "--no-context-shift"
@@ -148,11 +151,11 @@ services:
       - "--spec-draft-p-min"
       - "0.7"
       - "--spec-draft-sampling"
-      - "probabilistic"                 # v64 default: at T > 0 the draft is sampled and verified by rejection sampling; T = 0 unchanged. My 40-task coding bench with it: 39/40 (38/40 before). `greedy` restores v63k's drafting
+      - "probabilistic"                 # at T > 0 the draft is sampled and verified by rejection sampling; T = 0 stays greedy; `greedy` turns it off
       - "--reasoning-format"
       - "deepseek"
       - "--reasoning"
-      - "off"                           # thinking on the hands measured +16-24 % wall time with no gain in solved tasks
+      - "off"                           # thinking off by default; a client can turn it on per request
       - "--temp"
       - "0.7"
       - "--top-p"

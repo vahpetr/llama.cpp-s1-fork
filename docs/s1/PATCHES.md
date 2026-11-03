@@ -9,7 +9,11 @@ Status column:
 - **v60**: in this tree since v60 (in production 2026-10-16 to 2026-10-17); "v60, on" / "v60, off" = the default of its knob.
 - **v61**: in this tree since v61 (in production 2026-10-17 to 2026-10-19); "v61, on" = on by default.
 - **v63**: in this tree since v63 (released 2026-10-21; in production 2026-10-21 06:32 to 22:12); "v63, on" / "v63, off" = the default of its knob.
-- **v64**: in this tree (HEAD = v64, released 2026-10-21; in production since 2026-10-21 22:12 s1 / 22:16 balkon); "v64, on" = on by default.
+- **v64**: in this tree since v64 (released 2026-10-21); "v64, on" = on by default.
+
+This tree is v71: fork revision `8bcde80da` (`prod-v11-stage9-pkg11`), image `vahpetr/llama-cpp-s1-fork:v71`. Every row
+below is still in it. The patches made after 0265 (the v65-v71 packages, up to 0407) have no rows here yet; their knobs are in
+docs/s1/KNOBS.md, section "Added after patch 0265", and their tags are in the code comments.
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
 - **in tree, off**: compiled in, off unless you set its knob (docs/s1/KNOBS.md).
@@ -242,7 +246,7 @@ records and upstream status live in my private repo; ask if you want one.
 | 0241 | vulkan: QSA_SCORE planes of >= 2 N tiles run on `*_qsa_kr` twins whose workgroups are numbered key tile major, so the query tiles of a chunk read each pooled-key tile back to back (A2b); same per-tile program, same bits; s1 kernel test median 0.877x per call over 16 shapes | v61, on (EXACT) |
 | 0242 | tests: test-cell-ext-restore uses a private temp dir per run; comments use neutral wording | v61, no code change |
 | 0243 | vulkan: QSA top-k select (cell form, v2) without per-cell key rows: the key is computed from the score bits and the visibility with integer instructions; no key region in the scratch (A3); s1 select per QSA layer at 1M 7.616 -> 6.097 s | v61, on (EXACT) |
-| 0244-0251 | v62: correctness and diagnostics (incl. `GGML_VK_BUF_LOG`, `--spec-draft-n-ubatch`, unset); numbers = v61 (BENCHMARKS.md section 0b) | v62 |
+| 0244-0251 | v62: correctness and diagnostics (incl. `GGML_VK_BUF_LOG`, `--spec-draft-n-ubatch`, unset); numbers = v61 (its release gate record, not in this tree) | v62 |
 | 0252 | server + common: `--spec-draft-sampling greedy\|probabilistic` (upstream #27694 port): at T > 0 the draft is sampled from a draft sampler at the request's temperature and seed and the target verifies by rejection sampling; stateful samplers keep sample-and-match (U7) | v63, off (greedy = byte-identical); probabilistic in the composes since v64 (T = 0 unchanged) |
 | 0253 | vulkan: MUL_MAT_ID coopmat1 skips the B loads and the K loop of warps whose columns are not rows of the expert (upstream #25483 cherry-pick); test-only negative-control build option `GGML_VULKAN_MMID_SKIP_NEGCTL` + `test-mmid-skip` (U3) | v63, on (EXACT) |
 | 0254 | vulkan: matmul_id shaders read the (expert, tile) list written by the expert-count prepass instead of a binary search; duplicate ids, hoisting in rounds of 512 experts (upstream #29998 port); `test_mul_mat_id_dup` (U3) | v63, on (EXACT) |
@@ -266,11 +270,11 @@ covered the package as a whole, plus an off arm per lever.
 
 **0252-0259 apply order** on v62 (`e4af0a6ca`): 0253, 0254, 0255, 0256, 0257, 0258, 0252, 0259 (the order of the package
 commits); a strict `git am` of 0252 -> 0259 in number order gives the same tree (`5414224ae`, rev `8c1a468aa`,
-`prod-v11-stage9-pkg2`). The full oracle gate covered the package as a whole (docs/s1/BENCHMARKS.md section 0c), plus each
+`prod-v11-stage9-pkg2`). The full oracle gate covered the package as a whole (its release gate record, not in this tree), plus each
 patch's own unit and server tests; `--spec-draft-sampling probabilistic` was not in the gated configuration.
 
 **0262 / 0263 / 0265 apply order** on v63 (`8c1a468aa`): 0263, 0262, 0265. Applied with a strict `git am` in that order they
 reproduce the v64 tree (`6f39b1652`, rev `c5b3462ed`, `prod-v11-stage9-pkg3`). The three were gated as one package on the short
-tier of the oracle (docs/s1/BENCHMARKS.md section 0d; the deep tripwire the night after re-ran the control arms), plus each
+tier of the oracle (its release gate record, not in this tree; the deep tripwire the night after re-ran the control arms), plus each
 kernel's byte classifier against the v63 build and its op tests; 0252's probabilistic mode is on in the v64 composes but was
 not part of the gated (greedy) configuration.
