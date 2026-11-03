@@ -58,7 +58,7 @@ git archive <rev> | docker build -f .devops/vulkan.Dockerfile --build-arg APP_RE
   --target server -t vahpetr/llama-cpp-s1-fork:v71 -
 ```
 
-`:v71` = rev `8bcde80da` (`prod-v11-stage9-pkg11`; this branch adds docs, deploy files and `tools/s1` on top). The hands run
+`:v71` = `:latest` = digest `sha256:4d30c8679acd94d2e678c745129cc6bd20894f34b5e539813fe2aedd6b2d4c56`, rev `8bcde80da` (`prod-v11-stage9-pkg11`; this branch adds docs, deploy files and `tools/s1` on top). The hands run
 `:v70k` and `:v70` is the brain rollback (rev `03599f20a`, same disk-cache key): `LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v70`.
 Build with no model loaded on the GPU: on the 128 GB box a build next to a loaded model has run it out of memory.
 `docker compose -f <file> build` does the same from a checkout.
