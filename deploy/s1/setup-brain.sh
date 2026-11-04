@@ -59,8 +59,10 @@ want download && find_hf
 command -v curl >/dev/null || die "curl is missing"
 check_gtt "$NEED_GTT_MIB"
 if [ "$GTT_TOTAL_MIB" -gt 0 ]; then
+    # The bar is GTT - 3 424: 107 168 MiB on the current 108 GiB s1 cap. s1's committed compose still pins 109 216 (from the
+    # 110 GiB era, 2026-10-03); this script's value is for hosts that follow the formula. No behaviour change.
     export LLAMA_GTT_ADMISSION_MIB=$(( GTT_TOTAL_MIB - 3424 ))
-    info "GTT admission bar for this host: $LLAMA_GTT_ADMISSION_MIB MiB (GTT - 3 424)"
+    info "GTT admission bar for this host: $LLAMA_GTT_ADMISSION_MIB MiB (GTT - 3 424; = 107 168 on a 108 GiB cap, while s1's compose pins 109 216 from the 110 GiB era)"
 fi
 [ -n "${GTT_USED_PATH:-}" ] && export LLAMA_GTT_USED_PATH="$GTT_USED_PATH"
 if want download; then
