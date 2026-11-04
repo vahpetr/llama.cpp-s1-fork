@@ -634,33 +634,79 @@ export function joinWithOverlap(
 
 /** Replies shorter than this never count as cut mid-sentence (short answers, single words). */
 const MID_SENTENCE_MIN_CHARS = 40;
+/** A last line this long (chars or words) that ends without punctuation is a cut sentence. */
+const MID_SENTENCE_LINE_CHARS = 40;
+const MID_SENTENCE_LINE_WORDS = 6;
+/** A shorter last line counts only right after a closing fence, ending in a short word fragment. */
+const MID_SENTENCE_FRAGMENT_CHARS = 3;
 
 /**
- * A reply cut mid-sentence: its last non-empty line is prose (not a fence line, heading, table row,
- * list item, quote, HTML/XML tag, URL or code-looking line), has at least two words and ends in a
- * letter or a comma - i.e. without sentence-terminal punctuation, a closing bracket/quote or an emoji.
+ * A reply cut mid-sentence. The last non-empty line must be unindented prose - not a fence line,
+ * heading, table row (leading '|' or ' | '), list item or its indented continuation, quote,
+ * HTML/XML tag, URL or code-looking line (inline `code` spans are ignored) - with at least two
+ * words, ending in a letter or a comma (no terminal punctuation, closing bracket/quote or emoji).
+ * It counts when that line is long (>= 40 chars or >= 6 words), or - the 2026-11-04 incident
+ * "```\n\nОдин ос" - when it directly follows a closing fence and its last word is a short
+ * lowercase fragment; a short ack after a long body ("All done") never counts.
  */
 function endsMidSentence(t: string): boolean {
 	if (t.length < MID_SENTENCE_MIN_CHARS) return false;
 
-	const last = t.slice(t.lastIndexOf('\n') + 1).trim();
+	const lines = t.split('\n').filter((l) => l.trim());
+	const raw = lines[lines.length - 1] ?? '';
+	const prev = lines[lines.length - 2] ?? '';
 
-	if (!/\s/.test(last)) return false;
+	if (/^\s/.test(raw)) return false;
 
-	if (/^(?:```|~~~|#|\||>|<|[-*+]\s|\d+[.)]\s)/.test(last)) return false;
+	const line = raw.trim();
 
-	if (/https?:\/\/\S*$/.test(last)) return false;
+	if (/^(?:```|~~~|#|\||>|<|[-*+]\s|\d+[.)]\s)/.test(line) || / \| /.test(line)) return false;
+
+	if (/https?:\/\/\S*$/.test(line)) return false;
+
+	const prose = line.replace(/`[^`\n]+`/g, 'x');
 
 	if (
-		/[{}=;`$\\]|\(\)|=>|::|^\s*(?:import|export|const|let|var|function|def|class|return)\b/.test(
-			last
-		)
+		/[`{}=;$\\]|\(\)|=>|::|^(?:import|export|const|let|var|function|def|class|return)\b/.test(prose)
 	)
 		return false;
 
-	if (/^ {4,}|^\t/.test(t.slice(t.lastIndexOf('\n') + 1))) return false;
+	if (!/[\p{L},]$/u.test(prose)) return false;
 
-	return /[\p{L},]$/u.test(last);
+	const words = line.split(/\s+/);
+
+	if (words.length < 2) return false;
+
+	if (line.length >= MID_SENTENCE_LINE_CHARS || words.length >= MID_SENTENCE_LINE_WORDS)
+		return true;
+
+	const lastWord = words[words.length - 1];
+
+	return (
+		/^\s*```\s*$/.test(prev) &&
+		lastWord.length <= MID_SENTENCE_FRAGMENT_CHARS &&
+		/^\p{Ll}+$/u.test(lastWord)
+	);
+}
+
+/**
+ * Echo-aware join of a manual Continue (continue_final_message): an echo still in progress (the
+ * continuation is a prefix of the partial) keeps the partial; otherwise joinContinuationChecked
+ * (exact / whitespace-normalised echo strip, `mismatch` on divergence), or the overlap fallback.
+ */
+export function settleContinuation(
+	partial: string,
+	continuation: string
+): { text: string; mismatch: boolean } {
+	if (CONTEXT_RESERVE.JOIN_OVERLAP_FALLBACK) {
+		return { mismatch: false, text: joinWithOverlap(partial, continuation).text };
+	}
+
+	if (partial && normalizeWs(partial).startsWith(normalizeWs(continuation))) {
+		return { mismatch: false, text: partial };
+	}
+
+	return joinContinuationChecked(partial, continuation);
 }
 
 /**
