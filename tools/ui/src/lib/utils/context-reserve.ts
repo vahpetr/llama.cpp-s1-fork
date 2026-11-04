@@ -637,15 +637,6 @@ const MID_SENTENCE_MIN_CHARS = 40;
 /** A last line this long (chars or words) that ends without punctuation is a cut sentence. */
 const MID_SENTENCE_LINE_CHARS = 40;
 const MID_SENTENCE_LINE_WORDS = 6;
-/** A shorter last line counts only right after a closing fence, ending in a <= 2-letter fragment. */
-const MID_SENTENCE_FRAGMENT_CHARS = 2;
-/** Common 1-2-letter whole words: a last word among them is not a truncated fragment. */
-const SHORT_WHOLE_WORDS = new Set(
-	(
-		'it is so up on in at to ok no us me by of or an as be do go if we my he ' +
-		'ок да не но он я мы вы их ты то же бы ли из на по от до за ни об со во уж та те'
-	).split(' ')
-);
 const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 
 /** The last two non-blank lines of `t` (raw, may be ''), scanning from the end only. */
@@ -673,9 +664,8 @@ function lastTwoLines(t: string): { adjacent: boolean; last: string; prev: strin
  * heading, table row (leading '|' or ' | '), list item or its indented continuation, quote,
  * HTML/XML tag, URL or code-looking line (inline `code` spans count as non-letters) - ending in
  * a letter or a comma (no terminal punctuation, closing bracket/quote, code span or emoji).
- * It counts when that line is long (>= 40 chars with a space or CJK text, or >= 6 words), or -
- * the 2026-11-04 incident "```\n\nОдин ос" - when it has >= 2 words, directly follows a closing
- * fence and its last word is a <= 2-letter lowercase fragment; a short ack never counts.
+ * It counts only when that line is long (>= 40 chars with a space or CJK text, or >= 6 words);
+ * a short last line never counts - a short mid-word cut needs a server-side signal, not a guess.
  */
 function endsMidSentence(t: string): boolean {
 	if (t.length < MID_SENTENCE_MIN_CHARS) return false;
@@ -704,20 +694,7 @@ function endsMidSentence(t: string): boolean {
 
 	if (line.length >= MID_SENTENCE_LINE_CHARS && (/\s/.test(line) || CJK.test(line))) return true;
 
-	const words = line.split(/\s+/);
-
-	if (words.length < 2) return false;
-
-	if (words.length >= MID_SENTENCE_LINE_WORDS) return true;
-
-	const lastWord = words[words.length - 1];
-
-	return (
-		/^\s*```\s*$/.test(prev) &&
-		!SHORT_WHOLE_WORDS.has(lastWord) &&
-		lastWord.length <= MID_SENTENCE_FRAGMENT_CHARS &&
-		/^\p{Ll}+$/u.test(lastWord)
-	);
+	return line.split(/\s+/).length >= MID_SENTENCE_LINE_WORDS;
 }
 
 /**

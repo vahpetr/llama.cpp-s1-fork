@@ -415,9 +415,11 @@ describe('rule 3: a reply cut mid-sentence', () => {
 		'Here is the change to the config loader and why it is needed.\n\n```ts\nconst a = 1;\n```\n\n';
 	const long = 'This explains the change in detail and lists every option considered. '.repeat(5);
 
-	it('flags the 2026-11-04 incident tail', () => {
-		expect(unfinishedTail(body + 'Один ос')).toBe('ends mid-sentence');
-		expect(unfinishedTail(long + '\n\n```\nok\n```\n\nОдин ос')).toBe('ends mid-sentence');
+	it('does not flag the 2026-11-04 incident tail (short fragment, see comment)', () => {
+		// documented NON-trigger: a short mid-word fragment needs a server-side signal, not a
+		// dictionary - rule 3 judges only long last lines (user ruling: no fragment heuristic)
+		expect(unfinishedTail(body + 'Один ос')).toBeNull();
+		expect(unfinishedTail(long + '\n\n```\nok\n```\n\nОдин ос')).toBeNull();
 	});
 
 	it('flags a long prose last line ending in a letter or a comma', () => {
