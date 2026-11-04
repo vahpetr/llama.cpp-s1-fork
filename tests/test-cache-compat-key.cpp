@@ -203,6 +203,15 @@ int main() {
         CHECK(server_cache_env_classify("LLAMA_QSA_IDX_F16_DECODE") == SERVER_CACHE_ENV_SEMANTIC);
         CHECK(server_cache_env_classify("GGML_VK_MM_MERGE_FORCE") == SERVER_CACHE_ENV_SEMANTIC);
         CHECK(server_cache_env_digest({ "LLAMA_QSA_IDX_F16_DECODE=1" }) != d0);
+        // [TAG_MM_PLAN] with the GGML_VK_MM_MERGE_FORCE negative control on, PLAN 0 -> 1 changes outputs: PLAN enters the key;
+        //   with FORCE unset / 0 PLAN stays exact
+        CHECK(server_cache_env_digest({ "GGML_VK_MM_MERGE_FORCE=1", "LLAMA_QWEN4EXP_MERGE_PLAN=0" }) !=
+              server_cache_env_digest({ "GGML_VK_MM_MERGE_FORCE=1", "LLAMA_QWEN4EXP_MERGE_PLAN=1" }));
+        CHECK(server_cache_env_digest({ "GGML_VK_MM_MERGE_FORCE=1", "LLAMA_QWEN4EXP_MERGE_PLAN=1" }) !=
+              server_cache_env_digest({ "GGML_VK_MM_MERGE_FORCE=1" }));
+        CHECK(server_cache_env_digest({ "GGML_VK_MM_MERGE_FORCE=0", "LLAMA_QWEN4EXP_MERGE_PLAN=0" }) ==
+              server_cache_env_digest({ "GGML_VK_MM_MERGE_FORCE=0", "LLAMA_QWEN4EXP_MERGE_PLAN=1" }));
+        CHECK(server_cache_env_digest({ "LLAMA_QWEN4EXP_MERGE_PLAN=1" }) == d0);
         printf("env registry: LLAMA_SPEC_OVERLAP unset/0/1 = one digest (exact), GGML_VK_F32ACC(_SCOPE) semantic, "
                "GGML_VK_QSA_BIAS_FOLD / _MUTANT / GGML_VK_QSA_TOPK_V3_MIN_ROWS unset/default/override = one digest\n");
     }

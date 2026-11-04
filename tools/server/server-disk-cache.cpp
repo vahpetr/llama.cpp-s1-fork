@@ -738,7 +738,8 @@ static const char * const CACHE_ENV_EXACT[] = {
                         //   docs/verification/2026-10-31-gdn-replay-kproof.md), so =1 keeps the namespace key
     "LLAMA_QWEN4EXP_MERGE_PLAN", // [TAG_MM_PLAN] P3a: hc_inject merged into hc_down only where the Vulkan plan says the merged
                                  //   rows are bit-identical (K-proof per device): EXACT. LLAMA_QSA_IDX_F16_DECODE stays semantic
-                                 //   (=1 is class B), as does GGML_VK_MM_MERGE_FORCE (a negative control in every build)
+                                 //   (=1 is class B), as does GGML_VK_MM_MERGE_FORCE (a negative control in every build);
+                                 //   with FORCE on, server_cache_env_digest digests PLAN too
     // LLAMA_ARG_* aliases (common/arg.cpp): classified one by one by their parsed meaning - only the control plane
     "LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_API_KEY",
     // Vulkan speed / diagnostics only by contract
@@ -778,10 +779,20 @@ server_cache_env_class server_cache_env_classify(const std::string & name) {
 }
 
 std::string server_cache_env_digest(const std::vector<std::string> & env) {
+    // [TAG_MM_PLAN] LLAMA_QWEN4EXP_MERGE_PLAN is exact only while GGML_VK_MM_MERGE_FORCE is unset / 0: with the negative
+    //   control on (ggml-vulkan reads atoi != 0) PLAN=1 merges past the plan's exactness test, so there PLAN is semantic
+    bool mm_merge_force = false;
+    for (const auto & kv : env) {
+        if (kv.rfind("GGML_VK_MM_MERGE_FORCE=", 0) == 0 && atoi(kv.c_str() + strlen("GGML_VK_MM_MERGE_FORCE=")) != 0) {
+            mm_merge_force = true;
+        }
+    }
     std::vector<std::string> sem;
     for (const auto & kv : env) {
         const auto eq = kv.find('=');
-        if (server_cache_env_classify(kv.substr(0, eq)) == SERVER_CACHE_ENV_SEMANTIC) {
+        const std::string name = kv.substr(0, eq);
+        if (server_cache_env_classify(name) == SERVER_CACHE_ENV_SEMANTIC ||
+            (mm_merge_force && name == "LLAMA_QWEN4EXP_MERGE_PLAN")) {
             sem.push_back(kv);
         }
     }
