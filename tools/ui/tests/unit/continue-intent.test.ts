@@ -1,6 +1,10 @@
 import { ContinueIntentKind, MessageRole, MessageType } from '$lib/enums';
 import type { DatabaseMessage } from '$lib/types/database';
-import { classifyContinueIntent } from '$lib/utils/agentic';
+import {
+	agenticContinueTarget,
+	agenticForkTarget,
+	classifyContinueIntent
+} from '$lib/utils/agentic';
 import { describe, expect, it } from 'vitest';
 
 /**
@@ -159,5 +163,53 @@ describe('classifyContinueIntent', () => {
 
 		expect(classifyContinueIntent(messages, 5)).toEqual({ kind: ContinueIntentKind.APPEND_TEXT });
 		expect(classifyContinueIntent([], 0)).toEqual({ kind: ContinueIntentKind.APPEND_TEXT });
+	});
+});
+
+describe('agentic display entry: Fork/Continue targets', () => {
+	function flow(final: 'text' | 'tools') {
+		const user = makeMsg(MessageRole.USER, { content: 'do it' });
+		const root = makeMsg(MessageRole.ASSISTANT, { toolCalls: toolCall('c1', 'read') });
+		const t1 = makeMsg(MessageRole.TOOL, { content: 'r1', toolCallId: 'c1' });
+		const a2 = makeMsg(MessageRole.ASSISTANT, { toolCalls: toolCall('c2', 'write') });
+		const t2 = makeMsg(MessageRole.TOOL, { content: 'r2', toolCallId: 'c2' });
+		const tail = final === 'text' ? [makeMsg(MessageRole.ASSISTANT, { content: 'Один ос' })] : [];
+
+		return { all: [user, root, t1, a2, t2, ...tail], rest: [t1, a2, t2, ...tail], root };
+	}
+
+	it('forks at the last message of the flow (root when the flow is empty)', () => {
+		const f = flow('text');
+
+		expect(agenticForkTarget(f.root, f.rest).id).toBe(f.all[f.all.length - 1].id);
+		expect(agenticForkTarget(f.root, []).id).toBe(f.root.id);
+
+		const g = flow('tools');
+
+		expect(agenticForkTarget(g.root, g.rest).id).toBe(g.all[g.all.length - 1].id);
+	});
+
+	it('continues a final text assistant as a token-level append, not a new branch under step 1', () => {
+		const f = flow('text');
+		const target = agenticContinueTarget(f.root, f.rest);
+
+		expect(target.id).toBe(f.all[f.all.length - 1].id);
+		expect(classifyContinueIntent(f.all, f.all.indexOf(target))).toEqual({
+			kind: ContinueIntentKind.APPEND_TEXT
+		});
+		// the old behaviour: the root classified as NEXT_TURN after its first tool result
+		expect(classifyContinueIntent(f.all, 1).kind).toBe(ContinueIntentKind.NEXT_TURN);
+	});
+
+	it('continues a flow ending in tool results as the next turn after the last results', () => {
+		const g = flow('tools');
+		const target = agenticContinueTarget(g.root, g.rest);
+
+		expect(target.id).toBe(g.all[3].id);
+		expect(classifyContinueIntent(g.all, g.all.indexOf(target))).toEqual({
+			kind: ContinueIntentKind.NEXT_TURN,
+			truncateAfter: 4
+		});
+		expect(agenticContinueTarget(g.root, []).id).toBe(g.root.id);
 	});
 });

@@ -408,6 +408,58 @@ describe('W1.2 token-based tail', () => {
 	});
 });
 
+describe('rule 3: a reply cut mid-sentence', () => {
+	const body =
+		'Here is the change to the config loader and why it is needed.\n\n```ts\nconst a = 1;\n```\n\n';
+
+	it('flags the 2026-11-04 incident tail', () => {
+		expect(unfinishedTail(body + 'Один ос')).toBe('ends mid-sentence');
+		expect(unfinishedTail('x '.repeat(2000) + '\n\n```\nok\n```\n\nОдин ос')).toBe(
+			'ends mid-sentence'
+		);
+	});
+
+	it('flags prose ending in a letter or a comma at any length', () => {
+		expect(unfinishedTail(body + 'The next step is to update the')).toBe('ends mid-sentence');
+		expect(unfinishedTail(body + 'After that, and once the build passes,')).toBe(
+			'ends mid-sentence'
+		);
+		expect(unfinishedTail('word '.repeat(500) + 'and then we')).toBe('ends mid-sentence');
+	});
+
+	it('leaves finished or non-prose endings alone', () => {
+		for (const tail of [
+			'That is all.',
+			'Does that work?',
+			'Готово!',
+			'Wait for it…',
+			'see the note (below)',
+			'Квоты «как есть»',
+			'He said "done"',
+			'All green 🎉',
+			'Total cost is 42',
+			'## Next steps',
+			'| a | b',
+			'- remaining item text',
+			'1. remaining item text',
+			'> quoted line text',
+			'<details open',
+			'See https://example.com/path',
+			'const value = compute(a, b)',
+			'Use `npm run build` and `npm test`',
+			'Cheers'
+		]) {
+			// a long body: the short-reply ':' / table / list rules stay out of the way
+			expect(unfinishedTail(body.repeat(4) + tail), tail).toBeNull();
+		}
+
+		expect(unfinishedTail(body + '    indented code line here')).toBeNull();
+		expect(unfinishedTail('Yes')).toBeNull();
+		expect(unfinishedTail('The answer is no')).toBeNull();
+		expect(unfinishedTail('Use the second option')).toBeNull();
+	});
+});
+
 describe('rule 3: the unfinished-reply detector (pi cases)', () => {
 	it('flags unfinished tails', () => {
 		expect(unfinishedTail('Here is the fix:\n\n```ts\nconst a = 1;\n')).toBe('unclosed code fence');

@@ -262,7 +262,9 @@ export {
 	splitSearchSummaryList,
 	hasAgenticContent,
 	classifyToolResult,
-	classifyContinueIntent
+	classifyContinueIntent,
+	agenticContinueTarget,
+	agenticForkTarget
 } from './agentic';
 
 // Line-level unified diff for tool result rendering (`edit_file` block)

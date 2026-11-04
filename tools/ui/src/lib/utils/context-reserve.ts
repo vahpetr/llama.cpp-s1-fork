@@ -632,11 +632,43 @@ export function joinWithOverlap(
 	return { overlap: 0, text: a + b };
 }
 
+/** Replies shorter than this never count as cut mid-sentence (short answers, single words). */
+const MID_SENTENCE_MIN_CHARS = 40;
+
+/**
+ * A reply cut mid-sentence: its last non-empty line is prose (not a fence line, heading, table row,
+ * list item, quote, HTML/XML tag, URL or code-looking line), has at least two words and ends in a
+ * letter or a comma - i.e. without sentence-terminal punctuation, a closing bracket/quote or an emoji.
+ */
+function endsMidSentence(t: string): boolean {
+	if (t.length < MID_SENTENCE_MIN_CHARS) return false;
+
+	const last = t.slice(t.lastIndexOf('\n') + 1).trim();
+
+	if (!/\s/.test(last)) return false;
+
+	if (/^(?:```|~~~|#|\||>|<|[-*+]\s|\d+[.)]\s)/.test(last)) return false;
+
+	if (/https?:\/\/\S*$/.test(last)) return false;
+
+	if (
+		/[{}=;`$\\]|\(\)|=>|::|^\s*(?:import|export|const|let|var|function|def|class|return)\b/.test(
+			last
+		)
+	)
+		return false;
+
+	if (/^ {4,}|^\t/.test(t.slice(t.lastIndexOf('\n') + 1))) return false;
+
+	return /[\p{L},]$/u.test(last);
+}
+
 /**
  * Rule 3: why a reply that stopped on end-of-turn looks unfinished, or null. An odd number of ```
  * fence lines always counts; a tail ending in ':' / '—' / '–', an open table row or an empty list
  * item counts only when the visible reply is SHORT (< 60 tokens at 4 chars/token) - a long answer
- * ending in a colon is a legitimate prose ending.
+ * ending in a colon is a legitimate prose ending. A prose last line cut mid-sentence (see
+ * endsMidSentence) counts at any length.
  */
 export function unfinishedTail(text: string): string | null {
 	const fences = (text.match(/^[ \t]*```/gm) ?? []).length;
@@ -646,6 +678,8 @@ export function unfinishedTail(text: string): string | null {
 	const t = text.trimEnd();
 
 	if (!t) return null;
+
+	if (endsMidSentence(t)) return 'ends mid-sentence';
 
 	if (Math.ceil(t.length / 4) >= CONTEXT_RESERVE.UNFINISHED_SHORT_TOKENS) return null;
 
