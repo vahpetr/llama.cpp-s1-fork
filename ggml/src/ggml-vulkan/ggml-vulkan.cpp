@@ -14524,11 +14524,17 @@ static void ggml_vk_prewarm_shapes(ggml_backend_vk_context * ctx, const ggml_cgr
                 ggml_vk_prewarm_add_mm(todo, mmp_q);
                 ggml_vk_prewarm_add(todo, ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1));
             }
-            vk_matmul_pipeline mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, t, src1->type, prec);
+            // the B type the dispatch hands the selector (ggml_vk_mul_mat_q_f16): post-conversion f16 / bf16 where it
+            // stages B (coopmat2 with f32 B, bf16 A, non-contiguous B), else src1's own type
+            const ggml_type f16_type = t == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+            const bool y_non_contig = (dev->coopmat2 && src1->type == GGML_TYPE_F32) ||
+                                      (t == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) || !ggml_vk_dim01_contiguous(src1);
+            const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
+            vk_matmul_pipeline mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, t, y_non_contig ? f16_type : src1->type, prec);
             if (mmp == nullptr || mmp->is_empty()) {
                 // the f16 dequant fallback
                 ggml_vk_prewarm_add(todo, ggml_vk_get_to_fp16(ctx, t));
-                mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, t == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16, src1->type, prec);
+                mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, prec);
             }
             if (mmp && !mmp->is_empty()) {
                 ggml_vk_prewarm_add_mm(todo, mmp);
