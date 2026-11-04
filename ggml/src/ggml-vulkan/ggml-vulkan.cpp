@@ -17458,8 +17458,8 @@ static void ggml_vk_shexp_glu_sig_dispatch_fused(ggml_backend_vk_context * ctx, 
 }
 
 // [TAG_DECODE_FUSE] D3 "gdn_qk_gate" dispatch (validated by ggml_vk_can_fuse_gdn_qk_gate)
-// *refused (when the pattern matched and only the cross-branch preflight refused it) = "crossdep:", the
-// GGML_VK_FUSION_COUNT prefix of that refusal
+// *refused (when the pattern matched and only the cross-branch or alias preflight refused it) = "crossdep:" / "overlap:",
+// the GGML_VK_FUSION_COUNT prefix of that refusal
 static int ggml_vk_can_fuse_gdn_qk_gate(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
                                         int * gate_add = nullptr, const char ** refused = nullptr);
 static void ggml_vk_gdn_qk_gate_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -23154,6 +23154,30 @@ static int ggml_vk_can_fuse_gdn_qk_gate(ggml_backend_vk_context * ctx, const str
                 const bool noop = n >= node_idx + 4 && n < j;
                 if (!chain_edge && !noop && resolves_into_range(src)) {
                     if (refused) { *refused = "crossdep:"; }
+                    return 0;
+                }
+            }
+        }
+    }
+    // [TAG_DECODE_FUSE] graph_compute's generic src/dst veto, run here for the whole range with its flags (nothing is
+    // elementwise, three outputs, same elided-node rule n <= k): an alias that only the 3-output range sees (an in-place
+    // RMS-input / SCALE-output pair ggml-alloc placed exactly over each other) refuses HERE, so the else-if chain still
+    // reaches today's rms_norm_scale (elementwise, the exact alias is safe there) and add_softplus_mul, as in v72 -
+    // instead of the veto clearing the whole range and leaving all seven nodes unfused (as 6bd863a2a does for P5).
+    const ggml_tensor * dsts[3] = { cgraph->nodes[node_idx + 1], cgraph->nodes[node_idx + 3], mul };
+    for (const ggml_tensor * dst : dsts) {
+        for (int k = 0; k <= j + 2 - node_idx; ++k) {
+            for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = cgraph->nodes[node_idx + k]->src[s];
+                if (!src || src->op == GGML_OP_NONE || !ggml_vk_tensors_overlap(src, dst, false)) {
+                    continue;
+                }
+                bool elided = false;
+                for (int n = 0; n <= k; ++n) {
+                    elided |= cgraph->nodes[node_idx + n] == src;
+                }
+                if (!elided) {
+                    if (refused) { *refused = "overlap:"; }
                     return 0;
                 }
             }

@@ -4997,6 +4997,10 @@ struct test_add_softplus_mul_fuse : public test_case {
 //                         RMS(q) -> SCALE_A -> RMS(SCALE_A) -> SCALE_B -> gate. One dispatch would read SCALE_A in
 //                         other workgroups while it is written, so the matcher must refuse and arm A must run today's
 //                         rms_norm_scale x 2 + add_softplus_mul like arm B (same floats)
+//   kind 4 gdn_qk_gate_alias  regression (astra pkg13 Important): arm A's q SCALE is placed exactly over its RMS_NORM
+//                         input (the in-place alias ggml-alloc can produce; out->view_src as test_topk_qsa does), arm B
+//                         reads its own copy q_b of q. The 3-output range must refuse in its matcher so arm A still
+//                         runs today's rms_norm_scale (exact alias, elementwise) x 2 + add_softplus_mul
 // rows = decode / MTP-verify / multi-slot widths (the fusions take <= 32 rows; 33 is the refused boundary). strided:
 // kind 0 reads shexp and moe_out as row views of wider tensors; kind 2 reads q / k as views of the conv output (the
 // production layout) and alpha as the row view of the merged beta | alpha output; kind 1 takes contiguous tensors only.
@@ -5026,7 +5030,7 @@ struct test_decode_fuse_exact : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        static const char * names[] = { "shexp_tail", "shexp_glu_sig", "gdn_qk_gate", "gdn_qk_gate_crossdep" };
+        static const char * names[] = { "shexp_tail", "shexp_glu_sig", "gdn_qk_gate", "gdn_qk_gate_crossdep", "gdn_qk_gate_alias" };
         const std::string fusion = names[kind];
         return VARS_TO_STR5(fusion, rows, n_seqs, strided, gate_row);
     }
@@ -5111,7 +5115,8 @@ struct test_decode_fuse_exact : public test_case {
 
     ggml_tensor * build_gdn_qk_gate(ggml_context * ctx) {
         const int64_t conv_ch = head_k_dim * n_k_heads * 2 + head_k_dim * n_v_heads;
-        ggml_tensor * q, * k;
+        ggml_tensor * q, * k, * q_b = nullptr, * qs_a = nullptr;
+        GGML_ASSERT(kind != 4 || !strided);
         if (strided) {
             ggml_tensor * conv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, conv_ch, rows, n_seqs);
             ggml_set_name(conv, "conv_out");
@@ -5127,6 +5132,13 @@ struct test_decode_fuse_exact : public test_case {
             ggml_set_name(ks, "k");
             q = ggml_reshape_4d(ctx, qs, head_k_dim, n_k_heads, rows, n_seqs);
             k = ggml_reshape_4d(ctx, ks, head_k_dim, n_k_heads, rows, n_seqs);
+            if (kind == 4) {
+                // arm B's own copy of q (initialize_tensors gives it q's values): arm A's SCALE overwrites q's storage
+                ggml_tensor * qb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_k_dim * n_k_heads, rows * n_seqs);
+                ggml_set_name(qb, "q_b");
+                q_b  = ggml_reshape_4d(ctx, qb, head_k_dim, n_k_heads, rows, n_seqs);
+                qs_a = qs;
+            }
         }
         ggml_tensor * alpha;
         if (strided) {
@@ -5146,11 +5158,20 @@ struct test_decode_fuse_exact : public test_case {
         // the view / reshape nodes first (the matcher's first RMS_NORM needs a node in front that it does not read)
         expand(q);
         expand(k);
+        if (q_b) {
+            expand(q_b);
+        }
         expand(alpha);
         const float n = (float) head_k_dim;
         ggml_tensor * oq[2], * ok[2], * og[2];
         auto const & norms = [&](int arm) {
-            oq[arm] = ggml_scale(ctx, ggml_rms_norm(ctx, q, 1e-6f / n), 1.0f / sqrtf(n));
+            oq[arm] = ggml_scale(ctx, ggml_rms_norm(ctx, arm == 1 && q_b ? q_b : q, 1e-6f / n), 1.0f / sqrtf(n));
+            if (arm == 0 && qs_a) {
+                // kind 4: the SCALE destination exactly over the RMS_NORM input's storage
+                GGML_ASSERT(oq[arm]->view_src == nullptr && ggml_nbytes(oq[arm]) == ggml_nbytes(qs_a));
+                oq[arm]->view_src  = qs_a;
+                oq[arm]->view_offs = 0;
+            }
             expand(oq[arm]);
             // kind 3: the second norm reads the first one's SCALE (the cross-branch dependency the matcher refuses)
             ok[arm] = ggml_scale(ctx, ggml_rms_norm(ctx, kind == 3 ? oq[arm] : k, 1e-6f / n), 1.0f / sqrtf(n));
@@ -5169,7 +5190,7 @@ struct test_decode_fuse_exact : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * out = kind == 0 ? build_shexp_tail(ctx) : kind == 1 ? build_shexp_glu_sig(ctx) : build_gdn_qk_gate(ctx);   // 2, 3
+        ggml_tensor * out = kind == 0 ? build_shexp_tail(ctx) : kind == 1 ? build_shexp_glu_sig(ctx) : build_gdn_qk_gate(ctx);   // 2, 3, 4
         ggml_set_name(out, "out");
         return out;
     }
@@ -5178,11 +5199,17 @@ struct test_decode_fuse_exact : public test_case {
         std::mt19937 rng(0x9e3779b9u ^ (uint32_t) (kind*7 + rows*31 + n_seqs*131 + strided*17 + gate_row*5));
         std::uniform_real_distribution<float> u(-1.0f, 1.0f);
         std::uniform_int_distribution<int> ex(-12, 12);
+        std::vector<float> q_vals;   // kind 4: q_b gets q's values (q is created first)
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (t->op != GGML_OP_NONE || t->type != GGML_TYPE_F32) {
                 continue;
             }
             const std::string name = ggml_get_name(t);
+            if (name == "q_b") {
+                GGML_ASSERT(q_vals.size() == (size_t) ggml_nelements(t));
+                ggml_backend_tensor_set(t, q_vals.data(), 0, q_vals.size() * sizeof(float));
+                continue;
+            }
             std::vector<float> v(ggml_nelements(t));
             for (auto & e : v) {
                 if (name == "glu_gate" || name == "sig_src" || name == "gate") {
@@ -5197,6 +5224,9 @@ struct test_decode_fuse_exact : public test_case {
                 if (name != "ssm_dt" && name != "ssm_a" && (rng() & 31) == 0) {
                     e = (rng() & 1) ? -0.0f : 0.0f;
                 }
+            }
+            if (name == "q") {
+                q_vals = v;
             }
             ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
         }
@@ -12149,6 +12179,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool strided : { false, true }) {
             test_cases.emplace_back(new test_decode_fuse_exact(3, nt, 1, strided));
         }
+        // regression: the in-place RMS-input / SCALE-output alias refuses in the matcher, v72's rms_norm_scale fires
+        test_cases.emplace_back(new test_decode_fuse_exact(4, nt, 1, false));
     }
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
