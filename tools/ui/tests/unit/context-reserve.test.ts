@@ -54,6 +54,7 @@ import {
 	resolveContextReserveConfig,
 	selectTailMessages,
 	settleContinuation,
+	settleContinuationParts,
 	shouldCompactBeforeTurn,
 	summaryLengthUsable,
 	summaryRejection,
@@ -478,6 +479,18 @@ describe('rule 3: a reply cut mid-sentence', () => {
 		expect(unfinishedTail(body + 'Done, see the fix')).toBeNull();
 		expect(unfinishedTail(body + 'That is it for now')).toBeNull();
 		expect(unfinishedTail(body + 'ос')).toBeNull();
+		// a real 1-2-letter last word after a fence is a complete ack, not a fragment
+		expect(unfinishedTail(body + "That's it")).toBeNull();
+		expect(unfinishedTail(body + 'That is it')).toBeNull();
+		expect(unfinishedTail(body + 'Готово, всё ок')).toBeNull();
+		// a lazy list continuation directly under a list item
+		expect(
+			unfinishedTail(long + '\n\n- Run the tests and\ncheck that all of them pass now and then')
+		).toBeNull();
+		// ...but after a blank line it is prose again
+		expect(
+			unfinishedTail(long + '\n\n- Run the tests.\n\nThen check that all of them pass now and then')
+		).toBe('ends mid-sentence');
 		expect(unfinishedTail('Yes')).toBeNull();
 		expect(unfinishedTail('The answer is no')).toBeNull();
 		expect(unfinishedTail('Use the second option')).toBeNull();
@@ -504,7 +517,33 @@ describe('manual Continue: echo-aware join (settleContinuation)', () => {
 			text: partial
 		});
 		expect(settleContinuation(partial, '', true).text).toBe(partial);
-		expect(settleContinuation(partial, partial.slice(0, 20), true).text).toBe(partial);
+	});
+
+	it('flags a completed stream that ended inside the echo (a repeated table row is ambiguous)', () => {
+		const table = '| item | value |\n| --- | --- |\n| item | value |\n';
+		const row = '| item | value |\n';
+
+		expect(settleContinuation(table, row, true)).toEqual({
+			endedInEcho: true,
+			mismatch: true,
+			text: table
+		});
+		expect(settleContinuation(partial, partial.slice(0, 20), true).mismatch).toBe(true);
+		// mid-stream the same prefix is just an echo in progress
+		expect(settleContinuation(table, row, false)).toEqual({ mismatch: false, text: table });
+
+		// shared by the manual Continue and the auto-continuation paths
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const parts = settleContinuationParts(
+			{ content: table, reasoning: '' },
+			{ content: row, reasoning: '' },
+			true,
+			'm1'
+		);
+
+		expect(parts).toEqual({ content: table, mismatch: true, reasoning: '' });
+		expect(String(warn.mock.calls[0]?.[0])).toContain('ended inside the echoed prefill');
+		warn.mockRestore();
 	});
 
 	it('appends a short genuine continuation at completion even when it prefixes the partial', () => {
