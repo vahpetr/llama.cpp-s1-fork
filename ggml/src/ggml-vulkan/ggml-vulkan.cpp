@@ -9694,6 +9694,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // [TAG_HC_TAIL_FUSE] the whole hc_mix tail (SIGMOID_MUL + MULTI_ADD_SCALE) in one dispatch, bit-identical hc_mixed
         device->fuse_hc_tail         = fuse_enabled("GGML_VK_HC_TAIL_FUSE") &&
                                        device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_hc_tail_mix_push_constants);
+        // [TAG_HC_TAIL_FUSE] [TAG_ADD_RMS_ROWS] default-path proof lines, once per device (WARN: the server drops ggml INFO
+        // lines); the device flags as computed, so a missing push-constant room or GGML_VK_FUSE_HC_COMBINE=0 shows as off
+        GGML_LOG_WARN("ggml_vulkan: hc_tail_fuse: %s (GGML_VK_HC_TAIL_FUSE, default on)\n", device->fuse_hc_tail ? "on" : "off");
+        GGML_LOG_WARN("ggml_vulkan: add_rms_rows: %s (GGML_VK_ADD_RMS_ROWS, default on)\n", device->fuse_hc_combine_rms ? "on" : "off");
         // [TAG_CONV_INPUT_SPLIT] the GDN conv input: ssm_conv reads concat(state, x^T) from its two sources
         device->fuse_concat_ssm_conv = fuse_enabled("GGML_VK_FUSE_CONCAT_SSM_CONV");
         // [TAG_VK_DISPATCH_LOG] read once here; off = one bool test per matmul dispatch, nothing else
