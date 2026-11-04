@@ -637,24 +637,41 @@ const MID_SENTENCE_MIN_CHARS = 40;
 /** A last line this long (chars or words) that ends without punctuation is a cut sentence. */
 const MID_SENTENCE_LINE_CHARS = 40;
 const MID_SENTENCE_LINE_WORDS = 6;
-/** A shorter last line counts only right after a closing fence, ending in a short word fragment. */
-const MID_SENTENCE_FRAGMENT_CHARS = 3;
+/** A shorter last line counts only right after a closing fence, ending in a <= 2-letter fragment. */
+const MID_SENTENCE_FRAGMENT_CHARS = 2;
+const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+
+/** The last two non-blank lines of `t` (raw, may be ''), scanning from the end only. */
+function lastTwoLines(t: string): [string, string] {
+	const found: string[] = [];
+
+	let end = t.length;
+
+	while (end > 0 && found.length < 2) {
+		const start = t.lastIndexOf('\n', end - 1) + 1;
+		const line = t.slice(start, end);
+
+		if (line.trim()) found.push(line);
+
+		end = start - 1;
+	}
+
+	return [found[1] ?? '', found[0] ?? ''];
+}
 
 /**
  * A reply cut mid-sentence. The last non-empty line must be unindented prose - not a fence line,
  * heading, table row (leading '|' or ' | '), list item or its indented continuation, quote,
- * HTML/XML tag, URL or code-looking line (inline `code` spans are ignored) - with at least two
- * words, ending in a letter or a comma (no terminal punctuation, closing bracket/quote or emoji).
- * It counts when that line is long (>= 40 chars or >= 6 words), or - the 2026-11-04 incident
- * "```\n\nОдин ос" - when it directly follows a closing fence and its last word is a short
- * lowercase fragment; a short ack after a long body ("All done") never counts.
+ * HTML/XML tag, URL or code-looking line (inline `code` spans count as non-letters) - ending in
+ * a letter or a comma (no terminal punctuation, closing bracket/quote, code span or emoji).
+ * It counts when that line is long (>= 40 chars with a space or CJK text, or >= 6 words), or -
+ * the 2026-11-04 incident "```\n\nОдин ос" - when it has >= 2 words, directly follows a closing
+ * fence and its last word is a <= 2-letter lowercase fragment; a short ack never counts.
  */
 function endsMidSentence(t: string): boolean {
 	if (t.length < MID_SENTENCE_MIN_CHARS) return false;
 
-	const lines = t.split('\n').filter((l) => l.trim());
-	const raw = lines[lines.length - 1] ?? '';
-	const prev = lines[lines.length - 2] ?? '';
+	const [prev, raw] = lastTwoLines(t);
 
 	if (/^\s/.test(raw)) return false;
 
@@ -664,7 +681,7 @@ function endsMidSentence(t: string): boolean {
 
 	if (/https?:\/\/\S*$/.test(line)) return false;
 
-	const prose = line.replace(/`[^`\n]+`/g, 'x');
+	const prose = line.replace(/`[^`\n]+`/g, '\u00a7');
 
 	if (
 		/[`{}=;$\\]|\(\)|=>|::|^(?:import|export|const|let|var|function|def|class|return)\b/.test(prose)
@@ -673,12 +690,13 @@ function endsMidSentence(t: string): boolean {
 
 	if (!/[\p{L},]$/u.test(prose)) return false;
 
+	if (line.length >= MID_SENTENCE_LINE_CHARS && (/\s/.test(line) || CJK.test(line))) return true;
+
 	const words = line.split(/\s+/);
 
 	if (words.length < 2) return false;
 
-	if (line.length >= MID_SENTENCE_LINE_CHARS || words.length >= MID_SENTENCE_LINE_WORDS)
-		return true;
+	if (words.length >= MID_SENTENCE_LINE_WORDS) return true;
 
 	const lastWord = words[words.length - 1];
 
@@ -690,23 +708,55 @@ function endsMidSentence(t: string): boolean {
 }
 
 /**
- * Echo-aware join of a manual Continue (continue_final_message): an echo still in progress (the
- * continuation is a prefix of the partial) keeps the partial; otherwise joinContinuationChecked
+ * Echo-aware join of a continue_final_message reply (manual Continue and the rule-1/3
+ * auto-continuation share it). A continuation that is a whitespace-normalised prefix of the
+ * partial is an echo still in progress - the partial is kept - while the stream is incomplete
+ * (abort / error), and at completion only when it is at least ECHO_MIN_DIVERGENCE_CHARS long
+ * (a short genuine continuation such as 'The' is appended). Otherwise joinContinuationChecked
  * (exact / whitespace-normalised echo strip, `mismatch` on divergence), or the overlap fallback.
  */
 export function settleContinuation(
 	partial: string,
-	continuation: string
+	continuation: string,
+	complete: boolean
 ): { text: string; mismatch: boolean } {
 	if (CONTEXT_RESERVE.JOIN_OVERLAP_FALLBACK) {
 		return { mismatch: false, text: joinWithOverlap(partial, continuation).text };
 	}
 
-	if (partial && normalizeWs(partial).startsWith(normalizeWs(continuation))) {
+	const nc = normalizeWs(continuation);
+
+	if (
+		partial &&
+		nc &&
+		(!complete || nc.length >= ECHO_MIN_DIVERGENCE_CHARS) &&
+		normalizeWs(partial).startsWith(nc)
+	) {
 		return { mismatch: false, text: partial };
 	}
 
 	return joinContinuationChecked(partial, continuation);
+}
+
+/** settleContinuation on content and reasoning separately; one warning on a diverging echo. */
+export function settleContinuationParts(
+	original: { content: string; reasoning: string },
+	appended: { content: string; reasoning: string },
+	complete: boolean,
+	messageId: string
+): { content: string; reasoning: string; mismatch: boolean } {
+	const c = settleContinuation(original.content, appended.content, complete);
+	const r = settleContinuation(original.reasoning, appended.reasoning, complete);
+	const mismatch = c.mismatch || r.mismatch;
+
+	if (mismatch) {
+		console.warn(
+			'[ChatStore] continuation: the echoed prefill diverged from the partial - joined verbatim',
+			{ messageId }
+		);
+	}
+
+	return { content: c.text, mismatch, reasoning: r.text };
 }
 
 /**

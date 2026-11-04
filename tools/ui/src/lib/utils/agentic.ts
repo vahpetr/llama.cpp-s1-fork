@@ -462,25 +462,26 @@ export function hasAgenticContent(
  * Pure function over the persisted history snapshot.
  */
 export function classifyContinueIntent(messages: DatabaseMessage[], idx: number): ContinueIntent {
-	const target = messages[idx];
-
 	// Defensive default: callers already filter by role, stay deterministic.
-	if (!target || target.role !== MessageRole.ASSISTANT) {
-		return { kind: ContinueIntentKind.APPEND_TEXT };
+	if (!messages[idx] || messages[idx].role !== MessageRole.ASSISTANT) {
+		return { kind: ContinueIntentKind.APPEND_TEXT, targetIdx: idx };
 	}
 
+	// Continue on an agentic entry acts on its flow's last assistant, not the root
+	const at = flowLastAssistantIndex(messages, idx);
+	const target = messages[at];
 	const hasToolCalls = parseToolCalls(target.toolCalls).length > 0;
 
 	if (!hasToolCalls) {
-		return { kind: ContinueIntentKind.APPEND_TEXT };
+		return { kind: ContinueIntentKind.APPEND_TEXT, targetIdx: at };
 	}
 
 	// Walk consecutive trailing tool results. The agentic loop only emits tool
 	// messages directly after the assistant turn that owns them, so the first
 	// non tool message marks the boundary.
-	let lastTrailingTool = idx;
+	let lastTrailingTool = at;
 
-	for (let i = idx + 1; i < messages.length; i++) {
+	for (let i = at + 1; i < messages.length; i++) {
 		if (messages[i].role === MessageRole.TOOL) {
 			lastTrailingTool = i;
 		} else {
@@ -488,36 +489,36 @@ export function classifyContinueIntent(messages: DatabaseMessage[], idx: number)
 		}
 	}
 
-	if (lastTrailingTool > idx) {
+	if (lastTrailingTool > at) {
 		return { kind: ContinueIntentKind.NEXT_TURN, truncateAfter: lastTrailingTool };
 	}
 
+	// unpaired tool_calls (cut mid-turn): rerun from the ROOT - a sibling under a mid-flow step
+	// would be unreachable, sibling navigation is anchored on the entry's root
 	return { kind: ContinueIntentKind.RERUN_TURN, truncateAfter: idx - 1 };
 }
 
 /**
- * Fork target of a grouped agentic display entry (root assistant + the flow's later steps): the
- * flow's LAST message, so the fork copies the whole flow incl. the final answer.
+ * The flow an agentic display entry groups under its root assistant (one with tool calls):
+ * the consecutive TOOL / ASSISTANT rows after it. Returns the index of the flow's LAST
+ * assistant (the root itself when the flow has no later assistant, or for a plain reply) -
+ * the target of Continue and Fork on that entry.
  */
-export function agenticForkTarget(
-	root: DatabaseMessage,
-	flow: readonly DatabaseMessage[]
-): DatabaseMessage {
-	return flow.length ? flow[flow.length - 1] : root;
-}
+export function flowLastAssistantIndex(messages: readonly DatabaseMessage[], idx: number): number {
+	const root = messages[idx];
 
-/**
- * Continue target of a grouped agentic display entry: the flow's LAST assistant message
- * (classifyContinueIntent then picks APPEND_TEXT for a final text answer, NEXT_TURN for
- * tool calls with results).
- */
-export function agenticContinueTarget(
-	root: DatabaseMessage,
-	flow: readonly DatabaseMessage[]
-): DatabaseMessage {
-	for (let i = flow.length - 1; i >= 0; i--) {
-		if (flow[i].role === MessageRole.ASSISTANT) return flow[i];
+	if (!root || root.role !== MessageRole.ASSISTANT || parseToolCalls(root.toolCalls).length === 0) {
+		return idx;
 	}
 
-	return root;
+	let last = idx;
+
+	for (let i = idx + 1; i < messages.length; i++) {
+		const role = messages[i].role;
+
+		if (role === MessageRole.ASSISTANT) last = i;
+		else if (role !== MessageRole.TOOL) break;
+	}
+
+	return last;
 }

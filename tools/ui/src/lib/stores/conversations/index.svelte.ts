@@ -27,10 +27,10 @@ import type { ContextReserveConfig } from '$lib/utils';
 import {
 	filterByLeafNodeId,
 	findLeafNode,
+	flowLastAssistantIndex,
 	generateConversationTitle,
 	normalizeContextOverrides,
-	resolveContextReserveConfig
-} from '$lib/utils';
+	resolveContextReserveConfig} from '$lib/utils';
 import { SvelteSet } from 'svelte/reactivity';
 import { toast } from 'svelte-sonner';
 
@@ -430,10 +430,16 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	): Promise<string | null> {
 		if (!this.activeConversation) return null;
 
+		// an agentic entry (root + flow) forks at the flow's last assistant - the whole flow incl. the
+		// final answer is copied, and never at a tool row (a tool leaf breaks continue/regenerate/send)
+		const i = this.findMessageIndex(messageId);
+		const target =
+			i >= 0 ? this.activeMessages[flowLastAssistantIndex(this.activeMessages, i)].id : messageId;
+
 		try {
 			const newConv = await DatabaseService.forkConversation(
 				this.activeConversation.id,
-				messageId,
+				target,
 				options
 			);
 

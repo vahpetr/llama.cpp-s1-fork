@@ -20,8 +20,6 @@
 		DatabaseMessageExtraMcpPrompt
 	} from '$lib/types';
 	import {
-		agenticContinueTarget,
-		agenticForkTarget,
 		deriveAgenticSections,
 		estimateReprocessCost,
 		formatReprocessCost,
@@ -334,21 +332,14 @@
 		chatActions.regenerateWithBranching(message, modelOverride);
 	}
 
-	// An agentic entry groups the whole flow under its root assistant: Continue acts on the flow's
-	// last assistant and Fork on its last message; regenerate/edit/delete/siblings stay on the root.
+	// on an agentic entry the store retargets Continue/Fork to the flow's last assistant;
+	// regenerate/edit/delete/siblings stay on the root
 	function handleContinue() {
-		chatActions.continueAssistantMessage(
-			message.role === MessageRole.ASSISTANT
-				? agenticContinueTarget(message, toolMessages)
-				: message
-		);
+		chatActions.continueAssistantMessage(message);
 	}
 
 	function handleForkConversation(options: { name: string; includeAttachments: boolean }) {
-		chatActions.forkConversation(
-			message.role === MessageRole.ASSISTANT ? agenticForkTarget(message, toolMessages) : message,
-			options
-		);
+		chatActions.forkConversation(message, options);
 	}
 
 	function handleNavigateToSibling(siblingId: string) {

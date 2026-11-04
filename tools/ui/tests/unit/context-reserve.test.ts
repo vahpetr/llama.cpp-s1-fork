@@ -425,6 +425,19 @@ describe('rule 3: a reply cut mid-sentence', () => {
 			'ends mid-sentence'
 		);
 		expect(unfinishedTail(long + '\n\nUse `npm test` to verify the')).toBe('ends mid-sentence');
+		// CJK prose has no spaces: a long line still counts
+		expect(
+			unfinishedTail(long + '\n\n' + '这是一个很长的中文句子用来测试没有空格的情况'.repeat(3))
+		).toBe('ends mid-sentence');
+	});
+
+	it('scans only the reply tail (200k chars stay fast)', () => {
+		const huge =
+			'Many words in a long reply body. '.repeat(6000) + '\n\nThe next step is to update the';
+		const t0 = performance.now();
+
+		expect(unfinishedTail(huge)).toBe('ends mid-sentence');
+		expect(performance.now() - t0).toBeLessThan(200);
 	});
 
 	it('leaves finished or non-prose endings alone', () => {
@@ -451,7 +464,10 @@ describe('rule 3: a reply cut mid-sentence', () => {
 			'See the docs at https://example.com/path',
 			'const value = compute(a, b) + another(c, d) + more(e)',
 			'    indented code line here that is long enough to count',
-			'Cheers'
+			'Cheers',
+			'Use `npm run build` and `npm test`',
+			'so run `npm test`',
+			'这是一个很长的中文句子用来测试没有空格的情况。'
 		]) {
 			// a long body: the short-reply ':' / table / list rules stay out of the way
 			expect(unfinishedTail(long + '\n\n' + tail), tail).toBeNull();
@@ -459,6 +475,9 @@ describe('rule 3: a reply cut mid-sentence', () => {
 
 		// a short ack right after a code block is not a fragment
 		expect(unfinishedTail(body + 'All done')).toBeNull();
+		expect(unfinishedTail(body + 'Done, see the fix')).toBeNull();
+		expect(unfinishedTail(body + 'That is it for now')).toBeNull();
+		expect(unfinishedTail(body + 'ос')).toBeNull();
 		expect(unfinishedTail('Yes')).toBeNull();
 		expect(unfinishedTail('The answer is no')).toBeNull();
 		expect(unfinishedTail('Use the second option')).toBeNull();
@@ -469,31 +488,42 @@ describe('manual Continue: echo-aware join (settleContinuation)', () => {
 	const partial = 'Here is the plan.\n\n```\nx\n```\n\nОдин ос';
 
 	it('drops an echoed prefill before the new text', () => {
-		expect(settleContinuation(partial, partial + 'новной шаг.')).toEqual({
+		expect(settleContinuation(partial, partial + 'новной шаг.', true)).toEqual({
 			mismatch: false,
 			text: partial + 'новной шаг.'
 		});
 		// whitespace-normalised echo
-		expect(settleContinuation(partial, partial.replace('\n\n', '\n') + 'новной').text).toBe(
+		expect(settleContinuation(partial, partial.replace('\n\n', '\n') + 'новной', true).text).toBe(
 			partial + 'новной'
 		);
 	});
 
 	it('keeps the partial while the echo is still in progress (abort mid-echo)', () => {
-		expect(settleContinuation(partial, partial.slice(0, 12))).toEqual({
+		expect(settleContinuation(partial, partial.slice(0, 12), false)).toEqual({
 			mismatch: false,
 			text: partial
 		});
-		expect(settleContinuation(partial, '').text).toBe(partial);
+		expect(settleContinuation(partial, '', true).text).toBe(partial);
+		expect(settleContinuation(partial, partial.slice(0, 20), true).text).toBe(partial);
+	});
+
+	it('appends a short genuine continuation at completion even when it prefixes the partial', () => {
+		const p = 'Here is the plan. The';
+
+		expect(settleContinuation(p, 'Here', true)).toEqual({ mismatch: false, text: p + 'Here' });
+		// while the stream is still incomplete it may be an echo start: keep the partial
+		expect(settleContinuation(p, 'Here', false).text).toBe(p);
 	});
 
 	it('joins verbatim without an echo, and flags a diverging echo', () => {
-		expect(settleContinuation(partial, 'новной шаг.')).toEqual({
+		expect(settleContinuation(partial, 'новной шаг.', true)).toEqual({
 			mismatch: false,
 			text: partial + 'новной шаг.'
 		});
-		expect(settleContinuation('', 'fresh')).toEqual({ mismatch: false, text: 'fresh' });
-		expect(settleContinuation(partial, 'Here is the plan.\n\nDifferent text').mismatch).toBe(true);
+		expect(settleContinuation('', 'fresh', true)).toEqual({ mismatch: false, text: 'fresh' });
+		expect(settleContinuation(partial, 'Here is the plan.\n\nDifferent text', true).mismatch).toBe(
+			true
+		);
 	});
 });
 
