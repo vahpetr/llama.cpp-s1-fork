@@ -263,7 +263,8 @@ export {
 	hasAgenticContent,
 	classifyToolResult,
 	classifyContinueIntent,
-	flowLastAssistantIndex
+	flowLastAssistantIndex,
+	agenticCopyTarget
 } from './agentic';
 
 // Line-level unified diff for tool result rendering (`edit_file` block)

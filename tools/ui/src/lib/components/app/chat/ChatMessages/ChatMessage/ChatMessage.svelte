@@ -20,6 +20,7 @@
 		DatabaseMessageExtraMcpPrompt
 	} from '$lib/types';
 	import {
+		agenticCopyTarget,
 		deriveAgenticSections,
 		estimateReprocessCost,
 		formatReprocessCost,
@@ -264,6 +265,13 @@
 	}
 
 	function handleCopy() {
+		// an agentic entry's root is usually empty (reasoning + tool calls): copy the flow's answer
+		if (message.role === MessageRole.ASSISTANT && toolMessages.length > 0) {
+			chatActions.copy({ ...message, ...agenticCopyTarget(message, toolMessages) });
+
+			return;
+		}
+
 		chatActions.copy(message);
 	}
 
