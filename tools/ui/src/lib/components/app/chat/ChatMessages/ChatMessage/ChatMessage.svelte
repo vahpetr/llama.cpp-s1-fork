@@ -198,6 +198,11 @@
 		get forkConversation() {
 			const isForkableUser = message.role === MessageRole.USER && !mcpPromptExtra;
 
+			// while the flow streams its live tail is only an empty DB placeholder - a fork would copy it
+			if (message.role === MessageRole.ASSISTANT && chatStore.isChatLoading(message.convId)) {
+				return undefined;
+			}
+
 			return isForkableUser || message.role === MessageRole.ASSISTANT
 				? handleForkConversation
 				: undefined;

@@ -382,6 +382,7 @@ export {
 	joinContinuation,
 	joinContinuationChecked,
 	liveContinuation,
+	settleContinuation,
 	joinWithOverlap,
 	legacyContextFields,
 	measureContextUsage,

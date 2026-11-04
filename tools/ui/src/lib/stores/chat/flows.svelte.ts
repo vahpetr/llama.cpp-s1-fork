@@ -34,7 +34,9 @@ import {
 	findLeafNode,
 	findMessageById,
 	isAbortError,
-	parseToolsSnapshot
+	liveContinuation,
+	parseToolsSnapshot,
+	settleContinuation
 } from '$lib/utils';
 
 /**
@@ -125,6 +127,25 @@ export class ChatMessageFlows {
 			let appendedReasoning = '';
 			let hasReceivedContent = false;
 
+			// continue_final_message: llama-server streams the prefilled message back before the new
+			// tokens - join echo-aware (content and reasoning separately), as the auto-continuation does
+			const settle = (appContent: string, appReasoning: string) => {
+				const c = settleContinuation(originalContent, appContent);
+				const r = settleContinuation(originalReasoning, appReasoning);
+
+				if (c.mismatch || r.mismatch) {
+					console.warn(
+						'[ChatStore] continue: the echoed prefill diverged from the partial - joined verbatim',
+						{ messageId: msg.id }
+					);
+				}
+
+				return {
+					content: c.text,
+					echoMismatch: c.mismatch || r.mismatch || undefined,
+					reasoningContent: r.text || undefined
+				};
+			};
 			const updateStreamingContent = (fullContent: string) => {
 				this.host.setChatStreaming(msg.convId, fullContent, msg.id);
 				// resolve the row by id on every write, switching to another conv mid continue makes
@@ -149,7 +170,7 @@ export class ChatMessageFlows {
 					onChunk: (chunk: string) => {
 						appendedContent += chunk;
 						hasReceivedContent = true;
-						updateStreamingContent(originalContent + appendedContent);
+						updateStreamingContent(liveContinuation(originalContent, appendedContent));
 						this.host.setChatReasoning(msg.convId, false);
 					},
 					onComplete: async (
@@ -161,19 +182,16 @@ export class ChatMessageFlows {
 						const finalAppendedReasoning = hasReceivedContent
 							? appendedReasoning
 							: reasoningContent || '';
-						const fullContent = originalContent + finalAppendedContent;
-						const fullReasoning = originalReasoning + finalAppendedReasoning || undefined;
+						const joined = settle(finalAppendedContent, finalAppendedReasoning);
 
 						await DatabaseService.updateMessage(msg.id, {
-							content: fullContent,
-							reasoningContent: fullReasoning,
+							...joined,
 							timestamp: Date.now(),
 							timings
 						});
 
 						conversationsStore.updateMessageAtIndex(conversationsStore.findMessageIndex(msg.id), {
-							content: fullContent,
-							reasoningContent: fullReasoning,
+							...joined,
 							timestamp: Date.now(),
 							timings
 						});
@@ -199,19 +217,13 @@ export class ChatMessageFlows {
 					onError: async (error: Error) => {
 						if (isAbortError(error)) {
 							if (hasReceivedContent && appendedContent) {
-								await DatabaseService.updateMessage(msg.id, {
-									content: originalContent + appendedContent,
-									reasoningContent: originalReasoning + appendedReasoning || undefined,
-									timestamp: Date.now()
-								});
+								const joined = settle(appendedContent, appendedReasoning);
+
+								await DatabaseService.updateMessage(msg.id, { ...joined, timestamp: Date.now() });
 
 								conversationsStore.updateMessageAtIndex(
 									conversationsStore.findMessageIndex(msg.id),
-									{
-										content: originalContent + appendedContent,
-										reasoningContent: originalReasoning + appendedReasoning || undefined,
-										timestamp: Date.now()
-									}
+									{ ...joined, timestamp: Date.now() }
 								);
 							}
 
@@ -222,14 +234,11 @@ export class ChatMessageFlows {
 
 						console.error('Continue generation error:', error);
 						// keep whatever was appended so far, the message stays in memory and in DB
-						await DatabaseService.updateMessage(msg.id, {
-							content: originalContent + appendedContent,
-							reasoningContent: originalReasoning + appendedReasoning || undefined,
-							timestamp: Date.now()
-						});
+						const joined = settle(appendedContent, appendedReasoning);
+
+						await DatabaseService.updateMessage(msg.id, { ...joined, timestamp: Date.now() });
 						conversationsStore.updateMessageAtIndex(conversationsStore.findMessageIndex(msg.id), {
-							content: originalContent + appendedContent,
-							reasoningContent: originalReasoning + appendedReasoning || undefined,
+							...joined,
 							timestamp: Date.now()
 						});
 
@@ -243,9 +252,13 @@ export class ChatMessageFlows {
 						appendedReasoning += chunk;
 						hasReceivedContent = true;
 						// mark streaming state so a stop mid-thinking can persist the partial reasoning
-						this.host.setChatStreaming(msg.convId, originalContent + appendedContent, msg.id);
+						this.host.setChatStreaming(
+							msg.convId,
+							liveContinuation(originalContent, appendedContent),
+							msg.id
+						);
 						conversationsStore.updateMessageAtIndex(conversationsStore.findMessageIndex(msg.id), {
-							reasoningContent: originalReasoning + appendedReasoning
+							reasoningContent: liveContinuation(originalReasoning, appendedReasoning)
 						});
 						this.host.setChatReasoning(msg.convId, true);
 					},

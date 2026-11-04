@@ -53,6 +53,7 @@ import {
 	replyTokenCap,
 	resolveContextReserveConfig,
 	selectTailMessages,
+	settleContinuation,
 	shouldCompactBeforeTurn,
 	summaryLengthUsable,
 	summaryRejection,
@@ -411,20 +412,19 @@ describe('W1.2 token-based tail', () => {
 describe('rule 3: a reply cut mid-sentence', () => {
 	const body =
 		'Here is the change to the config loader and why it is needed.\n\n```ts\nconst a = 1;\n```\n\n';
+	const long = 'This explains the change in detail and lists every option considered. '.repeat(5);
 
 	it('flags the 2026-11-04 incident tail', () => {
 		expect(unfinishedTail(body + 'Один ос')).toBe('ends mid-sentence');
-		expect(unfinishedTail('x '.repeat(2000) + '\n\n```\nok\n```\n\nОдин ос')).toBe(
-			'ends mid-sentence'
-		);
+		expect(unfinishedTail(long + '\n\n```\nok\n```\n\nОдин ос')).toBe('ends mid-sentence');
 	});
 
-	it('flags prose ending in a letter or a comma at any length', () => {
-		expect(unfinishedTail(body + 'The next step is to update the')).toBe('ends mid-sentence');
-		expect(unfinishedTail(body + 'After that, and once the build passes,')).toBe(
+	it('flags a long prose last line ending in a letter or a comma', () => {
+		expect(unfinishedTail(long + '\n\nThe next step is to update the')).toBe('ends mid-sentence');
+		expect(unfinishedTail(long + '\n\nAfter that, and once the build passes,')).toBe(
 			'ends mid-sentence'
 		);
-		expect(unfinishedTail('word '.repeat(500) + 'and then we')).toBe('ends mid-sentence');
+		expect(unfinishedTail(long + '\n\nUse `npm test` to verify the')).toBe('ends mid-sentence');
 	});
 
 	it('leaves finished or non-prose endings alone', () => {
@@ -438,25 +438,62 @@ describe('rule 3: a reply cut mid-sentence', () => {
 			'He said "done"',
 			'All green 🎉',
 			'Total cost is 42',
-			'## Next steps',
-			'| a | b',
-			'- remaining item text',
-			'1. remaining item text',
-			'> quoted line text',
-			'<details open',
-			'See https://example.com/path',
-			'const value = compute(a, b)',
-			'Use `npm run build` and `npm test`',
+			'All done',
+			'No further changes needed',
+			'Status | All green',
+			'- Allowed values:\n  red, green,',
+			'## Next steps for the whole team to look at now',
+			'| a | b and a long cell that goes on and on and on',
+			'- remaining item text that is long enough to count as prose',
+			'1. remaining item text that is long enough to count as prose',
+			'> quoted line text that is long enough to count as prose here',
+			'<details open class="something long enough to count here"',
+			'See the docs at https://example.com/path',
+			'const value = compute(a, b) + another(c, d) + more(e)',
+			'    indented code line here that is long enough to count',
 			'Cheers'
 		]) {
 			// a long body: the short-reply ':' / table / list rules stay out of the way
-			expect(unfinishedTail(body.repeat(4) + tail), tail).toBeNull();
+			expect(unfinishedTail(long + '\n\n' + tail), tail).toBeNull();
 		}
 
-		expect(unfinishedTail(body + '    indented code line here')).toBeNull();
+		// a short ack right after a code block is not a fragment
+		expect(unfinishedTail(body + 'All done')).toBeNull();
 		expect(unfinishedTail('Yes')).toBeNull();
 		expect(unfinishedTail('The answer is no')).toBeNull();
 		expect(unfinishedTail('Use the second option')).toBeNull();
+	});
+});
+
+describe('manual Continue: echo-aware join (settleContinuation)', () => {
+	const partial = 'Here is the plan.\n\n```\nx\n```\n\nОдин ос';
+
+	it('drops an echoed prefill before the new text', () => {
+		expect(settleContinuation(partial, partial + 'новной шаг.')).toEqual({
+			mismatch: false,
+			text: partial + 'новной шаг.'
+		});
+		// whitespace-normalised echo
+		expect(settleContinuation(partial, partial.replace('\n\n', '\n') + 'новной').text).toBe(
+			partial + 'новной'
+		);
+	});
+
+	it('keeps the partial while the echo is still in progress (abort mid-echo)', () => {
+		expect(settleContinuation(partial, partial.slice(0, 12))).toEqual({
+			mismatch: false,
+			text: partial
+		});
+		expect(settleContinuation(partial, '').text).toBe(partial);
+	});
+
+	it('joins verbatim without an echo, and flags a diverging echo', () => {
+		expect(settleContinuation(partial, 'новной шаг.')).toEqual({
+			mismatch: false,
+			text: partial + 'новной шаг.'
+		});
+		expect(settleContinuation('', 'fresh')).toEqual({ mismatch: false, text: 'fresh' });
+		expect(settleContinuation(partial, 'Here is the plan.\n\nDifferent text').mismatch).toBe(true);
 	});
 });
 
