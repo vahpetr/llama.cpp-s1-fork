@@ -17461,8 +17461,8 @@ static void ggml_vk_shexp_glu_sig_dispatch_fused(ggml_backend_vk_context * ctx, 
 }
 
 // [TAG_DECODE_FUSE] D3 "gdn_qk_gate" dispatch (validated by ggml_vk_can_fuse_gdn_qk_gate)
-// *refused (when the pattern matched and only the cross-branch or alias preflight refused it) = "crossdep:" / "overlap:",
-// the GGML_VK_FUSION_COUNT prefix of that refusal
+// *refused (when the pattern matched and only the cross-branch or alias preflight refused it) = "crossdep:" / "overlap:" /
+// "aliasroot:", the GGML_VK_FUSION_COUNT prefix of that refusal
 static int ggml_vk_can_fuse_gdn_qk_gate(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
                                         int * gate_add = nullptr, const char ** refused = nullptr);
 static void ggml_vk_gdn_qk_gate_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -23181,6 +23181,30 @@ static int ggml_vk_can_fuse_gdn_qk_gate(ggml_backend_vk_context * ctx, const str
                 }
                 if (!elided) {
                     if (refused) { *refused = "overlap:"; }
+                    return 0;
+                }
+            }
+        }
+    }
+    // aliased storage through view_src, OP_NONE tensors included (the veto above exempts those): every tensor the
+    // dispatch reads from memory (both norm inputs, alpha, dt, ssm_a) against every tensor it writes (both SCALEs, the
+    // MUL), by storage root (view_src is already the base) and byte range. E.g. a SCALE placed over a raw input q
+    // (view_src = q) and an OP_NONE alpha viewing q: the gate's workgroups would read what the norm's write. Refused
+    // here (aliasroot:gdn_qk_gate), so the legacy dispatches run in graph order as in v72.
+    {
+        auto const root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+        auto const offs = [](const ggml_tensor * t) { return t->view_src ? t->view_offs : (size_t) 0; };
+        const ggml_tensor * reads[5]  = { cgraph->nodes[node_idx]->src[0], cgraph->nodes[node_idx + 2]->src[0],
+                                          add->src[0], add->src[1], mul->src[1] };
+        const ggml_tensor * writes[3] = { cgraph->nodes[node_idx + 1], cgraph->nodes[node_idx + 3], mul };
+        for (const ggml_tensor * r : reads) {
+            for (const ggml_tensor * w : writes) {
+                if (root(r) != root(w)) {
+                    continue;
+                }
+                const size_t r0 = offs(r), r1 = r0 + ggml_nbytes(r), w0 = offs(w), w1 = w0 + ggml_nbytes(w);
+                if (r0 < w1 && w0 < r1) {
+                    if (refused) { *refused = "aliasroot:"; }
                     return 0;
                 }
             }
