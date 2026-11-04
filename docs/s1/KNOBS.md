@@ -7,8 +7,8 @@ read once at start (or at context/memory creation). Upstream flags I rely on but
 Class: **EXACT** = outputs and state bytes identical with the knob on and off (proven by a gate); **COMPOSITION** = same math per
 op but a different batching / selection route, so near-ties can flip a token (classified by replay, see AGENTS.md); **LOSSY**
 = changes numerics; **SCHED** = scheduling or memory only, never outputs; **DIAG** = logging / checks / test-only.
-This page describes v71 (fork revision `8bcde80da`, `prod-v11-stage9-pkg11`). "prod" = the value in my s1 brain composes
-(`deploy/s1/`, v71); "-" = unset (the default). Rows marked (?) I have not re-checked
+This page describes v72 (fork revision `608af6ea8`, `prod-v11-stage9-pkg12`). "prod" = the value in my s1 brain composes
+(`deploy/s1/`, v72); "-" = unset (the default). Rows marked (?) I have not re-checked
 against the code for this table.
 
 ## Server flags
@@ -126,23 +126,28 @@ against the code for this table.
 | `GGML_VK_BUF_LOG=1` | 0 | 0244 (v62 62.1, `[TAG_VK_BUF_LOG]`): one INFO line per Vulkan buffer allocation, `[vk-buf] <device> kind=device\|host\|other size=<B> (<MiB>) type=<memory type index> heap=<heap> flags=<VkMemoryPropertyFlags> wc=<0\|1> import=<0\|1>`; kind device = `ggml_vk_create_buffer_device` (weights, KV / recurrent / pool buffers, preallocs), host = pinned host memory, other = staging / aux; wc=1 = host-visible without HOST_CACHED (write-combined for CPU reads). Prints only (the #30049 read-path change is parked, R129) | DIAG | - |
 | `GGML_SCHED_PROFILE=1`, `GGML_GET_ROWS_STATS=1\|2` | 0 | host-side scheduler timers, get_rows census | DIAG | - |
 
-## Added after patch 0265 (in v71)
+## Added after patch 0265 (in v72)
 
-Defaults below are read from the v71 code. The package sections that follow name the patches that added each older knob;
-their defaults are the same in v71. Patch rows for these knobs are not in docs/s1/PATCHES.md yet; the tag in the code comment
+Defaults below are read from the v72 code. The package sections that follow name the patches that added each older knob;
+their defaults are the same in v72. Their patch rows are in docs/s1/PATCHES.md (0266-0438); the tag in the code comment
 is the provenance.
 
 | knob | default | effect | class | prod |
 |---|---|---|---|---|
 | `--cache-disk-async N` (env `LLAMA_ARG_CACHE_DISK_ASYNC`) | 0 | `[TAG_DISK_ASYNC_SAVE]`: asynchronous disk-cache save with N MiB of host staging; the server loop only copies the slot state off the device, worker threads hash the 4 MiB blocks and write the new ones; a save waits only when N MiB are not written yet; 0 = synchronous. Not in the disk-cache key | SCHED | 1024 |
 | `--cache-disk-incr` (env `LLAMA_ARG_CACHE_DISK_INCR`) | off | incremental asynchronous save (needs `--cache-disk-async`): KV blocks whose cells were not modified since the slot's last committed save are taken from that save instead of the device; the files are byte-identical to a full copy. Not in the disk-cache key | EXACT (same file bytes) | on |
-| `LLAMA_SPEC_OVERLAP=0\|1` | 0 | `[TAG_T2_HOST_SPLIT]` / `[TAG_T2_SEQ_RM_COUNTED]`: 1 = trimmed host phase of each speculative round (counted top-down `seq_rm`, no per-round prompt copy for an MTP-only drafter); setting the variable at all also prints the per-phase host split next to the round time line. Not in the disk-cache key | EXACT (output bytes unchanged) | 1 |
+| `LLAMA_SPEC_OVERLAP=0\|1\|2` | 0 | `[TAG_T2_HOST_SPLIT]` / `[TAG_T2_SEQ_RM_COUNTED]`: 1 = trimmed host phase of each speculative round (counted top-down `seq_rm`, no per-round prompt copy for an MTP-only drafter); 2 = T2 step 2 (0419, code only, not in my composes), log `LLAMA_SPEC_OVERLAP=N: T2 step N on`; setting the variable at all also prints the per-phase host split next to the round time line. Not in the disk-cache key | EXACT (=1; output bytes unchanged); =2 not gated | 1 |
 | `GGML_VK_QSA_TOPK_ONEPASS=0\|1` | on on gfx1151, off elsewhere | `[TAG_QSA_TOPK_ONEPASS]` (0275): the QSA top-k cell form as sample -> one filter pass -> exact select of the candidates, v2 per row where the candidates do not fit; gated per dispatch by `GGML_VK_QSA_TOPK_ONEPASS_MIN_KV` / `_MIN_CELLS`. Startup line `qsa_topk: onepass on\|off (...)` | EXACT (v2's ids and order) | - |
 | `GGML_VK_QSA_TOPK_V3=0\|1` | on on gfx1151, off elsewhere | `[TAG_QSA_TOPK_V3]` (0361): the single-pass selection over blocks (a block = one key weighted by its cells visible to the row); needs onepass, the nokeys form and subgroup shuffle. Startup line `qsa_topk: v3 on\|off (...)` | EXACT (v2's ids and order) | - |
 | `GGML_VK_QSA_TOPK_V3_MIN_ROWS=N` | 2 | v3 only for selections of >= N rows; fewer rows (a decode row) use onepass. Path only | EXACT | - |
 | `GGML_VK_QSA_BIAS_FOLD=0\|1` | 1 | `[TAG_QSA_BIAS_FOLD]`: the QSA block bias is computed in the epilogue of the QSA score instead of a separate `[n_blocks, np, n_stream]` node. Startup line `qsa_bias_fold: on\|off (...)` | EXACT (v71 package gate) | - |
 | `LLAMA_GDN_REPLAY=0\|1` | on when every recurrent layer is on a gfx1151 Vulkan device, off elsewhere | `[TAG_GDN_REPLAY]`: the Gated-DeltaNet state after a speculative verify is committed by replaying the accepted tokens instead of keeping a state plane per draft position. Startup line `gdn_replay: on\|off (<reason>)`. Not in the disk-cache key | EXACT (state bytes and outputs equal to the planes path) | - |
 | `LLAMA_GDN_SNAPSHOT_MARGIN_MIB=N` | 512 | `[TAG_GDN_REPLAY]`: margin of the GDN snapshot admission (per-heap free value clamped at 0; on UMA the largest heap). Not in the disk-cache key | SCHED | - |
+| `GGML_VK_HC_TAIL_FUSE=0\|1` | 1 (needs the push-constant room) | `[TAG_HC_TAIL_FUSE]` (0412-0414): the qwen4exp hc_mix tail (SIGMOID_MUL + MULTI_ADD_SCALE) in one dispatch `hc_tail_mix`; a dst that overlaps a source falls back (`overlap:hc_tail_mix` in `GGML_VK_FUSION_COUNT`). Startup line `hc_tail_fuse: on\|off (GGML_VK_HC_TAIL_FUSE, default on)`. Not in the disk-cache key | EXACT (hc_mixed bytes) | - |
+| `GGML_VK_ADD_RMS_ROWS=0\|1` | 1 (under `GGML_VK_FUSE_HC_COMBINE`) | `[TAG_ADD_RMS_ROWS]` (0415-0417): HC_COMBINE + the next RMS_NORM_MUL (hc_norm) in one dispatch `hc_combine_rms`, any row count; =0 the v70 pair. Startup line `add_rms_rows: on\|off (GGML_VK_ADD_RMS_ROWS, default on)`. Not in the disk-cache key | EXACT (HC_COMBINE_RMS_EXACT, e2e hashes) | - |
+| `LLAMA_QWEN4EXP_MERGE_PLAN=0\|1` | on on gfx1151, off elsewhere | `[TAG_MM_PLAN]` (0409-0411): above `LLAMA_QWEN4EXP_MERGE_MAX_N` hc_inject still merges into hc_down where the Vulkan dispatch plan says the merged rows are bit-identical. Startup line `qwen4exp merge plan: on\|off (...)` + one line per n. Not in the disk-cache key | EXACT (K-proof per device) | - |
+| `GGML_VK_PREWARM_SHAPES=0\|N` | on | `[TAG_VK_PREWARM_SHAPES]` (0420): the first graph calls compile the other decode-width / prefill-tile pipelines (lazy compiles 159 -> 68 on s1). Startup line `prewarm_shapes: on\|off (...)`. Not in the disk-cache key | SCHED | - |
+| `LLAMA_QSA_IDX_F16_DECODE=0\|1` | 0 | `[TAG_QSA_IDX_F16_DECODE]` (0421-0424): where QSA_SCORE is refused (1-2 query rows: decode, MTP draft) the indexer score reads the f16 mirror via MUL_MAT_ROWS F16 store. Startup line `qsa_idx_f16_decode: on\|off (...)`. In the disk-cache key | LOSSY/class B when 1 | - |
 
 ## v64 package - patches 0262, 0263, 0265
 

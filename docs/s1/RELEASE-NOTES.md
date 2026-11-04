@@ -1,32 +1,30 @@
 # Release notes
 
-## v71
+## v72
 
-Fork revision `8bcde80da` (`prod-v11-stage9-pkg11`). Brain image `vahpetr/llama-cpp-s1-fork:v71`; the hands run `:v70k`; the
-brain rollback is `:v70`. Measurements: [BENCHMARKS.md](BENCHMARKS.md). Deploy, upgrade and rollback: [DEPLOY.md](DEPLOY.md).
+Fork revision `608af6ea8` (`prod-v11-stage9-pkg12`). Images `vahpetr/llama-cpp-s1-fork:v72` (brain) and `:v72k` (hands), one
+image; the rollback is `:v71` / `:v71k`. Measurements: [BENCHMARKS.md](BENCHMARKS.md). Deploy, upgrade and rollback:
+[DEPLOY.md](DEPLOY.md).
 
-What the fork is at v71:
+New in v72 (all code defaults, no compose change; on gfx1151 against v71: step 1M +4.6 %, step 262k +3.1 %, fill 1M −3.3 %,
+cold 32k prefill +2.9 %, decode −0.4…−0.7 %):
 
-- **1M context in one slot** on the Strix Halo (gfx1151, 128 GB, GTT 108 GiB): YaRN x4 over the native 262 144 tokens, KV q8_0,
-  every compute buffer reserved at load, GTT admission for prefill chunks.
-- **QSA sparse attention** on the 12 full-attention layers from 65 536 tokens: the model's indexer selects 2 051 cells per
-  query; the top-k select is single-pass with the v3 block form on gfx1151 (`GGML_VK_QSA_TOPK_V3`, v3 from 2 rows per
-  selection, single-pass below), the block bias is folded into the score epilogue (`GGML_VK_QSA_BIAS_FOLD`), and prefill runs
-  indexed flash attention.
-- **GDN commit-by-replay** on gfx1151 (`LLAMA_GDN_REPLAY`, default on there, off elsewhere): the recurrent state after a
-  speculative verify is committed by replaying the accepted tokens; the snapshot admission clamps the per-heap free value at 0
-  and uses the largest heap on UMA devices. The startup line `gdn_replay: on|off (<reason>)` names the reason.
-- **MTP speculative decoding** with the model's MTP head on Vulkan, probabilistic draft sampling at temperature > 0, and the
-  trimmed host phase per round (`LLAMA_SPEC_OVERLAP=1` in the composes).
-- **Disk prompt cache** with recurrent checkpoints, asynchronous saves with 1 024 MiB of host staging (`--cache-disk-async`)
-  and incremental re-saves of unchanged KV blocks (`--cache-disk-incr`).
-- **Vulkan kernels** for AMD coopmat1 (MoE and dense GEMM tiles and loaders, flash-attention layouts, fusions), measured on
-  gfx1151 and gfx1103.
-- **webui** for long agent sessions (compaction, continuation, per-chat reasoning levels, timing per reply).
+- **hc-mix tail in one shader** (`GGML_VK_HC_TAIL_FUSE`, default on): SIGMOID_MUL + MULTI_ADD_SCALE of the hyper-connection
+  mix run as one dispatch; a destination that overlaps a source falls back to the two ops.
+- **HC_COMBINE + RMS_NORM_MUL in one dispatch** (`GGML_VK_ADD_RMS_ROWS`, default on).
+- **hc_inject merged into hc_down** above `LLAMA_QWEN4EXP_MERGE_MAX_N` where the Vulkan dispatch plan gives bit-identical rows
+  (`LLAMA_QWEN4EXP_MERGE_PLAN`, default on gfx1151, off elsewhere).
+- **Pipeline prewarm** (`GGML_VK_PREWARM_SHAPES`, default on): the first graphs compile the other decode-width and prefill-tile
+  pipelines instead of compiling them lazily mid-request.
+- Code only, off by default: `LLAMA_SPEC_OVERLAP=2` (the composes keep `=1`) and the f16 indexer score for decode rows
+  (`LLAMA_QSA_IDX_F16_DECODE`, not exact, in the disk-cache key).
 
-Exactness: on gfx1151 the v71 package passed the D-gate as EXACT against the v70 reference, the oracle manifest (12 of 12),
-the AB64 greedy identity check and the same-key disk-cache gate (13 of 13 checks). v71 shares its disk-cache key with v60–v70.
+Each new path prints one startup line (`hc_tail_fuse: on`, `add_rms_rows: on`, `qwen4exp merge plan: on|off`,
+`prewarm_shapes: on`, `qsa_idx_f16_decode: off`); [KNOBS.md](KNOBS.md) lists them.
 
-Known limitations: hands build :v71k is not published — the v71 code crashes once at warmup on the Radeon 780M (gfx1103,
-vk::DeviceLostError); hands run :v70k until the fix. The 524k profile has no v71 measurements. The full list is in
-[README.md](../../README.md#known-limitations).
+Exactness: on gfx1151 v72 passed the D-gate as EXACT against the v71 reference at 262k and 1M, with every new knob off as a
+second arm (also EXACT) and a negative control that the gate caught; the oracle manifest (12 of 12); the AB64 greedy identity
+check; the same-key disk-cache gate (13 of 13). On the 780M (gfx1103) the hands test binary gave identical logits, ids and states
+against v71 in 5 of 5 arms. v72 shares its disk-cache key with v60–v71.
+
+Known limitations: the 524k profile has no v72 measurements. The full list is in [README.md](../../README.md#known-limitations).

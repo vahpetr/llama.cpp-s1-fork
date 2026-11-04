@@ -1,6 +1,6 @@
-# Brain, 524k context, one slot - AMD Ryzen AI Max+ 395 (Strix Halo, Radeon 8060S / gfx1151), 128 GB, Vulkan. Release v71.
+# Brain, 524k context, one slot - AMD Ryzen AI Max+ 395 (Strix Halo, Radeon 8060S / gfx1151), 128 GB, Vulkan. Release v72.
 # Same as docker-compose.brain-1m.yml except the context size (and the names / cache dir). Use this one if your GTT limit is
-# below 108 GiB or you want more headroom. Not measured on v71. Same YaRN and QSA as the 1M profile.
+# below 108 GiB or you want more headroom. Not measured on v72. Same YaRN and QSA as the 1M profile.
 #
 #   BRAIN_CTX=524k deploy/s1/setup-brain.sh        # downloads + checks the weights, pulls the image, starts this file, smoke-tests it
 #   or by hand: docker compose -f docker-compose.brain-524k.yml up -d   (MODELS_DIR / SLOTS_DIR / LLAMA_S1_IMAGE override the defaults)
@@ -13,7 +13,7 @@ services:
       context: ../..
       dockerfile: .devops/vulkan.Dockerfile
       target: server
-    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v71}   # prebuilt; `docker compose build` builds the same thing from this tree
+    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v72}   # prebuilt; `docker compose build` builds the same thing from this tree
     container_name: llama-s1-brain-524k
     restart: unless-stopped
     stop_grace_period: 90s            # on SIGTERM the server writes its slot to the disk prompt cache (a few seconds)
@@ -156,7 +156,7 @@ services:
       - --cache-disk-async
       - "1024"                          # asynchronous save: 1 024 MiB of host staging, worker threads write the blocks
       - --cache-disk-incr               # incremental re-save: unchanged KV blocks come from the last save (byte-identical files)
-      # --- upgrading from v59 or older only (v60-v71 share one key): keep the stored conversations (docs/s1/DEPLOY.md, section 4) ---
+      # --- upgrading from v59 or older only (v60-v72 share one key): keep the stored conversations (docs/s1/DEPLOY.md, section 4) ---
       # Uncomment the next two lines and put the OLD key there (the ns-<key> directory name, or "key" in GET /disk-cache of the
       # old server). The old namespace is opened read-only; without adoption the cache cleanup deletes it once idle past
       # --cache-disk-ttl-days or once foreign namespaces exceed half of --cache-disk-gib. A fresh install has nothing to adopt.

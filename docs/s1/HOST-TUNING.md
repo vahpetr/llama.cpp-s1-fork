@@ -20,7 +20,7 @@ amdgpu.lockup_timeout=600000                            # long prompts: with the
 - GTT size: I set it with `ttm.pages_limit` / `ttm.page_pool_size`, not `amdgpu.gttsize`. Check after reboot:
   `cat /sys/bus/pci/devices/<bdf>/mem_info_gtt_total` (should read 115 964 116 992 bytes = 108 GiB). I ran 110 GiB until
   2026-10-30 and lowered it to 108 GiB after a host out-of-memory hang, to leave the OS more RAM.
-- 108 GiB is needed only for the 1M profile (104 580 MiB GTT after load on v71, 105 407 MiB peak over a 1M fill). The 524k
+- 108 GiB is needed only for the 1M profile (104 538 MiB GTT after load on v72, 105 364 MiB peak over a 1M fill). The 524k
   profile ran for weeks with 104 GiB (`ttm.pages_limit=27262976`). Leaving ~16 GiB to the OS is enough only because nothing
   else big runs on the box.
 - *(my setup)* also on the command line: `nvme_core.default_ps_max_latency_us=0 pcie_aspm=off pcie_port_pm=off
@@ -55,7 +55,7 @@ Resilience *(my setup, worth copying)*:
 - One heavy GPU or RAM job at a time. Two model loads at once, or a GGUF conversion next to a model reload, hung or OOM'd the box
   more than once. I serialise them with one `flock`.
 
-Cooling: a 1M cold fill keeps the GPU at full load for about half an hour (27.76 min on v71), and a busy agent day is hours of
+Cooling: a 1M cold fill keeps the GPU at full load for about half an hour (26.85 min on v72), and a busy agent day is hours of
 decode. My unit runs
 in its default power profile; I have not measured throttling. Check temperatures under a long fill before you trust numbers.
 
