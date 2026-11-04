@@ -494,3 +494,30 @@ export function classifyContinueIntent(messages: DatabaseMessage[], idx: number)
 
 	return { kind: ContinueIntentKind.RERUN_TURN, truncateAfter: idx - 1 };
 }
+
+/**
+ * Fork target of a grouped agentic display entry (root assistant + the flow's later steps): the
+ * flow's LAST message, so the fork copies the whole flow incl. the final answer.
+ */
+export function agenticForkTarget(
+	root: DatabaseMessage,
+	flow: readonly DatabaseMessage[]
+): DatabaseMessage {
+	return flow.length ? flow[flow.length - 1] : root;
+}
+
+/**
+ * Continue target of a grouped agentic display entry: the flow's LAST assistant message
+ * (classifyContinueIntent then picks APPEND_TEXT for a final text answer, NEXT_TURN for
+ * tool calls with results).
+ */
+export function agenticContinueTarget(
+	root: DatabaseMessage,
+	flow: readonly DatabaseMessage[]
+): DatabaseMessage {
+	for (let i = flow.length - 1; i >= 0; i--) {
+		if (flow[i].role === MessageRole.ASSISTANT) return flow[i];
+	}
+
+	return root;
+}
