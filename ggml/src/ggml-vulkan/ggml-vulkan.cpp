@@ -23697,7 +23697,9 @@ static int ggml_vk_hc_tail_streams(const struct ggml_cgraph * cgraph, int node_i
 
 static int ggml_vk_can_fuse_hc_tail(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
                                     bool * overlap = nullptr) {
-    if (!ctx->device->fuse_hc_tail || node_idx + 1 >= cgraph->n_nodes) {
+    // the fused stream sum starts at +0 as multi_add.comp does; separate ADDs start at s0 (-0 + -0 = -0), so the tail
+    // fuses only where the old path runs the sum as MULTI_ADD (device->multi_add: GGML_VK_DISABLE_MULTI_ADD, RTE16)
+    if (!ctx->device->fuse_hc_tail || !ctx->device->multi_add || node_idx + 1 >= cgraph->n_nodes) {
         return 0;
     }
     const ggml_tensor * unary = cgraph->nodes[node_idx + 0];
@@ -23776,6 +23778,10 @@ static int ggml_vk_can_fuse_hc_tail(ggml_backend_vk_context * ctx, const struct 
             GGML_LOG_INFO("ggml_vulkan: hc_tail_mix refused at node %d (%s): dst overlaps%s%s, n=%lld\n", node_idx, scale->name,
                           ovl_g ? " gate-input" : "", ovl_xn ? " xn" : "", (long long) scale->ne[1]);
         }
+        return 0;
+    }
+    // the same pattern veto the old path's MULTI_ADD has (GGML_VK_DISABLE_FUSION_PATTERNS=multi_add -> separate ADDs)
+    if (vk_fusion_veto(ctx, "multi_add")) {
         return 0;
     }
     return n_extra;
