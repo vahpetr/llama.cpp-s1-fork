@@ -263,8 +263,7 @@ export {
 	hasAgenticContent,
 	classifyToolResult,
 	classifyContinueIntent,
-	agenticContinueTarget,
-	agenticForkTarget
+	flowLastAssistantIndex
 } from './agentic';
 
 // Line-level unified diff for tool result rendering (`edit_file` block)
@@ -383,6 +382,7 @@ export {
 	joinContinuationChecked,
 	liveContinuation,
 	settleContinuation,
+	settleContinuationParts,
 	joinWithOverlap,
 	legacyContextFields,
 	measureContextUsage,

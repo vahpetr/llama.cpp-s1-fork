@@ -36,7 +36,7 @@ import {
 	isAbortError,
 	liveContinuation,
 	parseToolsSnapshot,
-	settleContinuation
+	settleContinuationParts
 } from '$lib/utils';
 
 /**
@@ -86,12 +86,12 @@ export class ChatMessageFlows {
 
 		if (!result) return;
 
-		const { index: idx, message: msg } = result;
 		// Decide which resume path applies. tool_calls without tool results can
 		// not be resumed mid sequence by continue_final_message, branch instead.
 		// tool_calls already paired with tool results need a fresh next turn,
 		// not a token level continuation of the target assistant.
-		const intent = classifyContinueIntent(conversationsStore.activeMessages, idx);
+		// On an agentic entry (root + flow) the classifier targets the flow's last assistant.
+		const intent = classifyContinueIntent(conversationsStore.activeMessages, result.index);
 
 		if (intent.kind === ContinueIntentKind.RERUN_TURN) {
 			return this.regenerateMessageWithBranching(messageId);
@@ -101,13 +101,16 @@ export class ChatMessageFlows {
 			return this.continueAsNextAgenticTurn(intent.truncateAfter);
 		}
 
+		const idx = intent.targetIdx;
+		const msg = conversationsStore.activeMessages[idx] ?? result.message;
+
 		try {
 			this.host.showErrorDialog(null);
 			this.host.setChatLoading(activeConv.id, true);
 			this.host.clearChatStreaming(activeConv.id);
 
 			const allMessages = await conversationsStore.getConversationMessages(activeConv.id);
-			const dbMessage = findMessageById(allMessages, messageId);
+			const dbMessage = findMessageById(allMessages, msg.id);
 
 			if (!dbMessage) {
 				this.host.setChatLoading(activeConv.id, false);
@@ -129,21 +132,18 @@ export class ChatMessageFlows {
 
 			// continue_final_message: llama-server streams the prefilled message back before the new
 			// tokens - join echo-aware (content and reasoning separately), as the auto-continuation does
-			const settle = (appContent: string, appReasoning: string) => {
-				const c = settleContinuation(originalContent, appContent);
-				const r = settleContinuation(originalReasoning, appReasoning);
-
-				if (c.mismatch || r.mismatch) {
-					console.warn(
-						'[ChatStore] continue: the echoed prefill diverged from the partial - joined verbatim',
-						{ messageId: msg.id }
-					);
-				}
+			const settle = (appContent: string, appReasoning: string, complete: boolean) => {
+				const j = settleContinuationParts(
+					{ content: originalContent, reasoning: originalReasoning },
+					{ content: appContent, reasoning: appReasoning },
+					complete,
+					msg.id
+				);
 
 				return {
-					content: c.text,
-					echoMismatch: c.mismatch || r.mismatch || undefined,
-					reasoningContent: r.text || undefined
+					content: j.content,
+					echoMismatch: j.mismatch || undefined,
+					reasoningContent: j.reasoning || undefined
 				};
 			};
 			const updateStreamingContent = (fullContent: string) => {
@@ -182,7 +182,7 @@ export class ChatMessageFlows {
 						const finalAppendedReasoning = hasReceivedContent
 							? appendedReasoning
 							: reasoningContent || '';
-						const joined = settle(finalAppendedContent, finalAppendedReasoning);
+						const joined = settle(finalAppendedContent, finalAppendedReasoning, true);
 
 						await DatabaseService.updateMessage(msg.id, {
 							...joined,
@@ -217,7 +217,7 @@ export class ChatMessageFlows {
 					onError: async (error: Error) => {
 						if (isAbortError(error)) {
 							if (hasReceivedContent && appendedContent) {
-								const joined = settle(appendedContent, appendedReasoning);
+								const joined = settle(appendedContent, appendedReasoning, false);
 
 								await DatabaseService.updateMessage(msg.id, { ...joined, timestamp: Date.now() });
 
@@ -234,7 +234,7 @@ export class ChatMessageFlows {
 
 						console.error('Continue generation error:', error);
 						// keep whatever was appended so far, the message stays in memory and in DB
-						const joined = settle(appendedContent, appendedReasoning);
+						const joined = settle(appendedContent, appendedReasoning, false);
 
 						await DatabaseService.updateMessage(msg.id, { ...joined, timestamp: Date.now() });
 						conversationsStore.updateMessageAtIndex(conversationsStore.findMessageIndex(msg.id), {

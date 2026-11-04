@@ -243,6 +243,6 @@ export type ToolResultLine = {
  *                   that last tool result.
  */
 export type ContinueIntent =
-	| { kind: ContinueIntentKind.APPEND_TEXT }
+	| { kind: ContinueIntentKind.APPEND_TEXT; targetIdx: number }
 	| { kind: ContinueIntentKind.RERUN_TURN; truncateAfter: number }
 	| { kind: ContinueIntentKind.NEXT_TURN; truncateAfter: number };

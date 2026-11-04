@@ -1,10 +1,6 @@
 import { ContinueIntentKind, MessageRole, MessageType } from '$lib/enums';
 import type { DatabaseMessage } from '$lib/types/database';
-import {
-	agenticContinueTarget,
-	agenticForkTarget,
-	classifyContinueIntent
-} from '$lib/utils/agentic';
+import { classifyContinueIntent, flowLastAssistantIndex } from '$lib/utils/agentic';
 import { describe, expect, it } from 'vitest';
 
 /**
@@ -54,7 +50,7 @@ describe('classifyContinueIntent', () => {
 		];
 		const intent = classifyContinueIntent(messages, 1);
 
-		expect(intent).toEqual({ kind: ContinueIntentKind.APPEND_TEXT });
+		expect(intent).toEqual({ kind: ContinueIntentKind.APPEND_TEXT, targetIdx: 1 });
 	});
 
 	it('returns append_text for a plain text assistant turn in the middle', () => {
@@ -65,7 +61,10 @@ describe('classifyContinueIntent', () => {
 			makeMsg(MessageRole.ASSISTANT, { content: 'a2' })
 		];
 
-		expect(classifyContinueIntent(messages, 1)).toEqual({ kind: ContinueIntentKind.APPEND_TEXT });
+		expect(classifyContinueIntent(messages, 1)).toEqual({
+			kind: ContinueIntentKind.APPEND_TEXT,
+			targetIdx: 1
+		});
 	});
 
 	it('returns rerun_turn when the assistant has tool_calls without results', () => {
@@ -137,7 +136,10 @@ describe('classifyContinueIntent', () => {
 			makeMsg(MessageRole.ASSISTANT, { content: 'a', toolCalls: '[]' })
 		];
 
-		expect(classifyContinueIntent(messages, 1)).toEqual({ kind: ContinueIntentKind.APPEND_TEXT });
+		expect(classifyContinueIntent(messages, 1)).toEqual({
+			kind: ContinueIntentKind.APPEND_TEXT,
+			targetIdx: 1
+		});
 	});
 
 	it('returns append_text when toolCalls is malformed JSON', () => {
@@ -146,7 +148,10 @@ describe('classifyContinueIntent', () => {
 			makeMsg(MessageRole.ASSISTANT, { content: 'a', toolCalls: '{not json' })
 		];
 
-		expect(classifyContinueIntent(messages, 1)).toEqual({ kind: ContinueIntentKind.APPEND_TEXT });
+		expect(classifyContinueIntent(messages, 1)).toEqual({
+			kind: ContinueIntentKind.APPEND_TEXT,
+			targetIdx: 1
+		});
 	});
 
 	it('returns append_text defensively when idx points at a non assistant message', () => {
@@ -155,61 +160,90 @@ describe('classifyContinueIntent', () => {
 			makeMsg(MessageRole.ASSISTANT, { content: 'a' })
 		];
 
-		expect(classifyContinueIntent(messages, 0)).toEqual({ kind: ContinueIntentKind.APPEND_TEXT });
+		expect(classifyContinueIntent(messages, 0)).toEqual({
+			kind: ContinueIntentKind.APPEND_TEXT,
+			targetIdx: 0
+		});
 	});
 
 	it('returns append_text defensively when idx is out of bounds', () => {
 		const messages = [makeMsg(MessageRole.ASSISTANT, { content: 'a' })];
 
-		expect(classifyContinueIntent(messages, 5)).toEqual({ kind: ContinueIntentKind.APPEND_TEXT });
-		expect(classifyContinueIntent([], 0)).toEqual({ kind: ContinueIntentKind.APPEND_TEXT });
+		expect(classifyContinueIntent(messages, 5)).toEqual({
+			kind: ContinueIntentKind.APPEND_TEXT,
+			targetIdx: 5
+		});
+		expect(classifyContinueIntent([], 0)).toEqual({
+			kind: ContinueIntentKind.APPEND_TEXT,
+			targetIdx: 0
+		});
 	});
 });
 
-describe('agentic display entry: Fork/Continue targets', () => {
-	function flow(final: 'text' | 'tools') {
+describe('agentic display entry: Fork/Continue retarget to the flow', () => {
+	// user, root(tool_calls) -> tool -> assistant(tool_calls) -> tool [-> final]
+	function flow(final: 'text' | 'tools' | 'unpaired') {
 		const user = makeMsg(MessageRole.USER, { content: 'do it' });
 		const root = makeMsg(MessageRole.ASSISTANT, { toolCalls: toolCall('c1', 'read') });
 		const t1 = makeMsg(MessageRole.TOOL, { content: 'r1', toolCallId: 'c1' });
 		const a2 = makeMsg(MessageRole.ASSISTANT, { toolCalls: toolCall('c2', 'write') });
 		const t2 = makeMsg(MessageRole.TOOL, { content: 'r2', toolCallId: 'c2' });
-		const tail = final === 'text' ? [makeMsg(MessageRole.ASSISTANT, { content: 'Один ос' })] : [];
+		const tail =
+			final === 'text'
+				? [makeMsg(MessageRole.ASSISTANT, { content: 'Один ос' })]
+				: final === 'unpaired'
+					? [makeMsg(MessageRole.ASSISTANT, { toolCalls: toolCall('c3', 'run') })]
+					: [];
 
-		return { all: [user, root, t1, a2, t2, ...tail], rest: [t1, a2, t2, ...tail], root };
+		return [user, root, t1, a2, t2, ...tail];
 	}
 
-	it('forks at the last message of the flow (root when the flow is empty)', () => {
-		const f = flow('text');
+	it('Continue on the root of a flow ending in a text answer appends to that answer', () => {
+		const m = flow('text');
 
-		expect(agenticForkTarget(f.root, f.rest).id).toBe(f.all[f.all.length - 1].id);
-		expect(agenticForkTarget(f.root, []).id).toBe(f.root.id);
-
-		const g = flow('tools');
-
-		expect(agenticForkTarget(g.root, g.rest).id).toBe(g.all[g.all.length - 1].id);
-	});
-
-	it('continues a final text assistant as a token-level append, not a new branch under step 1', () => {
-		const f = flow('text');
-		const target = agenticContinueTarget(f.root, f.rest);
-
-		expect(target.id).toBe(f.all[f.all.length - 1].id);
-		expect(classifyContinueIntent(f.all, f.all.indexOf(target))).toEqual({
-			kind: ContinueIntentKind.APPEND_TEXT
+		expect(classifyContinueIntent(m, 1)).toEqual({
+			kind: ContinueIntentKind.APPEND_TEXT,
+			targetIdx: 5
 		});
-		// the old behaviour: the root classified as NEXT_TURN after its first tool result
-		expect(classifyContinueIntent(f.all, 1).kind).toBe(ContinueIntentKind.NEXT_TURN);
 	});
 
-	it('continues a flow ending in tool results as the next turn after the last results', () => {
-		const g = flow('tools');
-		const target = agenticContinueTarget(g.root, g.rest);
+	it('Continue on the root of a flow ending in tool results starts the next turn after them', () => {
+		const m = flow('tools');
 
-		expect(target.id).toBe(g.all[3].id);
-		expect(classifyContinueIntent(g.all, g.all.indexOf(target))).toEqual({
+		expect(classifyContinueIntent(m, 1)).toEqual({
 			kind: ContinueIntentKind.NEXT_TURN,
 			truncateAfter: 4
 		});
-		expect(agenticContinueTarget(g.root, []).id).toBe(g.root.id);
+	});
+
+	it('a flow whose last assistant has unpaired tool_calls reruns from the root', () => {
+		const m = flow('unpaired');
+
+		expect(classifyContinueIntent(m, 1)).toEqual({
+			kind: ContinueIntentKind.RERUN_TURN,
+			truncateAfter: 0
+		});
+	});
+
+	it('Fork targets the flow last ASSISTANT, never a tool row', () => {
+		expect(flowLastAssistantIndex(flow('text'), 1)).toBe(5);
+		expect(flowLastAssistantIndex(flow('tools'), 1)).toBe(3);
+		expect(flowLastAssistantIndex(flow('unpaired'), 1)).toBe(5);
+	});
+
+	it('plain replies and non-assistant rows are not retargeted; the flow stops at a user turn', () => {
+		const m = [
+			makeMsg(MessageRole.USER, { content: 'q' }),
+			makeMsg(MessageRole.ASSISTANT, { content: 'a' }),
+			makeMsg(MessageRole.USER, { content: 'q2' }),
+			makeMsg(MessageRole.ASSISTANT, { toolCalls: toolCall('c1', 'read') }),
+			makeMsg(MessageRole.TOOL, { content: 'r', toolCallId: 'c1' }),
+			makeMsg(MessageRole.USER, { content: 'q3' }),
+			makeMsg(MessageRole.ASSISTANT, { content: 'later' })
+		];
+
+		expect(flowLastAssistantIndex(m, 1)).toBe(1);
+		expect(flowLastAssistantIndex(m, 0)).toBe(0);
+		expect(flowLastAssistantIndex(m, 3)).toBe(3);
 	});
 });

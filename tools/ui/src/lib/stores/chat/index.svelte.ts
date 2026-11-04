@@ -69,8 +69,6 @@ import {
 	formatCwdMessage,
 	getConversationModel,
 	isAbortError,
-	joinContinuationChecked,
-	joinWithOverlap,
 	liveContinuation,
 	measureContextUsage,
 	normalizeModelName,
@@ -79,6 +77,7 @@ import {
 	replyTokenCap,
 	resolveContextReserveConfig,
 	selectTailMessages,
+	settleContinuationParts,
 	shouldCompactBeforeTurn,
 	snapshotRequestOptions,
 	summaryLengthUsable,
@@ -1803,27 +1802,15 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			// the start is dropped (reasoning and content separately), then the pieces are joined
 			// verbatim (a char-overlap strip would delete legitimately repeated text); the overlap
 			// join stays only as an explicit fallback for servers without prefill
-			let echoMismatch = false;
-
-			const join = (a: string, b: string) => {
-				if (CONTEXT_RESERVE.JOIN_OVERLAP_FALLBACK) return joinWithOverlap(a, b).text;
-
-				const r = joinContinuationChecked(a, b);
-
-				echoMismatch ||= r.mismatch;
-
-				return r.text;
-			};
-			const content = join(original, appended);
-			const reasoning = join(originalReasoning, appendedReasoning);
-
-			if (echoMismatch) {
-				console.warn(
-					'[ChatStore] continuation: the echoed prefill diverged from the partial - joined verbatim',
-					{ messageId }
-				);
-			}
-
+			const joined = settleContinuationParts(
+				{ content: original, reasoning: originalReasoning },
+				{ content: appended, reasoning: appendedReasoning },
+				true,
+				messageId
+			);
+			const content = joined.content;
+			const reasoning = joined.reasoning;
+			const echoMismatch = joined.mismatch;
 			const update: Partial<DatabaseMessage> = {
 				content,
 				echoMismatch: echoMismatch || undefined,
