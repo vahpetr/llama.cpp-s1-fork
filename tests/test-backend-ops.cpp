@@ -5013,6 +5013,11 @@ struct test_add_softplus_mul_fuse : public test_case {
 //                         runs today's rms_norm_scale (exact alias, elementwise) x 2 + add_softplus_mul
 //   kind 5 gdn_qk_gate_views  kind 2 with RESHAPE nodes of both SCALE outputs between the norms and the gate (the
 //                         production order: the matcher skips no-op nodes before the ADD), must still fuse
+//   kind 6 gdn_qk_gate_aliasroot  regression (astra pkg13 delta BLOCK): q is a raw OP_NONE input, the q SCALE is placed
+//                         over it (view_src = q) and alpha is an OP_NONE view of q's storage, so the gate reads what the
+//                         q norm writes. The matcher must refuse (aliasroot:gdn_qk_gate). Arm B = the same graph on its
+//                         own copy q_b with an unrelated SCALE(ssm_dt) node between the norms and the gate (no D3 match),
+//                         so both arms run today's dispatches in graph order: same floats
 // rows = decode / MTP-verify / multi-slot widths (the fusions take <= 32 rows; 33 is the refused boundary). strided:
 // kind 0 reads shexp and moe_out as row views of wider tensors; kind 2 reads q / k as views of the conv output (the
 // production layout) and alpha as the row view of the merged beta | alpha output; kind 1 takes contiguous tensors only.
@@ -5050,7 +5055,7 @@ struct test_decode_fuse_exact : public test_case {
 
     std::string vars() override {
         static const char * names[] = { "shexp_tail", "shexp_glu_sig", "gdn_qk_gate", "gdn_qk_gate_crossdep", "gdn_qk_gate_alias",
-                                        "gdn_qk_gate_views" };
+                                        "gdn_qk_gate_views", "gdn_qk_gate_aliasroot" };
         const std::string fusion = names[kind];
         return VARS_TO_STR5(fusion, rows, n_seqs, strided, gate_row);
     }
@@ -5214,11 +5219,49 @@ struct test_decode_fuse_exact : public test_case {
                            flat_diff(ctx, og[0], og[1]), 0);
     }
 
+    // kind 6 (see the comment above the struct)
+    ggml_tensor * build_gdn_aliasroot(ggml_context * ctx) {
+        ggml_tensor * ks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_k_dim * n_k_heads, rows * n_seqs);
+        ggml_set_name(ks, "k");
+        ggml_tensor * k = ggml_reshape_4d(ctx, ks, head_k_dim, n_k_heads, rows, n_seqs);
+        expand(k);   // a node in front of the first RMS_NORM that it does not read
+        ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_v_heads);
+        ggml_set_name(dt, "ssm_dt");
+        ggml_tensor * sa = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_v_heads);
+        ggml_set_name(sa, "ssm_a");
+        const float n = (float) head_k_dim;
+        ggml_tensor * oq[2], * ok[2], * og[2];
+        for (int arm = 0; arm < 2; ++arm) {
+            ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_k_dim, n_k_heads, rows, n_seqs);   // raw OP_NONE
+            ggml_set_name(q, arm == 0 ? "q" : "q_b");
+            ggml_tensor * alpha = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_v_heads, rows, n_seqs);
+            ggml_set_name(alpha, "alpha_view");
+            GGML_ASSERT(ggml_nbytes(alpha) <= ggml_nbytes(q));
+            alpha->view_src  = q;   // an OP_NONE alpha over q's storage
+            alpha->view_offs = 0;
+            oq[arm] = ggml_scale(ctx, ggml_rms_norm(ctx, q, 1e-6f / n), 1.0f / sqrtf(n));
+            GGML_ASSERT(ggml_nbytes(oq[arm]) == ggml_nbytes(q));
+            oq[arm]->view_src  = q;   // the q SCALE over the raw input
+            oq[arm]->view_offs = 0;
+            expand(oq[arm]);
+            ok[arm] = ggml_scale(ctx, ggml_rms_norm(ctx, k, 1e-6f / n), 1.0f / sqrtf(n));
+            expand(ok[arm]);
+            if (arm == 1) {
+                expand(ggml_scale(ctx, dt, 1.0f));   // breaks the D3 range: arm B = today's dispatches
+            }
+            og[arm] = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), sa);
+            expand(og[arm]);
+        }
+        return ggml_concat(ctx, ggml_concat(ctx, flat_diff(ctx, oq[0], oq[1]), flat_diff(ctx, ok[0], ok[1]), 0),
+                           flat_diff(ctx, og[0], og[1]), 0);
+    }
+
     // fusion witness (see the comment above the struct)
-    static constexpr int n_wkeys = 8;
+    static constexpr int n_wkeys = 9;
     static const char * wkey(int i) {
         static const char * keys[n_wkeys] = { "shexp_tail", "shexp_glu_sig", "gdn_qk_gate", "rms_norm_scale", "add_softplus_mul",
-                                              "crossdep:gdn_qk_gate", "overlap:gdn_qk_gate", "vetoed:gdn_qk_gate" };
+                                              "crossdep:gdn_qk_gate", "overlap:gdn_qk_gate", "vetoed:gdn_qk_gate",
+                                              "aliasroot:gdn_qk_gate" };
         return keys[i];
     }
     using fusion_total_t = int64_t (*)(ggml_backend_t, const char *);
@@ -5262,6 +5305,7 @@ struct test_decode_fuse_exact : public test_case {
             want[4] = fuse ? 1 : 2;   // add_softplus_mul: arm B's one (+ arm A's)
             want[5] = d3 && kind == 3 ? 1 : 0;
             want[6] = d3 && kind == 4 ? 1 : 0;
+            want[8] = d3 && kind == 6 ? 1 : 0;
         }
         std::string msg;
         for (int i = 0; i < n_wkeys; ++i) {
@@ -5274,7 +5318,8 @@ struct test_decode_fuse_exact : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * out = kind == 0 ? build_shexp_tail(ctx) : kind == 1 ? build_shexp_glu_sig(ctx) : build_gdn_qk_gate(ctx);   // 2..5
+        ggml_tensor * out = kind == 0 ? build_shexp_tail(ctx) : kind == 1 ? build_shexp_glu_sig(ctx) :
+                            kind == 6 ? build_gdn_aliasroot(ctx) : build_gdn_qk_gate(ctx);   // 2..5
         ggml_set_name(out, "out");
         return out;
     }
@@ -5285,7 +5330,7 @@ struct test_decode_fuse_exact : public test_case {
         std::uniform_int_distribution<int> ex(-12, 12);
         std::vector<float> q_vals;   // kind 4: q_b gets q's values (q is created first)
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->op != GGML_OP_NONE || t->type != GGML_TYPE_F32) {
+            if (t->op != GGML_OP_NONE || t->type != GGML_TYPE_F32 || t->view_src) {   // kind 6: alpha_view shares q's data
                 continue;
             }
             const std::string name = ggml_get_name(t);
@@ -12269,6 +12314,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool strided : { false, true }) {
             test_cases.emplace_back(new test_decode_fuse_exact(5, nt, 1, strided));
         }
+        // regression: an OP_NONE alpha over the storage the q SCALE writes (view_src) refuses (aliasroot:)
+        test_cases.emplace_back(new test_decode_fuse_exact(6, nt, 1, false));
     }
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
