@@ -14497,7 +14497,7 @@ static void ggml_vk_prewarm_shapes(ggml_backend_vk_context * ctx, const ggml_cgr
             continue;
         }
         const bool big = ggml_nbytes(src0) > max_range;
-        const ggml_prec prec = (ggml_prec) node->op_params[0];
+        const ggml_prec prec = node->op == GGML_OP_MUL_MAT && dev->f32acc_trunk && !ggml_vk_f32acc_excluded(src0) ? GGML_PREC_F32 : (ggml_prec) node->op_params[0]; // as ggml_vk_mul_mat_q_f16
         const auto add64 = [&](const vk_pipeline & p) {
             ggml_vk_prewarm_add(todo, p);
             if (big && p) {
