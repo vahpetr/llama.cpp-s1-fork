@@ -203,6 +203,9 @@ int main() {
         CHECK(server_cache_env_classify("LLAMA_QSA_IDX_F16_DECODE") == SERVER_CACHE_ENV_SEMANTIC);
         CHECK(server_cache_env_classify("GGML_VK_MM_MERGE_FORCE") == SERVER_CACHE_ENV_SEMANTIC);
         CHECK(server_cache_env_digest({ "LLAMA_QSA_IDX_F16_DECODE=1" }) != d0);
+        // [TAG_DECODE_FUSE] the D3 decode fusions (class A by the F71 e2e proof; the D-gate knob arm sets =0)
+        CHECK(server_cache_env_classify("GGML_VK_DECODE_FUSE") == SERVER_CACHE_ENV_EXACT);
+        CHECK(server_cache_env_digest({ "GGML_VK_DECODE_FUSE=0" }) == d0);
         // [TAG_MM_PLAN] with the GGML_VK_MM_MERGE_FORCE negative control on, PLAN 0 -> 1 changes outputs: PLAN enters the key;
         //   with FORCE unset / 0 PLAN stays exact
         CHECK(server_cache_env_digest({ "GGML_VK_MM_MERGE_FORCE=1", "LLAMA_QWEN4EXP_MERGE_PLAN=0" }) !=
