@@ -5,8 +5,8 @@ contributor rules for llama.cpp itself are in
 [upstream AGENTS.md](https://github.com/ggml-org/llama.cpp/blob/master/AGENTS.md); they apply to anything sent upstream from here.
 Read README.md first, then docs/s1/KNOBS.md (every flag and env knob) and docs/s1/PATCHES.md (every change, numbered).
 
-This tree is **v73**: fork revision `7597206a9` (`prod-v11-stage9-pkg13`) plus the docs and deploy files of this `s1-public`
-branch. Images `vahpetr/llama-cpp-s1-fork:v73` (brain) and `:v73k` (hands), one image; rollback `:v72` / `:v72k`. Deploy steps in docs/s1/DEPLOY.md, what the release contains in
+This tree is **v74**: fork revision `e5f793eae` (`ui-agentic-actions` = v73 `7597206a9` + webui-only commits) plus the docs and deploy files of this `s1-public`
+branch. Images `vahpetr/llama-cpp-s1-fork:v74` (brain) and `:v74k` (hands), one image; rollback `:v73` / `:v73k`. Deploy steps in docs/s1/DEPLOY.md, what the release contains in
 docs/s1/RELEASE-NOTES.md.
 
 ## Where the fork's code lives

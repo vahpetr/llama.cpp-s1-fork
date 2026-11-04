@@ -1,15 +1,15 @@
 # Running it: two commands per box
 
-Release v73: `:v73` (brain) and `:v73k` (hands) are one image.
+Release v74 (= v73 server + webui): `:v74` (brain) and `:v74k` (hands) are one image.
 
 | file | box | context | image | GTT after load | needs GTT |
 |---|---|---|---|---|---|
-| `s1/docker-compose.brain-1m.yml` | Ryzen AI Max+ 395, 128 GB | 1 048 576, 1 slot | `:v73` | 104 538 MiB (v73 deploy smoke) | 108 GiB |
-| `s1/docker-compose.brain-524k.yml` | Ryzen AI Max+ 395, 128 GB | 525 312, 1 slot | `:v73` | not measured on v73 | less than the 1M profile |
-| `balkon/docker-compose.hands.yml` | Ryzen 9 7940HS + 780M, 96 GB | 917 504 pool, 5 slots | `:v73k` | not measured on v73 | 78 GiB |
+| `s1/docker-compose.brain-1m.yml` | Ryzen AI Max+ 395, 128 GB | 1 048 576, 1 slot | `:v74` | 104 538 MiB (v73 deploy smoke) | 108 GiB |
+| `s1/docker-compose.brain-524k.yml` | Ryzen AI Max+ 395, 128 GB | 525 312, 1 slot | `:v74` | not measured on v73 | less than the 1M profile |
+| `balkon/docker-compose.hands.yml` | Ryzen 9 7940HS + 780M, 96 GB | 917 504 pool, 5 slots | `:v74k` | not measured on v73 | 78 GiB |
 
 First set the host up ([docs/s1/HOST-TUNING.md](../docs/s1/HOST-TUNING.md)): without the GTT change none of these load.
-Step by step, the upgrade (v60–v72 share v73's disk-cache key; v59 needs an adopt step) and the rollback to `:v72`:
+Step by step, the upgrade (v60–v72 share v73's disk-cache key; v59 needs an adopt step) and the rollback to `:v73`:
 [docs/s1/DEPLOY.md](../docs/s1/DEPLOY.md). Why these weights: [docs/s1/WEIGHTS.md](../docs/s1/WEIGHTS.md). Every flag and knob:
 [docs/s1/KNOBS.md](../docs/s1/KNOBS.md).
 
@@ -41,7 +41,7 @@ Both are idempotent and resumable (re-run after an interrupted download; finishe
 3. **Re-encode (hands only, CPU, a few minutes):** `tools/s1/gguf_hc_q8.py` turns the 290 BF16 `hc_*` tensors into Q8_0 and
    copies `output.weight` + `token_embd.weight` from the Q8_0 head, in one pass. The script checks that exactly those 292
    tensors changed type, compares the result with my file's sha256, and hardlinks the untouched PLE shard (no 29 GB copy).
-4. **Image:** `docker pull vahpetr/llama-cpp-s1-fork:v73` (s1) or `:v73k` (balkon). `BUILD=1` builds it from this tree instead.
+4. **Image:** `docker pull vahpetr/llama-cpp-s1-fork:v74` (s1) or `:v74k` (balkon). `BUILD=1` builds it from this tree instead.
 5. **Start** the compose file, wait for `/health` (up to 15-20 min; the brain's first start pre-reads the 33 GiB PLE range),
    print the expected GTT and fill time, and smoke-test: `/props` n_ctx, one short completion, `/disk-cache` own key and entries.
 
@@ -54,11 +54,11 @@ The prebuilt images are this tree built with upstream's `.devops/vulkan.Dockerfi
 
 ```sh
 git archive <rev> | docker build -f .devops/vulkan.Dockerfile --build-arg APP_REVISION=<rev> --label llama.rev=<rev> \
-  --target server -t vahpetr/llama-cpp-s1-fork:v73 -
+  --target server -t vahpetr/llama-cpp-s1-fork:v74 -
 ```
 
-`:v73` = `:v73k` = `:latest` = digest `sha256:653c9dacbb368ba27608080b72ef8ff88d4c7b319f8121a6d95ddec80bfde6bb`, rev `7597206a9` (`prod-v11-stage9-pkg13`; this branch adds docs, deploy files and `tools/s1` on top).
-`:v72` / `:v72k` are the rollback (rev `608af6ea8`, same disk-cache key): `LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v72`.
+`:v74` = `:v74k` = `:latest` = digest `sha256:5487e448f6623543833d715647cb10cd7c295454b4e00f91f31ed77fef8fb74e`, rev `7597206a9` (`prod-v11-stage9-pkg13`; this branch adds docs, deploy files and `tools/s1` on top).
+`:v73` / `:v73k` are the rollback (rev `608af6ea8`, same disk-cache key): `LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v73`.
 Build with no model loaded on the GPU: on the 128 GB box a build next to a loaded model has run it out of memory.
 `docker compose -f <file> build` does the same from a checkout.
 

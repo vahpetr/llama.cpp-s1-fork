@@ -23,7 +23,7 @@ parse_args "$@"
 COMPOSE="$HERE/docker-compose.hands.yml"; CONTAINER=llama-s1-hands; NEED_GTT_MIB=79872
 export MODELS_DIR="${MODELS_DIR:-$HERE/models}"
 export SLOTS_DIR="${SLOTS_DIR:-$HERE/slots}"
-export LLAMA_S1_IMAGE="${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v73k}"
+export LLAMA_S1_IMAGE="${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v74k}"
 PORT=8000
 TOOL="$ROOT/tools/s1/gguf_hc_q8.py"
 
@@ -170,7 +170,7 @@ if want up; then
         die "another llama-s1 container is running; stop it first (docker ps)"
     fi
     run docker compose -f "$COMPOSE" up -d
-    info "expected: GTT after load below the 78 GiB limit; image :v73k; deploy smoke on v73: 28.4 t/s on a short chat"
+    info "expected: GTT after load below the 78 GiB limit; image :v74k; deploy smoke on v73: 28.4 t/s on a short chat"
     if [ "$DRY_RUN" = 0 ]; then
         wait_health "$PORT" 1200
         smoke "$PORT"
