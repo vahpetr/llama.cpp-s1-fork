@@ -9696,7 +9696,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
                                        device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_hc_tail_mix_push_constants);
         // [TAG_HC_TAIL_FUSE] [TAG_ADD_RMS_ROWS] default-path proof lines, once per device (WARN: the server drops ggml INFO
         // lines); the device flags as computed, so a missing push-constant room or GGML_VK_FUSE_HC_COMBINE=0 shows as off
-        GGML_LOG_WARN("ggml_vulkan: hc_tail_fuse: %s (GGML_VK_HC_TAIL_FUSE, default on)\n", device->fuse_hc_tail ? "on" : "off");
+        // the effective gate of ggml_vk_can_fuse_hc_tail: the flag, device->multi_add and no multi_add pattern veto (the
+        // fusion patterns are read in ggml_vk_instance_init, before any device)
+        {
+            const bool ma_veto = ggml_vk_fusion_disabled_slow("multi_add");
+            if (device->fuse_hc_tail && device->multi_add && !ma_veto) {
+                GGML_LOG_WARN("ggml_vulkan: hc_tail_fuse: on (GGML_VK_HC_TAIL_FUSE, default on)\n");
+            } else {
+                GGML_LOG_WARN("ggml_vulkan: hc_tail_fuse: off (GGML_VK_HC_TAIL_FUSE, default on%s)\n",
+                              !device->fuse_hc_tail ? "" : !device->multi_add ? "; multi_add off" : "; multi_add pattern disabled");
+            }
+        }
         GGML_LOG_WARN("ggml_vulkan: add_rms_rows: %s (GGML_VK_ADD_RMS_ROWS, default on)\n", device->fuse_hc_combine_rms ? "on" : "off");
         // [TAG_CONV_INPUT_SPLIT] the GDN conv input: ssm_conv reads concat(state, x^T) from its two sources
         device->fuse_concat_ssm_conv = fuse_enabled("GGML_VK_FUSE_CONCAT_SSM_CONV");
