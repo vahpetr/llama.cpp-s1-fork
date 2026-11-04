@@ -288,18 +288,25 @@ static bool qwen4exp_on_vulkan(const ggml_tensor * w) {
 // iff the weight's device is gfx1151 (STRIX_HALO; the R188 device test), 0 = off (the n <= MAX_N rule alone), 1 = on.
 // One WARN line per distinct n with the decision and its reason (the proof line; WARN like the merge_rows load line, so it
 // shows at the default verbosity).
+// The mode is decided per device (the weight's device): a second device (draft / hands on another GPU) gets its own
+// device test and its own proof line, never the first caller's decision.
 static int qwen4exp_merge_plan_mode(ggml_backend_dev_t dev) {
-    static const int mode = [dev] {
-        const char * s = getenv("LLAMA_QWEN4EXP_MERGE_PLAN");
-        const char * dsc = dev ? ggml_backend_dev_description(dev) : "";
-        const bool gfx1151 = dsc && (strstr(dsc, "STRIX_HALO") != nullptr || strstr(dsc, "GFX1151") != nullptr || strstr(dsc, "gfx1151") != nullptr);
-        const bool env_set = s != nullptr && *s != '\0';
-        const int m = env_set ? (atoi(s) != 0 ? 1 : 0) : (gfx1151 ? 1 : 0);
-        LLAMA_LOG_WARN("%s: qwen4exp merge plan: %s (%s)\n", __func__, m ? "on" : "off",
-                       env_set ? "env" : (gfx1151 ? "default on gfx1151" : "default off: not gfx1151"));
-        return m;
-    }();
-    return mode;
+    static std::mutex mtx;
+    static std::map<ggml_backend_dev_t, int> modes;
+    std::lock_guard<std::mutex> lock(mtx);
+    const auto it = modes.find(dev);
+    if (it != modes.end()) {
+        return it->second;
+    }
+    const char * s = getenv("LLAMA_QWEN4EXP_MERGE_PLAN");
+    const char * dsc = dev ? ggml_backend_dev_description(dev) : "";
+    const bool gfx1151 = dsc && (strstr(dsc, "STRIX_HALO") != nullptr || strstr(dsc, "GFX1151") != nullptr || strstr(dsc, "gfx1151") != nullptr);
+    const bool env_set = s != nullptr && *s != '\0';
+    const int m = env_set ? (atoi(s) != 0 ? 1 : 0) : (gfx1151 ? 1 : 0);
+    LLAMA_LOG_WARN("%s: qwen4exp merge plan: %s (%s)\n", __func__, m ? "on" : "off",
+                   env_set ? "env" : (gfx1151 ? "default on gfx1151" : "default off: not gfx1151"));
+    modes.emplace(dev, m);
+    return m;
 }
 
 static bool qwen4exp_merge_plan_ok(const ggml_tensor * a, const ggml_tensor * b, int64_t n_tokens) {
@@ -311,10 +318,9 @@ static bool qwen4exp_merge_plan_ok(const ggml_tensor * a, const ggml_tensor * b,
         return false;
     }
     using merge_exact_fn = int (*)(ggml_backend_dev_t, ggml_type, int64_t, int64_t, int64_t, int64_t, char *, size_t);
-    static const merge_exact_fn fn = [dev] {
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-        return reg ? (merge_exact_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_mul_mat_rows_merge_exact") : nullptr;
-    }();
+    // looked up on the queried device's own backend reg (no cross-device static)
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    const merge_exact_fn fn = reg ? (merge_exact_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_mul_mat_rows_merge_exact") : nullptr;
     if (fn == nullptr) {
         return false;
     }
