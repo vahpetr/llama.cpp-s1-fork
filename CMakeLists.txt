@@ -125,6 +125,9 @@ option(LLAMA_SANITIZE_THREAD    "llama: enable thread sanitizer"    OFF)
 option(LLAMA_SANITIZE_ADDRESS   "llama: enable address sanitizer"   OFF)
 option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 
+# [TAG_QSA_IDX_F16_DECODE] test-only negative control: decode-width graphs read the f16 mirror without writing it
+option(LLAMA_QSA_IDX_F16_NEGCTL "llama: QSA indexer f16-decode negative-control build (tests only)" OFF)
+
 # utils
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
 

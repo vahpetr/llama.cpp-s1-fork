@@ -63,6 +63,11 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (LLAMA_QSA_IDX_F16_NEGCTL)
+    # [TAG_QSA_IDX_F16_DECODE] tests only (src/models/qwen4exp.cpp: the stale-mirror mutant)
+    target_compile_definitions(llama PRIVATE LLAMA_QSA_IDX_F16_NEGCTL)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
