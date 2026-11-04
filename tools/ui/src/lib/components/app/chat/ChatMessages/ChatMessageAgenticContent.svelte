@@ -3,6 +3,7 @@
 	import ToolChipScope from './ChatMessage/ChatMessageToolCall/ToolChipScope.svelte';
 	import ChatMessageReasoningBlock from './ChatMessageReasoningBlock.svelte';
 	import {
+		ActionIconCopyToClipboard,
 		ChatMessageActionCardContinueRequest,
 		ChatMessageActionCardPermissionRequest,
 		ChatMessageStatistics,
@@ -189,6 +190,13 @@
 	{#if section.type === AgenticSectionType.TEXT}
 		<div class="agentic-text">
 			<MarkdownContent attachments={message?.extra} content={section.content} />
+			{#if turnGroups.length > 1}
+				<div
+					class="flex justify-end opacity-0 transition-opacity group-hover/turn:opacity-100 focus-within:opacity-100"
+				>
+					<ActionIconCopyToClipboard ariaLabel="Copy this step" text={section.content} />
+				</div>
+			{/if}
 		</div>
 	{:else if section.type === AgenticSectionType.REASONING || section.type === AgenticSectionType.REASONING_PENDING}
 		<ChatMessageReasoningBlock

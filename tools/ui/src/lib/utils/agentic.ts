@@ -522,3 +522,27 @@ export function flowLastAssistantIndex(messages: readonly DatabaseMessage[], idx
 
 	return last;
 }
+
+/**
+ * What Copy on a display entry copies. A plain reply copies itself. An agentic entry's root
+ * usually holds only reasoning + tool calls (empty content), so its Copy targets the flow's
+ * final assistant (see flowLastAssistantIndex); when that one is empty (cut or still
+ * streaming) the text of all assistant steps is joined instead.
+ */
+export function agenticCopyTarget(
+	message: DatabaseMessage,
+	toolMessages: readonly DatabaseMessage[] = []
+): { content: string; extra?: DatabaseMessageExtra[] } {
+	const flow = [message, ...toolMessages];
+	const last = flow[flowLastAssistantIndex(flow, 0)];
+
+	if (last === message || last.content?.trim()) {
+		return { content: last.content ?? '', extra: last.extra };
+	}
+
+	const parts = flow
+		.filter((m) => m.role === MessageRole.ASSISTANT && m.content?.trim())
+		.map((m) => m.content.trim());
+
+	return { content: parts.join(`${NEWLINE}${NEWLINE}`), extra: last.extra };
+}
