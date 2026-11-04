@@ -23790,8 +23790,10 @@ static int ggml_vk_can_fuse_hc_tail(ggml_backend_vk_context * ctx, const struct 
         }
         return 0;
     }
-    // the same pattern veto the old path's MULTI_ADD has (GGML_VK_DISABLE_FUSION_PATTERNS=multi_add -> separate ADDs)
-    if (vk_fusion_veto(ctx, "multi_add")) {
+    // the same pattern veto the old path's MULTI_ADD has (GGML_VK_DISABLE_FUSION_PATTERNS=multi_add -> separate ADDs), and
+    // the old path's MULTI_ADD would cover exactly these num_adds ADDs (ggml_vk_fuse_multi_add's shape / type / misalign
+    // / can_fuse tests)
+    if (vk_fusion_veto(ctx, "multi_add") || ggml_vk_fuse_multi_add(ctx, cgraph, first_add) != (uint32_t) num_adds) {
         return 0;
     }
     return n_extra;
