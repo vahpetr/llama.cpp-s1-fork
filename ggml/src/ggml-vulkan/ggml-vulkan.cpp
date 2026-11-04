@@ -23351,6 +23351,35 @@ static bool ggml_vk_can_fuse_hc_combine_rms(ggml_backend_vk_context * ctx, const
         }
         return false;
     }
+    // [TAG_ADD_RMS_ROWS] the dispatcher's generic src/dst veto, run here for the 9-op chain (both outputs, every src
+    // elementwise as graph_compute marks them): an overlap that only the longer chain sees (residual partially over
+    // hc_norm, w_norm over the combine) is refused here, so the 7-op HC_COMBINE still fires there as it did in v71
+    // instead of the veto leaving the whole chain unfused. Same loop and elided-node rule as the veto.
+    for (const ggml_tensor * dst : { add, mul }) {
+        for (int k = 0; k <= 8; ++k) {
+            for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = cgraph->nodes[node_idx + k]->src[s];
+                if (!src || src->op == GGML_OP_NONE || !ggml_vk_tensors_overlap(src, dst, true)) {
+                    continue;
+                }
+                bool elided = false;
+                for (int n = 0; n <= k; ++n) {
+                    elided |= cgraph->nodes[node_idx + n] == src;
+                }
+                if (elided) {
+                    continue;
+                }
+                if (vk_fusion_diag) {
+                    GGML_LOG_INFO("ggml_vulkan: fusion HC_COMBINE_RMS refused at node %d: src %s (%s) overlaps dst %s, HC_COMBINE kept\n",
+                                  node_idx, src->name, ggml_op_name(src->op), dst->name);
+                }
+                if (overlap) {
+                    *overlap = true;
+                }
+                return false;
+            }
+        }
+    }
     return true;
 }
 
