@@ -3750,7 +3750,9 @@ private:
         const int64_t t_send0 = ggml_time_us();
         spec_flush_deferred(slot);
         queue_results.send(std::move(res));
-        if (!is_progress && !is_begin) {
+        // only the sends of slots that drafted this pass: send_us is added to those slots' stats
+        if (!is_progress && !is_begin &&
+            std::find(spec_rt.slot_ids.begin(), spec_rt.slot_ids.end(), slot.id) != spec_rt.slot_ids.end()) {
             spec_rt.send_us += ggml_time_us() - t_send0;
         }
     }
@@ -4958,6 +4960,9 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            // [TAG_T2_O1] the cancelled task's queued partials are dropped, not sent after it ended
+                            slot.spec_deferred.clear();
+                            slot.spec_defer_send = false;
                             slot.release_cancel = true;
                             slot.release();
                             break;
@@ -7843,6 +7848,8 @@ private:
             // [TAG_T2_O1] LLAMA_SPEC_OVERLAP=2: this round's partial responses are queued (sent in the next verify window);
             //   send_final_response flushes them first and clears the flag
             slot.spec_defer_send = server_spec_overlap() >= 2;
+            // an exception out of the token loop must not leave the flag set (later partials would stay queued)
+            struct defer_scope { bool & flag; ~defer_scope() { flag = false; } } defer_guard { slot.spec_defer_send };
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
