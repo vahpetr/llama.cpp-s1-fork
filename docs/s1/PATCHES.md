@@ -11,8 +11,8 @@ Status column:
 - **v63**: in this tree since v63 (released 2026-10-21; in production 2026-10-21 06:32 to 22:12); "v63, on" / "v63, off" = the default of its knob.
 - **v64**: in this tree since v64 (released 2026-10-21); "v64, on" = on by default.
 
-This tree is v71: fork revision `8bcde80da` (`prod-v11-stage9-pkg11`), image `vahpetr/llama-cpp-s1-fork:v71`. Every row
-below is still in it. The rows after 0265 (v65-v71, up to 0407) give the title, the patch file and the commit; the status column is the first
+This tree is v72: fork revision `608af6ea8` (`prod-v11-stage9-pkg12`), image `vahpetr/llama-cpp-s1-fork:v72`. Every row
+below is still in it. The rows after 0265 (v65-v72, up to 0438) give the title, the patch file and the commit; the status column is the first
 image that carried it. Their knobs are in docs/s1/KNOBS.md, section "Added after patch 0265".
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
@@ -380,6 +380,37 @@ records and upstream status live in my private repo; ask if you want one.
 | 0405 | ggml-cpu: out-of-range QSA query rows give -inf (`0405-ggml-cpu-qsa-out-of-range-rows-neginf.patch`, f5a878231) | v71 (class EXACT) |
 | 0406 | tests/vulkan: QSA top-k v3 summary growth (`0406-tests-vulkan-qsa-topk-v3-summary-growth.patch`, 0fbc0d744) | v71 (class EXACT) |
 | 0407 | llama/vulkan: gdn replay snapshot admission - per-heap free clamped at 0 (`0407-llama-vulkan-gdn-snapshot-admission-heap-clamp.patch`, 8bcde80da) | v71 (class EXACT) |
+| 0408 | tests: test-qwen4exp-hc-merge-kproof - P3 K-proof of hc_down + hc_inject merged vs separate (real weights, bitwise) (`0408-tests-qwen4exp-hc-merge-kproof-p3.patch`, 34fa25dcd) | v72 (class tests) |
+| 0409 | vulkan: ggml_vk_mul_mat_q_f16_plan + "ggml_backend_dev_mul_mat_plan" / "ggml_backend_dev_mul_mat_rows_merge_exact" (TAG_MM_PLAN) (`0409-vulkan-mul-mat-plan-query.patch`, 5fe2a92a4) | v72 (class EXACT) |
+| 0410 | qwen4exp: P3a - hc_inject merged with hc_down above MERGE_MAX_N where the Vulkan plan says bit-identical (LLAMA_QWEN4EXP_MERGE_PLAN) (`0410-qwen4exp-p3a-hc-inject-merge-plan.patch`, 1fc73d6c6) | v72 (class EXACT) |
+| 0411 | tests: test-qwen4exp-hc-merge-kproof - P3a plan query (MERGE / separate per n, PASS iff every MERGE n bit-equal), forced negctl, stronger mutant (`0411-tests-qwen4exp-hc-merge-kproof-p3a-plan.patch`, a0b011ab4) | v72 (class tests) |
+| 0412 | vulkan: hc_tail_mix.comp - the qwen4exp hc_mix tail (SIGMOID_MUL + MULTI_ADD_SCALE) in one shader, negctl mutants 1..6 (`0412-vulkan-hc-tail-mix-shader.patch`, 2ea051f96) | v72 (class EXACT) |
+| 0413 | vulkan: GGML_VK_HC_TAIL_FUSE (default on) - recognise and dispatch the hc_mix tail fusion (`0413-vulkan-hc-tail-fuse.patch`, 914eebec4) | v72 (class EXACT) |
+| 0414 | tests: test-vk-hc-tail - hc_mixed bytes of the hc_mix tail over n x sublayer fixtures (old vs fused, mutants) (`0414-tests-vk-hc-tail.patch`, b4d1f66b1) | v72 (class tests) |
+| 0415 | vulkan: rms_norm_hc_combine_f32 - the hc_combine expression as the RMS_NORM_MUL input load, same reduction lines (`0415-vulkan-rms-norm-hc-combine-shader.patch`, 0a32d6b40) | v72 (class EXACT) |
+| 0416 | vulkan: hc_combine_rms fusion - HC_COMBINE + the next RMS_NORM_MUL (hc_norm) in one dispatch at any row count (`0416-vulkan-hc-combine-rms-fusion.patch`, 872b63aa5) | v72 (class EXACT) |
+| 0417 | tests: HC_COMBINE_RMS_EXACT - hc_combine_rms against the v70 pair, bitwise, n 1/9/64/1020/2044/2048 x contiguous/strided inject (`0417-tests-hc-combine-rms-exact.patch`, a92dc8c36) | v72 (class tests) |
+| 0418 | vulkan: hc_combine_rms - GGML_VK_FUSION_DIAG names the source an hc_norm overlap refused the fusion on (`0418-vulkan-hc-combine-rms-fusion-diag.patch`, 3da5075cf) | v72 (class EXACT) |
+| 0419 | server: LLAMA_SPEC_OVERLAP=2 - T2 step 2 (O1): streamed partials of a speculative round sent in the next verify submit..sync window (`0419-server-spec-overlap-2-o1.patch`, c704b0325) | v72 (class EXACT) |
+| 0420 | vulkan: GGML_VK_PREWARM_SHAPES (default on) - compile the matmul pipelines of the other decode widths and prefill tiles in the first graph calls (`0420-vulkan-prewarm-shapes.patch`, de35d2dab) | v72 (class EXACT) |
+| 0421 | ggml: MUL_MAT_ROWS takes an F16 store (CPU: F16 gather + the F16 x F32 mul_mat) (`0421-ggml-mul-mat-rows-f16-store.patch`, 5cf68fb96) | v72 (class EXACT) |
+| 0422 | vulkan: MUL_MAT_ROWS with an F16 store at mat-vec widths - mul_mat_vec_rows_f16_f32_f32, the row-id twin of the F16 x F32 mat-vec (`0422-vulkan-mul-mat-vec-rows-f16.patch`, 1136198ad) | v72 (class EXACT) |
+| 0423 | tests: MUL_MAT_ROWS_EXACT / MUL_MAT_ROWS with an F16 store at the mat-vec widths (N 1 / 4 / 8, two streams, deployed-depth pools) (`0423-tests-mul-mat-rows-exact-f16.patch`, 8cbd3b7f0) | v72 (class tests) |
+| 0424 | qwen4exp: LLAMA_QSA_IDX_F16_DECODE (default 0) - the mat-vec-width indexer score reads the f16 mirror (class B) (`0424-qwen4exp-qsa-idx-f16-decode-default-off.patch`, ab1afefe7) | v72 (class EXACT) |
+| 0425 | vulkan: default-path proof lines hc_tail_fuse / add_rms_rows (WARN, once per device) (`0425-vulkan-hc-tail-fuse-add-rms-rows-proof-lines.patch`, 4c0116cb1) | v72 (class EXACT) |
+| 0426 | server: CACHE_ENV_EXACT += GGML_VK_HC_TAIL_FUSE, GGML_VK_ADD_RMS_ROWS, LLAMA_QWEN4EXP_MERGE_PLAN (class A, not in the disk-cache key) (`0426-server-cache-env-exact-pkg12-knobs.patch`, 019f4de77) | v72 (class EXACT) |
+| 0427 | vulkan: hc_combine_rms matcher runs the generic overlap veto for its 9-op chain, so an overlap falls back to HC_COMBINE (`0427-vulkan-hc-combine-rms-overlap-fallback-hc-combine.patch`, 6bd863a2a) | v72 (class EXACT) |
+| 0428 | vulkan: prewarm_shapes hands the mul_mm selector the dispatch's B type (post-conversion f16 / bf16), not raw f32 (`0428-vulkan-prewarm-shapes-dispatch-b-type.patch`, a450e8c3d) | v72 (class EXACT) |
+| 0429 | vulkan: hc_tail_mix fuses only where the old path's stream sum is a MULTI_ADD (device->multi_add + the multi_add pattern veto) (`0429-vulkan-hc-tail-fuse-requires-multi-add.patch`, 1fad15986) | v72 (class EXACT) |
+| 0430 | qwen4exp: P3a merge-plan mode and the merge_exact proc pointer per device, not first-call function statics (`0430-qwen4exp-merge-plan-per-device.patch`, 0d3c6e70a) | v72 (class EXACT) |
+| 0431 | qwen4exp: P3a per-n decision line at WARN for the first 8 distinct decisions, INFO after (`0431-qwen4exp-merge-plan-per-n-warn-cap.patch`, 7355dfb41) | v72 (class EXACT) |
+| 0432 | server: LLAMA_SPEC_OVERLAP=2 - drop a cancelled slot's queued partials, reset spec_defer_send on unwind, send_us only for drafting slots (`0432-server-spec-overlap-2-cancel-unwind-send-us.patch`, aa25a9c4a) | v72 (class EXACT) |
+| 0433 | cmake: LLAMA_QSA_IDX_F16_NEGCTL option (tests only) defines the stale-mirror mutant in libllama (`0433-cmake-llama-qsa-idx-f16-negctl.patch`, cfce87037) | v72 (class tests) |
+| 0434 | vulkan: prewarm_shapes derives the MUL_MAT precision as the dispatch does (f32acc trunk) (`0434-vulkan-prewarm-shapes-f32acc-trunk-prec.patch`, c731bbd89) | v72 (class EXACT) |
+| 0435 | server: LLAMA_QWEN4EXP_MERGE_PLAN enters the disk-cache key when GGML_VK_MM_MERGE_FORCE is on (`0435-server-cache-key-merge-plan-semantic-under-mm-merge-force.patch`, b22d00ee5) | v72 (class EXACT) |
+| 0436 | qwen4exp: the LLAMA_QSA_IDX_F16_NEGCTL mutant skips the mirror write only with LLAMA_QSA_IDX_F16_DECODE on (`0436-qwen4exp-qsa-idx-f16-negctl-gated-on-knob.patch`, f068b9c2a) | v72 (class tests) |
+| 0437 | vulkan: the hc_tail_fuse proof line prints the effective gate (flag && multi_add && no multi_add pattern veto) (`0437-vulkan-hc-tail-fuse-proof-line-effective-gate.patch`, 38fccaa22) | v72 (class EXACT) |
+| 0438 | vulkan: hc_tail_mix also requires the old path's MULTI_ADD to cover the same num_adds ADDs (`0438-vulkan-hc-tail-fuse-requires-legacy-multi-add-match.patch`, 608af6ea8) | v72 (class EXACT) |
 
 **0227-0240 apply order** on v59 (`a1b6c324e`): 0227, 0228, 0229, 0230, 0231, 0232, **0234, 0233**, 0235, 0236, 0237, 0238,
 0239, 0240 (0233 sits on 0234). Applied with a strict `git am` in that order they reproduce the v60 tree (`845c6fbcd`,
