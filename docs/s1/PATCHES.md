@@ -12,8 +12,8 @@ Status column:
 - **v64**: in this tree since v64 (released 2026-10-21); "v64, on" = on by default.
 
 This tree is v71: fork revision `8bcde80da` (`prod-v11-stage9-pkg11`), image `vahpetr/llama-cpp-s1-fork:v71`. Every row
-below is still in it. The patches made after 0265 (the v65-v71 packages, up to 0407) have no rows here yet; their knobs are in
-docs/s1/KNOBS.md, section "Added after patch 0265", and their tags are in the code comments.
+below is still in it. The rows after 0265 (v65-v71, up to 0407) give the title, the patch file and the commit; the status column is the first
+image that carried it. Their knobs are in docs/s1/KNOBS.md, section "Added after patch 0265".
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
 - **in tree, off**: compiled in, off unless you set its knob (docs/s1/KNOBS.md).
@@ -258,6 +258,128 @@ records and upstream status live in my private repo; ask if you want one.
 | 0262 | vulkan: MUL_MAT_ID coopmat1 l tile (the 0232 BM 128 x BN 64 tile; q4_K / q5_0 / q8_0 / q6_K / iq3_s) runs 8 warps of WM 64 x WN 16 with LDS pad 2 (a 72-B stride, RADV only; `GGML_VK_MMID_TILE_G2A_PAD`) instead of 4 warps of 64 x 32 with pad 4; a generic 14-element warptile carrier (name suffix, pinned subgroup size, B-load clamp) with per-device tile-reach checks; the shader's per-tile row count clamped to BN; 90 new MUL_MAT_ID test cases (duplicate ids, hot routes) (G2a); 780M n 2048 q4_K / q5_0 / q8_0 -17 / -15 / -12 %, s1 MUL_MAT_ID node -4.1 % at 32k | v64, on (EXACT) |
 | 0263 | vulkan: coopmat1 flash-attention shared-memory layouts for dense prefill: the P.V staging aliased onto the softmax staging (`GGML_VK_FA_SFPV_ALIAS`) and the dead-column V staged per 16-row chunk (`GGML_VK_FA_V_CHUNK`); 31 -> 21 KiB of LDS at head size 256, 4 -> 6 workgroups per WGP; `tests/test-fa-prefill-exact` (FA1); 780M 8k / 32k / 64k -13 / -18 / -17 %, s1 FLASH_ATTN_EXT node -16.5 % at 32k | v64, on (EXACT) |
 | 0265 | vulkan: dense coopmat1 GEMM tile table for the prefill shapes (q4_K / q6_K m >= 2048 k >= 2560 -> BM 64 x BN 128, q5_0 m >= 2048 k <= 640 -> BM 128 x BN 64; 2 warps, LDS pad 4, subgroup 64 pinned; `GGML_VK_DENSE_TILE_G1` with a sweep mode; a WARN proof line); `tools/perf/g1-sweep.sh` and the byte classifier `tools/perf/test-vk-gemm-class.cpp` (G1); 780M large q4_K shapes -31 ... -38 %, s1 G1-eligible MUL_MAT node -4.1 % at 32k (mixed per shape) | v64, on (EXACT) |
+| 0266 | server: erase context checkpoints that cover tokens not shared with the new prompt (`0266-server-swa-checkpoint-invalidation.patch`, 71a3f520e) | v65 |
+| 0267 | vulkan: place tensors at 256 B boundaries (`0267-vulkan-buffer-align-256.patch`, 81e8649a6) | v65 |
+| 0268 | vulkan: synchronous `ggml_vk_buffer_read_2d` reads a host-visible UMA buffer directly only from a HOST_CACHED mapping or for <= 64 KiB (`0268-vulkan-uma-bulk-read-copy.patch`, dcd15c8b8) | v65 |
+| 0269 | vulkan: flat GET_ROWS for narrow rows, `GGML_VK_GET_ROWS_FLAT=N` (`0269-vulkan-get-rows-flat.patch`, c2900d7cf) | v65 |
+| 0270 | vulkan: single-pass QSA indexer top-k, `GGML_VK_QSA_TOPK_ONEPASS=1` (default off at this patch; 0275 turns it on for gfx1151) (`0270-vulkan-qsa-topk-onepass.patch`, 15d0b7c34) | not in an image |
+| 0271 | vulkan: QSA top-k onepass s1 retune (`0271-vulkan-qsa-topk-onepass-s1-retune.patch`, b3c5edf16) | v66 |
+| 0272 | vulkan: QSA top-k onepass backoff (`0272-vulkan-qsa-topk-onepass-backoff.patch`, f15b92249) | v66 |
+| 0273 | vulkan: QSA top-k onepass counters, astra pkg5 review (`0273-vulkan-qsa-topk-onepass-counters-review.patch`, 41ffefa51) | v66 |
+| 0274 | vulkan: the `uma_bulk_read` proof line names the async-readback overrides (`0274-vulkan-uma-bulk-read-proof-overrides.patch`, 0f296f7b4) | v66 |
+| 0275 | vulkan: `GGML_VK_QSA_TOPK_ONEPASS` defaults ON on gfx1151 (Strix Halo), OFF elsewhere (`0275-vulkan-qsa-topk-onepass-default-gfx1151.patch`, a71e913ef) | v66, on gfx1151 |
+| 0276 | vulkan: QSA top-k onepass filter skip is workgroup-uniform (`0276-vulkan-qsa-topk-onepass-uniform-skip.patch`, 8fe14cdf5) | v66 |
+| 0277 | vulkan: coopmat1 FA P-fragment load hoisted out of the hsv_tile loop (`0277-vulkan-fa-cm1-p-fragment-hoist.patch`, 39fe91d3a) | v67 |
+| 0278 | vulkan: coopmat1 FA Psh stored query-major (`0278-vulkan-fa-cm1-psh-query-major.patch`, a7bf93287) | v67 |
+| 0279 | vulkan: CONCAT+SSM_CONV direct conv, sliding-window kernel (`0279-vulkan-concat-ssm-conv-sliding-window.patch`, 6438e1057) | v67 |
+| 0285 | vulkan: QSA top-k nokeys only from `GGML_VK_QSA_TOPK_NOKEYS_MIN_ROWS` rows (default 9) (`0285-vulkan-qsa-topk-nokeys-min-rows.patch`, 7c5c4bbe7) | v67 |
+| 0286 | vulkan: QSA top-k onepass counters per context (`0286-vulkan-qsa-topk-onepass-counters-per-context.patch`, 416d4d52c) | v67 |
+| 0290 | qwen4exp: merge the projection pairs at load (`0290-qwen4exp-merge-projections-at-load.patch`, 2f138e460) | v67 |
+| 0291 | ggml-cpu: scale bias branch steps the strided source by nb01 (`0291-cpu-scale-bias-strided-src0.patch`, 6af219b6c) | v67 |
+| 0292 | vulkan: hc_combine matcher rejects misaligned bindings (`0292-vulkan-hc-combine-misaligned-fallback.patch`, 75debcccc) | v67 |
+| 0293 | qwen4exp: no load-time merged matmul while a LoRA adapter is attached (`0293-qwen4exp-merge-lora-fallback.patch`, 1a6f0385a) | v67 |
+| 0294 | qwen4exp: merged matmul only for a container in a Vulkan device buffer (`0294-qwen4exp-merge-vulkan-only.patch`, f63a66f5f) | v67 |
+| 0295 | llama-arch: record that `ssm_beta_alpha` is upstream's name and [beta \| alpha] row layout (`0295-qwen4exp-ssm-beta-alpha-layout-comment.patch`, e103215ae) | v67 |
+| 0296 | tests: test-qsa-topk-nokeys forces `GGML_VK_QSA_TOPK_NOKEYS_MIN_ROWS=1` in the on arm (`0296-tests-qsa-topk-nokeys-min-rows-on-arm.patch`, c0d719593) | v67 |
+| 0297 | vulkan: `GGML_VK_QSA_TOPK_NOKEYS_MIN_ROWS` default 1 (`0297-vulkan-qsa-topk-nokeys-min-rows-default-1.patch`, 8fe14cdf5) | v67 |
+| 0298 | vulkan: coopmat1 mul_mm manual-fragment build + gfx11 layout probe + coopMatLoad `_cml` twins, coopMatLoad default (`0298-vulkan-cm1-manual-frag-layout-probe-cml-twins.patch`, 87837cfe0) | v68 |
+| 0299 | vulkan: mul_mm register-prefetch K loop, 8-wide q6_K/q3_K/q8_0/q5_0 loaders, q4_K/q5_K f32 scale cache (`0299-vulkan-mul-mm-register-prefetch-8wide-loaders-scale-cache.patch`, bb9aa2fa1) | v68 |
+| 0300 | vulkan: MoE routing-weight epilogue on the MUL_MAT_ID GEMM path (`0300-vulkan-mmid-routing-scale-epilogue-gemm.patch`, 74afb11d2) | v68 |
+| 0304 | vulkan: rms_norm_ext shader variant (`0304-vulkan-rms-norm-ext-shader-variant.patch`, 091cf925c) | v68 |
+| 0305 | vulkan: fuse RMS_NORM+SCALE (GDN q/k l2 norm) and RMS_NORM+MUL+SIGMOID+MUL / RMS_NORM+MUL+MUL (GDN gated output norm) (`0305-vulkan-fuse-rms-norm-scale-and-gated-norm.patch`, 05b01c20e) | v68 |
+| 0306 | vulkan: `GGML_VK_GRAPH_ORDER_LOG=1` (`0306-vulkan-graph-order-log.patch`, 4cb07f4b0) | v68 |
+| 0307 | tests: test-backend-ops RMS_NORM_SCALE / RMS_NORM_MUL_SIGMOID_MUL / RMS_NORM_MUL_MUL (+ _EXACT) (`0307-tests-rms-norm-fuse-ext-exact.patch`, c3ce4c1a8) | v68 |
+| 0308 | spec: `LLAMA_SPEC_DRAFT_STOP_EOG=1` ends the draft-mtp chain at a drafted EOG (halogen H3, default off) + post-EOG draft counter (always on) (`0308-spec-draft-stop-eog.patch`, 568ed963c) | v68 |
+| 0309 | spec: `LLAMA_SPEC_DRAFT_P_CHAIN=x` gates the draft-mtp chain on the product of the head's top-1 probabilities (halogen H1, default off) (`0309-spec-draft-p-chain.patch`, 269a682dc) | v68 |
+| 0310 | server: `LLAMA_SPEC_DRAFT_DEPTH_AUTO=d0` per-slot draft depth from the acceptance history (halogen H2, default off) (`0310-server-spec-draft-depth-auto.patch`, 543162bf7) | v68 |
+| 0311 | spec/server: deeper U7 drafts with early stop (halogen H5a `N_MAX_GREEDY` / H5b `Q_STOP`, default off) (`0311-spec-draft-n-max-greedy-q-stop.patch`, 6088c2eae) | v68 |
+| 0312 | docs: speculative.md - the draft-mtp draft-chain knobs + `draft_n_post_eog` (`0312-docs-speculative-draft-knobs.patch`, 7f6fb79de) | v68 |
+| 0313 | qwen4exp: merged projection matmul only on devices with verified mat-vec M-invariance (`0313-qwen4exp-merge-radv-device-gate.patch`, 0d2407256) | v68 |
+| 0314 | vulkan: QSA top-k nokeys CHECK word per context (`0314-vulkan-qsa-topk-nokeys-check-per-context.patch`, 9e64e717d) | v68 |
+| 0315 | vulkan: cm1 mul_mm pipeline rename only when the name differs (`0315-vulkan-cm1-pipeline-rename-only-when-differs.patch`, 3b2de85a1) | v68 |
+| 0316 | vulkan: MUL_MAT_ID + MUL GEMM fusion falls back to the unfused GEMM + MUL instead of asserting (`0316-vulkan-mmid-scale-epi-fallback-unfused.patch`, 9d238a6fc) | v68 |
+| 0317 | vulkan: mul_mat_id aligned B loads skip the columns past the tile's rows (`0317-vulkan-mmid-aligned-b-loads-tile-rows.patch`, cf07de908) | v68 |
+| 0318 | vulkan: mul_mm mul_mat_id pipelines take their 6-buffer count at the call sites (`0318-vulkan-mmid-mm-param-count-call-sites.patch`, d3d9bffea) | v68 |
+| 0319 | vulkan: cm1_manual_frag verdict as one enum (`0319-vulkan-cm1-manual-frag-verdict-enum.patch`, 250ec3728) | v68 |
+| 0320 | spec: `LLAMA_SPEC_DRAFT_Q_STOP` (H5b) stop made draw-independent = distribution-exact (`0320-spec-draft-q-stop-draw-independent.patch`, 2217dddc3) | v68 |
+| 0321 | server: H2 auto depth judged against the effective n_max (after the H5a greedy cap) (`0321-server-depth-auto-effective-n-max.patch`, c72f3ba4e) | v68 |
+| 0322 | server: H2 auto depth floored at min(`--spec-draft-n-min`, n_cfg) (`0322-server-depth-auto-floor-n-min.patch`, b702dffea) | v68 |
+| 0323 | spec: `spec_env_prob` strict plain decimal DIGITS[.DIGITS], explicit 0 = off (`0323-spec-env-prob-strict-decimal.patch`, ca6c4b840) | not in an image |
+| 0324 | server: fresh-tail counts (n_committed_in / n_fresh_draft / n_matched / n_fresh_acc) computed once (`0324-server-fresh-tail-hoist.patch`, a6dd97178) | v68 |
+| 0325 | vulkan: `ggml_vk_can_fuse_rms_norm_mul2` evaluated once per RMS_NORM node (`0325-vulkan-rms-norm-mul2-once.patch`, dc70e392b) | v68 |
+| 0326 | labels: H5a = `LLAMA_SPEC_DRAFT_N_MAX_GREEDY`, H5b = `LLAMA_SPEC_DRAFT_Q_STOP` (`0326-spec-label-h5a-h5b.patch`, ef54c1437) | v68 |
+| 0327 | server: H5a `LLAMA_SPEC_DRAFT_N_MAX_GREEDY` clamped to [`--spec-draft-n-min`, `--spec-draft-n-max`] (`0327-server-spec-n-max-greedy-clamp-n-min.patch`, 6e717ac37) | v68 |
+| 0328 | server: always-on `draft_n_eog_rejected` (`0328-server-draft-n-eog-rejected.patch`, 1fdbc12ac) | v68 |
+| 0329 | server: `draft_n_eog_rejected` does not count a drafted EOG the target matched (`0329-server-draft-n-eog-rejected-matched-eog.patch`, f3cbd94cb) | v68 |
+| 0330 | server: asynchronous + range-relative delta disk-cache save, save / load timings in /metrics (SC2, 0264 commit 1 re-based onto v68) (`0330-server-async-delta-save-v69.patch`, 666415db1) | v69 |
+| 0331 | server: SC2 review r3-r14 + astra package fixes on v68 (`0331-server-async-delta-save-review-fixes-v69.patch`, c72e9622e) | v69 |
+| 0333 | vulkan: the coopmat1 mul_mm manual-fragment build, its layout probe and `GGML_VK_CM1_MANUAL_FRAG` removed (R152: manual-frag = default within noise) (`0333-vulkan-cm1-manual-frag-removed-r152.patch`, d2ca058f4) | v69 (class A) |
+| 0335 | T2 step 1 = host-phase diet of the speculative round, `LLAMA_SPEC_OVERLAP=1` (default 0 = v68) (`0335-t2-seq-rm-counted-host-split-v69.patch`, b7bbcecfd) | v69 |
+| 0336 | vulkan: `GGML_VK_F32ACC_SCOPE=all\|trunk` (`0336-vulkan-f32acc-scope-trunk.patch`, f4c73e98f) | v69 |
+| 0337 | speculative: H3 `LLAMA_SPEC_DRAFT_STOP_EOG=1` keeps an EOG-shortened sampled draft below `--spec-draft-n-min` with its full q (`0337-spec-h3-stop-eog-keeps-short-sampled-draft.patch`, e82176341) | v69 |
+| 0338 | server: always-on `draft_n_short_discarded` / `draft_n_short_eog_discarded` (`0338-server-draft-n-short-discarded.patch`, 34e4f8703) | v69 |
+| 0339 | tests: `test-spec-h3-exact` (`0339-tests-spec-h3-exact.patch`, 3ef1799ab) | v69 |
+| 0340 | vulkan: `GGML_VK_F32ACC=1` = f32 accumulator for every cm1 matmul (`0340-vulkan-f32acc-knob.patch`, d4a4cbfc7) | v69 |
+| 0341 | server: `LLAMA_SPEC_OVERLAP` in the disk-cache exact env list (`0341-server-cache-env-exact-spec-overlap.patch`, 70a7d1383) | v69 |
+| 0342 | server: `--cache-disk-async 0` keeps the v68 block cut (`0342-server-sync-save-v68-block-cut.patch`, ee606dc24) | v69 |
+| 0343 | speculative: the H3 EOG exemption from the n_min clear only while the effective cap >= n_min (`0343-spec-h3-eog-exempt-cap-ge-n-min.patch`, d5ca8ebe8) | v69 |
+| 0344 | server: a failed finalizer-task enqueue at the end of an async save's copy fails the job and ends it on the server thread (`0344-server-async-finalize-enqueue-failure.patch`, 77f6504a9) | v69 |
+| 0345 | vulkan: `GGML_VK_F32ACC` never active on a coopmat2 device (`0345-vulkan-f32acc-not-on-coopmat2.patch`, b69b69dcc) | v69 |
+| 0346 | server/llama: incremental asynchronous disk-cache save `--cache-disk-incr` (env `LLAMA_ARG_CACHE_DISK_INCR`, default off, needs `--cache-disk-async`, outside the cache key); per-cell modification clock, `since` writer (`0346-server-incremental-disk-save-v69.patch`, d7add6cd3) | v69 |
+| 0347 | vulkan: honest proof for `GGML_VK_F32ACC_SCOPE=trunk` (`0347-vulkan-f32acc-scope-trunk-exclusion-proof.patch`, ff67c7683) | v70 |
+| 0348 | ggml: `ggml_gated_delta_net_set_replay(gdn, stash, ctl)` (`0348-ggml-gdn-commit-by-replay-op.patch`, bbdce3373) | v70 |
+| 0349 | llama: qwen4exp GDN states committed by replay, `LLAMA_GDN_REPLAY=1` (default off) (`0349-llama-qwen4exp-gdn-replay-knob.patch`, 0ba03c05c) | v70 |
+| 0350 | tests: `test-gdn-replay perf` (`0350-tests-gdn-replay-perf.patch`, eb53471f7) | v70 |
+| 0351 | llama: GDN replay review fixes (`0351-llama-gdn-replay-review-fixes.patch`, b421dae25) | v70 |
+| 0352 | server: `LLAMA_GDN_REPLAY` exact-listed in `CACHE_ENV_EXACT` (`0352-server-gdn-replay-exact-env.patch`, 0bea02508) | v70 |
+| 0353 | llama: the ON_DEVICE state writer copies through the views of its own capture (`0353-llama-ondevice-writer-fresh-views.patch`, 9fde956fa) | not in an image |
+| 0354 | llama: gdn replay `seq_cp` materialises a pending R / P rollback of its source (`0354-llama-gdn-replay-seqcp-normalise-rp.patch`, f6476128f) | not in an image |
+| 0355 | llama: gdn replay snapshot admission (`0355-llama-gdn-replay-snapshot-admission.patch`, 7816ec820) | not in an image |
+| 0356 | llama: gdn replay refused under `llama_memory_hybrid_iswa` (`0356-llama-gdn-replay-iswa-refuse-ondevice-test.patch`, 93f631343) | not in an image |
+| 0357 | tests: test-gdn-replay (`0357-tests-gdn-replay-v70-1-fixes.patch`, cef01a839) | not in an image |
+| 0360 | vulkan: QSA top-k v3 = block-weighted onepass of the nokeys cell form, knob `GGML_VK_QSA_TOPK_V3` (default off) (`0360-vulkan-qsa-topk-v3-block-weighted.patch`, 98041274c) | v70 |
+| 0361 | vulkan: `GGML_VK_QSA_TOPK_V3` defaults ON on gfx1151, OFF elsewhere (`0361-vulkan-qsa-topk-v3-default-gfx1151.patch`, 3c6bc366f) | v70 |
+| 0362 | tests: test-qsa-topk-onepass NEGCTL verdict (`0362-tests-qsa-topk-v3-negctl-eval.patch`, d009b09ad) | v70 |
+| 0363 | vulkan: `GGML_VK_QSA_TOPK_V3_MIN_ROWS` (default 16) (`0363-vulkan-qsa-topk-v3-min-rows.patch`, 03599f20a) | v70 |
+| 0364 | tests: test-qsa-topk-onepass partly-visible-block witness only for selections of >= 6 rows (`0364-tests-qsa-topk-v3-mixed-witness-rows.patch`, 6c410db5a) | not in an image |
+| 0370 | server: SC3 test hooks + status (`0370-server-sc3fix-test-hooks-status-device-read.patch`, 5e9a083e5) | v70 |
+| 0371 | llama: the K-shift marks every K row of every stream modified (`0371-llama-sc3-kshift-marks-every-row.patch`, 5cbc654bd) | v70 |
+| 0372 | server: SC3 reuse claims after every allocation (`0372-server-sc3-reuse-claim-after-alloc.patch`, 39f569ad9) | v70 |
+| 0373 | server: SC3 record build failure at a commit drops the record, the commit finishes (`0373-server-sc3-record-failure-finishes-commit.patch`, c680c3f31) | v70 |
+| 0374 | server: a block dropped as damaged (`blob_drop_copy`) while a save in flight claims it fails that save at its commit (`0374-server-drop-of-claimed-block-fails-claimant.patch`, 6b27483ee) | v70 |
+| 0375 | tests: sc3fix tests 1 / 4 setup (long parts so the divergence saves; held job = 3) (`0375-tests-sc3fix-test-setup.patch`, f38b2c852) | v70 |
+| 0376 | tests: test 1 reads the slot context from /props (`0376-tests-sc3fix-test1-props-n-ctx.patch`, b5ef0bf03) | v70 |
+| 0377 | tests: test 1 sends a token prompt cut to n_ctx − 200 (`0377-tests-sc3fix-test1-token-prompt.patch`, 47d474b98) | v70 |
+| 0378 | tests: test 4 first gives slot 1 a token prefix of A + B1 sized from /tokenize, so its lookup does not wait for job 3 (`0378-tests-sc3fix-test4-slot1-prefix-no-wait.patch`, 09d3375f7) | v70 |
+| 0379 | tests: test 4 holds job 4's first block write (`0379-tests-sc3fix-test4-hold-job4-write.patch`, 94c175d52) | v70 |
+| 0380 | tests: sc3fix test 4 runs one save worker (threads=1); still failed, item 4 fix unproven by this test, SC3 stays default off (`0380-tests-sc3fix-test4-one-worker.patch`, 8fa366876) | v70 |
+| 0381 | tests: sc3fix test 4 reaches the claim path (E1 saved first, slot 1 prefix loads once job 3 is in flight) + probe arm; after5 2 passed, negative control failed as required, item 4 proven (`0381-tests-sc3fix-test4-claim-path.patch`, e0c36d85d) | v70 |
+| 0382 | qwen4exp: `build_qsa_chunked` writes each chunk into one [hd, n_tps, n_stream] output by SET_ROWS (`0382-qwen4exp-qsa-chunked-set-rows.patch`, 807e3b324) | v71 (class EXACT) |
+| 0383 | qwen4exp: `build_qsa_pool` sums strided member views (`0383-qwen4exp-qsa-pool-strided-views.patch`, 20c9b7682) | v71 (class EXACT) |
+| 0384 | qwen4exp: indexer q reshaped without ggml_cont (`0384-qwen4exp-indexer-q-no-cont.patch`, 794afea0c) | v71 (class EXACT) |
+| 0385 | vulkan: `GGML_VK_QSA_BIAS_FOLD` (default on) (`0385-vulkan-qsa-bias-fold.patch`, 9d52b3427) | v71 (class EXACT) |
+| 0386 | vulkan: `GGML_VULKAN_QSA_BIAS_FOLD_NEGCTL` build option (tests only) (`0386-vulkan-qsa-bias-fold-negctl.patch`, 49bc01e22) | v71 (class EXACT) |
+| 0387 | qwen4exp: `build_qsa_select` keeps a folded QSA_BIAS node's tables alive (`0387-qwen4exp-qsa-select-bias-fold-keep-alive.patch`, 842c81333) | v71 (class EXACT) |
+| 0388 | tests: QSA_SCORE_EXACT bias modes 3..5 (shared node, poisoned stale plane, identity rows) + `GGML_TEST_QSA_SCORE_HASH` (`0388-tests-qsa-score-exact-bias-modes.patch`, 70c26029c) | v71 (class tests) |
+| 0389 | qsa: graph-side bias fold (`0389-qsa-graph-side-bias-fold.patch`, a42b5e4b4) | v71 (class EXACT) |
+| 0390 | qwen4exp: build_qsa_chunked first chunk destination = ggml_pad node (A71 review Major); reverted by 0392 (+52..+80 MiB compute buffer) (`0390-qwen4exp-qsa-chunked-first-chunk-pad.patch`, b18dc4603) | v71 (class EXACT) |
+| 0391 | pkg11 review fixes (`0391-pkg11-review-fixes.patch`, b71a47ee3) | v71 (class EXACT) |
+| 0392 | Revert of 0390 (A71 compute-buffer table: the pad node costs more peak than the leaf) (`0392-revert-qwen4exp-qsa-chunked-first-chunk-pad.patch`, be1846fd5) | v71 (class EXACT) |
+| 0393 | tests: test-qsa-topk-onepass partly-visible-block witness only for selections of >= 6 rows (`0393-tests-qsa-topk-v3-mixed-witness-rows-v71.patch`, afb498a20) | v71 (class tests) |
+| 0394 | vulkan: QSA top-k v3 stage 2 step 1 (`0394-vulkan-qsa-topk-v3-summary-once.patch`, e5c847bf5) | v71 (class EXACT) |
+| 0395 | vulkan: QSA top-k v3 stage 2 step 2 (`0395-vulkan-qsa-topk-v3-select-sort.patch`, f27c29546) | v71 (class EXACT) |
+| 0396 | vulkan: `GGML_VK_QSA_TOPK_V3_MIN_ROWS` default 16 → 2 (`0396-vulkan-qsa-topk-v3-min-rows-2.patch`, 3a48e743f) | v71 (class EXACT) |
+| 0397 | llama: the ON_DEVICE state writer copies through the views of its own capture (gdn replay snapshot use-after-free) (`0397-llama-ondevice-writer-fresh-views-v71.patch`, ae99b7f77) | v71 (class EXACT) |
+| 0398 | llama: gdn replay `seq_cp` materialises a pending R / P rollback of its source before sharing the cell (`0398-llama-gdn-replay-seqcp-normalise-rp-v71.patch`, 9534ff294) | v71 (class EXACT) |
+| 0399 | llama: gdn replay snapshot admission (`0399-llama-gdn-replay-snapshot-admission-v71.patch`, 75c90ed2f) | v71 (class EXACT) |
+| 0400 | llama/tests: gdn replay refused under the hybrid iswa memory; repeated ON_DEVICE checkpoint test with allocator churn (`0400-llama-gdn-replay-iswa-refuse-ondevice-test-v71.patch`, e527f1591) | v71 (class EXACT) |
+| 0401 | tests: test-gdn-replay - positions after the round trip, rollback → seq_cp oracle ignores sequence-id bytes, progress lines (`0401-tests-gdn-replay-v70-1-fixes-v71.patch`, d0b3d0375) | v71 (class tests) |
+| 0402 | llama: `LLAMA_GDN_REPLAY` default ON on gfx1151 (`0402-llama-gdn-replay-default-gfx1151.patch`, 0a40e8a43) | v71, on gfx1151 (class EXACT) |
+| 0403 | server: `GGML_VK_QSA_BIAS_FOLD(_MUTANT)` and `GGML_VK_QSA_TOPK_V3_MIN_ROWS` exact-listed in `CACHE_ENV_EXACT` (`0403-server-qsa-bias-fold-min-rows-exact-env.patch`, e3cad2ed3) | v71 (class EXACT) |
+| 0404 | vulkan: only the table form of QSA_SCORE folds the bias (`0404-vulkan-qsa-bias-fold-table-form-only.patch`, dfc811f02) | v71 (class EXACT) |
+| 0405 | ggml-cpu: out-of-range QSA query rows give -inf (`0405-ggml-cpu-qsa-out-of-range-rows-neginf.patch`, f5a878231) | v71 (class EXACT) |
+| 0406 | tests/vulkan: QSA top-k v3 summary growth (`0406-tests-vulkan-qsa-topk-v3-summary-growth.patch`, 0fbc0d744) | v71 (class EXACT) |
+| 0407 | llama/vulkan: gdn replay snapshot admission - per-heap free clamped at 0 (`0407-llama-vulkan-gdn-snapshot-admission-heap-clamp.patch`, 8bcde80da) | v71 (class EXACT) |
 
 **0227-0240 apply order** on v59 (`a1b6c324e`): 0227, 0228, 0229, 0230, 0231, 0232, **0234, 0233**, 0235, 0236, 0237, 0238,
 0239, 0240 (0233 sits on 0234). Applied with a strict `git am` in that order they reproduce the v60 tree (`845c6fbcd`,
