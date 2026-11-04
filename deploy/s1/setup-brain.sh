@@ -23,14 +23,14 @@ parse_args "$@"
 BRAIN_CTX="${BRAIN_CTX:-1m}"
 case "$BRAIN_CTX" in
     1m)   COMPOSE="$HERE/docker-compose.brain-1m.yml";   CONTAINER=llama-s1-brain-1m;   NEED_GTT_MIB=110592
-          EXPECT="GTT 104 580 MiB after load on v71, peak 105 407 MiB over a full 1M fill; cold fill 0 -> 1M 27.76 min on v71; prefill 623.5 t/s on a cold 32k prompt" ;;
+          EXPECT="GTT 104 538 MiB after load on v72, peak 105 364 MiB over a full 1M fill; cold fill 0 -> 1M 26.85 min on v72; prefill 641.0 t/s on a cold 32k prompt" ;;
     524k) COMPOSE="$HERE/docker-compose.brain-524k.yml"; CONTAINER=llama-s1-brain-524k; NEED_GTT_MIB=98000
-          EXPECT="the 524k profile has no v71 measurements" ;;
+          EXPECT="the 524k profile has no v72 measurements" ;;
     *) die "BRAIN_CTX must be 1m or 524k" ;;
 esac
 export MODELS_DIR="${MODELS_DIR:-$HERE/models}"
 export SLOTS_DIR="${SLOTS_DIR:-$HERE/slots}"
-export LLAMA_S1_IMAGE="${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v71}"
+export LLAMA_S1_IMAGE="${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v72}"
 PORT=8000
 
 # ---- weights, sha256 as published on Hugging Face (LFS oid) and checked against my local files, as of 2026-10-10 ----------
