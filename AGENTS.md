@@ -5,8 +5,8 @@ contributor rules for llama.cpp itself are in
 [upstream AGENTS.md](https://github.com/ggml-org/llama.cpp/blob/master/AGENTS.md); they apply to anything sent upstream from here.
 Read README.md first, then docs/s1/KNOBS.md (every flag and env knob) and docs/s1/PATCHES.md (every change, numbered).
 
-This tree is **v72**: fork revision `608af6ea8` (`prod-v11-stage9-pkg12`) plus the docs and deploy files of this `s1-public`
-branch. Images `vahpetr/llama-cpp-s1-fork:v72` (brain) and `:v72k` (hands), one image; rollback `:v71` / `:v71k`. Deploy steps in docs/s1/DEPLOY.md, what the release contains in
+This tree is **v73**: fork revision `7597206a9` (`prod-v11-stage9-pkg13`) plus the docs and deploy files of this `s1-public`
+branch. Images `vahpetr/llama-cpp-s1-fork:v73` (brain) and `:v73k` (hands), one image; rollback `:v72` / `:v72k`. Deploy steps in docs/s1/DEPLOY.md, what the release contains in
 docs/s1/RELEASE-NOTES.md.
 
 ## Where the fork's code lives
@@ -42,8 +42,8 @@ Fork code and commits carry `[TAG_<NAME>]` markers. `git grep -n TAG_GRAPH_CACHE
 `TAG_KQ_VIS_MIRROR` (0237), `TAG_SPEC_TRACE_IDS` (0238), `TAG_CELL_EXT_RESTORE` / `TAG_CELL_EXT_PROVENANCE` (0239),
 `TAG_QSA_POOLED_F16_MIRROR` (0240), `TAG_QSA_SCORE_KREUSE` (0241) and `TAG_QSA_TOPK_NOKEYS` (0243). Tags added after
 0265 include `TAG_QSA_TOPK_ONEPASS`, `TAG_QSA_TOPK_V3`, `TAG_QSA_BIAS_FOLD`, `TAG_GDN_REPLAY`, `TAG_T2_HOST_SPLIT` /
-`TAG_T2_SEQ_RM_COUNTED` (`LLAMA_SPEC_OVERLAP`), `TAG_DISK_ASYNC_SAVE`, and in v72 `TAG_HC_TAIL_FUSE`, `TAG_ADD_RMS_ROWS`,
-`TAG_MM_PLAN`, `TAG_VK_PREWARM_SHAPES` and `TAG_QSA_IDX_F16_DECODE` (docs/s1/KNOBS.md). New work gets a new tag in both
+`TAG_T2_SEQ_RM_COUNTED` (`LLAMA_SPEC_OVERLAP`), `TAG_DISK_ASYNC_SAVE`, `TAG_HC_TAIL_FUSE`, `TAG_ADD_RMS_ROWS`,
+`TAG_MM_PLAN`, `TAG_VK_PREWARM_SHAPES`, `TAG_QSA_IDX_F16_DECODE` and, new in v73, `TAG_DECODE_FUSE` (docs/s1/KNOBS.md). New work gets a new tag in both
 the code comment and the commit subject.
 
 ## Build and test contract
@@ -75,7 +75,7 @@ the code comment and the commit subject.
   (private): a probe program drives the production configuration through fixed prompts and compares the new build with the
   previous one bit for bit - logits at captured positions, the saved states, the QSA ids per chunk (`[qsa-ids]` sha256
   records, patch 0229) - across verify widths, depths up to 1M and restore / replay histories, on gfx1151, the package as a
-  whole. v72 passed it against v71 (docs/s1/RELEASE-NOTES.md).
+  whole. v73 passed it against v72 (docs/s1/RELEASE-NOTES.md).
 - **COMPOSITION**: same per-op math, different batching / routing / selection order, so near-ties can flip a token. Proof =
   teacher-forced replay after the first divergence: every divergence must be a near-tie or a selection flip that the reference
   also accepts (my "R81" classifier), plus needles and speed. A change that cannot be classified this way is treated as LOSSY.
