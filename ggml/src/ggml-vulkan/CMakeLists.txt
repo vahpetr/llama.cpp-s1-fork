@@ -186,8 +186,14 @@ if (Vulkan_FOUND)
     # reassociated; 0 = none): test-backend-ops DECODE_FUSE_EXACT must FAIL the mutated fusion
     if (GGML_VULKAN_DECODE_FUSE_MUTANT)
         add_compile_definitions(GGML_VULKAN_DECODE_FUSE_MUTANT=${GGML_VULKAN_DECODE_FUSE_MUTANT})
-        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_DECODE_FUSE_MUTANT=${GGML_VULKAN_DECODE_FUSE_MUTANT})
     endif()
+    # forwarded unconditionally, 0 included: the shader generator is an ExternalProject with its own CMakeCache, so an
+    # omitted -D would leave a reused build dir's generator at the previous mutant (31 -> 0 kept 31). The value also goes
+    # into a stamp the three D3 shaders depend on (file(CONFIGURE) rewrites it only when it changes): the shader custom
+    # commands do not depend on the generator binary, so without it a reused dir regenerates no D3 shader on 0 <-> 31.
+    list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_DECODE_FUSE_MUTANT=${GGML_VULKAN_DECODE_FUSE_MUTANT})
+    set(_ggml_vk_decode_fuse_stamp "${CMAKE_CURRENT_BINARY_DIR}/decode-fuse-mutant.stamp")
+    file(CONFIGURE OUTPUT ${_ggml_vk_decode_fuse_stamp} CONTENT "GGML_VULKAN_DECODE_FUSE_MUTANT=${GGML_VULKAN_DECODE_FUSE_MUTANT}\n")
 
     if (GGML_VULKAN_VALIDATE)
         add_compile_definitions(GGML_VULKAN_VALIDATE)
@@ -279,6 +285,11 @@ if (Vulkan_FOUND)
     foreach (file_full ${_ggml_vk_shader_files})
         get_filename_component(file ${file_full} NAME)
         set (_ggml_vk_target_cpp "${CMAKE_CURRENT_BINARY_DIR}/${file}.cpp")
+        # [TAG_DECODE_FUSE] the D3 shaders follow GGML_VULKAN_DECODE_FUSE_MUTANT (see the stamp above)
+        set (_ggml_vk_extra_deps "")
+        if (file MATCHES "^(shexp_tail|shexp_glu_sig|gdn_qk_gate)\\.comp$")
+            set (_ggml_vk_extra_deps ${_ggml_vk_decode_fuse_stamp})
+        endif()
 
         add_custom_command(
             OUTPUT  ${_ggml_vk_target_cpp}
@@ -291,6 +302,7 @@ if (Vulkan_FOUND)
                 --target-cpp ${_ggml_vk_target_cpp}
             DEPENDS ${file_full}
                     ${_ggml_vk_shaders_gen_sources}
+                    ${_ggml_vk_extra_deps}
                     vulkan-shaders-gen
             COMMENT "Generate vulkan shaders for ${file}"
         )
