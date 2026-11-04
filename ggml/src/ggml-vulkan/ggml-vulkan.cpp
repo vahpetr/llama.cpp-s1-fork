@@ -9774,6 +9774,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
                               ggml_vk_decode_fuse_enabled() ? "; GGML_VK_DISABLE_FUSION" : "");
             }
         }
+#if defined(GGML_VULKAN_DECODE_FUSE_MUTANT) && GGML_VULKAN_DECODE_FUSE_MUTANT > 0
+        // [TAG_DECODE_FUSE] the proof line of a mutant build (a shipped build has neither the line nor the string)
+        GGML_LOG_WARN("ggml_vulkan: decode_fuse: MUTANT BUILD %d (11 = shexp_tail fma, 21 = shexp_glu_sig swiglu reorder, "
+                      "31 = gdn_qk_gate tree reorder, 32 = gdn_qk_gate post-scale reassoc): the D3 shaders are NOT exact\n",
+                      GGML_VULKAN_DECODE_FUSE_MUTANT);
+#endif
         // [TAG_CONV_INPUT_SPLIT] the GDN conv input: ssm_conv reads concat(state, x^T) from its two sources
         device->fuse_concat_ssm_conv = fuse_enabled("GGML_VK_FUSE_CONCAT_SSM_CONV");
         // [TAG_VK_DISPATCH_LOG] read once here; off = one bool test per matmul dispatch, nothing else

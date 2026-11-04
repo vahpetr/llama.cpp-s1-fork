@@ -235,6 +235,7 @@ option(GGML_VULKAN_VALIDATE                 "ggml: enable Vulkan validation"    
 option(GGML_VULKAN_RUN_TESTS                "ggml: run Vulkan tests"                          OFF)
 option(GGML_VULKAN_HC_TAIL_NEGCTL          "ggml: Vulkan hc tail fusion mutant shaders (tests only)" OFF)
 set(GGML_VULKAN_ADD_RMS_ROWS_MUTANT "0" CACHE STRING "ggml: Vulkan hc_combine+rms_norm fusion mutant build 1|2|3 (tests only)")
+set(GGML_VULKAN_DECODE_FUSE_MUTANT "0" CACHE STRING "ggml: Vulkan D3 decode fusion mutant build 11|21|31|32 (tests only)")
 option(GGML_WEBGPU                          "ggml: use WebGPU"                                OFF)
 option(GGML_WEBGPU_DEBUG                    "ggml: enable WebGPU debug output"                OFF)
 option(GGML_WEBGPU_CPU_PROFILE              "ggml: enable WebGPU profiling (CPU)"             OFF)

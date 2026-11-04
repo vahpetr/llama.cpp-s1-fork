@@ -4983,6 +4983,221 @@ struct test_add_softplus_mul_fuse : public test_case {
     }
 };
 
+// [TAG_DECODE_FUSE] DECODE_FUSE_EXACT: the three D3 decode fusions against the dispatches GGML_VK_DECODE_FUSE=0 runs,
+// built twice from the same inputs ON THE SAME BACKEND (test-backend-ops keeps the graph order as built: no
+// ggml_vk_graph_optimize):
+//   kind 0 shexp_tail     MUL(shexp, gate) -> ADD(moe_out, .)                 (build_layer_ffn ffn_shexp_gated, ffn_out)
+//     arm B: the MUL flagged as an output (the fusion elides it) = today's MUL + ADD
+//   kind 1 shexp_glu_sig  GLU(SWIGLU split) then the independent SIGMOID of a [1, T] gate (ffn_swiglu, the
+//                         shared_expert_gate_sigmoid)
+//     arm B: the SIGMOID built before the GLU (not consecutive) = today's GLU + UNARY
+//   kind 2 gdn_qk_gate    RMS_NORM -> SCALE (q), RMS_NORM -> SCALE (k), ADD -> SOFTPLUS -> MUL (the decay pre-chain)
+//     arm B: the gate chain built before the norms = today's rms_norm_scale x 2 + add_softplus_mul
+// rows = decode / MTP-verify / multi-slot widths (the fusions take <= 32 rows; 33 is the refused boundary). strided:
+// kind 0 reads shexp and moe_out as row views of wider tensors; kind 2 reads q / k as views of the conv output (the
+// production layout) and alpha as the row view of the merged beta | alpha output; kind 1 takes contiguous tensors only.
+// The graph returns concat(A - B, B - A) per output: +0 everywhere iff both arms wrote the same floats; compared BITWISE
+// against the CPU's +0 (err = differing bit patterns, max 0). A mutant build (cmake -DGGML_VULKAN_DECODE_FUSE_MUTANT=11 |
+// 21 | 31 | 32) must FAIL its kind. GGML_VK_FUSION_COUNT=1 shows whether arm A fused (shexp_tail / shexp_glu_sig /
+// gdn_qk_gate > 0); with GGML_VK_DECODE_FUSE=0 both arms are the same dispatches.
+struct test_decode_fuse_exact : public test_case {
+    const int     kind;
+    const int64_t rows;     // tokens (kind 2: tokens per sequence)
+    const int64_t n_seqs;   // kind 2 only
+    const bool    strided;
+    const bool    gate_row; // kind 0: the gate is [ne0, T] instead of [1, T]
+
+    // the qwen4exp (Flash-Next) geometry
+    static constexpr int64_t n_embd     = 2560;
+    static constexpr int64_t n_ff_shexp = 512;
+    static constexpr int64_t head_k_dim = 128;
+    static constexpr int64_t n_k_heads  = 16;
+    static constexpr int64_t n_v_heads  = 48;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DECODE_FUSE_EXACT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        static const char * names[] = { "shexp_tail", "shexp_glu_sig", "gdn_qk_gate" };
+        const std::string fusion = names[kind];
+        return VARS_TO_STR5(fusion, rows, n_seqs, strided, gate_row);
+    }
+
+    double max_nmse_err() override { return 0.0; }
+    double max_err() override { return 0.0; }
+    double max_err(ggml_backend_t backend) override { GGML_UNUSED(backend); return 0.0; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        size_t bad = 0;
+        for (size_t i = 0; i < n; i++) {
+            bad += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        }
+        return (double) bad;
+    }
+
+    test_decode_fuse_exact(int kind = 0, int64_t rows = 1, int64_t n_seqs = 1, bool strided = false, bool gate_row = false)
+        : kind(kind), rows(rows), n_seqs(n_seqs), strided(strided), gate_row(gate_row) {}
+
+    void expand(ggml_tensor * t) {
+        if (gf && mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, t);
+        }
+    }
+
+    static ggml_tensor * flat_diff(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
+        ggml_tensor * d0 = ggml_sub(ctx, a, b);
+        ggml_tensor * d1 = ggml_sub(ctx, b, a);
+        return ggml_concat(ctx, ggml_reshape_1d(ctx, d0, ggml_nelements(d0)),
+                                ggml_reshape_1d(ctx, d1, ggml_nelements(d1)), 0);
+    }
+
+    // a [ne0, T] f32 operand: its own tensor, or (strided) a row view of a wider one at a 256-byte offset
+    ggml_tensor * operand_2d(ggml_context * ctx, const char * name, int64_t ne0, int64_t T, bool view) {
+        if (!view) {
+            ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, T);
+            ggml_set_name(t, name);
+            return t;
+        }
+        ggml_tensor * big = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0 + 192, T);
+        ggml_set_name(big, name);
+        ggml_tensor * v = ggml_view_2d(ctx, big, ne0, T, big->nb[1], 64 * sizeof(float));
+        expand(v);
+        return v;
+    }
+
+    ggml_tensor * build_shexp_tail(ggml_context * ctx) {
+        ggml_tensor * shexp = operand_2d(ctx, "shexp", n_embd, rows, strided);
+        ggml_tensor * moe   = operand_2d(ctx, "moe_out", n_embd, rows, strided);
+        ggml_tensor * gate  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, gate_row ? n_embd : 1, rows);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * out[2];
+        for (int arm = 0; arm < 2; ++arm) {
+            ggml_tensor * gated = ggml_mul(ctx, shexp, gate);
+            if (arm == 1) {
+                ggml_set_output(gated);
+            }
+            out[arm] = ggml_add(ctx, moe, gated);
+            expand(out[arm]);
+        }
+        return flat_diff(ctx, out[0], out[1]);
+    }
+
+    ggml_tensor * build_shexp_glu_sig(ggml_context * ctx) {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff_shexp, rows);
+        ggml_set_name(a, "glu_gate");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff_shexp, rows);
+        ggml_set_name(b, "glu_up");
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, rows);
+        ggml_set_name(s, "sig_src");
+        ggml_tensor * glu[2], * sig[2];
+        glu[0] = ggml_swiglu_split(ctx, a, b);
+        expand(glu[0]);
+        sig[0] = ggml_sigmoid(ctx, s);
+        expand(sig[0]);
+        sig[1] = ggml_sigmoid(ctx, s);
+        expand(sig[1]);
+        glu[1] = ggml_swiglu_split(ctx, a, b);
+        expand(glu[1]);
+        return ggml_concat(ctx, flat_diff(ctx, glu[0], glu[1]), flat_diff(ctx, sig[0], sig[1]), 0);
+    }
+
+    ggml_tensor * build_gdn_qk_gate(ggml_context * ctx) {
+        const int64_t conv_ch = head_k_dim * n_k_heads * 2 + head_k_dim * n_v_heads;
+        ggml_tensor * q, * k;
+        if (strided) {
+            ggml_tensor * conv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, conv_ch, rows, n_seqs);
+            ggml_set_name(conv, "conv_out");
+            const size_t nb1 = ggml_row_size(conv->type, conv_ch);
+            q = ggml_view_4d(ctx, conv, head_k_dim, n_k_heads, rows, n_seqs, ggml_row_size(conv->type, head_k_dim),
+                             nb1, nb1 * rows, 0);
+            k = ggml_view_4d(ctx, conv, head_k_dim, n_k_heads, rows, n_seqs, ggml_row_size(conv->type, head_k_dim),
+                             nb1, nb1 * rows, head_k_dim * n_k_heads * ggml_element_size(conv));
+        } else {
+            ggml_tensor * qs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_k_dim * n_k_heads, rows * n_seqs);
+            ggml_set_name(qs, "q");
+            ggml_tensor * ks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_k_dim * n_k_heads, rows * n_seqs);
+            ggml_set_name(ks, "k");
+            q = ggml_reshape_4d(ctx, qs, head_k_dim, n_k_heads, rows, n_seqs);
+            k = ggml_reshape_4d(ctx, ks, head_k_dim, n_k_heads, rows, n_seqs);
+        }
+        ggml_tensor * alpha;
+        if (strided) {
+            ggml_tensor * ba = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * n_v_heads + 16, rows, n_seqs);
+            ggml_set_name(ba, "alpha");
+            alpha = ggml_view_3d(ctx, ba, n_v_heads, rows, n_seqs, ba->nb[1], ba->nb[1] * rows,
+                                 ggml_row_size(ba->type, n_v_heads + 16));
+        } else {
+            ggml_tensor * al = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_v_heads, rows * n_seqs);
+            ggml_set_name(al, "alpha");
+            alpha = ggml_reshape_3d(ctx, al, n_v_heads, rows, n_seqs);
+        }
+        ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_v_heads);
+        ggml_set_name(dt, "ssm_dt");
+        ggml_tensor * sa = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_v_heads);
+        ggml_set_name(sa, "ssm_a");
+        // the view / reshape nodes first (the matcher's first RMS_NORM needs a node in front that it does not read)
+        expand(q);
+        expand(k);
+        expand(alpha);
+        const float n = (float) head_k_dim;
+        ggml_tensor * oq[2], * ok[2], * og[2];
+        auto const & norms = [&](int arm) {
+            oq[arm] = ggml_scale(ctx, ggml_rms_norm(ctx, q, 1e-6f / n), 1.0f / sqrtf(n));
+            expand(oq[arm]);
+            ok[arm] = ggml_scale(ctx, ggml_rms_norm(ctx, k, 1e-6f / n), 1.0f / sqrtf(n));
+            expand(ok[arm]);
+        };
+        auto const & gate = [&](int arm) {
+            og[arm] = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), sa);
+            expand(og[arm]);
+        };
+        norms(0);
+        gate(0);
+        gate(1);
+        norms(1);
+        return ggml_concat(ctx, ggml_concat(ctx, flat_diff(ctx, oq[0], oq[1]), flat_diff(ctx, ok[0], ok[1]), 0),
+                           flat_diff(ctx, og[0], og[1]), 0);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = kind == 0 ? build_shexp_tail(ctx) : kind == 1 ? build_shexp_glu_sig(ctx) : build_gdn_qk_gate(ctx);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0x9e3779b9u ^ (uint32_t) (kind*7 + rows*31 + n_seqs*131 + strided*17 + gate_row*5));
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        std::uniform_int_distribution<int> ex(-12, 12);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->type != GGML_TYPE_F32) {
+                continue;
+            }
+            const std::string name = ggml_get_name(t);
+            std::vector<float> v(ggml_nelements(t));
+            for (auto & e : v) {
+                if (name == "glu_gate" || name == "sig_src" || name == "gate") {
+                    e = 12.0f * u(rng);            // both tails of exp(-x)
+                } else if (name == "alpha") {
+                    e = 30.0f * u(rng);            // alpha + dt crosses softplus's x > 20 branch both ways
+                } else if (name == "ssm_dt" || name == "ssm_a") {
+                    e = 2.0f * u(rng);
+                } else {
+                    e = ldexpf(u(rng), ex(rng));   // wide exponents: every f32 rounding of an intermediate shows
+                }
+                if (name != "ssm_dt" && name != "ssm_a" && (rng() & 31) == 0) {
+                    e = (rng() & 1) ? -0.0f : 0.0f;
+                }
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
+        }
+    }
+};
+
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -11911,6 +12126,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_add_softplus_mul_fuse(31, 17, 1));        // non-power-of-two row
     test_cases.emplace_back(new test_add_softplus_mul_fuse(257, 7, 3));        // all primes
     test_cases.emplace_back(new test_add_softplus_mul_fuse(48, 5, 1, true));   // extra consumer: no fusion
+
+    // [TAG_DECODE_FUSE] DECODE_FUSE_EXACT: shexp_tail / shexp_glu_sig / gdn_qk_gate against today's dispatches, bit for
+    // bit, at the decode widths (1, MTP verify 2 / 3 / 6, multi-slot 9 / 16), the 32-row cap and the refused 33
+    for (int64_t nt : { 1, 2, 3, 6, 9, 16, 32, 33 }) {
+        for (bool strided : { false, true }) {
+            test_cases.emplace_back(new test_decode_fuse_exact(0, nt, 1, strided, false));
+            test_cases.emplace_back(new test_decode_fuse_exact(2, nt, 1, strided));
+        }
+        test_cases.emplace_back(new test_decode_fuse_exact(0, nt, 1, false, true));   // [ne0, T] gate
+        test_cases.emplace_back(new test_decode_fuse_exact(1, nt));
+    }
+    test_cases.emplace_back(new test_decode_fuse_exact(2, 3, 2, true));    // two sequences
+    test_cases.emplace_back(new test_decode_fuse_exact(2, 16, 2, false));  // 32 rows over two sequences
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));

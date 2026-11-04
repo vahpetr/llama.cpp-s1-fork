@@ -181,6 +181,13 @@ if (Vulkan_FOUND)
         add_compile_definitions(GGML_VULKAN_ADD_RMS_ROWS_MUTANT=${GGML_VULKAN_ADD_RMS_ROWS_MUTANT})
         list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_ADD_RMS_ROWS_MUTANT=${GGML_VULKAN_ADD_RMS_ROWS_MUTANT})
     endif()
+    # [TAG_DECODE_FUSE] mutant builds of the D3 decode fusion shaders, tests only (11 = shexp_tail fma-contracted,
+    # 21 = shexp_glu_sig swiglu reassociated, 31 = gdn_qk_gate reduction tree reordered, 32 = gdn_qk_gate post-scale
+    # reassociated; 0 = none): test-backend-ops DECODE_FUSE_EXACT must FAIL the mutated fusion
+    if (GGML_VULKAN_DECODE_FUSE_MUTANT)
+        add_compile_definitions(GGML_VULKAN_DECODE_FUSE_MUTANT=${GGML_VULKAN_DECODE_FUSE_MUTANT})
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_DECODE_FUSE_MUTANT=${GGML_VULKAN_DECODE_FUSE_MUTANT})
+    endif()
 
     if (GGML_VULKAN_VALIDATE)
         add_compile_definitions(GGML_VULKAN_VALIDATE)
