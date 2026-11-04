@@ -2531,8 +2531,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_tensor * st16 = nullptr;
 #ifdef LLAMA_QSA_IDX_F16_NEGCTL
             // [TAG_QSA_IDX_F16_DECODE] negctl mutant (tests only): a decode-width graph does not write the mirror and hands
-            // the score the cache tensor itself - the rows this graph pools are stale there
-            if (store->f16_mirror && n_tokens <= 2) {
+            // the score the cache tensor itself - the rows this graph pools are stale there. Only with the knob on: the OFF
+            // arm of a negctl build keeps the mirror write, node for node as v71
+            if (store->f16_mirror && n_tokens <= 2 && qwen4exp_qsa_idx_f16_decode()) {
                 st16 = store->layers_f16.at(il);
             } else
 #endif
