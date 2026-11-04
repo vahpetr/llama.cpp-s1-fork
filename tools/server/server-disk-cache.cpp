@@ -736,6 +736,9 @@ static const char * const CACHE_ENV_EXACT[] = {
     "LLAMA_GDN_SNAPSHOT_MARGIN_MIB", // [TAG_GDN_REPLAY] snapshot admission: in-place commit = the same bytes
     "LLAMA_GDN_REPLAY", // [TAG_GDN_REPLAY] GDN commit by replay: the state bytes and outputs are the planes path's (EXACT,
                         //   docs/verification/2026-10-31-gdn-replay-kproof.md), so =1 keeps the namespace key
+    "LLAMA_QWEN4EXP_MERGE_PLAN", // [TAG_MM_PLAN] P3a: hc_inject merged into hc_down only where the Vulkan plan says the merged
+                                 //   rows are bit-identical (K-proof per device): EXACT. LLAMA_QSA_IDX_F16_DECODE stays semantic
+                                 //   (=1 is class B), as does GGML_VK_MM_MERGE_FORCE (a negative control in every build)
     // LLAMA_ARG_* aliases (common/arg.cpp): classified one by one by their parsed meaning - only the control plane
     "LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_API_KEY",
     // Vulkan speed / diagnostics only by contract
@@ -748,6 +751,8 @@ static const char * const CACHE_ENV_EXACT[] = {
     "GGML_VK_QSA_BIAS_FOLD",         // [TAG_QSA_BIAS_FOLD] the bias computed in the score epilogue: the same plane bits (class A)
     "GGML_VK_QSA_BIAS_FOLD_MUTANT",  // [TAG_QSA_BIAS_FOLD] read only by the negative-control build; inert in a shipped one
     "GGML_VK_QSA_TOPK_V3_MIN_ROWS",  // [TAG_QSA_TOPK_V3] v3 vs onepass per selection size: the same ids (class A)
+    "GGML_VK_HC_TAIL_FUSE",          // [TAG_HC_TAIL_FUSE] the hc_mix tail in one dispatch: the same hc_mixed bytes (class A)
+    "GGML_VK_ADD_RMS_ROWS",          // [TAG_ADD_RMS_ROWS] hc_combine + rms_norm_mul in one dispatch: the same bytes (class A)
     "GGML_VK_PERF_LOGGER_CONCURRENT", "GGML_VK_PERF_LOGGER_FREQUENCY", "GGML_VK_SYNC_LOGGER", "GGML_VK_MEMORY_LOGGER",
     "GGML_VK_PIPELINE_STATS", "GGML_VK_OPT_WINDOW", "GGML_VK_FLOPS_SEED_LEGACY", "GGML_VK_SUBMIT_LOG",
     "GGML_VK_FUSION_DIAG", "GGML_VK_FUSION_COUNT", "GGML_VK_FUSION_LIST", "GGML_VULKAN_SKIP_CHECKS",

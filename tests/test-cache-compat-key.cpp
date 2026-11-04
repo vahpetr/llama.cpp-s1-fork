@@ -193,6 +193,16 @@ int main() {
         CHECK(server_cache_env_digest({ "GGML_VK_QSA_TOPK_V3_MIN_ROWS=2" }) == d0);
         CHECK(server_cache_env_digest({ "GGML_VK_QSA_BIAS_FOLD_MUTANT=0" }) == d0);
         CHECK(server_cache_env_digest({ "LLAMA_KQ_VIS=1", "GGML_VK_QSA_BIAS_FOLD=0", "GGML_VK_QSA_TOPK_V3_MIN_ROWS=1" }) == dk);
+        // [TAG_HC_TAIL_FUSE] [TAG_ADD_RMS_ROWS] [TAG_MM_PLAN] the pkg12 class-A knobs (the D-gate knob arm sets them =0);
+        //   LLAMA_QSA_IDX_F16_DECODE (=1 class B) and GGML_VK_MM_MERGE_FORCE (negative control) stay semantic
+        for (const char * n : { "GGML_VK_HC_TAIL_FUSE", "GGML_VK_ADD_RMS_ROWS", "LLAMA_QWEN4EXP_MERGE_PLAN" }) {
+            CHECK(server_cache_env_classify(n) == SERVER_CACHE_ENV_EXACT);
+        }
+        CHECK(server_cache_env_digest({ "GGML_VK_HC_TAIL_FUSE=0", "GGML_VK_ADD_RMS_ROWS=0", "LLAMA_QWEN4EXP_MERGE_PLAN=0" }) == d0);
+        CHECK(server_cache_env_digest({ "LLAMA_KQ_VIS=1", "GGML_VK_HC_TAIL_FUSE=0", "LLAMA_QWEN4EXP_MERGE_PLAN=1" }) == dk);
+        CHECK(server_cache_env_classify("LLAMA_QSA_IDX_F16_DECODE") == SERVER_CACHE_ENV_SEMANTIC);
+        CHECK(server_cache_env_classify("GGML_VK_MM_MERGE_FORCE") == SERVER_CACHE_ENV_SEMANTIC);
+        CHECK(server_cache_env_digest({ "LLAMA_QSA_IDX_F16_DECODE=1" }) != d0);
         printf("env registry: LLAMA_SPEC_OVERLAP unset/0/1 = one digest (exact), GGML_VK_F32ACC(_SCOPE) semantic, "
                "GGML_VK_QSA_BIAS_FOLD / _MUTANT / GGML_VK_QSA_TOPK_V3_MIN_ROWS unset/default/override = one digest\n");
     }
