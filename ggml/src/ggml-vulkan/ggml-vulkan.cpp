@@ -9753,6 +9753,27 @@ static vk_device ggml_vk_get_device(size_t idx) {
             }
         }
         GGML_LOG_WARN("ggml_vulkan: add_rms_rows: %s (GGML_VK_ADD_RMS_ROWS, default on)\n", device->fuse_hc_combine_rms ? "on" : "off");
+        // [TAG_DECODE_FUSE] default-path proof line of the D3 decode fusions, once per device: the effective gate every
+        // D3 matcher shares (GGML_VK_DECODE_FUSE and no GGML_VK_DISABLE_FUSION: graph_compute skips its fusion block);
+        // a per-fusion refusal that holds for the whole device (a GGML_VK_DISABLE_FUSION_PATTERNS veto, gdn_qk_gate's
+        // rms_norm_scale / add_softplus_mul prerequisites) adds its own line, so a default deploy prints exactly one
+        {
+            const bool d3 = ggml_vk_decode_fuse_enabled() && !device->disable_fusion;
+            if (d3) {
+                GGML_LOG_WARN("ggml_vulkan: decode_fuse: on (GGML_VK_DECODE_FUSE, default on)\n");
+                for (const char * name : { "shexp_tail", "shexp_glu_sig", "gdn_qk_gate" }) {
+                    if (ggml_vk_fusion_disabled_slow(name)) {
+                        GGML_LOG_WARN("ggml_vulkan: decode_fuse: %s off (GGML_VK_DISABLE_FUSION_PATTERNS)\n", name);
+                    }
+                }
+                if (!device->fuse_rms_norm_scale || !device->fuse_gdn_pre) {
+                    GGML_LOG_WARN("ggml_vulkan: decode_fuse: gdn_qk_gate off (GGML_VK_FUSE_RMS_NORM_SCALE / GGML_VK_FUSE_GDN_PRE)\n");
+                }
+            } else {
+                GGML_LOG_WARN("ggml_vulkan: decode_fuse: off (GGML_VK_DECODE_FUSE, default on%s)\n",
+                              ggml_vk_decode_fuse_enabled() ? "; GGML_VK_DISABLE_FUSION" : "");
+            }
+        }
         // [TAG_CONV_INPUT_SPLIT] the GDN conv input: ssm_conv reads concat(state, x^T) from its two sources
         device->fuse_concat_ssm_conv = fuse_enabled("GGML_VK_FUSE_CONCAT_SSM_CONV");
         // [TAG_VK_DISPATCH_LOG] read once here; off = one bool test per matmul dispatch, nothing else
