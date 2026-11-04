@@ -3797,6 +3797,9 @@ struct ggml_backend_vk_context {
     // GGML_VK_FUSION_COUNT: matches GGML_VK_DISABLE_FUSION_PATTERNS vetoed in the current graph,
     // reported as disabled:<name>=<count> so a bisect arm can be proven to have acted
     std::map<std::string, int> fusion_count_disabled;
+    // [TAG_DECODE_FUSE] GGML_VK_FUSION_COUNT: every per-graph tally of this backend summed since its init, read by tests
+    // through the "ggml_backend_vk_fusion_count_total" proc address (the DECODE_FUSE_EXACT fusion witness)
+    std::map<std::string, int64_t> fusion_count_totals;
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
 
@@ -25142,6 +25145,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::string line = "[vk-fusion-count] graph nodes=" + std::to_string(cgraph->n_nodes);
         for (const auto & kv : fusion_counts) {
             line += " " + kv.first + "=" + std::to_string(kv.second);
+            ctx->fusion_count_totals[kv.first] += kv.second;
         }
         // add_rms is a per-graph running-offset decision, so it belongs in the signature too
         const uint64_t add_rms = (uint64_t) ctx->fusion_count_add_rms;
@@ -27336,8 +27340,23 @@ static bool ggml_backend_vk_dev_memory_heaps(ggml_backend_dev_t dev, uint32_t n_
     return true;
 }
 
+// [TAG_DECODE_FUSE] int64_t (*)(ggml_backend_t, const char * key): the GGML_VK_FUSION_COUNT tally of key (a
+// [vk-fusion-count] key: gdn_qk_gate, rms_norm_scale, overlap:gdn_qk_gate, ...) summed over every graph this backend
+// computed; -1 when the backend is not Vulkan or GGML_VK_FUSION_COUNT is off (no tally is kept then)
+static int64_t ggml_backend_vk_fusion_count_total(ggml_backend_t backend, const char * key) {
+    if (!backend || !ggml_backend_is_vk(backend) || !ggml_vk_fusion_count_enabled()) {
+        return -1;
+    }
+    const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
+    const auto it = ctx->fusion_count_totals.find(key);
+    return it == ctx->fusion_count_totals.end() ? 0 : it->second;
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_vk_fusion_count_total") == 0) { // [TAG_DECODE_FUSE] int64_t (*)(ggml_backend_t, const char *)
+        return (void *) ggml_backend_vk_fusion_count_total;
+    }
     if (strcmp(name, "ggml_backend_fa_kv_ids") == 0) { // [TAG_QSA_INDEXED_FA] FLASH_ATTN_EXT reads src[5]
         return (void *) ggml_backend_vk_reg_get_proc_address;
     }

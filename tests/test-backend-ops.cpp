@@ -1359,6 +1359,10 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    // [TAG_DECODE_FUSE] a backend-side witness around the MODE_TEST compare (which fusions fired on backend1):
+    // witness_begin before it, witness_end after it; a non-empty string fails the case with that message
+    virtual void witness_begin(ggml_backend_t backend) { GGML_UNUSED(backend); }
+    virtual std::string witness_end(ggml_backend_t backend) { GGML_UNUSED(backend); return ""; }
     virtual bool use_weight_context() { return false; }
 
     ggml_cgraph * gf = nullptr;
@@ -1644,9 +1648,15 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
+        witness_begin(backend1);
         const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
                                                                fused_nodes_to_verify.size());
+        const std::string witness_err = witness_end(backend1);
+        if (!witness_err.empty()) {
+            printf("[%s] witness: %s ", current_op_name.c_str(), witness_err.c_str());
+            ud.ok = false;
+        }
 
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
@@ -5006,8 +5016,15 @@ struct test_add_softplus_mul_fuse : public test_case {
 // production layout) and alpha as the row view of the merged beta | alpha output; kind 1 takes contiguous tensors only.
 // The graph returns concat(A - B, B - A) per output: +0 everywhere iff both arms wrote the same floats; compared BITWISE
 // against the CPU's +0 (err = differing bit patterns, max 0). A mutant build (cmake -DGGML_VULKAN_DECODE_FUSE_MUTANT=11 |
-// 21 | 31 | 32) must FAIL its kind. GGML_VK_FUSION_COUNT=1 shows whether arm A fused (shexp_tail / shexp_glu_sig /
-// gdn_qk_gate > 0); with GGML_VK_DECODE_FUSE=0 both arms are the same dispatches.
+// 21 | 31 | 32) must FAIL its kind.
+// Fusion witness (Vulkan): run with GGML_VK_FUSION_COUNT=1 - without it a Vulkan case FAILS ("witness unavailable"),
+// so "fused" is proven per case, never assumed. Each case requires exact deltas of the backend's tallies
+// (ggml_backend_vk_fusion_count_total) over its one graph compute: the D3 key 1 where it must fuse (rows <= 32,
+// GGML_VK_DECODE_FUSE on) else 0, and for the gdn kinds the legacy rms_norm_scale / add_softplus_mul of arm B (2 / 1)
+// plus arm A's when it does not fuse (4 / 2 in all), crossdep: / overlap:gdn_qk_gate 1 for kinds 3 / 4 and every
+// other witness key 0. With GGML_VK_DECODE_FUSE=0 (the knob-off arm) the D3 and refusal keys are 0 and the legacy
+// counts 4 / 2. GGML_VK_DISABLE_FUSION / _PATTERNS / GGML_VK_FUSE_RMS_NORM_SCALE=0 / GGML_VK_FUSE_GDN_PRE=0 skip the
+// witness (printed). A mutant build keeps the witness and fails on the bits.
 struct test_decode_fuse_exact : public test_case {
     const int     kind;
     const int64_t rows;     // tokens (kind 2: tokens per sequence)
@@ -5187,6 +5204,65 @@ struct test_decode_fuse_exact : public test_case {
         norms(1);
         return ggml_concat(ctx, ggml_concat(ctx, flat_diff(ctx, oq[0], oq[1]), flat_diff(ctx, ok[0], ok[1]), 0),
                            flat_diff(ctx, og[0], og[1]), 0);
+    }
+
+    // fusion witness (see the comment above the struct)
+    static constexpr int n_wkeys = 8;
+    static const char * wkey(int i) {
+        static const char * keys[n_wkeys] = { "shexp_tail", "shexp_glu_sig", "gdn_qk_gate", "rms_norm_scale", "add_softplus_mul",
+                                              "crossdep:gdn_qk_gate", "overlap:gdn_qk_gate", "vetoed:gdn_qk_gate" };
+        return keys[i];
+    }
+    using fusion_total_t = int64_t (*)(ggml_backend_t, const char *);
+    fusion_total_t fusion_total = nullptr;
+    int64_t        w0[n_wkeys] = {};
+
+    void witness_begin(ggml_backend_t backend) override {
+        fusion_total = nullptr;
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg) {
+            fusion_total = (fusion_total_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count_total");
+        }
+        for (int i = 0; fusion_total && i < n_wkeys; ++i) {
+            w0[i] = fusion_total(backend, wkey(i));
+        }
+    }
+
+    std::string witness_end(ggml_backend_t backend) override {
+        if (!fusion_total) {
+            return "";   // not a Vulkan backend: no witness
+        }
+        if (w0[0] < 0) {
+            return "GGML_VK_FUSION_COUNT=1 required (fusion witness unavailable)";
+        }
+        auto const env_set = [](const char * n) { const char * v = getenv(n); return v != nullptr && *v != '\0'; };
+        auto const env_off = [](const char * n) { const char * v = getenv(n); return v != nullptr && *v != '\0' && atoi(v) == 0; };
+        if (getenv("GGML_VK_DISABLE_FUSION") != nullptr || env_set("GGML_VK_DISABLE_FUSION_PATTERNS") ||
+            env_off("GGML_VK_FUSE_RMS_NORM_SCALE") || env_off("GGML_VK_FUSE_GDN_PRE")) {
+            printf("[witness skipped: fusion env] ");
+            return "";
+        }
+        const bool d3 = !env_off("GGML_VK_DECODE_FUSE");
+        int64_t want[n_wkeys] = {};
+        if (kind == 0 || kind == 1) {
+            want[kind] = d3 && rows <= 32 ? 1 : 0;
+        } else {
+            const bool fuse = d3 && kind == 2 && rows * n_seqs <= 32;
+            want[2] = fuse ? 1 : 0;
+            want[3] = fuse ? 2 : 4;   // rms_norm_scale: arm B's two (+ arm A's two when it does not fuse)
+            want[4] = fuse ? 1 : 2;   // add_softplus_mul: arm B's one (+ arm A's)
+            want[5] = d3 && kind == 3 ? 1 : 0;
+            want[6] = d3 && kind == 4 ? 1 : 0;
+        }
+        std::string msg;
+        for (int i = 0; i < n_wkeys; ++i) {
+            const int64_t got = fusion_total(backend, wkey(i)) - w0[i];
+            if (got != want[i]) {
+                msg += std::string(msg.empty() ? "" : ", ") + wkey(i) + " " + std::to_string(got) + " (want " + std::to_string(want[i]) + ")";
+            }
+        }
+        return msg;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
