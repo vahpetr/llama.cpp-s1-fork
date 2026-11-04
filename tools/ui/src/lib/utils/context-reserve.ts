@@ -639,24 +639,33 @@ const MID_SENTENCE_LINE_CHARS = 40;
 const MID_SENTENCE_LINE_WORDS = 6;
 /** A shorter last line counts only right after a closing fence, ending in a <= 2-letter fragment. */
 const MID_SENTENCE_FRAGMENT_CHARS = 2;
+/** Common 1-2-letter whole words: a last word among them is not a truncated fragment. */
+const SHORT_WHOLE_WORDS = new Set(
+	(
+		'it is so up on in at to ok no us me by of or an as be do go if we my he ' +
+		'ок да не но он я мы вы их ты то же бы ли из на по от до за ни об со во уж та те'
+	).split(' ')
+);
 const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 
 /** The last two non-blank lines of `t` (raw, may be ''), scanning from the end only. */
-function lastTwoLines(t: string): [string, string] {
+function lastTwoLines(t: string): { adjacent: boolean; last: string; prev: string } {
 	const found: string[] = [];
 
 	let end = t.length;
+	let adjacent = true;
 
 	while (end > 0 && found.length < 2) {
 		const start = t.lastIndexOf('\n', end - 1) + 1;
 		const line = t.slice(start, end);
 
 		if (line.trim()) found.push(line);
+		else if (found.length === 1) adjacent = false;
 
 		end = start - 1;
 	}
 
-	return [found[1] ?? '', found[0] ?? ''];
+	return { adjacent: adjacent && found.length === 2, last: found[0] ?? '', prev: found[1] ?? '' };
 }
 
 /**
@@ -671,9 +680,12 @@ function lastTwoLines(t: string): [string, string] {
 function endsMidSentence(t: string): boolean {
 	if (t.length < MID_SENTENCE_MIN_CHARS) return false;
 
-	const [prev, raw] = lastTwoLines(t);
+	const { adjacent, last: raw, prev } = lastTwoLines(t);
 
 	if (/^\s/.test(raw)) return false;
+
+	// a lazy list continuation: an unindented line directly under a list item belongs to it
+	if (adjacent && /^\s*(?:[-*+]|\d+[.)])\s/.test(prev)) return false;
 
 	const line = raw.trim();
 
@@ -702,6 +714,7 @@ function endsMidSentence(t: string): boolean {
 
 	return (
 		/^\s*```\s*$/.test(prev) &&
+		!SHORT_WHOLE_WORDS.has(lastWord) &&
 		lastWord.length <= MID_SENTENCE_FRAGMENT_CHARS &&
 		/^\p{Ll}+$/u.test(lastWord)
 	);
@@ -711,34 +724,47 @@ function endsMidSentence(t: string): boolean {
  * Echo-aware join of a continue_final_message reply (manual Continue and the rule-1/3
  * auto-continuation share it). A continuation that is a whitespace-normalised prefix of the
  * partial is an echo still in progress - the partial is kept - while the stream is incomplete
- * (abort / error), and at completion only when it is at least ECHO_MIN_DIVERGENCE_CHARS long
- * (a short genuine continuation such as 'The' is appended). Otherwise joinContinuationChecked
+ * (abort / error). At completion a strict prefix of at least ECHO_MIN_DIVERGENCE_CHARS is
+ * ambiguous: the partial is kept and flagged (`mismatch` + `endedInEcho`); a shorter one (a
+ * genuine 'The') is appended. Otherwise joinContinuationChecked
  * (exact / whitespace-normalised echo strip, `mismatch` on divergence), or the overlap fallback.
  */
 export function settleContinuation(
 	partial: string,
 	continuation: string,
 	complete: boolean
-): { text: string; mismatch: boolean } {
+): { text: string; mismatch: boolean; endedInEcho?: boolean } {
 	if (CONTEXT_RESERVE.JOIN_OVERLAP_FALLBACK) {
 		return { mismatch: false, text: joinWithOverlap(partial, continuation).text };
 	}
 
 	const nc = normalizeWs(continuation);
 
-	if (
-		partial &&
-		nc &&
-		(!complete || nc.length >= ECHO_MIN_DIVERGENCE_CHARS) &&
-		normalizeWs(partial).startsWith(nc)
-	) {
+	// mid-stream (abort / error): an echo still in progress keeps the partial
+	if (!complete && partial && nc && normalizeWs(partial).startsWith(nc)) {
 		return { mismatch: false, text: partial };
+	}
+
+	// at completion a >= 16-char STRICT prefix is ambiguous (the server streams the prefill first,
+	// so a stream ending inside the echo generated nothing): keep the partial, but flag it
+	const np = normalizeWs(partial).trimEnd();
+
+	if (
+		complete &&
+		nc.length >= ECHO_MIN_DIVERGENCE_CHARS &&
+		np.startsWith(nc) &&
+		nc.trimEnd().length < np.length
+	) {
+		return { endedInEcho: true, mismatch: true, text: partial };
 	}
 
 	return joinContinuationChecked(partial, continuation);
 }
 
-/** settleContinuation on content and reasoning separately; one warning on a diverging echo. */
+/**
+ * settleContinuation on content and reasoning separately; one warning on a diverging echo or on a
+ * stream that ended inside the echo (both set `mismatch`, persisted as echoMismatch).
+ */
 export function settleContinuationParts(
 	original: { content: string; reasoning: string },
 	appended: { content: string; reasoning: string },
@@ -749,7 +775,11 @@ export function settleContinuationParts(
 	const r = settleContinuation(original.reasoning, appended.reasoning, complete);
 	const mismatch = c.mismatch || r.mismatch;
 
-	if (mismatch) {
+	if (c.endedInEcho || r.endedInEcho) {
+		console.warn('[ChatStore] continuation ended inside the echoed prefill; nothing appended', {
+			messageId
+		});
+	} else if (mismatch) {
 		console.warn(
 			'[ChatStore] continuation: the echoed prefill diverged from the partial - joined verbatim',
 			{ messageId }
