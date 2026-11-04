@@ -1,30 +1,30 @@
 # Release notes
 
-## v72
+## v73
 
-Fork revision `608af6ea8` (`prod-v11-stage9-pkg12`). Images `vahpetr/llama-cpp-s1-fork:v72` (brain) and `:v72k` (hands), one
-image; the rollback is `:v71` / `:v71k`. Measurements: [BENCHMARKS.md](BENCHMARKS.md). Deploy, upgrade and rollback:
+Fork revision `7597206a9` (`prod-v11-stage9-pkg13`). Images `vahpetr/llama-cpp-s1-fork:v73` (brain) and `:v73k` (hands), one
+image; the rollback is `:v72` / `:v72k`. Measurements: [BENCHMARKS.md](BENCHMARKS.md). Deploy, upgrade and rollback:
 [DEPLOY.md](DEPLOY.md).
 
-New in v72 (all code defaults, no compose change; on gfx1151 against v71: step 1M +4.6 %, step 262k +3.1 %, fill 1M −3.3 %,
-cold 32k prefill +2.9 %, decode −0.4…−0.7 %):
+New in v73 (all code defaults, no compose change; on gfx1151 against the published v72 numbers: step 262k +3.0 %, step 1M
++0.5 %, fill 1M −0.9 %, cold 32k prefill +0.4 % (AB64, same session), cold 128k −2.3 %, decode with MTP −0.2 % / +0.4 % / +0.6 %
+at 32k / 262k / 1M, TTFT after a 1M restore −7.5 %; hands chat 28.4 t/s against 29.4 on v72k, one request each; noise band
+about ±1.5 %):
 
-- **hc-mix tail in one shader** (`GGML_VK_HC_TAIL_FUSE`, default on): SIGMOID_MUL + MULTI_ADD_SCALE of the hyper-connection
-  mix run as one dispatch; a destination that overlaps a source falls back to the two ops.
-- **HC_COMBINE + RMS_NORM_MUL in one dispatch** (`GGML_VK_ADD_RMS_ROWS`, default on).
-- **hc_inject merged into hc_down** above `LLAMA_QWEN4EXP_MERGE_MAX_N` where the Vulkan dispatch plan gives bit-identical rows
-  (`LLAMA_QWEN4EXP_MERGE_PLAN`, default on gfx1151, off elsewhere).
-- **Pipeline prewarm** (`GGML_VK_PREWARM_SHAPES`, default on): the first graphs compile the other decode-width and prefill-tile
-  pipelines instead of compiling them lazily mid-request.
-- Code only, off by default: `LLAMA_SPEC_OVERLAP=2` (the composes keep `=1`) and the f16 indexer score for decode rows
-  (`LLAMA_QSA_IDX_F16_DECODE`, not exact, in the disk-cache key).
+- **D3 decode fusions** (`GGML_VK_DECODE_FUSE`, default on): at ≤ 32 rows (tokens × sequences) the shared-expert tail
+  (`shexp_tail`: MUL by the gate + ADD into the MoE output), the shared-expert GLU with sigmoid gate (`shexp_glu_sig`) and the
+  GDN q/k norm + gate (`gdn_qk_gate`) each run as one dispatch. `=0` gives the v72 dispatches. Exact-listed in CACHE_ENV_EXACT,
+  so it is not in the disk-cache key. Tests: `DECODE_FUSE_EXACT` bitwise cases, plus a mutant build option
+  (`GGML_VULKAN_DECODE_FUSE_MUTANT`, tests only) whose cases must fail.
+- **Upstream ports:** #30283 (int8 coopmat1 MMQ A-prefetch clamp; int8 MMQ stays off in the composes), #31350 (speculative
+  checkpoint for drafts longer than `n_rs_seq`), #30213 (rejection-sampling test), #31035 (DRY sequence-breaker cap 64), #31310
+  (gguf-py `np_roundf` sign).
 
-Each new path prints one startup line (`hc_tail_fuse: on`, `add_rms_rows: on`, `qwen4exp merge plan: on|off`,
-`prewarm_shapes: on`, `qsa_idx_f16_decode: off`); [KNOBS.md](KNOBS.md) lists them.
+The new path prints one startup line (`decode_fuse: on (GGML_VK_DECODE_FUSE, default on)`); [KNOBS.md](KNOBS.md) lists it.
 
-Exactness: on gfx1151 v72 passed the D-gate as EXACT against the v71 reference at 262k and 1M, with every new knob off as a
-second arm (also EXACT) and a negative control that the gate caught; the oracle manifest (12 of 12); the AB64 greedy identity
-check; the same-key disk-cache gate (13 of 13). On the 780M (gfx1103) the hands test binary gave identical logits, ids and states
-against v71 in 5 of 5 arms. v72 shares its disk-cache key with v60–v71.
+Exactness: on gfx1151 v73 passed the D-gate as EXACT against the v72 reference at 262k and 1M, with every new knob off as a
+second arm and a negative control that the gate caught; the oracle manifest; the AB64 greedy identity check; the same-key
+disk-cache gate (13 of 13). `DECODE_FUSE_EXACT` passed 62 of 62 cases on gfx1151 and on the 780M (gfx1103); the #30283 int8
+path is bitwise equal to v72. v73 shares its disk-cache key with v60–v72.
 
-Known limitations: the 524k profile has no v72 measurements. The full list is in [README.md](../../README.md#known-limitations).
+Known limitations: the 524k profile has no v73 measurements. The full list is in [README.md](../../README.md#known-limitations).

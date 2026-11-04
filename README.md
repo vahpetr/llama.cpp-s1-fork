@@ -4,29 +4,29 @@ This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) for one mac
 Radeon 8060S iGPU, gfx1151, 128 GB unified memory) on Vulkan (RADV), not ROCm. The model is Qwen3.8-Flash-Next (`qwen4exp`), a
 177B-parameter MoE with about 6B active parameters per token, an MTP head and vision. Stock llama.cpp runs this model with a
 dense window of at most 262 144 tokens and no working speculative decoding. This fork runs it with a 1 048 576-token context in
-one slot, with sparse attention, MTP drafting and a disk prompt cache. This README describes release v72 (fork revision
-`608af6ea8`, `prod-v11-stage9-pkg12`).
+one slot, with sparse attention, MTP drafting and a disk prompt cache. This README describes release v73 (fork revision
+`7597206a9`, `prod-v11-stage9-pkg13`).
 
-## Measured on v72, by context depth
+## Measured on v73, by context depth
 
 | depth | prefill or step, t/s | decode with MTP, t/s (ms/token) | draft acceptance | TTFT after slot restore |
 |---|---:|---:|---:|---:|
-| 8k | 820.9 (cold prompt) | — | — | — |
-| 32k | 641.0 (cold prompt) | 41.8 (23.92) | 0.817 | — |
-| 128k | 599.1 (cold prompt) | — | — | — |
-| 262k | 697.6 (step) | 52.0 (19.23) | 0.800 | — |
-| 524k | 670.7 (step) | — | — | — |
-| 1M | 612.4 (step) | 56.9 (17.57) | 0.877 | 1 348 ms |
+| 8k | 818.7 (cold prompt) | — | — | — |
+| 32k | 642.0 (cold prompt) | 41.7 (23.96) | 0.817 | — |
+| 128k | 585.5 (cold prompt) | — | — | — |
+| 262k | 718.5 (step) | 52.2 (19.16) | 0.800 | — |
+| 524k | 677.1 (step) | — | — | — |
+| 1M | 615.4 (step) | 57.2 (17.47) | 0.877 | 1 247 ms |
 
-GTT after load: 104 538 MiB (admission bar 109 216 MiB). Cold fill 0 → 1 046 528 tokens: 26.85 min (sum of 17 step walls).
-Hands (Radeon 780M, `:v72k`): 29.4 t/s on a short chat, first request after start. "—" = not measured on v72.
+GTT after load: 104 538 MiB (admission bar 109 216 MiB). Cold fill 0 → 1 046 528 tokens: 26.60 min (sum of 17 step walls).
+Hands (Radeon 780M, `:v73k`): 28.4 t/s on a short chat, first request after start. "—" = not measured on v73.
 Per-run tables and the method: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md).
 
 Measurement setup:
 
 - Host s1: Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB LPDDR5x, GTT 108 GiB (`ttm.pages_limit=28311552`), GPU DPM level
   `high` while busy, kernel 7.0.0-38-generic, Mesa 26.0.8 RADV and Vulkan loader 1.4.341 inside the image.
-- Image `flash-next:vulkan-v72` (rev `608af6ea8`), llama-server, the 1M compose of `deploy/s1/` without `--cache-disk*`.
+- Image `flash-next:vulkan-v73` (rev `7597206a9`), llama-server, the 1M compose of `deploy/s1/` without `--cache-disk*`.
 - Weights: Qwen3.8-Flash-Next-Uncensored i1-Q4_K_M (mradermacher, 110.97 GiB) + mmproj f16. Draft: the MTP head pruned to a
   65 536-token vocabulary (not published); the public setup uses the full-vocabulary head, so the decode column is an upper
   bound for it.
@@ -38,11 +38,11 @@ Measurement setup:
   on draft acceptance, which depends on the text.
 - TTFT = 256 new tokens after restoring a saved 1M conversation, mean of 2 restored reps.
 - Single runs; noise band about ±1.5 %.
-- No stock llama.cpp or other-engine numbers were measured on v72; the only cross-engine number is the dated v60 stock comparison.
+- No stock llama.cpp or other-engine numbers were measured on v73; the only cross-engine number is the dated v60 stock comparison.
 
 ## Against upstream and other Strix Halo engines
 
-Their numbers are their published ones (date, quant, context as they state); nothing below was re-measured on v72.
+Their numbers are their published ones (date, quant, context as they state); nothing below was re-measured on v73.
 
 | engine | backend | max context on a 128 GB box | prefill vs ours | decode vs ours | source / date |
 |---|---|---|---|---|---|
@@ -76,7 +76,8 @@ Short-context prefill is below Strata and halogen (×0.5–0.7 of theirs); the f
 - Disk prompt cache with recurrent checkpoints, asynchronous and incremental saves, restore instead of re-prefill.
 - Vulkan kernels for RDNA3/RDNA3.5 coopmat1: MoE `mul_mat_id` tiles and loaders, dense GEMM tile table, flash-attention
   layouts, QSA score epilogue, hyper-connection fusions (the hc-mix tail in one shader, combine + RMS norm in one dispatch),
-  GDN fusions, and a pipeline prewarm for the decode and prefill shapes.
+  GDN fusions, decode fusions of the shared-expert tail and the GDN q/k gate at ≤ 32 rows, and a pipeline prewarm for the
+  decode and prefill shapes.
 - Hands profile for the Radeon 780M (gfx1103): five slots, IQ3_S experts with Q8_0 hyper-connection and head weights.
 - webui for long agent sessions: auto-compaction, continuation from the stop point, per-chat reasoning levels, timing per reply.
 
@@ -93,8 +94,8 @@ deploy/s1/setup-brain.sh --dry-run && deploy/s1/setup-brain.sh           # Strix
 deploy/balkon/setup-hands.sh --dry-run && deploy/balkon/setup-hands.sh   # Radeon 780M: 5-slot hands
 ```
 
-Images on Docker Hub, `vahpetr/llama-cpp-s1-fork`: `:v72` (brain) and `:v72k` (hands) are this release, one image;
-`:v71` / `:v71k` are the rollback. Host settings: [docs/s1/HOST-TUNING.md](docs/s1/HOST-TUNING.md). Upgrade, rollback
+Images on Docker Hub, `vahpetr/llama-cpp-s1-fork`: `:v73` (brain) and `:v73k` (hands) are this release, one image;
+`:v72` / `:v72k` are the rollback. Host settings: [docs/s1/HOST-TUNING.md](docs/s1/HOST-TUNING.md). Upgrade, rollback
 and disk-cache keys: [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md). Compose files and flags: [deploy/README.md](deploy/README.md).
 
 ## For AI agents
@@ -110,7 +111,7 @@ and disk-cache keys: [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md). Compose files and f
 5. Hardware for the 1M brain: Strix Halo with 128 GB and GTT 108 GiB (`ttm.pages_limit=28311552`). For the hands: a Radeon
    780M-class box with 96 GB and GTT 78 GiB.
 6. Weights and sha256: [docs/s1/WEIGHTS.md](docs/s1/WEIGHTS.md). About 160 GB free disk for the brain, 150 GB for the hands.
-7. Docker Hub tags: `:v72` brain, `:v72k` hands (same image), `:v71` / `:v71k` rollback. `BUILD=1` builds the image from this tree instead.
+7. Docker Hub tags: `:v73` brain, `:v73k` hands (same image), `:v72` / `:v72k` rollback. `BUILD=1` builds the image from this tree instead.
 8. Verify: `curl -sf http://127.0.0.1:8000/health`, `/props` shows `n_ctx` 1048576, then one chat request
    ([docs/s1/DEPLOY.md](docs/s1/DEPLOY.md), "Smoke checks").
 9. Flags and environment knobs with defaults and classes: [docs/s1/KNOBS.md](docs/s1/KNOBS.md).
@@ -123,10 +124,10 @@ and disk-cache keys: [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md). Compose files and f
 - Two slots give no extra total throughput on these boxes; a second slot is for concurrency only.
 - After a checkpoint rewind the continuation can differ from a fresh prefill at near-tie tokens (same math, different batch
   shape). The restored state is verified; the text is not guaranteed byte-identical.
-- Disk-cache entries are tied to a cache key. v72 shares its key with v60–v71; [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md) has the details.
+- Disk-cache entries are tied to a cache key. v73 shares its key with v60–v72; [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md) has the details.
 - One model load per GPU at a time: a build or a second load next to a loaded 1M model has run the 128 GB box out of memory.
 - Single-user setups; no multi-tenant hardening beyond upstream's.
-- The 524k profile has no v72 measurements; the hands have only the deploy smoke's chat number.
+- The 524k profile has no v73 measurements; the hands have only the deploy smoke's chat number.
 
 ## Upstream and license
 

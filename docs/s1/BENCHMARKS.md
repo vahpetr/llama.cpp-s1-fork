@@ -1,6 +1,6 @@
 # Benchmarks
 
-Numbers for release v72 (image `flash-next:vulkan-v72`, fork revision `608af6ea8`, `prod-v11-stage9-pkg12`) on s1, plus one
+Numbers for release v73 (image `flash-next:vulkan-v73`, fork revision `7597206a9`, `prod-v11-stage9-pkg13`) on s1, plus one
 dated comparison with stock llama.cpp (section 6). Single runs unless reps are given; the speed noise band is about ±1.5 %.
 
 ## 1. Setup and method
@@ -19,7 +19,7 @@ Server flags: the 1M compose (`deploy/s1/docker-compose.brain-1m.yml`): `-c 1048
 `LLAMA_QSA_MIN_KV=65536` (dense below 65 536 tokens), `-ot per_layer_token_embd=CPU`, `--load-mode mmap --tensor-read-lazy
 auto`, `--ctx-checkpoints 4`, `--cache-disk-async 1024 --cache-disk-incr`; temp 0.7, top-p 0.8, top-k 20, min-p 0, presence
 penalty 1.5, `--reasoning off`; `GGML_VK_DISABLE_MMQ_CM1=1` (int8 MMQ off). Top-k v3, the QSA bias fold, GDN replay, the hyper-connection
-fusions, the merge plan and the pipeline prewarm run at their v72 code defaults on gfx1151 (startup proof lines). The S0.2 runs strip `--cache-disk*` from the compose.
+fusions, the merge plan, the pipeline prewarm and the D3 decode fusions run at their v73 code defaults on gfx1151 (startup proof lines). The S0.2 runs strip `--cache-disk*` from the compose.
 
 Method:
 
@@ -31,43 +31,43 @@ Method:
 - **TTFT**: 256 new tokens after a slot restore of a 1M conversation.
 - **GTT**: `mem_info_gtt_used` of the GPU.
 
-No stock llama.cpp or other-engine numbers were measured on v72.
+No stock llama.cpp or other-engine numbers were measured on v73.
 
 ## 2. S0.2 run 2026-11-04 (llama-server, corpus `tokens-s02`, 1M profile)
 
-| measurement | v72 |
+| measurement | v73 |
 |---|---:|
-| cold prompt 128k, t/s (first request; warm repeat 602.1) | 599.1 |
-| 72k prompt, probe M2 (range of its reps), t/s | 522.0–524.6 |
-| step 197 070 → 262 606, t/s | 697.6 |
-| step 459 676 → 525 212, t/s | 670.7 |
-| step 983 964 → 1 046 528 (62 564 new tokens), t/s | 612.4 |
-| fill 0 → 1 046 528 (17 steps), min | 26.85 |
-| decode with MTP at 32k / 262k / 1M, ms/token | 23.92 / 19.23 / 17.57 |
-| the same in t/s | 41.8 / 52.0 / 56.9 |
+| cold prompt 128k, t/s (first request; warm repeat 598.7) | 585.5 |
+| 72k prompt, probe M2 (range of its reps), t/s | 523.6–525.4 |
+| step 197 070 → 262 606, t/s | 718.5 |
+| step 459 676 → 525 212, t/s | 677.1 |
+| step 983 964 → 1 046 528 (62 564 new tokens), t/s | 615.4 |
+| fill 0 → 1 046 528 (17 steps), min | 26.60 |
+| decode with MTP at 32k / 262k / 1M, ms/token | 23.96 / 19.16 / 17.47 |
+| the same in t/s | 41.7 / 52.2 / 57.2 |
 | draft acceptance at 32k / 262k / 1M | 0.817 / 0.800 / 0.877 |
-| decode without draft (restore path) at 32k / 262k / 1M, ms/token | 31.51 / 32.12 / 39.16 |
-| TTFT, 256 new tokens at 1 046 989 after a slot restore, mean of the 2 restored reps, ms (1 407.8 / 1 287.2; warm rep without restore 1 342.9) | 1 348 |
+| decode without draft (restore path) at 32k / 262k / 1M, ms/token | 31.23 / 31.97 / 38.98 |
+| TTFT, 256 new tokens at 1 046 989 after a slot restore, mean of the 2 restored reps, ms (1 246.7 / 1 246.9; warm rep without restore 1 013.3) | 1 247 |
 | GTT peak over the 1M fill, MiB (admission bar 109 216) | 105 364 |
-| 1M slot file: size / save time | 17.09 GiB / 5.1 s |
+| 1M slot file: size / save time | 17.09 GiB / 3.9 s |
 
 Decode at depth depends on how predictable the text is (draft acceptance); on this corpus 1M decodes faster than 32k.
 
-## 3. AB64 run 2026-11-04 (llama-server, cold prompts, 2 reps, arm A3 = the v72 image, arm A0 = v71 in the same session)
+## 3. AB64 run 2026-11-04 (llama-server, cold prompts, 2 reps, arm A3 = the v73 image, arm A0 = v72 in the same session)
 
-| measurement | v71 (A0) | v72 (A3) |
+| measurement | v72 (A0) | v73 (A3) |
 |---|---:|---:|
-| cold prompt 32k, t/s (A3 reps 640.39 / 641.56) | 622.8 | 641.0 |
-| cold prompt 72k, t/s (A3 reps 522.91 / 522.85) | 509.7 | 522.9 |
+| cold prompt 32k, t/s (A3 reps 641.56 / 642.53) | 639.6 | 642.0 |
+| cold prompt 72k, t/s (A3 reps 523.21 / 517.74) | 522.9 | 520.5 |
 | greedy identity against the reference arm (32 tokens at 32k, 1 at 72k) | — | PASS |
 
 ## 4. Deploy smoke 2026-11-04 (the 1M compose, with the disk cache)
 
-| measurement | v72 |
+| measurement | v73 |
 |---|---:|
 | GTT after load, MiB | 104 538 |
-| cold prompt 8k (8 192 tokens, n = 1), t/s | 820.9 |
-| short chat (32-token prompt, 116 tokens), t/s | 84.5 |
+| cold prompt 8k (8 192 tokens, n = 1), t/s | 818.7 |
+| short chat (32-token prompt, 116 tokens), t/s | 85.2 |
 | draft accepted / drafted on that reply | 95 / 100 |
 
 ## 5. Two slots and the hands box
@@ -76,12 +76,12 @@ Two concurrent streams (`-np 2`, per-stream KV) cost 2.4x a solo round each, so 
 decoding already batches the rows of one context with high expert overlap, and a second context shares fewer expert reads. A
 second slot is a concurrency feature, not a speed-up.
 
-Hands (Radeon 780M, `:v72k`, deploy smoke 2026-11-04): 29.4 t/s on a short chat, draft 183 of 189 accepted, first request after
-the start (v71k: 23.8 t/s in the same smoke, 29.5–29.6 t/s warm, so the gain is not attributed to v72).
+Hands (Radeon 780M, `:v73k`, deploy smoke 2026-11-04): 28.4 t/s on a short chat, draft 183 of 189 accepted, first request after
+the start (v72k: 29.4 t/s in its own deploy smoke; one request each, so the difference is not attributed to v73).
 
 ## 6. Stock llama.cpp b10689 vs this fork (v60), same GGUF, gfx1151, n_ctx 262 144 dense (2026-10-16)
 
-This is the last stock baseline; it was not re-run on v72.
+This is the last stock baseline; it was not re-run on v73.
 
 Run `20261016-203641` on s1. Stock = the official image `ghcr.io/ggml-org/llama.cpp:server-vulkan-b10689` (build 10689 /
 57291f264); fork = the v60 image (845c6fbcd). Same files in every arm: Qwen3.8-Flash-Next-Uncensored i1-Q4_K_M + mmproj f16;
