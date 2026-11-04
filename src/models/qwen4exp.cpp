@@ -330,9 +330,12 @@ static bool qwen4exp_merge_plan_ok(const ggml_tensor * a, const ggml_tensor * b,
     static std::set<int64_t> seen;
     {
         std::lock_guard<std::mutex> lock(mtx);
+        // the first 8 distinct decisions at WARN (the proof line), the rest at INFO: the last ubatch of every prompt has an
+        // arbitrary n, so WARN per n would grow the log by up to ~ub lines over a server's life
         if (seen.insert(n_tokens * 2 + (ok ? 1 : 0)).second) {
-            LLAMA_LOG_WARN("qwen4exp merge plan: n=%lld %s m_a=%lld m_b=%lld %s: %s\n", (long long) n_tokens, ggml_type_name(a->type),
-                           (long long) a->ne[1], (long long) b->ne[1], ok ? "MERGE" : "separate", why);
+            llama_log_internal(seen.size() <= 8 ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
+                               "qwen4exp merge plan: n=%lld %s m_a=%lld m_b=%lld %s: %s\n", (long long) n_tokens, ggml_type_name(a->type),
+                               (long long) a->ne[1], (long long) b->ne[1], ok ? "MERGE" : "separate", why);
         }
     }
     return ok;
