@@ -12,7 +12,7 @@ Status column:
 - **v64**: in this tree since v64 (released 2026-10-21); "v64, on" = on by default.
 
 This tree is v72: fork revision `608af6ea8` (`prod-v11-stage9-pkg12`), image `vahpetr/llama-cpp-s1-fork:v72`. Every row
-below is still in it. The rows after 0265 (v65-v72, up to 0438) give the title, the patch file and the commit; the status column is the first
+below is still in it. The rows after 0265 (v65-v73, up to 0458) give the title, the patch file and the commit; the status column is the first
 image that carried it. Their knobs are in docs/s1/KNOBS.md, section "Added after patch 0265".
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
@@ -411,6 +411,26 @@ records and upstream status live in my private repo; ask if you want one.
 | 0436 | qwen4exp: the LLAMA_QSA_IDX_F16_NEGCTL mutant skips the mirror write only with LLAMA_QSA_IDX_F16_DECODE on (`0436-qwen4exp-qsa-idx-f16-negctl-gated-on-knob.patch`, f068b9c2a) | v72 (class tests) |
 | 0437 | vulkan: the hc_tail_fuse proof line prints the effective gate (flag && multi_add && no multi_add pattern veto) (`0437-vulkan-hc-tail-fuse-proof-line-effective-gate.patch`, 38fccaa22) | v72 (class EXACT) |
 | 0438 | vulkan: hc_tail_mix also requires the old path's MULTI_ADD to cover the same num_adds ADDs (`0438-vulkan-hc-tail-fuse-requires-legacy-multi-add-match.patch`, 608af6ea8) | v72 (class EXACT) |
+| 0439 | vulkan: coopmat1 int8 MMQ clamps the A prefetch to end_k and zeroes the A scale past end_k (upstream #30283) (`0439-vulkan-mmq-cm1-int8-a-prefetch-clamp-end-k.patch`, fa01c42da) | v73 (class Q) |
+| 0440 | server: restore the spec checkpoint for drafts longer than n_rs_seq (upstream #31350) (`0440-server-spec-checkpoint-drafts-longer-than-n-rs-seq.patch`, 5cbb5f3ba) | v73 (class EXACT) |
+| 0441 | tests: test-speculative-rejection-sampling - the draft's rejection sampling reproduces the target distribution (upstream #30213) (`0441-tests-speculative-rejection-draft-sampling.patch`, 06b5e170a) | v73 (class tests) |
+| 0442 | llama/server: DRY sequence breakers capped (upstream #31035) (`0442-llama-dry-sequence-breaker-cap.patch`, 1d648be95) | v73 (class Q) |
+| 0443 | gguf-py: np_roundf keeps the sign (upstream #31310) (`0443-gguf-py-np-roundf-sign.patch`, 3f3cd3853) | v73 (class S) |
+| 0444 | vulkan: D3 shexp_tail - MUL(shexp, gate) + ADD(moe_out) in one dispatch at <= 32 rows, knob GGML_VK_DECODE_FUSE (`0444-vulkan-d3-shexp-tail.patch`, 805df0e1d) | v73 (class EXACT) |
+| 0445 | vulkan: D3 shexp_glu_sig - the shared expert's GLU and its [1, T] gate SIGMOID in one dispatch (`0445-vulkan-d3-shexp-glu-sig.patch`, 65be40927) | v73 (class EXACT) |
+| 0446 | vulkan: D3 gdn_qk_gate - the GDN q / k l2 norms and the decay pre-chain ADD + SOFTPLUS + MUL in one dispatch (`0446-vulkan-d3-gdn-qk-gate.patch`, f11ba1961) | v73 (class EXACT) |
+| 0447 | vulkan: D3 review fixes - shexp_glu_sig refuses cross-node overlap and non-[1, T] sigmoids, gdn_qk_gate caps its range at 13 nodes (`0447-vulkan-d3-review-fixes.patch`, f94adda1c) | v73 (class EXACT) |
+| 0448 | vulkan: D3 forward declaration of ggml_vk_tensors_overlap (compile fix) (`0448-vulkan-d3-overlap-forward-decl.patch`, 62fcae748) | v73 (class EXACT) |
+| 0449 | server: CACHE_ENV_EXACT += GGML_VK_DECODE_FUSE (not in the disk-cache key) (`0449-server-cache-env-exact-decode-fuse.patch`, 67d0f7327) | v73 (class EXACT) |
+| 0450 | vulkan: decode_fuse proof line once per device (on / off and single-fusion refusals) (`0450-vulkan-decode-fuse-proof-line.patch`, 9c9d9cb05) | v73 (class EXACT) |
+| 0451 | tests: DECODE_FUSE_EXACT bitwise cases + build option GGML_VULKAN_DECODE_FUSE_MUTANT (tests only) (`0451-tests-decode-fuse-exact-mutant.patch`, 60076f3de) | v73 (class tests) |
+| 0452 | vulkan: gdn_qk_gate refuses cross-branch dependencies inside its range (`0452-vulkan-gdn-qk-gate-refuses-cross-branch-dependencies.patch`, e60ea0661) | v73 (class EXACT) |
+| 0453 | vulkan: gdn_qk_gate runs the generic overlap veto in its matcher, so the legacy fusions still apply on refusal (`0453-vulkan-gdn-qk-gate-overlap-preflight-legacy-fallback.patch`, 797db1503) | v73 (class EXACT) |
+| 0454 | cmake: GGML_VULKAN_DECODE_FUSE_MUTANT forwarded to the shader generator + a stamp the D3 shaders depend on (`0454-cmake-decode-fuse-mutant-forward-and-stamp.patch`, 2cb1cd3ef) | v73 (class build) |
+| 0455 | tests: DECODE_FUSE_EXACT fusion witness - exact per-case GGML_VK_FUSION_COUNT deltas (`0455-tests-decode-fuse-exact-fusion-witness.patch`, f7d85e664) | v73 (class tests) |
+| 0456 | tests: DECODE_FUSE_EXACT case gdn_qk_gate_views (RESHAPE nodes between the norms and the gate, must fuse) (`0456-tests-decode-fuse-exact-views-case.patch`, 5f732f95b) | v73 (class tests) |
+| 0457 | vulkan: gdn_qk_gate refuses view_src storage aliases between what it reads and writes, OP_NONE included (`0457-vulkan-gdn-qk-gate-refuses-view-src-storage-alias.patch`, b7d362d57) | v73 (class EXACT) |
+| 0458 | tests: DECODE_FUSE_EXACT case gdn_qk_gate_aliasroot (must refuse) (`0458-tests-decode-fuse-exact-aliasroot-case.patch`, 7597206a9) | v73 (class tests) |
 
 **0227-0240 apply order** on v59 (`a1b6c324e`): 0227, 0228, 0229, 0230, 0231, 0232, **0234, 0233**, 0235, 0236, 0237, 0238,
 0239, 0240 (0233 sits on 0234). Applied with a strict `git am` in that order they reproduce the v60 tree (`845c6fbcd`,

@@ -126,10 +126,10 @@ against the code for this table.
 | `GGML_VK_BUF_LOG=1` | 0 | 0244 (v62 62.1, `[TAG_VK_BUF_LOG]`): one INFO line per Vulkan buffer allocation, `[vk-buf] <device> kind=device\|host\|other size=<B> (<MiB>) type=<memory type index> heap=<heap> flags=<VkMemoryPropertyFlags> wc=<0\|1> import=<0\|1>`; kind device = `ggml_vk_create_buffer_device` (weights, KV / recurrent / pool buffers, preallocs), host = pinned host memory, other = staging / aux; wc=1 = host-visible without HOST_CACHED (write-combined for CPU reads). Prints only (the #30049 read-path change is parked, R129) | DIAG | - |
 | `GGML_SCHED_PROFILE=1`, `GGML_GET_ROWS_STATS=1\|2` | 0 | host-side scheduler timers, get_rows census | DIAG | - |
 
-## Added after patch 0265 (in v72)
+## Added after patch 0265 (in v73)
 
-Defaults below are read from the v72 code. The package sections that follow name the patches that added each older knob;
-their defaults are the same in v72. Their patch rows are in docs/s1/PATCHES.md (0266-0438); the tag in the code comment
+Defaults below are read from the v73 code. The package sections that follow name the patches that added each older knob;
+their defaults are the same in v73. Their patch rows are in docs/s1/PATCHES.md (0266-0458); the tag in the code comment
 is the provenance.
 
 | knob | default | effect | class | prod |
@@ -148,6 +148,8 @@ is the provenance.
 | `LLAMA_QWEN4EXP_MERGE_PLAN=0\|1` | on on gfx1151, off elsewhere | `[TAG_MM_PLAN]` (0409-0411): above `LLAMA_QWEN4EXP_MERGE_MAX_N` hc_inject still merges into hc_down where the Vulkan dispatch plan says the merged rows are bit-identical. Startup line `qwen4exp merge plan: on\|off (...)` + one line per n. Not in the disk-cache key | EXACT (K-proof per device) | - |
 | `GGML_VK_PREWARM_SHAPES=0\|N` | on | `[TAG_VK_PREWARM_SHAPES]` (0420): the first graph calls compile the other decode-width / prefill-tile pipelines (lazy compiles 159 -> 68 on s1). Startup line `prewarm_shapes: on\|off (...)`. Not in the disk-cache key | SCHED | - |
 | `LLAMA_QSA_IDX_F16_DECODE=0\|1` | 0 | `[TAG_QSA_IDX_F16_DECODE]` (0421-0424): where QSA_SCORE is refused (1-2 query rows: decode, MTP draft) the indexer score reads the f16 mirror via MUL_MAT_ROWS F16 store. Startup line `qsa_idx_f16_decode: on\|off (...)`. In the disk-cache key | LOSSY/class B when 1 | - |
+| `GGML_VK_DECODE_FUSE=0\|1` | on | `[TAG_DECODE_FUSE]` (0444-0453, 0457): the D3 decode fusions `shexp_tail`, `shexp_glu_sig`, `gdn_qk_gate` at <= 32 rows (tokens x sequences); =0 = the v72 dispatches. Startup line `decode_fuse: on\|off (GGML_VK_DECODE_FUSE, default on)`. Exact-listed in CACHE_ENV_EXACT (not in the disk-cache key) | EXACT | - |
+| CMake `GGML_VULKAN_DECODE_FUSE_MUTANT=0\|11\|21\|31\|32` | 0 | (0451, 0454): tests only - a mutant build of one D3 fusion whose DECODE_FUSE_EXACT cases must FAIL; WARN `decode_fuse: MUTANT BUILD <m> ...` | DIAG | - |
 
 ## v64 package - patches 0262, 0263, 0265
 
