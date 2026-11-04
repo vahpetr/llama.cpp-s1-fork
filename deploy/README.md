@@ -1,15 +1,15 @@
 # Running it: two commands per box
 
-Release v72: `:v72` (brain) and `:v72k` (hands) are one image.
+Release v73: `:v73` (brain) and `:v73k` (hands) are one image.
 
 | file | box | context | image | GTT after load | needs GTT |
 |---|---|---|---|---|---|
-| `s1/docker-compose.brain-1m.yml` | Ryzen AI Max+ 395, 128 GB | 1 048 576, 1 slot | `:v72` | 104 538 MiB (v72 deploy smoke) | 108 GiB |
-| `s1/docker-compose.brain-524k.yml` | Ryzen AI Max+ 395, 128 GB | 525 312, 1 slot | `:v72` | not measured on v72 | less than the 1M profile |
-| `balkon/docker-compose.hands.yml` | Ryzen 9 7940HS + 780M, 96 GB | 917 504 pool, 5 slots | `:v72k` | not measured on v72 | 78 GiB |
+| `s1/docker-compose.brain-1m.yml` | Ryzen AI Max+ 395, 128 GB | 1 048 576, 1 slot | `:v73` | 104 538 MiB (v73 deploy smoke) | 108 GiB |
+| `s1/docker-compose.brain-524k.yml` | Ryzen AI Max+ 395, 128 GB | 525 312, 1 slot | `:v73` | not measured on v73 | less than the 1M profile |
+| `balkon/docker-compose.hands.yml` | Ryzen 9 7940HS + 780M, 96 GB | 917 504 pool, 5 slots | `:v73k` | not measured on v73 | 78 GiB |
 
 First set the host up ([docs/s1/HOST-TUNING.md](../docs/s1/HOST-TUNING.md)): without the GTT change none of these load.
-Step by step, the upgrade (v60–v71 share v72's disk-cache key; v59 needs an adopt step) and the rollback to `:v71`:
+Step by step, the upgrade (v60–v72 share v73's disk-cache key; v59 needs an adopt step) and the rollback to `:v72`:
 [docs/s1/DEPLOY.md](../docs/s1/DEPLOY.md). Why these weights: [docs/s1/WEIGHTS.md](../docs/s1/WEIGHTS.md). Every flag and knob:
 [docs/s1/KNOBS.md](../docs/s1/KNOBS.md).
 
@@ -41,7 +41,7 @@ Both are idempotent and resumable (re-run after an interrupted download; finishe
 3. **Re-encode (hands only, CPU, a few minutes):** `tools/s1/gguf_hc_q8.py` turns the 290 BF16 `hc_*` tensors into Q8_0 and
    copies `output.weight` + `token_embd.weight` from the Q8_0 head, in one pass. The script checks that exactly those 292
    tensors changed type, compares the result with my file's sha256, and hardlinks the untouched PLE shard (no 29 GB copy).
-4. **Image:** `docker pull vahpetr/llama-cpp-s1-fork:v72` (s1) or `:v72k` (balkon). `BUILD=1` builds it from this tree instead.
+4. **Image:** `docker pull vahpetr/llama-cpp-s1-fork:v73` (s1) or `:v73k` (balkon). `BUILD=1` builds it from this tree instead.
 5. **Start** the compose file, wait for `/health` (up to 15-20 min; the brain's first start pre-reads the 33 GiB PLE range),
    print the expected GTT and fill time, and smoke-test: `/props` n_ctx, one short completion, `/disk-cache` own key and entries.
 
@@ -54,11 +54,11 @@ The prebuilt images are this tree built with upstream's `.devops/vulkan.Dockerfi
 
 ```sh
 git archive <rev> | docker build -f .devops/vulkan.Dockerfile --build-arg APP_REVISION=<rev> --label llama.rev=<rev> \
-  --target server -t vahpetr/llama-cpp-s1-fork:v72 -
+  --target server -t vahpetr/llama-cpp-s1-fork:v73 -
 ```
 
-`:v72` = `:v72k` = `:latest` = digest `sha256:fb2a1a0603dbf3d677cc3d6d29ffddca2c30e3de69eee8e8000377bb1b318e8f`, rev `608af6ea8` (`prod-v11-stage9-pkg12`; this branch adds docs, deploy files and `tools/s1` on top).
-`:v71` / `:v71k` are the rollback (rev `8bcde80da`, same disk-cache key): `LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v71`.
+`:v73` = `:v73k` = `:latest` = digest `sha256:653c9dacbb368ba27608080b72ef8ff88d4c7b319f8121a6d95ddec80bfde6bb`, rev `7597206a9` (`prod-v11-stage9-pkg13`; this branch adds docs, deploy files and `tools/s1` on top).
+`:v72` / `:v72k` are the rollback (rev `608af6ea8`, same disk-cache key): `LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v72`.
 Build with no model loaded on the GPU: on the 128 GB box a build next to a loaded model has run it out of memory.
 `docker compose -f <file> build` does the same from a checkout.
 
@@ -69,17 +69,17 @@ in docs/s1/WEIGHTS.md), then `docker compose -f <file> up -d`.
 
 ## First start: what to expect
 
-- **GTT after load** (`cat /sys/bus/pci/devices/<bdf>/mem_info_gtt_used`): brain-1m 104 538 MiB on v72, up to 105 364 MiB over a
+- **GTT after load** (`cat /sys/bus/pci/devices/<bdf>/mem_info_gtt_used`): brain-1m 104 538 MiB on v73, up to 105 364 MiB over a
   full 1M fill (admission bar 109 216 MiB on my host). `--kv-graph-span 0` reserves the compute buffers for the full span at
-  load, so an allocation error at load means the GTT limit is too small. The 524k and hands profiles have no v72 GTT measurement.
+  load, so an allocation error at load means the GTT limit is too small. The 524k and hands profiles have no v73 GTT measurement.
 - **Log proofs** (`-lv 4`): `n_ctx = 1048576` (or 525312), `freq_scale = 0.25` for target and draft, the QSA ratio line,
   `graph cache: K = 8`, `kq_vis: on`, and on gfx1151 `qsa_topk: onepass on`, `qsa_topk: v3 on (... from 2 rows ...)`,
   `qsa_bias_fold: on`, `gdn_replay: on (default on gfx1151)`, `hc_tail_fuse: on`, `add_rms_rows: on`,
-  `qwen4exp merge plan: on (default on gfx1151)`, `prewarm_shapes: on`. An `off (<reason>)` line names what is missing on your device.
-- **Speed** on s1 (v72): [docs/s1/BENCHMARKS.md](../docs/s1/BENCHMARKS.md).
+  `qwen4exp merge plan: on (default on gfx1151)`, `prewarm_shapes: on`, `decode_fuse: on`. An `off (<reason>)` line names what is missing on your device.
+- **Speed** on s1 (v73): [docs/s1/BENCHMARKS.md](../docs/s1/BENCHMARKS.md).
 - **Host RAM:** the PLE table lives in the page cache, so `MemAvailable` sits at a few GiB on s1 with the brain loaded. That is
   normal. Do not start a second model or a big build on the same box.
-- **Disk prompt cache** (`slots/prompt-cache/<profile>`): ~15 KB per cached token (the v72 1M slot file is 17.09 GiB). One
+- **Disk prompt cache** (`slots/prompt-cache/<profile>`): ~15 KB per cached token (the v73 1M slot file is 17.09 GiB). One
   directory per profile. Each build key has its own `ns-<key>` subdirectory; a new key starts empty unless you adopt the old one
   (`--cache-disk-adopt`, docs/s1/DEPLOY.md). Namespaces of other keys are left alone until they sit idle past the TTL or
   together pass half the quota; an adopted one is never removed.

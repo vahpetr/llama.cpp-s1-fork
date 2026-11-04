@@ -19,7 +19,7 @@ native context 262 144.
 
 **Why this quant.** i1-Q4_K_M is 5.39 bits per weight over the whole file. The PLE table (32.8 GiB, Q5_0: its rows are 160 wide,
 so K-quants fall back to Q5_0) stays in host RAM through mmap; the rest (78.2 GiB) goes to the GPU. With a 1M-token q8_0 KV,
-the QSA indexer cache and the draft, GTT is 104 538 MiB after load on v72 (GTT limit 108 GiB), which leaves the OS the rest of
+the QSA indexer cache and the draft, GTT is 104 538 MiB after load on v73 (GTT limit 108 GiB), which leaves the OS the rest of
 the 124 GiB it sees, most of it page cache for the PLE table. By my arithmetic an i1-Q5_K_M trunk (89 GiB) would not fit next to the 1M KV; i1-IQ4_XS (64 GiB
 trunk) fits easily, but Q4_K_M fit and I never needed to step down.
 
@@ -34,10 +34,10 @@ p 0.008), and +3.4 points (not significant) on 8k/32k controls. The two files co
 "not worse at depth", not a clean abliteration effect. I kept the uncensored one.
 
 **Draft head.** The MTP head is exported from the official checkpoint (the abliteration changed four MTP tensors; the official
-head drafts the uncensored target: acceptance 0.800-0.877 at 32k-1M on v72 with the pruned copy below). My servers run a vocabulary-pruned
+head drafts the uncensored target: acceptance 0.800-0.877 at 32k-1M on v73 with the pruned copy below). My servers run a vocabulary-pruned
 copy of the same head (65 536 of 248 320 output rows, fork patch 0007, `mtp-...Q4_K_M.v65536-v5.gguf`, sha `afeabdf62af8227b`).
 The ranking behind the pruning is built partly from my own traffic, so I do not publish it. The full-vocabulary dzannotti file
-loads the same way; I have not measured the speed difference on v72, so treat the README decode numbers as an upper bound
+loads the same way; I have not measured the speed difference on v73, so treat the README decode numbers as an upper bound
 for it.
 
 ## 2. Hands (balkon, Ryzen 9 7940HS + Radeon 780M, 96 GB)
