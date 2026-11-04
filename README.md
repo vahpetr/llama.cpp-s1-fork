@@ -4,8 +4,8 @@ This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) for one mac
 Radeon 8060S iGPU, gfx1151, 128 GB unified memory) on Vulkan (RADV), not ROCm. The model is Qwen3.8-Flash-Next (`qwen4exp`), a
 177B-parameter MoE with about 6B active parameters per token, an MTP head and vision. Stock llama.cpp runs this model with a
 dense window of at most 262 144 tokens and no working speculative decoding. This fork runs it with a 1 048 576-token context in
-one slot, with sparse attention, MTP drafting and a disk prompt cache. This README describes release v73 (fork revision
-`7597206a9`, `prod-v11-stage9-pkg13`).
+one slot, with sparse attention, MTP drafting and a disk prompt cache. This README describes release v74 (fork revision
+`e5f793eae` = v73 `7597206a9` + webui-only changes; the server code and every number below are v73's).
 
 ## Measured on v73, by context depth
 
@@ -19,7 +19,7 @@ one slot, with sparse attention, MTP drafting and a disk prompt cache. This READ
 | 1M | 615.4 (step) | 57.2 (17.47) | 0.877 | 1 247 ms |
 
 GTT after load: 104 538 MiB (admission bar 109 216 MiB). Cold fill 0 → 1 046 528 tokens: 26.60 min (sum of 17 step walls).
-Hands (Radeon 780M, `:v73k`): 28.4 t/s on a short chat, first request after start. "—" = not measured on v73.
+Hands (Radeon 780M, `:v73k`, same server as `:v74k`): 28.4 t/s on a short chat, first request after start. "—" = not measured on v73.
 Per-run tables and the method: [docs/s1/BENCHMARKS.md](docs/s1/BENCHMARKS.md).
 
 Measurement setup:
@@ -94,8 +94,8 @@ deploy/s1/setup-brain.sh --dry-run && deploy/s1/setup-brain.sh           # Strix
 deploy/balkon/setup-hands.sh --dry-run && deploy/balkon/setup-hands.sh   # Radeon 780M: 5-slot hands
 ```
 
-Images on Docker Hub, `vahpetr/llama-cpp-s1-fork`: `:v73` (brain) and `:v73k` (hands) are this release, one image;
-`:v72` / `:v72k` are the rollback. Host settings: [docs/s1/HOST-TUNING.md](docs/s1/HOST-TUNING.md). Upgrade, rollback
+Images on Docker Hub, `vahpetr/llama-cpp-s1-fork`: `:v74` (brain) and `:v74k` (hands) are this release, one image;
+`:v73` / `:v73k` are the rollback. Host settings: [docs/s1/HOST-TUNING.md](docs/s1/HOST-TUNING.md). Upgrade, rollback
 and disk-cache keys: [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md). Compose files and flags: [deploy/README.md](deploy/README.md).
 
 ## For AI agents
@@ -111,7 +111,7 @@ and disk-cache keys: [docs/s1/DEPLOY.md](docs/s1/DEPLOY.md). Compose files and f
 5. Hardware for the 1M brain: Strix Halo with 128 GB and GTT 108 GiB (`ttm.pages_limit=28311552`). For the hands: a Radeon
    780M-class box with 96 GB and GTT 78 GiB.
 6. Weights and sha256: [docs/s1/WEIGHTS.md](docs/s1/WEIGHTS.md). About 160 GB free disk for the brain, 150 GB for the hands.
-7. Docker Hub tags: `:v73` brain, `:v73k` hands (same image), `:v72` / `:v72k` rollback. `BUILD=1` builds the image from this tree instead.
+7. Docker Hub tags: `:v74` brain, `:v74k` hands (same image), `:v73` / `:v73k` rollback. `BUILD=1` builds the image from this tree instead.
 8. Verify: `curl -sf http://127.0.0.1:8000/health`, `/props` shows `n_ctx` 1048576, then one chat request
    ([docs/s1/DEPLOY.md](docs/s1/DEPLOY.md), "Smoke checks").
 9. Flags and environment knobs with defaults and classes: [docs/s1/KNOBS.md](docs/s1/KNOBS.md).

@@ -1,9 +1,20 @@
 # Release notes
 
-## v73
+## v74
+
+Fork revision `e5f793eae` (`ui-agentic-actions` = v73 `7597206a9` + six webui commits, patches 0469–0474). Images
+`vahpetr/llama-cpp-s1-fork:v74` (brain) and `:v74k` (hands), one image; the rollback is `:v73` / `:v73k`. Webui only: the server,
+ggml and every shared library are byte-identical to v73 (only the embedded UI changed), the disk-cache key is unchanged, so every
+number in BENCHMARKS.md is v73's.
+
+- **Agentic bubbles:** Fork, Continue and Copy act on the flow's last assistant message (the root holds only reasoning and tool calls).
+- **Continue after a cut reply:** a reply that ends mid-sentence offers Continue (judged on the last line only); Continue joins the
+  continuation without repeating the prefilled text.
+
+## v73 (server; unchanged in v74)
 
 Fork revision `7597206a9` (`prod-v11-stage9-pkg13`). Images `vahpetr/llama-cpp-s1-fork:v73` (brain) and `:v73k` (hands), one
-image; the rollback is `:v72` / `:v72k`. Measurements: [BENCHMARKS.md](BENCHMARKS.md). Deploy, upgrade and rollback:
+image; the rollback was `:v72` / `:v72k`. Measurements: [BENCHMARKS.md](BENCHMARKS.md). Deploy, upgrade and rollback:
 [DEPLOY.md](DEPLOY.md).
 
 New in v73 (all code defaults, no compose change; on gfx1151 against the published v72 numbers: step 262k +3.0 %, step 1M
