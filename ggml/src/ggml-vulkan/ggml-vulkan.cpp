@@ -17458,7 +17458,10 @@ static void ggml_vk_shexp_glu_sig_dispatch_fused(ggml_backend_vk_context * ctx, 
 }
 
 // [TAG_DECODE_FUSE] D3 "gdn_qk_gate" dispatch (validated by ggml_vk_can_fuse_gdn_qk_gate)
-static int ggml_vk_can_fuse_gdn_qk_gate(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int * gate_add);
+// *refused (when the pattern matched and only the cross-branch preflight refused it) = "crossdep:", the
+// GGML_VK_FUSION_COUNT prefix of that refusal
+static int ggml_vk_can_fuse_gdn_qk_gate(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
+                                        int * gate_add = nullptr, const char ** refused = nullptr);
 static void ggml_vk_gdn_qk_gate_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     int ai = -1;
     const int n_extra = ggml_vk_can_fuse_gdn_qk_gate(ctx, cgraph, node_idx, &ai);
@@ -23057,7 +23060,7 @@ static int ggml_vk_can_fuse_shexp_glu_sig(ggml_backend_vk_context * ctx, const s
 static bool ggml_vk_can_fuse_rms_norm_scale(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
 static bool ggml_vk_can_fuse_add_softplus_mul(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
 static int ggml_vk_can_fuse_gdn_qk_gate(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
-                                        int * gate_add = nullptr) {
+                                        int * gate_add, const char ** refused) {
     if (!ggml_vk_decode_fuse_enabled() || node_idx + 6 >= cgraph->n_nodes || node_idx < 1) {
         return 0;
     }
@@ -23109,6 +23112,52 @@ static int ggml_vk_can_fuse_gdn_qk_gate(ggml_backend_vk_context * ctx, const str
                         CEIL_DIV(ggml_nelements(mul), 128);
     if (wgs > (int64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
         return 0;
+    }
+    // cross-branch dependency: the q norm, the k norm and the gate run in separate workgroups of ONE dispatch with no
+    // barrier between them, so no node of the range may read a result of the range except along its own chain
+    // (SCALE <- its RMS_NORM, SOFTPLUS <- ADD, MUL <- SOFTPLUS; exact pointers, already required above). Any other
+    // source - directly, through a view (view_src) or through a no-op node of the range - that resolves to one of the
+    // six computed nodes (e.g. RMS(x) -> SCALE_A -> RMS(SCALE_A) -> SCALE_B, or a gate input viewing SCALE_A) refuses,
+    // and the else-if chain keeps today's rms_norm_scale x 2 + add_softplus_mul (separate dispatches, synchronised).
+    {
+        const int computed[6] = { node_idx, node_idx + 1, node_idx + 2, node_idx + 3, j, j + 1 };
+        auto const resolves_into_range = [&](const ggml_tensor * t) -> bool {
+            for (int depth = 0; t && depth < 16; ++depth) {
+                for (int c : computed) {
+                    if (t == cgraph->nodes[c] || (t->view_src && t->view_src == cgraph->nodes[c])) {
+                        return true;
+                    }
+                }
+                bool noop_in_range = false;
+                for (int n = node_idx + 4; n < j; ++n) {
+                    noop_in_range |= cgraph->nodes[n] == t;
+                }
+                if (!noop_in_range) {
+                    return false;
+                }
+                t = t->src[0];
+            }
+            return t != nullptr;   // a chain deeper than the window: refuse
+        };
+        for (int n = node_idx; n <= j + 2; ++n) {
+            const ggml_tensor * node = cgraph->nodes[n];
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = node->src[s];
+                if (!src) {
+                    continue;
+                }
+                const bool chain_edge = s == 0 && ((n == node_idx + 1 && src == cgraph->nodes[node_idx]) ||
+                                                   (n == node_idx + 3 && src == cgraph->nodes[node_idx + 2]) ||
+                                                   (n == j + 1 && src == add) ||
+                                                   (n == j + 2 && src == cgraph->nodes[j + 1]));
+                // a no-op node's own source is checked where a computed node reads the no-op node
+                const bool noop = n >= node_idx + 4 && n < j;
+                if (!chain_edge && !noop && resolves_into_range(src)) {
+                    if (refused) { *refused = "crossdep:"; }
+                    return 0;
+                }
+            }
+        }
     }
     if (gate_add) { *gate_add = j; }
     return j + 2 - node_idx;
@@ -24498,6 +24547,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             int  hc_tail_n       = 0;
             bool hc_tail_overlap = false;
             bool hcr_overlap = false;   // [TAG_ADD_RMS_ROWS] hc_combine_rms matched but hc_norm overlaps a source
+            const char * gdn_refused = nullptr;   // [TAG_DECODE_FUSE] gdn_qk_gate matched but its preflight refused it
             // RMS_NORM_MUL_SIGMOID_MUL (2) / RMS_NORM_MUL_MUL (1) / none (0): evaluated once per RMS_NORM node
             const int rms_norm_mul2 = cgraph->nodes[i]->op == GGML_OP_RMS_NORM ? ggml_vk_can_fuse_rms_norm_mul2(ctx, cgraph, i) : 0;
             if (num_adds && !vk_fusion_veto(ctx, "multi_add")) {
@@ -24569,7 +24619,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
-            } else if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM && ggml_vk_can_fuse_gdn_qk_gate(ctx, cgraph, i) > 0 &&
+            } else if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM && ggml_vk_can_fuse_gdn_qk_gate(ctx, cgraph, i, nullptr, &gdn_refused) > 0 &&
                        !vk_fusion_veto(ctx, "gdn_qk_gate")) {
                 // [TAG_DECODE_FUSE] D3 gdn_qk_gate: three outputs (the two SCALEs, nodes 1 and 3, and the MUL, last). The
                 // norms read whole rows and the gate reads alpha at its own (head, row): nothing is elementwise.
@@ -24803,6 +24853,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
             if (hc_tail_overlap && fusion_count) {
                 ggml_vk_fusion_count_add(fusion_counts, "overlap:", "hc_tail_mix");
+            }
+            if (gdn_refused && fusion_count) {
+                ggml_vk_fusion_count_add(fusion_counts, gdn_refused, "gdn_qk_gate");
             }
             if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
                 // Look for an additional scale op to fuse - occurs in deepseek2 and nemotron3 nano.

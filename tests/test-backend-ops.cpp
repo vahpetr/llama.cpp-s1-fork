@@ -4993,6 +4993,10 @@ struct test_add_softplus_mul_fuse : public test_case {
 //     arm B: the SIGMOID built before the GLU (not consecutive) = today's GLU + UNARY
 //   kind 2 gdn_qk_gate    RMS_NORM -> SCALE (q), RMS_NORM -> SCALE (k), ADD -> SOFTPLUS -> MUL (the decay pre-chain)
 //     arm B: the gate chain built before the norms = today's rms_norm_scale x 2 + add_softplus_mul
+//   kind 3 gdn_qk_gate_crossdep  regression (astra pkg13 Critical): the k branch norms the q branch's SCALE,
+//                         RMS(q) -> SCALE_A -> RMS(SCALE_A) -> SCALE_B -> gate. One dispatch would read SCALE_A in
+//                         other workgroups while it is written, so the matcher must refuse and arm A must run today's
+//                         rms_norm_scale x 2 + add_softplus_mul like arm B (same floats)
 // rows = decode / MTP-verify / multi-slot widths (the fusions take <= 32 rows; 33 is the refused boundary). strided:
 // kind 0 reads shexp and moe_out as row views of wider tensors; kind 2 reads q / k as views of the conv output (the
 // production layout) and alpha as the row view of the merged beta | alpha output; kind 1 takes contiguous tensors only.
@@ -5022,7 +5026,7 @@ struct test_decode_fuse_exact : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        static const char * names[] = { "shexp_tail", "shexp_glu_sig", "gdn_qk_gate" };
+        static const char * names[] = { "shexp_tail", "shexp_glu_sig", "gdn_qk_gate", "gdn_qk_gate_crossdep" };
         const std::string fusion = names[kind];
         return VARS_TO_STR5(fusion, rows, n_seqs, strided, gate_row);
     }
@@ -5148,7 +5152,8 @@ struct test_decode_fuse_exact : public test_case {
         auto const & norms = [&](int arm) {
             oq[arm] = ggml_scale(ctx, ggml_rms_norm(ctx, q, 1e-6f / n), 1.0f / sqrtf(n));
             expand(oq[arm]);
-            ok[arm] = ggml_scale(ctx, ggml_rms_norm(ctx, k, 1e-6f / n), 1.0f / sqrtf(n));
+            // kind 3: the second norm reads the first one's SCALE (the cross-branch dependency the matcher refuses)
+            ok[arm] = ggml_scale(ctx, ggml_rms_norm(ctx, kind == 3 ? oq[arm] : k, 1e-6f / n), 1.0f / sqrtf(n));
             expand(ok[arm]);
         };
         auto const & gate = [&](int arm) {
@@ -5164,7 +5169,7 @@ struct test_decode_fuse_exact : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * out = kind == 0 ? build_shexp_tail(ctx) : kind == 1 ? build_shexp_glu_sig(ctx) : build_gdn_qk_gate(ctx);
+        ggml_tensor * out = kind == 0 ? build_shexp_tail(ctx) : kind == 1 ? build_shexp_glu_sig(ctx) : build_gdn_qk_gate(ctx);   // 2, 3
         ggml_set_name(out, "out");
         return out;
     }
@@ -12139,6 +12144,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_decode_fuse_exact(2, 3, 2, true));    // two sequences
     test_cases.emplace_back(new test_decode_fuse_exact(2, 16, 2, false));  // 32 rows over two sequences
+    // regression: the cross-branch dependency must be refused (arm A = arm B = today's dispatches)
+    for (int64_t nt : { 1, 6 }) {
+        for (bool strided : { false, true }) {
+            test_cases.emplace_back(new test_decode_fuse_exact(3, nt, 1, strided));
+        }
+    }
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
