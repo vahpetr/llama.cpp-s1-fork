@@ -11,8 +11,8 @@ Status column:
 - **v63**: in this tree since v63 (released 2026-10-21; in production 2026-10-21 06:32 to 22:12); "v63, on" / "v63, off" = the default of its knob.
 - **v64**: in this tree since v64 (released 2026-10-21); "v64, on" = on by default.
 
-This tree is v72: fork revision `608af6ea8` (`prod-v11-stage9-pkg12`), image `vahpetr/llama-cpp-s1-fork:v72`. Every row
-below is still in it. The rows after 0265 (v65-v73, up to 0458) give the title, the patch file and the commit; the status column is the first
+This tree is v74: fork revision `e5f793eae` (`ui-agentic-actions`), image `vahpetr/llama-cpp-s1-fork:v74`. Every row
+below is still in it. The rows after 0265 (v65-v74, up to 0474) give the title, the patch file and the commit; the status column is the first
 image that carried it. Their knobs are in docs/s1/KNOBS.md, section "Added after patch 0265".
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
@@ -431,6 +431,12 @@ records and upstream status live in my private repo; ask if you want one.
 | 0456 | tests: DECODE_FUSE_EXACT case gdn_qk_gate_views (RESHAPE nodes between the norms and the gate, must fuse) (`0456-tests-decode-fuse-exact-views-case.patch`, 5f732f95b) | v73 (class tests) |
 | 0457 | vulkan: gdn_qk_gate refuses view_src storage aliases between what it reads and writes, OP_NONE included (`0457-vulkan-gdn-qk-gate-refuses-view-src-storage-alias.patch`, b7d362d57) | v73 (class EXACT) |
 | 0458 | tests: DECODE_FUSE_EXACT case gdn_qk_gate_aliasroot (must refuse) (`0458-tests-decode-fuse-exact-aliasroot-case.patch`, 7597206a9) | v73 (class tests) |
+| 0469 | webui: the agentic bubble's Fork / Continue act on the flow's last message; rule 3 detects a mid-sentence cut (`0469-webui-agentic-fork-continue-targets.patch`, 59249622a) | v74 (class webui) |
+| 0470 | webui: review r1 - echo-aware manual Continue join, rule 3 judges the last line, no Fork while the flow streams (`0470-webui-continuation-echo-join-rule3-review-fixes.patch`, f3fc8679f) | v74 (class webui) |
+| 0471 | webui: review r2 - Continue / Fork retarget in the classifier and the fork store, one echo-aware join (`0471-webui-review-round2-fixes.patch`, ba617c534) | v74 (class webui) |
+| 0472 | webui: review r3 - a completed stream ending inside the echo keeps the partial but is flagged (`0472-webui-astra-r2-fixes.patch`, 7508dfb64) | v74 (class webui) |
+| 0473 | webui: Copy on an agentic bubble copies the flow's final answer (`0473-webui-agentic-copy-target.patch`, 2dac0029a) | v74 (class webui) |
+| 0474 | webui: rule 3 drops the fence-fragment heuristic and its stoplist (last-line rule only) (`0474-webui-rule3-drop-fence-fragment-stoplist.patch`, e5f793eae) | v74 (class webui) |
 
 **0227-0240 apply order** on v59 (`a1b6c324e`): 0227, 0228, 0229, 0230, 0231, 0232, **0234, 0233**, 0235, 0236, 0237, 0238,
 0239, 0240 (0233 sits on 0234). Applied with a strict `git am` in that order they reproduce the v60 tree (`845c6fbcd`,

@@ -7,7 +7,7 @@
 #     (P(EOS) at a mid-code stop 0.021 on IQ3_S-hc8, 0.001 on IQ3_S-hc8-o8).
 # Context: one pool of 917 504 cells shared by 5 slots (--kv-unified), any single slot can grow to the whole pool;
 # YaRN x4 over 262 144 + QSA above 64k. Needs a 78 GiB GTT limit.
-# Image: :v73k (release v73; the same image as the brain's :v73). Deploy smoke on v73: 28.4 t/s on a short chat.
+# Image: :v74k (release v73; the same image as the brain's :v74). Deploy smoke on v73: 28.4 t/s on a short chat.
 #
 #   deploy/balkon/setup-hands.sh        # downloads + checks the weights, pulls the image, starts this file, smoke-tests it
 #   or by hand: docker compose -f docker-compose.hands.yml up -d   (MODELS_DIR / SLOTS_DIR / LLAMA_S1_IMAGE override the defaults)
@@ -20,7 +20,7 @@ services:
       context: ../..
       dockerfile: .devops/vulkan.Dockerfile
       target: server
-    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v73k}   # prebuilt; `docker compose build` builds the same thing from this tree
+    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v74k}   # prebuilt; `docker compose build` builds the same thing from this tree
     container_name: llama-s1-hands
     restart: unless-stopped
     stop_grace_period: 90s            # on SIGTERM the server writes its slots to the disk prompt cache
