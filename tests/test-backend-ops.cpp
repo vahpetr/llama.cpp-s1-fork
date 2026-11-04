@@ -5011,6 +5011,8 @@ struct test_add_softplus_mul_fuse : public test_case {
 //                         input (the in-place alias ggml-alloc can produce; out->view_src as test_topk_qsa does), arm B
 //                         reads its own copy q_b of q. The 3-output range must refuse in its matcher so arm A still
 //                         runs today's rms_norm_scale (exact alias, elementwise) x 2 + add_softplus_mul
+//   kind 5 gdn_qk_gate_views  kind 2 with RESHAPE nodes of both SCALE outputs between the norms and the gate (the
+//                         production order: the matcher skips no-op nodes before the ADD), must still fuse
 // rows = decode / MTP-verify / multi-slot widths (the fusions take <= 32 rows; 33 is the refused boundary). strided:
 // kind 0 reads shexp and moe_out as row views of wider tensors; kind 2 reads q / k as views of the conv output (the
 // production layout) and alpha as the row view of the merged beta | alpha output; kind 1 takes contiguous tensors only.
@@ -5047,7 +5049,8 @@ struct test_decode_fuse_exact : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        static const char * names[] = { "shexp_tail", "shexp_glu_sig", "gdn_qk_gate", "gdn_qk_gate_crossdep", "gdn_qk_gate_alias" };
+        static const char * names[] = { "shexp_tail", "shexp_glu_sig", "gdn_qk_gate", "gdn_qk_gate_crossdep", "gdn_qk_gate_alias",
+                                        "gdn_qk_gate_views" };
         const std::string fusion = names[kind];
         return VARS_TO_STR5(fusion, rows, n_seqs, strided, gate_row);
     }
@@ -5199,6 +5202,11 @@ struct test_decode_fuse_exact : public test_case {
             expand(og[arm]);
         };
         norms(0);
+        if (kind == 5) {
+            // no-op nodes between the norms and the gate, as the GDN layer reshapes q / k before the delta-net op
+            expand(ggml_reshape_3d(ctx, oq[0], head_k_dim * n_k_heads, rows, n_seqs));
+            expand(ggml_reshape_3d(ctx, ok[0], head_k_dim * n_k_heads, rows, n_seqs));
+        }
         gate(0);
         gate(1);
         norms(1);
@@ -5248,7 +5256,7 @@ struct test_decode_fuse_exact : public test_case {
         if (kind == 0 || kind == 1) {
             want[kind] = d3 && rows <= 32 ? 1 : 0;
         } else {
-            const bool fuse = d3 && kind == 2 && rows * n_seqs <= 32;
+            const bool fuse = d3 && (kind == 2 || kind == 5) && rows * n_seqs <= 32;
             want[2] = fuse ? 1 : 0;
             want[3] = fuse ? 2 : 4;   // rms_norm_scale: arm B's two (+ arm A's two when it does not fuse)
             want[4] = fuse ? 1 : 2;   // add_softplus_mul: arm B's one (+ arm A's)
@@ -5266,7 +5274,7 @@ struct test_decode_fuse_exact : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * out = kind == 0 ? build_shexp_tail(ctx) : kind == 1 ? build_shexp_glu_sig(ctx) : build_gdn_qk_gate(ctx);   // 2, 3, 4
+        ggml_tensor * out = kind == 0 ? build_shexp_tail(ctx) : kind == 1 ? build_shexp_glu_sig(ctx) : build_gdn_qk_gate(ctx);   // 2..5
         ggml_set_name(out, "out");
         return out;
     }
@@ -12257,6 +12265,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // regression: the in-place RMS-input / SCALE-output alias refuses in the matcher, v72's rms_norm_scale fires
         test_cases.emplace_back(new test_decode_fuse_exact(4, nt, 1, false));
+        // the production order: reshapes of both SCALE outputs between the norms and the gate, still one fusion
+        for (bool strided : { false, true }) {
+            test_cases.emplace_back(new test_decode_fuse_exact(5, nt, 1, strided));
+        }
     }
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
