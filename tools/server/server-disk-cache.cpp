@@ -408,12 +408,14 @@ static bool get_vec(std::istream & f, std::vector<uint8_t> & v) {
 bool server_disk_cache_env_neutral(const std::string & kv) {
     const std::string name = kv.substr(0, kv.find('='));
     return name.rfind("LLAMA_ARG_CACHE_DISK", 0) == 0 || name == "LLAMA_ARG_CHAT_TEMPLATE" ||
-           name == "LLAMA_ARG_CHAT_TEMPLATE_FILE";
+           name == "LLAMA_ARG_CHAT_TEMPLATE_FILE" ||
+           name == "LLAMA_ARG_DRIFT_GUARD"; // [TAG_DRIFT_GUARD] a stop rule: the KV state it leaves is compatible either way
 }
 
 bool server_disk_cache_argv_neutral(const std::string & arg, bool * skip_value) {
     const std::string opt = arg.substr(0, arg.find('='));
-    if (arg.rfind("--cache-disk", 0) == 0 || opt == "--chat-template" || opt == "--chat-template-file") {
+    if (arg.rfind("--cache-disk", 0) == 0 || opt == "--chat-template" || opt == "--chat-template-file" ||
+            opt == "--drift-guard") { // [TAG_DRIFT_GUARD]
         *skip_value = arg.find('=') == std::string::npos;
         return true;
     }
