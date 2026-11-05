@@ -159,7 +159,7 @@ class AgenticStore {
 	// permission, continue and steering gates the loop waits on between turns
 	private gates = new AgenticGates();
 	/** W1.2: how the last turn of a conversation's flow ended (rules 2 / 3 after the flow) */
-	private lastTurns = new Map<string, { finish?: string; byReserve: boolean }>();
+	private lastTurns = new Map<string, { finish?: string; stopType?: string; byReserve: boolean }>();
 	private sessions = new SvelteMap<string, AgenticSession>();
 
 	get isAnyRunning(): boolean {
@@ -452,7 +452,9 @@ class AgenticStore {
 	 * reserve off, or the configured limit applies), 0 = no room above the reserve.
 	 */
 	/** W1.2: how the last turn of the conversation's last flow ended, consumed once. */
-	takeLastTurn(conversationId: string): { finish?: string; byReserve: boolean } | undefined {
+	takeLastTurn(
+		conversationId: string
+	): { finish?: string; stopType?: string; byReserve: boolean } | undefined {
 		const t = this.lastTurns.get(conversationId);
 
 		this.lastTurns.delete(conversationId);
@@ -614,6 +616,7 @@ class AgenticStore {
 			let lastStreamingToolCallArgsLength = 0;
 			let turnTimings: ChatMessageTimings | undefined;
 			let turnFinish: string | undefined;
+			let turnStopType: string | undefined;
 
 			const turnStats: ChatMessageAgenticTurnStats = {
 				llm: { predicted_ms: 0, predicted_n: 0, prompt_ms: 0, prompt_n: 0 },
@@ -636,10 +639,12 @@ class AgenticStore {
 							_r?: string,
 							_t?: ChatMessageTimings,
 							_tc?: string,
-							finish?: string
+							finish?: string,
+							stopType?: string
 						) => {
 							// the rest is handled after sendMessage resolves
 							turnFinish = finish;
+							turnStopType = stopType;
 						},
 						onCompletionId,
 						onError: (error: Error) => {
@@ -792,7 +797,8 @@ class AgenticStore {
 					byReserve:
 						(turnOptions as { byReserve?: boolean }).byReserve === true ||
 						(turnOptions !== options && sent > 0 && !(max > 0 && sent >= max)),
-					finish: turnFinish
+					finish: turnFinish,
+					stopType: turnStopType
 				});
 
 				agenticTimings.perTurn!.push(turnStats);

@@ -304,8 +304,11 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	async afterReply(
 		convId: string,
 		messageId: string,
-		info: { finish?: string; byReserve: boolean; toolCalls: boolean }
+		info: { finish?: string; stopType?: string; byReserve: boolean; toolCalls: boolean }
 	): Promise<void> {
+		// how the request ended, on the message (the drift guard keys on stop_type)
+		await this.recordFinish(messageId, info.finish, info.stopType);
+
 		if (info.toolCalls || conversationsStore.activeConversation?.id !== convId) return;
 
 		const target = { convId, messageId };
@@ -340,6 +343,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		this.clearChatStreaming(convId);
 		this.processing.setState(convId, null);
 	}
+
 	clearChatStreaming(convId: string, messageId?: string): void {
 		// session aware: a stale generation must not wipe a newer one's streaming state on the
 		// same conversation, that would drop the frozen stop identity and stop the wrong session
@@ -357,7 +361,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		this.isEditModeActive = false;
 		this.addFilesHandler = null;
 	}
-
 	clearPendingEditMessageId(): void {
 		this.pendingEditMessageId = null;
 	}
@@ -1528,6 +1531,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					await this.afterReply(convId, currentMessageId, {
 						byReserve: lastTurn.byReserve,
 						finish: lastTurn.finish,
+						stopType: lastTurn.stopType,
 						toolCalls: false
 					});
 				}
@@ -1558,7 +1562,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					reasoningContent?: string,
 					timings?: ChatMessageTimings,
 					toolCalls?: string,
-					finishReason?: string
+					finishReason?: string,
+					stopType?: string
 				) => {
 					const content = streamedContent || finalContent || '';
 					const reasoning = streamedReasoningContent || reasoningContent;
@@ -1595,6 +1600,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					await this.afterReply(convId, currentMessageId, {
 						byReserve: replyCap.byReserve === true,
 						finish: finishReason,
+						stopType,
 						toolCalls: !!toolCalls && toolCalls !== '[]'
 					});
 
@@ -1627,6 +1633,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			abortController.signal
 		);
 	}
+
 	syncLoadingStateForChat(convId: string): void {
 		const s = this.chatStreamingStates.get(convId);
 
@@ -1642,7 +1649,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			}
 		}
 	}
-
 	async syncRemoteRunningStreams(): Promise<void> {
 		return this.streams.syncRemoteRunningStreams();
 	}
@@ -1921,11 +1927,23 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 	/** W1.2: note on a reply the rules could not finish (shown under the message). */
 	private async markReply(messageId: string, note: string): Promise<void> {
-		await DatabaseService.updateMessage(messageId, { replyNote: note });
+		await this.patchMessage(messageId, { replyNote: note });
+	}
+
+	/** Write a partial update of a message to the DB and mirror it into the open view. */
+	private async patchMessage(messageId: string, update: Partial<DatabaseMessage>): Promise<void> {
+		await DatabaseService.updateMessage(messageId, update);
 
 		const idx = conversationsStore.findMessageIndex(messageId);
 
-		if (idx >= 0) conversationsStore.updateMessageAtIndex(idx, { replyNote: note });
+		if (idx >= 0) conversationsStore.updateMessageAtIndex(idx, update);
+	}
+
+	/** Persist finish_reason + stop_type of the request that produced a reply (DB + open view). */
+	private async recordFinish(messageId: string, finish?: string, stopType?: string): Promise<void> {
+		if (finish === undefined && stopType === undefined) return;
+
+		await this.patchMessage(messageId, { finishReason: finish, stopType });
 	}
 
 	private async runCompaction(
