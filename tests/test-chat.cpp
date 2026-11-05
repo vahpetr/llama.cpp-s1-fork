@@ -6593,6 +6593,43 @@ static void test_template_generation_prompt() {
     }
 
     {
+        // qwen3.8-flash-next-preserve-ws.jinja: history turns keep the reasoning's trailing newline(s) as generated;
+        // trimmed / whitespace-free reasoning renders as the GGUF template does (trim + "\n</think>")
+      for (const char * path : { "models/templates/qwen3.8-flash-next-preserve-ws.jinja",
+                                 "models/templates/qwen3.8-flash-next-gsq-preserve-ws.jinja" }) {
+        auto tmpls = read_templates(path);
+        auto history = [&](const std::string & reasoning) {
+            common_chat_msg next_user;
+            next_user.role    = "user";
+            next_user.content = "Next";
+            common_chat_templates_inputs inputs;
+            inputs.messages              = { system_msg, message_user, simple_assist_msg("Hello", reasoning), next_user };
+            inputs.add_generation_prompt = true;
+            inputs.enable_thinking       = true;
+            return common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        };
+        assert_contains(history("I'm thinking\n\n"),   "<|im_start|>assistant\n<think>\nI'm thinking\n\n</think>\n\nHello<|im_end|>\n<|im_start|>user\nNext");
+        assert_contains(history("I'm thinking\n"),     "<|im_start|>assistant\n<think>\nI'm thinking\n</think>\n\nHello<|im_end|>\n<|im_start|>user\nNext");
+        assert_contains(history("I'm thinking"),       "<|im_start|>assistant\n<think>\nI'm thinking\n</think>\n\nHello<|im_end|>\n<|im_start|>user\nNext");
+        assert_contains(history("  I'm thinking  "),   "<|im_start|>assistant\n<think>\nI'm thinking\n</think>\n\nHello<|im_end|>\n<|im_start|>user\nNext");
+        assert_contains(history(" \nI'm thinking\n\n"), "<|im_start|>assistant\n<think>\nI'm thinking\n\n</think>\n\nHello<|im_end|>\n<|im_start|>user\nNext");
+        assert_contains(history(""),                   "<|im_start|>assistant\n<think>\n\n</think>\n\nHello<|im_end|>\n<|im_start|>user\nNext");
+        assert_contains(history("\n\n"),               "<|im_start|>assistant\n<think>\n\n</think>\n\nHello<|im_end|>\n<|im_start|>user\nNext");
+        assert_contains(history("foo  "),              "<|im_start|>assistant\n<think>\nfoo\n</think>\n\nHello<|im_end|>");
+        assert_contains(history(" foo\n"),             "<|im_start|>assistant\n<think>\nfoo\n</think>\n\nHello<|im_end|>");
+        assert_contains(history("foo\n\t"),            "<|im_start|>assistant\n<think>\nfoo\n</think>\n\nHello<|im_end|>");
+        assert_contains(history("A \n"),               "<|im_start|>assistant\n<think>\nA \n</think>\n\nHello<|im_end|>");
+        assert_ends_with(history("I'm thinking\n\n"),  "<|im_start|>assistant\n<think>\n");
+
+        // the trailing assistant turn (pre-encode) renders the same boundary through the continuation
+        check(tmpls, continuation_content(), "<|im_start|>assistant\n<think>\nI'm thinking\n</think>\n\nHello, ");
+        test_case_options opts = continuation_content();
+        opts.messages.back()   = simple_assist_msg("Hello, ", "I'm thinking\n\n");
+        check(tmpls, opts, "<|im_start|>assistant\n<think>\nI'm thinking\n\n</think>\n\nHello, ");
+      }
+    }
+
+    {
         auto tmpls = read_templates("models/templates/openai-gpt-oss-120b.jinja");
         check(tmpls, basic(),                  "<|start|>assistant");
         check(tmpls, continuation_content(),   "<|start|>assistant<|channel|>analysis<|message|>I'm thinking<|end|><|start|>assistant<|channel|>final<|message|>Hello, ");
