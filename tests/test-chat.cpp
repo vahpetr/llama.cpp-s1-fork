@@ -6575,6 +6575,21 @@ static void test_template_generation_prompt() {
         check(tmpls, basic(),                  "<|im_start|>assistant\n<think>\n");
         check(tmpls, continuation_content(),   "<|im_start|>assistant\n<think>\nI'm thinking\n</think>\n\nHello, ");
         check(tmpls, continuation_reasoning(), "<|im_start|>assistant\n<think>\nI'm");
+
+        // the boundary is rendered as generated: trailing newlines of the reasoning are kept,
+        // one "\n" is added only when the reasoning does not end with one
+        auto continuation_content_rc = [&](const std::string & reasoning) {
+            test_case_options opts = continuation_content();
+            opts.messages.back()   = simple_assist_msg("Hello, ", reasoning);
+            return opts;
+        };
+        check(tmpls, continuation_content_rc("I'm thinking\n\n"), "<|im_start|>assistant\n<think>\nI'm thinking\n\n</think>\n\nHello, ");
+        check(tmpls, continuation_content_rc("I'm thinking\n"),   "<|im_start|>assistant\n<think>\nI'm thinking\n</think>\n\nHello, ");
+        check(tmpls, continuation_content_rc("I'm thinking"),     "<|im_start|>assistant\n<think>\nI'm thinking\n</think>\n\nHello, ");
+        // one normalisation with the preserve-ws templates: lstrip; not ending in '\n' -> trim + "\n"
+        check(tmpls, continuation_content_rc("foo  "),            "<|im_start|>assistant\n<think>\nfoo\n</think>\n\nHello, ");
+        check(tmpls, continuation_content_rc(" foo\n"),           "<|im_start|>assistant\n<think>\nfoo\n</think>\n\nHello, ");
+        check(tmpls, continuation_content_rc("foo\n\t"),          "<|im_start|>assistant\n<think>\nfoo\n</think>\n\nHello, ");
     }
 
     {
