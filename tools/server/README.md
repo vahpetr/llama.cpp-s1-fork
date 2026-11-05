@@ -728,6 +728,7 @@ These words will not be included in the completion, so make sure to add them to 
   - `eos`: Stopped because it encountered the EOS token
   - `limit`: Stopped because `n_predict` tokens were generated before stop words or EOS was encountered
   - `word`: Stopped due to encountering a stopping word from `stop` JSON array provided
+  - `think_reenter`: Stopped by `drift_guard`: the content phase generated the think-close special token again (the token is not part of the reply). OAI-compatible responses report `finish_reason: "stop"` and carry `stop_type: "think_reenter"` in the choice (stream: `choices[0]` of the final chunk); Anthropic-compatible responses report `stop_reason: "end_turn"` plus a top-level `stop_type` (stream: in the `message_delta` event data) - all only for this stop
 - `stopping_word`: The stopping word encountered which stopped the generation (or "" if not stopped due to a stopping word)
 - `timings`: Hash of timing information about the completion such as the number of tokens `predicted_per_second`
 - `tokens_cached`: Number of tokens from the prompt which could be re-used from previous completion
