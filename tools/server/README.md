@@ -340,6 +340,16 @@ services:
       LLAMA_ARG_PORT: 8080
 ```
 
+### Reasoning boundary, finished-reply save, template flags and the disk cache
+
+The qwen3 prefill continuation and `models/templates/qwen3.8-flash-next{,-gsq}-preserve-ws.jinja` render a reasoning
+boundary as generated (`\n</think>` or `\n\n</think>`); the disk cache saves a finished reply that a shorter-prefix
+request would overwrite; `--chat-template` / `--chat-template-file` are not part of the cache fingerprint. Limits:
+
+- Prompt rendering changes by design for untrimmed reasoning (lstrip; kept if it ends with `\n`, else trim + `\n`); byte-identical to the GGUF template for trimmed / empty reasoning; whitespace-only, leading-whitespace and `A\n\t`-style suffixes are normalised; byte equality is not original token-id equality.
+- The finished-reply save is best-effort: it covers an interior divergence with >= 1024 lost tokens after an EOS / stop-word stop; it misses a divergence at the first generated token and a prefix-preserving pre-encode followed by a later divergent re-render.
+- The fingerprint exemption permits cache reuse across template (and guard) flags; the token keys of the entries are unchanged.
+
 ### MTP draft KV cache type
 
 With `--spec-type draft-mtp` the MTP draft context's K/V cache follows `--spec-draft-type-k` / `--spec-draft-type-v`
