@@ -45,6 +45,7 @@ enum stop_type {
     STOP_TYPE_EOS,
     STOP_TYPE_WORD,
     STOP_TYPE_LIMIT,
+    STOP_TYPE_THINK_REENTER, // [TAG_DRIFT_GUARD] the content phase generated the think-close special token again (not emitted)
 };
 
 struct task_params {

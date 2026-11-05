@@ -3394,6 +3394,29 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     }
 }
 
+void common_speculative_accept_rebase(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        // only the MTP row carry is rebased: eagle3 keeps a shifted-KV boundary row (token[P+1], g[P]) that a re-pick of
+        //   the carry does not reconcile, dflash / dspark keep their own state - the server never trims for these
+        //   (server_drift_guard_can_trim); refuse here too
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+            impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            LOG_WRN("%s: not supported for draft type %d, carry left as is\n", __func__, (int) impl->type);
+            return;
+        }
+    }
+    common_speculative_impl * last = spec->impl_last[seq_id];
+    for (auto & impl : spec->impls) {
+        if (impl->state_schema().empty()) {
+            continue; // no per-seq carry (the ngram implementations count statistics in accept())
+        }
+        impl->accept(seq_id, n_accepted, impl.get() != last);
+    }
+}
+
 // TODO: support the case of more than one speculative implementations having a state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
     if (spec == nullptr) {

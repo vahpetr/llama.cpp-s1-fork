@@ -12,6 +12,7 @@
 // serialization version of server_tokens::serialize (part of the disk cache state descriptor)
 constexpr uint32_t SERVER_TOKENS_STATE_VERSION = 1;
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -278,6 +279,90 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 // if the last character is potentially cut in half, return the index before the cut
 // if validate_utf8(text) == text.size(), then the whole text is valid utf8
 size_t validate_utf8(const std::string& text);
+
+// [TAG_DRIFT_GUARD] duplicate reasoning close guard (--drift-guard stop / "drift_guard": true)
+//
+// Token-level mirror of the chat parser's reasoning boundary for one reply: the state is initialised from the
+// generation prompt (the assistant prefill the parser also sees: role header, "<think>\n", or a continuation with
+// the reasoning already closed) and advanced by every generated token. "Reasoning closed" = the think-close special
+// token was seen after the start (or without one, as the parser's lenient form); the trigger is that same special
+// id generated again in the content phase. A different reasoning end tag (e.g. "<tool_call>") disarms the guard for
+// the rest of the reply - tool-call bodies are never cut.
+//
+// Armed ONLY for a dedicated once-per-reply think-close: the first reasoning end tag must be exactly one
+// CONTROL / USER_DEFINED token whose text is "</think>" (Qwen / DeepSeek family) - other templates (channel markers,
+// [/THINK], <|end|> that also delimits messages) are never armed.
+//
+// Only the special id is matched: a close the model spells as ordinary text pieces never triggers. Known gap:
+// "</think>" is a USER_DEFINED token on the Qwen vocabularies, so the TOKENIZER maps that text to the special id even
+// without parse_special - a prefill / history that quotes it counts as a close there (never as a trigger: triggers are
+// only reported for generated tokens).
+struct server_drift_guard {
+    enum phase_t { OFF, PRE, REASONING, CONTENT };
+    enum event_t { EV_NONE, EV_CLOSED, EV_TRIGGER };
+
+    phase_t     phase    = OFF;
+    llama_token open_id  = LLAMA_TOKEN_NULL;
+    llama_token close_id = LLAMA_TOKEN_NULL; // think-close special id (from the template's first reasoning end tag)
+    std::vector<llama_token> disarm_ids;     // other single-token reasoning end tags
+
+    // content_start: byte offset in the slot's generated text where the content phase began (0 = in the prefill)
+    size_t content_start = 0;
+
+    // the think-close id of the first end tag: one CONTROL / USER_DEFINED token with the text "</think>", else NULL
+    static llama_token resolve_close(const llama_vocab * vocab, const std::vector<llama_tokens> & ends);
+
+    // pure (no vocabulary): arm with resolved ids and walk the prefill (a close there only moves the phase)
+    void arm(llama_token open, llama_token close, const std::vector<llama_tokens> & ends, const llama_tokens & prefill);
+
+    bool active() const { return phase != OFF; }
+
+    event_t step(llama_token tok) {
+        switch (phase) {
+            case OFF:
+                return EV_NONE;
+            case PRE:
+                if (tok == open_id)  { phase = REASONING; return EV_NONE; }
+                if (tok == close_id) { phase = CONTENT;   return EV_CLOSED; }
+                break;
+            case REASONING:
+                if (tok == close_id) { phase = CONTENT; return EV_CLOSED; }
+                break;
+            case CONTENT:
+                if (tok == close_id) { return EV_TRIGGER; }
+                break;
+        }
+        if (std::find(disarm_ids.begin(), disarm_ids.end(), tok) != disarm_ids.end()) {
+            phase = OFF;
+        }
+        return EV_NONE;
+    }
+
+    // the ONE walk over a block of tokens that the server emits in order (a speculative round): steps the state up to
+    // and including the first trigger or the first EOG (the reply ends at either; the guard is checked before the
+    // EOG, so a close that is also an EOG triggers in the content phase), returns the event of every token walked
+    template <typename IsEog>
+    std::vector<event_t> walk(const llama_tokens & ids, IsEog is_eog) {
+        std::vector<event_t> evs;
+        evs.reserve(ids.size());
+        for (const llama_token tok : ids) {
+            const event_t ev = step(tok);
+            evs.push_back(ev);
+            if (ev == EV_TRIGGER || is_eog(tok)) {
+                break;
+            }
+        }
+        return evs;
+    }
+};
+
+// [TAG_DRIFT_GUARD] may a speculative round drop the decoded suffix after the suppressed close at block index i?
+//   Only where the partial rollback inside the batch is supported (PART; RS with n_draft <= n_rs_seq and i among the
+//   fresh, uncommitted drafts) AND every draft type's state can follow the shorter prefix: none / draft-simple (own KV,
+//   seq_rm) / MTP (row carry, common_speculative_accept_rebase) / n-gram (no state). eagle3 (shifted-KV boundary row),
+//   dflash and dspark never trim: the slot keeps the decoded suffix (WRN), as after any stop inside an accepted block
+bool server_drift_guard_can_trim(common_context_seq_rm_type seq_rm_type, size_t n_draft, uint32_t n_rs_seq, size_t i,
+                                 size_t n_committed, const std::vector<common_speculative_type> & types);
 
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
 // if is_placeholder is true, the media chunk will be treated as placeholder for counting tokens; the output tokens are not usable for actual inference (e.g. for submitting a task to server_queue)

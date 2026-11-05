@@ -109,6 +109,13 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// [TAG_DRIFT_GUARD] the caller kept only the first n_accepted tokens of the block it last reported to
+//   common_speculative_accept() (a stop inside the accepted block trimmed the rest): re-select the per-seq carry of the
+//   stateful implementations (MTP pending_h, eagle3 boundary) for that shorter prefix from the same verification rows;
+//   no statistics are counted, stateless implementations are not called; refused (no change) when an eagle3 / dflash /
+//   dspark implementation is active (their draft state is not a re-pickable row)
+void common_speculative_accept_rebase(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 // false: the blob was not restored (no implementation claims it, or the claiming one rejects its width / size);
