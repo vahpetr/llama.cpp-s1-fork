@@ -3842,6 +3842,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING"));
     add_opt(common_arg(
+        {"--drift-guard"}, "[off|stop]",
+        "duplicate reasoning close guard: 'stop' ends a reply whose content phase (reasoning already closed) generates\n"
+        "the template's think-close special token again; the token is not emitted, the reply finishes with\n"
+        "finish_reason 'stop' + stop_type 'think_reenter'; per-request override: \"drift_guard\": true|false (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.drift_guard = 0;
+            } else if (value == "stop") {
+                params.drift_guard = 1;
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --drift-guard: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DRIFT_GUARD"));
+    add_opt(common_arg(
         {"--reasoning-effort"}, "LEVEL",
         "reasoning effort level given to the chat template: 'default' to keep the template default,\n"
         "or a level such as 'minimal', 'low', 'medium', 'high', 'xhigh' or 'max' (default: default)",

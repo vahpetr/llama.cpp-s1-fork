@@ -42,6 +42,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                    "the checkpoint thinning, not the quota / TTL eviction of the conversation), so a "
                    "branch or a new chat that shares the prefix starts there instead of re-processing it"));
 
+    add((new field_bool("drift_guard", params.drift_guard))
+        ->set_desc("Stop when the content phase (reasoning already closed) generates the think-close special token again; "
+                   "the token is not emitted and the reply ends with stop_type think_reenter (default: --drift-guard != off)"));
+
     add((new field_bool("return_tokens", params.return_tokens))
         ->set_desc("Return the raw generated token ids in the `tokens` field"));
 
@@ -556,6 +560,7 @@ task_params eval_llama_cmpl_schema(
     params.cache_prompt  = params_base.cache_prompt;
     params.antiprompt    = params_base.antiprompt;
     params.sse_ping_interval = params_base.sse_ping_interval;
+    params.drift_guard   = params_base.drift_guard != 0;
 
     // enabling this will output extra debug information in the HTTP responses from the server
     params.verbose       = params_base.verbosity > 9;

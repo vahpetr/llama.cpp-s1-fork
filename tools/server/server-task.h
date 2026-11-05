@@ -77,6 +77,7 @@ struct task_params {
 
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
+    bool drift_guard         = false; // [TAG_DRIFT_GUARD] stop at a duplicate reasoning close in the content phase (default: --drift-guard != off)
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
