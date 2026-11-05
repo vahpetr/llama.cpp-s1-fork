@@ -1,4 +1,4 @@
-# Deploying v73, step by step
+# Deploying v75, step by step
 
 The short version is two commands (`deploy/s1/setup-brain.sh`, `deploy/balkon/setup-hands.sh`, see
 [deploy/README.md](../../deploy/README.md)); this page is the long version, with the upgrade, the rollback and the checks after
@@ -6,9 +6,9 @@ a switch.
 
 | box | profile | compose file | image | context | GTT after load |
 |---|---|---|---|---|---|
-| s1: Ryzen AI Max+ 395 (Radeon 8060S, gfx1151), 128 GB | brain, 1M | `deploy/s1/docker-compose.brain-1m.yml` | `:v74` | 1 048 576, 1 slot | 104 538 MiB on v73 (needs the 108 GiB GTT setting) |
-| s1 | brain, 524k | `deploy/s1/docker-compose.brain-524k.yml` | `:v74` | 525 312, 1 slot | not measured on v73 |
-| balkon: Ryzen 9 7940HS + Radeon 780M (gfx1103), 96 GB | hands | `deploy/balkon/docker-compose.hands.yml` | `:v74k` | 917 504 pool, 5 slots | not measured on v73 |
+| s1: Ryzen AI Max+ 395 (Radeon 8060S, gfx1151), 128 GB | brain, 1M | `deploy/s1/docker-compose.brain-1m.yml` | `:v75` | 1 048 576, 1 slot | 104 538 MiB on v73 (needs the 108 GiB GTT setting) |
+| s1 | brain, 524k | `deploy/s1/docker-compose.brain-524k.yml` | `:v75` | 525 312, 1 slot | not measured on v73 |
+| balkon: Ryzen 9 7940HS + Radeon 780M (gfx1103), 96 GB | hands | `deploy/balkon/docker-compose.hands.yml` | `:v75k` | 917 504 pool, 5 slots | not measured on v73 |
 
 ## 1. Images
 
@@ -16,9 +16,9 @@ a switch.
 
 | tag | use | revision |
 |---|---|---|
-| `:v74` | brain (s1), this release | `7597206a9` (`prod-v11-stage9-pkg13`) |
-| `:v74k` | hands (780M), this release (the same image as `:v74`) | `7597206a9` |
-| `:v73` / `:v73k` | rollback (same disk-cache key) | `608af6ea8` |
+| `:v75` | brain (s1), this release | `4a55d9173` (`prod-v11-stage9-pkg15`) |
+| `:v75k` | hands (780M), this release (the same image as `:v75`) | `4a55d9173` |
+| `:v74` / `:v74k` | rollback (same disk-cache key) | `e5f793eae` |
 
 The images are built with upstream's `.devops/vulkan.Dockerfile`, target `server` ("The image" in deploy/README.md; `BUILD=1`
 in the setup scripts builds it from this tree). Build with no model loaded on the GPU.
@@ -33,7 +33,7 @@ in the setup scripts builds it from this tree). Build with no model loaded on th
 3. **Dry run.** `deploy/s1/setup-brain.sh --dry-run` prints every step, file and size. About 160 GB free disk is needed for the
    weights (the target comes as three 40 GB parts that the script appends one by one).
 4. **Run.** `deploy/s1/setup-brain.sh`: checks docker, the Hugging Face CLI, disk, GTT and the Vulkan device, downloads and
-   sha256-checks the weights ([WEIGHTS.md](WEIGHTS.md)), pulls `:v74`, starts the compose file, waits for `/health` (the first
+   sha256-checks the weights ([WEIGHTS.md](WEIGHTS.md)), pulls `:v75`, starts the compose file, waits for `/health` (the first
    start pre-reads the 33 GiB PLE range) and runs the smoke checks below. For the 524k profile:
    `BRAIN_CTX=524k deploy/s1/setup-brain.sh`.
 5. **By hand** instead: put the files into `deploy/s1/models/`, then
@@ -51,16 +51,17 @@ host is 109 216 MiB. Measured speeds: [BENCHMARKS.md](BENCHMARKS.md).
 1. **Host.** [HOST-TUNING.md](HOST-TUNING.md), section balkon: GTT 78 GiB, `amd_iommu=off`.
 2. **Run.** `deploy/balkon/setup-hands.sh --dry-run`, then `deploy/balkon/setup-hands.sh`. It downloads SC117's IQ3_S shards,
    re-encodes the BF16 hyper-connection weights and the LM head to Q8_0 with `tools/s1/gguf_hc_q8.py` (CPU, a few minutes),
-   checks the result's sha256, pulls `:v74k` and starts the compose. About 150 GB free disk is needed; `PRUNE=1` deletes the
+   checks the result's sha256, pulls `:v75k` and starts the compose. About 150 GB free disk is needed; `PRUNE=1` deletes the
    59 GB of sources after a verified re-encode.
 3. The hands compose runs five slots on one 917 504-cell pool and leaves the sparse MTP draft and the graph cache off. Top-k v3
    and GDN replay default off on gfx1103.
 
 ## 4. Upgrading
 
-**From v60–v72: same disk-cache key.** Pull `:v74` and recreate the container with the v73 compose files (or set
-`LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v74` with your compose). Stored conversations stay readable; no adopt step. The v73
-composes carry `LLAMA_SPEC_OVERLAP=1`, `--cache-disk-async 1024` and `--cache-disk-incr` (none of them is in the disk-cache key).
+**From v60–v74: same disk-cache key.** Pull `:v75` and recreate the container with the v75 compose files (or set
+`LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v75` with your compose). Stored conversations stay readable; no adopt step. The v75
+composes carry `LLAMA_SPEC_OVERLAP=1`, `--cache-disk-async 1024`, `--cache-disk-incr`, `--chat-template-file` with the
+`models/templates/` mount and, on the brain, `--drift-guard off` (none of them is in the disk-cache key).
 If your compose has adopt lines for an older namespace, keep them.
 
 **From v59 or older: the key changes.** The state format changed in v60, so v60 and later start with an empty namespace
@@ -77,13 +78,14 @@ If your compose has adopt lines for an older namespace, keep them.
 
 ## 5. Rollback
 
-To v72 (same key, nothing to do in the cache):
+To v74 (same key, nothing to do in the cache). v74 does not know `--drift-guard`: delete the two `--drift-guard` lines
+(flag and value) from the brain compose first. Delete the two `--chat-template-file` lines too to get the v74 compose exactly.
 
 ```sh
-LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v73 docker compose -f deploy/s1/docker-compose.brain-1m.yml up -d
+LLAMA_S1_IMAGE=vahpetr/llama-cpp-s1-fork:v74 docker compose -f deploy/s1/docker-compose.brain-1m.yml up -d
 ```
 
-v72 reads the conversations v73 saved. v72 accepts every flag of the v73 compose (the v73 knob `GGML_VK_DECODE_FUSE` is a code default).
+v74 reads the conversations v75 saved. The hands compose has no `--drift-guard` line; `:v74k` runs it as is.
 
 ## 6. Smoke checks
 
@@ -106,7 +108,7 @@ docker logs llama-s1-brain-1m 2>&1 | grep -E 'n_ctx *=|qsa_topk: |qsa_bias_fold:
 - Admission: `admission: GTT headroom admission on: bar = <N> MiB, ...` and no `headroom admission disabled` line. The
   disabled line means `LLAMA_GTT_USED_PATH` points at a file that does not exist; the server still serves without GTT
   protection on long prompts.
-- v73 startup lines on gfx1151: `qsa_topk: onepass on`, `qsa_topk: v3 on (... from 2 rows ...)`, `qsa_bias_fold: on`,
+- Startup lines on gfx1151 (engine unchanged since v73): `qsa_topk: onepass on`, `qsa_topk: v3 on (... from 2 rows ...)`, `qsa_bias_fold: on`,
   `gdn_replay: on (default on gfx1151)`, `hc_tail_fuse: on`, `add_rms_rows: on`, `qwen4exp merge plan: on (default on gfx1151)`,
   `prewarm_shapes: on`, `qsa_idx_f16_decode: off`, `decode_fuse: on (GGML_VK_DECODE_FUSE, default on)`. On the 780M the merge plan, top-k v3 and GDN replay say `off (default off: not gfx1151)`. An `off` line names the reason or the environment variable that switched it off
   ([KNOBS.md](KNOBS.md)).

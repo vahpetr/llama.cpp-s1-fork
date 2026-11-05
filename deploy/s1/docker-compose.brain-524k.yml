@@ -1,4 +1,4 @@
-# Brain, 524k context, one slot - AMD Ryzen AI Max+ 395 (Strix Halo, Radeon 8060S / gfx1151), 128 GB, Vulkan. Release v73.
+# Brain, 524k context, one slot - AMD Ryzen AI Max+ 395 (Strix Halo, Radeon 8060S / gfx1151), 128 GB, Vulkan. Release v75.
 # Same as docker-compose.brain-1m.yml except the context size (and the names / cache dir). Use this one if your GTT limit is
 # below 108 GiB or you want more headroom. Not measured on v73. Same YaRN and QSA as the 1M profile.
 #
@@ -13,7 +13,7 @@ services:
       context: ../..
       dockerfile: .devops/vulkan.Dockerfile
       target: server
-    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v74}   # prebuilt; `docker compose build` builds the same thing from this tree
+    image: ${LLAMA_S1_IMAGE:-vahpetr/llama-cpp-s1-fork:v75}   # prebuilt; `docker compose build` builds the same thing from this tree
     container_name: llama-s1-brain-524k
     restart: unless-stopped
     stop_grace_period: 90s            # on SIGTERM the server writes its slot to the disk prompt cache (a few seconds)
@@ -85,6 +85,7 @@ services:
     volumes:
       - ${MODELS_DIR:-./models}:/models:ro
       - ${SLOTS_DIR:-./slots}:/slots
+      - ../../models/templates:/app/models/templates:ro   # chat template files of this tree (the image ships no models/)
     command:
       - -m
       - /models/Qwen3.8-Flash-Next-Uncensored.i1-Q4_K_M.gguf
@@ -192,6 +193,10 @@ services:
       - --repeat-penalty
       - "1.0"
       - --jinja
+      - --chat-template-file            # the GGUF template with the reasoning/content boundary kept as generated (patches 0475/0476)
+      - /app/models/templates/qwen3.8-flash-next-preserve-ws.jinja
+      - --drift-guard                   # opt-in stop on a second </think> in the content phase (stop_type think_reenter); off here
+      - "off"
       - --host
       - 0.0.0.0
       - --port
