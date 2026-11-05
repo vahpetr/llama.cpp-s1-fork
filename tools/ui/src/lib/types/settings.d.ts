@@ -149,7 +149,8 @@ export interface SettingsChatServiceOptions {
 		reasoningContent?: string,
 		timings?: ChatMessageTimings,
 		toolCalls?: string,
-		finishReason?: string
+		finishReason?: string,
+		stopType?: string
 	) => void;
 	onError?: (error: Error) => void;
 	onConnectionState?: (state: StreamConnectionState) => void;

@@ -170,6 +170,10 @@ export interface DatabaseMessage {
 	replyNote?: string;
 	/** the server's echo of a continued prefill diverged from the partial (joined verbatim) */
 	echoMismatch?: boolean;
+	/** how the request that produced this reply ended (`stop` / `length` / ...) */
+	finishReason?: string;
+	/** fork extension next to `finish_reason`: why a `stop` stopped ("think_reenter" = drift guard) */
+	stopType?: string;
 	/**
 	 * The template options + sampling of the request that produced this reply (reasoning level,
 	 * enable_thinking, native effort, sampling): its continuations reuse them verbatim, so a

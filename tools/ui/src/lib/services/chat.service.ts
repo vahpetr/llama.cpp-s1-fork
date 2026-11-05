@@ -510,7 +510,8 @@ export class ChatService {
 			reasoningContent?: string,
 			timings?: ChatMessageTimings,
 			toolCalls?: string,
-			finishReason?: string
+			finishReason?: string,
+			stopType?: string
 		) => void,
 		onError?: (error: Error) => void,
 		onReasoningChunk?: (chunk: string) => void,
@@ -556,6 +557,7 @@ export class ChatService {
 		let aggregatedToolCalls: ApiChatCompletionToolCall[] = [];
 		let lastTimings: ChatMessageTimings | undefined;
 		let finishReason: string | undefined;
+		let stopType: string | undefined;
 		let streamFinished = false;
 		let modelEmitted = false;
 		let idEmitted = false;
@@ -724,6 +726,9 @@ export class ChatService {
 
 								if (choice?.finish_reason) finishReason = choice.finish_reason;
 
+								// fork extension next to finish_reason (drift guard: "think_reenter")
+								if (choice?.stop_type) stopType = choice.stop_type;
+
 								const promptProgress = parsed.prompt_progress;
 								const chunkModel = ChatService.extractModelName(parsed);
 
@@ -849,7 +854,8 @@ export class ChatService {
 					fullReasoningContent || undefined,
 					lastTimings,
 					finalToolCalls,
-					finishReason
+					finishReason,
+					stopType
 				);
 			}
 		} catch (error) {
@@ -1419,8 +1425,14 @@ export class ChatService {
 				? (t?: ChatMessageTimings, p?: ChatMessagePromptProgress) => onTimings(withClient(t), p)
 				: undefined;
 			const cOnComplete = onComplete
-				? (r: string, rc?: string, t?: ChatMessageTimings, tc?: string, finish?: string) =>
-						onComplete(r, rc, withClient(t), tc, finish)
+				? (
+						r: string,
+						rc?: string,
+						t?: ChatMessageTimings,
+						tc?: string,
+						finish?: string,
+						stopType?: string
+					) => onComplete(r, rc, withClient(t), tc, finish, stopType)
 				: undefined;
 			const response = await fetch(API_CHAT.COMPLETIONS, {
 				body: JSON.stringify(requestBody),
@@ -1662,7 +1674,9 @@ export class ChatService {
 			response: string,
 			reasoningContent?: string,
 			timings?: ChatMessageTimings,
-			toolCalls?: string
+			toolCalls?: string,
+			finishReason?: string,
+			stopType?: string
 		) => void,
 		onError?: (error: Error) => void,
 		onToolCallChunk?: (chunk: string) => void,
@@ -1708,7 +1722,16 @@ export class ChatService {
 				throw noResponseError;
 			}
 
-			onComplete?.(content, reasoningContent, undefined, serializedToolCalls);
+			// finish_reason stays unreported for a non-stream reply, as before (rules 2 / 3 never ran
+			// on one); stop_type is passed on for the record
+			onComplete?.(
+				content,
+				reasoningContent,
+				undefined,
+				serializedToolCalls,
+				undefined,
+				data.choices[0]?.stop_type ?? undefined
+			);
 
 			return content;
 		} catch (error) {

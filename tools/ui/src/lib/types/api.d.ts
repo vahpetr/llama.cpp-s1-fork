@@ -350,6 +350,8 @@ export interface ApiChatCompletionStreamChunk {
 			tool_calls?: ApiChatCompletionToolCallDelta[];
 		};
 		finish_reason?: string | null;
+		/** fork extension: why a `stop` stopped (e.g. "think_reenter": a duplicate </think>) */
+		stop_type?: string | null;
 	}>;
 	timings?: {
 		prompt_n?: number;
@@ -373,6 +375,8 @@ export interface ApiChatCompletionResponse {
 			tool_calls?: ApiChatCompletionToolCall[];
 		};
 		finish_reason?: string | null;
+		/** fork extension: why a `stop` stopped (e.g. "think_reenter": a duplicate </think>) */
+		stop_type?: string | null;
 	}>;
 }
 
