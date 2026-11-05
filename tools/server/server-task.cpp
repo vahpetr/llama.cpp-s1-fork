@@ -255,6 +255,7 @@ static inline std::string stop_type_to_str(stop_type type) {
         case STOP_TYPE_EOS:   return "eos";
         case STOP_TYPE_WORD:  return "word";
         case STOP_TYPE_LIMIT: return "limit";
+        case STOP_TYPE_THINK_REENTER: return "think_reenter"; // [TAG_DRIFT_GUARD]
         default:              return "none";
     }
 }
@@ -382,7 +383,7 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         };
     }
     json finish_reason = "length";
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_THINK_REENTER) {
         finish_reason = "stop";
     }
     json res = json {
@@ -401,6 +402,9 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         {"usage",              usage_json_oaicompat()},
         {"id", oaicompat_cmpl_id}
     };
+    if (stop == STOP_TYPE_THINK_REENTER) {
+        res["choices"][0]["stop_type"] = stop_type_to_str(stop); // [TAG_DRIFT_GUARD] only on this stop: other replies unchanged
+    }
 
     // extra fields for debugging purposes
     if (verbose) {
@@ -422,7 +426,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         msg.role = "assistant";
         msg.content = content;
     }
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_THINK_REENTER) {
         finish_reason = msg.tool_calls.empty() ? "stop" : "tool_calls";
     }
 
@@ -431,6 +435,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"index", index},
         {"message", msg.to_json_oaicompat()},
     };
+    if (stop == STOP_TYPE_THINK_REENTER) {
+        choice["stop_type"] = stop_type_to_str(stop); // [TAG_DRIFT_GUARD] only on this stop: other replies unchanged
+    }
 
     if (!stream && probs_output.size() > 0) {
         choice["logprobs"] = json{
@@ -464,7 +471,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
 json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     std::time_t t = std::time(0);
     std::string finish_reason = "length";
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_THINK_REENTER) {
         finish_reason = oaicompat_msg.tool_calls.empty() ? "stop" : "tool_calls";
     }
 
@@ -486,14 +493,16 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
         });
     }
 
+    json finish_choice {
+        {"finish_reason", finish_reason},
+        {"index", index},
+        {"delta", json::object()},
+    };
+    if (stop == STOP_TYPE_THINK_REENTER) {
+        finish_choice["stop_type"] = stop_type_to_str(stop); // [TAG_DRIFT_GUARD] only on this stop: other replies unchanged
+    }
     deltas.push_back({
-        {"choices", json::array({
-            json {
-                {"finish_reason", finish_reason},
-                {"index", index},
-                {"delta", json::object()},
-            },
-        })},
+        {"choices", json::array({ finish_choice })},
         {"created",            t},
         {"id",                 oaicompat_cmpl_id},
         {"model",              oaicompat_model},
@@ -732,7 +741,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_asr() {
 
 json server_task_result_cmpl_final::to_json_anthropic() {
     std::string stop_reason = "max_tokens";
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_THINK_REENTER) {
         stop_reason = oaicompat_msg.tool_calls.empty() ? "end_turn" : "tool_use";
     }
 
@@ -792,6 +801,9 @@ json server_task_result_cmpl_final::to_json_anthropic() {
             {"output_tokens", n_decoded}
         }}
     };
+    if (stop == STOP_TYPE_THINK_REENTER) {
+        res["stop_type"] = stop_type_to_str(stop); // [TAG_DRIFT_GUARD] only on this stop: other replies unchanged
+    }
 
     return res;
 }
@@ -800,7 +812,7 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
     json events = json::array();
 
     std::string stop_reason = "max_tokens";
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_THINK_REENTER) {
         stop_reason = oaicompat_msg.tool_calls.empty() ? "end_turn" : "tool_use";
     }
 
@@ -960,18 +972,22 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
         });
     }
 
+    json message_delta = {
+        {"type", "message_delta"},
+        {"delta", {
+            {"stop_reason", stop_reason},
+            {"stop_sequence", stopping_word.empty() ? nullptr : json(stopping_word)}
+        }},
+        {"usage", {
+            {"output_tokens", n_decoded}
+        }}
+    };
+    if (stop == STOP_TYPE_THINK_REENTER) {
+        message_delta["stop_type"] = stop_type_to_str(stop); // [TAG_DRIFT_GUARD] only on this stop: other replies unchanged
+    }
     events.push_back({
         {"event", "message_delta"},
-        {"data", {
-            {"type", "message_delta"},
-            {"delta", {
-                {"stop_reason", stop_reason},
-                {"stop_sequence", stopping_word.empty() ? nullptr : json(stopping_word)}
-            }},
-            {"usage", {
-                {"output_tokens", n_decoded}
-            }}
-        }}
+        {"data", message_delta}
     });
 
     events.push_back({
