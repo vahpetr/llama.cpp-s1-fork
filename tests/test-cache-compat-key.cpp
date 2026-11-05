@@ -795,15 +795,22 @@ int main() {
         CHECK(knobs(with_eq) == knobs(base));
         CHECK(knobs(with_tmpl) == knobs(base));
         CHECK(knobs(with_disk) == knobs(base));
+        std::vector<std::string> with_guard = base;
+        with_guard.insert(with_guard.begin() + 4, { "--drift-guard", "stop" });
+        std::vector<std::string> with_guard_eq = base;
+        with_guard_eq.insert(with_guard_eq.begin() + 4, "--drift-guard=stop");
+        CHECK(knobs(with_guard) == knobs(base)); // [TAG_DRIFT_GUARD]
+        CHECK(knobs(with_guard_eq) == knobs(base));
         std::vector<std::string> with_kwargs = base;
         with_kwargs.insert(with_kwargs.begin() + 4, { "--chat-template-kwargs", "{}" });
-        CHECK(knobs(with_kwargs) != knobs(base)); // only the two template options are neutral
+        CHECK(knobs(with_kwargs) != knobs(base)); // the template options (and --drift-guard) are neutral, kwargs is not
         std::vector<std::string> with_ctx = base;
         with_ctx.insert(with_ctx.begin() + 4, { "-c", "4096" });
         CHECK(knobs(with_ctx) != knobs(base)); // a state option still counts
         CHECK(server_disk_cache_env_neutral("LLAMA_ARG_CHAT_TEMPLATE_FILE=/x.jinja"));
         CHECK(server_disk_cache_env_neutral("LLAMA_ARG_CHAT_TEMPLATE=chatml"));
         CHECK(server_disk_cache_env_neutral("LLAMA_ARG_CACHE_DISK=/c"));
+        CHECK(server_disk_cache_env_neutral("LLAMA_ARG_DRIFT_GUARD=stop"));
         CHECK(!server_disk_cache_env_neutral("LLAMA_ARG_CHAT_TEMPLATE_KWARGS={}"));
         CHECK(!server_disk_cache_env_neutral("LLAMA_ARG_CTX_SIZE=4096"));
         printf("fingerprint neutral options: chat template argv / env forms filtered, kwargs / ctx kept\n");
