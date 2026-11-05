@@ -520,6 +520,11 @@ export class DatabaseService {
 		return result;
 	}
 
+	/** One message by id. */
+	static async getMessage(id: string): Promise<DatabaseMessage | undefined> {
+		return await db[IDXDB_TABLES.messages].get(id);
+	}
+
 	/**
 	 * Imports multiple conversations and their messages.
 	 * Skips conversations that already exist.

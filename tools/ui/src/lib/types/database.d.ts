@@ -174,6 +174,8 @@ export interface DatabaseMessage {
 	finishReason?: string;
 	/** fork extension next to `finish_reason`: why a `stop` stopped ("think_reenter" = drift guard) */
 	stopType?: string;
+	/** drift guard: the one continuation after a think_reenter stop + its visible marker */
+	driftGuard?: { retried: boolean; note: string };
 	/**
 	 * The template options + sampling of the request that produced this reply (reasoning level,
 	 * enable_thinking, native effort, sampling): its continuations reuse them verbatim, so a

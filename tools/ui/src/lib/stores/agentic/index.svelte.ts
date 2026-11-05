@@ -85,6 +85,7 @@ import {
 	timingsTotal,
 	utf8Bytes
 } from '$lib/utils';
+import type { ReplyEnd } from '$lib/utils/context-reserve';
 import { SvelteMap } from 'svelte/reactivity';
 import { toast } from 'svelte-sonner';
 
@@ -159,7 +160,7 @@ class AgenticStore {
 	// permission, continue and steering gates the loop waits on between turns
 	private gates = new AgenticGates();
 	/** W1.2: how the last turn of a conversation's flow ended (rules 2 / 3 after the flow) */
-	private lastTurns = new Map<string, { finish?: string; stopType?: string; byReserve: boolean }>();
+	private lastTurns = new Map<string, ReplyEnd>();
 	private sessions = new SvelteMap<string, AgenticSession>();
 
 	get isAnyRunning(): boolean {
@@ -452,9 +453,7 @@ class AgenticStore {
 	 * reserve off, or the configured limit applies), 0 = no room above the reserve.
 	 */
 	/** W1.2: how the last turn of the conversation's last flow ended, consumed once. */
-	takeLastTurn(
-		conversationId: string
-	): { finish?: string; stopType?: string; byReserve: boolean } | undefined {
+	takeLastTurn(conversationId: string): ReplyEnd | undefined {
 		const t = this.lastTurns.get(conversationId);
 
 		this.lastTurns.delete(conversationId);
@@ -798,6 +797,9 @@ class AgenticStore {
 						(turnOptions as { byReserve?: boolean }).byReserve === true ||
 						(turnOptions !== options && sent > 0 && !(max > 0 && sent >= max)),
 					finish: turnFinish,
+					// drift guard: the turn's output budget and what it generated
+					generated: turnTimings?.predicted_n,
+					maxTokens: sent > 0 ? sent : max > 0 ? max : undefined,
 					stopType: turnStopType
 				});
 

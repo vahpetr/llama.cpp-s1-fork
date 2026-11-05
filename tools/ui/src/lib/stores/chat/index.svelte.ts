@@ -85,6 +85,14 @@ import {
 	tailTokenBudget,
 	unfinishedTail
 } from '$lib/utils';
+import type { ReplyEnd } from '$lib/utils/context-reserve';
+import {
+	DRIFT_GUARD_NOTES,
+	driftContinuationBudget,
+	driftContinuationSampling,
+	driftGuardDecision,
+	STOP_TYPE_THINK_REENTER
+} from '$lib/utils/drift-guard';
 import { SvelteMap } from 'svelte/reactivity';
 import { toast } from 'svelte-sonner';
 
@@ -106,6 +114,13 @@ export interface CompactionOptions {
 	auto?: boolean;
 	/** rule 2: the last message is a reply cut by the reserve cap, carried into the new chat */
 	partialMessageId?: string;
+}
+
+/** The configured output limit (Settings max_tokens), undefined when unlimited (0 / unset). */
+function configuredMaxTokens(): number | undefined {
+	const max = Number(settingsStore.config.max_tokens);
+
+	return max > 0 ? max : undefined;
 }
 
 class ChatStore implements ChatStreamHost, ChatFlowsHost {
@@ -304,12 +319,24 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	async afterReply(
 		convId: string,
 		messageId: string,
-		info: { finish?: string; stopType?: string; byReserve: boolean; toolCalls: boolean }
+		info: ReplyEnd & { toolCalls: boolean }
 	): Promise<void> {
 		// how the request ended, on the message (the drift guard keys on stop_type)
 		await this.recordFinish(messageId, info.finish, info.stopType);
 
-		if (info.toolCalls || conversationsStore.activeConversation?.id !== convId) return;
+		if (info.toolCalls) return;
+
+		if (conversationsStore.activeConversation?.id !== convId) {
+			// the continuation needs the open conversation: only the marker
+			if (driftGuardDecision(info) !== 'none') {
+				await this.markDrift(messageId, {
+					note: DRIFT_GUARD_NOTES.SKIPPED('the conversation is not open'),
+					retried: false
+				});
+			}
+
+			return;
+		}
 
 		const target = { convId, messageId };
 
@@ -1531,6 +1558,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					await this.afterReply(convId, currentMessageId, {
 						byReserve: lastTurn.byReserve,
 						finish: lastTurn.finish,
+						generated: lastTurn.generated,
+						maxTokens: lastTurn.maxTokens,
 						stopType: lastTurn.stopType,
 						toolCalls: false
 					});
@@ -1600,6 +1629,9 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					await this.afterReply(convId, currentMessageId, {
 						byReserve: replyCap.byReserve === true,
 						finish: finishReason,
+						// drift guard: the reply's output budget and what it generated
+						generated: timings?.predicted_n,
+						maxTokens: replyCap.max_tokens ?? configuredMaxTokens(),
 						stopType,
 						toolCalls: !!toolCalls && toolCalls !== '[]'
 					});
@@ -1695,8 +1727,15 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	private async continueReply(
 		convId: string,
 		messageId: string,
-		o: { logitBias?: Record<string, number>; maxTokens?: number }
-	): Promise<{ finish?: string; byReserve: boolean } | { error: string }> {
+		o: {
+			logitBias?: Record<string, number>;
+			maxTokens?: number;
+			/** 'content' = explicit content-phase continuation (never resume reasoning) */
+			phase?: 'content';
+			/** sampling of this request only (drift guard: the Instruct preset) */
+			sampling?: Record<string, number>;
+		}
+	): Promise<ReplyEnd | { error: string }> {
 		if (this.isChatLoadingInternal(convId)) return { error: 'the conversation is busy' };
 
 		this.setChatLoading(convId, true);
@@ -1739,7 +1778,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 			let appended = '';
 			let appendedReasoning = '';
-			let done: { finish?: string; timings?: ChatMessageTimings } | null = null;
+			let done: { finish?: string; stopType?: string; timings?: ChatMessageTimings } | null = null;
 
 			const show = () => {
 				const shown = liveContinuation(original, appended);
@@ -1763,7 +1802,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 						{ ...this.getApiOptions(conversation), ...(model ? { model } : {}) },
 						msg.requestOptions
 					),
-					continueFinalMessage: true,
+					continueFinalMessage: o.phase === 'content' ? 'content' : true,
+					...(o.sampling ? { samplingOverride: o.sampling } : {}),
 					...(capped !== undefined
 						? {
 								max_tokens: capped,
@@ -1781,9 +1821,10 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 						_r?: string,
 						timings?: ChatMessageTimings,
 						_tc?: string,
-						finish?: string
+						finish?: string,
+						stopType?: string
 					) => {
-						done = { finish, timings };
+						done = { finish, stopType, timings };
 					},
 					onError: () => {},
 					onReasoningChunk: (chunk: string) => {
@@ -1799,7 +1840,11 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 			if (abortController.signal.aborted) return { error: 'cancelled' };
 
-			const end = done as { finish?: string; timings?: ChatMessageTimings } | null;
+			const end = done as {
+				finish?: string;
+				stopType?: string;
+				timings?: ChatMessageTimings;
+			} | null;
 
 			if (!end) return { error: 'the stream ended before completion' };
 
@@ -1820,8 +1865,10 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			const update: Partial<DatabaseMessage> = {
 				content,
 				echoMismatch: echoMismatch || undefined,
+				finishReason: end.finish,
 				reasoningContent: reasoning || undefined,
 				replyNote: undefined,
+				stopType: end.stopType,
 				timestamp: Date.now(),
 				...(end.timings ? { timings: end.timings } : {})
 			};
@@ -1836,7 +1883,10 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 			return {
 				byReserve: capped !== undefined && !(max > 0 && capped >= max),
-				finish: end.finish
+				finish: end.finish,
+				generated: end.timings?.predicted_n,
+				maxTokens: capped,
+				stopType: end.stopType
 			};
 		} catch (error) {
 			return { error: error instanceof Error ? error.message : String(error) };
@@ -1860,6 +1910,84 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			await this.sendMessage(pending.content, pending.extras);
 		} else {
 			this.keepAsDraft(convId, pending.content, pending.extras);
+		}
+	}
+
+	/**
+	 * Drift guard (spec r2 S2, containment): the server stopped this reply at a duplicate
+	 * </think> in the content phase. ONE continuation of the same message from that point - an
+	 * explicit content-phase continuation, the card's Instruct sampling for that request only,
+	 * the remaining output budget (budget - generated; none left = no request). One retry per
+	 * logical message: the flag is persisted before the request (and carried into a compacted
+	 * copy). Whatever the continuation ends with, the guard STOPS there: a `length` cut is marked
+	 * and noted as truncated, never compacted and continued again (that would lose the budget and
+	 * the Instruct sampling of this request).
+	 */
+	private async driftGuardContinue(
+		target: { convId: string; messageId: string },
+		p: { maxTokens?: number; generated?: number }
+	): Promise<void> {
+		const msg = await DatabaseService.getMessage(target.messageId);
+
+		if (!msg) return;
+
+		const decision = driftGuardDecision({
+			finish: 'stop',
+			state: msg.driftGuard,
+			stopType: STOP_TYPE_THINK_REENTER
+		});
+
+		if (decision === 'again') {
+			await this.markDrift(target.messageId, { note: DRIFT_GUARD_NOTES.AGAIN, retried: true });
+
+			return;
+		}
+
+		const plan = driftContinuationBudget({ budget: p.maxTokens, generated: p.generated });
+
+		if ('skip' in plan) {
+			await this.markDrift(target.messageId, {
+				note: DRIFT_GUARD_NOTES.SKIPPED(plan.skip),
+				retried: false
+			});
+
+			return;
+		}
+
+		await this.markDrift(target.messageId, { note: DRIFT_GUARD_NOTES.CONTINUED, retried: true });
+		console.info(
+			`[drift guard] think_reenter on ${target.messageId}: one content-phase continuation, max_tokens ${plan.maxTokens}`
+		);
+
+		const c = await this.continueReply(target.convId, target.messageId, {
+			maxTokens: plan.maxTokens,
+			phase: 'content',
+			sampling: driftContinuationSampling(settingsStore.samplingPresets)
+		});
+
+		if ('error' in c) {
+			await this.markDrift(target.messageId, {
+				note: DRIFT_GUARD_NOTES.FAILED(c.error),
+				retried: true
+			});
+
+			return;
+		}
+
+		if (c.finish === 'stop' && c.stopType === STOP_TYPE_THINK_REENTER) {
+			await this.markDrift(target.messageId, { note: DRIFT_GUARD_NOTES.CUT_AGAIN, retried: true });
+
+			return;
+		}
+
+		if (c.finish === 'length') {
+			await this.markDrift(target.messageId, { note: DRIFT_GUARD_NOTES.CUT_BUDGET, retried: true });
+
+			// no rule 2 for it (also when the reserve cap was binding): the guard ends here
+			await this.markReply(
+				target.messageId,
+				'reply truncated: the drift-guard continuation reached the output limit'
+			);
 		}
 	}
 
@@ -1923,6 +2051,14 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				? 'The message was not sent; its text is kept as the draft of its conversation (attachments must be added again).'
 				: 'The message was not sent; it is kept as the draft of its conversation.'
 		);
+	}
+
+	/** Drift guard: persist its state + visible marker on a reply (DB + open view). */
+	private async markDrift(
+		messageId: string,
+		state: { retried: boolean; note: string }
+	): Promise<void> {
+		await this.patchMessage(messageId, { driftGuard: state });
 	}
 
 	/** W1.2: note on a reply the rules could not finish (shown under the message). */
@@ -2126,10 +2262,12 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	/** Rules 2 and 3; `target` follows the reply into the continuation conversation. */
 	private async runReplyRules(
 		target: { convId: string; messageId: string },
-		info: { finish?: string; byReserve: boolean }
+		info: ReplyEnd
 	): Promise<void> {
 		let finish = info.finish;
+		let stopType = info.stopType;
 		let byReserve = info.byReserve;
+		let budget = { generated: info.generated, maxTokens: info.maxTokens };
 		let n = 0;
 
 		while (finish === 'length' && byReserve) {
@@ -2172,10 +2310,19 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			}
 
 			finish = c.finish;
+			stopType = c.stopType;
 			byReserve = c.byReserve;
+			budget = { generated: c.generated, maxTokens: c.maxTokens };
 		}
 
 		if (finish !== 'stop') return;
+
+		// drift guard: a think_reenter stop gets its own single continuation, never rule 3's
+		if (stopType === STOP_TYPE_THINK_REENTER) {
+			await this.driftGuardContinue(target, budget);
+
+			return;
+		}
 
 		for (let g = 0; ; g++) {
 			const msg = (await DatabaseService.getConversationMessages(target.convId)).find(
@@ -2204,6 +2351,16 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 			if ('error' in c || c.finish !== 'stop') {
 				await this.markReply(target.messageId, `reply looks unfinished: ${why}`);
+
+				return;
+			}
+
+			// a rule 3 continuation stopped at a duplicate </think>: the drift guard takes over
+			if (c.stopType === STOP_TYPE_THINK_REENTER) {
+				await this.driftGuardContinue(target, {
+					generated: c.generated,
+					maxTokens: c.maxTokens
+				});
 
 				return;
 			}
@@ -2330,6 +2487,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		if (p.partial) {
 			await copy({
 				content: p.partial.content,
+				// the drift guard's one retry is per logical message: the copy keeps its state
+				driftGuard: p.partial.driftGuard,
 				model: p.partial.model,
 				reasoningContent: p.partial.reasoningContent,
 				requestOptions: p.partial.requestOptions,

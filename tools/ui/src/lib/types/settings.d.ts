@@ -134,8 +134,11 @@ export interface SettingsChatServiceOptions {
 	logitBias?: Record<string, number>;
 	// W1.2: the reserve (not the configured limit) set max_tokens - not sent to the server
 	byReserve?: boolean;
-	// Continuation control (vLLM compat), opt in to the explicit continue final message flag
-	continueFinalMessage?: boolean;
+	// Continuation control (vLLM compat), opt in to the explicit continue final message flag;
+	// 'content' = continue the content phase explicitly (never resume reasoning)
+	continueFinalMessage?: boolean | 'content';
+	// drift guard: sampling of this request only, applied after the custom JSON
+	samplingOverride?: Record<string, number>;
 	// Callbacks
 	onChunk?: (chunk: string) => void;
 	onReasoningChunk?: (chunk: string) => void;

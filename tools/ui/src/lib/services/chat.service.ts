@@ -1138,6 +1138,7 @@ export class ChatService {
 			repeat_penalty,
 			// Other parameters
 			samplers,
+			samplingOverride,
 			stream,
 			// Generation parameters
 			temperature,
@@ -1264,8 +1265,12 @@ export class ChatService {
 		// arms the budget sampler so reasoning can be ended at runtime via the control endpoint
 		requestBody.reasoning_control = true;
 
+		// 'content' = an explicit content-phase continuation (AUTO resumes reasoning when the
+		// content is empty, common/chat.cpp)
+		const continuationFlag = continueFinalMessage === 'content' ? 'content' : true;
+
 		if (continueFinalMessage) {
-			requestBody.continue_final_message = true;
+			requestBody.continue_final_message = continuationFlag;
 			requestBody.add_generation_prompt = false;
 		}
 
@@ -1347,8 +1352,18 @@ export class ChatService {
 		// and the continuation flags, so a join can never concatenate an independent response
 		if (continueFinalMessage) {
 			requestBody.messages = continuationMessages;
-			requestBody.continue_final_message = true;
+			requestBody.continue_final_message = continuationFlag;
 			requestBody.add_generation_prompt = false;
+		}
+
+		// drift guard: this request's own sampling wins over the custom JSON too
+		if (samplingOverride) {
+			for (const [k, v] of Object.entries(samplingOverride)) {
+				if (typeof v === 'number' && Number.isFinite(v)) {
+					(requestBody as unknown as Record<string, unknown>)[k] =
+						k === 'top_k' ? Math.round(v) : v;
+				}
+			}
 		}
 
 		// W1 ceilings last, so no custom JSON alias lifts them: the output limit (context reserve)

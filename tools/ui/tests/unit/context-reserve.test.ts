@@ -61,6 +61,7 @@ import {
 	tailTokenBudget,
 	unfinishedTail
 } from '$lib/utils/context-reserve';
+import { DRIFT_GUARD_NOTES } from '$lib/utils/drift-guard';
 
 let seq = 0;
 
@@ -95,6 +96,7 @@ function sse(
 		done?: boolean;
 		toolCall?: boolean;
 		timings?: object;
+		stopType?: string;
 	} = {}
 ): Response {
 	const finish = o.finish === undefined ? 'stop' : o.finish;
@@ -105,7 +107,7 @@ function sse(
 			? `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [call] } }] })}\n\n`
 			: '',
 		finish || o.timings
-			? `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: finish }], timings: o.timings })}\n\n`
+			? `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: finish, ...(o.stopType ? { stop_type: o.stopType } : {}) }], timings: o.timings })}\n\n`
 			: '',
 		o.done === false ? '' : 'data: [DONE]\n\n'
 	];
@@ -149,6 +151,9 @@ function harness(
 
 	vi.spyOn(DatabaseService, 'getConversation').mockImplementation(async (id) =>
 		structuredClone(convs.get(id))
+	);
+	vi.spyOn(DatabaseService, 'getMessage').mockImplementation(async (id) =>
+		db.has(id) ? structuredClone(db.get(id)) : undefined
 	);
 	vi.spyOn(DatabaseService, 'getConversationMessages').mockImplementation(async (id) =>
 		[...db.values()].filter((m) => m.convId === id).map((m) => structuredClone(m))
@@ -952,6 +957,23 @@ describe('W1.2 rule 2: a reply cut by the reserve cap is compacted and continued
 		expect(last.content).toBe(PARTIAL + ' more more');
 	}, 60000);
 
+	it('the compacted copy of the partial keeps its drift-guard state (one retry per message)', async () => {
+		setConfig();
+
+		const state = { note: 'cut at a duplicate </think>; continued', retried: true };
+		const r = rows();
+
+		r[4] = { ...r[4], driftGuard: state };
+
+		const h = harness(N_CTX, r, conv, (_b, n) =>
+			n === 1 ? sse(SUMMARY) : sse(' finishes the answer.', { timings: t(5, 600, 9) })
+		);
+
+		await chatStore.afterReply('c1', 'a2', { byReserve: true, finish: 'length', toolCalls: false });
+
+		expect(h.pathOf('conv-1').at(-1)!.driftGuard).toEqual(state);
+	}, 60000);
+
 	it('a `length` stop at the configured max_tokens (not our cap) is left alone', async () => {
 		setConfig();
 
@@ -1028,6 +1050,195 @@ describe('W1.2 rule 3: the unfinished-reply guard', () => {
 		await chatStore.afterReply('c1', 'a1', { byReserve: true, finish: 'stop', toolCalls: true });
 		expect(h.bodies).toHaveLength(0);
 	});
+});
+
+// ── drift guard (spec r2 S2): one content-phase continuation after a think_reenter stop ────────
+
+describe('drift guard: think_reenter = one bounded content-phase continuation', () => {
+	afterEach(cleanup);
+
+	// rule 3 would flag this tail (no final punctuation): it must not fire for think_reenter
+	const CUT = 'Ответ: функция готова.\n\nLet me also add the tests:';
+	const REENTER = { byReserve: true, finish: 'stop', stopType: 'think_reenter', toolCalls: false };
+
+	function setup(
+		reply: string,
+		respond: Respond,
+		extra: Partial<DatabaseMessage> = {},
+		cfg = {},
+		nCtx = 100000
+	) {
+		setConfig(cfg);
+
+		return harness(
+			nCtx,
+			[
+				{ ...msg(MessageRole.USER, 'напиши функцию'), id: 'u1', parent: 'root' },
+				{
+					...msg(MessageRole.ASSISTANT, reply, {
+						reasoningContent: 'thinking about it',
+						timings: t(10, 100, 1000),
+						...extra
+					}),
+					id: 'a1',
+					parent: 'u1'
+				}
+			],
+			{ currNode: 'a1', id: 'c1', lastModified: 0, name: 'D' },
+			respond
+		);
+	}
+
+	const continuations = (bodies: Record<string, unknown>[]) =>
+		bodies.filter((b) => b.continue_final_message !== undefined);
+
+	it('one request: explicit content phase, Instruct sampling, remaining budget, no rule 3', async () => {
+		const h = setup(
+			CUT,
+			() => sse(' tests.', { timings: t(5, 600, 3) }),
+			{},
+			{
+				customJson: '{"temperature":1.3,"top_p":0.99}'
+			}
+		);
+
+		await chatStore.afterReply('c1', 'a1', { ...REENTER, generated: 1000, maxTokens: 4000 });
+
+		expect(h.urls.some((u) => u.includes('tokenize'))).toBe(false);
+
+		const [c] = continuations(h.bodies);
+
+		expect(continuations(h.bodies)).toHaveLength(1);
+		expect(c).toMatchObject({
+			add_generation_prompt: false,
+			continue_final_message: 'content',
+			// 4000 - 1000 generated (predicted_n; the suppressed </think> is not counted)
+			max_tokens: 3000,
+			min_p: 0,
+			presence_penalty: 1.5,
+			repeat_penalty: 1.0,
+			// the Instruct preset wins over the custom JSON for this request
+			temperature: 0.7,
+			top_k: 20,
+			top_p: 0.8
+		});
+		expect(c.logit_bias).toBeUndefined();
+		// history and reasoning kept: the prefill is the reply with its reasoning
+		expect((c.messages as Record<string, unknown>[]).at(-1)).toMatchObject({
+			content: CUT,
+			reasoning_content: 'thinking about it',
+			role: 'assistant'
+		});
+		expect(h.db.get('a1')).toMatchObject({
+			content: CUT + ' tests.',
+			driftGuard: { note: DRIFT_GUARD_NOTES.CONTINUED, retried: true },
+			finishReason: 'stop'
+		});
+		expect(h.db.get('a1')!.stopType).toBeUndefined();
+		expect(h.db.get('a1')!.replyNote).toBeUndefined();
+	}, 60000);
+
+	it('an empty content cut still continues the CONTENT (never AUTO into reasoning)', async () => {
+		const h = setup('', () => sse('Ответ.', { timings: t(5, 600, 3) }));
+
+		await chatStore.afterReply('c1', 'a1', { ...REENTER, generated: 1000, maxTokens: 4000 });
+
+		const [c] = continuations(h.bodies);
+
+		expect(c.continue_final_message).toBe('content');
+		expect(h.db.get('a1')!.content).toBe('Ответ.');
+	}, 60000);
+
+	it('no budget left = no request (0 would mean unlimited), marked', async () => {
+		const h = setup(CUT, () => sse('x'));
+
+		await chatStore.afterReply('c1', 'a1', { ...REENTER, generated: 4000, maxTokens: 4000 });
+
+		expect(h.bodies).toHaveLength(0);
+		expect(h.db.get('a1')!.driftGuard).toEqual({
+			note: DRIFT_GUARD_NOTES.SKIPPED('no output budget left'),
+			retried: false
+		});
+	}, 60000);
+
+	it('unlimited budget: bounded by the auto-continuation fallback', async () => {
+		const h = setup(CUT, () => sse(' tests.', { timings: t(5, 600, 3) }));
+
+		await chatStore.afterReply('c1', 'a1', { ...REENTER, generated: 1000 });
+
+		const [c] = continuations(h.bodies);
+
+		expect(c.max_tokens).toBeGreaterThan(0);
+		expect(c.max_tokens).toBeLessThanOrEqual(CONTEXT_RESERVE.GUARD_MAX_TOKENS);
+	}, 60000);
+
+	it('one retry per message: a second think_reenter is kept as is, never retried', async () => {
+		const h = setup(CUT, () => sse(' more', { stopType: 'think_reenter', timings: t(5, 600, 3) }));
+
+		await chatStore.afterReply('c1', 'a1', { ...REENTER, generated: 1000, maxTokens: 4000 });
+
+		expect(continuations(h.bodies)).toHaveLength(1);
+		expect(h.db.get('a1')).toMatchObject({
+			content: CUT + ' more',
+			driftGuard: { note: DRIFT_GUARD_NOTES.CUT_AGAIN, retried: true },
+			stopType: 'think_reenter'
+		});
+
+		// the same logical message reported again (e.g. a later rule path): no second request
+		await chatStore.afterReply('c1', 'a1', { ...REENTER, generated: 3, maxTokens: 4000 });
+
+		expect(continuations(h.bodies)).toHaveLength(1);
+		expect(h.db.get('a1')!.driftGuard).toEqual({ note: DRIFT_GUARD_NOTES.AGAIN, retried: true });
+	}, 60000);
+
+	it('a continuation cut by length is marked "cut again: budget" and truncated, not "continued"', async () => {
+		const h = setup(CUT, () => sse(' more', { finish: 'length', timings: t(5, 600, 3000) }));
+
+		await chatStore.afterReply('c1', 'a1', { ...REENTER, generated: 1000, maxTokens: 4000 });
+
+		// the shared budget ran out (not the reserve): no compaction, no further request
+		expect(continuations(h.bodies)).toHaveLength(1);
+		expect(h.bodies).toHaveLength(1);
+		expect(h.db.get('a1')).toMatchObject({
+			content: CUT + ' more',
+			driftGuard: { note: DRIFT_GUARD_NOTES.CUT_BUDGET, retried: true },
+			finishReason: 'length',
+			replyNote: 'reply truncated: the drift-guard continuation reached the output limit'
+		});
+	}, 60000);
+
+	it('a length cut under a BINDING reserve cap stops too: no compaction, no second continuation', async () => {
+		// a small context: the reserve cap (not the 3000 remaining budget) sets max_tokens
+		const h = setup(
+			CUT,
+			() => sse(' more', { finish: 'length', timings: t(5, 600, 500) }),
+			{},
+			{},
+			5000
+		);
+
+		await chatStore.afterReply('c1', 'a1', { ...REENTER, generated: 1000, maxTokens: 4000 });
+
+		expect(h.bodies).toHaveLength(1);
+		expect(h.bodies[0].max_tokens as number).toBeLessThan(3000);
+		expect(h.convs.size).toBe(1);
+		expect(h.db.get('a1')).toMatchObject({
+			driftGuard: { note: DRIFT_GUARD_NOTES.CUT_BUDGET, retried: true },
+			replyNote: 'reply truncated: the drift-guard continuation reached the output limit'
+		});
+	}, 60000);
+
+	it('an ordinary stop keeps rule 3 (unchanged)', async () => {
+		const h = setup(CUT, (_b, _n, url) =>
+			url.includes('tokenize') ? new Response(JSON.stringify({ tokens: [248046] })) : sse(' tests.')
+		);
+
+		await chatStore.afterReply('c1', 'a1', { byReserve: true, finish: 'stop', toolCalls: false });
+
+		expect(h.urls[0]).toContain('tokenize');
+		expect(continuations(h.bodies)[0]).toMatchObject({ continue_final_message: true });
+		expect(h.db.get('a1')!.driftGuard).toBeUndefined();
+	}, 60000);
 });
 
 // ── sol review hardening ───────────────────────────────────────────────────────────────────────
