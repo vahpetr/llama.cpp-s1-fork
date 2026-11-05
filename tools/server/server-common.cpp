@@ -941,6 +941,52 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
     return prompt_tokens;
 }
 
+llama_token server_drift_guard::resolve_close(const llama_vocab * vocab, const std::vector<llama_tokens> & ends) {
+    if (vocab == nullptr || ends.empty() || ends.front().size() != 1) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const llama_token close = ends.front().front();
+    if (!(llama_vocab_get_attr(vocab, close) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED))) {
+        return LLAMA_TOKEN_NULL;
+    }
+    if (common_token_to_piece(vocab, close, true) != "</think>") {
+        return LLAMA_TOKEN_NULL;
+    }
+    return close;
+}
+
+void server_drift_guard::arm(llama_token open, llama_token close, const std::vector<llama_tokens> & ends, const llama_tokens & prefill) {
+    phase         = OFF;
+    open_id       = open;
+    close_id      = close;
+    content_start = 0;
+    disarm_ids.clear();
+    if (close == LLAMA_TOKEN_NULL) {
+        return;
+    }
+    for (size_t i = 1; i < ends.size(); ++i) {
+        if (ends[i].size() == 1 && ends[i].front() != close_id) {
+            disarm_ids.push_back(ends[i].front());
+        }
+    }
+    phase = PRE;
+    for (const llama_token tok : prefill) {
+        step(tok);
+    }
+}
+
+bool server_drift_guard_can_trim(common_context_seq_rm_type seq_rm_type, size_t n_draft, uint32_t n_rs_seq, size_t i,
+                                 size_t n_committed, const std::vector<common_speculative_type> & types) {
+    for (const auto t : types) {
+        if (t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+            t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            return false;
+        }
+    }
+    return seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+           (seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= (size_t) n_rs_seq && i >= n_committed);
+}
+
 size_t validate_utf8(const std::string& text) {
     size_t len = text.size();
     if (len == 0) return 0;

@@ -709,6 +709,7 @@ struct server_slot {
 
     stop_type stop;
     llama_token stop_eog_id = LLAMA_TOKEN_NULL; // [TAG_EOS_SAVE] the sampled EOG token of a stop=eos (logged as eog_id=)
+    server_drift_guard drift_guard;             // [TAG_DRIFT_GUARD] reasoning boundary of the current reply (OFF = inactive)
 
     std::string stopping_word;
 
@@ -993,6 +994,7 @@ struct server_slot {
         release_cancel = false;
         stop           = STOP_TYPE_NONE;
         stop_eog_id    = LLAMA_TOKEN_NULL;
+        drift_guard    = {};
         stopping_word  = "";
         n_sent_text    = 0;
 
@@ -1215,6 +1217,7 @@ struct server_slot {
                     case STOP_TYPE_EOS:   stop_str = "eos";   break;
                     case STOP_TYPE_WORD:  stop_str = "word";  break;
                     case STOP_TYPE_LIMIT: stop_str = "limit"; break;
+                    case STOP_TYPE_THINK_REENTER: stop_str = "think_reenter"; break;
                     case STOP_TYPE_NONE:  stop_str = "none";  break;
                 }
             }
@@ -1896,6 +1899,8 @@ private:
     common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
+    bool drift_guard_template_ok = true; // [TAG_DRIFT_GUARD] false = the loaded template has no dedicated think-close
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     // [TAG_CKPT_NO_DFT] (v33 B2) prompt checkpoints leave the draft KV out when it is a plain (partially
@@ -3015,6 +3020,49 @@ private:
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
 
+            // [TAG_DRIFT_GUARD] one startup verdict for the loaded template, whatever the default flag (a per-request
+            //   "drift_guard": true under --drift-guard off arms on the same verdict): the guard arms only on a dedicated
+            //   once-per-reply think-close (one "</think>" special token that is not a message delimiter)
+            {
+                std::string why;
+                try {
+                    common_chat_msg probe_user;
+                    probe_user.role    = "user";
+                    probe_user.content = "x";
+                    common_chat_templates_inputs probe;
+                    probe.messages              = { probe_user };
+                    probe.add_generation_prompt = true;
+                    probe.enable_thinking       = true;
+                    probe.use_jinja             = params_base.use_jinja;
+                    const auto cp = common_chat_templates_apply(chat_params.tmpls.get(), probe);
+                    std::vector<llama_tokens> ends;
+                    for (const auto & t : cp.thinking_end_tags) {
+                        ends.push_back(common_tokenize(vocab, t, false, true));
+                    }
+                    if (server_drift_guard::resolve_close(vocab, ends) == LLAMA_TOKEN_NULL) {
+                        why = cp.thinking_end_tags.empty() ? "no reasoning end tag"
+                            : "reasoning end tag '" + cp.thinking_end_tags.front() + "' is not one </think> special token";
+                    }
+                    for (const auto & d : cp.message_delimiters.delimiters) {
+                        if (why.empty() && d.delimiter.find("</think>") != std::string::npos) {
+                            why = "</think> is part of the message delimiter '" + d.delimiter + "'";
+                        }
+                    }
+                } catch (const std::exception & e) {
+                    why = std::string("template probe failed: ") + e.what();
+                }
+                drift_guard_template_ok = why.empty();
+                if (params_base.drift_guard != 0) {
+                    if (why.empty()) {
+                        SRV_INF("%s", "drift guard: armed for this template (think-close </think>)\n");
+                    } else {
+                        SRV_WRN("drift guard: inactive (template): %s\n", why.c_str());
+                    }
+                } else {
+                    SRV_DBG("drift guard (per-request only): template %s%s\n", why.empty() ? "eligible" : "inactive: ", why.c_str());
+                }
+            }
+
             {
                 auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
                 auto it = params_base.default_template_kwargs.find("preserve_reasoning");
@@ -3474,6 +3522,24 @@ private:
             slot.smpl.reset();
         }
 
+        // [TAG_DRIFT_GUARD] the reasoning boundary of this reply, from the generation prompt the parser also sees
+        slot.drift_guard = {};
+        if (task.params.drift_guard && task.need_sampling() && drift_guard_template_ok &&
+                task.params.chat_parser_params.reasoning_format != COMMON_REASONING_FORMAT_NONE) {
+            const auto & sp = task.params.sampling;
+            // the precondition first: the prefill is tokenised only for a request the guard can arm on
+            const llama_token close = server_drift_guard::resolve_close(vocab, sp.reasoning_budget_end);
+            if (close != LLAMA_TOKEN_NULL) {
+                const llama_token open = sp.reasoning_budget_start.size() == 1 ? sp.reasoning_budget_start.front() : LLAMA_TOKEN_NULL;
+                const llama_tokens prefill = sp.generation_prompt.empty()
+                    ? llama_tokens{}
+                    : common_tokenize(vocab, sp.generation_prompt, false, true);
+                slot.drift_guard.arm(open, close, sp.reasoning_budget_end, prefill);
+            } else {
+                SLT_DBG(slot, "%s", "drift guard: inactive (the reasoning end tag is not one </think> special token)\n");
+            }
+        }
+
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
@@ -3490,12 +3556,42 @@ private:
         return true;
     }
 
-    bool process_token(completion_token_output & result, server_slot & slot) {
+    // [TAG_DRIFT_GUARD] stop at a suppressed duplicate think-close. The suppressed token was consumed (decoded / sampled)
+    // but is not part of the reply: it is not counted in n_gen (= completion_tokens / tokens_predicted). The text is
+    // left as it is, like every other stop: a dangling partial UTF-8 sequence stays in the text and its token(s) stay in
+    // tokens / probs (consistent), only the valid prefix is ever streamed (send_final_response flushes held bytes)
+    void drift_guard_stop(server_slot & slot) {
+        if (slot.stats.n_gen > 0) {
+            slot.stats.n_gen--;
+        }
+        slot.stop           = STOP_TYPE_THINK_REENTER;
+        slot.has_next_token = false;
+
+        const size_t c0 = std::min(slot.drift_guard.content_start, slot.generated_text.size());
+        size_t n_chars = 0;
+        for (size_t i = c0; i < slot.generated_text.size(); ++i) {
+            n_chars += ((unsigned char) slot.generated_text[i] & 0xC0) != 0x80;
+        }
+        SLT_INF(slot, "drift guard: think_reenter n_gen=%d content_chars=%zu\n", (int) slot.stats.n_gen, n_chars);
+    }
+
+    // dg_ev: this token's drift guard event, from the caller's single walk (step() / walk()) of the emitted tokens
+    bool process_token(completion_token_output & result, server_slot & slot, server_drift_guard::event_t dg_ev) {
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
 
+        // [TAG_DRIFT_GUARD] before any accumulation / emission: a duplicate think-close in the content phase ends the
+        // reply here; the token itself is never added to the text, the tokens, the probs or the stream
+        if (dg_ev == server_drift_guard::EV_TRIGGER) {
+            drift_guard_stop(slot);
+            return false;
+        }
+
         slot.generated_text += token_str;
+        if (dg_ev == server_drift_guard::EV_CLOSED) {
+            slot.drift_guard.content_start = slot.generated_text.size();
+        }
         if (slot.task->params.return_tokens) {
             slot.generated_tokens.push_back(result.tok);
         }
@@ -3801,6 +3897,13 @@ private:
         if (slot.task->params.stream) {
             res->content     = "";
             res->tokens      = llama_tokens{};
+            // [TAG_DRIFT_GUARD] flush the complete-UTF-8 bytes held back by partial stop-string matching (a stop string that
+            //   never completed is content); a no-op for EOS / WORD (EOG and a matched stop word send everything)
+            const size_t n_valid = validate_utf8(slot.generated_text);
+            if (slot.n_sent_text < n_valid) {
+                res->content     = slot.generated_text.substr(slot.n_sent_text, n_valid - slot.n_sent_text);
+                slot.n_sent_text = n_valid;
+            }
         } else {
             res->content     = std::move(slot.generated_text);
             res->tokens      = std::move(slot.generated_tokens);
@@ -7581,7 +7684,7 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
-            if (!process_token(result, slot)) {
+            if (!process_token(result, slot, slot.drift_guard.step(result.tok))) {
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
@@ -7836,6 +7939,7 @@ private:
             if (slot.spec_is_replay && n_accepted > 0) {
                 n_accepted--;
             }
+            const size_t n_committed_round = slot.spec_n_committed; // [TAG_DRIFT_GUARD] committed tokens cannot be rolled back
             slot.spec_is_replay = false;
             slot.spec_n_committed = 0;
 
@@ -7856,9 +7960,37 @@ private:
             // (the adaptive draft length's acceptance EMA was updated in the verification block
             // above, before the checkpoint-restore branch, so that a restore round is observed too)
 
+            // [TAG_DRIFT_GUARD] accepted tokens enter the prompt before they are emitted one by one: a duplicate think-close
+            //   inside them ends the reply there, so the slot keeps only the tokens before it (the KV suffix goes with the
+            //   rejected drafts' seq_rm below). Only where a partial rollback inside this batch is supported (the same
+            //   condition as the partial acceptance above); otherwise the slot keeps the decoded suffix and the next
+            //   request's prefix match handles it as after any stop inside an accepted block
+            const std::vector<server_drift_guard::event_t> dg_evs = slot.drift_guard.active()
+                ? slot.drift_guard.walk(ids, [&](llama_token t) { return llama_vocab_is_eog(vocab, t); })
+                : std::vector<server_drift_guard::event_t>{};
+            size_t n_insert = ids.size() - 1;
+            if (!dg_evs.empty() && dg_evs.back() == server_drift_guard::EV_TRIGGER && dg_evs.size() - 1 < n_insert) {
+                const size_t i = dg_evs.size() - 1;
+                // the decode recorded rollback planes for the fresh (uncommitted) draft tokens only; eagle3 / dflash /
+                //   dspark drafts never trim (their draft state cannot follow the shorter prefix)
+                const bool can_trim = server_drift_guard_can_trim(ctx_tgt_seq_rm_type, n_draft, llama_n_rs_seq(ctx_tgt), i,
+                                                                  n_committed_round, params_base.speculative.types);
+                if (can_trim) {
+                    n_insert = i;
+                    // the speculative carry was selected for the whole accepted block above (common_speculative_accept:
+                    //   MTP pending_h = the block's last verification row); the slot keeps only ids[0..i-1] after
+                    //   sampled_prev, so the carry has to be the row of that last kept token (verification row i) -
+                    //   else a cache save serialises, and a prefix extension pairs, a row of a token the slot dropped
+                    common_speculative_accept_rebase(spec.get(), slot.id, (uint16_t) i);
+                } else {
+                    SLT_WRN(slot, "drift guard: accepted block holds the suppressed close at %zu/%zu, slot keeps the decoded suffix (no partial rollback)\n",
+                            i, ids.size() - 1);
+                }
+            }
+
             // add accepted tokens to the prompt
             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
-            slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+            slot.prompt.tokens.insert({ids.begin(), ids.begin() + n_insert});
 
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
@@ -7886,7 +8018,9 @@ private:
 
                 slot.stats.n_gen += 1;
 
-                if (!process_token(result, slot)) {
+                // the walk stopped at the trigger / the first EOG, and so does process_token (EOG = EOS stop)
+                const auto dg_ev = i < dg_evs.size() ? dg_evs[i] : server_drift_guard::EV_NONE;
+                if (!process_token(result, slot, dg_ev)) {
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();
