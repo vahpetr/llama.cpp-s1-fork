@@ -1205,9 +1205,21 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
         data.generation_prompt = GEN_PREFIX;
         if (supports_reasoning) {
-            data.generation_prompt += "<think>\n" + msg.reasoning_content;
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-                data.generation_prompt += "\n</think>\n\n";
+                // render the boundary as generated: the parser keeps the trailing whitespace of the
+                // reasoning (the model emits "\n</think>" or "\n\n</think>"). One normalisation, the same as
+                // models/templates/qwen3.8-flash-next-preserve-ws.jinja: lstrip; a reasoning ending in '\n' is
+                // kept as is, any other is trimmed + "\n" (= the trim of the GGUF templates)
+                static const char * ws = " \t\n\r\v\f";
+                const auto b  = msg.reasoning_content.find_first_not_of(ws);
+                std::string rc = b == std::string::npos ? std::string() : msg.reasoning_content.substr(b);
+                if (rc.empty() || rc.back() != '\n') {
+                    rc.erase(rc.find_last_not_of(ws) + 1); // npos + 1 = 0: all whitespace -> empty
+                    rc += "\n";
+                }
+                data.generation_prompt += "<think>\n" + rc + "</think>\n\n";
+            } else {
+                data.generation_prompt += "<think>\n" + msg.reasoning_content;
             }
         }
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
