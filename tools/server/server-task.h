@@ -663,6 +663,14 @@ struct server_prompt {
     //   its next disk save; it lives with the prompt, so every clear / erase / invalidation / full reset drops it
     std::string adopted_from;
 
+    // [TAG_EOS_SAVE] the generation that left these tokens finished on its own: stopped on an EOG token or a stop word
+    //   (set by release(), before reset() clears the slot's stop status; a cancel, a limit and a pre-encode with
+    //   n_predict 0 are not finished). last_reply_start = where that reply's generated tokens begin (the task's prompt
+    //   size, i.e. after the generation prompt's <think>). A request diverging inside that reply (a pre-encode or a
+    //   next turn whose reasoning boundary re-renders differently) makes the outgoing save rule fire on the lost tail
+    bool    last_stop_finished = false;
+    int32_t last_reply_start   = -1;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
@@ -672,6 +680,8 @@ struct server_prompt {
         partial = false;
         draft_gap = 0;
         adopted_from.clear();
+        last_stop_finished = false;
+        last_reply_start   = -1;
     }
 
     // [TAG_TURN_BOUNDARY] a user message of this prompt starts at or after pos: a whole later turn lies there
@@ -698,6 +708,8 @@ struct server_prompt {
             partial,
             draft_gap,
             adopted_from,
+            last_stop_finished,
+            last_reply_start,
         };
     }
 };

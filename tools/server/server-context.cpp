@@ -708,6 +708,7 @@ struct server_slot {
     bool release_cancel = false; // [TAG_MULTISLOT] released by a SERVER_TASK_TYPE_CANCEL (logged as stop=cancel)
 
     stop_type stop;
+    llama_token stop_eog_id = LLAMA_TOKEN_NULL; // [TAG_EOS_SAVE] the sampled EOG token of a stop=eos (logged as eog_id=)
 
     std::string stopping_word;
 
@@ -991,6 +992,7 @@ struct server_slot {
         truncated      = false;
         release_cancel = false;
         stop           = STOP_TYPE_NONE;
+        stop_eog_id    = LLAMA_TOKEN_NULL;
         stopping_word  = "";
         n_sent_text    = 0;
 
@@ -1203,7 +1205,8 @@ struct server_slot {
             GGML_ASSERT(task);
 
             // [TAG_MULTISLOT] one INFO line per finished generation with the stop type, so a cut reply can be
-            // classified from the INFO log (stable format for grep: stop=<eos|limit|word|cancel|none> n_gen= n_predict= truncated=)
+            // classified from the INFO log (stable format for grep: stop=<eos|limit|word|cancel|none> n_gen= n_predict= truncated=;
+            // [TAG_EOS_SAVE] a stop=eos line appends " eog_id=<sampled EOG token>" after truncated=, other lines are unchanged)
             const char * stop_str = "none";
             if (release_cancel) {
                 stop_str = "cancel";
@@ -1215,8 +1218,16 @@ struct server_slot {
                     case STOP_TYPE_NONE:  stop_str = "none";  break;
                 }
             }
-            SLT_INF(*this, "stop processing: n_tokens = %d, stop=%s n_gen=%d n_predict=%d truncated=%d\n",
-                    prompt.n_tokens(), stop_str, (int) stats.n_gen, (int) task->params.n_predict, truncated ? 1 : 0);
+            const bool stop_eos = !release_cancel && stop == STOP_TYPE_EOS;
+            const std::string eog_id = stop_eos ? string_format(" eog_id=%d", (int) stop_eog_id) : std::string();
+            SLT_INF(*this, "stop processing: n_tokens = %d, stop=%s n_gen=%d n_predict=%d truncated=%d%s\n",
+                    prompt.n_tokens(), stop_str, (int) stats.n_gen, (int) task->params.n_predict, truncated ? 1 : 0,
+                    eog_id.c_str());
+
+            // [TAG_EOS_SAVE] provenance of the cached tokens, kept with the prompt (reset() clears `stop` below):
+            //   finished = EOS or a stop word; a cancel is not covered (an abandoned reply), nor a limit
+            prompt.last_stop_finished = !release_cancel && (stop == STOP_TYPE_EOS || stop == STOP_TYPE_WORD);
+            prompt.last_reply_start   = prompt.last_stop_finished ? (int32_t) task->n_tokens() : -1;
 
             t_last_used = ggml_time_us();
 
@@ -3210,9 +3221,21 @@ private:
             //   A normal next turn or a regenerate diverges inside the last assistant answer - no user start there
             const bool late_branch = n_slot - lcp_slot >= margin && ret->prompt.user_start_from((int32_t) lcp_slot);
 
-            if (n_slot > 0 && (will_load || 2*lcp_slot < n_slot || late_branch)) {
+            // [TAG_EOS_SAVE] a finished (EOS / stop word) reply loses a tail worth a load: saved even when the kept
+            //   prefix is above half - only when the divergence lies INSIDE that reply (past its first generated token,
+            //   no user turn at or after it: a pre-encode / next turn whose re-rendered reasoning boundary diverges
+            //   there). A regenerate (lcp = the reply start) or an edit of the last user turn (lcp before it) abandons
+            //   the branch: no save
+            const bool eos_tail = n_slot - lcp_slot >= margin && ret->prompt.last_stop_finished &&
+                                  ret->prompt.last_reply_start >= 0 && lcp_slot > (size_t) ret->prompt.last_reply_start &&
+                                  !ret->prompt.user_start_from((int32_t) lcp_slot);
+
+            if (n_slot > 0 && (will_load || 2*lcp_slot < n_slot || late_branch || eos_tail)) {
                 if (late_branch && !will_load && 2*lcp_slot >= n_slot) {
                     SLT_INF(*ret, "disk cache: a late branch at %zu of %zu tokens cuts off a user turn, saving\n", lcp_slot, n_slot);
+                } else if (eos_tail && !will_load && 2*lcp_slot >= n_slot) {
+                    SLT_INF(*ret, "disk cache: a finished reply loses %zu of %zu tokens (common prefix %zu), saving\n",
+                            n_slot - lcp_slot, n_slot, lcp_slot);
                 }
                 ret->disk_save(*disk_cache);
             }
@@ -3588,6 +3611,7 @@ private:
 
         if (llama_vocab_is_eog(vocab, result.tok)) {
             slot.stop           = STOP_TYPE_EOS;
+            slot.stop_eog_id    = result.tok;
             slot.has_next_token = false;
 
             SLT_DBG(slot, "%s", "stopped by EOS\n");

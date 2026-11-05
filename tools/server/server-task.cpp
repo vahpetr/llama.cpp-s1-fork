@@ -2021,16 +2021,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     states.push_back({
-        /*.prompt =*/ {
-            /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
-            /*.deep        =*/ prompt.deep,
-            /*.noncanonical=*/ prompt.noncanonical,
-            /*.user_starts =*/ prompt.user_starts, // [TAG_TURN_BOUNDARY]
-            /*.partial     =*/ prompt.partial,     // [TAG_PARTIAL_PROMPT]
-            /*.draft_gap   =*/ prompt.draft_gap,   // [TAG_DRAFT_PARTIAL]
-            /*.adopted_from=*/ prompt.adopted_from, // [TAG_DISK_ADOPT]
-        },
+        /*.prompt =*/ prompt.clone(), // every field, incl. [TAG_EOS_SAVE] last_stop_finished / last_reply_start
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
