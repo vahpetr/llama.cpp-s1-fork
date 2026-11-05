@@ -764,6 +764,51 @@ int main() {
         fs::remove_all(root, ec);
     }
 
+    // [TAG_FP_NEUTRAL] the chat template never reaches the fingerprint: an argv / env differing only in it filters to
+    //   the same knob list (the filter loop of server_disk_cache_fingerprint, over a given argv instead of /proc)
+    {
+        const auto knobs = [](const std::vector<std::string> & argv) {
+            std::string r;
+            bool skip = false;
+            for (const auto & a : argv) {
+                if (skip) {
+                    skip = false;
+                    continue;
+                }
+                if (server_disk_cache_argv_neutral(a, &skip)) {
+                    continue;
+                }
+                r += "argv:" + a + ";";
+            }
+            return r;
+        };
+        const std::vector<std::string> base = { "/app/llama-server", "-m", "/m.gguf", "--jinja", "--port", "8000" };
+        std::vector<std::string> with_file = base;
+        with_file.insert(with_file.begin() + 4, { "--chat-template-file", "/app/models/templates/t.jinja" });
+        std::vector<std::string> with_eq = base;
+        with_eq.insert(with_eq.begin() + 4, "--chat-template-file=/x.jinja");
+        std::vector<std::string> with_tmpl = base;
+        with_tmpl.insert(with_tmpl.begin() + 4, { "--chat-template", "chatml" });
+        std::vector<std::string> with_disk = base;
+        with_disk.insert(with_disk.begin() + 4, { "--cache-disk", "/c" });
+        CHECK(knobs(with_file) == knobs(base));
+        CHECK(knobs(with_eq) == knobs(base));
+        CHECK(knobs(with_tmpl) == knobs(base));
+        CHECK(knobs(with_disk) == knobs(base));
+        std::vector<std::string> with_kwargs = base;
+        with_kwargs.insert(with_kwargs.begin() + 4, { "--chat-template-kwargs", "{}" });
+        CHECK(knobs(with_kwargs) != knobs(base)); // only the two template options are neutral
+        std::vector<std::string> with_ctx = base;
+        with_ctx.insert(with_ctx.begin() + 4, { "-c", "4096" });
+        CHECK(knobs(with_ctx) != knobs(base)); // a state option still counts
+        CHECK(server_disk_cache_env_neutral("LLAMA_ARG_CHAT_TEMPLATE_FILE=/x.jinja"));
+        CHECK(server_disk_cache_env_neutral("LLAMA_ARG_CHAT_TEMPLATE=chatml"));
+        CHECK(server_disk_cache_env_neutral("LLAMA_ARG_CACHE_DISK=/c"));
+        CHECK(!server_disk_cache_env_neutral("LLAMA_ARG_CHAT_TEMPLATE_KWARGS={}"));
+        CHECK(!server_disk_cache_env_neutral("LLAMA_ARG_CTX_SIZE=4096"));
+        printf("fingerprint neutral options: chat template argv / env forms filtered, kwargs / ctx kept\n");
+    }
+
     if (n_fail) {
         fprintf(stderr, "%d failure(s)\n", n_fail);
         return 1;

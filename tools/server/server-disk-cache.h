@@ -477,6 +477,13 @@ struct server_disk_cache {
 // count / KV layout (those stay in the parsed-param digest, i.e. in the namespace key)
 std::string server_disk_cache_fingerprint(const common_params & params, int32_t n_ctx);
 
+// [TAG_FP_NEUTRAL] options that never reach the fingerprint (v1 env / argv part): the disk cache's own options and the
+//   chat template (--chat-template / --chat-template-file change the prompt tokens, not what a token sequence's state
+//   is; entries are keyed by token content, so a re-rendered prompt simply does not match a stale one).
+//   argv: *skip_value = the option's value is the next argument (no '=' form)
+bool server_disk_cache_env_neutral(const std::string & kv);
+bool server_disk_cache_argv_neutral(const std::string & arg, bool * skip_value);
+
 // [TAG_CACHE_COMPAT2] compatibility key v2 (R80.2 parts 2-3, spec series D4): namespace key = hash of
 //   {model content identity (sampled hash per shard), state descriptor hash, short-context measurement hash,
 //    depth version, semantic-env digest}. The libraries, sources, argv and exact env knobs stay in the cheap identity

@@ -405,6 +405,22 @@ static bool get_vec(std::istream & f, std::vector<uint8_t> & v) {
     return n == 0 || (bool) f.read(reinterpret_cast<char *>(v.data()), n);
 }
 
+bool server_disk_cache_env_neutral(const std::string & kv) {
+    const std::string name = kv.substr(0, kv.find('='));
+    return name.rfind("LLAMA_ARG_CACHE_DISK", 0) == 0 || name == "LLAMA_ARG_CHAT_TEMPLATE" ||
+           name == "LLAMA_ARG_CHAT_TEMPLATE_FILE";
+}
+
+bool server_disk_cache_argv_neutral(const std::string & arg, bool * skip_value) {
+    const std::string opt = arg.substr(0, arg.find('='));
+    if (arg.rfind("--cache-disk", 0) == 0 || opt == "--chat-template" || opt == "--chat-template-file") {
+        *skip_value = arg.find('=') == std::string::npos;
+        return true;
+    }
+    *skip_value = false;
+    return false;
+}
+
 std::string server_disk_cache_fingerprint(const common_params & params, int32_t n_ctx) {
     std::error_code ec;
     // the code that computes and lays out the state: the content of the loaded llama / ggml / mtmd
@@ -473,7 +489,7 @@ std::string server_disk_cache_fingerprint(const common_params & params, int32_t 
     for (char ** ep = environ; ep && *ep; ep++) {
         const std::string kv = *ep;
         if (kv.rfind("LLAMA_", 0) == 0 || kv.rfind("GGML_", 0) == 0) {
-            if (kv.rfind("LLAMA_ARG_CACHE_DISK", 0) != 0) { // only the disk cache's own options are neutral
+            if (!server_disk_cache_env_neutral(kv)) { // [TAG_FP_NEUTRAL] the disk cache's own options + the chat template
                 knobs.push_back(kv);
             }
         }
@@ -489,8 +505,7 @@ std::string server_disk_cache_fingerprint(const common_params & params, int32_t 
                 skip_value = false;
                 continue;
             }
-            if (arg.rfind("--cache-disk", 0) == 0) {
-                skip_value = arg.find('=') == std::string::npos;
+            if (server_disk_cache_argv_neutral(arg, &skip_value)) { // [TAG_FP_NEUTRAL]
                 continue;
             }
             knobs.push_back("argv:" + arg);
