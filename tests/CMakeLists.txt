@@ -177,6 +177,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
+    llama_build_and_test(test-drift-guard.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}) # [TAG_DRIFT_GUARD] duplicate think-close guard + classifier
+    target_include_directories(test-drift-guard PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-drift-guard PRIVATE server-context)
+    set_tests_properties(test-drift-guard PROPERTIES SKIP_RETURN_CODE 77) # 77 only with DRIFT_GUARD_ALLOW_SKIP=1 and no GGUF
     llama_build_and_test(test-draft-accept-eog.cpp) # [TAG_UP29638] no draft acceptance after an EOG (both call sites)
     target_include_directories(test-draft-accept-eog PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-draft-accept-eog PRIVATE server-context)

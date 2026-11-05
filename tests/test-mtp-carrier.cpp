@@ -21,6 +21,14 @@
 //     slot.spec_ckpt and replays the committed tokens. With the carrier stashed in the checkpoint's data_spec and
 //     put back on the restore (server-context.cpp, [TAG_MTP_CKPT_PENDING_H]) the next draft equals the uninterrupted
 //     run's; without it (control) the replay pairs its first token with the rejected suffix's last row and differs.
+//  5. [TAG_DRIFT_GUARD] a stop INSIDE an accepted draft block (the drift guard's duplicate </think> at draft index 1 of
+//     a fully accepted block of 3): the server keeps [id_last, draft[0]] and drops the rest of the block, then a later
+//     request extends that prefix (after a carry save + a foreign carry + restore, as the disk / RAM cache does).
+//     With common_speculative_accept_rebase(1) the carry is draft[0]'s verification row and the extension's draft equals
+//     a run that only ever decoded [id_last, draft[0]]; without it (control) the carry is the dropped draft[2]'s row.
+//     The target side of the trim is emulated with the per-round checkpoint (qwen35 here has no partial rollback; the
+//     server trims only on PART / RS targets) - the carry is what is under test. Compared bit for bit when the CPU rows
+//     are batch-size invariant (they are: 0 logits differ), the control must differ bitwise (it does in every logit).
 
 #include "common.h"
 #include "log.h"
@@ -36,6 +44,9 @@
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
+#include <cmath>
+#include <algorithm>
+#include <utility>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -411,6 +422,94 @@ int main() {
         const draft_out stale = verify_round(meta.get(), round_kind::fallback_no_carrier);
         expect(same(cont, fb), "per-round checkpoint fallback + replay == uninterrupted run", cont, fb);
         expect(!same(cont, stale), "fallback without the carrier != uninterrupted (control)", cont, stale);
+    }
+
+    // 5. [TAG_DRIFT_GUARD] stop inside an accepted draft block -> trim -> carry rebase -> save / restore -> extension
+    {
+        const std::vector<llama_token> P  = tokens(40, 1);
+        const std::vector<llama_token> PX = tokens(7,  4); // the later request's extension of the kept prefix
+        const llama_pos   n       = (llama_pos) P.size();
+        const llama_token id_last = 7, id_x = 19;
+
+        auto run_trim = [&](bool rebase, bool save_restore) {
+            mtp_env env;
+            init_env(env, meta.get());
+            new_request(env, P);
+            auto * mem_tgt = llama_get_memory(env.ctx_tgt.get());
+            common_prompt_checkpoint ckpt;
+            ckpt.update_pos(n, llama_memory_seq_pos_min(mem_tgt, 0), llama_memory_seq_pos_max(mem_tgt, 0));
+            const draft_out d = draft(env, n, id_last);
+            GGML_ASSERT(d.toks.size() >= 3 && "the case needs a draft of at least 3 tokens");
+            const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+            ckpt.update_tgt(env.ctx_tgt.get(), 0, flags);
+
+            // verification of [id_last, d0, d1, d2], all accepted: the carry is selected for the whole block
+            const std::vector<llama_token> block = { id_last, d.toks[0], d.toks[1], d.toks[2] };
+            feed(env, block, n);
+            common_speculative_accept(env.spec, 0, (uint16_t) (block.size() - 1));
+
+            // the trigger at block index 2 (= draft index 1): keep [id_last, d0]. Target: what a partial rollback leaves
+            // (checkpoint + replay of the kept tokens, target only); draft KV: seq_rm of the dropped positions
+            ckpt.load_tgt(env.ctx_tgt.get(), 0, flags);
+            GGML_ASSERT(llama_memory_seq_rm(mem_tgt, 0, ckpt.pos_max + 1, -1));
+            {
+                llama_batch b = llama_batch_init(2, 0, 1);
+                common_batch_add(b, id_last,   n,     { 0 }, false);
+                common_batch_add(b, d.toks[0], n + 1, { 0 }, true);
+                GGML_ASSERT(llama_decode(env.ctx_tgt.get(), b) == 0);
+                llama_batch_free(b);
+            }
+            GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(env.ctx_dft.get()), 0, n + 2, -1));
+            if (rebase) {
+                common_speculative_accept_rebase(env.spec, 0, 1);
+            }
+            if (save_restore) {
+                std::vector<uint8_t> saved, foreign;
+                GGML_ASSERT(common_speculative_get_state(env.spec, 0, saved));
+                foreign.assign(saved.begin(), saved.end());
+                for (size_t i = sizeof(uint32_t); i < foreign.size(); ++i) {
+                    foreign[i] ^= 0x5a; // another conversation's carry in the slot
+                }
+                GGML_ASSERT(common_speculative_set_state(env.spec, 0, foreign));
+                GGML_ASSERT(common_speculative_set_state(env.spec, 0, saved));
+            }
+            feed(env, PX, n + 2);
+            return std::make_pair(d.toks, draft(env, n + 2 + (llama_pos) PX.size(), id_x));
+        };
+
+        // reference: only [id_last, d0] ever decoded after P
+        draft_out ref5;
+        {
+            mtp_env env;
+            init_env(env, meta.get());
+            new_request(env, P);
+            const draft_out d = draft(env, n, id_last);
+            GGML_ASSERT(d.toks.size() >= 3);
+            feed(env, { id_last, d.toks[0] }, n);
+            common_speculative_accept(env.spec, 0, 1);
+            feed(env, PX, n + 2);
+            ref5 = draft(env, n + 2 + (llama_pos) PX.size(), id_x);
+        }
+        const auto maxdiff = [](const draft_out & a, const draft_out & b) {
+            double m = 0.0;
+            for (size_t i = 0; i < a.logits.size() && i < b.logits.size(); ++i) {
+                m = std::max(m, (double) std::fabs(a.logits[i] - b.logits[i]));
+            }
+            return m;
+        };
+        const draft_out rb    = run_trim(true,  false).second;
+        const draft_out rb_sr = run_trim(true,  true).second;
+        const draft_out stale = run_trim(false, false).second;
+        const double d_rb = maxdiff(ref5, rb), d_sr = maxdiff(ref5, rb_sr), d_st = maxdiff(ref5, stale);
+        printf("drift-guard trim: max |logit diff| vs reference: rebase %.3g, rebase+save/restore %.3g, stale (control) %.3g\n",
+               d_rb, d_sr, d_st);
+        // bit-identical on the CPU (the rows are batch-size invariant there); the control differs in every logit (random
+        //   weights make the carry's effect small in magnitude, ~1e-6, but never zero)
+        const bool ok_rb = same(ref5, rb);
+        const bool ok_sr = same(ref5, rb_sr);
+        expect(ok_rb, "trim inside an accepted block + carry rebase == prefix-only run", ref5, rb);
+        expect(ok_sr, "... + carry save / foreign / restore == prefix-only run", ref5, rb_sr);
+        expect(!same(ref5, stale), "trim without the rebase != prefix-only run (control)", ref5, stale);
     }
 
     llama_backend_free();
