@@ -11,8 +11,8 @@ Status column:
 - **v63**: in this tree since v63 (released 2026-10-21; in production 2026-10-21 06:32 to 22:12); "v63, on" / "v63, off" = the default of its knob.
 - **v64**: in this tree since v64 (released 2026-10-21); "v64, on" = on by default.
 
-This tree is v74: fork revision `e5f793eae` (`ui-agentic-actions`), image `vahpetr/llama-cpp-s1-fork:v74`. Every row
-below is still in it. The rows after 0265 (v65-v74, up to 0474) give the title, the patch file and the commit; the status column is the first
+This tree is v75: fork revision `4a55d9173` (`prod-v11-stage9-pkg15`), image `vahpetr/llama-cpp-s1-fork:v75`. Every row
+below is still in it. The rows after 0265 (v65-v75, up to 0486) give the title, the patch file and the commit; the status column is the first
 image that carried it. Their knobs are in docs/s1/KNOBS.md, section "Added after patch 0265".
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
@@ -437,6 +437,18 @@ records and upstream status live in my private repo; ask if you want one.
 | 0472 | webui: review r3 - a completed stream ending inside the echo keeps the partial but is flagged (`0472-webui-astra-r2-fixes.patch`, 7508dfb64) | v74 (class webui) |
 | 0473 | webui: Copy on an agentic bubble copies the flow's final answer (`0473-webui-agentic-copy-target.patch`, 2dac0029a) | v74 (class webui) |
 | 0474 | webui: rule 3 drops the fence-fragment heuristic and its stoplist (last-line rule only) (`0474-webui-rule3-drop-fence-fragment-stoplist.patch`, e5f793eae) | v74 (class webui) |
+| 0475 | chat: the qwen3 prefill continuation renders the reasoning/content boundary as generated (lstrip; a trailing newline kept, else trim + one) (`0475-chat-qwen3-continuation-reasoning-boundary-as-generated.patch`, efaf7e377) | v75 (class prompt rendering, by design) |
+| 0476 | templates: `qwen3.8-flash-next-preserve-ws.jinja` and `qwen3.8-flash-next-gsq-preserve-ws.jinja` = the GGUF templates with the history reasoning boundary as 0475, served by `--chat-template-file` (`0476-templates-qwen38-flash-next-preserve-ws.patch`, 573775690) | v75 (class prompt rendering, by design) |
+| 0477 | server: the disk cache saves a finished reply whose tail a pre-encode / next turn would overwrite (temporary rule); the stop line logs the EOG id (`0477-server-disk-cache-save-finished-reply-tail-eog-id.patch`, eb1b21a1d) | v75 (class EXACT) |
+| 0478 | server: `--chat-template` / `--chat-template-file` and their env forms never reach the disk-cache fingerprint (`0478-server-disk-cache-fingerprint-chat-template-neutral.patch`, 3e7702978) | v75 (class EXACT) |
+| 0479 | server: `--drift-guard off\|stop` (env `LLAMA_ARG_DRIFT_GUARD`, default off) + per-request `drift_guard` param, no behaviour yet (`0479-server-drift-guard-flag-per-request-param.patch`, 0182b059b) | v75 (class EXACT) |
+| 0480 | server: drift guard - a duplicate think-close in the content phase ends the reply (`STOP_TYPE_THINK_REENTER`); MTP carry re-picked after the trim (`0480-server-drift-guard-think-reenter-stop.patch`, 91664b4a4) | v75, off (untriggered: sampled ids unchanged) |
+| 0481 | server: `think_reenter` in every serializer (`finish_reason` stop, `stop_type` in native / OAI / Anthropic responses) (`0481-server-think-reenter-serializers.patch`, 51ea20fd1) | v75, off (untriggered: replies byte-identical) |
+| 0482 | tests: drift guard (`test-drift-guard`), MTP carry after a trim (`test-mtp-carrier` case 5), server e2e `test_drift_guard.py` (`0482-tests-drift-guard.patch`, 844612c67) | v75 (class tests) |
+| 0483 | server: `--drift-guard` / `LLAMA_ARG_DRIFT_GUARD` are disk-cache fingerprint neutral (`0483-server-disk-cache-fingerprint-drift-guard-neutral.patch`, 8600cc61a) | v75 (class EXACT) |
+| 0484 | server README: limits of the reasoning-boundary rendering, the finished-reply save and the template fingerprint exemption (docs only) (`0484-server-readme-reasoning-boundary-save-limits.patch`, f4f390d65) | v75 (class docs) |
+| 0485 | webui: drift guard - parse `stop_type` next to `finish_reason` and record both on the message (`0485-webui-drift-guard-stop-type-recorded.patch`, 04ab962e5) | v75 (class webui) |
+| 0486 | webui: drift guard - one bounded content-phase continuation after a `think_reenter` stop (`0486-webui-drift-guard-content-phase-continuation.patch`, 4a55d9173) | v75 (class webui) |
 
 **0227-0240 apply order** on v59 (`a1b6c324e`): 0227, 0228, 0229, 0230, 0231, 0232, **0234, 0233**, 0235, 0236, 0237, 0238,
 0239, 0240 (0233 sits on 0234). Applied with a strict `git am` in that order they reproduce the v60 tree (`845c6fbcd`,

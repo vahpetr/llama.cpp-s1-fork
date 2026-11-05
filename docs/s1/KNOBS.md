@@ -7,8 +7,8 @@ read once at start (or at context/memory creation). Upstream flags I rely on but
 Class: **EXACT** = outputs and state bytes identical with the knob on and off (proven by a gate); **COMPOSITION** = same math per
 op but a different batching / selection route, so near-ties can flip a token (classified by replay, see AGENTS.md); **LOSSY**
 = changes numerics; **SCHED** = scheduling or memory only, never outputs; **DIAG** = logging / checks / test-only.
-This page describes v72 (fork revision `608af6ea8`, `prod-v11-stage9-pkg12`). "prod" = the value in my s1 brain composes
-(`deploy/s1/`, v72); "-" = unset (the default). Rows marked (?) I have not re-checked
+This page describes v75 (fork revision `4a55d9173`, `prod-v11-stage9-pkg15`). "prod" = the value in my s1 brain composes
+(`deploy/s1/`, v75); "-" = unset (the default). Rows marked (?) I have not re-checked
 against the code for this table.
 
 ## Server flags
@@ -129,7 +129,7 @@ against the code for this table.
 ## Added after patch 0265 (in v73)
 
 Defaults below are read from the v73 code. The package sections that follow name the patches that added each older knob;
-their defaults are the same in v73. Their patch rows are in docs/s1/PATCHES.md (0266-0458); the tag in the code comment
+their defaults are the same in v73. The v75 rows (`--drift-guard`, `--chat-template-file`) are read from the v75 code. Their patch rows are in docs/s1/PATCHES.md (0266-0486); the tag in the code comment
 is the provenance.
 
 | knob | default | effect | class | prod |
@@ -150,6 +150,8 @@ is the provenance.
 | `LLAMA_QSA_IDX_F16_DECODE=0\|1` | 0 | `[TAG_QSA_IDX_F16_DECODE]` (0421-0424): where QSA_SCORE is refused (1-2 query rows: decode, MTP draft) the indexer score reads the f16 mirror via MUL_MAT_ROWS F16 store. Startup line `qsa_idx_f16_decode: on\|off (...)`. In the disk-cache key | LOSSY/class B when 1 | - |
 | `GGML_VK_DECODE_FUSE=0\|1` | on | `[TAG_DECODE_FUSE]` (0444-0453, 0457): the D3 decode fusions `shexp_tail`, `shexp_glu_sig`, `gdn_qk_gate` at <= 32 rows (tokens x sequences); =0 = the v72 dispatches. Startup line `decode_fuse: on\|off (GGML_VK_DECODE_FUSE, default on)`. Exact-listed in CACHE_ENV_EXACT (not in the disk-cache key) | EXACT | - |
 | CMake `GGML_VULKAN_DECODE_FUSE_MUTANT=0\|11\|21\|31\|32` | 0 | (0451, 0454): tests only - a mutant build of one D3 fusion whose DECODE_FUSE_EXACT cases must FAIL; WARN `decode_fuse: MUTANT BUILD <m> ...` | DIAG | - |
+| `--drift-guard off\|stop` (env `LLAMA_ARG_DRIFT_GUARD`) | off | (0479-0483, v75): `stop` ends a reply when the model generates the template's think-close special token (`</think>`) again in the content phase; the token is not emitted, the reply ends with `finish_reason` stop and `stop_type` `think_reenter`; a speculative draft past the trigger is trimmed and the MTP carry re-picked. Per-request `"drift_guard": true\|false`. Arms only when the end tag is one special token; startup line `drift guard: inactive (template): <why>` otherwise. Not in the disk-cache key | EXACT when untriggered (sampled ids unchanged) | off |
+| `--chat-template-file FILE` (upstream flag) | GGUF template | (0475/0476/0478, v75): the composes pass `models/templates/qwen3.8-flash-next-preserve-ws.jinja` (brain) or `qwen3.8-flash-next-gsq-preserve-ws.jinja` (hands), the GGUF template with the reasoning/content boundary kept as generated; byte-identical to the GGUF template for trimmed or empty reasoning. Needs `--jinja` before it. Not in the disk-cache key (0478) | prompt rendering changes by design for untrimmed reasoning | preserve-ws template |
 
 ## v64 package - patches 0262, 0263, 0265
 
