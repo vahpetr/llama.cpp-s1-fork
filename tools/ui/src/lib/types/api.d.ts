@@ -317,7 +317,7 @@ export interface ApiChatCompletionRequest {
 	n_predict?: number;
 	// Continuation control (vLLM compat)
 	add_generation_prompt?: boolean;
-	continue_final_message?: boolean;
+	continue_final_message?: boolean | 'content' | 'reasoning_content';
 }
 
 export interface ApiChatCompletionToolCallFunctionDelta {

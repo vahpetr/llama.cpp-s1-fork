@@ -818,3 +818,16 @@ export function formatTokenCount(n: number): string {
 
 	return String(Math.max(0, Math.round(n)));
 }
+
+/**
+ * How a reply request ended, as the W1.2 rules and the drift guard read it: finish_reason, the
+ * fork's stop_type, whether the reserve cap (not the configured limit) set max_tokens, the
+ * max_tokens sent (undefined = unlimited) and the tokens it generated (predicted_n).
+ */
+export interface ReplyEnd {
+	finish?: string;
+	stopType?: string;
+	byReserve: boolean;
+	maxTokens?: number;
+	generated?: number;
+}

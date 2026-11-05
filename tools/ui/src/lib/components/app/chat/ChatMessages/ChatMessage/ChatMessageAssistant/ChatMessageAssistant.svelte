@@ -164,6 +164,12 @@
 		</p>
 	{/if}
 
+	{#if message.driftGuard}
+		<p class="mt-2 text-xs text-muted-foreground" data-drift-guard>
+			[{message.driftGuard.note}]
+		</p>
+	{/if}
+
 	{#if displayedModel}
 		<div class="info my-6 grid gap-4 tabular-nums">
 			<div class="inline-flex flex-wrap items-start gap-2 text-xs text-muted-foreground">
