@@ -189,6 +189,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-cache-compat-key.cpp) # [TAG_CACHE_COMPAT2] disk cache key v2 + env registry
     target_include_directories(test-cache-compat-key PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-cache-compat-key PRIVATE server-context)
+    llama_build_and_test(test-cache-align.cpp) # [TAG_CACHE_ALIGN] byte-aligned prompt-cache splice core (P16e part 1)
+    target_include_directories(test-cache-align PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-cache-align PRIVATE server-context)
     llama_build_and_test(test-backend-sampling-guard.cpp) # [TAG_BS_GUARD] 0226 backend_sampling support check
     target_include_directories(test-backend-sampling-guard PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-backend-sampling-guard PRIVATE server-context)
