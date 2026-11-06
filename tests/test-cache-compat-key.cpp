@@ -206,6 +206,21 @@ int main() {
         // [TAG_DECODE_FUSE] the D3 decode fusions (class A by the F71 e2e proof; the D-gate knob arm sets =0)
         CHECK(server_cache_env_classify("GGML_VK_DECODE_FUSE") == SERVER_CACHE_ENV_EXACT);
         CHECK(server_cache_env_digest({ "GGML_VK_DECODE_FUSE=0" }) == d0);
+        // [TAG_VK_READ_CHUNK] the sync-read staging ring changes only the route of a byte copy: unset / 0 (whole-read
+        //   staging = v75) / 64 / 128 give one env digest and one v2 namespace key, so the rollback knob keeps the prod cache
+        CHECK(server_cache_env_classify("GGML_VK_SYNC_READ_CHUNK_MIB") == SERVER_CACHE_ENV_EXACT);
+        {
+            const std::string k_unset = server_disk_cache_fingerprint_v2(cheap_a, parts()).substr(0, 16);
+            for (const char * kv : { "GGML_VK_SYNC_READ_CHUNK_MIB=0", "GGML_VK_SYNC_READ_CHUNK_MIB=64",
+                                     "GGML_VK_SYNC_READ_CHUNK_MIB=128", "GGML_VK_SYNC_READ_CHUNK_MIB=" }) {
+                const std::string dg = server_cache_env_digest({ kv });
+                CHECK(dg == d0);
+                server_cache_key_parts p = parts();
+                p.env_digest = dg;
+                CHECK(server_disk_cache_fingerprint_v2(cheap_a, p).substr(0, 16) == k_unset);
+                CHECK(server_cache_env_digest({ "LLAMA_KQ_VIS=1", kv }) == dk);
+            }
+        }
         // [TAG_MM_PLAN] with the GGML_VK_MM_MERGE_FORCE negative control on, PLAN 0 -> 1 changes outputs: PLAN enters the key;
         //   with FORCE unset / 0 PLAN stays exact
         CHECK(server_cache_env_digest({ "GGML_VK_MM_MERGE_FORCE=1", "LLAMA_QWEN4EXP_MERGE_PLAN=0" }) !=

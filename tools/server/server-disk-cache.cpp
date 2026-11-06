@@ -773,6 +773,8 @@ static const char * const CACHE_ENV_EXACT[] = {
     "GGML_VK_HC_TAIL_FUSE",          // [TAG_HC_TAIL_FUSE] the hc_mix tail in one dispatch: the same hc_mixed bytes (class A)
     "GGML_VK_ADD_RMS_ROWS",          // [TAG_ADD_RMS_ROWS] hc_combine + rms_norm_mul in one dispatch: the same bytes (class A)
     "GGML_VK_DECODE_FUSE",           // [TAG_DECODE_FUSE] D3 shexp_tail / shexp_glu_sig / gdn_qk_gate: the same bytes (class A)
+    "GGML_VK_SYNC_READ_CHUNK_MIB",   // [TAG_VK_READ_CHUNK] staging ring size of the sync device->host read: the same bytes
+                                     //   (test-vk-staging-plan), so unset / 0 / 64 keep the namespace (the rollback knob is warm)
     "GGML_VK_PERF_LOGGER_CONCURRENT", "GGML_VK_PERF_LOGGER_FREQUENCY", "GGML_VK_SYNC_LOGGER", "GGML_VK_MEMORY_LOGGER",
     "GGML_VK_PIPELINE_STATS", "GGML_VK_OPT_WINDOW", "GGML_VK_FLOPS_SEED_LEGACY", "GGML_VK_SUBMIT_LOG",
     "GGML_VK_FUSION_DIAG", "GGML_VK_FUSION_COUNT", "GGML_VK_FUSION_LIST", "GGML_VULKAN_SKIP_CHECKS",
