@@ -103,6 +103,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 
 #include "ggml-vulkan-shaders.hpp"
 #include "ggml-vulkan-mmq-knobs.h" // [TAG_MMQ_INT8_KNOBS]
+#include "ggml-vulkan-staging-plan.h" // [TAG_VK_READ_CHUNK]
 
 // remove this once it's more widely available in the SDK
 #if !defined(VK_KHR_shader_bfloat16)
@@ -2764,6 +2765,10 @@ static bool vk_async_read_uma_force = false;
 // [TAG_VK_BUF_LOG] GGML_VK_BUF_LOG=1: one "[vk-buf]" line per buffer allocation (kind, size, memory type, heap,
 // VkMemoryPropertyFlags, wc = host-visible but not HOST_CACHED, i.e. write-combined for CPU reads). Diagnostic only.
 static bool vk_buf_log_enabled = false;
+// [TAG_VK_READ_CHUNK] GGML_VK_SYNC_READ_CHUNK_MIB (default 64, 0 = off): a synchronous staged read larger than this
+// streams through a fixed two-slot ring in device->sync_staging instead of growing it to the whole read
+// (ggml-vulkan-staging-plan.h). Bytes are identical; only the size of the staging buffer held afterwards changes.
+static size_t vk_sync_read_chunk_bytes = (size_t) 64 << 20;
 static thread_local const char * vk_buf_log_kind = nullptr;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
@@ -9634,6 +9639,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
         GGML_LOG_WARN("ggml_vulkan: %s uma_bulk_read: %s%s\n", device->name.c_str(), device->uma ?
                       "copy path (direct CPU read only from HOST_CACHED mappings or for <= 64 KiB; no knob)" : "n/a (not a UMA device)",
                       uma_async);
+        // [TAG_VK_READ_CHUNK] the proof line
+        if (vk_sync_read_chunk_bytes > 0) {
+            GGML_LOG_WARN("ggml_vulkan: %s sync_read_staging: chunked, %zu MiB ring (2 x %zu MiB; GGML_VK_SYNC_READ_CHUNK_MIB)\n",
+                          device->name.c_str(), vk_sync_read_chunk_bytes >> 20, vk_sync_read_chunk_bytes >> 21);
+        } else {
+            GGML_LOG_WARN("ggml_vulkan: %s sync_read_staging: whole read (GGML_VK_SYNC_READ_CHUNK_MIB=0)\n", device->name.c_str());
+        }
 
         // [TAG_VK_GET_ROWS_FLAT] the proof line
         if (ggml_vk_get_rows_flat_knob() > 0) {
@@ -10184,6 +10196,15 @@ static void ggml_vk_instance_init() {
     vk_async_read_copybuf   = ggml_vk_env_bool("GGML_VK_ASYNC_READ_COPYBUF", false);
     vk_async_read_uma_force = ggml_vk_env_bool("GGML_VK_ASYNC_READ_UMA", false);
     vk_buf_log_enabled      = ggml_vk_env_bool("GGML_VK_BUF_LOG", false);
+    { // [TAG_VK_READ_CHUNK]
+        const char * e = getenv("GGML_VK_SYNC_READ_CHUNK_MIB");
+        uint32_t mib = 64;
+        if (!ggml_vk_parse_sync_read_chunk_mib(e, mib)) {
+            GGML_LOG_WARN("ggml_vulkan: ignoring malformed GGML_VK_SYNC_READ_CHUNK_MIB=\"%s\", using 64\n", e);
+            mib = 64;
+        }
+        vk_sync_read_chunk_bytes = (size_t) mib << 20;
+    }
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
     if (GGML_VK_PIPELINE_STATS != nullptr) {
@@ -11498,6 +11519,70 @@ static bool ggml_vk_buffer_read_async(vk_context subctx, vk_buffer& src, size_t 
     return ggml_vk_buffer_read_2d_async(subctx, src, offset, dst, size, size, size, 1, sync_staging);
 }
 
+// [TAG_VK_READ_CHUNK] The staging branch of ggml_vk_buffer_read_2d for a read larger than vk_sync_read_chunk_bytes:
+// device->sync_staging is held at the chunk size (allocated once, reused; a larger buffer left by another path is
+// reused as is) and split into two slots of chunk/2. Chunk i is copied into slot i%2 while the host memcpys chunk i-1
+// out of the other slot; at most one submission is in flight, so the single device fence suffices and the command pools
+// are only cleaned up when the queue is idle. Returns false (nothing done) when the destination is pinned host memory,
+// which the caller's path copies into directly without staging. The caller holds src->device->mutex.
+static bool ggml_vk_buffer_read_2d_chunked(vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height) {
+    vk_device & device = src->device;
+    {
+        vk_buffer pinned = nullptr;
+        size_t pinned_offset = 0;
+        ggml_vk_host_get(device, dst, pinned, pinned_offset);
+        if (pinned != nullptr) {
+            return false;
+        }
+    }
+
+    const size_t slot = vk_sync_read_chunk_bytes / 2;
+    std::vector<ggml_vk_staging_piece> pieces;
+    std::vector<ggml_vk_staging_chunk> chunks;
+    ggml_vk_staging_plan_2d(offset, spitch, dpitch, width, height, slot, pieces, chunks);
+    GGML_ASSERT(!chunks.empty());
+
+    ggml_vk_ensure_sync_staging_buffer(device, 2 * slot);
+    vk_buffer staging = device->sync_staging;
+    VK_LOG_DEBUG("ggml_vk_buffer_read_2d_chunked(" << width * height << " B, " << chunks.size() << " chunks of <= " << slot << " B)");
+
+    auto submit_chunk = [&](size_t ci) {
+        const ggml_vk_staging_chunk & ch = chunks[ci];
+        const size_t base = (ci % 2) * slot;
+        std::vector<vk::BufferCopy> slices(ch.count);
+        for (size_t k = 0; k < ch.count; k++) {
+            const ggml_vk_staging_piece & p = pieces[ch.first + k];
+            slices[k] = vk::BufferCopy{ p.src, base + p.stg, p.n };
+        }
+        vk_context subctx = ggml_vk_create_temporary_context(device->transfer_queue->cmd_pool);
+        ggml_vk_ctx_begin(device, subctx);
+        ggml_vk_sync_buffers(nullptr, subctx);
+        subctx->s->buffer->buf.copyBuffer(src->buffer, staging->buffer, slices);
+        subctx->s->buffer->buf.pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {},
+            { { vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead } }, {}, {});
+        ggml_vk_ctx_end(subctx);
+        ggml_vk_submit(subctx, device->fence);
+    };
+
+    submit_chunk(0);
+    for (size_t ci = 0; ci < chunks.size(); ci++) {
+        VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "vk_buffer_read_2d_chunked waitForFences", device);
+        device->device.resetFences({ device->fence });
+        ggml_vk_queue_command_pools_cleanup(device); // the queue is idle here
+        if (ci + 1 < chunks.size()) {
+            submit_chunk(ci + 1); // into the other slot, overlapping the memcpy below
+        }
+        const ggml_vk_staging_chunk & ch = chunks[ci];
+        const uint8_t * base = (const uint8_t *) staging->ptr + (ci % 2) * slot;
+        for (size_t k = 0; k < ch.count; k++) {
+            const ggml_vk_staging_piece & p = pieces[ch.first + k];
+            memcpy((uint8_t *) dst + p.dst, base + p.stg, p.n);
+        }
+    }
+    return true;
+}
+
 static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_read_2d(" << src->buffer << ", " << offset << ", " << width << ", " << height << ")");
 
@@ -11538,6 +11623,12 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
         }
     } else {
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
+
+        // [TAG_VK_READ_CHUNK] a read that would grow the staging buffer past the chunk streams through the ring instead
+        if (vk_sync_read_chunk_bytes > 0 && width * height > vk_sync_read_chunk_bytes &&
+            ggml_vk_buffer_read_2d_chunked(src, offset, dst, spitch, dpitch, width, height)) {
+            return;
+        }
 
         vk_context subctx = ggml_vk_create_temporary_context(src->device->transfer_queue->cmd_pool);
         ggml_vk_ctx_begin(src->device, subctx);

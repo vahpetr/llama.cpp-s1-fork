@@ -336,6 +336,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-graph-cache-check3 PROPERTIES ENVIRONMENT "${MTP_QSA_TEST_ENV};LLAMA_QSA_DUMP_IDS=1")
     llama_build_and_test(test-qwen4exp-hc-norm.cpp) # [TAG_UP28896] RMS_NORM + MUL adjacency, bit identity on the CPU
     llama_build_and_test(test-vk-mmq-knobs.cpp) # [TAG_MMQ_INT8_KNOBS] GGML_VK_MMQ_INT8_MIN_N / _OPS parsers, CPU only
+    llama_build_and_test(test-vk-staging-plan.cpp) # [TAG_VK_READ_CHUNK] chunked sync-read staging plan: byte identity + ring order, CPU only
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
