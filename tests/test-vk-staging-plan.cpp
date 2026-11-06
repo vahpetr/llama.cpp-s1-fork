@@ -9,7 +9,8 @@
 //     a contiguous read is one piece per chunk and ceil(total / cap) chunks;
 //  3. mutant: the same ring order with a one-slot staging (no ring) must corrupt the output - the check above would
 //     catch a ring that lets the in-flight copy overwrite the slot being read;
-//  4. the GGML_VK_SYNC_READ_CHUNK_MIB parser.
+//  4. the GGML_VK_SYNC_READ_CHUNK_MIB parser (digits via ggml_vk_parse_mmq_int8_min_n);
+//  5. MiB -> bytes in 64-bit, clamped for a 32-bit size_t (4096 MiB must not wrap to 0).
 
 #include "../ggml/src/ggml-vulkan/ggml-vulkan-staging-plan.h"
 
@@ -173,6 +174,19 @@ int main() {
             v = 7;
             CHECK(!ggml_vk_parse_sync_read_chunk_mib(bad, v) && v == 7);
         }
+    }
+
+    // 5: MiB -> bytes in 64-bit; a 32-bit size_t must not wrap 4096 MiB to 0 (chunking silently off)
+    {
+        const uint64_t m64 = UINT64_MAX, m32 = UINT32_MAX;
+        CHECK(ggml_vk_sync_read_chunk_bytes(0,    m64) == 0);
+        CHECK(ggml_vk_sync_read_chunk_bytes(64,   m64) == (64ull << 20));
+        CHECK(ggml_vk_sync_read_chunk_bytes(4096, m64) == (4096ull << 20));
+        CHECK(ggml_vk_sync_read_chunk_bytes(64,   m32) == (64ull << 20));
+        CHECK(ggml_vk_sync_read_chunk_bytes(2047, m32) == (2047ull << 20));
+        CHECK(ggml_vk_sync_read_chunk_bytes(2048, m32) == (2047ull << 20));
+        CHECK(ggml_vk_sync_read_chunk_bytes(4096, m32) == (2047ull << 20));
+        CHECK(ggml_vk_sync_read_chunk_bytes(4096, m32) != 0 && ggml_vk_sync_read_chunk_bytes(4096, m32) <= m32);
     }
 
     if (n_fail == 0) {

@@ -22,6 +22,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "ggml-vulkan-mmq-knobs.h"
+
 struct ggml_vk_staging_piece {
     size_t src; // byte offset in the source buffer
     size_t stg; // byte offset in the staging slot (0 .. cap)
@@ -42,61 +44,54 @@ static inline void ggml_vk_staging_plan_2d(size_t offset, size_t spitch, size_t 
     if (width == 0 || height == 0 || cap == 0) {
         return;
     }
-    size_t used = 0;
-    auto close_chunk = [&]() {
-        const size_t first = chunks.empty() ? 0 : chunks.back().first + chunks.back().count;
-        chunks.push_back({ first, pieces.size() - first, used });
-        used = 0;
-    };
+    size_t used        = 0; // staging bytes of the open chunk
+    size_t chunk_first = 0; // index of the open chunk's first piece
     for (size_t r = 0; r < height; r++) {
         for (size_t c = 0; c < width; ) {
             const size_t n   = std::min(width - c, cap - used);
             const size_t src = offset + r*spitch + c;
             const size_t dst = r*dpitch + c;
-            const size_t first = chunks.empty() ? 0 : chunks.back().first + chunks.back().count;
-            if (pieces.size() > first) {
-                ggml_vk_staging_piece & p = pieces.back();
-                if (p.src + p.n == src && p.stg + p.n == used && p.dst + p.n == dst) {
-                    p.n += n;
-                    used += n;
-                    c += n;
-                    if (used == cap) {
-                        close_chunk();
-                    }
-                    continue;
-                }
+            ggml_vk_staging_piece * last = pieces.size() > chunk_first ? &pieces.back() : nullptr;
+            if (last != nullptr && last->src + last->n == src && last->stg + last->n == used && last->dst + last->n == dst) {
+                last->n += n; // contiguous in source, staging and destination: extend
+            } else {
+                pieces.push_back({ src, used, dst, n });
             }
-            pieces.push_back({ src, used, dst, n });
             used += n;
-            c += n;
+            c    += n;
             if (used == cap) {
-                close_chunk();
+                chunks.push_back({ chunk_first, pieces.size() - chunk_first, used });
+                chunk_first = pieces.size();
+                used = 0;
             }
         }
     }
     if (used > 0) {
-        close_chunk();
+        chunks.push_back({ chunk_first, pieces.size() - chunk_first, used });
     }
 }
 
 // GGML_VK_SYNC_READ_CHUNK_MIB: absent / empty -> 64; decimal digits 0..4096 accepted (0 = off: the staging buffer is
 // sized to the whole read, the behaviour before the chunking); 1 is raised to 2 (a slot is half the chunk). Anything
-// else is rejected with the output untouched (the backend keeps the default and warns).
+// else is rejected with the output untouched (the backend keeps the default and warns). The digit parsing is the
+// GGML_VK_MMQ_INT8_MIN_N one (ggml-vulkan-mmq-knobs.h).
 static inline bool ggml_vk_parse_sync_read_chunk_mib(const char * s, uint32_t & out) {
     if (s == nullptr || *s == '\0') {
         out = 64;
         return true;
     }
-    uint64_t v = 0;
-    for (const char * p = s; *p; p++) {
-        if (*p < '0' || *p > '9') {
-            return false;
-        }
-        v = v*10 + (uint64_t) (*p - '0');
-        if (v > 4096) {
-            return false;
-        }
+    uint32_t v = 0;
+    if (!ggml_vk_parse_mmq_int8_min_n(s, v) || v > 4096) {
+        return false;
     }
-    out = v == 1 ? 2 : (uint32_t) v;
+    out = v == 1 ? 2 : v;
     return true;
+}
+
+// MiB -> bytes in 64-bit, clamped to half the size_t range (rounded down to whole MiB), so 4096 MiB on a 32-bit size_t
+// becomes 2047 MiB instead of wrapping to 0 (= chunking silently off). size_max = SIZE_MAX in the backend.
+static inline uint64_t ggml_vk_sync_read_chunk_bytes(uint32_t mib, uint64_t size_max) {
+    const uint64_t bytes = (uint64_t) mib << 20;
+    const uint64_t lim   = ((size_max >> 1) >> 20) << 20;
+    return std::min(bytes, lim);
 }

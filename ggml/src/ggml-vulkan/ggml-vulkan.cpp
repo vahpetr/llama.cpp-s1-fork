@@ -9641,8 +9641,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
                       uma_async);
         // [TAG_VK_READ_CHUNK] the proof line
         if (vk_sync_read_chunk_bytes > 0) {
-            GGML_LOG_WARN("ggml_vulkan: %s sync_read_staging: chunked, %zu MiB ring (2 x %zu MiB; GGML_VK_SYNC_READ_CHUNK_MIB)\n",
-                          device->name.c_str(), vk_sync_read_chunk_bytes >> 20, vk_sync_read_chunk_bytes >> 21);
+            const bool uma_direct = device->uma && vk_async_read_uma_force && !vk_async_read_copybuf;
+            GGML_LOG_WARN("ggml_vulkan: %s sync_read_staging: chunked, %zu MiB ring (2 x %zu MiB; GGML_VK_SYNC_READ_CHUNK_MIB)%s\n",
+                          device->name.c_str(), vk_sync_read_chunk_bytes >> 20, vk_sync_read_chunk_bytes >> 21,
+                          uma_direct ? "; NOT for host-visible UMA mappings: GGML_VK_ASYNC_READ_UMA=1 reads them directly" : "");
         } else {
             GGML_LOG_WARN("ggml_vulkan: %s sync_read_staging: whole read (GGML_VK_SYNC_READ_CHUNK_MIB=0)\n", device->name.c_str());
         }
@@ -10203,7 +10205,7 @@ static void ggml_vk_instance_init() {
             GGML_LOG_WARN("ggml_vulkan: ignoring malformed GGML_VK_SYNC_READ_CHUNK_MIB=\"%s\", using 64\n", e);
             mib = 64;
         }
-        vk_sync_read_chunk_bytes = (size_t) mib << 20;
+        vk_sync_read_chunk_bytes = (size_t) ggml_vk_sync_read_chunk_bytes(mib, (uint64_t) SIZE_MAX); // 64-bit, clamped
     }
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
@@ -11375,6 +11377,16 @@ static void ggml_vk_buffer_write(vk_buffer& dst, size_t offset, const void * src
     ggml_vk_buffer_write_2d(dst, offset, src, size, size, size, 1);
 }
 
+// the UMA direct-read test of ggml_vk_buffer_read_2d_async (shared with the [TAG_VK_READ_CHUNK] precedence check)
+static bool ggml_vk_uma_direct_read_ok(const vk_buffer & src) {
+    return !vk_async_read_copybuf &&
+           src->device->uma &&
+           (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+           (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent) &&
+           ((src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached) || vk_async_read_uma_force) &&
+           src->ptr != nullptr;
+}
+
 static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height, bool sync_staging = false) {
     VK_LOG_DEBUG("ggml_vk_buffer_read_2d_async(offset=" << offset << ", width=" << width << ", height=" << height << ")");
     GGML_ASSERT(width > 0);
@@ -11418,12 +11430,7 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
     // Knobs, both for the A/B: GGML_VK_ASYNC_READ_COPYBUF=1 forces the old vkCmdCopyBuffer path
     // even on cached UMA memory; GGML_VK_ASYNC_READ_UMA=1 forces this shortcut even when the memory
     // type is not HOST_CACHED (COPYBUF wins if both are set).
-    if (!vk_async_read_copybuf &&
-        src->device->uma &&
-        (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
-        (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent) &&
-        ((src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached) || vk_async_read_uma_force) &&
-        src->ptr != nullptr) {
+    if (ggml_vk_uma_direct_read_ok(src)) {
         const bool transfer_queue = subctx->p->q->transfer_only;
         const vk::AccessFlags src_access = transfer_queue
             ? vk::AccessFlags(vk::AccessFlagBits::eTransferWrite)
@@ -11523,7 +11530,7 @@ static bool ggml_vk_buffer_read_async(vk_context subctx, vk_buffer& src, size_t 
 // device->sync_staging is held at the chunk size (allocated once, reused; a larger buffer left by another path is
 // reused as is) and split into two slots of chunk/2. Chunk i is copied into slot i%2 while the host memcpys chunk i-1
 // out of the other slot; at most one submission is in flight, so the single device fence suffices and the command pools
-// are only cleaned up when the queue is idle. Returns false (nothing done) when the destination is pinned host memory,
+// are cleaned up once after the last fence (as the whole-read path). Returns false (nothing done) when the destination is pinned host memory,
 // which the caller's path copies into directly without staging. The caller holds src->device->mutex.
 static bool ggml_vk_buffer_read_2d_chunked(vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height) {
     vk_device & device = src->device;
@@ -11569,7 +11576,8 @@ static bool ggml_vk_buffer_read_2d_chunked(vk_buffer& src, size_t offset, void *
     for (size_t ci = 0; ci < chunks.size(); ci++) {
         VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "vk_buffer_read_2d_chunked waitForFences", device);
         device->device.resetFences({ device->fence });
-        ggml_vk_queue_command_pools_cleanup(device); // the queue is idle here
+        // no command pool cleanup in the loop: it would also reset pools of other queues (and of async transfers) that
+        // are not proven idle here; one cleanup after the loop, as the whole-read path does after its single fence
         if (ci + 1 < chunks.size()) {
             submit_chunk(ci + 1); // into the other slot, overlapping the memcpy below
         }
@@ -11580,6 +11588,7 @@ static bool ggml_vk_buffer_read_2d_chunked(vk_buffer& src, size_t offset, void *
             memcpy((uint8_t *) dst + p.dst, base + p.stg, p.n);
         }
     }
+    ggml_vk_queue_command_pools_cleanup(device);
     return true;
 }
 
@@ -11625,9 +11634,23 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
 
         // [TAG_VK_READ_CHUNK] a read that would grow the staging buffer past the chunk streams through the ring instead
-        if (vk_sync_read_chunk_bytes > 0 && width * height > vk_sync_read_chunk_bytes &&
-            ggml_vk_buffer_read_2d_chunked(src, offset, dst, spitch, dpitch, width, height)) {
-            return;
+        //   - unless GGML_VK_ASYNC_READ_UMA=1 selects the direct deferred memcpy from the UMA mapping (no staging) in
+        //     ggml_vk_buffer_read_2d_async below: that A/B override keeps its precedence over the chunking
+        if (vk_sync_read_chunk_bytes > 0 && width * height > vk_sync_read_chunk_bytes) {
+            if (ggml_vk_uma_direct_read_ok(src)) {
+                static std::atomic<bool> logged_direct { false };
+                if (!logged_direct.exchange(true)) {
+                    GGML_LOG_INFO("ggml_vulkan: sync read of %zu B: direct UMA read (GGML_VK_ASYNC_READ_UMA=1), not the staging ring\n",
+                                  width * height);
+                }
+            } else if (ggml_vk_buffer_read_2d_chunked(src, offset, dst, spitch, dpitch, width, height)) {
+                static std::atomic<bool> logged_chunked { false };
+                if (!logged_chunked.exchange(true)) {
+                    GGML_LOG_INFO("ggml_vulkan: sync read of %zu B: staging ring (%zu MiB, first use)\n",
+                                  width * height, vk_sync_read_chunk_bytes >> 20);
+                }
+                return;
+            }
         }
 
         vk_context subctx = ggml_vk_create_temporary_context(src->device->transfer_queue->cmd_pool);
