@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [TAG_CACHE_ALIGN] server-level replay of the three logged v75 re-segmentation incidents (P16e, design §7.2)
+# [TAG_CACHE_ALIGN] server-level replay of the three logged v75 re-segmentation incidents (P16e, design sec. 7.2)
 #
 # For each incident: the cached ids C (the disk-cache .tok entry: prompt + the reply the model sampled) are put into
 # slot 0 as a numeric prompt (n_predict 0); then the client turn is replayed as TEXT: detokenize(C) + the next user
@@ -24,7 +24,7 @@ import sys
 import urllib.request
 
 TOK_DIR = "/mnt/data/piagent-slots/prompt-cache/qwen38-flash-next-uncensored-brain-1m/ns-36557823e9dde84e/"
-CASES = [  # key, reply start, |C|, id LCP (design §1, test-cache-align)
+CASES = [  # key, reply start, |C|, id LCP (design sec. 1, test-cache-align)
     ("ba543f058ab248da", 89623, 124316, 92653),
     ("95ea69c1eb053e22", 234824, 257289, 238290),
     ("a32a45b7e9f14c89", 306875, 336262, 310735),

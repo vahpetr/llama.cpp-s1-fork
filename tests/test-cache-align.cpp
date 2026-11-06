@@ -7,7 +7,9 @@
 #include "common.h"
 #include "llama.h"
 
+#include <chrono>
 #include <cstdio>
+#include <random>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -29,7 +31,8 @@ enum : llama_token {
     IM_START = 0, IM_END = 1, THINK_END = 2, USER = 3, NL = 4, SP_PAREN = 5, PREC = 6, ACHE = 7, PRE = 8, CACHE = 9,
     LT = 10, BAR = 11, IM = 12, UEND = 13, BAR_GT = 14, LT_SLASH = 15, THINK = 16, GT = 17, B_D0 = 18, B_BC = 19,
     CYR_M = 20, ASSISTANT = 21, HELLO = 22, WORLD = 23, BOX = 24, BOX2 = 25, USER_NL = 26, UNUSED = 27, X = 28,
-    N_TOY = 29,
+    W_LIT = 29, // ordinary " world<|im_end|>\n"
+    N_TOY = 30,
 };
 
 static server_cache_align_vocab toy_vocab() {
@@ -40,6 +43,7 @@ static server_cache_align_vocab toy_vocab() {
     p[LT_SLASH] = "</"; p[THINK] = "think"; p[GT] = ">"; p[B_D0] = "\xD0"; p[B_BC] = "\xBC"; p[CYR_M] = "\xD0\xBC";
     p[ASSISTANT] = "assistant"; p[HELLO] = "hello"; p[WORLD] = " world"; p[BOX] = "\xE2\x95\x90";
     p[BOX2] = "\xE2\x95\x90\xE2\x95\x90"; p[USER_NL] = "user\n"; p[UNUSED] = ""; p[X] = "x";
+    p[W_LIT] = " world<|im_end|>\n";
     return server_cache_align_vocab::from_pieces(p, { IM_START, IM_END, THINK_END });
 }
 
@@ -49,6 +53,22 @@ static common_chat_msg_delimiters toy_delims() {
     d.delimiters.push_back({ COMMON_CHAT_ROLE_ASSISTANT, "<|im_start|>assistant", { IM_START, ASSISTANT } });
     d.delimiters.push_back({ COMMON_CHAT_ROLE_USER,      "<|im_start|>user\n",    { IM_START, USER, NL } });
     return d;
+}
+
+// full-split cross-check of the position-local span check: spans of S == spans of N mapped through the splice
+static bool spans_match(const common_chat_msg_delimiters & d, const llama_tokens & N, const llama_tokens & S,
+                        const server_cache_align_result & r) {
+    const auto sn = d.split(N), ss = d.split(S);
+    if (sn.spans.size() != ss.spans.size()) {
+        return false;
+    }
+    for (size_t k = 0; k < sn.spans.size(); k++) {
+        const auto mp = server_cache_align_map_pos(r, sn.spans[k].pos);
+        if (mp.snapped || mp.pos != ss.spans[k].pos || sn.spans[k].role != ss.spans[k].role) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static std::string bytes_of(const server_cache_align_vocab & v, const llama_tokens & t) {
@@ -75,23 +95,26 @@ static void synthetic() {
         const auto r = server_cache_align(C, N, v, pd);
         CHECK(r.status == CACHE_ALIGN_ALIGNED);
         CHECK(r.n_lcp == 5 && r.n_c == 7 && r.n_n == 7 && r.delta() == 0 && r.n_spans == 1);
-        CHECK(r.n_bytes == bytes_of(v, C).size());
         const auto S = server_cache_align_splice(C, N, r);
         CHECK(bytes_of(v, S) == bytes_of(v, N));
         CHECK(llama_tokens(S.begin(), S.begin() + 7) == C);
-        CHECK(r.spans.spans.size() == 2 && r.spans.spans[1].role == COMMON_CHAT_ROLE_USER && r.spans.spans[1].pos == 9);
+        const auto ss = d.split(S);
+        CHECK(ss.spans.size() == 2 && ss.spans[1].role == COMMON_CHAT_ROLE_USER && ss.spans[1].pos == 9);
+        CHECK(spans_match(d, N, S, r));
         // no delimiters: same splice, no span check
         const auto r0 = server_cache_align(C, N, v);
         CHECK(r0.aligned() && r0.n_c == 7 && r0.n_n == 7);
     }
-    // 2. `═` `═` (cached) vs `══` (canonical): delta +1, spans after the splice shift by delta
+    // 2. BOX BOX (cached) vs BOX2 (canonical): delta +1, spans after the splice shift by delta
     {
         const llama_tokens C = { IM_START, USER, NL, HELLO, BOX, BOX, WORLD };
         const llama_tokens N = { IM_START, USER, NL, HELLO, BOX2, WORLD, IM_END, NL, IM_START, USER, NL, X };
         const auto r = server_cache_align(C, N, v, pd);
         CHECK(r.aligned() && r.n_lcp == 4 && r.n_c == 7 && r.n_n == 6 && r.delta() == 1);
-        CHECK(r.spans.spans.size() == 2 && r.spans.spans[0].pos == 0 && r.spans.spans[1].pos == 9); // 8 + 1
         const auto S = server_cache_align_splice(C, N, r);
+        const auto ss = d.split(S);
+        CHECK(ss.spans.size() == 2 && ss.spans[0].pos == 0 && ss.spans[1].pos == 9); // 8 + 1
+        CHECK(spans_match(d, N, S, r));
         CHECK(S.size() == N.size() + 1 && bytes_of(v, S) == bytes_of(v, N));
     }
     // 3. literal vs structural collisions, both directions, `<|im_end|>` and `</think>`: stop before, no splice
@@ -108,9 +131,18 @@ static void synthetic() {
         CHECK(r.status == CACHE_ALIGN_NONE && r.n_c == 2 && r.stop == CACHE_ALIGN_STOP_LITERAL);
         r = server_cache_align(N2, C2, v);
         CHECK(r.status == CACHE_ALIGN_NONE && r.n_c == 2 && r.stop == CACHE_ALIGN_STOP_LITERAL);
-        // a structural token that does not start at a joint boundary (`══` cached vs `═` + `<|im_end|>`)
+        // a structural token that does not start at a joint boundary (BOX2 cached vs BOX + `<|im_end|>`)
         r = server_cache_align({ HELLO, BOX2, X }, { HELLO, BOX, IM_END }, v);
         CHECK(r.status == CACHE_ALIGN_NONE && r.n_c == 1 && r.stop == CACHE_ALIGN_STOP_STRUCTURAL);
+        // (review r1 5) the unmatched remainder is longer than the structural piece: ordinary bytes spelling
+        //   `<|im_end|>\n` against `<|im_end|>` - LITERAL, both directions
+        r = server_cache_align({ HELLO, W_LIT, X }, { HELLO, WORLD, IM_END, NL }, v);
+        CHECK(r.status == CACHE_ALIGN_NONE && r.n_c == 1 && r.stop == CACHE_ALIGN_STOP_LITERAL);
+        r = server_cache_align({ HELLO, WORLD, IM_END, NL }, { HELLO, W_LIT, X }, v);
+        CHECK(r.status == CACHE_ALIGN_NONE && r.n_c == 1 && r.stop == CACHE_ALIGN_STOP_LITERAL);
+        // a remainder that is no head of the structural piece stays STRUCTURAL
+        r = server_cache_align({ HELLO, BOX2, LT, BAR, IM }, { HELLO, BOX, IM_END }, v);
+        CHECK(r.stop == CACHE_ALIGN_STOP_STRUCTURAL); // the remainder BOX is not a head of `<|im_end|>`
     }
     // 4. UTF-8: byte pieces vs the full character, joint boundary after the character
     {
@@ -119,7 +151,7 @@ static void synthetic() {
         const auto r = server_cache_align(C, N, v);
         CHECK(r.aligned() && r.n_c == 4 && r.n_n == 3 && r.delta() == 1);
         CHECK(r.syncs.size() == 3 && r.syncs[1] == std::make_pair((size_t) 2, (size_t) 3));
-        // a pin between the byte pieces (C side) is not a request coordinate; the request's 2 = after `м` -> C 3
+        // a pin between the byte pieces (C side) is not a request coordinate; the request's 2 = after CYR_M -> C 3
         const auto mp = server_cache_align_map_pos(r, 2);
         CHECK(mp.pos == 3 && !mp.snapped);
     }
@@ -136,7 +168,7 @@ static void synthetic() {
         // mid-UTF-8 character: N ends after the lead byte, C holds the full character
         r = server_cache_align({ HELLO, CYR_M, WORLD }, { HELLO, B_D0 }, v);
         CHECK(r.status == CACHE_ALIGN_NONE && r.n_c == 1 && r.n_n == 1);
-        // `═` vs `══` at the end of N
+        // BOX vs BOX2 at the end of N
         r = server_cache_align({ HELLO, BOX2 }, { HELLO, BOX }, v);
         CHECK(r.status == CACHE_ALIGN_NONE && r.n_c == 1);
     }
@@ -155,7 +187,9 @@ static void synthetic() {
         const llama_tokens N = { HELLO, SP_PAREN, PRE, CACHE, IM_END, NL, IM_START, USER, NL, HELLO, IM_END, NL, IM_START, ASSISTANT, NL };
         auto r = server_cache_align(C, N, v, pd);
         CHECK(r.aligned() && r.n_c == 6 && r.n_n == 6 && r.n_tried == 1);
-        CHECK(r.spans.spans.size() == 2 && r.spans.spans[0].pos == 6 && r.spans.spans[0].role == COMMON_CHAT_ROLE_USER);
+        const auto ss = d.split(server_cache_align_splice(C, N, r));
+        CHECK(ss.spans.size() == 2 && ss.spans[0].pos == 6 && ss.spans[0].role == COMMON_CHAT_ROLE_USER);
+        CHECK(spans_match(d, N, server_cache_align_splice(C, N, r), r));
         // without delimiters the later point wins
         r = server_cache_align(C, N, v);
         CHECK(r.aligned() && r.n_c == 9 && r.n_n == 10);
@@ -165,7 +199,6 @@ static void synthetic() {
         r = server_cache_align(C2, N2, v, pd);
         CHECK(r.status == CACHE_ALIGN_DECLINED_SPANS && r.n_c == 2 && r.n_n == 2 && r.n_tried == 1);
         CHECK(server_cache_align_splice(C2, N2, r) == N2);
-        CHECK(r.spans.spans.size() == 1 && r.spans.spans[0].pos == 1);
         // retries exhausted
         server_cache_align_params p0 = pd;
         p0.max_span_retries = 0;
@@ -180,7 +213,7 @@ static void synthetic() {
         CHECK(r.aligned() && r.n_c == 3 && r.n_n == 4 && r.delta() == -1);
         auto mp = server_cache_align_map_pos(r, 1);
         CHECK(mp.pos == 1 && !mp.snapped);
-        mp = server_cache_align_map_pos(r, 2);                 // between `═` and `═` = inside the cached `══`
+        mp = server_cache_align_map_pos(r, 2);                 // between BOX and BOX = inside the cached BOX2
         CHECK(mp.pos == 1 && mp.snapped);
         mp = server_cache_align_map_pos(r, 3);
         CHECK(mp.pos == 2 && !mp.snapped);
@@ -188,6 +221,30 @@ static void synthetic() {
         CHECK(mp.pos == 3 && !mp.snapped);
         mp = server_cache_align_map_pos(r, 5);
         CHECK(mp.pos == 4 && !mp.snapped);
+    }
+    // 8b. (review r1 7) cache_pin at a turn start inside a re-split region maps to that turn's start in S; a pin inside a
+    //     re-split token snaps down to the previous span start of S (where checkpoints are made), not to a bare boundary
+    {
+        // turn 1 (user) | reply with two re-split spans | turn 2 (user) | re-split | end of C; N continues
+        const llama_tokens C = { IM_START, USER, NL, X, IM_END, NL, IM_START, ASSISTANT, NL, BOX, BOX, IM_END, NL,
+                                 IM_START, USER, NL, PREC, ACHE };
+        const llama_tokens N = { IM_START, USER, NL, X, IM_END, NL, IM_START, ASSISTANT, NL, BOX2, IM_END, NL,
+                                 IM_START, USER, NL, PRE, CACHE, IM_END, NL, IM_START, ASSISTANT, NL };
+        const auto r = server_cache_align(C, N, v, pd);
+        CHECK(r.aligned() && r.n_lcp == 9 && r.n_c == 18 && r.n_n == 17 && r.delta() == 1);
+        const auto S  = server_cache_align_splice(C, N, r);
+        const auto sn = d.split(N), ss = d.split(S);
+        CHECK(spans_match(d, N, S, r) && sn.spans.size() == 4 && ss.spans.size() == 4);
+        // the second user turn starts at 12 in N, at 13 in S
+        CHECK(sn.spans[2].pos == 12 && ss.spans[2].pos == 13);
+        auto mp = server_cache_align_map_pin(r, 12, sn, ss);
+        CHECK(mp.pos == 13 && !mp.snapped);
+        // 16 = between `pre` and `cache` (inside the cached `prec` `ache` split): snapped to the turn start 13
+        mp = server_cache_align_map_pin(r, 16, sn, ss);
+        CHECK(mp.pos == 13 && mp.snapped);
+        // an exact boundary that is no span start maps exactly
+        mp = server_cache_align_map_pin(r, 15, sn, ss);
+        CHECK(mp.pos == 16 && !mp.snapped);
     }
     // 9. media: the walk stops at a placeholder; media after the splice point in N declines
     {
@@ -240,35 +297,37 @@ static void coordinates() {
 
     const llama_tokens N = { HELLO, CYR_M, CYR_M, IM_END, NL, X };
     server_cache_matcher m;
-    m.vocab        = &v;
-    m.delims       = &d;
-    m.prompt_bytes = server_cache_align_prefix_bytes(N, v);
-    CHECK(m.prompt_bytes.size() == N.size() + 1 && m.prompt_bytes[3] == 9 && m.prompt_bytes[4] == 19);
+    m.vocab  = &v;
+    m.delims = &d;
 
-    // inactive (knob off / ineligible / nullptr): n_c = n_n = n_bytes = the id LCP - the v75 comparisons
+    // inactive (knob off / ineligible / nullptr): n_c = n_n = the id LCP - the v75 comparisons
     const llama_tokens C1 = { HELLO, B_D0, B_BC, B_D0, B_BC };   // finer segmentation, fewer bytes
     const llama_tokens C2 = { HELLO, CYR_M, CYR_M, IM_END };     // fewer tokens, more bytes
     for (const server_cache_matcher * off : { (const server_cache_matcher *) nullptr, (const server_cache_matcher *) new server_cache_matcher() }) {
         const auto a = server_cache_match_tokens(st(C1), st(N), off);
-        CHECK(a.n_lcp == 1 && a.n_c == 1 && a.n_n == 1 && a.n_bytes == 1 && !a.aligned);
+        CHECK(a.n_lcp == 1 && a.n_c == 1 && a.n_n == 1 && !a.aligned);
         const auto b = server_cache_match_tokens(st(C2), st(N), off);
-        CHECK(b.n_lcp == 4 && b.n_c == 4 && b.n_n == 4 && b.n_bytes == 4);
+        CHECK(b.n_lcp == 4 && b.n_c == 4 && b.n_n == 4);
         delete off;
     }
 
     // active: two coordinates. C1 keeps 5 cached tokens (retention n_c) for 3 prompt tokens (coverage n_n)
     const auto a = server_cache_match_tokens(st(C1), st(N), &m);
-    CHECK(a.aligned && a.n_lcp == 1 && a.n_c == 5 && a.n_n == 3 && a.n_bytes == 9);
+    CHECK(a.aligned && a.n_lcp == 1 && a.n_c == 5 && a.n_n == 3);
     const auto b = server_cache_match_tokens(st(C2), st(N), &m);
-    CHECK(!b.aligned && b.n_c == 4 && b.n_n == 4 && b.n_bytes == 19);
-    // the rank key: C1 keeps more cached tokens, C2 matches more bytes and covers more of the prompt -> C2
-    CHECK(a.n_c > b.n_c && b.n_bytes > a.n_bytes && b.n_n > a.n_n);
+    CHECK(!b.aligned && b.n_c == 4 && b.n_n == 4);
+    // the rank key n_n (monotone in the matched bytes): C1 keeps more cached tokens, C2 covers more of the prompt -> C2
+    CHECK(a.n_c > b.n_c && b.n_n > a.n_n);
     // f_keep = n_c / |C| (1.0 for C1: the whole cache is kept), f_sim = n_n / |N|
     CHECK(a.n_c == C1.size() && b.n_c == C2.size());
 
     // the media-aware id LCP of server_tokens is the walk's start
     const auto c = server_cache_match_tokens(st({ HELLO, CYR_M, B_D0, B_BC }), st(N), &m);
-    CHECK(c.n_lcp == 2 && c.aligned && c.n_c == 4 && c.n_n == 3 && c.n_bytes == 9);
+    CHECK(c.n_lcp == 2 && c.aligned && c.n_c == 4 && c.n_n == 3);
+    // the full result for a later splice of the same pair (the launch reuses the selection's walk)
+    server_cache_align_result full;
+    const auto c2 = server_cache_match_tokens(st({ HELLO, CYR_M, B_D0, B_BC }), st(N), &m, &full);
+    CHECK(c2.aligned && full.aligned() && full.n_c == 4 && full.n_n == 3 && full.syncs.size() == 2);
 
     // provenance per subprompt, mirroring tokenize_input_prompts' split
     auto pf = server_cache_align_prompts_from_text(common_json::parse(R"(["a", {"prompt_string":"b"}, [1,2]])"));
@@ -279,7 +338,80 @@ static void coordinates() {
     CHECK(pf.size() == 1 && pf[0]);
 }
 
-// ---- the three logged v75 incidents (design §1 / §7.2) ----
+// ---- (review r1 1) cost of one matching pass at 1M: |N| = 1M, 60 candidates, matcher active vs inactive ----
+static void perf_1m() {
+    // vocab: 4 structural ids, 8 one-char + 64 two-char ordinary pieces over "abcdefgh"
+    std::vector<std::string> p = { "<|s|>", "<|e|>", "<|u|>", "<|a|>" };
+    const std::string al = "abcdefgh";
+    for (char a : al) { p.push_back(std::string(1, a)); }
+    for (char a : al) { for (char b : al) { p.push_back(std::string(1, a) + b); } }
+    const auto v = server_cache_align_vocab::from_pieces(p, { 0, 1, 2, 3 });
+    const auto one = [](char c) { return (llama_token) (4 + (c - 'a')); };
+    common_chat_msg_delimiters d;
+    d.delimiters.push_back({ COMMON_CHAT_ROLE_USER,      "", { 0, 2 } });
+    d.delimiters.push_back({ COMMON_CHAT_ROLE_ASSISTANT, "", { 0, 3 } });
+
+    std::mt19937 rng(42);
+    const size_t n_prompt = 1u << 20;
+    llama_tokens N;
+    N.reserve(n_prompt);
+    while (N.size() < n_prompt) {
+        if (N.size() % 2048 == 0) {
+            N.push_back(1); N.push_back(0); N.push_back(N.size() % 4096 == 2 ? 2 : 3); // <|e|><|s|> role
+        } else {
+            N.push_back((llama_token) (12 + rng() % 64)); // a two-char piece
+        }
+    }
+    N.resize(n_prompt);
+    const auto resplit = [&](llama_tokens & C, size_t at) {
+        // replace one two-char token at `at` by its two one-char pieces (same bytes)
+        while (at < C.size() && C[at] < 12) { at++; }
+        if (at >= C.size()) { return; }
+        const std::string & s2 = v.piece[C[at]];
+        C[at] = one(s2[0]);
+        C.insert(C.begin() + at + 1, one(s2[1]));
+    };
+    std::vector<server_tokens> cands;
+    for (int k = 0; k < 10; k++) {
+        const size_t len = n_prompt - (size_t) k * 10000 - 7;   // same conversation, earlier snapshots
+        llama_tokens C(N.begin(), N.begin() + len);
+        if (k % 2 == 0) {
+            for (int j = 0; j < 8; j++) { resplit(C, len - 30000 + j * 3000); }
+        }
+        cands.emplace_back(C, false);
+    }
+    for (int k = 0; k < 50; k++) {
+        llama_tokens C(n_prompt - 1000);
+        for (auto & t : C) { t = (llama_token) (12 + rng() % 64); }
+        cands.emplace_back(C, false);
+    }
+    const server_tokens NN(N, false);
+    server_cache_matcher on;
+    on.vocab  = &v;
+    on.delims = &d;
+    const auto pass = [&](const server_cache_matcher * m, size_t & sum_n, size_t & n_aligned) {
+        const auto t0 = std::chrono::steady_clock::now();
+        sum_n = n_aligned = 0;
+        for (const auto & c : cands) {
+            const auto r = server_cache_match_tokens(c, NN, m);
+            sum_n += r.n_n;
+            n_aligned += r.aligned;
+        }
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+    size_t s_off = 0, s_on = 0, a_off = 0, a_on = 0;
+    double t_off = 1e9, t_on = 1e9;
+    for (int rep = 0; rep < 3; rep++) {
+        t_off = std::min(t_off, pass(nullptr, s_off, a_off));
+        t_on  = std::min(t_on,  pass(&on, s_on, a_on));
+    }
+    fprintf(stderr, "perf 1M: |N| %zu, %zu candidates (10 same-conversation, 5 with re-splits; 50 unrelated): "
+            "off %.1f ms, on %.1f ms (aligned %zu, coverage %zu -> %zu)\n", N.size(), cands.size(), t_off, t_on, a_on, s_off, s_on);
+    CHECK(a_off == 0 && a_on == 5 && s_on > s_off);
+    CHECK(t_on < 3.0 * t_off + 50.0); // the walk + window span check stay proportional to the re-segmented region
+}
+
+// ---- the three logged v75 incidents (design sec. 1 / 7.2) ----
 
 static bool read_tok(const std::string & path, llama_tokens & out) {
     std::ifstream f(path, std::ios::binary);
@@ -363,14 +495,14 @@ static int real_cases() {
         fprintf(stderr, "real case %s: |C| %zu |N| %zu id-lcp %zu (lost %zu) -> %s n_c %zu n_n %zu delta %lld spans %zu, "
                 "dropped %zu, message spans %zu\n", c.key, C.size(), N.size(), r.n_lcp, C.size() - r.n_lcp,
                 server_cache_align_status_str(r.status), r.n_c, r.n_n, (long long) r.delta(), r.n_spans,
-                C.size() - r.n_c, r.spans.spans.size());
+                C.size() - r.n_c, d.split(S).spans.size());
         CHECK(r.n_lcp == c.id_lcp);           // the bug, reproduced
         CHECK(r.aligned());
         CHECK(r.n_c == C.size());             // 0 dropped
         CHECK(r.n_spans > 0);
         CHECK(bytes_of(v, S) == bytes_of(v, N));
         CHECK(llama_tokens(S.begin(), S.begin() + C.size()) == C);
-        CHECK(r.spans.spans.size() == d.split(N).spans.size());
+        CHECK(spans_match(d, N, S, r));
     }
 
     llama_model_free(model);
@@ -381,6 +513,7 @@ static int real_cases() {
 int main() {
     synthetic();
     coordinates();
+    perf_1m();
     const int rc = real_cases();
     if (n_fail > 0 || rc != 0) {
         fprintf(stderr, "test-cache-align: %d check(s) failed, real rc %d\n", n_fail, rc);
