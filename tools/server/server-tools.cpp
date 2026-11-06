@@ -863,7 +863,7 @@ static bool path_glob_match(const std::string & pattern, const std::string & rel
 // read_file: read a file with optional line range and line-number prefix
 //
 
-static constexpr size_t SERVER_TOOL_READ_FILE_MAX_SIZE = 16 * 1024; // 16 KB
+static constexpr size_t SERVER_TOOL_READ_FILE_MAX_SIZE = 256 * 1024; // 256 KB
 static constexpr size_t SERVER_TOOL_READ_FILE_MAX_SIZE_BASE64 = 32 * 1024 * 1024; // 32 MB
 
 struct server_tool_read_file : server_tool {
@@ -880,7 +880,8 @@ struct server_tool_read_file : server_tool {
             {"function", {
                 {"name", name},
                 {"description", "Read the contents of a file. Optionally specify a 1-based line range. "
-                                "If append_loc is true, each line is prefixed with its line number (e.g. \"1\u2192...\")."},
+                                "If append_loc is true, each line is prefixed with its line number (e.g. \"1\u2192...\"). "
+                                "Files larger than 256 KiB cannot be read whole; read them in parts with start_line/end_line."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
