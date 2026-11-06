@@ -2,6 +2,7 @@
 // toy vocab table, then the three logged v75 incidents replayed from their disk-cache .tok entries on the prod vocab
 // (vocab-only load; skipped with a note when the GGUF / .tok files are absent, CACHE_ALIGN_REQUIRE_REAL=1 = fail)
 #include "server-cache-align.h"
+#include "server-common.h"
 #include "chat.h"
 #include "common.h"
 #include "llama.h"
@@ -231,6 +232,53 @@ static void synthetic() {
     }
 }
 
+// ---- part 2: the two-coordinate match the server's matching sites use ----
+static void coordinates() {
+    const auto v = toy_vocab();
+    const auto d = toy_delims();
+    const auto st = [](const llama_tokens & t) { return server_tokens(t, false); };
+
+    const llama_tokens N = { HELLO, CYR_M, CYR_M, IM_END, NL, X };
+    server_cache_matcher m;
+    m.vocab        = &v;
+    m.delims       = &d;
+    m.prompt_bytes = server_cache_align_prefix_bytes(N, v);
+    CHECK(m.prompt_bytes.size() == N.size() + 1 && m.prompt_bytes[3] == 9 && m.prompt_bytes[4] == 19);
+
+    // inactive (knob off / ineligible / nullptr): n_c = n_n = n_bytes = the id LCP - the v75 comparisons
+    const llama_tokens C1 = { HELLO, B_D0, B_BC, B_D0, B_BC };   // finer segmentation, fewer bytes
+    const llama_tokens C2 = { HELLO, CYR_M, CYR_M, IM_END };     // fewer tokens, more bytes
+    for (const server_cache_matcher * off : { (const server_cache_matcher *) nullptr, (const server_cache_matcher *) new server_cache_matcher() }) {
+        const auto a = server_cache_match_tokens(st(C1), st(N), off);
+        CHECK(a.n_lcp == 1 && a.n_c == 1 && a.n_n == 1 && a.n_bytes == 1 && !a.aligned);
+        const auto b = server_cache_match_tokens(st(C2), st(N), off);
+        CHECK(b.n_lcp == 4 && b.n_c == 4 && b.n_n == 4 && b.n_bytes == 4);
+        delete off;
+    }
+
+    // active: two coordinates. C1 keeps 5 cached tokens (retention n_c) for 3 prompt tokens (coverage n_n)
+    const auto a = server_cache_match_tokens(st(C1), st(N), &m);
+    CHECK(a.aligned && a.n_lcp == 1 && a.n_c == 5 && a.n_n == 3 && a.n_bytes == 9);
+    const auto b = server_cache_match_tokens(st(C2), st(N), &m);
+    CHECK(!b.aligned && b.n_c == 4 && b.n_n == 4 && b.n_bytes == 19);
+    // the rank key: C1 keeps more cached tokens, C2 matches more bytes and covers more of the prompt -> C2
+    CHECK(a.n_c > b.n_c && b.n_bytes > a.n_bytes && b.n_n > a.n_n);
+    // f_keep = n_c / |C| (1.0 for C1: the whole cache is kept), f_sim = n_n / |N|
+    CHECK(a.n_c == C1.size() && b.n_c == C2.size());
+
+    // the media-aware id LCP of server_tokens is the walk's start
+    const auto c = server_cache_match_tokens(st({ HELLO, CYR_M, B_D0, B_BC }), st(N), &m);
+    CHECK(c.n_lcp == 2 && c.aligned && c.n_c == 4 && c.n_n == 3 && c.n_bytes == 9);
+
+    // provenance per subprompt, mirroring tokenize_input_prompts' split
+    auto pf = server_cache_align_prompts_from_text(common_json::parse(R"(["a", {"prompt_string":"b"}, [1,2]])"));
+    CHECK(pf.size() == 3 && pf[0] && pf[1] && !pf[2]);
+    pf = server_cache_align_prompts_from_text(common_json::parse(R"([1, "a"])")); // one mixed prompt
+    CHECK(pf.size() == 1 && !pf[0]);
+    pf = server_cache_align_prompts_from_text(common_json("text"));
+    CHECK(pf.size() == 1 && pf[0]);
+}
+
 // ---- the three logged v75 incidents (design §1 / §7.2) ----
 
 static bool read_tok(const std::string & path, llama_tokens & out) {
@@ -332,6 +380,7 @@ static int real_cases() {
 
 int main() {
     synthetic();
+    coordinates();
     const int rc = real_cases();
     if (n_fail > 0 || rc != 0) {
         fprintf(stderr, "test-cache-align: %d check(s) failed, real rc %d\n", n_fail, rc);
