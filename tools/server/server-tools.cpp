@@ -1386,7 +1386,9 @@ struct server_tool_edit_file : server_tool {
                 {"description",
                     "Edit a file using exact text replacement. Each edits[].old_text must be unique in the file "
                     "and is matched against the original content, not incrementally. Merge nearby changes into "
-                    "one edit instead of overlapping edits. Use write_file to replace the whole file."},
+                    "one edit instead of overlapping edits. Use write_file to replace the whole file. "
+                    "If any edit fails (old_text not found or not unique), NO change is written to the file. "
+                    "Re-read the region with read_file append_loc=true before retrying."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
