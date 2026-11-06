@@ -17,6 +17,8 @@ add_library(${TARGET} STATIC
     server-context.h
     server-disk-cache.cpp
     server-disk-cache.h
+    server-cache-align.cpp
+    server-cache-align.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp
