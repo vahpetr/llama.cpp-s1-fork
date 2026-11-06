@@ -106,6 +106,9 @@ struct task_params {
     //   spans came from (the span identity check of a splice)
     bool cache_align_from_text = false;
     common_chat_msg_delimiters message_delimiters;
+    // [TAG_CACHE_ALIGN] (review r1 6) eligibility decided once on the HTTP thread (knob, text provenance, completion,
+    //   cache_prompt, n_cmpl <= 1); the matcher is then built from the task in O(1)
+    bool cache_align_active = false;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
@@ -194,6 +197,25 @@ struct server_task {
 
     int32_t n_tokens() const {
         return tokens.size();
+    }
+
+    // [TAG_CACHE_ALIGN] (review r1 3) a byte-aligned splice changes tokens.size() by delta; what the client is told
+    //   (usage prompt_tokens, progress, errors) stays in its own coordinates: |N| and positions mapped back
+    int32_t align_n_request = -1; // |N| when spliced, else -1
+    int32_t align_n_lcp     = 0;
+    int32_t align_n_c       = 0;
+    int32_t align_delta     = 0;
+
+    int32_t n_tokens_request() const {
+        return align_n_request >= 0 ? align_n_request : n_tokens();
+    }
+
+    // an S position (n_past, processed count) in request coordinates
+    int32_t to_request_pos(int32_t pos) const {
+        if (align_n_request < 0) {
+            return pos;
+        }
+        return pos >= align_n_c ? pos - align_delta : std::min(pos, align_n_lcp);
     }
 
     bool need_embd() const {

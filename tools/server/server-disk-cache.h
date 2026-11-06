@@ -157,8 +157,7 @@ struct server_disk_cache {
     uint64_t pending_bytes() const;
 
     // index of the entry with the longest common prefix with tokens, if longer than lcp_min and it fits n_ctx_slot
-    // [TAG_CACHE_ALIGN] with an active matcher: threshold lcp_min and *lcp_out in new-prompt coverage (n_n), ranked by
-    //   matched bytes; inactive / nullptr = the id LCP (v75)
+    // [TAG_CACHE_ALIGN] threshold, rank and *lcp_out in new-prompt coverage n_n (inactive / nullptr = the id LCP, v75)
     int find(const server_tokens & tokens, size_t lcp_min, size_t n_ctx_slot, size_t * lcp_out,
              const server_cache_matcher * matcher = nullptr) const;
 

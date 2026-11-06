@@ -2069,13 +2069,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         *swapped = false;
     }
     // [TAG_CACHE_ALIGN] two coordinates: f_keep from the cached tokens kept (n_c), f_sim from the new-prompt coverage
-    //   (n_n), candidates ranked by matched bytes; an inactive matcher gives n_c = n_n = the id LCP (= v75)
-    const bool aligning = matcher != nullptr && matcher->active();
+    //   (n_n); an inactive matcher gives n_c = n_n = the id LCP (= v75)
     const server_cache_match m_base = server_cache_match_tokens(prompt.tokens, tokens_new, matcher);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(m_base.n_c) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
     float f_sim_best  = float(m_base.n_n) / tokens_new.size();
-    size_t bytes_best = m_base.n_bytes;
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -2102,10 +2100,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && (aligning ? bytes_best < m_cur.n_bytes : f_sim_best < f_sim_cur)) {
+        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
-            bytes_best  = m_cur.n_bytes;
 
             it_best = it;
         }

@@ -2007,23 +2007,33 @@ private:
 
     std::unique_ptr<server_disk_cache> disk_cache; // [TAG_DISK_PROMPT_CACHE]
 
-    // [TAG_CACHE_ALIGN] the matcher of one request: active only for an eligible completion (knob on, text provenance,
-    //   cache_prompt, not n > 1, not a child); otherwise every match is the plain id LCP (= v75)
+    // [TAG_CACHE_ALIGN] the matcher of one request, O(1): eligibility was decided on the HTTP thread
+    //   (task.params.cache_align_active); a child never aligns. Inactive = every match is the plain id LCP (= v75)
     server_cache_matcher cache_matcher(const server_task & task) const {
         server_cache_matcher m;
-        server_cache_align_gate g;
-        g.enabled      = cache_align_enabled() && task.type == SERVER_TASK_TYPE_COMPLETION;
-        g.from_text    = task.params.cache_align_from_text;
-        g.cache_prompt = task.params.cache_prompt;
-        g.n_cmpl       = task.params.n_cmpl;
-        g.is_child     = task.is_child();
-        if (!server_cache_align_eligible(g)) {
+        if (!cache_align_enabled() || !task.params.cache_align_active || task.is_child()) {
             return m;
         }
-        m.vocab        = cache_align_vocab.get();
-        m.delims       = task.params.message_delimiters.delimiters.empty() ? nullptr : &task.params.message_delimiters;
-        m.prompt_bytes = server_cache_align_prefix_bytes(task.tokens.get_tokens(), *m.vocab);
+        m.vocab  = cache_align_vocab.get();
+        m.delims = task.params.message_delimiters.delimiters.empty() ? nullptr : &task.params.message_delimiters;
         return m;
+    }
+
+    // [TAG_CACHE_ALIGN] (review r1 6) the walk of the selected (task, slot) pair done during selection, reused by the
+    //   launch when the slot's cache is still the one it was computed on (selection and launch run back to back;
+    //   a RAM / disk load in between invalidates it)
+    struct {
+        int    id_task  = -1;
+        int    id_slot  = -1;
+        size_t n_cached = 0;
+        server_cache_align_result r;
+    } cache_align_memo;
+
+    void cache_align_memo_set(const server_task & task, const server_slot & slot, server_cache_align_result && r) {
+        cache_align_memo.id_task  = task.id;
+        cache_align_memo.id_slot  = slot.id;
+        cache_align_memo.n_cached = slot.prompt.tokens.size();
+        cache_align_memo.r        = std::move(r);
     }
 
     // [TAG_CACHE_COMPAT2] the short-context measurement (spec D4): on sequence 0 before serving, from a cleared
@@ -3154,6 +3164,9 @@ private:
         // [TAG_CACHE_ALIGN] inactive (knob off / ineligible request) = every match below is the id LCP (v75)
         const server_cache_matcher matcher = cache_matcher(task);
         const bool aligning = matcher.active();
+        cache_align_memo.id_task = -1;
+        server_cache_align_result r_best;
+        const server_slot * r_best_slot = nullptr;
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -3172,8 +3185,7 @@ private:
         // find the slot that has at least n% prompt similarity
         if (slot_prompt_similarity != 0.0f) {
             float  f_sim_best = 0;
-            size_t bytes_best = 0; // [TAG_CACHE_ALIGN] rank key with an active matcher
-            size_t n_c_best   = 0;
+            size_t n_c_best   = 0; // [TAG_CACHE_ALIGN] retention of the best slot
 
             for (server_slot & slot : slots) {
                 if (task.id_slot != -1 && slot.id != task.id_slot) {
@@ -3195,20 +3207,23 @@ private:
                 }
 
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
-                // [TAG_CACHE_ALIGN] f_sim = new-prompt coverage n_n / |N|; with an active matcher the best slot is the
-                //   one with the most matched bytes (a finer segmentation must not win over a longer byte prefix)
-                const server_cache_match m = server_cache_match_tokens(tokens, task.tokens, &matcher);
+                // [TAG_CACHE_ALIGN] f_sim = new-prompt coverage n_n / |N| (monotone in the matched bytes, so a finer
+                //   cached segmentation never wins over a longer byte prefix)
+                server_cache_align_result r_cur;
+                const server_cache_match m = server_cache_match_tokens(tokens, task.tokens, &matcher, aligning ? &r_cur : nullptr);
                 const size_t lcp_len = m.n_n;
                 const float f_sim_cur = float(lcp_len) / task.tokens.size();
 
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
                 // select the current slot if the criteria match
-                const bool better = aligning ? (ret == nullptr || m.n_bytes > bytes_best) : f_sim_cur > f_sim_best;
-                if (better && f_sim_cur > slot_prompt_similarity) {
+                if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
                     f_sim_best = f_sim_cur;
-                    bytes_best = m.n_bytes;
                     n_c_best   = m.n_c;
+                    if (aligning) {
+                        r_best      = std::move(r_cur);
+                        r_best_slot = &slot;
+                    }
 
                     ret = &slot;
                 }
@@ -3249,6 +3264,11 @@ private:
 
             // cache prompts only for the tasks that reuse them
             update_cache = update_cache && !task.is_stateless();
+
+            // [TAG_CACHE_ALIGN] the slot keeps its cache unless the RAM tier replaces it below
+            if (aligning && r_best_slot == ret && !update_cache) {
+                cache_align_memo_set(task, *ret, std::move(r_best));
+            }
 
             // [TAG_MULTISLOT] (item 5b) a RAM swap-in may follow: within the concurrent reserve only, else the task
             //   waits in the queue (nothing saved or loaded yet; selection re-runs on the next pass)
@@ -3301,8 +3321,13 @@ private:
             const size_t n_slot   = ret->prompt.tokens.size();
             // [TAG_CACHE_ALIGN] two coordinates: lcp_n = the new prompt's coverage (gain: lookup / pending thresholds),
             //   lcp_slot = the slot tokens kept (loss: the save rules); equal (= the id LCP) with an inactive matcher
-            const server_cache_match m_slot = reuse ? server_cache_match_tokens(ret->prompt.tokens, task.tokens, &matcher)
+            server_cache_align_result r_slot;
+            const server_cache_match m_slot = reuse ? server_cache_match_tokens(ret->prompt.tokens, task.tokens, &matcher,
+                                                                                aligning ? &r_slot : nullptr)
                                                     : server_cache_match{};
+            if (aligning && reuse) {
+                cache_align_memo_set(task, *ret, std::move(r_slot)); // invalidated below if an entry is loaded
+            }
             const size_t lcp_slot = m_slot.n_c;
             const size_t lcp_n    = m_slot.n_n;
             const size_t margin   = 1024; // below this a load does not pay for itself
@@ -3350,6 +3375,7 @@ private:
                 size_t lcp_disk = 0;
                 const int idx = disk_cache->find(task.tokens, lcp_n + margin, ret->n_ctx, &lcp_disk, &matcher);
                 if (idx >= 0) {
+                    cache_align_memo.id_task = -1; // [TAG_CACHE_ALIGN] the slot's cache is replaced
                     SLT_INF(*ret, "disk cache: loading a stored prompt, common prefix %zu vs %zu in the slot\n", lcp_disk, lcp_n);
                     server_disk_load_result res = ret->disk_load(*disk_cache, idx);
 
@@ -3470,12 +3496,22 @@ private:
         }
         const llama_tokens & C = slot.prompt.tokens.get_tokens();
         const llama_tokens & N = task.tokens.get_tokens();
+        const size_t n_lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
 
-        server_cache_align_params p;
-        p.delims       = m.delims;
-        p.n_lcp        = slot.prompt.tokens.get_common_prefix(task.tokens);
-        p.prompt_bytes = &m.prompt_bytes;
-        const server_cache_align_result r = server_cache_align(C, N, *m.vocab, p);
+        // (review r1 6) the selection's walk of this very pair when the slot's cache did not change since
+        server_cache_align_result r;
+        if (cache_align_memo.id_task == task.id && cache_align_memo.id_slot == slot.id &&
+                cache_align_memo.n_cached == C.size() && cache_align_memo.r.n_lcp == n_lcp) {
+            r = std::move(cache_align_memo.r);
+            SRV_DBG("slot %d | task %d | cache-align: the selection's walk reused\n", slot.id, task.id);
+        } else {
+            server_cache_align_params p;
+            p.delims           = m.delims;
+            p.n_lcp            = n_lcp;
+            p.prompt_has_media = task.tokens.has_mtmd ? -1 : 0;
+            r = server_cache_align(C, N, *m.vocab, p);
+        }
+        cache_align_memo.id_task = -1;
 
         if (r.stop == CACHE_ALIGN_STOP_LITERAL) {
             SRV_WRN("slot %d | task %d | cache-align: the walk stopped at a literal-vs-structural collision (lcp_ids=%zu)\n",
@@ -3490,6 +3526,16 @@ private:
             return;
         }
 
+        // (review r1 3) admission must not depend on the cache: a splice that would take the prompt to the context
+        //   limit (|S| = |N| + delta >= n_ctx while |N| fits) is declined, so a warm and a cold slot answer alike
+        const int64_t n_spliced = (int64_t) N.size() + r.delta();
+        if (n_spliced >= slot.n_ctx && (int64_t) N.size() < slot.n_ctx) {
+            metrics.n_cache_align_declined++;
+            SRV_INF("slot %d | task %d | cache-align: declined (context: %" PRId64 " spliced tokens vs n_ctx %d), lcp_ids=%zu\n",
+                    slot.id, task.id, n_spliced, slot.n_ctx, r.n_lcp);
+            return;
+        }
+
         // N's own prefix [0, n_lcp) keeps its media map; C[n_lcp, n_c) and N[n_n, |N|) are text (the walk stops at
         //   media, media in N past the splice point declines)
         server_tokens spliced = task.tokens.clone();
@@ -3501,8 +3547,13 @@ private:
             spliced.push_back(N[k]);
         }
 
+        // message spans recomputed on S (their identity was verified by the walk); client boundaries mapped with them
+        const common_chat_msg_spans spans_n = task.params.message_spans;
+        if (!task.params.message_delimiters.delimiters.empty()) {
+            task.params.message_spans = spliced.find_message_spans(task.params.message_delimiters);
+        }
         const auto remap = [&](int64_t pos, const char * what) {
-            const server_cache_align_pos mp = server_cache_align_map_pos(r, (size_t) pos);
+            const server_cache_align_pos mp = server_cache_align_map_pin(r, (size_t) pos, spans_n, task.params.message_spans);
             if (mp.snapped) {
                 SRV_WRN("slot %d | task %d | %s: moved %" PRId64 " -> %zu (inside a re-segmented span)\n", slot.id, task.id,
                         what, pos, mp.pos);
@@ -3515,15 +3566,16 @@ private:
         if (task.params.n_keep > 0) {
             task.params.n_keep = (int32_t) remap(task.params.n_keep, "n_keep");
         }
-        if (!task.params.message_delimiters.delimiters.empty()) {
-            task.params.message_spans = spliced.find_message_spans(task.params.message_delimiters);
-        }
 
         SRV_INF("slot %d | task %d | cache-align: lcp_ids=%zu aligned_n_c=%zu n_n=%zu delta=%+" PRId64 " spans=%zu dropped=%zu prompt=%zu -> %zu\n",
                 slot.id, task.id, r.n_lcp, r.n_c, r.n_n, r.delta(), r.n_spans, C.size() - r.n_c, N.size(), spliced.size());
         metrics.n_cache_align++;
         metrics.n_cache_align_tokens += r.n_c - r.n_lcp;
 
+        task.align_n_request = (int32_t) N.size();
+        task.align_n_lcp     = (int32_t) r.n_lcp;
+        task.align_n_c       = (int32_t) r.n_c;
+        task.align_delta     = (int32_t) r.delta();
         task.tokens = std::move(spliced);
     }
 
@@ -3912,7 +3964,7 @@ private:
 
     void send_error(const server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
         spec_flush_deferred(slot); // [TAG_T2_O1] the slot's queued partials first
-        send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
+        send_error(slot.task->id, error, type, slot.task->n_tokens_request(), slot.n_ctx);
     }
 
     // [TAG_T2_O1] send the slot's queued partial responses (in order); returns the number sent
@@ -3961,9 +4013,10 @@ private:
 
         if (is_progress) {
             res->is_progress        = true;
-            res->progress.total     = slot.task->n_tokens();
-            res->progress.cache     = slot.stats.n_prompt_cached;
-            res->progress.processed = slot.prompt.tokens.size();
+            // [TAG_CACHE_ALIGN] (review r1 3) request coordinates (|N|, positions mapped back from S)
+            res->progress.total     = slot.task->n_tokens_request();
+            res->progress.cache     = slot.task->to_request_pos(slot.stats.n_prompt_cached);
+            res->progress.processed = slot.task->to_request_pos((int32_t) slot.prompt.tokens.size());
             res->progress.time_ms   = slot.stats.t_elapsed_us() / 1000;
         }
         if (is_begin) {
@@ -3974,8 +4027,8 @@ private:
         }
 
         res->n_decoded             = slot.stats.n_gen;
-        res->n_prompt_tokens       = slot.task->n_tokens();
-        res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
+        res->n_prompt_tokens       = slot.task->n_tokens_request(); // [TAG_CACHE_ALIGN] request coordinates
+        res->n_prompt_tokens_cache = slot.task->to_request_pos(slot.stats.n_prompt_cached);
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
         res->verbose           = slot.task->params.verbose;
@@ -4045,8 +4098,8 @@ private:
 
         res->truncated             = slot.truncated;
         res->n_decoded             = slot.stats.n_gen;
-        res->n_prompt_tokens       = slot.task->n_tokens();
-        res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
+        res->n_prompt_tokens       = slot.task->n_tokens_request(); // [TAG_CACHE_ALIGN] request coordinates
+        res->n_prompt_tokens_cache = slot.task->to_request_pos(slot.stats.n_prompt_cached);
         res->n_tokens_cached       = slot.prompt.n_tokens();
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
@@ -8521,7 +8574,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
             task.params.cache_align_from_text = i < from_text.size() && from_text[i] && type == SERVER_TASK_TYPE_COMPLETION;
             if (ctx_server.cache_align_enabled()) {
-                task.params.message_delimiters = delimiters;
+                // [TAG_CACHE_ALIGN] (review r1 6) decided once here; children copy the params but never align
+                server_cache_align_gate g;
+                g.enabled      = true;
+                g.from_text    = task.params.cache_align_from_text;
+                g.cache_prompt = task.params.cache_prompt;
+                g.n_cmpl       = task.params.n_cmpl;
+                task.params.cache_align_active = server_cache_align_eligible(g);
+                if (task.params.cache_align_active) {
+                    task.params.message_delimiters = delimiters;
+                }
             }
 
             task.id_slot = json_value(data, "id_slot", -1);

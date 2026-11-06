@@ -3456,38 +3456,16 @@ int server_disk_cache::find(const server_tokens & tokens, size_t lcp_min, size_t
                             const server_cache_matcher * matcher) const {
     int    best     = -1;
     size_t lcp_best = lcp_min;
-    if (matcher == nullptr || !matcher->active()) {
-        for (size_t i = 0; i < entries.size(); i++) {
-            if (entries[i].tokens.size() > n_ctx_slot) {
-                continue;
-            }
-            const size_t lcp = entries[i].tokens.get_common_prefix(tokens);
-            // [TAG_DISK_ADOPT] the own namespace wins a tie with an adopt source
-            if (lcp > lcp_best || (lcp == lcp_best && best >= 0 && entries[i].src.empty() && !entries[best].src.empty())) {
-                lcp_best = lcp;
-                best     = (int) i;
-            }
-        }
-        if (lcp_out) {
-            *lcp_out = best >= 0 ? lcp_best : 0;
-        }
-        return best;
-    }
-    // [TAG_CACHE_ALIGN] threshold in new-prompt coverage, rank by matched bytes, the adopt tie rule on equal bytes
-    size_t bytes_best = 0;
     for (size_t i = 0; i < entries.size(); i++) {
         if (entries[i].tokens.size() > n_ctx_slot) {
             continue;
         }
-        const server_cache_match m = server_cache_match_tokens(entries[i].tokens, tokens, matcher);
-        if (m.n_n <= lcp_min) {
-            continue;
-        }
-        if (best < 0 || m.n_bytes > bytes_best ||
-                (m.n_bytes == bytes_best && entries[i].src.empty() && !entries[best].src.empty())) {
-            bytes_best = m.n_bytes;
-            lcp_best   = m.n_n;
-            best       = (int) i;
+        // [TAG_CACHE_ALIGN] the new prompt's coverage n_n (= the id LCP with an inactive matcher)
+        const size_t lcp = server_cache_match_tokens(entries[i].tokens, tokens, matcher).n_n;
+        // [TAG_DISK_ADOPT] the own namespace wins a tie with an adopt source
+        if (lcp > lcp_best || (lcp == lcp_best && best >= 0 && entries[i].src.empty() && !entries[best].src.empty())) {
+            lcp_best = lcp;
+            best     = (int) i;
         }
     }
     if (lcp_out) {

@@ -6,7 +6,7 @@
 // `prec` `ache` instead of ` (` `pre` `cache`) re-tokenizes canonically when the client re-sends the text, and the
 // id LCP of the next turn stops at the first such span. align() walks the cached ids C and the new prompt N byte by
 // byte past their id LCP and returns a splice S = C[0:n_c] ++ N[n_n:] that keeps the cached ids for a byte-identical
-// prefix. Rules (design r2 §4.1-4.3 + astra r2 OPEN 2):
+// prefix. Rules (design r2 sec. 4.1-4.3 + astra r2 OPEN 2):
 //   - structural identity: a token whose bytes cannot identify it (CONTROL / USER_DEFINED / UNKNOWN, or an empty
 //     piece) matches only the same id at the same byte offset on both sides; a literal `<|im_end|>` spelled by
 //     ordinary pieces never matches the structural token, in either direction
@@ -68,15 +68,11 @@ struct server_cache_align_result {
     size_t n_lcp   = 0; // id LCP of C and N (the walk's start)
     size_t n_c     = 0; // tokens of C kept by the splice
     size_t n_n     = 0; // tokens of N they replace
-    size_t n_bytes = 0; // bytes of C[0:n_c] (= bytes of N[0:n_n]); rank candidates by this, not by token counts
     size_t n_tried = 0; // usable points rejected by the span check before the chosen one
 
     // joint token boundaries (n index, c index) from (n_lcp, n_lcp) up to the farthest one the walk reached,
     // ascending; the chosen splice point is one of them
     std::vector<std::pair<size_t, size_t>> syncs;
-
-    // message spans of S (meaningful when delimiters were given; equal to the spans of N when not aligned)
-    common_chat_msg_spans spans;
 
     bool aligned() const { return status == CACHE_ALIGN_ALIGNED; }
 
@@ -98,8 +94,8 @@ struct server_cache_align_params {
     // earlier usable points to try after a span-check failure before declining
     int max_span_retries = 8;
 
-    // prefix byte sums of the prompt N (size |N| + 1) for n_bytes; nullptr = summed here over C[0:n_lcp]
-    const std::vector<size_t> * prompt_bytes = nullptr;
+    // media placeholders in N: 0 = none (no scan), otherwise N past the LCP is scanned once a usable point exists
+    int prompt_has_media = -1;
 };
 
 server_cache_align_result server_cache_align(
@@ -133,9 +129,6 @@ struct server_cache_align_gate {
 };
 bool server_cache_align_eligible(const server_cache_align_gate & g);
 
-// prefix byte sums of a token sequence (media placeholders and ids outside the table count 0)
-std::vector<size_t> server_cache_align_prefix_bytes(const llama_tokens & toks, const server_cache_align_vocab & vocab);
-
 // the split of tokenize_input_prompts: one provenance flag per subprompt (string / prompt_string = text)
 std::vector<bool> server_cache_align_prompts_from_text(const common_json & prompt);
 
@@ -144,25 +137,30 @@ std::vector<bool> server_cache_align_prompts_from_text(const common_json & promp
 //
 struct server_tokens;
 
-// one per request; vocab == nullptr = knob off or the request is ineligible: every match is the plain id LCP
+// O(1) to build from a task; vocab == nullptr = knob off or the request is ineligible: every match is the id LCP
 struct server_cache_matcher {
     const server_cache_align_vocab   * vocab  = nullptr;
     const common_chat_msg_delimiters * delims = nullptr; // the request's message delimiters (span identity)
-    std::vector<size_t>                prompt_bytes;     // prefix byte sums of the request's prompt
 
     bool active() const { return vocab != nullptr; }
 };
 
 // a match of a cached sequence C against the new prompt N in two coordinates:
-//   n_n     - new-prompt coverage (f_sim, gain thresholds)
-//   n_c     - cached tokens kept (f_keep, loss rules)
-//   n_bytes - rank key; off: n_lcp (token count), so every comparison is the v75 one
+//   n_n - new-prompt coverage (f_sim, gain thresholds, the rank key: monotone in the matched bytes)
+//   n_c - cached tokens kept (f_keep, loss rules)
+// inactive matcher: n_c = n_n = n_lcp, so every comparison is the v75 one
 struct server_cache_match {
     size_t n_lcp   = 0;
     size_t n_c     = 0;
     size_t n_n     = 0;
-    size_t n_bytes = 0;
     bool   aligned = false;
 };
 
-server_cache_match server_cache_match_tokens(const server_tokens & cached, const server_tokens & prompt, const server_cache_matcher * m);
+// full (optional) receives the whole result (syncs) for a later splice of the same pair
+server_cache_match server_cache_match_tokens(const server_tokens & cached, const server_tokens & prompt, const server_cache_matcher * m,
+                                             server_cache_align_result * full = nullptr);
+
+// a client boundary (cache_pin) in S coordinates (review r1 7): a message-span start of N maps to the same span's start
+//   in S; a position inside a re-segmented token snaps down to the previous span start of S (snapped = true, WARN)
+server_cache_align_pos server_cache_align_map_pin(const server_cache_align_result & r, size_t p,
+                                                  const common_chat_msg_spans & spans_n, const common_chat_msg_spans & spans_s);

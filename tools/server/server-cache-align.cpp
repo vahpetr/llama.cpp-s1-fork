@@ -71,10 +71,16 @@ bool spells_literal(const server_cache_align_vocab & v, const llama_tokens & tok
     return acc.size() >= lit.size() && acc.compare(0, lit.size(), lit) == 0;
 }
 
+// (review r1 5) the unmatched remainder buf[from:] and a structural piece spell the same bytes over their common length
+//   (either may be the longer one: ordinary pieces spelling `<|im_end|>\n`, or `<|im_` waiting for more)
+bool same_head(const std::string & buf, size_t from, const std::string & piece) {
+    const size_t k = std::min(buf.size() - from, piece.size());
+    return k > 0 && buf.compare(from, k, piece, 0, k) == 0;
+}
+
 struct walk_sync {
     size_t n;     // index in N
     size_t c;     // index in C
-    size_t bytes; // bytes past the LCP
     bool   usable;
 };
 
@@ -99,14 +105,11 @@ server_cache_align_result server_cache_align(
     }
     r.n_lcp = r.n_c = r.n_n = n;
 
-    const auto spans_of = [&](const llama_tokens & toks) {
-        return params.delims != nullptr ? params.delims->split(toks) : common_chat_msg_spans{};
-    };
 
     // the walk: advance the side that is behind by one piece; the buffers hold only the bytes since the last sync
     std::vector<walk_sync> syncs;
-    syncs.push_back({ n, n, 0, true }); // the LCP itself: the no-op splice
-    size_t i = n, j = n, base = 0;
+    syncs.push_back({ n, n, true }); // the LCP itself: the no-op splice
+    size_t i = n, j = n;
     std::string bc, bn;
 
     const auto usable_at = [&](size_t ci, size_t nj) {
@@ -134,11 +137,10 @@ server_cache_align_result server_cache_align(
     while (true) {
         if (bc.size() == bn.size()) {
             // a joint boundary (both buffers fully matched)
-            base += bc.size();
             bc.clear();
             bn.clear();
             if (syncs.back().c != i || syncs.back().n != j) {
-                syncs.push_back({ j, i, base, usable_at(i, j) });
+                syncs.push_back({ j, i, usable_at(i, j) });
             }
             if (i == C.size() || j == N.size()) {
                 r.stop = CACHE_ALIGN_STOP_END;
@@ -179,8 +181,7 @@ server_cache_align_result server_cache_align(
             }
             if (!in_vocab(v, a) || v.is_structural(a)) {
                 // a structural token can only start at a joint boundary
-                r.stop = in_vocab(v, a) && bn.compare(bc.size(), std::string::npos, v.piece[a], 0, bn.size() - bc.size()) == 0
-                    ? CACHE_ALIGN_STOP_LITERAL : CACHE_ALIGN_STOP_STRUCTURAL;
+                r.stop = in_vocab(v, a) && same_head(bn, bc.size(), v.piece[a]) ? CACHE_ALIGN_STOP_LITERAL : CACHE_ALIGN_STOP_STRUCTURAL;
                 break;
             }
             bc += v.piece[a];
@@ -196,8 +197,7 @@ server_cache_align_result server_cache_align(
                 break;
             }
             if (!in_vocab(v, b) || v.is_structural(b)) {
-                r.stop = in_vocab(v, b) && bc.compare(bn.size(), std::string::npos, v.piece[b], 0, bc.size() - bn.size()) == 0
-                    ? CACHE_ALIGN_STOP_LITERAL : CACHE_ALIGN_STOP_STRUCTURAL;
+                r.stop = in_vocab(v, b) && same_head(bc, bn.size(), v.piece[b]) ? CACHE_ALIGN_STOP_LITERAL : CACHE_ALIGN_STOP_STRUCTURAL;
                 break;
             }
             bn += v.piece[b];
@@ -210,32 +210,17 @@ server_cache_align_result server_cache_align(
         }
     }
 
-    // bytes of the common id prefix (rank by absolute matched bytes)
-    size_t lcp_bytes = 0;
-    if (params.prompt_bytes != nullptr && params.prompt_bytes->size() == N.size() + 1) {
-        lcp_bytes = (*params.prompt_bytes)[n];
-    } else {
-        for (size_t k = 0; k < n; k++) {
-            if (in_vocab(v, C[k])) {
-                lcp_bytes += v.piece[C[k]].size();
-            }
-        }
-    }
-
-    const common_chat_msg_spans spans_n = spans_of(N);
-
-    size_t last_null_n = SIZE_MAX;
-    for (size_t k = N.size(); k-- > n;) {
-        if (N[k] == LLAMA_TOKEN_NULL) {
-            last_null_n = k;
-            break;
+    // the longest delimiter (span check window)
+    size_t max_delim = 0;
+    if (params.delims != nullptr) {
+        for (const auto & d : params.delims->delimiters) {
+            max_delim = std::max(max_delim, d.tokens.size());
         }
     }
 
     const auto accept = [&](size_t s) {
-        r.n_n     = syncs[s].n;
-        r.n_c     = syncs[s].c;
-        r.n_bytes = lcp_bytes + syncs[s].bytes;
+        r.n_n = syncs[s].n;
+        r.n_c = syncs[s].c;
         r.syncs.clear();
         r.n_spans = 0;
         for (size_t k = 0; k <= s; k++) {
@@ -254,8 +239,83 @@ server_cache_align_result server_cache_align(
     const auto decline = [&](server_cache_align_status st) {
         accept(0);
         r.status = st;
-        r.spans  = spans_n;
         return r;
+    };
+
+    // (review r1 1) nothing below scans N as a whole: media and spans are checked only once a usable point past the
+    //   LCP exists, and the span check only looks at the window the splice can change
+    bool   media_known = params.prompt_has_media == 0;
+    size_t last_null_n = SIZE_MAX;
+    const auto media_from = [&](size_t from) {
+        if (!media_known) {
+            for (size_t k = N.size(); k-- > n;) {
+                if (N[k] == LLAMA_TOKEN_NULL) {
+                    last_null_n = k;
+                    break;
+                }
+            }
+            media_known = true;
+        }
+        return last_null_n != SIZE_MAX && last_null_n >= from;
+    };
+
+    // complete delimiter identity, position-local: split() tests every position on its own, so a match at i depends on
+    //   the window [i, i + len) only. S and N agree below the LCP and S[n_c + k] == N[n_n + k]; only the starts in
+    //   [lo, n_n) of N and [lo, n_c) of S can differ (lo = the first window that reaches past the LCP)
+    const auto spans_ok = [&](size_t s) {
+        const size_t nn = syncs[s].n, nc = syncs[s].c;
+        const size_t lo = n + 1 >= max_delim ? n + 1 - max_delim : 0;
+        const auto s_at = [&](size_t k) { return k < nc ? C[k] : N[k - nc + nn]; };
+        const size_t s_size = nc + (N.size() - nn);
+        const auto first_match = [&](size_t i, size_t size, const auto & at) -> int {
+            for (size_t d = 0; d < params.delims->delimiters.size(); d++) {
+                const auto & t = params.delims->delimiters[d].tokens;
+                if (i + t.size() > size) {
+                    continue;
+                }
+                bool eq = true;
+                for (size_t k = 0; eq && k < t.size(); k++) {
+                    eq = at(i + k) == t[k];
+                }
+                if (eq) {
+                    return (int) d;
+                }
+            }
+            return -1;
+        };
+        std::vector<std::pair<size_t, int>> mn, ms;
+        for (size_t i = lo; i < nn; i++) {
+            const int d = first_match(i, N.size(), [&](size_t k) { return N[k]; });
+            if (d >= 0) {
+                mn.emplace_back(i, (int) params.delims->delimiters[d].role);
+            }
+        }
+        for (size_t i = lo; i < nc; i++) {
+            const int d = first_match(i, s_size, s_at);
+            if (d >= 0) {
+                ms.emplace_back(i, (int) params.delims->delimiters[d].role);
+            }
+        }
+        if (mn.size() != ms.size()) {
+            return false;
+        }
+        for (size_t k = 0; k < mn.size(); k++) {
+            const size_t pn = mn[k].first;
+            size_t pc = pn;
+            if (pn > n) {
+                // an exact joint boundary among syncs[0..s]
+                auto it = std::lower_bound(syncs.begin(), syncs.begin() + s + 1, pn,
+                        [](const walk_sync & w, size_t x) { return w.n < x; });
+                if (it == syncs.begin() + s + 1 || it->n != pn) {
+                    return false;
+                }
+                pc = it->c;
+            }
+            if (pc != ms[k].first || mn[k].second != ms[k].second) {
+                return false;
+            }
+        }
+        return true;
     };
 
     int retries = 0;
@@ -263,28 +323,12 @@ server_cache_align_result server_cache_align(
         if (!syncs[s].usable) {
             continue;
         }
-        if (syncs[s].n == n && syncs[s].c == n) {
-            break;
-        }
-        if (last_null_n != SIZE_MAX && last_null_n >= syncs[s].n) {
+        if (media_from(syncs[s].n)) {
             return decline(CACHE_ALIGN_DECLINED_MEDIA);
         }
-        accept(s);
-        if (params.delims == nullptr) {
+        if (params.delims == nullptr || spans_ok(s)) {
+            accept(s);
             r.status = CACHE_ALIGN_ALIGNED;
-            return r;
-        }
-        // complete delimiter identity: spans of S == spans of N mapped through the splice, every start exact
-        const llama_tokens S = server_cache_align_splice(C, N, r);
-        const common_chat_msg_spans spans_s = spans_of(S);
-        bool same = spans_s.spans.size() == spans_n.spans.size();
-        for (size_t k = 0; same && k < spans_n.spans.size(); k++) {
-            const auto mp = server_cache_align_map_pos(r, spans_n.spans[k].pos);
-            same = !mp.snapped && spans_s.spans[k].pos == mp.pos && spans_s.spans[k].role == spans_n.spans[k].role;
-        }
-        if (same) {
-            r.status = CACHE_ALIGN_ALIGNED;
-            r.spans  = spans_s;
             return r;
         }
         r.n_tried++; // decline() keeps the count
@@ -335,14 +379,6 @@ bool server_cache_align_eligible(const server_cache_align_gate & g) {
     return g.enabled && g.from_text && g.cache_prompt && g.n_cmpl <= 1 && !g.is_child;
 }
 
-std::vector<size_t> server_cache_align_prefix_bytes(const llama_tokens & toks, const server_cache_align_vocab & v) {
-    std::vector<size_t> out(toks.size() + 1, 0);
-    for (size_t k = 0; k < toks.size(); k++) {
-        out[k + 1] = out[k] + (in_vocab(v, toks[k]) ? v.piece[toks[k]].size() : 0);
-    }
-    return out;
-}
-
 std::vector<bool> server_cache_align_prompts_from_text(const common_json & prompt) {
     // mirrors tokenize_input_prompts: an array without numbers is a list of subprompts, anything else is one
     bool has_numbers = false;
@@ -362,21 +398,48 @@ std::vector<bool> server_cache_align_prompts_from_text(const common_json & promp
     return out;
 }
 
-server_cache_match server_cache_match_tokens(const server_tokens & C, const server_tokens & N, const server_cache_matcher * m) {
+server_cache_match server_cache_match_tokens(const server_tokens & C, const server_tokens & N, const server_cache_matcher * m,
+                                             server_cache_align_result * full) {
     server_cache_match out;
     out.n_lcp = C.get_common_prefix(N);
-    out.n_c = out.n_n = out.n_bytes = out.n_lcp;
+    out.n_c = out.n_n = out.n_lcp;
     if (m == nullptr || !m->active()) {
         return out; // v75
     }
     server_cache_align_params p;
-    p.delims       = m->delims;
-    p.n_lcp        = out.n_lcp;
-    p.prompt_bytes = &m->prompt_bytes;
-    const auto r = server_cache_align(C.get_tokens(), N.get_tokens(), *m->vocab, p);
+    p.delims           = m->delims;
+    p.n_lcp            = out.n_lcp;
+    p.prompt_has_media = N.has_mtmd ? -1 : 0;
+    server_cache_align_result r = server_cache_align(C.get_tokens(), N.get_tokens(), *m->vocab, p);
     out.n_c     = r.n_c;
     out.n_n     = r.n_n;
-    out.n_bytes = r.n_bytes;
     out.aligned = r.aligned();
+    if (full != nullptr) {
+        *full = std::move(r);
+    }
     return out;
+}
+
+server_cache_align_pos server_cache_align_map_pin(const server_cache_align_result & r, size_t p,
+                                                  const common_chat_msg_spans & spans_n, const common_chat_msg_spans & spans_s) {
+    // a message-span start of N -> the same span's start in S (spans are recomputed on S with the identity verified)
+    if (spans_n.spans.size() == spans_s.spans.size()) {
+        for (size_t k = 0; k < spans_n.spans.size(); k++) {
+            if (spans_n.spans[k].pos == p) {
+                return { spans_s.spans[k].pos, false };
+            }
+        }
+    }
+    server_cache_align_pos mp = server_cache_align_map_pos(r, p);
+    if (mp.snapped) {
+        // inside a re-segmented token: down to the previous span start of S (where checkpoints are made), else the
+        //   previous joint boundary
+        for (auto it = spans_s.spans.rbegin(); it != spans_s.spans.rend(); ++it) {
+            if (it->pos <= mp.pos) {
+                mp.pos = it->pos;
+                break;
+            }
+        }
+    }
+    return mp;
 }
