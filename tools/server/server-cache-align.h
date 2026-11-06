@@ -97,6 +97,9 @@ struct server_cache_align_params {
 
     // earlier usable points to try after a span-check failure before declining
     int max_span_retries = 8;
+
+    // prefix byte sums of the prompt N (size |N| + 1) for n_bytes; nullptr = summed here over C[0:n_lcp]
+    const std::vector<size_t> * prompt_bytes = nullptr;
 };
 
 server_cache_align_result server_cache_align(
@@ -129,3 +132,37 @@ struct server_cache_align_gate {
     bool is_child     = false;
 };
 bool server_cache_align_eligible(const server_cache_align_gate & g);
+
+// prefix byte sums of a token sequence (media placeholders and ids outside the table count 0)
+std::vector<size_t> server_cache_align_prefix_bytes(const llama_tokens & toks, const server_cache_align_vocab & vocab);
+
+// the split of tokenize_input_prompts: one provenance flag per subprompt (string / prompt_string = text)
+std::vector<bool> server_cache_align_prompts_from_text(const common_json & prompt);
+
+//
+// [TAG_CACHE_ALIGN] part 2: the server's matching sites (slot selection, RAM tier, disk find, pending-save match)
+//
+struct server_tokens;
+
+// one per request; vocab == nullptr = knob off or the request is ineligible: every match is the plain id LCP
+struct server_cache_matcher {
+    const server_cache_align_vocab   * vocab  = nullptr;
+    const common_chat_msg_delimiters * delims = nullptr; // the request's message delimiters (span identity)
+    std::vector<size_t>                prompt_bytes;     // prefix byte sums of the request's prompt
+
+    bool active() const { return vocab != nullptr; }
+};
+
+// a match of a cached sequence C against the new prompt N in two coordinates:
+//   n_n     - new-prompt coverage (f_sim, gain thresholds)
+//   n_c     - cached tokens kept (f_keep, loss rules)
+//   n_bytes - rank key; off: n_lcp (token count), so every comparison is the v75 one
+struct server_cache_match {
+    size_t n_lcp   = 0;
+    size_t n_c     = 0;
+    size_t n_n     = 0;
+    size_t n_bytes = 0;
+    bool   aligned = false;
+};
+
+server_cache_match server_cache_match_tokens(const server_tokens & cached, const server_tokens & prompt, const server_cache_matcher * m);

@@ -149,14 +149,18 @@ struct server_disk_cache {
     std::function<void()> on_async_done;
     // the newest save in flight that shares more than lcp_min tokens with tokens (and the ones before it) is waited for
     //   and committed, so find() sees its entry
-    std::vector<server_disk_lost> await_pending(const server_tokens & tokens, size_t lcp_min); // failed saves as poll()
+    std::vector<server_disk_lost> await_pending(const server_tokens & tokens, size_t lcp_min,
+                                                const server_cache_matcher * matcher = nullptr); // failed saves as poll(); [TAG_CACHE_ALIGN] lcp_min in n_n
     size_t n_pending() const;
     // bytes the saves in flight wrote so far minus the own files (.tok / .aux / maps) of the entries they will replace
     //   (pinned, each once), at least 0 - GET /disk-cache bytes_pending, /metrics; enforce() charges it capped
     uint64_t pending_bytes() const;
 
     // index of the entry with the longest common prefix with tokens, if longer than lcp_min and it fits n_ctx_slot
-    int find(const server_tokens & tokens, size_t lcp_min, size_t n_ctx_slot, size_t * lcp_out) const;
+    // [TAG_CACHE_ALIGN] with an active matcher: threshold lcp_min and *lcp_out in new-prompt coverage (n_n), ranked by
+    //   matched bytes; inactive / nullptr = the id LCP (v75)
+    int find(const server_tokens & tokens, size_t lcp_min, size_t n_ctx_slot, size_t * lcp_out,
+             const server_cache_matcher * matcher = nullptr) const;
 
     // load entry idx into seq id_slot and prompt; unless OK the slot's memory is undefined (caller clears it)
     server_disk_load_result load(int idx, llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec,

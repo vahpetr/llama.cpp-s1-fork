@@ -3858,6 +3858,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DRIFT_GUARD"));
     add_opt(common_arg(
+        {"--cache-align-bytes"}, "[on|off]",
+        "byte-aligned prompt-cache matching: a text prompt that repeats a cached reply with another (canonical)\n"
+        "token segmentation of the same bytes keeps the cached ids up to the last joint token boundary before a\n"
+        "special token, instead of re-processing from the first re-segmented token (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "on") {
+                params.cache_align_bytes = true;
+            } else if (value == "off") {
+                params.cache_align_bytes = false;
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --cache-align-bytes: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_ALIGN_BYTES"));
+    add_opt(common_arg(
         {"--reasoning-effort"}, "LEVEL",
         "reasoning effort level given to the chat template: 'default' to keep the template default,\n"
         "or a level such as 'minimal', 'low', 'medium', 'high', 'xhigh' or 'max' (default: default)",

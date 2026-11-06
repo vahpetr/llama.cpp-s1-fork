@@ -769,10 +769,11 @@ struct server_slot {
         return server_cache_state_desc(ctx_tgt, ctx_dft, spec ? common_speculative_state_schema(spec) : std::string());
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens,
+                     const server_cache_matcher * matcher = nullptr /* [TAG_CACHE_ALIGN] */) {
         std::vector<uint8_t> carry;
         bool swapped = false;
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, state_desc(), &carry, &swapped);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, state_desc(), &carry, &swapped, matcher);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
             if (spec) {
@@ -1745,6 +1746,13 @@ public:
     mtmd_context * mctx = nullptr;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
+
+    // [TAG_CACHE_ALIGN] piece table of the vocab, built at load only with --cache-align-bytes on (nullptr = off)
+    std::unique_ptr<server_cache_align_vocab> cache_align_vocab;
+
+    bool cache_align_enabled() const {
+        return cache_align_vocab != nullptr;
+    }
     const llama_vocab * vocab = nullptr;
 
     server_queue    queue_tasks;
@@ -1998,6 +2006,25 @@ private:
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     std::unique_ptr<server_disk_cache> disk_cache; // [TAG_DISK_PROMPT_CACHE]
+
+    // [TAG_CACHE_ALIGN] the matcher of one request: active only for an eligible completion (knob on, text provenance,
+    //   cache_prompt, not n > 1, not a child); otherwise every match is the plain id LCP (= v75)
+    server_cache_matcher cache_matcher(const server_task & task) const {
+        server_cache_matcher m;
+        server_cache_align_gate g;
+        g.enabled      = cache_align_enabled() && task.type == SERVER_TASK_TYPE_COMPLETION;
+        g.from_text    = task.params.cache_align_from_text;
+        g.cache_prompt = task.params.cache_prompt;
+        g.n_cmpl       = task.params.n_cmpl;
+        g.is_child     = task.is_child();
+        if (!server_cache_align_eligible(g)) {
+            return m;
+        }
+        m.vocab        = cache_align_vocab.get();
+        m.delims       = task.params.message_delimiters.delimiters.empty() ? nullptr : &task.params.message_delimiters;
+        m.prompt_bytes = server_cache_align_prefix_bytes(task.tokens.get_tokens(), *m.vocab);
+        return m;
+    }
 
     // [TAG_CACHE_COMPAT2] the short-context measurement (spec D4): on sequence 0 before serving, from a cleared
     //   target and draft memory, a temporary fresh speculative object driven through target decode + its process(),
@@ -3020,6 +3047,18 @@ private:
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
 
+            // [TAG_CACHE_ALIGN] the piece table once per vocab (only with the knob on: off = v75, nothing built)
+            if (params_base.cache_align_bytes) {
+                const int64_t t0 = ggml_time_us();
+                cache_align_vocab = std::make_unique<server_cache_align_vocab>(server_cache_align_vocab::from_llama(vocab));
+                size_t n_struct = 0;
+                for (auto f : cache_align_vocab->structural) {
+                    n_struct += f;
+                }
+                SRV_INF("cache-align: on (piece table of %zu tokens, %zu structural, %.1f ms)\n",
+                        cache_align_vocab->size(), n_struct, (ggml_time_us() - t0) / 1000.0);
+            }
+
             // [TAG_DRIFT_GUARD] one startup verdict for the loaded template, whatever the default flag (a per-request
             //   "drift_guard": true under --drift-guard off arms on the same verdict): the guard arms only on a dedicated
             //   once-per-reply think-close (one "</think>" special token that is not a message delimiter)
@@ -3112,6 +3151,10 @@ private:
 
         bool update_cache = false;
 
+        // [TAG_CACHE_ALIGN] inactive (knob off / ineligible request) = every match below is the id LCP (v75)
+        const server_cache_matcher matcher = cache_matcher(task);
+        const bool aligning = matcher.active();
+
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
@@ -3128,7 +3171,9 @@ private:
 
         // find the slot that has at least n% prompt similarity
         if (slot_prompt_similarity != 0.0f) {
-            float f_sim_best = 0;
+            float  f_sim_best = 0;
+            size_t bytes_best = 0; // [TAG_CACHE_ALIGN] rank key with an active matcher
+            size_t n_c_best   = 0;
 
             for (server_slot & slot : slots) {
                 if (task.id_slot != -1 && slot.id != task.id_slot) {
@@ -3150,21 +3195,29 @@ private:
                 }
 
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
-                const size_t lcp_len = tokens.get_common_prefix(task.tokens);
+                // [TAG_CACHE_ALIGN] f_sim = new-prompt coverage n_n / |N|; with an active matcher the best slot is the
+                //   one with the most matched bytes (a finer segmentation must not win over a longer byte prefix)
+                const server_cache_match m = server_cache_match_tokens(tokens, task.tokens, &matcher);
+                const size_t lcp_len = m.n_n;
                 const float f_sim_cur = float(lcp_len) / task.tokens.size();
 
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
                 // select the current slot if the criteria match
-                if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
+                const bool better = aligning ? (ret == nullptr || m.n_bytes > bytes_best) : f_sim_cur > f_sim_best;
+                if (better && f_sim_cur > slot_prompt_similarity) {
                     f_sim_best = f_sim_cur;
+                    bytes_best = m.n_bytes;
+                    n_c_best   = m.n_c;
 
                     ret = &slot;
                 }
             }
 
             if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                // [TAG_CACHE_ALIGN] retention in cache coordinates (n_c / |C|)
+                const float f_keep = aligning ? float(n_c_best) / ret->prompt.tokens.size()
+                                              : (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
@@ -3217,7 +3270,7 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (!ret->prompt_load(*prompt_cache, task.tokens, &matcher)) {
                     ret->prompt_clear();
                 }
 
@@ -3246,16 +3299,21 @@ private:
             //   keeps nothing of its prompt (the retained prefix counts as 0 for the outgoing save)
             const bool   reuse    = task.params.cache_prompt;
             const size_t n_slot   = ret->prompt.tokens.size();
-            const size_t lcp_slot = reuse ? ret->prompt.tokens.get_common_prefix(task.tokens) : 0;
+            // [TAG_CACHE_ALIGN] two coordinates: lcp_n = the new prompt's coverage (gain: lookup / pending thresholds),
+            //   lcp_slot = the slot tokens kept (loss: the save rules); equal (= the id LCP) with an inactive matcher
+            const server_cache_match m_slot = reuse ? server_cache_match_tokens(ret->prompt.tokens, task.tokens, &matcher)
+                                                    : server_cache_match{};
+            const size_t lcp_slot = m_slot.n_c;
+            const size_t lcp_n    = m_slot.n_n;
             const size_t margin   = 1024; // below this a load does not pay for itself
 
             // [TAG_DISK_ASYNC_SAVE] this conversation's own save still in flight (it left this or another slot just
             //   now): wait for its commit, so the lookup finds it instead of re-processing the prompt
             if (reuse) {
-                report_disk_lost(disk_cache->await_pending(task.tokens, lcp_slot + margin), "before a lookup");
+                report_disk_lost(disk_cache->await_pending(task.tokens, lcp_n + margin, &matcher), "before a lookup");
             }
 
-            const bool will_load = reuse && disk_cache->find(task.tokens, lcp_slot + margin, ret->n_ctx, nullptr) >= 0;
+            const bool will_load = reuse && disk_cache->find(task.tokens, lcp_n + margin, ret->n_ctx, nullptr, &matcher) >= 0;
 
             // [TAG_MULTISLOT] (item 5b) a disk load allocates: within the concurrent reserve only, else the task waits
             //   in the queue before anything is saved or loaded
@@ -3290,9 +3348,9 @@ private:
 
             if (will_load) {
                 size_t lcp_disk = 0;
-                const int idx = disk_cache->find(task.tokens, lcp_slot + margin, ret->n_ctx, &lcp_disk);
+                const int idx = disk_cache->find(task.tokens, lcp_n + margin, ret->n_ctx, &lcp_disk, &matcher);
                 if (idx >= 0) {
-                    SLT_INF(*ret, "disk cache: loading a stored prompt, common prefix %zu vs %zu in the slot\n", lcp_disk, lcp_slot);
+                    SLT_INF(*ret, "disk cache: loading a stored prompt, common prefix %zu vs %zu in the slot\n", lcp_disk, lcp_n);
                     server_disk_load_result res = ret->disk_load(*disk_cache, idx);
 
                     // [TAG_DISK_LOAD_RESULT] no room in a unified pool: purge idle slots (they are saved first) and
@@ -3400,6 +3458,75 @@ private:
         return output;
     }
 
+    // [TAG_CACHE_ALIGN] the splice of an eligible prompt onto the slot's cached ids: task.tokens = C[0:n_c] ++ N[n_n:]
+    //   (same bytes; the cached segmentation kept up to the last joint boundary before a special token). Metadata in
+    //   request coordinates follows: message spans recomputed on the spliced ids (the walk verified their identity),
+    //   cache_pin_tokens / n_keep mapped (a boundary inside a re-segmented token snaps down, WARN). Checkpoints,
+    //   last_reply_start / last_stop_finished are cache coordinates: the spliced prefix IS the cache, unchanged
+    void cache_align_apply(server_slot & slot, server_task & task) {
+        const server_cache_matcher m = cache_matcher(task);
+        if (!m.active() || slot.prompt.tokens.empty()) {
+            return;
+        }
+        const llama_tokens & C = slot.prompt.tokens.get_tokens();
+        const llama_tokens & N = task.tokens.get_tokens();
+
+        server_cache_align_params p;
+        p.delims       = m.delims;
+        p.n_lcp        = slot.prompt.tokens.get_common_prefix(task.tokens);
+        p.prompt_bytes = &m.prompt_bytes;
+        const server_cache_align_result r = server_cache_align(C, N, *m.vocab, p);
+
+        if (r.stop == CACHE_ALIGN_STOP_LITERAL) {
+            SRV_WRN("slot %d | task %d | cache-align: the walk stopped at a literal-vs-structural collision (lcp_ids=%zu)\n",
+                    slot.id, task.id, r.n_lcp);
+        }
+        if (!r.aligned()) {
+            if (r.status != CACHE_ALIGN_NONE) {
+                metrics.n_cache_align_declined++;
+                SRV_INF("slot %d | task %d | cache-align: %s, lcp_ids=%zu (tried %zu)\n", slot.id, task.id,
+                        server_cache_align_status_str(r.status), r.n_lcp, r.n_tried);
+            }
+            return;
+        }
+
+        // N's own prefix [0, n_lcp) keeps its media map; C[n_lcp, n_c) and N[n_n, |N|) are text (the walk stops at
+        //   media, media in N past the splice point declines)
+        server_tokens spliced = task.tokens.clone();
+        spliced.keep_first(r.n_lcp);
+        for (size_t k = r.n_lcp; k < r.n_c; k++) {
+            spliced.push_back(C[k]);
+        }
+        for (size_t k = r.n_n; k < N.size(); k++) {
+            spliced.push_back(N[k]);
+        }
+
+        const auto remap = [&](int64_t pos, const char * what) {
+            const server_cache_align_pos mp = server_cache_align_map_pos(r, (size_t) pos);
+            if (mp.snapped) {
+                SRV_WRN("slot %d | task %d | %s: moved %" PRId64 " -> %zu (inside a re-segmented span)\n", slot.id, task.id,
+                        what, pos, mp.pos);
+            }
+            return (int64_t) mp.pos;
+        };
+        if (task.params.cache_pin_tokens >= 0) {
+            task.params.cache_pin_tokens = remap(task.params.cache_pin_tokens, "cache_pin");
+        }
+        if (task.params.n_keep > 0) {
+            task.params.n_keep = (int32_t) remap(task.params.n_keep, "n_keep");
+        }
+        if (!task.params.message_delimiters.delimiters.empty()) {
+            task.params.message_spans = spliced.find_message_spans(task.params.message_delimiters);
+        }
+
+        SRV_INF("slot %d | task %d | cache-align: lcp_ids=%zu aligned_n_c=%zu n_n=%zu delta=%+" PRId64 " spans=%zu dropped=%zu prompt=%zu -> %zu\n",
+                slot.id, task.id, r.n_lcp, r.n_c, r.n_n, r.delta(), r.n_spans, C.size() - r.n_c, N.size(), spliced.size());
+        metrics.n_cache_align++;
+        metrics.n_cache_align_tokens += r.n_c - r.n_lcp;
+
+        task.tokens = std::move(spliced);
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
@@ -3417,6 +3544,10 @@ private:
         } else {
             slot.lora = params_base.lora_adapters;
         }
+
+        // [TAG_CACHE_ALIGN] after the LoRA compatibility checks (they may clear the cache above) and before the aLoRA
+        //   invocation scan (it indexes the final prompt)
+        cache_align_apply(slot, task);
 
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
@@ -8349,12 +8480,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
+        // [TAG_CACHE_ALIGN] provenance per input (text-tokenized or caller-chosen ids)
+        std::vector<bool> from_text;
+
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
+            from_text.push_back(true);
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+            from_text = server_cache_align_prompts_from_text(prompt);
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
@@ -8383,6 +8519,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+            task.params.cache_align_from_text = i < from_text.size() && from_text[i] && type == SERVER_TASK_TYPE_COMPLETION;
+            if (ctx_server.cache_align_enabled()) {
+                task.params.message_delimiters = delimiters;
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;

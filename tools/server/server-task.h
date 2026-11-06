@@ -10,6 +10,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-cache-align.h" // [TAG_CACHE_ALIGN]
 
 
 enum server_task_type {
@@ -98,6 +99,13 @@ struct task_params {
 
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
+
+    // [TAG_CACHE_ALIGN] provenance: true only when the server tokenized this prompt from text (a string /
+    //   prompt_string subprompt, the chat rendering); caller-chosen ids (numeric / mixed arrays) stay false and are
+    //   never re-aligned. Copied to child tasks with the params. message_delimiters = the tokenized delimiters the
+    //   spans came from (the span identity check of a splice)
+    bool cache_align_from_text = false;
+    common_chat_msg_delimiters message_delimiters;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
@@ -768,7 +776,8 @@ struct server_prompt_cache {
     // swapped_spec: when a cached state was swapped in, set to its saved speculative carry and *swapped = true (the
     //   caller restores the carry or resets the draft side)
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
-              const std::string & desc = "", std::vector<uint8_t> * swapped_spec = nullptr, bool * swapped = nullptr);
+              const std::string & desc = "", std::vector<uint8_t> * swapped_spec = nullptr, bool * swapped = nullptr,
+              const server_cache_matcher * matcher = nullptr /* [TAG_CACHE_ALIGN] */);
 
     void update();
 };

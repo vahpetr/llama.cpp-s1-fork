@@ -2,6 +2,7 @@
 #include "server-cache-align.h"
 
 #include "common.h"
+#include "server-common.h"
 
 #include <algorithm>
 #include <cstring>
@@ -211,9 +212,13 @@ server_cache_align_result server_cache_align(
 
     // bytes of the common id prefix (rank by absolute matched bytes)
     size_t lcp_bytes = 0;
-    for (size_t k = 0; k < n; k++) {
-        if (in_vocab(v, C[k])) {
-            lcp_bytes += v.piece[C[k]].size();
+    if (params.prompt_bytes != nullptr && params.prompt_bytes->size() == N.size() + 1) {
+        lcp_bytes = (*params.prompt_bytes)[n];
+    } else {
+        for (size_t k = 0; k < n; k++) {
+            if (in_vocab(v, C[k])) {
+                lcp_bytes += v.piece[C[k]].size();
+            }
         }
     }
 
@@ -328,4 +333,50 @@ bool server_cache_align_prompt_from_text(const common_json & p) {
 
 bool server_cache_align_eligible(const server_cache_align_gate & g) {
     return g.enabled && g.from_text && g.cache_prompt && g.n_cmpl <= 1 && !g.is_child;
+}
+
+std::vector<size_t> server_cache_align_prefix_bytes(const llama_tokens & toks, const server_cache_align_vocab & v) {
+    std::vector<size_t> out(toks.size() + 1, 0);
+    for (size_t k = 0; k < toks.size(); k++) {
+        out[k + 1] = out[k] + (in_vocab(v, toks[k]) ? v.piece[toks[k]].size() : 0);
+    }
+    return out;
+}
+
+std::vector<bool> server_cache_align_prompts_from_text(const common_json & prompt) {
+    // mirrors tokenize_input_prompts: an array without numbers is a list of subprompts, anything else is one
+    bool has_numbers = false;
+    if (prompt.is_array()) {
+        for (const auto & e : prompt) {
+            has_numbers = has_numbers || e.is_number_integer();
+        }
+    }
+    std::vector<bool> out;
+    if (prompt.is_array() && !has_numbers) {
+        for (const auto & p : prompt) {
+            out.push_back(server_cache_align_prompt_from_text(p));
+        }
+    } else {
+        out.push_back(server_cache_align_prompt_from_text(prompt));
+    }
+    return out;
+}
+
+server_cache_match server_cache_match_tokens(const server_tokens & C, const server_tokens & N, const server_cache_matcher * m) {
+    server_cache_match out;
+    out.n_lcp = C.get_common_prefix(N);
+    out.n_c = out.n_n = out.n_bytes = out.n_lcp;
+    if (m == nullptr || !m->active()) {
+        return out; // v75
+    }
+    server_cache_align_params p;
+    p.delims       = m->delims;
+    p.n_lcp        = out.n_lcp;
+    p.prompt_bytes = &m->prompt_bytes;
+    const auto r = server_cache_align(C.get_tokens(), N.get_tokens(), *m->vocab, p);
+    out.n_c     = r.n_c;
+    out.n_n     = r.n_n;
+    out.n_bytes = r.n_bytes;
+    out.aligned = r.aligned();
+    return out;
 }

@@ -409,13 +409,14 @@ bool server_disk_cache_env_neutral(const std::string & kv) {
     const std::string name = kv.substr(0, kv.find('='));
     return name.rfind("LLAMA_ARG_CACHE_DISK", 0) == 0 || name == "LLAMA_ARG_CHAT_TEMPLATE" ||
            name == "LLAMA_ARG_CHAT_TEMPLATE_FILE" ||
-           name == "LLAMA_ARG_DRIFT_GUARD"; // [TAG_DRIFT_GUARD] a stop rule: the KV state it leaves is compatible either way
+           name == "LLAMA_ARG_DRIFT_GUARD" || // [TAG_DRIFT_GUARD] a stop rule: the KV state it leaves is compatible either way
+           name == "LLAMA_ARG_CACHE_ALIGN_BYTES"; // [TAG_CACHE_ALIGN] which ids a request reuses, not how a state is computed
 }
 
 bool server_disk_cache_argv_neutral(const std::string & arg, bool * skip_value) {
     const std::string opt = arg.substr(0, arg.find('='));
     if (arg.rfind("--cache-disk", 0) == 0 || opt == "--chat-template" || opt == "--chat-template-file" ||
-            opt == "--drift-guard") { // [TAG_DRIFT_GUARD]
+            opt == "--drift-guard" || opt == "--cache-align-bytes") { // [TAG_DRIFT_GUARD] [TAG_CACHE_ALIGN]
         *skip_value = arg.find('=') == std::string::npos;
         return true;
     }
@@ -2804,7 +2805,8 @@ std::vector<server_disk_lost> server_disk_cache::drain() {
     return lost;
 }
 
-std::vector<server_disk_lost> server_disk_cache::await_pending(const server_tokens & tokens, size_t lcp_min) {
+std::vector<server_disk_lost> server_disk_cache::await_pending(const server_tokens & tokens, size_t lcp_min,
+                                                              const server_cache_matcher * matcher) {
     std::vector<server_disk_lost> lost;
     if (!as) {
         return lost;
@@ -2814,7 +2816,8 @@ std::vector<server_disk_lost> server_disk_cache::await_pending(const server_toke
     size_t n_wait = 0;
     for (size_t i = 0; i < as->jobs.size(); i++) {
         // (review r14 2) a superseded save commits nothing a lookup could find (its extension is registered)
-        if (!as->jobs[i]->superseded && as->jobs[i]->tokens.get_common_prefix(tokens) > lcp_min) {
+        // [TAG_CACHE_ALIGN] the same aligned coverage the lookup will use (else a save of this conversation is missed)
+        if (!as->jobs[i]->superseded && server_cache_match_tokens(as->jobs[i]->tokens, tokens, matcher).n_n > lcp_min) {
             n_wait = i + 1;
         }
     }
@@ -3449,18 +3452,42 @@ void server_disk_cache::commit_job(server_disk_save_job & job, std::vector<serve
     refresh_status(); // the snapshot carries the commit and its timing
 }
 
-int server_disk_cache::find(const server_tokens & tokens, size_t lcp_min, size_t n_ctx_slot, size_t * lcp_out) const {
+int server_disk_cache::find(const server_tokens & tokens, size_t lcp_min, size_t n_ctx_slot, size_t * lcp_out,
+                            const server_cache_matcher * matcher) const {
     int    best     = -1;
     size_t lcp_best = lcp_min;
+    if (matcher == nullptr || !matcher->active()) {
+        for (size_t i = 0; i < entries.size(); i++) {
+            if (entries[i].tokens.size() > n_ctx_slot) {
+                continue;
+            }
+            const size_t lcp = entries[i].tokens.get_common_prefix(tokens);
+            // [TAG_DISK_ADOPT] the own namespace wins a tie with an adopt source
+            if (lcp > lcp_best || (lcp == lcp_best && best >= 0 && entries[i].src.empty() && !entries[best].src.empty())) {
+                lcp_best = lcp;
+                best     = (int) i;
+            }
+        }
+        if (lcp_out) {
+            *lcp_out = best >= 0 ? lcp_best : 0;
+        }
+        return best;
+    }
+    // [TAG_CACHE_ALIGN] threshold in new-prompt coverage, rank by matched bytes, the adopt tie rule on equal bytes
+    size_t bytes_best = 0;
     for (size_t i = 0; i < entries.size(); i++) {
         if (entries[i].tokens.size() > n_ctx_slot) {
             continue;
         }
-        const size_t lcp = entries[i].tokens.get_common_prefix(tokens);
-        // [TAG_DISK_ADOPT] the own namespace wins a tie with an adopt source
-        if (lcp > lcp_best || (lcp == lcp_best && best >= 0 && entries[i].src.empty() && !entries[best].src.empty())) {
-            lcp_best = lcp;
-            best     = (int) i;
+        const server_cache_match m = server_cache_match_tokens(entries[i].tokens, tokens, matcher);
+        if (m.n_n <= lcp_min) {
+            continue;
+        }
+        if (best < 0 || m.n_bytes > bytes_best ||
+                (m.n_bytes == bytes_best && entries[i].src.empty() && !entries[best].src.empty())) {
+            bytes_best = m.n_bytes;
+            lcp_best   = m.n_n;
+            best       = (int) i;
         }
     }
     if (lcp_out) {

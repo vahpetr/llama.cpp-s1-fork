@@ -618,6 +618,11 @@ struct server_metrics {
     uint64_t n_prompt_restores        = 0;
     uint64_t n_prompt_replayed_tokens = 0;
 
+    // [TAG_CACHE_ALIGN] byte-aligned splices (prompts that kept cached ids past the id LCP) and the tokens they kept
+    uint64_t n_cache_align          = 0;
+    uint64_t n_cache_align_tokens   = 0;
+    uint64_t n_cache_align_declined = 0;
+
     uint64_t n_tokens_max = 0;
 
     uint64_t n_decode     = 0;

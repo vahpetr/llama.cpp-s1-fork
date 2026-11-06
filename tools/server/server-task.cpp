@@ -1673,6 +1673,18 @@ std::string server_task_result_metrics::to_metrics() {
             "Common-prefix tokens re-processed because the state was restored at an earlier checkpoint",
             (double) metrics.n_prompt_replayed_tokens
         }, {
+            "cache_align_total",
+            "Prompts spliced onto the cache by bytes (--cache-align-bytes): cached ids kept past the id LCP",
+            (double) metrics.n_cache_align
+        }, {
+            "cache_align_tokens_total",
+            "Cached tokens kept past the id LCP by byte-aligned splices",
+            (double) metrics.n_cache_align_tokens
+        }, {
+            "cache_align_declined_total",
+            "Byte-aligned splices declined (message-span identity or media past the splice point)",
+            (double) metrics.n_cache_align_declined
+        }, {
             "admission_deferred_total",
             "GTT headroom admission: prompts that had to wait for headroom (one per deferral episode)",
             (double) metrics.admission_deferred_total
@@ -2051,14 +2063,19 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
-                               const std::string & desc, std::vector<uint8_t> * swapped_spec, bool * swapped) {
+                               const std::string & desc, std::vector<uint8_t> * swapped_spec, bool * swapped,
+                               const server_cache_matcher * matcher) {
     if (swapped) {
         *swapped = false;
     }
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    // [TAG_CACHE_ALIGN] two coordinates: f_keep from the cached tokens kept (n_c), f_sim from the new-prompt coverage
+    //   (n_n), candidates ranked by matched bytes; an inactive matcher gives n_c = n_n = the id LCP (= v75)
+    const bool aligning = matcher != nullptr && matcher->active();
+    const server_cache_match m_base = server_cache_match_tokens(prompt.tokens, tokens_new, matcher);
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+    float f_keep_best = prompt.tokens.size() > 0 ? float(m_base.n_c) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    float f_sim_best  = float(m_base.n_n) / tokens_new.size();
+    size_t bytes_best = m_base.n_bytes;
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -2066,10 +2083,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        const server_cache_match m_cur = server_cache_match_tokens(it->prompt.tokens, tokens_new, matcher);
+        const int lcp_cur = (int) m_cur.n_lcp;
 
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+        const float f_keep_cur = float(m_cur.n_c) / it->prompt.tokens.size();
+        const float f_sim_cur  = float(m_cur.n_n) / tokens_new.size();
 
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
@@ -2084,9 +2102,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        if (f_keep_best < f_keep_cur && (aligning ? bytes_best < m_cur.n_bytes : f_sim_best < f_sim_cur)) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
+            bytes_best  = m_cur.n_bytes;
 
             it_best = it;
         }

@@ -801,6 +801,12 @@ int main() {
         with_guard_eq.insert(with_guard_eq.begin() + 4, "--drift-guard=stop");
         CHECK(knobs(with_guard) == knobs(base)); // [TAG_DRIFT_GUARD]
         CHECK(knobs(with_guard_eq) == knobs(base));
+        std::vector<std::string> with_align = base;
+        with_align.insert(with_align.begin() + 4, { "--cache-align-bytes", "on" });
+        std::vector<std::string> with_align_eq = base;
+        with_align_eq.insert(with_align_eq.begin() + 4, "--cache-align-bytes=on");
+        CHECK(knobs(with_align) == knobs(base)); // [TAG_CACHE_ALIGN]
+        CHECK(knobs(with_align_eq) == knobs(base));
         std::vector<std::string> with_kwargs = base;
         with_kwargs.insert(with_kwargs.begin() + 4, { "--chat-template-kwargs", "{}" });
         CHECK(knobs(with_kwargs) != knobs(base)); // the template options (and --drift-guard) are neutral, kwargs is not
@@ -811,6 +817,14 @@ int main() {
         CHECK(server_disk_cache_env_neutral("LLAMA_ARG_CHAT_TEMPLATE=chatml"));
         CHECK(server_disk_cache_env_neutral("LLAMA_ARG_CACHE_DISK=/c"));
         CHECK(server_disk_cache_env_neutral("LLAMA_ARG_DRIFT_GUARD=stop"));
+        CHECK(server_disk_cache_env_neutral("LLAMA_ARG_CACHE_ALIGN_BYTES=on")); // [TAG_CACHE_ALIGN]
+        CHECK(server_cache_env_classify("LLAMA_ARG_CACHE_ALIGN_BYTES") == SERVER_CACHE_ENV_EXACT);
+        {
+            // the parsed knob is not part of the parsed-parameter digest
+            common_params pa, pb;
+            pb.cache_align_bytes = true;
+            CHECK(server_cache_param_canon(pa) == server_cache_param_canon(pb));
+        }
         CHECK(!server_disk_cache_env_neutral("LLAMA_ARG_CHAT_TEMPLATE_KWARGS={}"));
         CHECK(!server_disk_cache_env_neutral("LLAMA_ARG_CTX_SIZE=4096"));
         printf("fingerprint neutral options: chat template argv / env forms filtered, kwargs / ctx kept\n");
