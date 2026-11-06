@@ -353,6 +353,10 @@ static tools_io::exec_result run_subprocess(
 
     res.output    = console_output_to_utf8(output);
     res.timed_out = timed_out.load();
+    if (res.timed_out) {
+        // what coreutils `timeout` reports, so a local and an isolate timeout read the same
+        res.exit_code = 124;
+    }
     if (truncated) {
         res.output += "\n[output truncated]";
     }
@@ -688,9 +692,17 @@ public:
         inner.insert(inner.end(), args.begin(), args.end());
         // small buffer over timeout_secs so the in-isolate `timeout` has a chance to exit cleanly
         // before the host-side supervisory timeout forcibly kills the client
-        return run_subprocess(
+        const auto t_start = std::chrono::steady_clock::now();
+        auto res = run_subprocess(
             build_argv(with_cwd(inner), /*needs_stdin=*/true),
             max_output, timeout_secs + 5, on_chunk, true);
+        // the in-isolate `timeout` fired: 124 after SIGTERM, 137 after the -k SIGKILL; the elapsed
+        // time tells it from a command that exits 124/137 by itself before the deadline
+        if (!res.timed_out && (res.exit_code == 124 || res.exit_code == 137) &&
+                std::chrono::steady_clock::now() - t_start >= std::chrono::seconds(timeout_secs)) {
+            res.timed_out = true;
+        }
+        return res;
     }
 
 protected:
