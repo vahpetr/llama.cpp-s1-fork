@@ -93,7 +93,12 @@ enum subprocess_option_e {
 
   // Make subprocess_read_stdout and subprocess_read_stderr return immediately
   // with 0 if no data is available. Requires subprocess_option_enable_async.
-  subprocess_option_enable_async_no_wait = 0x20
+  subprocess_option_enable_async_no_wait = 0x20,
+
+  // POSIX only: start the child as the leader of a new process group, so the
+  // caller can signal the whole tree it spawns with kill(-pid, sig). Ignored on
+  // Windows. (llama.cpp local patch)
+  subprocess_option_new_process_group = 0x40
 };
 
 // Error codes returned by subprocess_create and subprocess_create_ex.
@@ -1387,8 +1392,10 @@ cleanup:
   int exec_errfd[2] = {-1, -1};
 #else
   int actions_created = 0;
+  int attr_created = 0;
   int posix_error;
   posix_spawn_file_actions_t actions;
+  posix_spawnattr_t attr;
 #endif
 
   async_no_wait = subprocess_option_enable_async_no_wait ==
@@ -1520,6 +1527,12 @@ cleanup:
       goto child_failed;
     }
 
+    if ((subprocess_option_new_process_group ==
+         (options & subprocess_option_new_process_group)) &&
+        (0 != setpgid(0, 0))) {
+      goto child_failed;
+    }
+
 #ifdef __clang__
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wcast-qual"
@@ -1588,6 +1601,26 @@ cleanup:
     goto cleanup;
   }
   actions_created = 1;
+
+  if (subprocess_option_new_process_group ==
+      (options & subprocess_option_new_process_group)) {
+    posix_error = posix_spawnattr_init(&attr);
+    if (0 == posix_error) {
+      attr_created = 1;
+      posix_error = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    }
+    if (0 == posix_error) {
+      posix_error = posix_spawnattr_setpgroup(&attr, 0);
+    }
+    if (0 != posix_error) {
+      saved_errno = posix_error;
+      result = subprocess_error_from_errno(posix_error);
+      if (subprocess_error_unknown == result) {
+        result = subprocess_error_spawn;
+      }
+      goto cleanup;
+    }
+  }
 
   // Set working directory
   if (process_cwd) {
@@ -1705,7 +1738,7 @@ cleanup:
   if (subprocess_option_search_user_path ==
       (options & subprocess_option_search_user_path)) {
     posix_error = posix_spawnp(&child, commandLine[0], &actions,
-                               SUBPROCESS_NULL,
+                               attr_created ? &attr : SUBPROCESS_NULL,
                                SUBPROCESS_CONST_CAST(char *const *, commandLine),
                                used_environment);
     if (0 != posix_error) {
@@ -1729,7 +1762,7 @@ cleanup:
     }
 #endif
     posix_error = posix_spawn(&child, commandLine[0], &actions,
-                              SUBPROCESS_NULL,
+                              attr_created ? &attr : SUBPROCESS_NULL,
                               SUBPROCESS_CONST_CAST(char *const *, commandLine),
                               used_environment);
     if (0 != posix_error) {
@@ -1832,6 +1865,9 @@ cleanup:
 #else
   if (actions_created) {
     posix_spawn_file_actions_destroy(&actions);
+  }
+  if (attr_created) {
+    posix_spawnattr_destroy(&attr);
   }
 #endif
 

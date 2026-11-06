@@ -10,6 +10,12 @@ bool common_subproc::is_supported() {
 
 #ifdef LLAMA_SUBPROCESS
 
+#if !defined(_WIN32)
+#include <cerrno>
+#include <csignal>
+#include <sys/wait.h>
+#endif
+
 static std::vector<char *> to_cstr_vec(const std::vector<std::string> & v) {
     std::vector<char *> r;
     r.reserve(v.size() + 1);
@@ -86,6 +92,33 @@ void common_subproc::terminate() {
     }
 }
 
+void common_subproc::kill_group(int sig) {
+#if defined(_WIN32)
+    (void) sig;
+#else
+    if (has_handle()) {
+        kill(-proc.child, sig);
+    }
+#endif
+}
+
+bool common_subproc::exited() {
+#if defined(_WIN32)
+    return false;
+#else
+    if (!has_handle()) {
+        return true;
+    }
+    siginfo_t info;
+    info.si_pid = 0;
+    int r;
+    do {
+        r = waitid(P_PID, (id_t) proc.child, &info, WEXITED | WNOHANG | WNOWAIT);
+    } while (r == -1 && errno == EINTR);
+    return r == 0 && info.si_pid != 0;
+#endif
+}
+
 int common_subproc::join() {
     int exit_code = -1;
     if (is_created) {
@@ -134,6 +167,13 @@ void common_subproc::close_stdin() {
 }
 
 void common_subproc::terminate() {
+}
+
+void common_subproc::kill_group(int) {
+}
+
+bool common_subproc::exited() {
+    return true;
 }
 
 int common_subproc::join() {

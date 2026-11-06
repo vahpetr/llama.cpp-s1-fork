@@ -30,6 +30,8 @@
 #   include <io.h>
 #else
 #   include <cerrno>
+#   include <csignal>
+#   include <poll.h>
 #   include <unistd.h>
 #endif
 
@@ -184,6 +186,9 @@ public:
 
 // shared subprocess execution helper, used by both the local and the isolate-backed tools_io implementations.
 // combine_stderr=false when the raw stdout bytes must not be tainted by stderr, e.g. reading file contents.
+// own_group=true (POSIX) runs the child as a new process group and kills the whole group: on timeout
+// (SIGTERM, then SIGKILL after 1 s) and once the direct child has exited, so neither a grandchild that
+// holds the output pipe nor a background job outlives the call. Windows keeps the single-process kill.
 static tools_io::exec_result run_subprocess(
         const std::vector<std::string> & args,
         size_t max_output,
@@ -191,7 +196,8 @@ static tools_io::exec_result run_subprocess(
         const std::function<bool(const std::string &)> & on_chunk,
         bool combine_stderr,
         const std::string & cwd = "",
-        const std::string * stdin_data = nullptr) {
+        const std::string * stdin_data = nullptr,
+        bool own_group = false) {
     tools_io::exec_result res;
 
     common_subproc proc;
@@ -202,6 +208,13 @@ static tools_io::exec_result run_subprocess(
     if (combine_stderr) {
         options |= subprocess_option_combined_stdout_stderr;
     }
+#if defined(_WIN32)
+    own_group = false;
+#else
+    if (own_group) {
+        options |= subprocess_option_new_process_group;
+    }
+#endif
 
     if (!proc.create(args, options, {}, cwd.empty() ? nullptr : cwd.c_str())) {
         res.output = "failed to spawn process";
@@ -216,6 +229,18 @@ static tools_io::exec_result run_subprocess(
         while (!done.load()) {
             if (std::chrono::steady_clock::now() >= deadline) {
                 timed_out.store(true);
+#if !defined(_WIN32)
+                if (own_group) {
+                    // the group: a polite SIGTERM, then SIGKILL for whatever is left after 1 s
+                    proc.kill_group(SIGTERM);
+                    const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                    while (!done.load() && std::chrono::steady_clock::now() < grace) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }
+                    proc.kill_group(SIGKILL);
+                    return;
+                }
+#endif
                 proc.terminate();
                 return;
             }
@@ -241,6 +266,19 @@ static tools_io::exec_result run_subprocess(
     FILE * f = proc.stdout_file();
     std::string output;
     bool truncated = false;
+    // own_group: set once the group was killed because the direct child has exited
+    bool group_killed = false;
+    auto stop = [&]() {
+#if !defined(_WIN32)
+        if (own_group) {
+            proc.kill_group(SIGKILL);
+            group_killed = true;
+            return;
+        }
+#endif
+        proc.terminate();
+    };
+    (void) group_killed;
     if (f) {
 #if defined(_WIN32)
         // pipe fds default to CRT text mode: binary keeps the bytes untranslated
@@ -253,6 +291,19 @@ static tools_io::exec_result run_subprocess(
 #if defined(_WIN32)
             const int n = _read(_fileno(f), buf, (unsigned) sizeof(buf));
 #else
+            if (own_group) {
+                // the direct child is gone: kill what it left behind, the pipe then reaches EOF
+                // (bytes already in the pipe stay readable)
+                if (!group_killed && proc.exited()) {
+                    proc.kill_group(SIGKILL);
+                    group_killed = true;
+                }
+                struct pollfd pfd = { fileno(f), POLLIN, 0 };
+                const int pr = poll(&pfd, 1, 100);
+                if (pr == 0 || (pr < 0 && errno == EINTR)) {
+                    continue;
+                }
+            }
             ssize_t n = read(fileno(f), buf, sizeof(buf));
             while (n < 0 && errno == EINTR) {
                 n = read(fileno(f), buf, sizeof(buf));
@@ -268,7 +319,7 @@ static tools_io::exec_result run_subprocess(
             if (output.size() + len <= max_output) {
                 output.append(buf, len);
                 if (on_chunk && !on_chunk(console_output_to_utf8(std::string(buf, len)))) {
-                    proc.terminate();
+                    stop();
                     break;
                 }
             } else {
@@ -279,6 +330,19 @@ static tools_io::exec_result run_subprocess(
             }
         }
     }
+
+#if !defined(_WIN32)
+    if (own_group) {
+        // the direct child may outlive EOF (it closed its stdout): still under the timeout above;
+        // then kill the leftovers while the unreaped child keeps the group id reserved
+        while (!proc.exited()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (!group_killed) {
+            proc.kill_group(SIGKILL);
+        }
+    }
+#endif
 
     done.store(true);
     if (timeout_thread.joinable()) {
@@ -406,7 +470,8 @@ public:
             size_t max_output,
             int timeout_secs,
             const std::function<bool(const std::string &)> & on_chunk = nullptr) const override {
-        return run_subprocess(args, max_output, timeout_secs, on_chunk, /*combine_stderr=*/true, cwd);
+        return run_subprocess(args, max_output, timeout_secs, on_chunk, /*combine_stderr=*/true, cwd,
+                              /*stdin_data=*/nullptr, /*own_group=*/true);
     }
 
 private:
@@ -617,7 +682,9 @@ public:
             size_t max_output,
             int timeout_secs,
             const std::function<bool(const std::string &)> & on_chunk = nullptr) const override {
-        std::vector<std::string> inner = {"timeout", std::to_string(timeout_secs) + "s"};
+        // -k 5: a command that ignores SIGTERM gets SIGKILL 5 s later, the same moment the host-side
+        // supervisory timeout below kills the client
+        std::vector<std::string> inner = {"timeout", "-k", "5", std::to_string(timeout_secs)};
         inner.insert(inner.end(), args.begin(), args.end());
         // small buffer over timeout_secs so the in-isolate `timeout` has a chance to exit cleanly
         // before the host-side supervisory timeout forcibly kills the client
@@ -778,6 +845,8 @@ private:
             "-o", "PasswordAuthentication=no",
             "-o", "KbdInteractiveAuthentication=no",
             "-o", "StrictHostKeyChecking=yes",
+            // a dead link is noticed in ~45 s instead of hanging until the supervisory kill
+            "-o", "ServerAliveInterval=15",
         };
     }
 };

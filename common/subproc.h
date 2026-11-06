@@ -14,6 +14,7 @@ static constexpr int subprocess_option_no_window = 0;
 static constexpr int subprocess_option_combined_stdout_stderr = 0;
 static constexpr int subprocess_option_inherit_environment = 0;
 static constexpr int subprocess_option_search_user_path = 0;
+static constexpr int subprocess_option_new_process_group = 0;
 #endif
 
 // RAII-style wrapper around https://github.com/sheredom/subprocess.h,
@@ -47,6 +48,14 @@ struct common_subproc {
     void close_stdin();
 
     void terminate();
+
+    // POSIX, for a child created with subprocess_option_new_process_group:
+    // send `sig` to its whole process group; does nothing before create() or after join()
+    void kill_group(int sig);
+
+    // POSIX: true once the direct child has exited; it is not reaped, so its pid (and the
+    // process group id) stays reserved until join(), and join() still reports the exit code
+    bool exited();
 
     // wait for the process to exit, release the underlying handle and return its exit code
     int join();
