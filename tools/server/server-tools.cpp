@@ -863,11 +863,12 @@ static bool path_glob_match(const std::string & pattern, const std::string & rel
 // read_file: read a file with optional line range and line-number prefix
 //
 
-static constexpr size_t SERVER_TOOL_READ_FILE_MAX_SIZE = 256 * 1024; // 256 KB
 static constexpr size_t SERVER_TOOL_READ_FILE_MAX_SIZE_BASE64 = 32 * 1024 * 1024; // 32 MB
 
 struct server_tool_read_file : server_tool {
-    server_tool_read_file() {
+    const size_t max_size; // --tools-read-max
+
+    explicit server_tool_read_file(size_t max_size) : max_size(max_size) {
         name = "read_file";
         display_name = "Read file";
         uses_cwd = true;
@@ -879,9 +880,9 @@ struct server_tool_read_file : server_tool {
             {"type", "function"},
             {"function", {
                 {"name", name},
-                {"description", "Read the contents of a file. Optionally specify a 1-based line range. "
+                {"description", string_format("Read the contents of a file. Optionally specify a 1-based line range. "
                                 "If append_loc is true, each line is prefixed with its line number (e.g. \"1\u2192...\"). "
-                                "Files larger than 256 KiB cannot be read whole; read them in parts with start_line/end_line."},
+                                "Files larger than %zu bytes cannot be read whole; read them in parts with start_line/end_line.", max_size)},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
@@ -927,10 +928,10 @@ struct server_tool_read_file : server_tool {
             };
         }
 
-        if (file_size > SERVER_TOOL_READ_FILE_MAX_SIZE && end_line == -1) {
+        if (file_size > max_size && end_line == -1) {
             return {{"error", string_format(
                 "file too large (%zu bytes, max %zu). Use start_line/end_line to read a portion.",
-                (size_t)file_size, SERVER_TOOL_READ_FILE_MAX_SIZE)}};
+                (size_t)file_size, max_size)}};
         }
 
         std::string content;
@@ -955,7 +956,7 @@ struct server_tool_read_file : server_tool {
                 out_line = line + "\n";
             }
 
-            if (result.size() + out_line.size() > SERVER_TOOL_READ_FILE_MAX_SIZE) {
+            if (result.size() + out_line.size() > max_size) {
                 result += "[output truncated]";
                 break;
             }
@@ -1240,13 +1241,10 @@ struct server_tool_grep_search : server_tool {
 // exec_shell_command: run an arbitrary shell command
 //
 
-static constexpr size_t SERVER_TOOL_EXEC_SHELL_COMMAND_DEF_OUTPUT_SIZE = 64 * 1024;  // 64 KB
-static constexpr size_t SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_OUTPUT_SIZE = 256 * 1024; // 256 KB
-static constexpr int    SERVER_TOOL_EXEC_SHELL_COMMAND_DEF_TIMEOUT     = 60;         // seconds
-static constexpr int    SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_TIMEOUT     = 600;        // seconds
-
 struct server_tool_exec_shell_command : server_tool {
-    server_tool_exec_shell_command() {
+    const server_tools_limits limits; // --tools-exec-timeout[-max], --tools-exec-output[-max]
+
+    explicit server_tool_exec_shell_command(const server_tools_limits & limits) : limits(limits) {
         name = "exec_shell_command";
         display_name = "Execute shell command";
         uses_cwd = true;
@@ -1261,14 +1259,14 @@ struct server_tool_exec_shell_command : server_tool {
                 {"name", name},
                 {"description", string_format("Execute a shell command and return its output (stdout and stderr combined). "
                                               "Timeout default %d s, max %d s; output default %zu bytes, max %zu bytes.",
-                                              SERVER_TOOL_EXEC_SHELL_COMMAND_DEF_TIMEOUT, SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_TIMEOUT,
-                                              SERVER_TOOL_EXEC_SHELL_COMMAND_DEF_OUTPUT_SIZE, SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_OUTPUT_SIZE)},
+                                              limits.exec_timeout, limits.exec_timeout_max,
+                                              limits.exec_output, limits.exec_output_max)},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
                         {"command",         {{"type", "string"},  {"description", "Shell command to execute"}}},
-                        {"timeout",         {{"type", "integer"}, {"description", string_format("Timeout in seconds (default %d, max %d)", SERVER_TOOL_EXEC_SHELL_COMMAND_DEF_TIMEOUT, SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_TIMEOUT)}}},
-                        {"max_output_size", {{"type", "integer"}, {"description", string_format("Maximum output size in bytes (default %zu, max %zu)", SERVER_TOOL_EXEC_SHELL_COMMAND_DEF_OUTPUT_SIZE, SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_OUTPUT_SIZE)}}},
+                        {"timeout",         {{"type", "integer"}, {"description", string_format("Timeout in seconds (default %d, max %d)", limits.exec_timeout, limits.exec_timeout_max)}}},
+                        {"max_output_size", {{"type", "integer"}, {"description", string_format("Maximum output size in bytes (default %zu, max %zu)", limits.exec_output, limits.exec_output_max)}}},
                     }},
                     {"required", json::array({"command"})},
                 }},
@@ -1278,11 +1276,11 @@ struct server_tool_exec_shell_command : server_tool {
 
     json invoke(json params, server_tool::stream * st) const override {
         std::string command   = params.at("command").get<std::string>();
-        int    timeout        = json_value(params, "timeout",         SERVER_TOOL_EXEC_SHELL_COMMAND_DEF_TIMEOUT);
-        size_t max_output     = (size_t) json_value(params, "max_output_size", (int) SERVER_TOOL_EXEC_SHELL_COMMAND_DEF_OUTPUT_SIZE);
+        int    timeout        = json_value(params, "timeout",         limits.exec_timeout);
+        size_t max_output     = (size_t) json_value(params, "max_output_size", (int) limits.exec_output);
 
-        timeout    = std::min(timeout,    SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_TIMEOUT);
-        max_output = std::min(max_output, SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_OUTPUT_SIZE);
+        timeout    = std::min(timeout,    limits.exec_timeout_max);
+        max_output = std::min(max_output, limits.exec_output_max);
 
         // an isolate is always POSIX regardless of host OS, so it always gets `sh -c`
 #ifdef _WIN32
@@ -1956,16 +1954,16 @@ static server_tool & find_tool(std::vector<std::unique_ptr<server_tool>> & tools
 // public API
 //
 
-static std::vector<std::unique_ptr<server_tool>> build_tools() {
+static std::vector<std::unique_ptr<server_tool>> build_tools(const server_tools_limits & limits) {
     // IMPORTANT: for contributors, please keep this array of tools as minimal as possible
     //            we only accept minimal i/o and shell command tools here
     //            for example, do not add: web search, get date time, etc.
     //            high-level functionality should be added either via MCP or web UI
     std::vector<std::unique_ptr<server_tool>> tools;
-    tools.push_back(std::make_unique<server_tool_read_file>());
+    tools.push_back(std::make_unique<server_tool_read_file>(limits.read_max));
     tools.push_back(std::make_unique<server_tool_file_glob_search>());
     tools.push_back(std::make_unique<server_tool_grep_search>());
-    tools.push_back(std::make_unique<server_tool_exec_shell_command>());
+    tools.push_back(std::make_unique<server_tool_exec_shell_command>(limits));
     tools.push_back(std::make_unique<server_tool_write_file>());
     tools.push_back(std::make_unique<server_tool_edit_file>());
     tools.push_back(std::make_unique<server_tool_get_info>());
@@ -2004,7 +2002,22 @@ static std::unique_ptr<server_tools_runtime> make_tools_runtime(const std::strin
 
 void server_tools::setup(const std::vector<std::string> & enabled_tools,
                          server_mcp & mcp_mgr,
-                         const std::string & tools_runtime) {
+                         const std::string & tools_runtime,
+                         const server_tools_limits & limits) {
+    if (limits.read_max < 4096) {
+        throw std::runtime_error(string_format("--tools-read-max must be >= 4096 (got %zu)", limits.read_max));
+    }
+    if (limits.exec_timeout < 1 || limits.exec_timeout_max < limits.exec_timeout) {
+        throw std::runtime_error(string_format(
+            "--tools-exec-timeout-max (%d) must be >= --tools-exec-timeout (%d) and the timeout >= 1",
+            limits.exec_timeout_max, limits.exec_timeout));
+    }
+    if (limits.exec_output < 1 || limits.exec_output_max < limits.exec_output) {
+        throw std::runtime_error(string_format(
+            "--tools-exec-output-max (%zu) must be >= --tools-exec-output (%zu) and the output >= 1",
+            limits.exec_output_max, limits.exec_output));
+    }
+
     if (!tools_runtime.empty()) {
         runtime = make_tools_runtime(tools_runtime);
     }
@@ -2015,7 +2028,7 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools,
         }
 
         std::unordered_set<std::string> enabled_set(enabled_tools.begin(), enabled_tools.end());
-        auto all_tools = build_tools();
+        auto all_tools = build_tools(limits);
 
         // collect all known tool names for validation
         std::vector<std::string> known_names;

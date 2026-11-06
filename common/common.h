@@ -724,6 +724,13 @@ struct common_params {
     std::vector<std::string> server_tools;
     std::string server_tools_runtime;
 
+    // built-in tool limits (read_file cap, exec_shell_command timeout/output default and max)
+    int32_t tools_read_max         = 256 * 1024; // bytes
+    int32_t tools_exec_timeout     = 60;         // seconds
+    int32_t tools_exec_timeout_max = 600;        // seconds
+    int32_t tools_exec_output      = 64 * 1024;  // bytes
+    int32_t tools_exec_output_max  = 256 * 1024; // bytes
+
     // MCP server configs (Cursor-compatible JSON)
     std::string mcp_servers_config;   // path to JSON file with MCP server definitions
     std::string mcp_servers_json;     // inline JSON with MCP server definitions

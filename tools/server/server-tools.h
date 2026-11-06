@@ -31,6 +31,15 @@ struct server_tool {
     json to_json() const;
 };
 
+// limits of the built-in tools, from --tools-read-max / --tools-exec-*
+struct server_tools_limits {
+    size_t read_max         = 256 * 1024;
+    int    exec_timeout     = 60;
+    int    exec_timeout_max = 600;
+    size_t exec_output      = 64 * 1024;
+    size_t exec_output_max  = 256 * 1024;
+};
+
 struct server_tools_runtime; // impl detail, defined in server-tools.cpp
 
 struct server_tools {
@@ -45,7 +54,8 @@ struct server_tools {
 
     void setup(const std::vector<std::string> & enabled_tools,
                server_mcp & mcp_mgr,
-               const std::string & tools_runtime);
+               const std::string & tools_runtime,
+               const server_tools_limits & limits = {});
 
     server_http_context::handler_t handle_get;
     server_http_context::handler_t handle_post;

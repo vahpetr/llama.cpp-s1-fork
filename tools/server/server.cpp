@@ -353,7 +353,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     if (!params.server_tools.empty() || !mcp_mgr.empty()) {
         try {
-            tools.setup(params.server_tools, mcp_mgr, params.server_tools_runtime);
+            server_tools_limits limits;
+            limits.read_max         = (size_t) std::max(0, params.tools_read_max);
+            limits.exec_timeout     = params.tools_exec_timeout;
+            limits.exec_timeout_max = params.tools_exec_timeout_max;
+            limits.exec_output      = (size_t) std::max(0, params.tools_exec_output);
+            limits.exec_output_max  = (size_t) std::max(0, params.tools_exec_output_max);
+            tools.setup(params.server_tools, mcp_mgr, params.server_tools_runtime, limits);
         } catch (const std::exception & e) {
             SRV_ERR("tools setup failed: %s\n", e.what());
             return 1;

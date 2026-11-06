@@ -3575,6 +3575,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TOOLS_RUNTIME"));
     add_opt(common_arg(
+        {"--tools-read-max"}, "BYTES",
+        string_format("max file size read_file returns whole; larger files must be read by line range (default: %d, min 4096)", params.tools_read_max),
+        [](common_params & params, int value) {
+            params.tools_read_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--tools-exec-timeout"}, "SEC",
+        string_format("exec_shell_command timeout when the model gives none (default: %d)", params.tools_exec_timeout),
+        [](common_params & params, int value) {
+            params.tools_exec_timeout = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--tools-exec-timeout-max"}, "SEC",
+        string_format("exec_shell_command max timeout, a larger requested timeout is clamped (default: %d)", params.tools_exec_timeout_max),
+        [](common_params & params, int value) {
+            params.tools_exec_timeout_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--tools-exec-output"}, "BYTES",
+        string_format("exec_shell_command output cap when the model gives none (default: %d)", params.tools_exec_output),
+        [](common_params & params, int value) {
+            params.tools_exec_output = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--tools-exec-output-max"}, "BYTES",
+        string_format("exec_shell_command max output cap, a larger requested max_output_size is clamped (default: %d)", params.tools_exec_output_max),
+        [](common_params & params, int value) {
+            params.tools_exec_output_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--mcp-servers-config"}, "PATH",
         "experimental: path to JSON file with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)\n"
         "note: for security reasons, this will limit --cors-origins to localhost by default",
