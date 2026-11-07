@@ -2,23 +2,23 @@
 // Included by flash_attn.comp (scalar) and flash_attn_cm1.comp after flash_attn_base.glsl.
 //
 // With VIS set, binding 3 holds the cell planes [n_kv, 4, n_stream] (I32) instead of the f16 mask,
-// binding 7 the token records [4, n_tps, n_stream], and every load of a mask element becomes
+// binding 8 the token records [4, n_tps, n_stream], and every load of a mask element becomes
 // fa_vis_value() of the same (row, column): the same f16 value, so everything downstream (the
 // all -inf skip, slope * mask, ZERO_DEAD_V, GQA_TOKENS rows, split_k) is unchanged. The host keeps
 // the mask push constants as the plane would have them: nem1 = n_tps, nem2 = 1, nem3 = n_stream.
 //
-// Flags bits: 512 VIS, 1024 causal, 2048 alibi, 4096/8192 swa type; n_swa is spec constant 16.
+// Flags bits: 1<<21 VIS, 1<<22 causal, 1<<23 alibi, 1<<24/1<<25 swa type; n_swa is spec constant 16.
 
 layout (constant_id = 16) const uint32_t VisNSwa = 0;
 
-const bool VIS           = (Flags & 512) != 0;
-const uint32_t VIS_FLAGS = (((Flags & 1024) != 0) ? 1u : 0u) |
-                           (((Flags & 2048) != 0) ? 2u : 0u) |
-                           (((Flags >> 12) & 3u) << 2) |
+const bool VIS           = (Flags & (1u << 21)) != 0;
+const uint32_t VIS_FLAGS = (((Flags & (1u << 22)) != 0) ? 1u : 0u) |
+                           (((Flags & (1u << 23)) != 0) ? 2u : 0u) |
+                           (((Flags >> 24) & 3u) << 2) |
                            16u; // KQV_FLAG_F16: FA reads the values of an f16 plane
 
 layout (binding = 3) readonly buffer VC {int data_vc[];};
-layout (binding = 7) readonly buffer VT {ivec4 data_vt[];};
+layout (binding = 8) readonly buffer VT {ivec4 data_vt[];}; // binding 7 = upstream SP (sparse FA), unused here
 
 int kqv_cell_load(uint idx) {
     return data_vc[idx];

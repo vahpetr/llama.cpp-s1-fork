@@ -38,7 +38,7 @@ const uint32_t MatBc = 16;
 // get_fa_tuning_params_coopmat1 and ggml_vk_flash_attn_coopmat_shmem_support cap Br at 32.
 const uint32_t row_tiles = Br / MatBr;
 
-// [TAG_FA1] two shared-memory layouts of this kernel (Flags bits 16384 / 32768, host knobs GGML_VK_FA_SFPV_ALIAS /
+// [TAG_FA1] two shared-memory layouts of this kernel (Flags bits 1<<26 / 1<<27, host knobs GGML_VK_FA_SFPV_ALIAS /
 // GGML_VK_FA_V_CHUNK).  The kernel is occupancy-bound by shared memory on RDNA3 at HSK == HSV == 256 (128 VGPRs
 // allow 8 subgroups per SIMD, 31 KiB of LDS allows 4), so these shrink it.  Neither changes an operand, the order
 // of any coopMatMulAdd, or a softmax/accumulation step - a dispatch's output is bit-identical with or without them.
@@ -49,7 +49,7 @@ const uint32_t row_tiles = Br / MatBr;
 //               it is staged one MatBc-row chunk at a time right before that chunk's coopMatMulAdd instead of all Bc
 //               rows at once, so kvsh only needs max(Bc x K chunk, MatBc x V chunk).  -5 KiB; costs two barriers per
 //               chunk on staged tiles only.  Host: row_tiles == 1, no SHMEM_STAGING, f16 V (no per-tile decode).
-const bool SFPV_ALIAS = (Flags & 16384) != 0;
+const bool SFPV_ALIAS = (Flags & (1u << 26)) != 0;
 // V_CHUNK is only defined for one row tile (the row_tiles > 1 paths - PVMat1, the dead_split staging of Bc rows -
 // need the whole-tile kvsh) and without whole-tile staging, so the kernel itself folds those conditions in: a
 // dispatch that sets the bit on any other pipeline gets the legacy layout, never a dropped P*V term or an
@@ -58,7 +58,7 @@ const bool SFPV_ALIAS = (Flags & 16384) != 0;
 // unmeasured under this layout.  The host predicate ggml_vk_fa_cm1_v_chunk (ggml-vulkan.cpp) sets the bit only on a
 // subset of these pipelines (it adds policy: aligned, f16 V, dense rows); ggml_vk_fa_cm1_v_chunk_kernel_fold mirrors
 // this fold there - keep the two in step.
-const bool V_CHUNK    = (Flags & 32768) != 0 && row_tiles == 1 && !INDEXED && SHMEM_STAGING == 0;
+const bool V_CHUNK    = (Flags & (1u << 27)) != 0 && row_tiles == 1 && !INDEXED && SHMEM_STAGING == 0;
 
 const uint32_t rows_per_thread = Br / row_split;
 const uint32_t cols_per_iter = gl_WorkGroupSize.x / row_split;

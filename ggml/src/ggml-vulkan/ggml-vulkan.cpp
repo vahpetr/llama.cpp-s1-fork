@@ -3461,7 +3461,7 @@ static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
         const ggml_tensor * q = node->src[0];
         const ggml_tensor * k = node->src[1];
         const ggml_tensor * v = node->src[2];
-        return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * (node->src[5] ? node->src[5]->ne[0] : k->ne[1]) * q->ne[3]; // [TAG_QSA_INDEXED_FA] W ids
+        return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * (node->src[GGML_FA_SRC_KV_IDS] ? node->src[GGML_FA_SRC_KV_IDS]->ne[0] : k->ne[1]) * q->ne[3]; // [TAG_QSA_INDEXED_FA] W ids
     }
     return 0;
 }
@@ -3603,8 +3603,8 @@ class vk_perf_logger {
                 " k(" << k->ne[0] << "," << k->ne[1] << "," << k->ne[2] << "," << k->ne[3] << "), " <<
                 " v(" << v->ne[0] << "," << v->ne[1] << "," << v->ne[2] << "," << v->ne[3] << "), " <<
                 " m(" << (m?m->ne[0]:0) << "," << (m?m->ne[1]:0) << "," << (m?m->ne[2]:0) << "," << (m?m->ne[3]:0) << ")";
-            if (node->src[5]) {
-                name << " ids(" << node->src[5]->ne[0] << ")"; // [TAG_QSA_INDEXED_FA] W: indexed vs dense in the profile
+            if (node->src[GGML_FA_SRC_KV_IDS]) {
+                name << " ids(" << node->src[GGML_FA_SRC_KV_IDS]->ne[0] << ")"; // [TAG_QSA_INDEXED_FA] W: indexed vs dense in the profile
             }
             return name.str();
         }
@@ -5393,6 +5393,21 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
     }
 }
 
+// FA spec constant 10 (Flags). Bits 0-3 (1/2/4/8) and bit 4 (16, USE_SPARSE) are upstream's; every fork bit sits at 16 and
+// above (bits 16-27, shifted +12 from the old 16..32768 layout) so an upstream merge cannot alias them (upgrade plan §3:
+// upstream #28105 USE_SPARSE = 16 vs the old fork ZERO_DEAD_V = 16). Keep flash_attn_base.glsl / flash_attn_vis.glsl /
+// flash_attn_cm1.comp in step; bit 18 stays reserved for prod-v7-fa CM1_SF_PAD (was 64).
+static constexpr uint32_t FA_FLAG_ZERO_DEAD_V   = 1u << 16; // was 16
+static constexpr uint32_t FA_FLAG_DEADV_LDS     = 1u << 17; // was 32
+static constexpr uint32_t FA_FLAG_GQA_TOKENS    = 1u << 19; // was 128 ([TAG_FA_GQA_TOKENS])
+static constexpr uint32_t FA_FLAG_INDEXED       = 1u << 20; // was 256 ([TAG_QSA_INDEXED_FA])
+static constexpr uint32_t FA_FLAG_VIS           = 1u << 21; // was 512 ([TAG_KQ_VIS])
+static constexpr uint32_t FA_FLAG_VIS_CAUSAL    = 1u << 22; // was 1024
+static constexpr uint32_t FA_FLAG_VIS_ALIBI     = 1u << 23; // was 2048
+static constexpr uint32_t FA_FLAG_VIS_SWA_SHIFT = 24;       // 2 bits, was 12 (4096/8192)
+static constexpr uint32_t FA_FLAG_SFPV_ALIAS    = 1u << 26; // was 16384 ([TAG_FA1])
+static constexpr uint32_t FA_FLAG_V_CHUNK       = 1u << 27; // was 32768 ([TAG_FA1])
+
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type,
                                                   bool gqa_tokens = false, uint32_t vis_flags = 0, uint32_t vis_n_swa = 0,
@@ -5421,27 +5436,27 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
-                     (zero_dead_v       ? 16 : 0) |
-                     (deadv_lds         ? 32 : 0) |
+                     (zero_dead_v       ? FA_FLAG_ZERO_DEAD_V : 0) |
+                     (deadv_lds         ? FA_FLAG_DEADV_LDS : 0) |
                      // [TAG_FA_GQA_TOKENS] rows are (token, head) pairs, see flash_attn_base.glsl.
-                     // Bit 64 is reserved for prod-v7-fa's CM1_SF_PAD so the two FA series cannot
+                     // Bit 18 is reserved for prod-v7-fa's CM1_SF_PAD so the two FA series cannot
                      // alias if they are ever merged; see flash_attn_base.glsl.
-                     (gqa_tokens        ? 128 : 0) |
-                     (indexed           ? 256 : 0) | // [TAG_QSA_INDEXED_FA] FLASH_ATTN_EXT src[5] kv ids
-                     // [TAG_FA1] 16384 SFPV_ALIAS, 32768 V_CHUNK (coopmat1 layouts, bit-identical)
+                     (gqa_tokens        ? FA_FLAG_GQA_TOKENS : 0) |
+                     (indexed           ? FA_FLAG_INDEXED : 0) | // [TAG_QSA_INDEXED_FA] FLASH_ATTN_EXT src[GGML_FA_SRC_KV_IDS] kv ids
+                     // [TAG_FA1] SFPV_ALIAS, V_CHUNK (coopmat1 layouts, bit-identical)
                      // dense_rows: the caller's "no kv ids, no GQA fold" (one query row per Q row of one head)
-                     (ggml_vk_fa_cm1_sfpv_alias(params, f32acc, k_type, dense_rows) ? 16384 : 0) |
+                     (ggml_vk_fa_cm1_sfpv_alias(params, f32acc, k_type, dense_rows) ? FA_FLAG_SFPV_ALIAS : 0) |
                      // V_CHUNK only on aligned pipelines: with Clamp every V tile is staged, and per-chunk barriers
                      // on every KV tile would cost more than the occupancy gives back
-                     (ggml_vk_fa_cm1_v_chunk(params, v_type, dense_rows && aligned) ? 32768 : 0) |
-                     // [TAG_KQ_VIS] 512 VIS, 1024 causal, 2048 alibi, 4096/8192 swa type (flash_attn_vis.glsl)
+                     (ggml_vk_fa_cm1_v_chunk(params, v_type, dense_rows && aligned) ? FA_FLAG_V_CHUNK : 0) |
+                     // [TAG_KQ_VIS] VIS, causal, alibi, swa type (flash_attn_vis.glsl)
                      vis_flags;
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
     // [TAG_FA1] host policy and kernel fold diverged: the kernel folds V_CHUNK off for this pipeline, so the bit only
     // makes a distinct pipeline that behaves as the legacy layout (no LDS saving)
-    if ((flags & 32768) && !ggml_vk_fa_cm1_v_chunk_kernel_fold(params, indexed)) {
+    if ((flags & FA_FLAG_V_CHUNK) && !ggml_vk_fa_cm1_v_chunk_kernel_fold(params, indexed)) {
         VK_LOG_DEBUG("get_fa_pipeline_state: V_CHUNK set on a pipeline the kernel folds it off for (Br=" << params.block_rows
                      << ", shmem_staging=" << params.shmem_staging << ", indexed=" << indexed << ")");
     }
@@ -6415,7 +6430,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
             name = aligned ? "flash_attn_f32_f16_aligned" : "flash_attn_f32_f16";
         }
-        ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8, /* [TAG_KQ_VIS] binding 7: vis tokens */
+        ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 9, /* [TAG_KQ_VIS] binding 8: vis tokens; 7 = upstream SP, empty */
                                 sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                 get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                 !fa_ds, !fa_ds ? fa_sgs : 0);
@@ -6451,7 +6466,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
                 name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
             }
-            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8, /* [TAG_KQ_VIS] binding 7: vis tokens */
+            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 9, /* [TAG_KQ_VIS] binding 8: vis tokens; 7 = upstream SP, empty */
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                     !fa_ds, !fa_ds ? fa_sgs : 0);
@@ -15028,7 +15043,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
 
     // [TAG_KQ_VIS] the mask as metadata (ggml_flash_attn_ext_set_vis): binding 3 carries the cell planes
-    // [n_kv, 4, n_stream], binding 7 the token records [4, n_tps, n_stream]; the mask dimensions are
+    // [n_kv, 4, n_stream], binding 8 the token records [4, n_tps, n_stream]; the mask dimensions are
     // the ones the plane would have ([n_kv, n_tps, 1, n_stream]), so every index stays the same.
     const bool vis = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM) != 0 && dst->src[6] != nullptr;
     const ggml_tensor * vis_cells = vis ? dst->src[6] : nullptr;
@@ -15042,7 +15057,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         const uint32_t alibi    = ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 2) != 0;
         const uint32_t swa_type = (uint32_t) ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 3) & 3u;
         vis_n_swa     = swa_type ? ggml_get_op_params_i32(dst, GGML_FA_VIS_PARAM + 4) : 0;
-        vis_flags     = 512u | (causal << 10) | (alibi << 11) | (swa_type << 12);
+        vis_flags     = FA_FLAG_VIS | (causal ? FA_FLAG_VIS_CAUSAL : 0u) | (alibi ? FA_FLAG_VIS_ALIBI : 0u) | (swa_type << FA_FLAG_VIS_SWA_SHIFT);
         vis_kqv_flags = causal | (alibi << 1) | (swa_type << 2) | 16u; // 16: f16 plane values (KQV_FLAG_F16)
         GGML_ASSERT(vis_cells->ne[0] == k->ne[1]);
     }
@@ -15349,7 +15364,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : vis ? ggml_vk_tensor_subbuffer(ctx, vis_cells) : q_buf;
-    vk_subbuffer vis_toks_buf = vis ? ggml_vk_tensor_subbuffer(ctx, vis_toks) : q_buf; // binding 7 (scalar/coopmat1 only)
+    vk_subbuffer vis_toks_buf = vis ? ggml_vk_tensor_subbuffer(ctx, vis_toks) : q_buf; // binding 8 (scalar/coopmat1 only)
+    // binding 7 is upstream's SP (sparse FA indices, #28105) - unused by the fork kernels, bound to q_buf
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = ids != nullptr ? ggml_vk_tensor_subbuffer(ctx, ids) : // [TAG_QSA_INDEXED_FA] binding 6
                                 use_mask_opt   ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
@@ -15484,7 +15500,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                         pc, { dispatch_x, workgroups_y, workgroups_z });
         } else {
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, vis_toks_buf},
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, q_buf, vis_toks_buf},
                                         pc, { dispatch_x, workgroups_y, workgroups_z });
         }
 
@@ -15508,7 +15524,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                         pc, { workgroups_x, workgroups_y, workgroups_z });
         } else {
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, vis_toks_buf},
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, q_buf, vis_toks_buf},
                                         pc, { workgroups_x, workgroups_y, workgroups_z });
         }
     }
@@ -21718,7 +21734,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_FLASH_ATTN_EXT:
-        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node->src[5], node);
+        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node->src[GGML_FA_SRC_KV_IDS], node);
 
         break;
 
@@ -25402,7 +25418,7 @@ static void ggml_vk_qsa_scratch_hint(ggml_backend_vk_context * ctx, const struct
         if (node->op != GGML_OP_FLASH_ATTN_EXT) {
             continue;
         }
-        if (vk_qsa_scratch_presize_fa && ggml_vk_fa_use_dequant_kv(ctx, node->src[0], node->src[1], node->src[2], node->src[5])) {
+        if (vk_qsa_scratch_presize_fa && ggml_vk_fa_use_dequant_kv(ctx, node->src[0], node->src[1], node->src[2], node->src[GGML_FA_SRC_KV_IDS])) {
             ctx->prealloc_size_qsa_hint = std::max(ctx->prealloc_size_qsa_hint,
                                                    ggml_vk_fa_dequant_staging_bytes(node->src[1], node->src[2]));
         }
@@ -26448,8 +26464,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if ((op->src[1]->type == GGML_TYPE_BF16) != (op->src[2]->type == GGML_TYPE_BF16)) {
                     return false;
                 }
-                if (op->src[5] != nullptr) { // [TAG_QSA_INDEXED_FA] coopmat1 plain GQA fold only
-                    const ggml_tensor * ids = op->src[5];
+                if (op->src[GGML_FA_SRC_KV_IDS] != nullptr) { // [TAG_QSA_INDEXED_FA] coopmat1 plain GQA fold only
+                    const ggml_tensor * ids = op->src[GGML_FA_SRC_KV_IDS];
                     const int64_t nh = op->src[0]->ne[2], nh_kv = op->src[1]->ne[2];
                     if (ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || nh_kv == 0 || nh % nh_kv != 0 ||
                         op->src[2]->ne[2] != nh_kv ||
@@ -27496,7 +27512,7 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     if (strcmp(name, "ggml_backend_vk_fusion_count_total") == 0) { // [TAG_DECODE_FUSE] int64_t (*)(ggml_backend_t, const char *)
         return (void *) ggml_backend_vk_fusion_count_total;
     }
-    if (strcmp(name, "ggml_backend_fa_kv_ids") == 0) { // [TAG_QSA_INDEXED_FA] FLASH_ATTN_EXT reads src[5]
+    if (strcmp(name, "ggml_backend_fa_kv_ids") == 0) { // [TAG_QSA_INDEXED_FA] FLASH_ATTN_EXT reads src[GGML_FA_SRC_KV_IDS]
         return (void *) ggml_backend_vk_reg_get_proc_address;
     }
     if (strcmp(name, "ggml_backend_dev_mul_mat_plan") == 0) { // [TAG_MM_PLAN] int (*)(dev, type, m, n, k, const void **, const char **, uint32_t *)
@@ -27880,8 +27896,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                         ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 1) != 0, ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 2) != 0,
                         ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 3), ggml_get_op_params_i32(tensor, GGML_FA_VIS_PARAM + 4));
             }
-            if (src_clone[5]) {
-                ggml_flash_attn_ext_set_kv_ids(tensor_clone, src_clone[5]); // [TAG_QSA_INDEXED_FA]
+            if (src_clone[GGML_FA_SRC_KV_IDS]) {
+                ggml_flash_attn_ext_set_kv_ids(tensor_clone, src_clone[GGML_FA_SRC_KV_IDS]); // [TAG_QSA_INDEXED_FA]
             }
         } else if (tensor->op == GGML_OP_KQ_MASK) { // [TAG_KQ_VIS]
             tensor_clone = src_clone[2] // [TAG_QSA_VIS] ggml_kq_mask_ids

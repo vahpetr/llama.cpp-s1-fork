@@ -25,11 +25,12 @@ const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 // Replace V by +0 in KV columns that this Br tile's mask suppresses for every row.
-const bool ZERO_DEAD_V     = (Flags & 16) != 0;
+// Fork bits sit at 1<<16 and above (host FA_FLAG_* table, ggml-vulkan.cpp); 16 is upstream's USE_SPARSE.
+const bool ZERO_DEAD_V     = (Flags & (1u << 16)) != 0;
 // Derive ZERO_DEAD_V's dead-column predicate by re-reading Psh from shared memory (the
 // original implementation) instead of from the P values that are still in registers.
 // Same predicate either way; this is the A/B knob (GGML_VK_FA_DEADV_LDS).
-const bool DEADV_LDS       = (Flags & 32) != 0;
+const bool DEADV_LDS       = (Flags & (1u << 17)) != 0;
 // [TAG_FA_GQA_TOKENS] Fold the query tokens into the row dimension on top of the GQA head
 // fold: a Br tile holds rows of the (token, head) product space, decoded as
 // token = r / FA_GQA_ROWS, head = iq2 + r % FA_GQA_ROWS, instead of one token's gqa_ratio
@@ -59,15 +60,15 @@ const bool DEADV_LDS       = (Flags & 32) != 0;
 // Br = 16 dispatch already used for its 12-head tokens.  In general the padding a token wastes
 // here is the padding the unfolded dispatch wasted anyway, because both allot a whole coopmat
 // row tile per token.
-// Bit 64 is deliberately skipped: the prod-v7-fa line uses it for CM1_SF_PAD (the coopmat1
+// Bit 18 (was 64) is deliberately skipped: the prod-v7-fa line uses it for CM1_SF_PAD (the coopmat1
 // QK^T scratch stride pad, [TAG_FA_CM1_SF_PAD]).  The two series are independent and either
 // could land first, so they must not alias - a merge that gave one branch's dispatch the
 // other's shader meaning would pad sfshstride under a GQA_TOKENS dispatch (mismatching the
-// host-side shared-memory estimate) and mis-decode the rows.  Keep new FA flags above 64.
-const bool GQA_TOKENS      = (Flags & 128) != 0;
+// host-side shared-memory estimate) and mis-decode the rows.  Keep new fork FA flags at bit 16 and above.
+const bool GQA_TOKENS      = (Flags & (1u << 19)) != 0;
 // [TAG_QSA_INDEXED_FA] (M6) KV tile j column c is cell ids[tok][j * Bc + c] of the token's W = p.split_kv ids
 // (binding 6, int32, contiguous [W, ne2, 1, ne3]). Host-enforced: coopmat1, plain GQA fold, split_k 1, Clamp on.
-const bool INDEXED         = (Flags & 256) != 0;
+const bool INDEXED         = (Flags & (1u << 20)) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;

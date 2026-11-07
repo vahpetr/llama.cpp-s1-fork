@@ -9412,7 +9412,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * sinks = dst->src[4];
     const fa_vis_src    vis   = fa_get_vis(dst); // [TAG_KQ_VIS]
     // [TAG_QSA_INDEXED_FA] per-query KV cell list; the loop below walks it instead of [ic_start, ic_end)
-    const ggml_tensor * kv_ids = dst->src[5];
+    const ggml_tensor * kv_ids = dst->src[GGML_FA_SRC_KV_IDS];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -10060,7 +10060,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
-    const bool indexed = dst->src[5] != nullptr; // [TAG_QSA_INDEXED_FA] ids: the per-row reference loop, no KV split, no Q tiles
+    const bool indexed = dst->src[GGML_FA_SRC_KV_IDS] != nullptr; // [TAG_QSA_INDEXED_FA] ids: the per-row reference loop, no KV split, no Q tiles
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
     const bool use_split_kv_path = !indexed && !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;

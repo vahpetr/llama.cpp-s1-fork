@@ -2695,13 +2695,15 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    // [TAG_QSA_INDEXED_FA] fork-only: a per-query KV cell list as src[5]; NULL = dense (node unchanged).
+    // [TAG_QSA_INDEXED_FA] fork-only: a per-query KV cell list as src[GGML_FA_SRC_KV_IDS] (= 8; src[5] is upstream's
+    //   ggml_flash_attn_ext_rows kv_rows slot, #29510, and must stay NULL on an indexed node); NULL = dense (node unchanged).
     //   ids: [W, n_batch, 1, ne3] I32, contiguous, W <= n_kv; row (t, s) names the cells query t of stream s attends,
     //   unique within the row, each in [0, n_kv). K, V and the mask are read at those cells (mask[t, ids[c, t, 0, s]]);
     //   a cell whose mask is -inf is dead. Backends not exporting "ggml_backend_fa_kv_ids" refuse the node.
     //   [TAG_QSA_VIS] an id outside [0, n_kv) (e.g. -1) is a dead column too: never read, never counted - the way a
     //   caller masks a repeated id (the [TAG_QSA_WHOLE_BLOCKS] padding). With ggml_flash_attn_ext_set_vis the mask of
     //   column c is the metadata's value at cell ids[c, t, 0, s].
+#define GGML_FA_SRC_KV_IDS 8
     GGML_API void ggml_flash_attn_ext_set_kv_ids(
             struct ggml_tensor * a,
             struct ggml_tensor * ids);

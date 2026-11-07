@@ -9,7 +9,7 @@
 //                   cell, the cache's type, e.g. q8_0), written once per layer; meta.k = type/ne/nb of the view
 //   v.bin      raw  the same for src[2]
 //   ids.bin    i32  [width, n_tps]: indexer_top_k-<il>, chunks concatenated
-//   kv_ids.bin i32  [width, n_tps]: src[5] of the indexed flash attention, when the fill ran indexed (else absent)
+//   kv_ids.bin i32  [width, n_tps]: src[GGML_FA_SRC_KV_IDS] (8) of the indexed flash attention, when the fill ran indexed (else absent)
 //   cells.bin  i32  [n_kv]: the attention cache's position per cell, -1 = empty
 //   toks.bin   i32  [n_tps]: the probe ubatch's token positions
 //   mask.fnv   text "<t0> <nc> <fnv1a-64 hex>" per chunk: FNV-1a of src[3] (the f16 mask flash attention read)
@@ -265,7 +265,7 @@ struct capture {
         }
         layer_state & s = st[il];
         if (t->op == GGML_OP_FLASH_ATTN_EXT) {
-            const ggml_tensor * q = t->src[0], * k = t->src[1], * v = t->src[2], * m = t->src[3], * ids = t->src[5];
+            const ggml_tensor * q = t->src[0], * k = t->src[1], * v = t->src[2], * m = t->src[3], * ids = t->src[GGML_FA_SRC_KV_IDS];
             if (q->type != GGML_TYPE_F32 || q->ne[3] != 1 || k->ne[3] != 1) {
                 throw std::runtime_error("capture: unexpected flash attention shape at il " + std::to_string(il));
             }
