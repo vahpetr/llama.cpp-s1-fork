@@ -6651,6 +6651,32 @@ static void test_template_generation_prompt() {
     }
 
     {
+        // any template: an empty continued assistant renders exactly the fresh-turn prompt; an empty final
+        // message of another role keeps the continuation rendering (messages[:-1], no generation prompt)
+        auto tmpls = read_templates("models/templates/meta-llama-Llama-3.3-70B-Instruct.jinja");
+        auto render = [&](const std::vector<common_chat_msg> & msgs, bool add_gen, common_chat_continuation cont) {
+            common_chat_templates_inputs inputs;
+            inputs.messages               = msgs;
+            inputs.add_generation_prompt  = add_gen;
+            inputs.continue_final_message = cont;
+            return common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        };
+        const std::vector<common_chat_msg> history = { system_msg, message_user };
+        const std::string fresh = render(history, true, COMMON_CHAT_CONTINUATION_NONE);
+        for (auto cont : { COMMON_CHAT_CONTINUATION_AUTO, COMMON_CHAT_CONTINUATION_CONTENT, COMMON_CHAT_CONTINUATION_REASONING }) {
+            auto msgs = history;
+            msgs.push_back(simple_assist_msg(""));
+            assert_equals(fresh, render(msgs, false, cont));
+
+            common_chat_msg empty_user;
+            empty_user.role = "user";
+            auto msgs_user  = history;
+            msgs_user.push_back(empty_user);
+            assert_equals(render(history, false, COMMON_CHAT_CONTINUATION_NONE), render(msgs_user, false, cont));
+        }
+    }
+
+    {
         auto tmpls = read_templates("models/templates/openai-gpt-oss-120b.jinja");
         check(tmpls, basic(),                  "<|start|>assistant");
         check(tmpls, continuation_content(),   "<|start|>assistant<|channel|>analysis<|message|>I'm thinking<|end|><|start|>assistant<|channel|>final<|message|>Hello, ");

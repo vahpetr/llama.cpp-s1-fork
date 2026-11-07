@@ -202,6 +202,30 @@ def test_chat_template_continue_final_message_vllm_compat():
     assert res.body["__verbose"]["prompt"].endswith("<|start_header_id|>user<|end_header_id|>\n\nWhat is the best book<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nWhill")
 
 
+@pytest.mark.parametrize("continue_final_message", [None, True, "content", "reasoning_content"])
+def test_chat_template_empty_assistant_prefill_is_fresh_turn(continue_final_message):
+    """An empty trailing assistant (a reply cut before its first token) has nothing to continue: with the
+    prefill_assistant heuristic (no flag) and with every continue_final_message mode the prompt is the
+    fresh-turn prompt, generation prompt included."""
+    global server
+    server.jinja = True
+    server.chat_template_file = "../../../models/templates/meta-llama-Llama-3.1-8B-Instruct.jinja"
+    server.start()
+    history = [
+        {"role": "system", "content": "Book"},
+        {"role": "user", "content": "What is the best book"},
+    ]
+    fresh = server.make_request("POST", "/apply-template", data={"messages": history})
+    data = {"messages": history + [{"role": "assistant", "content": ""}]}
+    if continue_final_message is not None:
+        data["continue_final_message"] = continue_final_message
+        data["add_generation_prompt"] = False
+    res = server.make_request("POST", "/apply-template", data=data)
+    assert fresh.status_code == 200 and res.status_code == 200
+    assert fresh.body["prompt"].endswith("<|start_header_id|>assistant<|end_header_id|>\n\n")
+    assert res.body["prompt"] == fresh.body["prompt"]
+
+
 def test_chat_template_continue_final_message_mutual_exclusion():
     """add_generation_prompt and continue_final_message both set to true must be rejected"""
     global server
