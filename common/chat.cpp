@@ -3653,6 +3653,14 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
             params.messages.erase(params.messages.size() - 1);
         }
 
+        if (params.continue_msg.empty()) {
+            // an empty final message (a reply cut before its first token) has nothing to continue:
+            // generate a fresh turn, otherwise the prompt ends without the generation prompt that the
+            // output parser expects (the model then writes the assistant header itself)
+            params.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+            params.add_generation_prompt  = true;
+        }
+
         if (params.continue_final_message == COMMON_CHAT_CONTINUATION_AUTO && !inputs.messages.empty()) {
             // Resolve based on message content
             params.continue_final_message = COMMON_CHAT_CONTINUATION_CONTENT;

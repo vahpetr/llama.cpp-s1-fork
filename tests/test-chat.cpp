@@ -6553,6 +6553,16 @@ static void test_template_generation_prompt() {
         return opts;
     };
 
+    // a reply cut before its first token (an empty final assistant after a tool result), continued:
+    // nothing to continue, the turn is generated fresh - the prompt ends with the generation prompt
+    auto continuation_empty = [&](common_chat_continuation cont) {
+        test_case_options opts;
+        opts.messages               = { system_msg, message_user, tool_call_msg, tool_msg, simple_assist_msg("") };
+        opts.add_generation_prompt  = false;
+        opts.continue_final_message = cont;
+        return opts;
+    };
+
     auto check = [&](const common_chat_templates_ptr & tmpls,
                      const test_case_options & opts,
                      const std::string & expected_generation_prompt) {
@@ -6626,6 +6636,17 @@ static void test_template_generation_prompt() {
         test_case_options opts = continuation_content();
         opts.messages.back()   = simple_assist_msg("Hello, ", "I'm thinking\n\n");
         check(tmpls, opts, "<|im_start|>assistant\n<think>\nI'm thinking\n\n</think>\n\nHello, ");
+
+        for (auto cont : { COMMON_CHAT_CONTINUATION_AUTO, COMMON_CHAT_CONTINUATION_CONTENT, COMMON_CHAT_CONTINUATION_REASONING }) {
+            check(tmpls, continuation_empty(cont), "<|im_start|>assistant\n<think>\n");
+            common_chat_templates_inputs inputs;
+            inputs.messages               = continuation_empty(cont).messages;
+            inputs.add_generation_prompt  = false;
+            inputs.continue_final_message = cont;
+            inputs.enable_thinking        = true;
+            assert_ends_with(common_chat_templates_apply(tmpls.get(), inputs).prompt,
+                             "Sunny\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n");
+        }
       }
     }
 
