@@ -11759,13 +11759,33 @@ static void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, siz
     ggml_vk_queue_command_pools_cleanup(dst->device);
 }
 
-static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, bool disable_split_k, const vk_pipeline& pipeline) {
-    VK_LOG_DEBUG("ggml_vk_guess_split_k(" << m << ", " << n << ", " << k << ", " << disable_split_k << ")");
+// [TAG_SPLIT_K_POLICY] GGML_VK_SPLIT_K_POLICY selects the split-K count of a regular MUL_MAT (the K summation order):
+//   fork (default) = the selection of this tree up to v77 (b10664 + fork), bit-for-bit: split only when m and n fill one
+//                    tile each, k >= 2048, <= 1/2 or <= 2/3 of the CUs busy;
+//   upstream       = upstream's selection at U* 80d2c0c2c: #28457 (6788edb4f, no m >= tile gate), #30146 (07ec7c8af, RDNA3/4
+//                    small n <= 32 aims for 8 workgroups per CU, n <= 64 partial tile column), #30280 (da3416d80, RDNA3/4
+//                    two-wave split 3).
+// The upstream body is kept verbatim so the v78 merge resolves this function to "ours" and the three upstream commits land
+// behind the knob (EXACT by construction; a NEAR lever once enabled). Read once per process.
+enum vk_split_k_policy { VK_SPLIT_K_POLICY_FORK = 0, VK_SPLIT_K_POLICY_UPSTREAM = 1 };
 
-    if (disable_split_k) {
-        return 1;
-    }
+static vk_split_k_policy ggml_vk_split_k_policy() {
+    static const vk_split_k_policy policy = [] {
+        const char * e = getenv("GGML_VK_SPLIT_K_POLICY");
+        if (e == nullptr || *e == '\0' || strcmp(e, "fork") == 0) {
+            return VK_SPLIT_K_POLICY_FORK;
+        }
+        if (strcmp(e, "upstream") == 0) {
+            GGML_LOG_INFO("ggml_vulkan: GGML_VK_SPLIT_K_POLICY=upstream (split-K selection of U* 80d2c0c2c)\n");
+            return VK_SPLIT_K_POLICY_UPSTREAM;
+        }
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_SPLIT_K_POLICY=%s unknown (fork|upstream), using fork\n", e);
+        return VK_SPLIT_K_POLICY_FORK;
+    }();
+    return policy;
+}
 
+static uint32_t ggml_vk_guess_split_k_fork(ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, const vk_pipeline& pipeline) {
     uint32_t split_k = 1;
     if (ctx->device->shader_core_count != 0 && m >= pipeline->wg_denoms[0] && n >= pipeline->wg_denoms[1]) {
         // If k is 'large' and the SMs will fill less than halfway, use split_k.
@@ -11799,6 +11819,69 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     }
 
     return split_k;
+}
+
+// upstream ggml_vk_guess_split_k at U* 80d2c0c2c, verbatim below the disable_split_k early return
+static uint32_t ggml_vk_guess_split_k_upstream(ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, const vk_pipeline& pipeline) {
+    const bool rdna = ctx->device->architecture == AMD_RDNA3 || ctx->device->architecture == AMD_RDNA4;
+    uint32_t split_k = 1;
+    if (rdna && ctx->device->shader_core_count != 0 && k >= 2048 && n <= 32) {
+        // Small n gives too few workgroups to hide latency, aim for 8 per CU. Small tiles are one subgroup each.
+        const uint32_t tiles = CEIL_DIV(m, pipeline->wg_denoms[0]) * CEIL_DIV(n, pipeline->wg_denoms[1]);
+        if (tiles < 4 * ctx->device->shader_core_count) {
+            split_k = std::min(8u, CEIL_DIV(8 * ctx->device->shader_core_count, tiles));
+        }
+    }
+
+    // On RDNA, also split when n <= 64 only partly fills one tile column.
+    if (split_k == 1 && ctx->device->shader_core_count != 0 && (n >= pipeline->wg_denoms[1] || (rdna && n <= 64))) {
+        // If k is 'large' and the SMs will fill less than halfway, use split_k.
+        uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
+        uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
+
+        if (k >= 2048) {
+            if (m_tiles * n_tiles <= ctx->device->shader_core_count / 2) {
+                split_k = ctx->device->shader_core_count / (m_tiles * n_tiles);
+            } else if (m_tiles * n_tiles <= ctx->device->shader_core_count * 2 / 3) {
+                split_k = 3;
+            } else if ((ctx->device->architecture == AMD_RDNA3 || ctx->device->architecture == AMD_RDNA4) &&
+                       m_tiles * n_tiles > ctx->device->shader_core_count &&
+                       m_tiles * n_tiles <= ctx->device->shader_core_count * 4 / 3) {
+                // two waves, the second one at most 1/3 full
+                split_k = 3;
+            }
+            // Cap the split at 8x. Unless k is huge this is a lot of overhead.
+            split_k = std::min(split_k, 8u);
+        }
+    }
+
+    // ggml_vk_matmul will align the splits to be a multiple of 256.
+    // If this rounded up size would cause the last split to be empty,
+    // then reduce the split count.
+    while (true) {
+        if (split_k == 1) {
+            break;
+        }
+        uint32_t k_split = CEIL_DIV(k, split_k);
+        k_split = ROUNDUP_POW2(k_split, 256);
+        if (k_split * (split_k - 1) < k) {
+            break;
+        }
+        split_k--;
+    }
+
+    return split_k;
+}
+
+static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, bool disable_split_k, const vk_pipeline& pipeline) {
+    VK_LOG_DEBUG("ggml_vk_guess_split_k(" << m << ", " << n << ", " << k << ", " << disable_split_k << ")");
+
+    if (disable_split_k) {
+        return 1;
+    }
+
+    return ggml_vk_split_k_policy() == VK_SPLIT_K_POLICY_UPSTREAM ? ggml_vk_guess_split_k_upstream(ctx, m, n, k, pipeline)
+                                                                  : ggml_vk_guess_split_k_fork(ctx, m, n, k, pipeline);
 }
 
 static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
