@@ -1214,11 +1214,15 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		modelOverride?: string | null,
 		firstUserMessageContent?: string,
 		/**
-		 * W1: continue this partial reply (it is `assistantMessage` and the last of `allMessages`) as
-		 * the first turn of the agentic flow; the caller routes here only when the flow runs (tools)
+		 * W1: re-run an interrupted reply (`resume.message` = `assistantMessage`) with the request
+		 * settings it was produced with (its requestOptions snapshot). `continue`: the reply is the
+		 * last of `allMessages` and is continued as the first turn of the agentic flow; otherwise its
+		 * turn is generated fresh. The caller routes here only when the flow runs (tools).
 		 */
-		continueFrom?: DatabaseMessage
+		resume?: { continue: boolean; message: DatabaseMessage }
 	): Promise<void> {
+		const continueFrom = resume?.continue ? resume.message : undefined;
+
 		// the ::model suffix in the stream identity is only for router mode, where it routes to the
 		// owning child. in single-model mode the identity stays the bare conv id so that attach, stop
 		// and reattach all agree, regardless of fresh send vs regenerate passing a resolved model
@@ -1237,9 +1241,9 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		// the request options of this turn, snapshotted on its replies: their continuations reuse
 		// the template options + sampling verbatim (a level change since does not touch them) -
-		// a continued reply (continueFrom) runs with the snapshot of the request that produced it
-		const turnApiOptions = continueFrom
-			? applyRequestSnapshot(this.getApiOptions(), continueFrom.requestOptions)
+		// a resumed reply (continued or restarted) runs with the snapshot of the request that produced it
+		const turnApiOptions = resume
+			? applyRequestSnapshot(this.getApiOptions(), resume.message.requestOptions)
 			: this.getApiOptions();
 		const requestSnapshot = snapshotRequestOptions({
 			...turnApiOptions,
@@ -1394,7 +1398,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				content: string,
 				reasoningContent: string | undefined,
 				timings: ChatMessageTimings | undefined,
-				toolCalls: import('$lib/types/api').ApiChatCompletionToolCall[] | undefined
+				toolCalls: import('$lib/types/api').ApiChatCompletionToolCall[] | undefined,
+				echoMismatch?: boolean
 			) => {
 				const updateData: Record<string, unknown> = {
 					content,
@@ -1405,6 +1410,9 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				};
 
 				if (resolvedModel && !modelPersisted) updateData.model = resolvedModel;
+
+				// a continued turn carries the echo check like the plain Continue (only it passes one)
+				if (echoMismatch !== undefined) updateData.echoMismatch = echoMismatch || undefined;
 
 				await DatabaseService.updateMessage(currentMessageId, updateData);
 				const idx = conversationsStore.findMessageIndex(currentMessageId);
@@ -1418,6 +1426,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				if (timings) uiUpdate.timings = timings;
 
 				if (resolvedModel) uiUpdate.model = resolvedModel;
+
+				if (echoMismatch !== undefined) uiUpdate.echoMismatch = echoMismatch || undefined;
 
 				// touch the active ui array and node pointer only when this conversation
 				// is displayed; otherwise persist the node move straight to the db so a
@@ -1583,7 +1593,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				// W1.2 rules 2 / 3 on the flow's final reply
 				const lastTurn = agenticStore.takeLastTurn(convId);
 
-				if (lastTurn) {
+				// a manual Continue (resume) keeps the plain Continue's semantics: no auto-continuation
+				if (lastTurn && !resume) {
 					await this.afterReply(convId, currentMessageId, {
 						byReserve: lastTurn.byReserve,
 						finish: lastTurn.finish,
@@ -1608,9 +1619,14 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			}
 		}
 
-		// a continuation runs only inside the agentic flow: never send a fresh reply over the partial
-		if (continueFrom) {
+		// a resumed reply runs only inside the agentic flow: never send a fresh reply over it here
+		// (the caller routes here only when the flow runs, so this is not expected)
+		if (resume) {
 			cleanupStreamingState();
+			this.showErrorDialog({
+				message: 'Continue needs the agentic flow (tools), which did not start.',
+				type: ErrorDialogType.SERVER
+			});
 
 			return;
 		}

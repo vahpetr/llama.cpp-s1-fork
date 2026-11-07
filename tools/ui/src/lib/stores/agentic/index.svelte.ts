@@ -636,9 +636,13 @@ class AgenticStore {
 			// what the turn persists: a continued turn streams the partial back first (the prefill
 			// echo), joined echo-aware like the manual Continue; an incomplete one keeps the partial
 			// (called once the stream has ended: settled once, the persisted completeness decides)
-			let settled: { complete: boolean; content: string; reasoning?: string } | undefined;
+			let settled:
+				| { complete: boolean; content: string; mismatch?: boolean; reasoning?: string }
+				| undefined;
 
-			const turnParts = (complete: boolean): { content: string; reasoning?: string } => {
+			const turnParts = (
+				complete: boolean
+			): { content: string; mismatch?: boolean; reasoning?: string } => {
 				if (!continuation) {
 					return { content: turnContent, reasoning: turnReasoningContent || undefined };
 				}
@@ -651,7 +655,12 @@ class AgenticStore {
 						continuation.messageId
 					);
 
-					settled = { complete, content: joined.content, reasoning: joined.reasoning || undefined };
+					settled = {
+						complete,
+						content: joined.content,
+						mismatch: joined.mismatch,
+						reasoning: joined.reasoning || undefined
+					};
 				}
 
 				return settled;
@@ -768,7 +777,8 @@ class AgenticStore {
 						turnParts(false).content,
 						turnParts(false).reasoning,
 						this.buildFinalTimings(capturedTimings, agenticTimings),
-						undefined
+						undefined,
+						turnParts(false).mismatch
 					);
 					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
 
@@ -782,7 +792,8 @@ class AgenticStore {
 					turnParts(false).content,
 					turnParts(false).reasoning,
 					this.buildFinalTimings(capturedTimings, agenticTimings),
-					undefined
+					undefined,
+					turnParts(false).mismatch
 				);
 				onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
 
@@ -798,7 +809,8 @@ class AgenticStore {
 					turnParts(false).content,
 					turnParts(false).reasoning,
 					this.buildFinalTimings(capturedTimings, agenticTimings),
-					undefined
+					undefined,
+					turnParts(false).mismatch
 				);
 				onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
 
@@ -813,7 +825,8 @@ class AgenticStore {
 					turnParts(true).content,
 					turnParts(true).reasoning,
 					this.buildFinalTimings(capturedTimings, agenticTimings),
-					turnToolCalls.length > 0 ? this.normalizeToolCalls(turnToolCalls) : undefined
+					turnToolCalls.length > 0 ? this.normalizeToolCalls(turnToolCalls) : undefined,
+					turnParts(true).mismatch
 				);
 				onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
 
@@ -845,7 +858,8 @@ class AgenticStore {
 					turnParts(true).content,
 					turnParts(true).reasoning,
 					finalTimings,
-					undefined
+					undefined,
+					turnParts(true).mismatch
 				);
 
 				if (finalTimings) onTurnComplete?.(finalTimings);
@@ -863,7 +877,8 @@ class AgenticStore {
 					turnParts(true).content,
 					turnParts(true).reasoning,
 					this.buildFinalTimings(capturedTimings, agenticTimings),
-					undefined
+					undefined,
+					turnParts(true).mismatch
 				);
 				onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
 
@@ -878,7 +893,8 @@ class AgenticStore {
 				turnParts(true).content,
 				turnParts(true).reasoning,
 				turnTimings,
-				normalizedCalls
+				normalizedCalls,
+				turnParts(true).mismatch
 			);
 
 			// Add assistant message to session history (a continued turn replaces its partial)

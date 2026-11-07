@@ -43,6 +43,7 @@ Llama UI supports two server operation modes:
 
 - **Branching** - Branch messages conversations at any point by editing messages or regenerating responses, navigate between branches
 - **Regeneration** - Regenerate responses with optional model switching (ROUTER mode)
+- **Continue** - Resume a cut reply. When the conversation can use tools (its tool list is not empty), Continue runs through the agentic flow: the partial reply is continued with the request settings it was produced with, tool calls it asks for run and the flow goes on; a reply cut before its first token is generated fresh in the same message. No automatic continuation follows a manual Continue. A conversation without tools continues the plain reply.
 - **Import/Export** - JSON format for backup and sharing
 - **Search** - Find conversations by title or content
 

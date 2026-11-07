@@ -74,13 +74,13 @@ function chain(partial: Partial<DatabaseMessage>): DatabaseMessage[] {
 	];
 }
 
-function setConversation(messages: DatabaseMessage[]) {
+function setConversation(messages: DatabaseMessage[], tools: unknown[] = TOOLS) {
 	const conv = {
 		currNode: messages[messages.length - 1].id,
 		id: 'conv-cut',
 		lastModified: 0,
 		name: 'cut',
-		toolsSnapshot: JSON.stringify(TOOLS)
+		toolsSnapshot: JSON.stringify(tools)
 	} as DatabaseConversation;
 
 	conversationsStore.activeConversation = conv;
@@ -110,11 +110,25 @@ describe('W1: Continue after a cut, routing', () => {
 
 		expect(send).not.toHaveBeenCalled();
 		expect(stream).toHaveBeenCalledTimes(1);
-		const [path, target, , , , , continueFrom] = stream.mock.calls[0];
+		const [path, target, , , , , resume] = stream.mock.calls[0];
 
 		expect(path.map((m) => m.id)).toEqual(['u1', 'a1', 't1']);
 		expect(target.id).toBe('a2');
-		expect(continueFrom).toBeUndefined();
+		expect(resume).toEqual({ continue: false, message: expect.objectContaining({ id: 'a2' }) });
+	});
+
+	it('a whitespace-only partial is continued, not regenerated (literal emptiness)', async () => {
+		const messages = chain({ content: '\n' });
+
+		setConversation(messages);
+		const stream = vi.spyOn(chatStore, 'streamChatCompletion').mockResolvedValue();
+
+		await chatStore.continueAssistantMessage('a2');
+
+		const [path, , , , , , resume] = stream.mock.calls[0];
+
+		expect(path.map((m) => m.id)).toEqual(['u1', 'a1', 't1', 'a2']);
+		expect(resume?.continue).toBe(true);
 	});
 
 	it('a partial reply continues as the first turn of the agentic flow', async () => {
@@ -126,18 +140,19 @@ describe('W1: Continue after a cut, routing', () => {
 		await chatStore.continueAssistantMessage('a2');
 
 		expect(stream).toHaveBeenCalledTimes(1);
-		const [path, target, , , , , continueFrom] = stream.mock.calls[0];
+		const [path, target, , , , , resume] = stream.mock.calls[0];
 
 		expect(path.map((m) => m.id)).toEqual(['u1', 'a1', 't1', 'a2']);
 		expect(target.id).toBe('a2');
-		expect(continueFrom?.id).toBe('a2');
+		expect(resume).toEqual({ continue: true, message: expect.objectContaining({ id: 'a2' }) });
 	});
 
-	it('without tools the plain continuation stays', async () => {
+	it('a conversation whose frozen tool list is empty keeps the plain continuation', async () => {
 		const messages = chain({ reasoningContent: 'Correct links:\n' });
 
-		setConversation(messages);
-		vi.spyOn(agenticStore, 'getConfig').mockReturnValue({ enabled: false, maxTurns: 5 } as never);
+		// the first request fixes the list, also an empty one (every tool disabled at that send)
+		setConversation(messages, []);
+		vi.mocked(agenticStore.getConfig).mockRestore();
 		const stream = vi.spyOn(chatStore, 'streamChatCompletion').mockResolvedValue();
 		const send = vi.spyOn(ChatService, 'sendMessage').mockResolvedValue(undefined as never);
 
@@ -234,7 +249,10 @@ describe('W1: a continued first turn runs the tool call it asks for', () => {
 			undefined,
 			undefined,
 			undefined,
-			partial
+			{
+				continue: true,
+				message: partial
+			}
 		);
 		await new Promise((r) => setTimeout(r, 0));
 
@@ -263,4 +281,160 @@ describe('W1: a continued first turn runs the tool call it asks for', () => {
 		expect(created.map((m) => m.role)).toEqual([MessageRole.TOOL, MessageRole.ASSISTANT]);
 		expect(created[1].content).toBe('done');
 	}, 60000);
+});
+
+describe('W1: a resumed reply keeps its request settings and the echo check', () => {
+	function captureFlow() {
+		const updates: Record<string, unknown>[] = [];
+
+		vi.spyOn(DatabaseService, 'updateMessage').mockImplementation(async (_id, u) => {
+			updates.push(u as Record<string, unknown>);
+		});
+		vi.spyOn(DatabaseService, 'updateCurrentNode').mockImplementation(async () => {});
+
+		const sent: Record<string, unknown>[] = [];
+
+		vi.spyOn(ChatService, 'sendMessage').mockImplementation(async (_m, options) => {
+			sent.push(options as Record<string, unknown>);
+			// the stream ends inside the echo of the partial: nothing was appended
+			options?.onReasoningChunk?.('Correct links: the partial');
+		});
+		vi.spyOn(agenticStore, 'runAgenticFlow').mockImplementation(async (params) => {
+			await (
+				agenticStore as unknown as { executeAgenticLoop: (p: unknown) => Promise<void> }
+			).executeAgenticLoop({
+				agenticConfig: { enabled: true, maxTurns: 5 },
+				callbacks: params.callbacks,
+				continuation: params.continuation,
+				conversationId: params.conversationId,
+				messages: await ChatService.normalizeMessagesForApi(params.messages),
+				options: params.options ?? {},
+				signal: params.signal,
+				tools: TOOLS
+			});
+
+			return { handled: true };
+		});
+
+		return { sent, updates };
+	}
+
+	it('a restarted empty reply runs with its saved requestOptions, not the current settings', async () => {
+		const messages = chain({
+			content: '',
+			requestOptions: { reasoningEffortNative: 'low', sampling: { temperature: 0.123 } }
+		});
+
+		setConversation(messages);
+		vi.spyOn(chatStore, 'getApiOptions').mockReturnValue({
+			reasoningEffortNative: 'high',
+			temperature: 0.9
+		});
+		const { sent } = captureFlow();
+
+		await chatStore.streamChatCompletion(
+			messages.slice(0, 3),
+			messages[3],
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{ continue: false, message: messages[3] }
+		);
+
+		expect(sent).toHaveLength(1);
+		expect(sent[0].temperature).toBe(0.123);
+		expect(sent[0].reasoningEffortNative).toBe('low');
+		expect(sent[0].continueFinalMessage).toBeUndefined();
+	}, 60000);
+
+	it('a stream that ended inside the echo is persisted as echoMismatch, the partial kept', async () => {
+		const messages = chain({ reasoningContent: 'Correct links: the partial reasoning so far\n' });
+
+		setConversation(messages);
+		const { sent, updates } = captureFlow();
+
+		await chatStore.streamChatCompletion(
+			messages,
+			messages[3],
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{ continue: true, message: messages[3] }
+		);
+
+		expect(sent[0].continueFinalMessage).toBe(true);
+		const final = updates.find((u) => 'reasoningContent' in u);
+
+		expect(final?.echoMismatch).toBe(true);
+		expect(final?.reasoningContent).toBe('Correct links: the partial reasoning so far\n');
+	}, 60000);
+});
+
+describe('W1: a manual Continue keeps the plain Continue semantics', () => {
+	function runFlow(lastTurn: Record<string, unknown>) {
+		vi.spyOn(DatabaseService, 'updateMessage').mockImplementation(async () => {});
+		vi.spyOn(DatabaseService, 'updateCurrentNode').mockImplementation(async () => {});
+		vi.spyOn(agenticStore, 'runAgenticFlow').mockResolvedValue({ handled: true });
+		vi.spyOn(agenticStore, 'takeLastTurn').mockReturnValue(lastTurn as never);
+
+		return vi
+			.spyOn(chatStore as unknown as { afterReply: () => Promise<void> }, 'afterReply')
+			.mockResolvedValue();
+	}
+
+	it('no auto-continuation (afterReply) after a resumed reply', async () => {
+		const messages = chain({ reasoningContent: 'Correct links:\n' });
+
+		setConversation(messages);
+		const afterReply = runFlow({ finish: 'length', stopType: 'limit' });
+		const take = vi.mocked(agenticStore.takeLastTurn);
+
+		await chatStore.streamChatCompletion(
+			messages,
+			messages[3],
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{ continue: true, message: messages[3] }
+		);
+
+		expect(take).toHaveBeenCalledTimes(1);
+		expect(afterReply).not.toHaveBeenCalled();
+	});
+
+	it('a normal flow still runs afterReply', async () => {
+		const messages = chain({ content: '' });
+
+		setConversation(messages);
+		const afterReply = runFlow({ finish: 'length', stopType: 'limit' });
+
+		await chatStore.streamChatCompletion(messages.slice(0, 3), messages[3]);
+
+		expect(afterReply).toHaveBeenCalledTimes(1);
+	});
+
+	it('a resume the agentic flow did not handle surfaces an error and sends nothing', async () => {
+		const messages = chain({ reasoningContent: 'Correct links:\n' });
+
+		setConversation(messages);
+		vi.spyOn(agenticStore, 'runAgenticFlow').mockResolvedValue({ handled: false });
+		const send = vi.spyOn(ChatService, 'sendMessage');
+		const dialog = vi.spyOn(chatStore, 'showErrorDialog');
+
+		await chatStore.streamChatCompletion(
+			messages,
+			messages[3],
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{ continue: true, message: messages[3] }
+		);
+
+		expect(send).not.toHaveBeenCalled();
+		expect(dialog).toHaveBeenCalledWith(expect.objectContaining({ message: expect.any(String) }));
+	});
 });

@@ -73,7 +73,7 @@ export interface ChatFlowsHost {
 		onError?: (error: Error) => void,
 		modelOverride?: string | null,
 		firstUserMessageContent?: string,
-		continueFrom?: DatabaseMessage
+		resume?: { continue: boolean; message: DatabaseMessage }
 	): Promise<void>;
 }
 
@@ -124,11 +124,13 @@ export class ChatMessageFlows {
 			// W1 (Continue after a cut): with the conversation's tools on, the continuation runs as the
 			// first turn of an agentic flow, so a tool call it asks for is executed (the plain path
 			// below keeps only text); a reply cut before its first token has nothing to continue -
-			// its turn is generated fresh into the same message
+			// its turn is generated fresh into the same message (literally empty, as the server's
+			// common_chat_msg::empty(): generated whitespace is continued, not dropped); both run with
+			// the request settings the reply was produced with
 			const flowTools = parseToolsSnapshot(
 				(await DatabaseService.getConversation(msg.convId))?.toolsSnapshot
 			);
-			const isEmpty = !dbMessage.content?.trim() && !dbMessage.reasoningContent?.trim();
+			const isEmpty = !dbMessage.content && !dbMessage.reasoningContent;
 
 			if (
 				agenticStore.getConfig(settingsStore.config).enabled &&
@@ -149,7 +151,7 @@ export class ChatMessageFlows {
 					undefined,
 					undefined,
 					undefined,
-					isEmpty ? undefined : dbMessage
+					{ continue: !isEmpty, message: dbMessage }
 				);
 
 				return;

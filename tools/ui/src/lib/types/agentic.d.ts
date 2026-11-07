@@ -118,7 +118,9 @@ export interface AgenticFlowCallbacks {
 		content: string,
 		reasoningContent: string | undefined,
 		timings: ChatMessageTimings | undefined,
-		toolCalls: ApiChatCompletionToolCall[] | undefined
+		toolCalls: ApiChatCompletionToolCall[] | undefined,
+		/** a continued turn: its echo did not match the partial (or the stream ended inside it) */
+		echoMismatch?: boolean
 	) => Promise<void>;
 	/** Create a tool result message in the DB tree */
 	createToolResultMessage?: (
