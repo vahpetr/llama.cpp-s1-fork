@@ -1212,7 +1212,12 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		onComplete?: (content: string) => Promise<void>,
 		onError?: (error: Error) => void,
 		modelOverride?: string | null,
-		firstUserMessageContent?: string
+		firstUserMessageContent?: string,
+		/**
+		 * W1: continue this partial reply (it is `assistantMessage` and the last of `allMessages`) as
+		 * the first turn of the agentic flow; the caller routes here only when the flow runs (tools)
+		 */
+		continueFrom?: DatabaseMessage
 	): Promise<void> {
 		// the ::model suffix in the stream identity is only for router mode, where it routes to the
 		// owning child. in single-model mode the identity stays the bare conv id so that attach, stop
@@ -1231,8 +1236,11 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		}
 
 		// the request options of this turn, snapshotted on its replies: their continuations reuse
-		// the template options + sampling verbatim (a level change since does not touch them)
-		const turnApiOptions = this.getApiOptions();
+		// the template options + sampling verbatim (a level change since does not touch them) -
+		// a continued reply (continueFrom) runs with the snapshot of the request that produced it
+		const turnApiOptions = continueFrom
+			? applyRequestSnapshot(this.getApiOptions(), continueFrom.requestOptions)
+			: this.getApiOptions();
 		const requestSnapshot = snapshotRequestOptions({
 			...turnApiOptions,
 			...(effectiveModel ? { model: effectiveModel } : {})
@@ -1291,11 +1299,18 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				completionIdRecorded = false;
 			});
 		};
+		// a continued reply shows the partial while the server streams it back (the prefill echo)
+		const shown = (partial: string | undefined, streamed: string) =>
+			continueFrom && currentMessageId === continueFrom.id
+				? liveContinuation(partial ?? '', streamed)
+				: streamed;
 		const updateStreamingUI = () => {
-			this.setChatStreaming(convId, streamedContent, currentMessageId, effectiveModel);
+			const content = shown(continueFrom?.content, streamedContent);
+
+			this.setChatStreaming(convId, content, currentMessageId, effectiveModel);
 			const idx = conversationsStore.findMessageIndex(currentMessageId);
 
-			conversationsStore.updateMessageAtIndex(idx, { content: streamedContent });
+			conversationsStore.updateMessageAtIndex(idx, { content });
 		};
 		const cleanupStreamingState = () => {
 			this.setChatLoading(convId, false);
@@ -1476,11 +1491,16 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			onReasoningChunk: (chunk: string) => {
 				streamedReasoningContent += chunk;
 				// mark streaming state so a stop mid-thinking can persist the partial reasoning
-				this.setChatStreaming(convId, streamedContent, currentMessageId, effectiveModel);
+				this.setChatStreaming(
+					convId,
+					shown(continueFrom?.content, streamedContent),
+					currentMessageId,
+					effectiveModel
+				);
 				const idx = conversationsStore.findMessageIndex(currentMessageId);
 
 				conversationsStore.updateMessageAtIndex(idx, {
-					reasoningContent: streamedReasoningContent
+					reasoningContent: shown(continueFrom?.reasoningContent, streamedReasoningContent)
 				});
 				this.setChatReasoning(convId, true);
 			},
@@ -1538,6 +1558,15 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		{
 			const agenticResult = await agenticStore.runAgenticFlow({
 				callbacks: streamCallbacks,
+				...(continueFrom
+					? {
+							continuation: {
+								content: continueFrom.content ?? '',
+								messageId: continueFrom.id,
+								reasoning: continueFrom.reasoningContent ?? ''
+							}
+						}
+					: {}),
 				conversationId: convId,
 				flowRootMessageId: assistantMessage.id,
 				messages: allMessages,
@@ -1577,6 +1606,13 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 				return;
 			}
+		}
+
+		// a continuation runs only inside the agentic flow: never send a fresh reply over the partial
+		if (continueFrom) {
+			cleanupStreamingState();
+
+			return;
 		}
 
 		await ChatService.sendMessage(

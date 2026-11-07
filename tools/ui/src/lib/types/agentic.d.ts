@@ -175,8 +175,22 @@ export interface AgenticFlowParams {
 	messages: (ApiChatMessageData | (DatabaseMessage & { extra?: DatabaseMessageExtra[] }))[];
 	options?: AgenticFlowOptions;
 	callbacks: AgenticFlowCallbacks;
+	/**
+	 * The first turn continues the final assistant message of `messages` (continue_final_message:
+	 * a manual Continue of a cut reply). Its output is joined to the partial echo-aware, the joined
+	 * turn replaces the partial in the flow's history and the tool calls it asks for run as in any
+	 * turn.
+	 */
+	continuation?: AgenticContinuation;
 	signal?: AbortSignal;
 	toolPolicy?: AgenticToolPolicy;
+}
+
+/** The partial assistant message a flow's first turn continues */
+export interface AgenticContinuation {
+	content: string;
+	messageId: string;
+	reasoning: string;
 }
 
 /**

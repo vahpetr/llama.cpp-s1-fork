@@ -50,6 +50,7 @@ import type {
 	ToolExecutionResult
 } from '$lib/types';
 import type {
+	AgenticContinuation,
 	AgenticFlowCallbacks,
 	AgenticFlowOptions,
 	AgenticMessage,
@@ -82,6 +83,7 @@ import {
 	getAudioInputFormat,
 	isAbortError,
 	parseToolsSnapshot,
+	settleContinuationParts,
 	timingsTotal,
 	utf8Bytes
 } from '$lib/utils';
@@ -327,6 +329,7 @@ class AgenticStore {
 	async runAgenticFlow(params: AgenticFlowParams): Promise<AgenticFlowResult> {
 		const {
 			callbacks,
+			continuation,
 			conversationId,
 			flowRootMessageId,
 			messages,
@@ -416,6 +419,7 @@ class AgenticStore {
 			await this.executeAgenticLoop({
 				agenticConfig,
 				callbacks,
+				continuation,
 				conversationId,
 				messages: normalizedMessages,
 				options,
@@ -498,9 +502,14 @@ class AgenticStore {
 		tools: ReturnType<typeof toolsStore.getEnabledToolsForLLM>;
 		agenticConfig: AgenticConfig;
 		callbacks: AgenticFlowCallbacks;
+		continuation?: AgenticContinuation;
 		signal?: AbortSignal;
 	}): Promise<void> {
 		const { agenticConfig, callbacks, conversationId, messages, options, signal, tools } = params;
+
+		// the first turn continues the flow's final (partial) assistant message, later turns are fresh
+		let continuation = params.continuation;
+
 		const {
 			createAssistantMessage,
 			createToolResultMessage,
@@ -624,11 +633,36 @@ class AgenticStore {
 				turn: turn + 1
 			};
 
+			// what the turn persists: a continued turn streams the partial back first (the prefill
+			// echo), joined echo-aware like the manual Continue; an incomplete one keeps the partial
+			// (called once the stream has ended: settled once, the persisted completeness decides)
+			let settled: { complete: boolean; content: string; reasoning?: string } | undefined;
+
+			const turnParts = (complete: boolean): { content: string; reasoning?: string } => {
+				if (!continuation) {
+					return { content: turnContent, reasoning: turnReasoningContent || undefined };
+				}
+
+				if (!settled || settled.complete !== complete) {
+					const joined = settleContinuationParts(
+						{ content: continuation.content, reasoning: continuation.reasoning },
+						{ content: turnContent, reasoning: turnReasoningContent },
+						complete,
+						continuation.messageId
+					);
+
+					settled = { complete, content: joined.content, reasoning: joined.reasoning || undefined };
+				}
+
+				return settled;
+			};
+
 			try {
 				await ChatService.sendMessage(
 					sessionMessages as ApiChatMessageData[],
 					{
 						...turnOptions,
+						...(continuation ? { continueFinalMessage: true } : {}),
 						onChunk: (chunk: string) => {
 							turnContent += chunk;
 							onChunk?.(chunk);
@@ -731,8 +765,8 @@ class AgenticStore {
 				if (signal?.aborted) {
 					// Save whatever we have for this turn before exiting
 					await onAssistantTurnComplete?.(
-						turnContent,
-						turnReasoningContent || undefined,
+						turnParts(false).content,
+						turnParts(false).reasoning,
 						this.buildFinalTimings(capturedTimings, agenticTimings),
 						undefined
 					);
@@ -745,8 +779,8 @@ class AgenticStore {
 
 				// preserve partial output as is, the outer error dialog informs the user separately
 				await onAssistantTurnComplete?.(
-					turnContent,
-					turnReasoningContent || undefined,
+					turnParts(false).content,
+					turnParts(false).reasoning,
 					this.buildFinalTimings(capturedTimings, agenticTimings),
 					undefined
 				);
@@ -761,8 +795,8 @@ class AgenticStore {
 			// arguments JSON) is not persisted as if it were complete.
 			if (signal?.aborted) {
 				await onAssistantTurnComplete?.(
-					turnContent,
-					turnReasoningContent || undefined,
+					turnParts(false).content,
+					turnParts(false).reasoning,
 					this.buildFinalTimings(capturedTimings, agenticTimings),
 					undefined
 				);
@@ -776,8 +810,8 @@ class AgenticStore {
 			if (this.gates.hasPendingSteeringMessage(conversationId)) {
 				console.log('[AgenticStore] Steering message detected after turn, exiting agentic flow');
 				await onAssistantTurnComplete?.(
-					turnContent,
-					turnReasoningContent || undefined,
+					turnParts(true).content,
+					turnParts(true).reasoning,
 					this.buildFinalTimings(capturedTimings, agenticTimings),
 					turnToolCalls.length > 0 ? this.normalizeToolCalls(turnToolCalls) : undefined
 				);
@@ -808,8 +842,8 @@ class AgenticStore {
 				const finalTimings = this.buildFinalTimings(capturedTimings, agenticTimings);
 
 				await onAssistantTurnComplete?.(
-					turnContent,
-					turnReasoningContent || undefined,
+					turnParts(true).content,
+					turnParts(true).reasoning,
 					finalTimings,
 					undefined
 				);
@@ -826,8 +860,8 @@ class AgenticStore {
 
 			if (normalizedCalls.length === 0) {
 				await onAssistantTurnComplete?.(
-					turnContent,
-					turnReasoningContent || undefined,
+					turnParts(true).content,
+					turnParts(true).reasoning,
 					this.buildFinalTimings(capturedTimings, agenticTimings),
 					undefined
 				);
@@ -841,19 +875,24 @@ class AgenticStore {
 
 			// Save the assistant message with its tool calls
 			await onAssistantTurnComplete?.(
-				turnContent,
-				turnReasoningContent || undefined,
+				turnParts(true).content,
+				turnParts(true).reasoning,
 				turnTimings,
 				normalizedCalls
 			);
 
-			// Add assistant message to session history
+			// Add assistant message to session history (a continued turn replaces its partial)
+			const persisted = turnParts(true);
+
+			if (continuation) sessionMessages.pop();
+
 			sessionMessages.push({
-				content: turnContent || undefined,
-				reasoning_content: turnReasoningContent || undefined,
+				content: persisted.content || undefined,
+				reasoning_content: persisted.reasoning,
 				role: MessageRole.ASSISTANT,
 				tool_calls: normalizedCalls
 			});
+			continuation = undefined;
 
 			// Execute each tool call and create result messages
 			for (let i = 0; i < normalizedCalls.length; i++) {

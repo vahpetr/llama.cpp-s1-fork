@@ -16,9 +16,11 @@ import {
 } from '$lib/enums';
 import { ChatService } from '$lib/services/chat.service';
 import { DatabaseService } from '$lib/services/database.service';
-import type { ChatProcessingStore } from '$lib/stores/chat/processing.svelte';
 // direct imports between stores, not via the barrel, to avoid circular deps
+import { agenticStore } from '$lib/stores/agentic/index.svelte';
+import type { ChatProcessingStore } from '$lib/stores/chat/processing.svelte';
 import { conversationsStore } from '$lib/stores/conversations/index.svelte';
+import { settingsStore } from '$lib/stores/settings/index.svelte';
 import type {
 	ChatMessagePromptProgress,
 	ChatMessageTimings,
@@ -70,7 +72,8 @@ export interface ChatFlowsHost {
 		onComplete?: (content: string) => Promise<void>,
 		onError?: (error: Error) => void,
 		modelOverride?: string | null,
-		firstUserMessageContent?: string
+		firstUserMessageContent?: string,
+		continueFrom?: DatabaseMessage
 	): Promise<void>;
 }
 
@@ -114,6 +117,40 @@ export class ChatMessageFlows {
 
 			if (!dbMessage) {
 				this.host.setChatLoading(activeConv.id, false);
+
+				return;
+			}
+
+			// W1 (Continue after a cut): with the conversation's tools on, the continuation runs as the
+			// first turn of an agentic flow, so a tool call it asks for is executed (the plain path
+			// below keeps only text); a reply cut before its first token has nothing to continue -
+			// its turn is generated fresh into the same message
+			const flowTools = parseToolsSnapshot(
+				(await DatabaseService.getConversation(msg.convId))?.toolsSnapshot
+			);
+			const isEmpty = !dbMessage.content?.trim() && !dbMessage.reasoningContent?.trim();
+
+			if (
+				agenticStore.getConfig(settingsStore.config).enabled &&
+				flowTools &&
+				flowTools.length > 0 &&
+				(!isEmpty || dbMessage.parent)
+			) {
+				const path = filterByLeafNodeId(
+					allMessages,
+					isEmpty ? dbMessage.parent! : dbMessage.id,
+					false
+				) as DatabaseMessage[];
+
+				await this.host.streamChatCompletion(
+					path,
+					dbMessage,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					isEmpty ? undefined : dbMessage
+				);
 
 				return;
 			}
