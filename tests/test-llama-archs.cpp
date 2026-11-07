@@ -544,6 +544,62 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
+// [K1] a model with an MTP (NextN) block is built with load_mtp = true, so the generic ".scale" / ".input_scale" pass in
+// llama_model_base::load_tensors also gives every MTP-block weight a sidecar (a model built from metadata creates every
+// TENSOR_NOT_REQUIRED tensor, src/llama-model-loader.cpp create_tensor, files.empty() branch) and the saver writes them.
+// A file load without the draft head (load_mtp = false: llama-server without -md, test-qwen4exp-merge-e2e) skips the
+// MTP-block weights, so that pass never asks for their sidecars and done_getting_tensors rejects the file (qwen4exp:
+// "wrong number of tensors; expected 147, got 127" = the 20 blk.2 sidecars). Real checkpoints carry sidecars only for
+// NVFP4 weights; drop the MTP-block ones so the saved file loads with and without the MTP head. Returns the count dropped.
+static int drop_nextn_scale_sidecars(const std::string & path) {
+    ggml_context * meta = nullptr;
+    gguf_init_params params = { /*.no_alloc =*/ false, /*.ctx =*/ &meta };
+    gguf_context_ptr src(gguf_init_from_file(path.c_str(), params));
+    if (!src) {
+        throw std::runtime_error("failed to re-read " + path);
+    }
+    ggml_context_ptr meta_ptr(meta);
+
+    const char * arch = gguf_get_val_str(src.get(), gguf_find_key(src.get(), "general.architecture"));
+    const int64_t kid_nextn = gguf_find_key(src.get(), (std::string(arch) + ".nextn_predict_layers").c_str());
+    const int64_t kid_n     = gguf_find_key(src.get(), (std::string(arch) + ".block_count").c_str());
+    if (kid_nextn < 0 || kid_n < 0 || gguf_get_val_u32(src.get(), kid_nextn) == 0) {
+        return 0;
+    }
+    const uint32_t n_trunk = gguf_get_val_u32(src.get(), kid_n) - gguf_get_val_u32(src.get(), kid_nextn);
+
+    // a sidecar is "<base>.scale" / "<base>.input_scale" next to a "<base>.weight" in a block >= n_trunk
+    auto is_nextn_sidecar = [&](const std::string & name) {
+        uint32_t il = 0;
+        if (sscanf(name.c_str(), "blk.%" SCNu32 ".", &il) != 1 || il < n_trunk) {
+            return false;
+        }
+        for (const char * sfx : { ".input_scale", ".scale" }) {
+            const size_t ls = strlen(sfx);
+            if (name.size() > ls && name.compare(name.size() - ls, ls, sfx) == 0) {
+                return gguf_find_tensor(src.get(), (name.substr(0, name.size() - ls) + ".weight").c_str()) >= 0;
+            }
+        }
+        return false;
+    };
+
+    gguf_context_ptr dst(gguf_init_empty());
+    gguf_set_kv(dst.get(), src.get());
+    int n_dropped = 0;
+    for (int64_t i = 0; i < gguf_get_n_tensors(src.get()); i++) {
+        const char * name = gguf_get_tensor_name(src.get(), i);
+        if (is_nextn_sidecar(name)) {
+            n_dropped++;
+            continue;
+        }
+        gguf_add_tensor(dst.get(), ggml_get_tensor(meta, name));
+    }
+    if (n_dropped > 0 && !gguf_write_to_file(dst.get(), path.c_str(), false)) {
+        throw std::runtime_error("failed to rewrite " + path);
+    }
+    return n_dropped;
+}
+
 static int save_models(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const std::string & dir) {
     struct user_data_t {
         struct {
@@ -591,6 +647,11 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
             const std::string path = dir + "/" + llm_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
+            const int n_dropped = drop_nextn_scale_sidecars(path);
+            if (n_dropped > 0) {
+                LOG_INF("%s: dropped %d MTP-block scale sidecars from %s (unread by a load without the MTP head)\n",
+                        __func__, n_dropped, path.c_str());
+            }
         }
     }
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
