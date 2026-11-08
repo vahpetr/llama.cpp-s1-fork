@@ -5,6 +5,7 @@
 #   python3 -I tools/server/tests/cache-align-smoke.py --server http://127.0.0.1:18931 --n-ctx 512 --expect on
 # With an mmproj loaded (e.g. LFM2-VL-450M + its mmproj; every server_tokens then has has_mtmd = true) add --media: the
 #   text checks must give the same results, plus an image turn and a text follow-up on the image cache stay healthy.
+#   The server needs LLAMA_MEDIA_MARKER='<__media__>' in its environment (the /completion prompt_string marker).
 # Checks
 #   splice   : a numeric fill with forced re-splits, then the same text + a next turn: on = n_past == |C|, a few new
 #              tokens, cache_align_total +1; off = the v75 re-processing. Both: usage prompt_tokens == |N| (review r1 3)
