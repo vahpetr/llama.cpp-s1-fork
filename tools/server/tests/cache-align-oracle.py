@@ -9,6 +9,8 @@
 #   arm R  the same server, slot erased, cache_prompt false: prompt = S as a numeric array (ineligible = verbatim).
 #   CTL    (diagnostic only, --ctl) the cache rebuilt identically, then S sent numerically with cache_prompt true (the v75
 #          id-LCP path on the same warm cache). A == CTL != R localises a difference to cache-vs-fresh evaluation.
+#          Criterion r3 (i): A == CTL bitwise (splice exactness).
+#   RR     (--rr) arm R run twice: R == R2 bitwise = the decoding itself is reproducible (criterion r3 (iv), MTP on).
 # Sampler (both arms): T = 0, n_probs 20 (pre-sampling: softmax of the full logit row), ignore_eos, no penalties, --steps
 # (256). Gate (astra r2 OPEN 5, R231): A == R BITWISE on every step: chosen id + the 20 (id, logprob) pairs (JSON doubles,
 # nlohmann round-trip = the float bits). With MTP on the server fills no probs for drafted tokens (server-context.cpp
@@ -20,7 +22,9 @@
 # cache_pin outside / inside the re-segmented span), edit (earlier assistant message edited after its re-splits),
 # cont_tok (Continue cut inside the last cached token), cont_utf8 (Continue after a partial UTF-8 char), preencode (webui:
 # chat pre-encode n_predict 0, then the real chat turn), numturn (numeric next turn on a warm cache = ineligible; parity),
-# compete (np 2: two conversations sharing a prefix, concurrent text turns, slot selection), disk-build / disk-turn
+# compete (np 2: two conversations sharing a prefix, concurrent text turns, slot selection), natturn (criterion r3 (iii):
+# a decode-built reply resent as text WITHOUT re-splits, so the ids match the cache naturally and the v75 id-LCP path
+# reuses the decode-built KV; A vs R = the cached-vs-fresh divergence of prod with the knob off), disk-build / disk-turn
 # (--cache-disk: build, server restart, entry load + splice; with a key-changing env + --cache-disk-adopt = adoption).
 #
 # Not a CI test: needs the brain (or any ChatML model) on a dev server WITHOUT the prod --cache-disk dir; see the unit
@@ -191,6 +195,7 @@ class Oracle:
         self.steps = a.steps
         self.mtp = a.mtp == "on"
         self.res = []
+        self.rr = set(x for x in (a.rr or "").split(",") if x)
 
     # ---------------------------------------------------------------- building blocks
     def fill(self, ids, slot=0):
@@ -252,6 +257,7 @@ class Oracle:
         return dump_completion(r)
 
     def finish(self, name, A, S, info, err, lines, C_cands, R_extra=None, ctl_build=None, expect_splice=True, extra_info=None):
+        rr = name in self.rr or name.split("_")[0] in self.rr
         rec = {"scenario": name, "label": self.a.label, "expect": self.a.expect, "mtp": self.a.mtp, "info": info, "err": err,
                "extra": extra_info or {}, "log": [l for l in lines if "cache-align" in l or "disk_cache" in l or "cache_pin" in l
                                                   or "checkpoint" in l.lower() and "restor" in l.lower()][-40:]}
@@ -260,7 +266,14 @@ class Oracle:
             R = self.run_R(S, R_extra)
             ok, where, nprob = compare(A, R, self.steps, self.mtp)
             verdict = "PASS" if ok else "FAIL"
+            if name == "natturn":  # a control, not a gate: it documents the knob-independent cached-vs-fresh divergence
+                verdict = "CTRL-EQ" if ok else "CTRL-DIFF"
             rec["R"] = R
+            if rr:
+                R2 = self.run_R(S, R_extra)
+                okrr, wrr, _ = compare(R, R2, self.steps, self.mtp)
+                rec["R2"] = R2
+                rec["rr"] = "EQ" if okrr else wrr
             if ctl_build is not None:
                 ctl_build()
                 C = self.srv.post("/completion", samp(self.steps, dict({"prompt": S, "cache_prompt": True, "id_slot": 0}, **(R_extra or {}))))
@@ -278,7 +291,7 @@ class Oracle:
         ctl = rec.get("ctl", {})
         line = (f"{self.a.label}\t{name}\texpect={self.a.expect}\tmtp={self.a.mtp}\t{verdict}\t{where or '-'}\tprob_steps={nprob}\t"
                 f"align={'-' if not info or 'lcp' not in info else 'lcp %(lcp)d n_c %(n_c)d n_n %(n_n)d delta %(delta)+d dropped %(dropped)d |N| %(n_N)d |S| %(n_S)d slot %(slot)d' % info}"
-                f"\tctl={ctl or '-'}\textra={json.dumps(extra_info or {}, ensure_ascii=True)}")
+                f"\tctl={ctl or '-'}\trr={rec.get('rr', '-')}\textra={json.dumps(extra_info or {}, ensure_ascii=True)}")
         print(line, flush=True)
         with open(os.path.join(self.a.out, "summary.tsv"), "a") as f:
             f.write(line + "\n")
@@ -491,6 +504,33 @@ class Oracle:
         err = "a cache-align line on a numeric request" if any(RE_ALIGN.search(l) for l in lines) else ""
         self.finish("numturn", A, None if err else N, None, err, lines, C, expect_splice=False)
 
+    def sc_natturn(self, ctl):
+        """criterion r3 (iii): decode-built reply, NO re-split prefix; the text turn's ids match the cache naturally (v75 id-LCP
+        reuse of decode-built KV, knob on or off alike); A (text, warm) vs R (fresh prefill of the same ids)"""
+        st = {}
+
+        def build():
+            self.srv.erase(0)
+            P = self.head(2600, 27, "Explain the cache design described above.")
+            g = self.gen(P, 128)
+            st["P"], st["g"] = P, g
+            return [P + g]
+        C = build()
+        text = self.srv.detok(st["P"] + st["g"][:-1]) + f"{END}<|im_start|>user\nNow list the open questions.{END}{GEN}"
+        N = self.srv.tok(text)
+        l = 0
+        while l < min(len(C[0]), len(N)) and C[0][l] == N[l]:
+            l += 1
+        first = [True]
+
+        def build2():
+            if first[0]:
+                first[0] = False
+                return C
+            return build()
+        self.text_turn("natturn", build2, text, ctl=ctl, expect_splice=False,
+                       extra_info={"C": len(C[0]), "id_lcp": l, "natural": l >= len(C[0]) - 1})
+
     def sc_preencode(self, ctl):
         sysb = text_block(2400, 81)
         msgs = [{"role": "system", "content": sysb}, {"role": "user", "content": "Explain the cache design."}]
@@ -607,6 +647,7 @@ def main():
     ap.add_argument("--mtp", choices=["on", "off"], default="on")
     ap.add_argument("--scenarios", default="single,turn,turnfill,rewind,pin_out,pin_in,edit,cont_tok,cont_utf8,preencode,numturn")
     ap.add_argument("--ctl", default="", help="scenarios that also run the CTL diagnostic")
+    ap.add_argument("--rr", default="", help="scenarios whose arm R runs twice (reproducibility control)")
     ap.add_argument("--steps", type=int, default=256)
     ap.add_argument("--parity", nargs=2)
     a = ap.parse_args()
@@ -628,7 +669,7 @@ def main():
                 f.write(line + "\n")
             o.res.append("ERROR")
         print(f"# {sc}: {time.time() - t0:.1f} s", flush=True)
-    bad = [v for v in o.res if v != "PASS"]
+    bad = [v for v in o.res if v not in ("PASS", "CTRL-EQ", "CTRL-DIFF")]
     sys.exit(1 if bad else 0)
 
 
