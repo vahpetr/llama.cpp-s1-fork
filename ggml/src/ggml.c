@@ -7666,7 +7666,7 @@ static size_t ggml_visit_parents_graph(struct ggml_cgraph * cgraph, struct ggml_
             (cgraph->order == GGML_CGRAPH_EVAL_ORDER_RIGHT_TO_LEFT) ? (GGML_MAX_SRC-1-i) :
             /* unknown order, just fall back to using i */ i;
 
-        struct ggml_tensor * src = node->src[k];
+        struct ggml_tensor * src = node->src[ggml_src_visit_slot(node, k)];
         if (src) {
             const size_t src_hash_pos = ggml_visit_parents_graph(cgraph, src, compute);
 

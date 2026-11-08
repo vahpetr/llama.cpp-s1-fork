@@ -770,7 +770,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
         }
 
         for (int j = 0; j < GGML_MAX_SRC; j++) {
-            struct ggml_tensor * src = node->src[j];
+            struct ggml_tensor * src = node->src[ggml_src_visit_slot(node, j)];
             if (src == NULL) {
                 continue;
             }
@@ -791,7 +791,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
         // allocate parents (only leafs need to be allocated at this point)
         for (int j = 0; j < GGML_MAX_SRC; j++) {
-            struct ggml_tensor * parent = node->src[j];
+            struct ggml_tensor * parent = node->src[ggml_src_visit_slot(node, j)];
             if (parent == NULL) {
                 continue;
             }
@@ -816,7 +816,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
         // update parents
         for (int j = 0; j < GGML_MAX_SRC; j++) {
-            struct ggml_tensor * parent = node->src[j];
+            struct ggml_tensor * parent = node->src[ggml_src_visit_slot(node, j)];
             if (parent == NULL) {
                 continue;
             }

@@ -104,6 +104,18 @@ static inline bool ggml_impl_is_view(const struct ggml_tensor * t) {
     return t->view_src != NULL;
 }
 
+// [TAG_QSA_INDEXED_FA] the operand visiting order of a node: slot j of the walk reads src[ggml_src_visit_slot(node, j)].
+// Identity, except for an indexed FLASH_ATTN_EXT: its kv ids moved from src[5] to src[GGML_FA_SRC_KV_IDS] (= 8, plan K),
+// and they are visited where src[5] was - before the VIS operands src[6]/src[7] - so the graph walk (topological node
+// order), gallocr's allocate/free order and with them the buffer layout stay what they were with the ids in src[5]
+// (walk 0 1 2 3 4 8 5 6 7 9; src[5] is NULL on an indexed node).
+static inline int ggml_src_visit_slot(const struct ggml_tensor * node, int j) {
+    if (node->op != GGML_OP_FLASH_ATTN_EXT || node->src[GGML_FA_SRC_KV_IDS] == NULL || j < 5 || j > GGML_FA_SRC_KV_IDS) {
+        return j;
+    }
+    return j == 5 ? GGML_FA_SRC_KV_IDS : j - 1;
+}
+
 static inline float ggml_compute_softplus_f32(float input) {
     return (input > 20.0f) ? input : logf(1 + expf(input));
 }
