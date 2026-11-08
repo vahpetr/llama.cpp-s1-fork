@@ -1397,8 +1397,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
 
             // find inputs that are not on the same backend
+            // [TAG_QSA_INDEXED_FA] visited in ggml_src_visit_slot order (indexed-FA ids where src[5] was), so the split
+            // inputs and their copies are created in the v77 order; each source keeps its physical slot (js)
             for (int j = 0; j < GGML_MAX_SRC; j++) {
-                struct ggml_tensor * src = node->src[j];
+                const int js = ggml_src_visit_slot(node, j);
+                struct ggml_tensor * src = node->src[js];
                 if (src == NULL) {
                     continue;
                 }
@@ -1451,7 +1454,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         }
                         split->inputs[n_inputs] = src;
                     }
-                    node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                    node->src[js] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
             }
         }
@@ -2439,13 +2442,15 @@ static struct ggml_tensor * graph_copy_dup_tensor(struct ggml_hash_set hash_set,
     memcpy(dst->op_params, src->op_params, sizeof(dst->op_params));
     ggml_set_name(dst, src->name);
 
-    // copy src
+    // copy src - [TAG_QSA_INDEXED_FA] duplicated in ggml_src_visit_slot order (the copies' creation = allocation order
+    // stays v77's), each into its physical slot
     for (int i = 0; i < GGML_MAX_SRC; i++) {
-        struct ggml_tensor * s = src->src[i];
+        const int is = ggml_src_visit_slot(src, i);
+        struct ggml_tensor * s = src->src[is];
         if (s == NULL) {
             continue;
         }
-        dst->src[i] = graph_copy_dup_tensor(hash_set, node_copies, ctx_allocated, ctx_unallocated, s);
+        dst->src[is] = graph_copy_dup_tensor(hash_set, node_copies, ctx_allocated, ctx_unallocated, s);
     }
 
     node_copies[id] = dst;

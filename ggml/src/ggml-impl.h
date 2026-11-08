@@ -109,6 +109,10 @@ static inline bool ggml_impl_is_view(const struct ggml_tensor * t) {
 // and they are visited where src[5] was - before the VIS operands src[6]/src[7] - so the graph walk (topological node
 // order), gallocr's allocate/free order and with them the buffer layout stay what they were with the ids in src[5]
 // (walk 0 1 2 3 4 8 5 6 7 9; src[5] is NULL on an indexed node).
+// Merge guard: the helper assumes the fork owns slot 8 of FLASH_ATTN_EXT and that a non-NULL src[8] means "indexed".
+// If upstream ever puts its own operand at src[8] (or moves the ids), this fails the build - re-derive the order then.
+static_assert(GGML_FA_SRC_KV_IDS == 8 && GGML_MAX_SRC > GGML_FA_SRC_KV_IDS,
+              "ggml_src_visit_slot: FA kv ids must be the fork-owned src[8] - re-check the visiting order at the merge");
 static inline int ggml_src_visit_slot(const struct ggml_tensor * node, int j) {
     if (node->op != GGML_OP_FLASH_ATTN_EXT || node->src[GGML_FA_SRC_KV_IDS] == NULL || j < 5 || j > GGML_FA_SRC_KV_IDS) {
         return j;
