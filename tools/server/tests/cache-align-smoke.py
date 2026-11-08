@@ -3,12 +3,18 @@
 # single-token <|im_end|>, e.g. LFM2-350M). Start the server with -np 1 -c N_CTX --metrics and --cache-align-bytes on|off:
 #   llama-server -m LFM2-350M-Q8_0.gguf -c 512 -np 1 --metrics --cache-align-bytes on --port 18931
 #   python3 -I tools/server/tests/cache-align-smoke.py --server http://127.0.0.1:18931 --n-ctx 512 --expect on
+# With an mmproj loaded (e.g. LFM2-VL-450M + its mmproj; every server_tokens then has has_mtmd = true) add --media: the
+#   text checks must give the same results, plus an image turn and a text follow-up on the image cache stay healthy.
 # Checks
 #   splice   : a numeric fill with forced re-splits, then the same text + a next turn: on = n_past == |C|, a few new
 #              tokens, cache_align_total +1; off = the v75 re-processing. Both: usage prompt_tokens == |N| (review r1 3)
 #   admission: a text prompt of n_ctx - 1 tokens whose splice would be longer (delta > 0) is accepted warm exactly as cold
 #              (on: the splice is declined for context, cache_align_declined_total +1) (review r1 3)
+#   media    : (--media) an image turn, then the same image + a longer text: both 200, the server stays healthy
 import argparse
+import base64
+import struct
+import zlib
 import json
 import sys
 import urllib.error
@@ -37,6 +43,7 @@ def main():
     ap.add_argument("--server", default="http://127.0.0.1:18931")
     ap.add_argument("--n-ctx", type=int, required=True)
     ap.add_argument("--expect", choices=["on", "off"], required=True)
+    ap.add_argument("--media", action="store_true", help="the server has an mmproj loaded: also run the image turns")
     a = ap.parse_args()
     B = a.server.rstrip("/")
 
@@ -111,7 +118,33 @@ def main():
           f"tokens_evaluated {r_cold.get('tokens_evaluated')}/{r_warm.get('tokens_evaluated')} declined +{dec}: "
           f"{'PASS' if ok else 'FAIL'}")
     fails += not ok
+
+    if a.media:
+        img = base64.b64encode(png(32, 32)).decode()
+        p1 = "<|im_start|>user\n<__media__>\nDescribe the precache picture.<|im_end|>\n<|im_start|>assistant\n"
+        post(B, "/slots/0?action=erase", {})
+        st1, r1 = post(B, "/completion", {"prompt": {"prompt_string": p1, "multimodal_data": [img]}, "n_predict": 4,
+                                          "cache_prompt": True, "id_slot": 0, "temperature": 0})
+        p2 = p1 + "It is a square.<|im_end|>\n<|im_start|>user\nnext turn<|im_end|>\n<|im_start|>assistant\n"
+        st2, r2 = post(B, "/completion", {"prompt": {"prompt_string": p2, "multimodal_data": [img]}, "n_predict": 4,
+                                          "cache_prompt": True, "id_slot": 0, "temperature": 0})
+        st3, _ = post(B, "/completion", {"prompt": p2.replace("<__media__>", "a picture"), "n_predict": 2, "cache_prompt": True,
+                                         "id_slot": 0, "temperature": 0})
+        with urllib.request.urlopen(B + "/health", timeout=30) as h:
+            alive = h.status == 200
+        ok = st1 == 200 and st2 == 200 and st3 == 200 and alive
+        print(f"media: image turn {st1}, image follow-up {st2} (cache_n {r2.get('timings', {}).get('cache_n')}), text turn {st3}, "
+              f"health {alive}: {'PASS' if ok else 'FAIL'}")
+        fails += not ok
     sys.exit(1 if fails else 0)
+
+
+def png(w, h):
+    raw = b"".join(b"\x00" + bytes(v for x in range(w) for v in (x * 8 % 256, y * 8 % 256, 128)) for y in range(h))
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
 if __name__ == "__main__":

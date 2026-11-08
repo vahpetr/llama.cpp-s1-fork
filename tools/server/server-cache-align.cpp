@@ -410,7 +410,7 @@ server_cache_match server_cache_match_tokens(const server_tokens & C, const serv
     p.delims           = m->delims;
     p.n_lcp            = out.n_lcp;
     p.prompt_has_media = N.has_mtmd ? -1 : 0;
-    server_cache_align_result r = server_cache_align(C.get_tokens(), N.get_tokens(), *m->vocab, p);
+    server_cache_align_result r = server_cache_align(C.get_raw_tokens(), N.get_raw_tokens(), *m->vocab, p);
     out.n_c     = r.n_c;
     out.n_n     = r.n_n;
     out.aligned = r.aligned();

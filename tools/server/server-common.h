@@ -215,6 +215,10 @@ public:
     // for compatibility with speculative decoding, ctx shift
     const llama_tokens & get_tokens() const;
 
+    // [TAG_CACHE_ALIGN] the raw id list without the !has_mtmd assert: media positions read LLAMA_TOKEN_NULL (the
+    //   byte-alignment walk stops on them); identical to get_tokens() when no mmproj is loaded
+    const llama_tokens & get_raw_tokens() const { return tokens; }
+
     llama_tokens get_text_tokens() const;
 
     std::vector<char> serialize() const;

@@ -3494,8 +3494,8 @@ private:
         if (!m.active() || slot.prompt.tokens.empty()) {
             return;
         }
-        const llama_tokens & C = slot.prompt.tokens.get_tokens();
-        const llama_tokens & N = task.tokens.get_tokens();
+        const llama_tokens & C = slot.prompt.tokens.get_raw_tokens(); // media -> LLAMA_TOKEN_NULL
+        const llama_tokens & N = task.tokens.get_raw_tokens();
         const size_t n_lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
 
         // (review r1 6) the selection's walk of this very pair when the slot's cache did not change since

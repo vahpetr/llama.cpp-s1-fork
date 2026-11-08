@@ -6,6 +6,7 @@
 #include "chat.h"
 #include "common.h"
 #include "llama.h"
+#include "mtmd.h"
 
 #include <chrono>
 #include <cstdio>
@@ -338,6 +339,64 @@ static void coordinates() {
     CHECK(pf.size() == 1 && pf[0]);
 }
 
+// ---- an mmproj-loaded server: every server_tokens has has_mtmd = true; media positions read LLAMA_TOKEN_NULL ----
+static mtmd_input_chunk * audio_chunk(uint32_t n_tokens, const std::string & id) {
+    // a placeholder audio chunk in mtmd's serialization (version, type, no text, no image, audio{n, id, batch{})})
+    std::vector<char> b;
+    const auto put = [&](const void * p, size_t n) { b.insert(b.end(), (const char *) p, (const char *) p + n); };
+    const uint64_t ver = MTMD_SERIALIZATION_VERSION, zero64 = 0, id_len = id.size();
+    const uint32_t type = MTMD_INPUT_CHUNK_TYPE_AUDIO;
+    const uint8_t  no = 0, yes = 1;
+    put(&ver, 8); put(&type, 4); put(&zero64, 8); put(&no, 1); put(&yes, 1);
+    put(&n_tokens, 4); put(&id_len, 8); put(id.data(), id.size());
+    put(&yes, 1); put(&zero64, 8); // batch_f32: is_audio, 0 entries
+    return mtmd_input_chunk_load(b.data(), b.size());
+}
+
+static void media() {
+    const auto v = toy_vocab();
+    const auto d = toy_delims();
+    server_cache_matcher m;
+    m.vocab  = &v;
+    m.delims = &d;
+    mtmd::input_chunk_ptr a(audio_chunk(3, "a0"));
+    CHECK(a && mtmd_input_chunk_get_n_tokens(a.get()) == 3);
+    if (!a) {
+        return;
+    }
+    const auto mk = [&](const llama_tokens & pre, const llama_tokens & post) {
+        server_tokens t(pre, true);
+        t.push_back(a.get());
+        for (auto x : post) { t.push_back(x); }
+        return t;
+    };
+    const auto txt = [](const llama_tokens & t) { return server_tokens(t, true); }; // mmproj loaded, no media
+
+    // text-only prompts with has_mtmd = true (the W1 abort): same result as has_mtmd = false
+    const llama_tokens C1 = { HELLO, B_D0, B_BC, B_D0, B_BC };
+    const llama_tokens N  = { HELLO, CYR_M, CYR_M, IM_END, NL, X };
+    const auto r0 = server_cache_match_tokens(server_tokens(C1, false), server_tokens(N, false), &m);
+    const auto r1 = server_cache_match_tokens(txt(C1), txt(N), &m);
+    CHECK(r1.aligned && r1.n_lcp == r0.n_lcp && r1.n_c == r0.n_c && r1.n_n == r0.n_n);
+    CHECK(txt(N).get_raw_tokens() == N);
+
+    // media chunk in the shared prefix: the media-aware LCP passes it, the walk aligns the text after it
+    const server_tokens Cm = mk({ HELLO }, { B_D0, B_BC, B_D0, B_BC });
+    const server_tokens Nm = mk({ HELLO }, { CYR_M, CYR_M, IM_END, NL, X });
+    CHECK(Cm.get_raw_tokens().size() == 8 && Cm.get_raw_tokens()[1] == LLAMA_TOKEN_NULL && Cm.get_raw_tokens()[3] == LLAMA_TOKEN_NULL);
+    const auto rm = server_cache_match_tokens(Cm, Nm, &m);
+    CHECK(rm.n_lcp == 4 && rm.aligned && rm.n_c == 8 && rm.n_n == 6);
+
+    // media in the cache past the LCP: the walk stops at LLAMA_TOKEN_NULL, no splice across it
+    const server_tokens Cx = mk({ HELLO, B_D0 }, { X });
+    const auto rx = server_cache_match_tokens(Cx, txt(N), &m);
+    CHECK(rx.n_lcp == 1 && rx.n_c <= 2 && rx.n_n <= 2);
+    // media in the prompt past the splice point: declined (n_c = n_n = the id LCP)
+    const server_tokens Nx = mk({ HELLO, CYR_M, CYR_M }, { X });
+    const auto ry = server_cache_match_tokens(txt(C1), Nx, &m);
+    CHECK(!ry.aligned && ry.n_c == ry.n_lcp && ry.n_n == ry.n_lcp);
+}
+
 // ---- (review r1 1) cost of one matching pass at 1M: |N| = 1M, 60 candidates, matcher active vs inactive ----
 static void perf_1m() {
     // vocab: 4 structural ids, 8 one-char + 64 two-char ordinary pieces over "abcdefgh"
@@ -513,6 +572,7 @@ static int real_cases() {
 int main() {
     synthetic();
     coordinates();
+    media();
     perf_1m();
     const int rc = real_cases();
     if (n_fail > 0 || rc != 0) {
