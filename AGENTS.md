@@ -5,8 +5,8 @@ contributor rules for llama.cpp itself are in
 [upstream AGENTS.md](https://github.com/ggml-org/llama.cpp/blob/master/AGENTS.md); they apply to anything sent upstream from here.
 Read README.md first, then docs/s1/KNOBS.md (every flag and env knob) and docs/s1/PATCHES.md (every change, numbered).
 
-This tree is **v75**: fork revision `4a55d9173` (`prod-v11-stage9-pkg15` = v74 `e5f793eae` + patches 0475-0486) plus the docs and deploy files of this `s1-public`
-branch. Images `vahpetr/llama-cpp-s1-fork:v75` (brain) and `:v75k` (hands), one image; rollback `:v74` / `:v74k`. Deploy steps in docs/s1/DEPLOY.md, what the release contains in
+This tree is **v77**: fork revision `ba604efa9` (`p16f-tool-limits` = v76 `65e3d8e7f` + patches 0496-0505; v76 = v75 `4a55d9173` + patches 0459-0468, 0487-0495)
+plus the docs and deploy files of this `s1-public` branch. Images `vahpetr/llama-cpp-s1-fork:v77` (brain) and `:v77k` (hands), one image; rollback `:v75` / `:v75k` (v76 was not published). Deploy steps in docs/s1/DEPLOY.md, what the release contains in
 docs/s1/RELEASE-NOTES.md.
 
 ## Where the fork's code lives
@@ -75,7 +75,7 @@ the code comment and the commit subject.
   (private): a probe program drives the production configuration through fixed prompts and compares the new build with the
   previous one bit for bit - logits at captured positions, the saved states, the QSA ids per chunk (`[qsa-ids]` sha256
   records, patch 0229) - across verify widths, depths up to 1M and restore / replay histories, on gfx1151, the package as a
-  whole. v73 passed it against v72; v75 runs the same ggml and libllama (docs/s1/RELEASE-NOTES.md).
+  whole. v73 passed it against v72; v77 passed it against the v59 reference on the live image (it covers v76: same ggml and libllama) (docs/s1/RELEASE-NOTES.md).
 - **COMPOSITION**: same per-op math, different batching / routing / selection order, so near-ties can flip a token. Proof =
   teacher-forced replay after the first divergence: every divergence must be a near-tie or a selection flip that the reference
   also accepts (my "R81" classifier), plus needles and speed. A change that cannot be classified this way is treated as LOSSY.

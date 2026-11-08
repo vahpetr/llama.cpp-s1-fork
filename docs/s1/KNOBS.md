@@ -7,8 +7,8 @@ read once at start (or at context/memory creation). Upstream flags I rely on but
 Class: **EXACT** = outputs and state bytes identical with the knob on and off (proven by a gate); **COMPOSITION** = same math per
 op but a different batching / selection route, so near-ties can flip a token (classified by replay, see AGENTS.md); **LOSSY**
 = changes numerics; **SCHED** = scheduling or memory only, never outputs; **DIAG** = logging / checks / test-only.
-This page describes v75 (fork revision `4a55d9173`, `prod-v11-stage9-pkg15`). "prod" = the value in my s1 brain composes
-(`deploy/s1/`, v75); "-" = unset (the default). Rows marked (?) I have not re-checked
+This page describes v77 (fork revision `ba604efa9`, `p16f-tool-limits`). "prod" = the value in my s1 brain composes
+(`deploy/s1/`, v77); "-" = unset (the default). Rows marked (?) I have not re-checked
 against the code for this table.
 
 ## Server flags
@@ -129,7 +129,7 @@ against the code for this table.
 ## Added after patch 0265 (in v73)
 
 Defaults below are read from the v73 code. The package sections that follow name the patches that added each older knob;
-their defaults are the same in v73. The v75 rows (`--drift-guard`, `--chat-template-file`) are read from the v75 code. Their patch rows are in docs/s1/PATCHES.md (0266-0486); the tag in the code comment
+their defaults are the same in v73. The v75 rows (`--drift-guard`, `--chat-template-file`) are read from the v75 code, the v76 / v77 rows (`GGML_VK_SYNC_READ_CHUNK_MIB`, `--cache-align-bytes`, the tool flags) from the v77 code. Their patch rows are in docs/s1/PATCHES.md (0266-0505); the tag in the code comment
 is the provenance.
 
 | knob | default | effect | class | prod |
@@ -152,6 +152,12 @@ is the provenance.
 | CMake `GGML_VULKAN_DECODE_FUSE_MUTANT=0\|11\|21\|31\|32` | 0 | (0451, 0454): tests only - a mutant build of one D3 fusion whose DECODE_FUSE_EXACT cases must FAIL; WARN `decode_fuse: MUTANT BUILD <m> ...` | DIAG | - |
 | `--drift-guard off\|stop` (env `LLAMA_ARG_DRIFT_GUARD`) | off | (0479-0483, v75): `stop` ends a reply when the model generates the template's think-close special token (`</think>`) again in the content phase; the token is not emitted, the reply ends with `finish_reason` stop and `stop_type` `think_reenter`; a speculative draft past the trigger is trimmed and the MTP carry re-picked. Per-request `"drift_guard": true\|false`. Arms only when the end tag is one special token; startup line `drift guard: inactive (template): <why>` otherwise. Not in the disk-cache key | EXACT when untriggered (sampled ids unchanged) | off |
 | `--chat-template-file FILE` (upstream flag) | GGUF template | (0475/0476/0478, v75): the composes pass `models/templates/qwen3.8-flash-next-preserve-ws.jinja` (brain) or `qwen3.8-flash-next-gsq-preserve-ws.jinja` (hands), the GGUF template with the reasoning/content boundary kept as generated; byte-identical to the GGUF template for trimmed or empty reasoning. Needs `--jinja` before it. Not in the disk-cache key (0478) | prompt rendering changes by design for untrimmed reasoning | preserve-ws template |
+| `GGML_VK_SYNC_READ_CHUNK_MIB=N` | 64 | `[TAG_VK_READ_CHUNK]` (0487-0488, v76): a synchronous staged device read larger than N MiB streams through a two-slot ring (2 x N/2 MiB) in the device's sync staging buffer instead of growing that buffer to the whole read (a 1M slot save used to keep about 545 MiB of staging GTT); `0` = whole-read staging (v75). Startup line `sync_read_staging: chunked, N MiB ring (...)` or `whole read (GGML_VK_SYNC_READ_CHUNK_MIB=0)`. Exact-listed in CACHE_ENV_EXACT (0495, not in the disk-cache key) | EXACT | - |
+| `--cache-align-bytes on\|off` (env `LLAMA_ARG_CACHE_ALIGN_BYTES`) | off | (0489-0494, v76): byte-aligned prompt-cache matching - a text prompt that repeats a cached reply with another (canonical) token segmentation of the same bytes keeps the cached ids up to the last joint token boundary before a special token, instead of re-processing from the first re-segmented token. Fingerprint-neutral. Not in my composes | outputs can differ on the re-segmented spans (KV math unchanged) | - |
+| `--tools-runtime ssh:<user>@<host>` (upstream flag, env `LLAMA_ARG_TOOLS_RUNTIME`) | none (host) | upstream #26774: the webui built-in tools (`--tools`) run on a remote POSIX host over ssh (key auth, trusted host key); also `docker:<image>`, `podman:<image>`, `docker-container:<id>`. The images since v76 carry `openssh-client`, `git` and `ripgrep` for it. My private brain runs `--tools all --tools-runtime ssh:<a dedicated user>@<the host>`; the public composes enable no tools | SCHED (tools only) | - |
+| `--tools-read-max BYTES` | 262144 | (0496, 0499, v77): largest file `read_file` returns whole; larger files must be read by line range; min 4096 | tools only | - |
+| `--tools-exec-timeout SEC` / `--tools-exec-timeout-max SEC` | 60 / 600 | (0497, 0499-0501, v77): `exec_shell_command` timeout when the model gives none / the clamp for a requested one; a timeout kills the process group and returns exit code 124 with `[exit due to timed out]`. Startup refuses max < default | tools only | - |
+| `--tools-exec-output BYTES` / `--tools-exec-output-max BYTES` | 65536 / 262144 | (0497, 0499, v77): `exec_shell_command` output cap when the model gives none / the clamp for a requested `max_output_size`. No env aliases (the tool limits never reach the disk-cache fingerprint) | tools only | - |
 
 ## v64 package - patches 0262, 0263, 0265
 

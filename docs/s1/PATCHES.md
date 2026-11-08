@@ -11,8 +11,8 @@ Status column:
 - **v63**: in this tree since v63 (released 2026-10-21; in production 2026-10-21 06:32 to 22:12); "v63, on" / "v63, off" = the default of its knob.
 - **v64**: in this tree since v64 (released 2026-10-21); "v64, on" = on by default.
 
-This tree is v75: fork revision `4a55d9173` (`prod-v11-stage9-pkg15`), image `vahpetr/llama-cpp-s1-fork:v75`. Every row
-below is still in it. The rows after 0265 (v65-v75, up to 0486) give the title, the patch file and the commit; the status column is the first
+This tree is v77: fork revision `ba604efa9` (`p16f-tool-limits`), image `vahpetr/llama-cpp-s1-fork:v77`. Every row
+below is still in it. The rows after 0265 (v65-v77, up to 0505) give the title, the patch file and the commit; the status column is the first
 image that carried it. Their knobs are in docs/s1/KNOBS.md, section "Added after patch 0265".
 - **lab image vNN, status unverified**: built into lab image vNN (v19-v30, before the v31 production build); I have not
   re-checked that each of these reached production unchanged.
@@ -449,6 +449,35 @@ records and upstream status live in my private repo; ask if you want one.
 | 0484 | server README: limits of the reasoning-boundary rendering, the finished-reply save and the template fingerprint exemption (docs only) (`0484-server-readme-reasoning-boundary-save-limits.patch`, f4f390d65) | v75 (class docs) |
 | 0485 | webui: drift guard - parse `stop_type` next to `finish_reason` and record both on the message (`0485-webui-drift-guard-stop-type-recorded.patch`, 04ab962e5) | v75 (class webui) |
 | 0486 | webui: drift guard - one bounded content-phase continuation after a `think_reenter` stop (`0486-webui-drift-guard-content-phase-continuation.patch`, 4a55d9173) | v75 (class webui) |
+| 0459 | ggml: fp16 / bf16 row conversions index with `int64_t` (an `int` overflowed past 2^31 elements); export-lora keeps BF16 tensors BF16 (upstream #31609) (`0459-ggml-fp16-bf16-row-int64-index-export-lora-bf16.patch`, 4e6bedeca) | v76 (upstream port; same values below 2^31) |
+| 0460 | ggml: `ggml_roll` bounds asserts without signed overflow (upstream #30375) (`0460-ggml-roll-bounds-check-no-signed-overflow.patch`, 12641f0a7) | v76 (upstream port; asserts only) |
+| 0461 | gguf: the writer writes host-buffer tensor data straight from `t->data`, no staging vector (upstream #31144) (`0461-gguf-writer-host-buffer-tensors-without-staging.patch`, a7f4d5f47) | v76 (upstream port; same file bytes) |
+| 0462 | gguf-py: `SpecialVocab` validates every pair of a list-format `merges` (upstream #31631) (`0462-gguf-py-validate-every-tokenizer-merge-pair.patch`, 1cc637715) | v76 (upstream port; conversion only) |
+| 0463 | tools: `llama-gguf-split --merge` refuses shards of a different split (upstream #31579) (`0463-gguf-split-reject-mismatched-shards.patch`, ed72ffc52) | v76 (upstream port; tool) |
+| 0464 | cmake: test-backend-ops links Threads explicitly (upstream #31414) (`0464-cmake-tests-explicit-thread-linkage.patch`, 7904ff6db) | v76 (upstream port; build) |
+| 0465 | vulkan: `supports_op` skips the buffer-size pre-check for non-compute ops (NONE / VIEW / RESHAPE / PERMUTE / TRANSPOSE) (upstream #31114) (`0465-vulkan-supports-op-skip-size-precheck-none-view.patch`, dfcabe1d2) | v76 (upstream port; placement unchanged) |
+| 0466 | qwen4exp: the conv-state tail is written by `ggml_cpy` from the strided view, without an intermediate `ggml_cont` (upstream #31443) (`0466-qwen4exp-conv-tail-cpy-without-cont.patch`, c02053619) | v76 (upstream port; graphs with MTP on are identical) |
+| 0467 | ggml: a view is bounded by the bytes its strides reach; strided views assert a dim-0-contiguous source (upstream #31584) (`0467-ggml-view-bounds-by-strides-dim0-contiguous.patch`, d75fd8702) | v76 (upstream port; asserts only) |
+| 0468 | vulkan: NVFP4 `ue4m3_fp32_lut` 128 -> 256 entries (shared-memory out-of-bounds read) (upstream #31079) (`0468-vulkan-nvfp4-ue4m3-lut-256.patch`, e2f36b876) | v76 (upstream port; NVFP4 pipelines only) |
+| 0487 | vulkan: a synchronous staged read larger than `GGML_VK_SYNC_READ_CHUNK_MIB` streams through a 2 x 32 MiB staging ring instead of growing the staging buffer to the whole read (about 545 MiB GTT kept after a 1M save before) (`0487-vulkan-sync-read-chunked-staging-ring.patch`, 88b81fc6f) | v76, on (class EXACT: same bytes) |
+| 0488 | vulkan: sync-read staging ring - review round 1 (plan + test) (`0488-vulkan-sync-read-staging-ring-review-r1.patch`, 9dedceeb7) | v76 (class EXACT) |
+| 0489 | server: byte-aligned prompt-cache splice core (`tools/server/server-cache-align.{h,cpp}`, not wired) (`0489-server-cache-align-splice-core.patch`, e47b38c52) | v76 (class server) |
+| 0490 | tests: `tests/test-cache-align.cpp` - splice boundary rules and three logged non-canonical-BPE cases (`0490-tests-cache-align-splice-boundary-v75-incidents.patch`, 6e60cb42d) | v76 (class tests) |
+| 0491 | server: `--cache-align-bytes on\|off` (env `LLAMA_ARG_CACHE_ALIGN_BYTES`) wires the splice into slot matching, the RAM / disk tiers and launch; fingerprint-neutral (`0491-server-cache-align-bytes-wire.patch`, 1265c9fce) | v76, off |
+| 0492 | tests: cache-align coordinate rule + `tools/server/tests/cache-align-replay.py` (needs a model) (`0492-tests-cache-align-coordinate-rule-server-replay.patch`, 58c7de610) | v76 (class tests) |
+| 0493 | server: cache-align review r1 - lazy local span check, request coordinates, O(1) matcher (`0493-server-cache-align-review-r1.patch`, f0edbbb36) | v76, off |
+| 0494 | tests: cache-align review r1 + `tools/server/tests/cache-align-smoke.py` (needs a model) (`0494-tests-cache-align-review-r1.patch`, 8fb01eb6e) | v76 (class tests) |
+| 0495 | server: `GGML_VK_SYNC_READ_CHUNK_MIB` is disk-cache EXACT - unset / 0 / 64 / any value give the same namespace key (`0495-server-disk-cache-vk-sync-read-chunk-exact.patch`, 65e3d8e7f) | v76 (class EXACT) |
+| 0496 | server tools: `read_file` returns files up to 256 KiB whole (was 16 KiB); the description states the cap (`0496-server-tools-read-file-cap-256k.patch`, 4eafd6dc5) | v77 (class server tools) |
+| 0497 | server tools: `exec_shell_command` timeout default / max 10 / 60 -> 60 / 600 s, output default / max 16 / 16 -> 64 / 256 KiB (`0497-server-tools-exec-shell-limits.patch`, 72d62899b) | v77 (class server tools) |
+| 0498 | server tools: `edit_file` description - a failed edit writes nothing; re-read before retrying (description only) (`0498-server-tools-edit-file-description.patch`, 02fcacc2f) | v77 (class server tools) |
+| 0499 | server tools: the limits as arguments `--tools-read-max`, `--tools-exec-timeout[-max]`, `--tools-exec-output[-max]`; startup refuses max < default (`0499-server-tools-limits-args.patch`, 24add1371) | v77 (class server tools) |
+| 0500 | server tools: an exec timeout kills the whole process group (SIGTERM, SIGKILL after 1 s); leftovers of an exited command are killed so the reply returns at once (`0500-server-tools-exec-group-kill.patch`, bd409b0be) | v77 (class server tools) |
+| 0501 | server tools: a timed-out exec reports exit code 124 and one `[exit due to timed out]` marker on every runtime (local, ssh, docker / podman) (`0501-server-tools-exec-timeout-marker.patch`, 6090ac0ba) | v77 (class server tools) |
+| 0502 | chat: an empty final assistant message with `continue_final_message` renders a fresh assistant turn (a reply cut before its first token) (`0502-chat-empty-continuation-fresh-turn.patch`, edf8f159a) | v77 (class prompt rendering, one request shape) |
+| 0503 | webui: Continue in a conversation with tools runs as the first turn of the agentic flow (a continuation ending in a tool call keeps the call) (`0503-webui-continue-agentic-flow.patch`, 767e24da2) | v77 (class webui) |
+| 0504 | chat: the empty-continuation fresh turn applies to an assistant message only (review r1) (`0504-chat-empty-continuation-assistant-only.patch`, 8756d0b4c) | v77 (class prompt rendering) |
+| 0505 | webui: resumed reply - literal emptiness, saved request settings, plain Continue semantics (review r1) (`0505-webui-resume-literal-empty-snapshot-echo.patch`, ba604efa9) | v77 (class webui) |
 
 **0227-0240 apply order** on v59 (`a1b6c324e`): 0227, 0228, 0229, 0230, 0231, 0232, **0234, 0233**, 0235, 0236, 0237, 0238,
 0239, 0240 (0233 sits on 0234). Applied with a strict `git am` in that order they reproduce the v60 tree (`845c6fbcd`,
