@@ -1342,7 +1342,7 @@ static int64_t qwen4exp_qsa_gather_max_windows() {
 }
 
 // [TAG_QSA_INDEXED_FA] (M6) LLAMA_QSA_PREFILL=scan|indexed: the SCAN branch at n_tps > 8 is the masked scan (default, node
-// for node as before) or FA over each query's own QSA_TOP_K ids (src[5]: no fill/set_rows/add planes, no zeros, no K/V
+// for node as before) or FA over each query's own QSA_TOP_K ids (src[8]: no fill/set_rows/add planes, no zeros, no K/V
 // staging). Read once, logged at the first graph build (the reserve); unknown values fall back to scan with a warning.
 // The decision is made once per ubatch from its token count (spec §3.4): every chunk of a chunked ubatch, the
 // [TAG_QSA_CHUNK_PAD] tail included, takes the same attention. It acts only where the scan is taken today: gather
@@ -1356,7 +1356,7 @@ static bool qwen4exp_qsa_prefill_indexed() {
             LLAMA_LOG_WARN("qwen4exp_qsa_prefill: LLAMA_QSA_PREFILL=%s unknown, using scan\n", s);
         }
         LLAMA_LOG_INFO("qwen4exp_qsa_prefill: LLAMA_QSA_PREFILL=%s: the scan branch at n_tps > 8 is %s\n", s,
-                on ? "indexed flash attention (src[5] = QSA_TOP_K ids)" : "the masked scan");
+                on ? "indexed flash attention (src[8] = QSA_TOP_K ids)" : "the masked scan");
         return on;
     }();
     return indexed;
