@@ -10,6 +10,9 @@
 #   CTL    (diagnostic only, --ctl) the cache rebuilt identically, then S sent numerically with cache_prompt true (the v75
 #          id-LCP path on the same warm cache). A == CTL != R localises a difference to cache-vs-fresh evaluation.
 #          Criterion r3 (i): A == CTL bitwise (splice exactness).
+#   CTL_off (--ctl-from DIR, knob-off run; astra r3 "matched control") the knob-on run's S (DIR/<scenario>.json) sent
+#          numerically onto the identically rebuilt warm cache of THIS (knob-off) server: CTL_off == CTL_on and R_off == R_on
+#          bitwise = the splice adds nothing beyond the v75 warm numeric path (C identity checked by sha256).
 #   RR     (--rr) arm R run twice: R == R2 bitwise = the decoding itself is reproducible (criterion r3 (iv), MTP on).
 # Sampler (both arms): T = 0, n_probs 20 (pre-sampling: softmax of the full logit row), ignore_eos, no penalties, --steps
 # (256). Gate (astra r2 OPEN 5, R231): A == R BITWISE on every step: chosen id + the 20 (id, logprob) pairs (JSON doubles,
@@ -33,6 +36,7 @@
 #       --expect on --mtp off --scenarios single,turn,... [--ctl turn,rewind] [--steps 256]
 #   python3 -I cache-align-oracle.py --parity DIR_ON/V2 DIR_OFF/V3 --scenarios single,numturn
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -284,11 +288,14 @@ class Oracle:
                 rec["ctl"] = {"A_vs_CTL": "EQ" if okc else wc, "CTL_vs_R": "EQ" if okr else wr}
         if self.a.expect == "on" and expect_splice and (info is None or info.get("n_c", 0) <= info.get("lcp", 0)):
             verdict, where = "NOT-EXERCISED", (where or "") + " | no splice past the id LCP"
-        rec.update(A=A, S_len=None if S is None else len(S), verdict=verdict, first_diff=where, n_prob_steps=nprob)
+        if S is not None and ctl_build is not None and self.a.ctl_from and self.a.expect == "off":
+            rec["ctl_off"] = self.ctl_off(name, ctl_build, R_extra, rec.get("R"))
+        rec.update(A=A, S=S, C_sha=csha(C_cands), S_len=None if S is None else len(S), verdict=verdict, first_diff=where,
+                   n_prob_steps=nprob)
         os.makedirs(self.a.out, exist_ok=True)
         with open(os.path.join(self.a.out, f"{name}.json"), "w") as f:
             json.dump(rec, f)
-        ctl = rec.get("ctl", {})
+        ctl = dict(rec.get("ctl", {}), **({"off": rec["ctl_off"]} if "ctl_off" in rec else {}))
         line = (f"{self.a.label}\t{name}\texpect={self.a.expect}\tmtp={self.a.mtp}\t{verdict}\t{where or '-'}\tprob_steps={nprob}\t"
                 f"align={'-' if not info or 'lcp' not in info else 'lcp %(lcp)d n_c %(n_c)d n_n %(n_n)d delta %(delta)+d dropped %(dropped)d |N| %(n_N)d |S| %(n_S)d slot %(slot)d' % info}"
                 f"\tctl={ctl or '-'}\trr={rec.get('rr', '-')}\textra={json.dumps(extra_info or {}, ensure_ascii=True)}")
@@ -296,6 +303,25 @@ class Oracle:
         with open(os.path.join(self.a.out, "summary.tsv"), "a") as f:
             f.write(line + "\n")
         self.res.append(verdict)
+
+    def ctl_off(self, name, ctl_build, R_extra, R_off):
+        try:
+            on = json.load(open(os.path.join(self.a.ctl_from, name + ".json")))
+        except OSError as e:
+            return {"err": f"no knob-on record: {e}"}
+        if not on.get("S") or "CTL" not in on:
+            return {"err": "knob-on record has no S / CTL"}
+        cands = ctl_build()
+        out = {"C_same": csha(cands) == on.get("C_sha")}
+        Coff = dump_completion(self.srv.post("/completion", samp(self.steps, dict({"prompt": on["S"], "cache_prompt": True,
+                                                                                   "id_slot": 0}, **(R_extra or {})))))
+        ok, w, _ = compare(on["CTL"], Coff, self.steps, self.mtp)
+        out["CTLon_vs_CTLoff"] = "EQ" if ok else w
+        # R_off here is the fresh prefill of N (knob off, S = N); the matched fresh pair is a fresh prefill of the on-run S
+        Roff = self.run_R(on["S"], R_extra)
+        ok, w, _ = compare(on["R"], Roff, self.steps, self.mtp)
+        out["Ron_vs_Roff"] = "EQ" if ok else w
+        return out
 
     def text_turn(self, name, build, text, extra=None, R_extra_fn=None, ctl=False, expect_splice=True, extra_info=None):
         """build() -> list of candidate cache contents; text = the client turn"""
@@ -621,6 +647,10 @@ class Oracle:
         self.sc_disk_turn(ctl, "disk_adopt")
 
 
+def csha(cands):
+    return hashlib.sha256(json.dumps(cands[0] if cands else []).encode()).hexdigest()[:16]
+
+
 def parity(a):
     fails = 0
     for sc in a.scenarios.split(","):
@@ -647,6 +677,7 @@ def main():
     ap.add_argument("--mtp", choices=["on", "off"], default="on")
     ap.add_argument("--scenarios", default="single,turn,turnfill,rewind,pin_out,pin_in,edit,cont_tok,cont_utf8,preencode,numturn")
     ap.add_argument("--ctl", default="", help="scenarios that also run the CTL diagnostic")
+    ap.add_argument("--ctl-from", default="", help="knob-off run: the knob-on run dir whose S / CTL / R the matched control uses")
     ap.add_argument("--rr", default="", help="scenarios whose arm R runs twice (reproducibility control)")
     ap.add_argument("--steps", type=int, default=256)
     ap.add_argument("--parity", nargs=2)
