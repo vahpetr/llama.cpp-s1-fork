@@ -2900,7 +2900,8 @@ static bool ggml_vk_mmid_tile_g2a_knob() {
     return on;
 }
 
-// [TAG_FA1] coopmat1 flash attention shared-memory layouts (flash_attn_cm1.comp Flags 16384 / 32768): the kernel is
+// [TAG_FA1] coopmat1 flash attention shared-memory layouts (flash_attn_cm1.comp Flags FA_FLAG_SFPV_ALIAS = 1 << 26 /
+// FA_FLAG_V_CHUNK = 1 << 27, were 16384 / 32768 before the +12 fork-bit shift): the kernel is
 // occupancy-bound by LDS on RDNA3 at HSK == HSV == 256. Both are layout-only - same operands, same coopMatMulAdd /
 // softmax / accumulation order - so a dispatch is bit-identical either way. Read once (static).
 // Default on, =0 off; applied only to dense multi-row dispatches (no kv ids, no GQA fold) - decode, verify and the
