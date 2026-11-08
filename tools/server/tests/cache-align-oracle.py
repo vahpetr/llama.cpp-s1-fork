@@ -620,8 +620,10 @@ class Oracle:
             self.finish(f"compete_{k}", out[k], S, info, err, lines, C, extra_info=ei)
 
     def sc_disk_build(self, ctl):
-        st, build = self._turn_build(seed=101)
+        # |C| must reach the prod --cache-disk-min-tokens 4096 or no entry is saved (W2r3: 2600 words -> 3906 tokens)
+        st, build = self._turn_build(seed=101, words=3200)
         C = build()
+        assert len(C[0]) >= 4096, f"disk-build: |C| {len(C[0])} < 4096 (--cache-disk-min-tokens)"
         with open(os.path.join(self.a.out, "..", "disk-state.json"), "w") as f:
             json.dump({"C": C[0], "text": self._turn_text(st)}, f)
         print(f"{self.a.label}\tdisk-build\tC={len(C[0])}\t(saved by the server at SIGTERM)", flush=True)
