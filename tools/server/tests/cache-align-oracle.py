@@ -28,7 +28,13 @@
 # compete (np 2: two conversations sharing a prefix, concurrent text turns, slot selection), natturn (criterion r3 (iii):
 # a decode-built reply resent as text WITHOUT re-splits, so the ids match the cache naturally and the v75 id-LCP path
 # reuses the decode-built KV; A vs R = the cached-vs-fresh divergence of prod with the knob off), disk-build / disk-turn
-# (--cache-disk: build, server restart, entry load + splice; with a key-changing env + --cache-disk-adopt = adoption).
+# (--cache-disk: build, server restart, entry load + splice; with a key-changing env + --cache-disk-adopt = adoption),
+# tok-build (night 1M variant of disk-build: C = a logged prod disk-cache .tok entry, e.g. the 336k incident a32a45b7e9f14c89,
+# prefilled numerically past LLAMA_QSA_MIN_KV; the client turn = detok(C) + a next user turn; then disk-turn / disk-adopt).
+# Night options (canon-oracle-night.sh): --draft-restore (MTP on, R241 equal draft state: before A, R, R2, CTL the slot is erased
+# and ONE fixed slot file is restored, W4), --no-r (scenarios without arm R: the matched knob-off control needs CTL only, a 1M
+# fresh prefill costs ~10 min), --rr-ctl (CTL run twice = warm-path reproducibility), R dumps cached by sha(S, extra, steps,
+# mtp, draft-restore) in OUT/.. (shared by the visits of one run; R2 of --rr is never cached; a shared R is reported SHARED).
 #
 # Not a CI test: needs the brain (or any ChatML model) on a dev server WITHOUT the prod --cache-disk dir; see the unit
 #   ~/claude-tmp/codex/train/canon-oracle/canon-oracle.sh. Usage:
@@ -200,6 +206,30 @@ class Oracle:
         self.mtp = a.mtp == "on"
         self.res = []
         self.rr = set(x for x in (a.rr or "").split(",") if x)
+        self.rr_ctl = set(x for x in (getattr(a, "rr_ctl", "") or "").split(",") if x)
+        self.no_r = set(x for x in (getattr(a, "no_r", "") or "").split(",") if x)
+        self.draft_saved = None
+        self.R_src = None
+
+    def _in(self, name, sel):
+        return name in sel or name.split("_")[0] in sel or name.replace("_", "-") in sel
+
+    def prep(self, slot=0):
+        """erase the slot; with --draft-restore also restore one fixed slot file (saved once per server start after a 1-token
+        prompt, = W4 restore mode): the restore resets the drafter (sequence + carry) to the same state before every arm"""
+        self.srv.erase(slot)
+        if not getattr(self.a, "draft_restore", False):
+            return
+        if self.draft_saved is None:
+            t = self.srv.tok("<|im_start|>system")[:1]
+            self.srv.post("/completion", {"prompt": t, "n_predict": 0, "cache_prompt": True, "id_slot": slot})
+            self.draft_saved = self.srv.post(f"/slots/{slot}?action=save", {"filename": "canon-draft.bin"})
+            print(f"{self.a.label}\tdraft-restore\tsaved {json.dumps({k: self.draft_saved.get(k) for k in ('n_saved', 'n_written')})}",
+                  flush=True)
+            self.srv.erase(slot)
+        r = self.srv.post(f"/slots/{slot}?action=restore", {"filename": "canon-draft.bin"})
+        if r.get("n_restored") is None:
+            raise RuntimeError(f"draft restore: {r}")
 
     # ---------------------------------------------------------------- building blocks
     def fill(self, ids, slot=0):
@@ -256,40 +286,75 @@ class Oracle:
         return self.srv.post("/completion", samp(self.steps, dict({"prompt": text, "cache_prompt": True, "id_slot": slot}, **(extra or {}))))
 
     def run_R(self, S, extra=None):
-        self.srv.erase(0)
+        dr = bool(getattr(self.a, "draft_restore", False))
+        key = hashlib.sha256(json.dumps([S, extra or {}, self.steps, self.a.mtp, dr]).encode()).hexdigest()[:16]
+        cache = os.path.join(self.a.out, "..", f"R-{self.a.mtp}-{key}.json")
+        if os.path.exists(cache):
+            self.R_src = "cache:" + os.path.basename(cache)
+            return json.load(open(cache))
+        R = self._run_R(S, extra)
+        with open(cache + ".tmp", "w") as f:
+            json.dump(R, f)
+        os.replace(cache + ".tmp", cache)
+        self.R_src = "fresh:" + self.a.label
+        return R
+
+    def _run_R(self, S, extra=None):
+        self.prep(0)
         r = self.srv.post("/completion", samp(self.steps, dict({"prompt": S, "cache_prompt": False, "id_slot": 0}, **(extra or {}))))
         return dump_completion(r)
 
     def finish(self, name, A, S, info, err, lines, C_cands, R_extra=None, ctl_build=None, expect_splice=True, extra_info=None):
-        rr = name in self.rr or name.split("_")[0] in self.rr
+        rr, rrc, nor = self._in(name, self.rr), self._in(name, self.rr_ctl), self._in(name, self.no_r)
         rec = {"scenario": name, "label": self.a.label, "expect": self.a.expect, "mtp": self.a.mtp, "info": info, "err": err,
                "extra": extra_info or {}, "log": [l for l in lines if "cache-align" in l or "disk_cache" in l or "cache_pin" in l
                                                   or "checkpoint" in l.lower() and "restor" in l.lower()][-40:]}
         verdict, where, nprob = "FAIL", err, 0
         if S is not None:
-            R = self.run_R(S, R_extra)
-            ok, where, nprob = compare(A, R, self.steps, self.mtp)
-            verdict = "PASS" if ok else "FAIL"
-            if name == "natturn":  # a control, not a gate: it documents the knob-independent cached-vs-fresh divergence
-                verdict = "CTRL-EQ" if ok else "CTRL-DIFF"
-            rec["R"] = R
-            if rr:
-                R2 = self.run_R(S, R_extra)
-                okrr, wrr, _ = compare(R, R2, self.steps, self.mtp)
-                rec["R2"] = R2
-                rec["rr"] = "EQ" if okrr else wrr
+            R = None
+            if not nor:
+                R = self.run_R(S, R_extra)
+                rec["R_src"] = self.R_src
+                ok, where, nprob = compare(A, R, self.steps, self.mtp)
+                verdict = "PASS" if ok else "FAIL"
+                if name == "natturn":  # a control, not a gate: it documents the knob-independent cached-vs-fresh divergence
+                    verdict = "CTRL-EQ" if ok else "CTRL-DIFF"
+                rec["R"] = R
+                if rr:
+                    R2 = self._run_R(S, R_extra)  # never cached: R2 is the reproducibility control
+                    okrr, wrr, _ = compare(R, R2, self.steps, self.mtp)
+                    rec["R2"] = R2
+                    rec["rr"] = "EQ" if okrr else wrr
+            else:
+                verdict, where = "NO-R", ""
             if ctl_build is not None:
-                ctl_build()
-                C = self.srv.post("/completion", samp(self.steps, dict({"prompt": S, "cache_prompt": True, "id_slot": 0}, **(R_extra or {}))))
-                C = dump_completion(C)
-                okc, wc, _ = compare(A, C, self.steps, self.mtp)
-                okr, wr, _ = compare(C, R, self.steps, self.mtp)
+                def ctl_run():
+                    ctl_build()
+                    return dump_completion(self.srv.post("/completion", samp(self.steps, dict({"prompt": S, "cache_prompt": True,
+                                                                                               "id_slot": 0}, **(R_extra or {})))))
+                C = ctl_run()
+                okc, wc, nc = compare(A, C, self.steps, self.mtp)
                 rec["CTL"] = C
-                rec["ctl"] = {"A_vs_CTL": "EQ" if okc else wc, "CTL_vs_R": "EQ" if okr else wr}
+                rec["ctl"] = {"A_vs_CTL": "EQ" if okc else wc}
+                if R is not None:
+                    okr, wr, _ = compare(C, R, self.steps, self.mtp)
+                    rec["ctl"]["CTL_vs_R"] = "EQ" if okr else wr
+                else:  # no arm R (--no-r): the scenario's verdict is the warm numeric-S contract A == CTL (R241)
+                    verdict, where, nprob = ("CTL-EQ" if okc else "CTL-DIFF"), ("" if okc else "A vs CTL: " + wc), nc
+                if rrc:
+                    C2 = ctl_run()
+                    ok2, w2, _ = compare(C, C2, self.steps, self.mtp)
+                    rec["CTL2"] = C2
+                    rec["ctl"]["CTL_vs_CTL2"] = "EQ" if ok2 else w2
+        if S is not None and err:  # e.g. no disk_cache load line / wrong slot: the path under test was not taken
+            verdict, where = "NOT-EXERCISED", (where + " | " if where else "") + err
         if self.a.expect == "on" and expect_splice and (info is None or info.get("n_c", 0) <= info.get("lcp", 0)):
             verdict, where = "NOT-EXERCISED", (where or "") + " | no splice past the id LCP"
         if S is not None and ctl_build is not None and self.a.ctl_from and self.a.expect == "off":
+            self.ctl_off_rec = None
             rec["ctl_off"] = self.ctl_off(name, ctl_build, R_extra, rec.get("R"))
+            if self.ctl_off_rec is not None:
+                rec["CTL_off"] = self.ctl_off_rec
         rec.update(A=A, S=S, C_sha=csha(C_cands), S_len=None if S is None else len(S), verdict=verdict, first_diff=where,
                    n_prob_steps=nprob)
         os.makedirs(self.a.out, exist_ok=True)
@@ -317,8 +382,18 @@ class Oracle:
                                                                                    "id_slot": 0}, **(R_extra or {})))))
         ok, w, _ = compare(on["CTL"], Coff, self.steps, self.mtp)
         out["CTLon_vs_CTLoff"] = "EQ" if ok else w
+        if "A" in on:  # criterion R241: the knob-on result A == the matched knob-off control
+            ok, w, _ = compare(on["A"], Coff, self.steps, self.mtp)
+            out["Aon_vs_CTLoff"] = "EQ" if ok else w
+        self.ctl_off_rec = Coff
+        if "R" not in on:
+            out["Ron_vs_Roff"] = "no knob-on R"
+            return out
         # R_off here is the fresh prefill of N (knob off, S = N); the matched fresh pair is a fresh prefill of the on-run S
         Roff = self.run_R(on["S"], R_extra)
+        if self.R_src.startswith("cache:"):
+            out["Ron_vs_Roff"] = "SHARED (" + self.R_src + ")"  # the cache_prompt:false path never consults the matcher
+            return out
         ok, w, _ = compare(on["R"], Roff, self.steps, self.mtp)
         out["Ron_vs_Roff"] = "EQ" if ok else w
         return out
@@ -628,22 +703,56 @@ class Oracle:
             json.dump({"C": C[0], "text": self._turn_text(st)}, f)
         print(f"{self.a.label}\tdisk-build\tC={len(C[0])}\t(saved by the server at SIGTERM)", flush=True)
 
+    def sc_tok_build(self, ctl):
+        """night 1M variant of disk-build: C = a logged disk-cache .tok entry (e.g. the 336k incident), PREFILLED by a numeric
+        fill (QSA active past LLAMA_QSA_MIN_KV); the client turn = detok(C) + the next user turn (cache-align-replay.py)"""
+        import struct
+        b = open(self.a.tok, "rb").read()
+        n = struct.unpack("<i", b[8:12])[0]
+        C = list(struct.unpack("<%di" % n, b[12:12 + 4 * n]))
+        assert len(C) == n and n > self.a.qsa_min_kv, f"tok-build: |C| {n} must exceed LLAMA_QSA_MIN_KV {self.a.qsa_min_kv} (QSA active)"
+        text = self.srv.detok(C) + f"{END}<|im_start|>user\nnext turn{END}{GEN}"
+        N = self.srv.tok(text)
+        lcp = 0
+        while lcp < min(len(C), len(N)) and C[lcp] == N[lcp]:
+            lcp += 1
+        assert lcp < len(C), "tok-build: the canonical tokenization of detok(C) keeps all of C (nothing to splice)"
+        self.srv.erase(0)
+        t0 = time.time()
+        self.fill(C)
+        tf = time.time() - t0
+        with open(os.path.join(self.a.out, "..", "disk-state.json"), "w") as f:
+            json.dump({"C": C, "text": text, "tok": self.a.tok, "tok_sha": hashlib.sha256(b).hexdigest()[:16]}, f)
+        print(f"{self.a.label}\ttok-build\tC={len(C)}\tN={len(N)}\tid_lcp={lcp}\tfill {tf:.0f} s ({len(C) / max(tf, 1e-3):.0f} t/s)"
+              f"\t(saved by the server at SIGTERM)", flush=True)
+
     def sc_disk_turn(self, ctl, name="disk_turn"):
         d = json.load(open(os.path.join(self.a.out, "..", "disk-state.json")))
         cands = [d["C"]] + ([d["S"] + d["g"]] if "S" in d else [])
-        m = self.mark()
-        A = dump_completion(self.run_A_text(d["text"]))
-        lines = self.since(m)
         N = self.srv.tok(d["text"])
-        S, info, err = self.splice_of(lines, N, cands)
+        self.prep(0)  # equal start state for A and CTL: an empty slot (+ the draft restore), C comes from the disk entry
+        m = self.mark()
+        a0 = self.srv.metric("cache_align_total")
+        A = dump_completion(self.run_A_text(d["text"]))
+        a1 = self.srv.metric("cache_align_total")
+        lines = self.since(m)
+        ei = {"align_total_delta": None if a0 is None or a1 is None else a1 - a0}
+        if self.a.expect == "on":
+            S, info, err = self.splice_of(lines, N, cands)
+        else:
+            S, info, err = N, None, ""
+            if any(RE_ALIGN_ANY.search(l) for l in lines) or ei["align_total_delta"] not in (0, None):
+                S, err = None, "knob off but a cache-align line / metric moved"
         loaded = [l for l in lines if "disk_cache" in l and ("load" in l or "adopt" in l or "restor" in l)]
         if not loaded:
             err = (err + "; " if err else "") + "no disk_cache load line"
-        if S is not None and "S" not in d:
+        if S is not None and "S" not in d and self.a.expect == "on":
             d["S"], d["g"] = S, A["ids"]
             with open(os.path.join(self.a.out, "..", "disk-state.json"), "w") as f:
                 json.dump(d, f)
-        self.finish(name, A, S, info, err, lines, cands, extra_info={"disk_lines": loaded[-6:]})
+        ei["disk_lines"] = loaded[-6:]
+        ei["A_timings"] = {k: A["timings"].get(k) for k in ("cache_n", "prompt_n", "prompt_ms", "predicted_ms")}
+        self.finish(name, A, S, info, err, lines, cands, ctl_build=(lambda: (self.prep(0), cands)[1]) if ctl else None, extra_info=ei)
 
     def sc_disk_adopt(self, ctl):
         self.sc_disk_turn(ctl, "disk_adopt")
@@ -683,6 +792,11 @@ def main():
     ap.add_argument("--rr", default="", help="scenarios whose arm R runs twice (reproducibility control)")
     ap.add_argument("--steps", type=int, default=256)
     ap.add_argument("--parity", nargs=2)
+    ap.add_argument("--tok", help="tok-build: the disk-cache .tok entry used as C")
+    ap.add_argument("--qsa-min-kv", type=int, default=65536, help="tok-build: |C| must exceed it (= the compose LLAMA_QSA_MIN_KV)")
+    ap.add_argument("--draft-restore", action="store_true", help="erase + restore one fixed slot file before A / R / R2 / CTL")
+    ap.add_argument("--no-r", default="", help="scenarios without arm R (verdict = A vs CTL)")
+    ap.add_argument("--rr-ctl", default="", help="scenarios whose CTL runs twice (warm-path reproducibility)")
     a = ap.parse_args()
     if a.parity:
         sys.exit(1 if parity(a) else 0)
@@ -692,7 +806,7 @@ def main():
     for sc in a.scenarios.split(","):
         t0 = time.time()
         fn = {"pin_out": lambda c: o.sc_turn(c, "pin_out", "out"), "pin_in": lambda c: o.sc_turn(c, "pin_in", "in"),
-              "disk-build": o.sc_disk_build, "disk-turn": o.sc_disk_turn, "disk-adopt": o.sc_disk_adopt}.get(sc) or getattr(o, "sc_" + sc)
+              "disk-build": o.sc_disk_build, "tok-build": o.sc_tok_build, "disk-turn": o.sc_disk_turn, "disk-adopt": o.sc_disk_adopt}.get(sc) or getattr(o, "sc_" + sc)
         try:
             fn(sc in ctl)
         except Exception as e:  # noqa: BLE001 - one scenario's error must not hide the others
@@ -702,7 +816,7 @@ def main():
                 f.write(line + "\n")
             o.res.append("ERROR")
         print(f"# {sc}: {time.time() - t0:.1f} s", flush=True)
-    bad = [v for v in o.res if v not in ("PASS", "CTRL-EQ", "CTRL-DIFF")]
+    bad = [v for v in o.res if v not in ("PASS", "CTRL-EQ", "CTRL-DIFF", "CTL-EQ")]
     sys.exit(1 if bad else 0)
 
 
