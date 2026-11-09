@@ -807,6 +807,13 @@ struct server_slot {
 
         mem.seq_rm(id, -1, -1);
 
+        // [TAG_SPEC_RESET] (W4 2026-11-08) a cleared sequence starts with the drafter's construction state: the carry and
+        //   verify rows of the previous request must not survive an erase, a new-task reuse or an eviction (with MTP on
+        //   at T=0 the output depended on the previous request). disk_load() restores the entry's carry after this
+        if (spec) {
+            common_speculative_reset_state(spec, id);
+        }
+
         prompt.clear();
     }
 
