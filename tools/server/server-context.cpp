@@ -7263,6 +7263,12 @@ private:
                             slot.prompt.partial      = false; // [TAG_PARTIAL_PROMPT] the draft side is rebuilt too
                             slot.prompt.draft_gap    = 0;     // [TAG_DRAFT_PARTIAL]
                             slot.prompt.adopted_from.clear(); // [TAG_DISK_ADOPT] recomputed, not the adopted state
+                            // [TAG_SPEC_RESET] (astra 0510 r1 M1) a full recompute (cache_prompt false, no common prefix)
+                            //   starts the drafter from its construction state as prompt_clear() does; a prefix kept at
+                            //   n_past > 0 keeps its carry (R241: equal draft state only)
+                            if (slot.spec) {
+                                common_speculative_reset_state(slot.spec, slot.id);
+                            }
                         }
 
                         // [TAG_TURN_BOUNDARY] the user-message starts of the prompt this slot is about to hold: the
@@ -7353,6 +7359,9 @@ private:
                         slot.prompt.draft_gap    = 0;     // [TAG_DRAFT_PARTIAL]
                         slot.prompt.adopted_from.clear(); // [TAG_DISK_ADOPT]
                         cache_pin_setup(slot, 0); // [TAG_CACHE_PIN] (review m1) re-arm: the prefix is re-processed
+                        if (slot.spec) {
+                            common_speculative_reset_state(slot.spec, slot.id); // [TAG_SPEC_RESET] full recompute from 0
+                        }
 
                         slot.stats.n_prompt_cached = 0;
 
